@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import cast
 
@@ -12,6 +13,9 @@ HistoricalEvidenceResolver = Callable[[str], "dict[str, object] | None"]
 
 SCIENTIFIC_OUTCOME_SCHEMA_REF = "meta-research/scientific-outcome-candidate/v1"
 REASONING_STAGE_OUTPUT_SCHEMA_REF = "meta-research/reasoning-stage-output/v1"
+REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF = (
+    "meta-research/reasoning-research-context/v3"
+)
 REASONING_REVIEW_SCHEMA_REF = "meta-research/reasoning-review/v1"
 REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF = (
     "meta-research/reasoning-autonomous-checkpoint/v1"
@@ -1001,6 +1005,108 @@ def _validated_closure_leaf(value: dict[str, object]) -> str:
     )
 
 
+def _validate_supplied_authoritative_refs(
+    value: object, frozen_refs: list[str], *, conflict_code: str,
+) -> None:
+    supplied = _require_text_list(value, conflict_code)
+    conflicts = [ref for ref in supplied if ref not in frozen_refs or supplied.count(ref) > 1]
+    if conflicts:
+        raise ReasoningContractError(f"{conflict_code}:{','.join(conflicts)}")
+
+
+def assemble_reasoning_authoritative_metadata(
+    output: dict[str, object],
+    *,
+    frozen_research_context: dict[str, object],
+) -> dict[str, object]:
+    """Bind new model output to system-owned metadata before it is hashed.
+
+    Historical v2 requests keep their exact output contract.  The returned
+    copy preserves the Agent's evidence choices and scientific judgments;
+    available frozen sources alone do not imply adoption.
+    """
+
+    assembled = deepcopy(output)
+    if (
+        frozen_research_context.get("schema_ref")
+        != REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF
+    ):
+        return assembled
+    outcome = assembled.get("scientific_outcome")
+    if not isinstance(outcome, dict):
+        raise ReasoningContractError("reasoning_stage_output_invalid")
+    for field in ("cycle_ref", "question_ref", "quest_ref", "goal_revision_ref"):
+        supplied = outcome.get(field)
+        frozen_identity = frozen_research_context.get(field)
+        if supplied != frozen_identity:
+            raise ReasoningContractError(
+                "scientific_outcome_authoritative_metadata_conflict:"
+                f"scientific_outcome.{field}:supplied={supplied}:expected={frozen_identity}"
+            )
+    expected = _validate_frozen_research_context(
+        frozen_research_context,
+        cycle_ref=cast(str, outcome.get("cycle_ref")),
+        question_ref=cast(str, outcome.get("question_ref")),
+        quest_ref=cast(str, outcome.get("quest_ref")),
+        goal_revision_ref=cast(str, outcome.get("goal_revision_ref")),
+    )
+    causal = outcome.get("causal_interpretation")
+    if not isinstance(causal, dict):
+        raise ReasoningContractError("scientific_outcome_causal_interpretation_invalid")
+    frozen_causal = cast(dict[str, list[str]], expected["causal_context"])
+    for field, refs in frozen_causal.items():
+        if field in causal:
+            conflict_code = (
+                "scientific_outcome_authoritative_metadata_conflict:"
+                f"causal_interpretation.{field}"
+            )
+            _validate_supplied_authoritative_refs(
+                causal[field], refs, conflict_code=conflict_code,
+            )
+        causal[field] = list(refs)
+    synthesis = outcome.get("research_synthesis")
+    current = synthesis.get("current_question") if isinstance(synthesis, dict) else None
+    if not isinstance(current, dict):
+        raise ReasoningContractError("scientific_outcome_research_synthesis_invalid")
+    prior_refs = cast(list[str], expected["prior_outcome_refs"])
+    if "prior_accepted_outcome_refs" in current:
+        conflict_code = (
+            "scientific_outcome_authoritative_metadata_conflict:"
+            "research_synthesis.current_question.prior_accepted_outcome_refs"
+        )
+        _validate_supplied_authoritative_refs(
+            current["prior_accepted_outcome_refs"], prior_refs,
+            conflict_code=conflict_code,
+        )
+    current["prior_accepted_outcome_refs"] = list(prior_refs)
+    assert isinstance(synthesis, dict)
+    parents = synthesis.get("parent_questions")
+    if not isinstance(parents, list):
+        raise ReasoningContractError("scientific_outcome_research_synthesis_invalid")
+    parent_refs = cast(list[str], expected["parent_question_refs"])
+    by_parent_ref: dict[str, dict[str, object]] = {}
+    for parent in parents:
+        if not isinstance(parent, dict):
+            raise ReasoningContractError("scientific_outcome_research_synthesis_invalid")
+        parent_ref = _require_text(
+            parent.get("question_ref"), "scientific_outcome_research_synthesis_invalid"
+        )
+        if parent_ref not in parent_refs or parent_ref in by_parent_ref:
+            raise ReasoningContractError(
+                "scientific_outcome_authoritative_metadata_conflict:"
+                f"research_synthesis.parent_questions.question_ref:{parent_ref}"
+            )
+        by_parent_ref[parent_ref] = parent
+    if set(by_parent_ref) != set(parent_refs):
+        missing = [ref for ref in parent_refs if ref not in by_parent_ref]
+        raise ReasoningContractError(
+            "scientific_outcome_research_synthesis_invalid:"
+            f"research_synthesis.parent_questions:missing_impact_for:{','.join(missing)}"
+        )
+    synthesis["parent_questions"] = [by_parent_ref[ref] for ref in parent_refs]
+    return assembled
+
+
 def validate_scientific_outcome(
     outcome: dict[str, object],
     *,
@@ -1147,7 +1253,10 @@ def _validate_frozen_research_context(
         "reasoning_research_context_invalid",
     )
     if (
-        context.get("schema_ref") != "meta-research/reasoning-research-context/v2"
+        context.get("schema_ref") not in {
+            "meta-research/reasoning-research-context/v2",
+            REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF,
+        }
         or context.get("cycle_ref") != cycle_ref
         or context.get("question_ref") != question_ref
         or context.get("quest_ref") != quest_ref

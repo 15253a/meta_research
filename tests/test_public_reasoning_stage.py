@@ -489,12 +489,14 @@ def _confirm_deepfetch_quest(runtime) -> dict[str, object]:
         preview_hash=str(previewed["confirmation_preview"]["hash"]),
         idempotency_key="reasoning-deepfetch-confirm",
     )
-    for _step in range(8):
+    for _step in range(16):
         completed = human.query_quest_creation(initialization_id)
         if completed["status"] == "completed":
             return completed
         assert human.reconcile_once()
-    raise AssertionError("DeepFetch Quest did not complete")
+    completed = human.query_quest_creation(initialization_id)
+    assert completed["status"] == "completed", "DeepFetch Quest did not complete"
+    return completed
 
 
 def _tick_reasoning(runtime) -> dict[str, object]:
@@ -689,10 +691,28 @@ def test_current_reasoning_epoch_does_not_return_a_stale_request(
         runtime.close()
 
 
+class _SystemMetadataReasoningSkill(_DeterministicReasoningSkill):
+    def generate_draft(self, request: ReasoningSkillRequest) -> ReasoningSkillDraft:
+        draft = super().generate_draft(request)
+        outcome = draft.draft["scientific_outcome"]
+        for field in (
+            "target_commit_refs", "changed_axis_fact_refs",
+            "held_fixed_fact_refs", "provenance_refs",
+        ):
+            outcome["causal_interpretation"].pop(field)
+        outcome["research_synthesis"]["current_question"].pop(
+            "prior_accepted_outcome_refs"
+        )
+        return draft
+
+
+@pytest.mark.parametrize("system_metadata", [False, True])
 def test_reasoning_affirmed_next_cycle_keeps_owner_acceptance_layers_distinct(
-    tmp_path: Path,
+    tmp_path: Path, system_metadata: bool,
 ) -> None:
-    reasoning_skill = _DeterministicReasoningSkill()
+    reasoning_skill = (
+        _SystemMetadataReasoningSkill() if system_metadata else _DeterministicReasoningSkill()
+    )
     data_path = tmp_path / "reasoning-owner-chain"
     runtime = _reasoning_runtime(
         data_path,

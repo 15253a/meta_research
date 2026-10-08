@@ -45,22 +45,22 @@ import test_public_bundle_stage as bundle_fixtures
 from test_target_launch_admission import _ready_launch
 
 
-def _admit_independent_target_root(runtime, *, ready=None):
+def _admit_independent_target_root(runtime, *, ready=None, key_prefix=""):
     graph, target, _bundle_run, dispatch, _source_launch_request = (ready if ready is not None else _ready_launch(runtime))
     runtime.owners.research_graph.accept_formal_plan_content(
         formal_plan_ref=graph.formal_plan_ref,
-        idempotency_key="accept-target-root-plan-source",
+        idempotency_key=key_prefix + "accept-target-root-plan-source",
     )
     formal_plan_projection = (
         runtime.owners.research_graph.accept_target_formal_plan_projection(
             graph_ref=graph.graph_ref,
-            idempotency_key="accept-target-root-plan-projection",
+            idempotency_key=key_prefix + "accept-target-root-plan-projection",
         )
     )
     candidate_projection = (
         runtime.owners.research_graph.accept_target_candidate_projection(
             target_ref=target.target_ref,
-            idempotency_key="accept-target-root-candidate-projection",
+            idempotency_key=key_prefix + "accept-target-root-candidate-projection",
         )
     )
     launch_request = runtime.owners.research_graph.query_target_launch_request(
@@ -69,7 +69,7 @@ def _admit_independent_target_root(runtime, *, ready=None):
     runtime.owners.agent_runtime.admit_target_launch(
         launch_request,
         dispatch_decision_ref=dispatch.decision_ref,
-        idempotency_key="formal-target-launch",
+        idempotency_key=key_prefix + "formal-target-launch",
     )
     with runtime._database.read() as connection:
         target_run_ref = connection.execute(
@@ -114,7 +114,7 @@ def _admit_independent_target_root(runtime, *, ready=None):
             target_spec_hash=launch_request.target_spec_binding.content_hash_ref,
             target_scope_binding_hash=canonical_hash(scope),
             input_refs=(),
-            idempotency_key="formal-target-input-binding",
+            idempotency_key=key_prefix + "formal-target-input-binding",
         )
     )
     handle = TargetWorkHandle(
@@ -342,7 +342,7 @@ class _CurrentBindingBundleSkill(bundle_fixtures._DeterministicBundleSkill):
         )
 
 
-def _current_bundle_runtime(path: Path):
+def _current_bundle_runtime(path: Path, *, bundle_skill=None):
     """Use current operation-local Bundle and Target admission."""
 
     drafting = bundle_fixtures._DeterministicDraftingAdapter()
@@ -355,7 +355,7 @@ def _current_bundle_runtime(path: Path):
         plan_skill_provider=bundle_fixtures._DeterministicPlanSkill(
             no_gap=False
         ),
-        bundle_skill_provider=_CurrentBindingBundleSkill(),
+        bundle_skill_provider=bundle_skill or _CurrentBindingBundleSkill(),
         harness_adapters=(
             bundle_fixtures._FullConformanceAdapter("codex"),
         ),

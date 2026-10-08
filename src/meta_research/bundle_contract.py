@@ -68,6 +68,11 @@ def target_execution_assertion(
     }
 
 
+def target_execution_technical_binding(assertion: dict[str, object]) -> dict[str, object]:
+    """Read the exact execution binding without optional handoff narrative."""
+    return {key: value for key, value in assertion.items() if key != "help_context"}
+
+
 def target_execution_authorization_requirement(
     *,
     quest_ref: str,
@@ -88,6 +93,33 @@ def target_execution_authorization_requirement(
             "target_ref": target_ref,
             "target_spec_hash": target_spec_hash,
         },
+    }
+
+
+def target_execution_help_context(spec: dict[str, object]) -> dict[str, object]:
+    """Describe the accepted work and the risk check that requested permission."""
+    descriptions = []
+    semantic_inputs = spec.get("semantic_inputs")
+    if isinstance(semantic_inputs, list):
+        for semantic in semantic_inputs:
+            if isinstance(semantic, dict):
+                for key, label in (
+                    ("goal", "实验目的"), ("characteristics", "实验内容"),
+                    ("boundary_constraints", "约束"), ("semantic_delta", "计划变化"),
+                ):
+                    value = semantic.get(key)
+                    if isinstance(value, str) and value.strip():
+                        descriptions.append(f"{label}：{value}")
+    return {
+        "background": "当前工作来自已接受的研究计划。\n" + "\n".join(descriptions),
+        "attempted_work": [{
+            "action": "核对已接受计划中的实验目的、约束与执行风险。",
+            "result": "当前工作被标记为高风险，执行前需要这一精确工作的单次授权。",
+        }],
+        "problem": "当前精确工作尚缺单次授权，不能据此启动高风险执行。",
+        "requested_delivery": "请决定为当前精确工作授予或拒绝单次执行授权。",
+        "impact": "授权并通过精确绑定检查后可恢复当前工作；其他独立普通工作继续推进。",
+        "safe_response": "请在本求助页面选择授予或拒绝；授权范围仅限当前请求绑定的精确工作。",
     }
 
 

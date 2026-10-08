@@ -10642,7 +10642,7 @@ def _reasoning_context_pack_from_rows(
             leaf.as_public_dict() for leaf in current_target_evidence_closure
         ],
         "research_context": {
-            "schema_ref": "meta-research/reasoning-research-context/v2",
+            "schema_ref": "meta-research/reasoning-research-context/v3",
             "cycle_ref": cycle_ref,
             "quest_ref": accepted_question.quest_ref,
             "question_ref": accepted_question.question_ref,
@@ -10873,7 +10873,10 @@ def _validate_reasoning_context_pack(
             "causal_context", "upstream_stage_commit_refs",
         }
         or research_context.get("schema_ref")
-        != "meta-research/reasoning-research-context/v2"
+        not in {
+            "meta-research/reasoning-research-context/v2",
+            "meta-research/reasoning-research-context/v3",
+        }
         or research_context.get("cycle_ref") != cycle_ref
         or research_context.get("quest_ref")
         != accepted_question_binding.get("quest_ref")

@@ -161,6 +161,8 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                                      "index_offset": 0, "summary_only": True}
     from meta_research.human_research_context import human_research_reader
     view["human_guidance_reader"] = human_research_reader()
+    if stage in {"idea", "plan", "bundle", "reasoning"}:
+        view["formal_human_guidance_reader"] = {"operation": "human_guidance.read"}
     predecessors = context_pack.get("prior_accepted_bindings", [])
     if isinstance(predecessors, list):
         view["predecessor_research_notes_readers"] = [

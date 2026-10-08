@@ -9,6 +9,8 @@ description: 在已接纳 FormalPlan 内组织并启用 Target，滚动安排材
 
 粒度、风险、正式工作与依赖查[Bundle 契约](references/contract.md)；调用与反馈查[Owner 操作](references/owner-operations.md)。Target 按运行时注入的 target-execution Skill、measurement_contract、result_schema 执行，Bundle 不重建另一套交接协议。
 
+
+正式人类指导按运行时加载的[共享指导合同](../human-guidance.md)读取原文、声明处理并延续约束。
 ## 1. 读取与滚动安排
 
 读取已接纳 FormalPlan、gap Brief、输入索引、权威 frontier 与反馈，选择值得现在投入的工作。局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。
@@ -56,3 +58,5 @@ Target 正式接纳后，在同一整理核验环节从 TargetCommit 上下文�
 重大候选与终态交接按研究需要委派原生独立子智能体审阅，根核对完整结果及必要原文并自主修订；最终交接的独立审阅不能用同根自查替代，不要求固定反馈数量或审查表单。
 
 全部完成 cells 有 current accepted TargetCommit 覆盖时为 `realized`；需改变冻结语义时说明 `replan_required` 与剩余义务；真实阻塞、在途工作和未知效果保持实际状态。完成条件是本轮承诺已核对、结果与未决项已交接，Owner 接纳链可验证；执行结束、保存、TargetCommit 和科学结论分别成立。
+
+收到正式人类答复后，用原 effect_id 对账 human_request.open.reconcile，再以精确 request_ref／response_ref 调用 human_request.read。按 delivery.reply_reader／uploaded_readers 读取原根工作文件，linked_locators 沿原生工具读取原路径；先核对实际意见与材料，再继续工作。library_reconnect 的 provided_material 路线使用工作文件，不要求预先入库。提交本身不登记 Literature、Dataset、Environment 或 ResearchAsset；判断有复用价值后再用既有 RM／RG 流程接纳登记。

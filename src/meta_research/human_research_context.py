@@ -20,11 +20,11 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
             attempt_ref=context.attempt_ref, root_session_ref=context.root_session_ref,
             fence_ref=context.fence_ref, runtime_binding_hash=context.capability_binding_hash)
         quest_ref = scope.get("quest_ref")
-        if not isinstance(quest_ref, str) or not quest_ref:
-            raise OwnerConflict("research_help_quest_unavailable")
         request_ref = arguments.get("request_ref")
         response_ref = arguments.get("response_ref")
         if request_ref is None:
+            if not isinstance(quest_ref, str) or not quest_ref:
+                raise OwnerConflict("research_help_request_required")
             if response_ref is not None:
                 raise OwnerConflict("research_help_response_unbound")
             page = human_collaboration.query_research_help_page(
@@ -40,6 +40,10 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
             request = human_collaboration.query_human_request(request_ref)
             if request is None or request.get("quest_ref") != quest_ref:
                 raise OwnerConflict("research_help_request_unbound")
+            if not quest_ref:
+                binding = (request.get("open_effect") or {}).get("operation_binding") or {}
+                if binding.get("task_ref") != context.run_ref or binding.get("root_session_ref") != context.root_session_ref:
+                    raise OwnerConflict("research_help_request_unbound")
             value = {key: request.get(key) for key in (
                 "request_ref", "quest_ref", "kind", "obligation", "business_purpose",
                 "target_assertion", "acceptance_conditions", "required_authorization",
@@ -104,7 +108,7 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
                      "按 research_inputs.next_offset 设置 input_offset 独立翻页。切换任一列表页时将字节 offset 归零。"
                      "主动材料的 reader 交给 research_memory.content.read；精确请求使用 request_ref，"
                      "精确回复同时提供 request_ref 和 response_ref，并省略 cursor。offset／limit 按 UTF-8 字节重建原文与 hash。"
-                     "有精确来源的专业意见可支持研究判断，执行授权按对应 Owner 事实核验。"),
+                     "正式回复的 delivery.reply_reader／uploaded_readers 参数交给 research_workspace.read，linked_locators 用原生工具按原 locator 有界读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
         input_schema={"type": "object", "properties": {
             "input_offset": {"type":"integer","minimum":0},
             "query": {"type":"string","maxLength":1024},

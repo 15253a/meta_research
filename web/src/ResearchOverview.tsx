@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import type { PublicSnapshot, WritingReportView } from "./api";
 import "./research-overview.css";
-import { SpectrumStages, spectrumStage, spectrumStages } from "./Spectrum";
+import { SpectrumStages, spectrumStage } from "./Spectrum";
 import { StageRootSessions, rootSessionStatus, type RootConversationsModel } from "./RootConversations";
 import { BoundedDetails, PageWindow } from "./BoundedDetails";
 import type { RootSession } from "./rootSessionsApi";
 import { summaryNeedsAcceptedResultReview, useTimelineSummaries, type TimelineSummaryNode } from "./timelineSummaries";
+import { MetaTrace } from "./MetaTrace";
+import { useResearchMotion } from "./ResearchMotion";
 
 export type OverviewStage = "idea" | "plan" | "bundle" | "reasoning";
 export type OverviewSource = {
@@ -161,15 +163,17 @@ function latestFinding(items: OverviewFinding[]) {
   return items.find(item => typeof item.text === "string" && item.text.trim());
 }
 
-export function cycleRuntime(snapshot: PublicSnapshot): { label: string; running: boolean; executionPrevented?: boolean } {
+type ResearchRuntimeState = "absent" | "unknown" | "paused" | "waiting" | "running" | "completed" | "idle";
+
+export function cycleRuntime(snapshot: PublicSnapshot): { state: ResearchRuntimeState; label: string; running: boolean; executionPrevented?: boolean } {
   const foreground = snapshot.research_control.foreground;
-  if (!foreground) return { label: "尚未进入研究轮次", running: false };
-  if (snapshot.research_control.status !== "ready") return { label: "当前运行状态暂不可确认", running: false, executionPrevented: true };
+  if (!foreground) return { state: "absent", label: "尚未进入研究轮次", running: false };
+  if (snapshot.research_control.status !== "ready") return { state: "unknown", label: "当前运行状态暂不可确认", running: false, executionPrevented: true };
   const stageKey = foreground.stage.toLowerCase() as OverviewStage;
   const stage = stageNames[stageKey] ?? "当前阶段";
-  if (["completed", "closed"].includes(foreground.status)) return { label: "本轮已结束", running: false, executionPrevented: true };
-  if (["paused", "suspended"].includes(foreground.status) || foreground.grant_status === "suspended") return { label: `${stage} · 已暂停`, running: false, executionPrevented: true };
-  if (["blocked", "waiting", "revoked", "abandoned"].includes(foreground.status) || ["revoked", "abandoned"].includes(foreground.grant_status)) return { label: `${stage} · 等待继续条件`, running: false, executionPrevented: true };
+  if (["completed", "closed"].includes(foreground.status)) return { state: "completed", label: "本轮已结束", running: false, executionPrevented: true };
+  if (["paused", "suspended"].includes(foreground.status) || foreground.grant_status === "suspended") return { state: "paused", label: `${stage} · 已暂停`, running: false, executionPrevented: true };
+  if (["blocked", "waiting", "revoked", "abandoned"].includes(foreground.status) || ["revoked", "abandoned"].includes(foreground.grant_status)) return { state: "waiting", label: `${stage} · 等待继续条件`, running: false, executionPrevented: true };
   const projection = ({ idea: snapshot.idea_stage, plan: snapshot.plan_stage, bundle: snapshot.bundle_stage, reasoning: snapshot.reasoning_stage })[stageKey];
   const request = projection?.stage_run_request;
   const binding = request?.accepted_question_binding;
@@ -185,11 +189,11 @@ export function cycleRuntime(snapshot: PublicSnapshot): { label: string; running
   const run = exact ? projection.run : null;
   const current = run?.run_ref ? snapshot.research_control.managed_runs.filter(item => item.run_ref === run.run_ref && item.quest_ref === foreground.quest_ref && item.cycle_ref === foreground.cycle_ref && (item.epoch == null || item.epoch === foreground.epoch)) : [];
   const statuses = [run?.status, ...current.map(item => item.status)];
-  if (statuses.some(status => status === "paused" || status === "suspended")) return { label: `${stage} · 已暂停`, running: false, executionPrevented: true };
-  if (run?.blocker || statuses.some(status => status === "blocked" || status === "waiting" || status?.startsWith("waiting_"))) return { label: `${stage} · 等待继续条件`, running: false };
-  if (statuses.some(status => status === "active" || status === "running")) return { label: `${stage} · 执行中`, running: true };
-  if (statuses.some(status => status === "completed" || status === "succeeded")) return { label: `${stage} · 本次输出已结束`, running: false };
-  return { label: `${stage} · 暂无新的执行状态`, running: false };
+  if (statuses.some(status => status === "paused" || status === "suspended")) return { state: "paused", label: `${stage} · 已暂停`, running: false, executionPrevented: true };
+  if (run?.blocker || statuses.some(status => status === "blocked" || status === "waiting" || status?.startsWith("waiting_"))) return { state: "waiting", label: `${stage} · 等待继续条件`, running: false };
+  if (statuses.some(status => status === "active" || status === "running")) return { state: "running", label: `${stage} · 执行中`, running: true };
+  if (statuses.some(status => status === "completed" || status === "succeeded")) return { state: "completed", label: `${stage} · 本次输出已结束`, running: false };
+  return { state: "idle", label: `${stage} · 暂无新的执行状态`, running: false };
 }
 
 function writingProgress(snapshot: PublicSnapshot, questRef: string | null): string | null {
@@ -209,9 +213,10 @@ type OverviewProps = {
   onRetry?: () => void;
   onOpenWriting: () => void;
   connected?: boolean;
+  rootConversations?: RootConversationsModel;
 };
 
-export function ResearchOverview({ snapshot, overview, error, onRetry, onOpenWriting, connected = true }: OverviewProps) {
+export function ResearchOverview({ snapshot, overview, error, onRetry, onOpenWriting, connected = true, rootConversations }: OverviewProps) {
   const data = scopedOverview(snapshot, overview);
   const scope = JSON.stringify([overviewQuestRef(snapshot), snapshot.research_control.foreground?.cycle_ref, snapshot.research_control.foreground?.question_ref]);
   const [detailSelection, setDetailSelection] = useState<{ scope: string; kind: "quest" | "question" | "cycle" } | null>(null);
@@ -231,16 +236,18 @@ export function ResearchOverview({ snapshot, overview, error, onRetry, onOpenWri
     : null;
   const writing = acceptedWritingRuns(snapshot, overviewQuestRef(snapshot));
   const writingState = writingProgress(snapshot, overviewQuestRef(snapshot));
-  const runtime = cycleRuntime(snapshot);
+  const currentStage = spectrumStage(snapshot.research_control.foreground?.stage);
+  const runtime = currentStage ? currentStageStatus(currentStage, snapshot, rootConversations) : cycleRuntime(snapshot);
+  const motion = useResearchMotion<HTMLElement>(connected && runtime.state === "running");
   const runtimeLabel = connected ? runtime.label : `上次确认：${runtime.label}`;
   const labels = { quest: "研究进展", question: "本题发现", cycle: "本轮进展" };
   const empty = !overviewQuestRef(snapshot) ? "尚未建立研究" : data?.status === "limited" ? "发现暂不可确认" : data ? "尚未形成研究发现" : error ? "发现暂不可用" : "正在读取研究发现";
   const selectedFindings = detail ? findings[detail] : [];
   return <>
-    <section className="research-overview" aria-label="研究进展、发现与写作产物">
+    <section className="research-overview" aria-label="研究进展、发现与写作产物" ref={motion.ref} data-motion-active={motion.active}>
       <button className="research-overview-item" onClick={() => setDetail("quest")}><span>研究进展 <i aria-hidden="true">↗</i></span><strong>{quest?.text ?? milestoneCopy ?? empty}</strong><small>{quest ? "整个研究 · 最近进展" : milestoneCopy ? "阶段产物已形成 · 尚无研究结论" : "整个研究 · 最近进展"}</small></button>
       <button className="research-overview-item" onClick={() => setDetail("question")}><span>本题发现 <i aria-hidden="true">↗</i></span><strong>{question?.text ?? empty}</strong><small>当前问题 · 已接纳的研究判断</small></button>
-      <button className="research-overview-item research-overview-cycle" onClick={() => setDetail("cycle")}><span><i className={`research-overview-dot${connected && runtime.running ? " is-running" : ""}`} aria-hidden="true" />{cycleOrdinalLabel(data?.cycle_ordinal)} <i aria-hidden="true">↗</i></span><strong>{runtimeLabel}</strong><small className="research-overview-finding">{cycle?.text ?? (error || data?.status === "limited" ? "本轮发现暂不可确认" : data ? "本轮尚未形成发现" : "本轮发现待载入")}</small></button>
+      <button className="research-overview-item research-overview-cycle" onClick={() => setDetail("cycle")}><span><i className={`research-overview-dot${motion.active ? " is-running" : ""}`} aria-hidden="true" />{cycleOrdinalLabel(data?.cycle_ordinal)} <i aria-hidden="true">↗</i></span><strong>{runtimeLabel}</strong><small className="research-overview-finding">{cycle?.text ?? (error || data?.status === "limited" ? "本轮发现暂不可确认" : data ? "本轮发现尚未形成" : "本轮发现待载入")}</small></button>
       <button className="research-overview-item" onClick={onOpenWriting}><span>写作产物 <i aria-hidden="true">↗</i></span><strong>{writing.length ? `${writing.length} 份写作产物` : "暂无写作产物"}</strong><small>{writingState ? `${connected ? "" : "上次确认："}${writingState}` : writing.length ? writing.at(-1)?.intent.title : "查看报告、论文与演示稿"}</small></button>
     </section>
     {error && <p className="research-overview-availability" role="status">{data ? "发现更新暂不可用，保留已收到的结果。" : "研究发现暂不可用；对话与日志仍可阅读。"}{onRetry && <button onClick={onRetry}>重试</button>}</p>}
@@ -264,9 +271,69 @@ type StageHistoryProps = {
   onStageResult?: (stage: OverviewStage, cycle: OverviewCycle | null, artifact: OverviewStageArtifact | null) => void;
 };
 
+/** Read the current work separately from the recorder's interpretation and scientific findings. */
+export function ResearchBrief({ snapshot, overview, error, rootConversations }: {
+  snapshot: PublicSnapshot; overview?: ResearchOverviewData | null; error?: string | null; rootConversations?: RootConversationsModel;
+}) {
+  const data = scopedOverview(snapshot, overview);
+  const foreground = snapshot.research_control.foreground;
+  const stage = spectrumStage(foreground?.stage);
+  const stageState = stage ? currentStageStatus(stage, snapshot, rootConversations) : cycleRuntime(snapshot);
+  const running = stageState.state === "running";
+  const motion = useResearchMotion<HTMLElement>(running);
+  const summaries = useTimelineSummaries(overviewQuestRef(snapshot), motion.visible);
+  const nodeKey = `cycle:${foreground?.cycle_ref}`;
+  const node = summaries.nodes[nodeKey];
+  const requests = snapshot.human_collaboration?.human_requests;
+  const ownRequests = foreground && requests?.status === "ready" ? requests.items.filter(request => request.status === "open"
+    && request.quest_ref?.replace(/^quest:/, "") === foreground?.quest_ref.replace(/^quest:/, "")) : [];
+  const paused = ["paused", "suspended"].includes(foreground?.status ?? "") || foreground?.grant_status === "suspended" || stageState.state === "paused";
+  const projection = stage ? ({ idea: snapshot.idea_stage, plan: snapshot.plan_stage, bundle: snapshot.bundle_stage, reasoning: snapshot.reasoning_stage })[stage] : null;
+  const exactCycle = (projection?.stage_run_request?.cycle_ref ?? projection?.eligibility.cycle_ref) === foreground?.cycle_ref;
+  const failed = !rootConversations?.error && !rootConversations?.context.stale && !rootConversations?.data?.limited && exactCycle
+    && rootConversations?.sessions.some(session => session.cycle_ref === foreground?.cycle_ref
+      && session.question_ref === foreground?.question_ref && session.is_current !== false && spectrumStage(session.stage) === stage && session.status === "failed"
+      && (session.kind === "target" ? snapshot.bundle_stage?.target_graph.targets.some(target => target.target_ref === session.target_ref && target.target_run_ref === session.run_ref && target.status === "failed")
+        : session.kind === "stage" && projection?.run?.run_ref === session.run_ref));
+  const wait = rootConversations?.error || rootConversations?.context.stale ? "当前等待状态暂不可确认。"
+    : paused ? "等待继续研究。"
+      : ownRequests.length ? `还有 ${ownRequests.length} 项求助等你处理；可从求助入口查看。`
+        : failed ? "有工作遇到阻碍，需查看对应会话的说明。"
+          : stageState.state === "waiting" ? "还在等待继续条件，可查看当前工作说明。"
+            : running ? "等待这次工作完成，再核对结果。"
+              : foreground ? "暂无已确认的等待事项；执行状态见当前工作。" : "等待进入研究轮次。";
+  const finding = latestFinding(data?.findings.cycle ?? []) ?? latestFinding((data?.findings.question ?? []).filter(item => item.question_ref === foreground?.question_ref));
+  const confirmed = Boolean(finding && ["affirmed", "supported", "denied", "refuted", "answered"].includes(finding.disposition));
+  const [findingOpen, setFindingOpen] = useState(false);
+  const scope = JSON.stringify([foreground?.quest_ref, foreground?.question_ref, foreground?.cycle_ref]);
+  useEffect(() => setFindingOpen(false), [scope]);
+  const currentCycle = data?.cycles.find(cycle => cycle.cycle_ref === data.cycle_ref);
+  const acceptedResultNeedsReview = currentCycle ? summaryNeedsAcceptedResultReview(node, currentCycle,
+    stages.flatMap(item => currentCycle.stages[item] ?? []), rootConversations?.sessions ?? [], summaries.observedAt) : false;
+  const openCurrent = () => {
+    if (stage) rootConversations?.selectStage(stage);
+    requestAnimationFrame(() => document.getElementById("research-activity")?.focus({ preventScroll: true }));
+    document.getElementById("research-activity")?.scrollIntoView({ block: "start" });
+  };
+  return <section className="research-brief" aria-label="研究近况" ref={motion.ref} data-motion-active={motion.active}>
+    <header><h2><MetaTrace variant="brief" active={motion.active} />研究近况</h2><span>{cycleOrdinalLabel(data?.cycle_ordinal)}</span></header>
+    <div className="research-brief-facts">
+      <div><h3>正在做什么</h3><p>{running && stage ? `正在开展${stageNames[stage]}。` : stageState.label}</p></div>
+      <div><h3>还在等什么</h3><p>{wait}</p></div>
+    </div>
+    <div className="research-brief-process"><h3>本轮工作记录</h3><TimelineSummary nodeKey={nodeKey} node={node} className="research-brief-summary" unavailable={summaries.error} acceptedResultNeedsReview={acceptedResultNeedsReview} /></div>
+    <div className="research-brief-finding"><h3>{finding ? confirmed ? "已确认科研结论" : "待确认发现" : "目前知道什么"}</h3><p>{finding?.text ?? (error ? "研究发现暂不可用，已读取的工作记录仍可查看。" : data ? "本轮尚无可确认的科研结论。" : "正在读取发现；暂不作科研判断。")}</p>{finding ? <small>{dispositionNames[finding.disposition] ?? "尚待核对"} · {cycleOrdinalLabel(finding.cycle_ordinal)}</small> : null}</div>
+    <footer>{rootConversations && stage ? <button type="button" onClick={openCurrent}>查看当前工作 ↗</button> : null}{finding ? <button type="button" onClick={() => setFindingOpen(true)}>查看发现依据</button> : null}</footer>
+    {summaries.error ? <p className="research-brief-availability" role="status">近况摘要读取暂不可用，保留已读取内容；稍后自动重试。</p> : null}
+    {error && finding ? <p className="research-brief-availability" role="status">发现更新暂不可用，保留上次读取的发现与依据。</p> : null}
+    {findingOpen && finding ? <OverviewDialog title="发现依据" subtitle={`${confirmed ? "已确认科研结论" : "待确认发现"} · ${cycleOrdinalLabel(finding.cycle_ordinal)}`} onClose={() => setFindingOpen(false)}><div className="overview-result-meta">{dispositionNames[finding.disposition] ?? "尚待核对"}</div><p className="overview-readable-text">{finding.text}</p><SourceDetails source={{ ...finding.source, quest_ref: finding.quest_ref, question_ref: finding.question_ref, cycle_ref: finding.cycle_ref, epoch: finding.epoch, disposition: finding.disposition }} /></OverviewDialog> : null}
+  </section>;
+}
+
 export function StageHistoryStrip({ snapshot, overview, error, loading, onRetry, onStageResult, onRequestOverview, rootConversations }: StageHistoryProps) {
   const data = scopedOverview(snapshot, overview);
   const current = data?.cycles.find(cycle => cycle.cycle_ref === data.cycle_ref) ?? null;
+  const foregroundStage = spectrumStage(snapshot.research_control.foreground?.stage);
   const questRef = overviewQuestRef(snapshot);
   const [selected, setSelection] = useState<{ questRef: string | null; stage: OverviewStage; cycleRef: string | null; epoch: number | null } | null>(null);
   const selection = selected?.questRef === questRef ? selected : null;
@@ -282,7 +349,7 @@ export function StageHistoryStrip({ snapshot, overview, error, loading, onRetry,
   };
   return <>
     {loading && data ? <p className="overview-empty" role="status">历史成果正在更新，以下保留已读取记录；当前运行状态见阶段会话。</p> : null}
-    <SpectrumStages compact stageContent={rootConversations ? stage => <StageRootSessions model={rootConversations} stage={stage} /> : undefined} selected={rootConversations?.selectedStage} current={spectrumStage(snapshot.research_control.foreground?.stage)} onSelect={rootConversations ? stage => rootConversations.selectStage(stage) : open} onResult={open} labels={Object.fromEntries((["idea", "plan", "bundle", "reasoning"] as const).map(stage => {
+    <SpectrumStages compact running={foregroundStage !== null && currentStageStatus(foregroundStage, snapshot, rootConversations).state === "running"} stageContent={rootConversations ? stage => <StageRootSessions model={rootConversations} stage={stage} /> : undefined} selected={rootConversations?.selectedStage} current={foregroundStage} onSelect={rootConversations ? stage => rootConversations.selectStage(stage) : open} onResult={open} labels={Object.fromEntries((["idea", "plan", "bundle", "reasoning"] as const).map(stage => {
       const last = [...(current?.stages[stage] ?? [])].sort((a, b) => a.epoch - b.epoch).at(-1);
       const isCurrent = snapshot.research_control.foreground?.stage.toLowerCase() === stage;
       return [stage, isCurrent ? "当前阶段" : last ? acceptedStatusNames[last.status] : error || data?.status === "limited" ? "暂不可用" : data ? "尚无结果" : "查看结果"];
@@ -291,26 +358,31 @@ export function StageHistoryStrip({ snapshot, overview, error, loading, onRetry,
   </>;
 }
 
-function currentStageStatus(stage: OverviewStage, snapshot: PublicSnapshot, model?: RootConversationsModel): string {
+function currentStageStatus(stage: OverviewStage, snapshot: PublicSnapshot, model?: RootConversationsModel): { state: ResearchRuntimeState; label: string } {
   const foreground = snapshot.research_control.foreground;
-  if (model?.context.stale || model?.error || model?.data?.limited) return "状态待确认";
+  if (model?.context.stale || model?.error || model?.data?.limited) return { state: "unknown", label: "状态待确认" };
   const observedControl = model?.context.foreground ?? foreground;
-  if (["paused", "suspended"].includes(observedControl?.status ?? "") || observedControl?.grant_status === "suspended") return "已暂停";
-  if (["completed", "closed"].includes(observedControl?.status ?? "")) return "本轮已结束";
+  if (["paused", "suspended"].includes(observedControl?.status ?? "") || observedControl?.grant_status === "suspended") return { state: "paused", label: "已暂停" };
+  if (["completed", "closed"].includes(observedControl?.status ?? "")) return { state: "completed", label: "本轮已结束" };
   if (["blocked", "waiting", "revoked", "abandoned"].includes(observedControl?.status ?? "")
-    || ["revoked", "abandoned"].includes(observedControl?.grant_status ?? "")) return "等待继续条件";
+    || ["revoked", "abandoned"].includes(observedControl?.grant_status ?? "")) return { state: "waiting", label: "等待继续条件" };
   const sessions = model?.sessions.filter(session => session.cycle_ref === foreground?.cycle_ref
     && (!session.question_ref || session.question_ref === foreground?.question_ref) && session.is_current !== false) ?? [];
   const projection = ({ idea: snapshot.idea_stage, plan: snapshot.plan_stage, bundle: snapshot.bundle_stage, reasoning: snapshot.reasoning_stage })[stage];
   const exactCycle = (projection?.stage_run_request?.cycle_ref ?? projection?.eligibility.cycle_ref) === foreground?.cycle_ref;
-  const active = sessions.find(session => session.kind === (stage === "bundle" ? "target" : "stage")
+  const active = sessions.find(session => (session.kind === "stage" || stage === "bundle" && session.kind === "target")
     && exactCycle && session.is_executing && spectrumStage(session.stage) === stage
-    && (stage === "bundle" ? snapshot.bundle_stage?.target_graph.targets.some(target => target.target_ref === session.target_ref
+    && (session.kind === "target" ? snapshot.bundle_stage?.target_graph.targets.some(target => target.target_ref === session.target_ref
       && target.target_run_ref === session.run_ref && target.status === "running") : projection?.run?.run_ref === session.run_ref));
   const runtime = cycleRuntime(snapshot);
   const controlAllowsExecution = foreground?.status === "active" && foreground.grant_status === "active";
-  if (active && controlAllowsExecution && !runtime.executionPrevented && (stage === "bundle" || runtime.running)) return "执行中";
-  return runtime.label;
+  if (active && controlAllowsExecution && !runtime.executionPrevented && (stage === "bundle" || runtime.running)) return { state: "running", label: "执行中" };
+  if (exactCycle && sessions.some(session => session.kind === "stage" && spectrumStage(session.stage) === stage
+    && !session.is_executing && session.status === "waiting")) return { state: "waiting", label: "等待继续条件" };
+  // A managed lease can remain running while its root has durably waited.
+  // Animation requires a positively matched executing root or Target.
+  if (runtime.state === "running") return { state: "unknown", label: "执行状态待确认" };
+  return { state: runtime.state, label: runtime.label };
 }
 
 type StageSelection = { cycleRef: string | null; stage: OverviewStage; epoch: number | null };
@@ -428,7 +500,8 @@ function OverviewDialog({ title, subtitle, children, onClose }: { title: string;
   return <dialog ref={dialogRef} className="research-overview-dialog" aria-labelledby={titleId} aria-describedby={subtitleId} onCancel={event => { event.preventDefault(); onClose(); }} onClose={onClose}><div className="research-overview-dialog-layout"><header><div><h2 id={titleId}>{title}</h2><p id={subtitleId}>{subtitle}</p></div><button ref={closeRef} type="button" onClick={onClose} aria-label={`关闭${title}`}>×</button></header><div className="research-overview-dialog-body">{children}</div><footer><button type="button" onClick={onClose}>返回研究</button></footer></div></dialog>;
 }
 
-const stageAccents = Object.fromEntries(spectrumStages.map(stage => [stage.id, stage.color])) as Record<OverviewStage, string>;
+const stageAccents: Record<OverviewStage, string> = { idea: "#257c70", plan: "#3b67ab", bundle: "#6656a6", reasoning: "#995a32" };
+const summaryKindNames = { process: "过程摘要", tentative_finding: "待确认发现", accepted_conclusion: "已确认科研结论", insufficient_evidence: "证据不足" };
 
 function TimelineSummary({ nodeKey, node, className, unavailable, acceptedResultNeedsReview = false }: {
   nodeKey: string; node?: TimelineSummaryNode; className: string; unavailable: boolean; acceptedResultNeedsReview?: boolean;
@@ -441,12 +514,13 @@ function TimelineSummary({ nodeKey, node, className, unavailable, acceptedResult
       : status === "updating" ? "正在更新总结"
         : status === "pending" || stale ? "总结待更新" : null;
   const sourceTitle = node?.sources.map(source => source.label ? `${source.label} · ${source.ref}` : source.ref).join("\n");
-  const savedAt = node?.updated_at != null ? `记录员独立摘要 · 保存于 ${new Date(node.updated_at * 1_000).toLocaleString("zh-CN", {
+  const savedAt = node?.updated_at != null ? `总结保存于 ${new Date(node.updated_at * 1_000).toLocaleString("zh-CN", {
     year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
-  })}` : "记录员独立摘要（保存时间未知）";
-  const title = [sentence ? savedAt : null,
+  })}` : "既有总结（保存时间未知）";
+  const title = [sentence ? `记录员独立摘要 · ${savedAt}` : null,
     sourceTitle ? `依据：\n${sourceTitle}` : null].filter(Boolean).join("\n");
-  return <span className={`${className} timeline-summary`} data-summary-key={nodeKey} data-summary-status={status} data-summary-stale={stale}>
+  return <span className={`${className} timeline-summary`} data-summary-key={nodeKey} data-summary-kind={node?.summary_kind ?? "process"} data-summary-status={status} data-summary-stale={stale}>
+    {sentence ? <small className="timeline-summary-kind">{summaryKindNames[node?.summary_kind ?? "process"]}</small> : null}
     <span className="timeline-summary-text" title={title || undefined}>{sentence ?? (status === "failed" ? "总结暂未生成" : "记录员正在整理…")}</span>
     {sentence && acceptedResultNeedsReview ? <small className="timeline-summary-status timeline-summary-result-review">已有正式阶段成果，记录员摘要待核对；请查看正式成果。</small> : null}
     {sentence ? <small className="timeline-summary-saved-at">{savedAt}</small> : null}
@@ -462,7 +536,7 @@ type TimelineProps = {
   rootConversations?: RootConversationsModel;
 };
 
-function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, sessions: RootSession[], unavailable: boolean, paused: boolean) {
+function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, sessions: RootSession[], recordedNodes: TimelineSummaryNode[], unavailable: boolean, paused: boolean) {
   const unique = new Map<string, RootSession>();
   const prefer = (candidate: RootSession, previous: RootSession) =>
     Number(previous.activity_label === "已由新会话接续") - Number(candidate.activity_label === "已由新会话接续")
@@ -481,8 +555,12 @@ function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, session
     && (!bundle?.eligibility.question_ref || bundle.eligibility.question_ref === cycle.question_ref);
   const graph = exact ? bundle?.target_graph.targets ?? [] : [];
   const recorded = [...unique.values()].sort((a, b) => (a.short_title || a.title).localeCompare(b.short_title || b.title, undefined, { numeric: true }));
+  // Suspending the foreground can withdraw the live graph. The recorder's
+  // source-bound historical identities remain readable, without a live status.
+  const savedRefs = recordedNodes.filter(node => node.kind === "target" && node.cycle_ref === cycle.cycle_ref
+    && node.question_ref === cycle.question_ref && node.target_ref).map(node => node.target_ref!);
   // Starting a later Target first must not reorder or renumber pending work.
-  const refs = [...new Set([...graph.map(target => target.target_ref), ...recorded.map(session => session.target_ref!)])];
+  const refs = [...new Set([...graph.map(target => target.target_ref), ...recorded.map(session => session.target_ref!), ...savedRefs])];
   return refs.map((ref, index) => {
     const target = graph.find(item => item.target_ref === ref);
     const session = unique.get(ref);
@@ -494,6 +572,7 @@ function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, session
       : unavailable ? "状态待确认"
       : paused && currentSession?.is_executing ? "已暂停"
       : currentSession ? rootSessionStatus(currentSession)
+      : !target ? "状态待确认"
       : target?.status === "running" ? "等待执行记录"
       : target?.status === "failed" || target?.blocker ? "执行受阻"
       : "等待启动";
@@ -509,7 +588,9 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
   const foreground = snapshot.research_control.foreground;
   const sessions = rootConversations?.sessions ?? [];
   const sessionsUnavailable = Boolean(rootConversations?.error || rootConversations?.data?.limited || rootConversations?.context.stale);
-  const summaries = useTimelineSummaries(overviewQuestRef(snapshot));
+  const stage = spectrumStage(foreground?.stage);
+  const motion = useResearchMotion<HTMLElement>(stage !== null && currentStageStatus(stage, snapshot, rootConversations).state === "running");
+  const summaries = useTimelineSummaries(overviewQuestRef(snapshot), motion.visible);
   // A limited history can still contain this exact completed run. Only use
   // positive matched rows, and do not infer from a stale/failed Quest read.
   const summarySessions = !rootConversations?.error && !rootConversations?.context.stale
@@ -536,8 +617,8 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
   const sourcesObservedAt = summaries.observedAt > 0 ? new Date(summaries.observedAt * 1_000).toLocaleString("zh-CN", {
     year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
   }) : null;
-  return <section className="research-timeline" aria-label="研究时间线">
-    <header className="research-timeline-heading"><div><h2>研究时间线</h2><p>摘要按扫描资料独立整理；阶段状态与正式成果请查看详情。</p>{sourcesObservedAt ? <p>资料最近扫描开始于 {sourcesObservedAt}</p> : null}</div><span>{cycles.length ? `${questionOrdinals.size} 个问题 · ${cycles.length} 轮探索` : "随研究更新"}</span></header>
+  return <section className="research-timeline" aria-label="研究时间线" ref={motion.ref} data-motion-active={motion.active}>
+    <header className="research-timeline-heading"><div><h2>研究时间线</h2><details className="research-timeline-note"><summary>摘要说明</summary><p>摘要按扫描资料独立整理；过程摘要、待确认发现与科研结论分别标明。阶段状态与正式成果请查看详情。</p></details>{sourcesObservedAt ? <p>资料最近扫描开始于 {sourcesObservedAt}</p> : null}</div><span>{cycles.length ? `${questionOrdinals.size} 个问题 · ${cycles.length} 轮探索` : "随研究更新"}</span></header>
     {error && data ? <p className="overview-empty" role="status">时间线更新暂不可用，保留已读取记录。{onRetry && <button className="overview-text-button" onClick={onRetry}>重新读取</button>}</p> : null}
     {sessionsUnavailable ? <p className="overview-empty" role="status">部分工作会话暂不可确认，以下保留已读取记录。</p> : null}
     {summaries.error ? <p className="timeline-summary-availability" role="status">总结读取暂不可用，保留已读取内容；稍后自动重试。</p> : null}
@@ -558,10 +639,10 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
           const artifacts = [...(cycle.stages[stage] ?? [])].sort((a, b) => a.epoch - b.epoch);
           return { stage, artifacts, latest: artifacts.at(-1) ?? null };
         });
-        const targets = timelineTargets(snapshot, cycle, sessions, sessionsUnavailable, isCurrent && paused);
+        const targets = timelineTargets(snapshot, cycle, sessions, Object.values(summaries.nodes), sessionsUnavailable, isCurrent && paused);
         return <li key={cycle.cycle_ref} className="research-timeline-cycle" data-cycle-ref={cycle.cycle_ref} data-current={isCurrent}>
           <BoundedDetails className="research-timeline-cycle-details" defaultOpen={isCurrent} summary={<>
-            <span className="research-timeline-cycle-name">Cycle {cycle.ordinal ?? "?"}<i className="research-timeline-chevron" aria-hidden="true">▸</i></span>
+            <span className="research-timeline-cycle-name">{isCurrent ? <MetaTrace variant="timeline" /> : null}Cycle {cycle.ordinal ?? "?"}<i className="research-timeline-chevron" aria-hidden="true">▸</i></span>
             <TimelineSummary className="research-timeline-cycle-meta" nodeKey={`cycle:${cycle.cycle_ref}`} node={summaries.nodes[`cycle:${cycle.cycle_ref}`]} unavailable={summaries.error}
               acceptedResultNeedsReview={summaryNeedsAcceptedResultReview(summaries.nodes[`cycle:${cycle.cycle_ref}`], cycle, entries.flatMap(entry => entry.artifacts), summarySessions, summaries.observedAt)} />
             {isCurrent ? <i className="research-timeline-badge">当前轮</i> : null}
@@ -570,16 +651,20 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
                 <span className="research-timeline-stage-head"><b>{stageTechnicalNames[stage]}</b></span>
                 <TimelineSummary className="research-timeline-stage-summary" nodeKey={`stage:${cycle.cycle_ref}:${stage}`} node={summaries.nodes[`stage:${cycle.cycle_ref}:${stage}`]} unavailable={summaries.error}
                   acceptedResultNeedsReview={summaryNeedsAcceptedResultReview(summaries.nodes[`stage:${cycle.cycle_ref}:${stage}`], cycle, artifacts, summarySessions, summaries.observedAt)} />
-                <small className="research-timeline-stage-state">{isCurrent && foreground?.stage.toLowerCase() === stage ? <><span>当前阶段</span><span>{currentStageStatus(stage, snapshot, rootConversations)}</span></> : latest ? acceptedStatusNames[latest.status] : "尚无记录"}</small>
+                <small className="research-timeline-stage-state">{isCurrent && foreground?.stage.toLowerCase() === stage ? <><span>当前阶段</span><span>{currentStageStatus(stage, snapshot, rootConversations).label}</span></> : latest ? acceptedStatusNames[latest.status] : "尚无记录"}</small>
               </button>
               {stage === "bundle" && (targets.length > 0 || isCurrent) ? <ul className="research-timeline-targets">
                 {targets.map(target => <li key={target.ref} className="research-timeline-target" data-target-ref={target.ref} data-executing={target.executing}>
-                  <button className="research-timeline-target-open" type="button" disabled={!target.session || !rootConversations} onClick={() => {
+                  <button className="research-timeline-target-open" type="button" onClick={() => {
+                    if (!target.session || !rootConversations) {
+                      setSelection({ cycleRef: cycle.cycle_ref, stage: "bundle", epoch: latest?.epoch ?? null });
+                      return;
+                    }
                     rootConversations?.selectStage("bundle", target.session?.session_ref);
                     requestAnimationFrame(() => {
                       const activity = document.getElementById("research-activity");
                       activity?.focus({ preventScroll: true });
-                      activity?.scrollIntoView({ block: "start", behavior: "smooth" });
+                      activity?.scrollIntoView({ block: "start", behavior: motion.active ? "smooth" : "auto" });
                     });
                   }}><b>{target.label}</b><TimelineSummary className="research-timeline-target-summary" nodeKey={`target:${cycle.cycle_ref}:${target.ref}`} node={summaries.nodes[`target:${cycle.cycle_ref}:${target.ref}`]} unavailable={summaries.error} /><small className="research-timeline-target-state">{target.status}</small></button>
                 </li>)}

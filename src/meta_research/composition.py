@@ -949,6 +949,8 @@ def build_production_runtime(
             for kind, provider in workspace_providers.items()},
         deepfetch_locator=getattr(deepfetch_provider, "research_workspace_path", None),
     )
+    human_collaboration.bind_reply_workspaces(root_workspaces)
+    human_collaboration.recover_response_deliveries()
     for provider in (*workspace_providers.values(), proposal_drafter, deepfetch_provider):
         bind_workspaces = getattr(provider, "bind_workspaces", None)
         if callable(bind_workspaces):
@@ -1004,6 +1006,11 @@ def build_production_runtime(
         root_operation_diagnostic_recorder=root_operation_diagnostics,
     )
     harnesses.bind_resident_mcp_scope_verifier(owners.agent_runtime)
+    harnesses.bind_human_guidance_authority(owners.human_collaboration)
+    for provider in (idea_skill_provider, plan_skill_provider, bundle_skill_provider, reasoning_skill_provider):
+        bind_guidance = getattr(provider, "bind_human_guidance_authority", None)
+        if callable(bind_guidance):
+            bind_guidance(owners.human_collaboration)
     harnesses.bind_target_workspace_resolver(target_run_agent)
     if startup_harness_diagnostics:
         harnesses.run_startup_diagnostics()
@@ -1096,6 +1103,10 @@ def build_production_runtime(
         harnesses=harnesses,
         finalizer=target_run_finalizer,
         database=database,
+        root_workspaces=root_workspaces,
+        advancement_engine=owners.advancement_engine,
+        protected_storage_roots=(data_root.objects, data_root.provider_homes,
+            data_root.run / 'harness-supervisor', data_root.database),
     )
     bundle_stage = BundleStageWorker(
         feed,

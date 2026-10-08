@@ -23,6 +23,8 @@ type ProductStart = {
 type DeterministicProductOptions = {
   legacyState?: "draft" | "recovering";
   manualRoot?: boolean;
+  humanRequestHandoff?: boolean;
+  humanRequestHandoffKind?: "offline_action" | "library_reconnect" | "system_operation_help";
   stagePipeline?:
     | "plan-gap"
     | "bundle-exhaustion"
@@ -75,6 +77,12 @@ export class DeterministicProduct {
     }
     if (options.manualRoot) {
       argv.push("--manual-root");
+    }
+    if (options.humanRequestHandoff) {
+      argv.push("--human-request-handoff");
+      if (options.humanRequestHandoffKind) {
+        argv.push("--human-request-handoff-kind", options.humanRequestHandoffKind);
+      }
     }
     if (options.stagePipeline) {
       argv.push("--stage-pipeline", options.stagePipeline);
