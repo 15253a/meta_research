@@ -31,7 +31,7 @@ export type RootConversationContext = {
 
 type OperationReadingState = {
   page: RootOutput | null; chunks: { offset: number; text: string }[]; browseOffset: number | null;
-  tailOffset: number; clock: ExecutionClockSample | null;
+  tailOffset: number; clock: ExecutionClockSample | null; visibleCount: number;
 };
 type SessionReadingState = {
   historyEnd: number | null; follow: boolean; scrollTop: number | null; operations: Map<string, OperationReadingState>;
@@ -224,7 +224,7 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
     const state = readingCache.get(session.session_ref) ?? { historyEnd: null, follow: true, scrollTop: null, operations: new Map<string, OperationReadingState>() };
     if (followCurrent) {
       state.historyEnd = null; state.follow = true; state.scrollTop = null;
-      for (const output of state.operations.values()) output.browseOffset = null;
+      for (const output of state.operations.values()) { output.browseOffset = null; output.visibleCount = 80; }
     }
     readingCache.set(session.session_ref, state);
     return state;
@@ -249,9 +249,9 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   useLayoutEffect(() => {
     const node = scrollRef.current;
     if (!node) return;
-    if (reading.scrollTop !== null) node.scrollTop = reading.scrollTop;
+    if (!followCurrent && reading.scrollTop !== null) node.scrollTop = reading.scrollTop;
     return () => { reading.scrollTop = node.scrollTop; };
-  }, [reading]);
+  }, [reading, followCurrent]);
   const onOutput = useCallback(() => {
     if (follow) requestAnimationFrame(() => { const node = scrollRef.current; if (node) node.scrollTop = node.scrollHeight; });
   }, [follow]);
@@ -266,17 +266,17 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
     }}>
       {start > 0 ? <button className="root-load-earlier" onClick={() => pauseReading(start)}>读取更早工作 · 还有 {start} 次</button> : null}
       {operations.slice(start, end).map((operation, index) => <RootOperationOutput key={operation.operation_ref} questRef={questRef} sessionRef={session.session_ref}
-        operation={operation} ordinal={start + index + 1} active={active} onOutput={onOutput} readingCache={reading.operations} onReadHistory={() => pauseReading()} />)}
+        operation={operation} ordinal={start + index + 1} active={active} followLive={follow} onOutput={onOutput} readingCache={reading.operations} onReadHistory={() => pauseReading()} />)}
       {end < operations.length ? <button className="root-load-earlier" onClick={() => setHistoryEnd(Math.min(operations.length, end + 4))}>读取后续工作 · 还有 {operations.length - end} 次</button> : null}
       {!operations.length ? <p className="research-output-empty">会话已建立，等待第一条公开工作记录。</p> : null}
     </div>
-    <footer className="research-output-footer"><button type="button" aria-pressed={follow} onClick={() => { if (follow) pauseReading(); else { setFollow(true); setHistoryEnd(null); requestAnimationFrame(() => { const node = scrollRef.current; if (node) node.scrollTop = node.scrollHeight; }); } }}>{follow ? "跟随最新 ✓" : "继续跟随 ↓"}</button><span>{follow ? "默认显示最近 4 次工作；原始历史可分页读取" : "已暂停滚动，可以继续回看"}</span></footer>
+    <footer className="research-output-footer"><button type="button" aria-pressed={follow} onClick={() => { if (follow) pauseReading(); else { setFollow(true); setHistoryEnd(null); requestAnimationFrame(() => { const node = scrollRef.current; if (node) node.scrollTop = node.scrollHeight; }); } }}>{follow ? "跟随最新 ✓" : "继续跟随 ↓"}</button><span>{follow ? "默认显示最近 4 次工作；原始历史可分页读取" : "已固定当前已读视图；返回当前或继续跟随可读取新输出"}</span></footer>
   </section>;
 }
 
-function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active, onOutput, readingCache, onReadHistory }: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void }) {
+function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active, followLive = true, onOutput, readingCache, onReadHistory }: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; followLive?: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void }) {
   const [reading] = useState(() => {
-    const state = readingCache.get(operation.operation_ref) ?? { page: null, chunks: [], browseOffset: null, tailOffset: 0, clock: null };
+    const state = readingCache.get(operation.operation_ref) ?? { page: null, chunks: [], browseOffset: null, tailOffset: 0, clock: null, visibleCount: 80 };
     readingCache.set(operation.operation_ref, state);
     return state;
   });
@@ -286,13 +286,15 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
   const [clock, setClock] = useState<ExecutionClockSample | null>(reading.clock);
   const [retry, setRetry] = useState(0);
   const [browseOffset, setBrowseOffset] = useState<number | null>(reading.browseOffset);
+  const [visibleCount, setVisibleCount] = useState(reading.visibleCount);
   const last = useRef<RootOutput | null>(reading.page);
   const tailOffset = useRef(reading.tailOffset);
   const chunksRef = useRef<{ offset: number; text: string }[]>(reading.chunks);
+  const retryRequested = useRef(false);
   useEffect(() => {
     reading.page = page; reading.chunks = chunks; reading.browseOffset = browseOffset;
-    reading.tailOffset = tailOffset.current; reading.clock = clock;
-  }, [reading, page, chunks, browseOffset, clock]);
+    reading.tailOffset = tailOffset.current; reading.clock = clock; reading.visibleCount = visibleCount;
+  }, [reading, page, chunks, browseOffset, clock, visibleCount]);
   const browse = (offset: number | null) => {
     if (browseOffset === null) tailOffset.current = last.current?.offset ?? 0;
     if (offset === null || offset !== last.current?.next_offset) { chunksRef.current = []; setChunks([]); }
@@ -303,6 +305,8 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
   };
   useEffect(() => {
     if (!active) return;
+    const frozenRetry = !followLive && last.current && browseOffset === null && retryRequested.current;
+    if (!followLive && last.current && browseOffset === null && !frozenRetry) return;
     const controller = new AbortController();
     let timer: number | undefined;
     let failures = 0;
@@ -317,6 +321,13 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
     };
     const load = async () => {
       try {
+        if (frozenRetry) {
+          // Check recovery without replacing the reader's retained page.
+          await readAt(0);
+          if (controller.signal.aborted) return;
+          retryRequested.current = false; setError(null);
+          return;
+        }
         const previous = last.current;
         const after = browseOffset ?? previous?.next_offset ?? tailOffset.current;
         let next = await readAt(after);
@@ -331,17 +342,20 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
           return;
         }
         const sameStream = !previous || previous.stream_ref === next.stream_ref;
+        if (reading.page && reading.page.stream_ref !== next.stream_ref) { reading.visibleCount = 80; setVisibleCount(80); }
         const collected = [...(sameStream ? chunksRef.current.filter(chunk => chunk.offset < next.offset) : []), ...(next.text ? [{ offset: next.offset, text: next.text }] : [])];
         // Bound browser memory per call while retaining adjacent UTF-8 pages.
         let bytes = collected.reduce((sum, chunk) => sum + new TextEncoder().encode(chunk.text).length, 0);
         while (bytes > 512 * 1024 && collected.length > 1) bytes -= new TextEncoder().encode(collected.shift()!.text).length;
         chunksRef.current = collected; last.current = next;
-        setChunks(collected); setPage(next); setError(null); failures = 0;
+        setChunks(collected); setPage(next); setError(null); failures = 0; retryRequested.current = false;
         if (next.source_updated_at && Number.isFinite(next.observed_at)) setClock(previousClock => previousClock?.sourceUpdatedAt === next.source_updated_at ? previousClock : { sourceUpdatedAt: next.source_updated_at!, observedAt: next.observed_at, receivedAt: performance.now() });
         unchangedReads = next.text ? 0 : unchangedReads + 1;
-        if (browseOffset === null && (next.has_more || next.status !== "terminal")) timer = window.setTimeout(load, next.has_more ? 30 : Math.min(8_000, 1_000 * 2 ** Math.min(unchangedReads, 3)));
+        if (browseOffset === null && (next.has_more || followLive && next.status !== "terminal")) timer = window.setTimeout(load, next.has_more ? 30 : Math.min(8_000, 1_000 * 2 ** Math.min(unchangedReads, 3)));
       } catch (caught) {
         if (controller.signal.aborted) return;
+        retryRequested.current = false;
+        if (frozenRetry) { setError(caught instanceof Error ? caught.message : "root_output_unavailable"); return; }
         if (caught instanceof RootSessionError && ["root_session_output_cursor_stale", "root_session_output_cursor_invalid"].includes(caught.code)) {
           last.current = null; tailOffset.current = 0;
           if (browseOffset !== null && browseOffset !== 0) { setBrowseOffset(0); return; }
@@ -354,7 +368,7 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
     };
     void load();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [questRef, sessionRef, operation.operation_ref, operation.status, active, retry, browseOffset]);
+  }, [questRef, sessionRef, operation.operation_ref, operation.status, active, followLive, retry, browseOffset]);
   useEffect(onOutput, [page?.next_offset, page?.stream_ref, onOutput]);
   const sourceUpdatedAt = page?.source_updated_at;
   return <article className="root-operation" data-operation-ref={operation.operation_ref}>
@@ -363,9 +377,10 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
         ? <time>输出更新 · {timeText(sourceUpdatedAt)}</time>
         : <span>输出时间待确认</span>}
     </div>
-    {error ? <div className="root-session-warning" role="status">记录暂时无法更新，已保留上次内容。<button onClick={() => setRetry(value => value + 1)}>重试</button><details><summary>读取详情</summary><code>{error}</code></details></div> : null}
+    {error ? <div className="root-session-warning" role="status">记录暂时无法更新，已保留上次内容。<button onClick={() => { retryRequested.current = true; setRetry(value => value + 1); }}>重试</button><details><summary>读取详情</summary><code>{error}</code></details></div> : null}
     {page ? <>{(chunks[0]?.offset ?? 0) > 0 && browseOffset === null ? <p className="root-output-truncated">这次调用较早的记录已收起，可通过分页回看。</p> : null}
-      <StageReadableOutput rawText={page.text} chunks={chunks} streamKey={page.stream_ref} rootNativeSessionRef={page.native_session_ref} isTerminal={page.status === "terminal"} publicOnly />
+      <StageReadableOutput rawText={page.text} chunks={chunks} streamKey={page.stream_ref} rootNativeSessionRef={page.native_session_ref} isTerminal={page.status === "terminal"} publicOnly
+        visibleCount={visibleCount} onVisibleCountChange={count => { reading.visibleCount = count; setVisibleCount(count); }} onPauseFollow={onReadHistory} />
       <div className="root-operation-clock"><ExecutionElapsed sample={clock} ended={page.status === "terminal"} />{page.has_more && browseOffset === null ? <small>正在补读后续记录…</small> : null}</div>
       <details className="root-output-pages" open={browseOffset !== null}><summary>查看这次调用的分页记录</summary><nav aria-label={`工作记录 ${ordinal} 分页`}>
         <button disabled={page.offset === 0} onClick={() => browse(0)}>最早记录</button>

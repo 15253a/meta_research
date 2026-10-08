@@ -535,6 +535,81 @@ test("returning current resumes latest output after manually reading the executi
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
 
+test("expanding older public messages pins the Session and keeps its expanded window across root and Cycle changes", async ({ page }) => {
+  const f = await fixture(page);
+  f.output.set("target-turn-1", Array.from({ length: 100 }, (_, index) => message(`较早公开步骤 ${index}。`)).join(""));
+  await page.goto("http://research-trace.test/?workspace=1");
+  const trace = page.locator("#research-activity"), log = trace.getByRole("log");
+  await expect(trace).toContainText("较早公开步骤 99。");
+  await expect(trace).not.toContainText("较早公开步骤 0。");
+  await trace.getByRole("button", { name: /显示更早的输出/ }).click();
+  await expect(trace).toContainText("较早公开步骤 0。");
+  await expect(trace.getByRole("button", { name: "返回当前阶段 ↗" })).toBeVisible();
+  await log.evaluate(node => { node.scrollTop = 240; });
+  await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
+  await expect(trace).toContainText("较早公开步骤 0。");
+  await page.locator('button[data-session-ref="session-t2"]').click();
+  await expect(trace).toContainText("T2 正在执行对照实验。");
+  await page.locator('button[data-session-ref="session-t1"]').click();
+  await expect(trace).toContainText("较早公开步骤 0。");
+  await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
+  f.snapshot.research_control.foreground!.cycle_ref = "advanced-cycle"; f.snapshot.revision += 1;
+  await expect(page.getByTestId("current-cycle-overview")).toHaveAttribute("data-cycle-ref", "advanced-cycle");
+  await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
+  await expect(trace).toContainText("较早公开步骤 0。");
+  await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
+test("paused in-call history keeps its readable page when appended bytes exceed the live window and resumes on return current", async ({ page }) => {
+  const f = await fixture(page);
+  const initial = Array.from({ length: 100 }, (_, index) => message(`已读公开步骤 ${index}。`)).join("");
+  f.output.set("target-turn-1", initial);
+  await page.goto("http://research-trace.test/?workspace=1");
+  const trace = page.locator("#research-activity"), log = trace.getByRole("log");
+  await expect(trace).toContainText("已读公开步骤 99。");
+  await trace.getByRole("button", { name: /显示更早的输出/ }).click();
+  await expect(trace).toContainText("已读公开步骤 0。");
+  await log.evaluate(node => { node.scrollTop = 240; });
+  const reads = f.state.listReads;
+  f.output.set("target-turn-1", initial + " ".repeat(600 * 1024) + "\n" + Array.from({ length: 100 }, (_, index) => message(`后台追加公开步骤 ${index}。`)).join(""));
+  await expect.poll(() => f.state.listReads).toBeGreaterThan(reads + 1);
+  await expect(trace).toContainText("已读公开步骤 0。");
+  await expect(trace).not.toContainText("后台追加公开步骤 99。");
+  await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
+  await expect(trace).toContainText("已固定当前已读视图");
+  await trace.getByRole("button", { name: "返回当前阶段 ↗" }).click();
+  await expect(trace).toContainText("后台追加公开步骤 99。", { timeout: 20_000 });
+  await expect(trace.getByRole("button", { name: "跟随最新 ✓" })).toBeVisible();
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
+test("explicit retry clears a recovered output warning after scrolling it into a frozen reading view", async ({ page }) => {
+  const f = await fixture(page);
+  f.output.set("target-turn-2", Array.from({ length: 100 }, (_, index) => message(`第二根已读公开步骤 ${index}。`)).join(""));
+  await page.goto("http://research-trace.test/?workspace=1");
+  await page.locator('button[data-session-ref="session-t2"]').click();
+  const trace = page.locator("#research-activity"), log = trace.getByRole("log");
+  await expect(trace).toContainText("第二根已读公开步骤 99。");
+  f.state.outputFailed = true;
+  await expect(trace).toContainText("记录暂时无法更新，已保留上次内容。");
+  const retry = trace.getByRole("button", { name: "重试", exact: true });
+  await retry.scrollIntoViewIfNeeded();
+  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  const position = await log.evaluate(node => node.scrollTop);
+  const reads = f.state.outputReads;
+  f.output.set("target-turn-2", f.output.get("target-turn-2") + message("恢复后新增公开说明。"));
+  f.state.outputFailed = false;
+  await retry.click();
+  await expect.poll(() => f.state.outputReads, { timeout: 3_000 }).toBeGreaterThan(reads);
+  await expect(trace).not.toContainText("记录暂时无法更新，已保留上次内容。");
+  await expect(trace).toContainText("第二根已读公开步骤 99。");
+  await expect(trace).not.toContainText("恢复后新增公开说明。");
+  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(position);
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
 test("an unstarted Reasoning role stays in its chosen Cycle and Quest changes clear old reading state", async ({ page }) => {
   const f = await fixture(page);
   const original = { ...f.snapshot.research_control.foreground!, stage: "Reasoning" };
