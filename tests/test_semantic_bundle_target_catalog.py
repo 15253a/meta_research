@@ -425,10 +425,15 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
     # These operations return Owner records or bounded research content directly.
     # Name each operation so a new unconstrained output cannot silently pass.
     owner_record_outputs = {
+        "research_graph.quest_goal.read",
+        "research_graph.quest_goal.evolve",
+        "research_graph.quest_goal.evolve.reconcile",
         "human_guidance.read",
         "human_guidance.read.reconcile",
         "human_guidance.feedback",
         "human_guidance.feedback.reconcile",
+        "research_workspace.materials.discover",
+        "research_workspace.materials.read",
         "research_workspace.discover",
         "research_workspace.read",
         "research_memory.research_notes.read",
