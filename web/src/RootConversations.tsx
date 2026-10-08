@@ -14,8 +14,9 @@ type ReasoningRole = typeof reasoningRoles[number];
 const reasoningRoleLabels = { reasoning: "Reasoning", deepfetch: "DeepFetch", acquisition: "Acquisition" };
 const reasoningRole = (session: RootSession): ReasoningRole => session.kind === "stage" ? "reasoning" : session.kind === "deepfetch" ? "deepfetch" : "acquisition";
 
-const kindLabels = { stage: "阶段会话", target: "实验会话", deepfetch: "DeepFetch", acquisition: "Acquisition" };
+const kindLabels = { stage: "阶段会话", target: "独立 Target 根", deepfetch: "DeepFetch", acquisition: "Acquisition" };
 const sessionStage = (session: RootSession): SpectrumStage | null => session.kind === "target" ? "bundle" : spectrumStage(session.stage);
+const childStatusLabels = { starting: "正在启动", running: "正在运行", completed: "已完成", failed: "已失败", cancelled: "已取消", unknown: "未知 · 待核实" };
 const isHistoricalWaitingSession = (session: RootSession) => session.is_current === false && session.is_executing === false && session.status === "waiting";
 export const rootSessionStatus = (session: RootSession, language: "zh" | "en" = "zh") => isHistoricalWaitingSession(session)
   ? language === "en" ? "Historical session" : "历史会话"
@@ -232,6 +233,7 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   const [historyEnd, setHistoryEnd] = useState<number | null>(reading.historyEnd);
   const [follow, setFollow] = useState(reading.follow);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const children = (session.children ?? []).filter(child => child.parent_session_ref === session.session_ref);
   const operations = [...session.operations].sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0) || a.operation_ref.localeCompare(b.operation_ref));
   const end = Math.min(historyEnd ?? operations.length, operations.length);
   const start = Math.max(0, end - 4);
@@ -259,6 +261,13 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   return <section className="research-conversation root-session-conversation" aria-label={`${session.title} 会话`} data-session-ref={session.session_ref}>
     <header className="root-session-heading"><div><b>{session.title}</b><small>{scope} · {kindLabels[session.kind]}{session.stage ? ` · ${session.stage}` : ""}</small></div><span data-executing={!stale && session.is_executing}>{stale ? `状态待确认 · 上次${rootSessionStatus(session, language)}` : rootSessionStatus(session, language)}</span></header>
     <div className="root-session-context"><span>{stale ? "当前会话状态暂不可确认，以下为已读取的工作记录。" : isHistoricalWaitingSession(session) ? language === "en" ? "View recorded content." : "查看已记录内容。" : session.status === "waiting" ? "当前会话等待继续条件，暂无模型调用在执行。" : session.status === "completed" ? "本会话已完成，以下保留已产生的公开工作记录。" : "同一会话的连续工作记录"}</span><details><summary>归属</summary><p>会话 {session.session_ref}</p><p>研究轮次 {session.cycle_ref ?? "Quest 资料范围"}</p><p>研究问题 {session.question_ref ?? "未绑定单个问题"}</p>{session.owner_session_ref ? <p>发起会话 {session.owner_session_ref}</p> : null}</details></div>
+    {children.length ? <section className="root-delegated-children" aria-label="委派子智能体">
+      <h4>委派子智能体 <small>{children.length}</small></h4>
+      <PageWindow items={children} label="子智能体分页" wrap={rows => <ul>{rows}</ul>} render={child => <li key={child.session_ref} data-child-session-ref={child.session_ref} data-child-status={stale ? "unknown" : child.status}>
+        <div><b>{child.label || "子智能体"}</b><small>{child.provider === "claude" ? "Claude" : "Codex"} · <code title={child.native_session_ref ?? child.session_ref}>{child.session_ref}</code></small></div>
+        <span>{stale ? `待核实 · 上次${childStatusLabels[child.status]}` : childStatusLabels[child.status]}</span>
+      </li>} />
+    </section> : null}
     <div className="root-session-scroll" ref={scrollRef} role="log" aria-live="off" aria-label={`${session.title} 连续工作记录`} onScroll={event => {
       const node = event.currentTarget;
       reading.scrollTop = node.scrollTop;
