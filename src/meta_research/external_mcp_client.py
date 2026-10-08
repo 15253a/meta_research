@@ -7,9 +7,10 @@ import json
 import os
 from typing import Any
 
+import httpx
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 class ExternalMcpClientError(Exception):
@@ -39,7 +40,10 @@ class ExternalMcpClient:
         except Exception as error:
             leaves = _exception_leaves(error)
             code = "unreachable"
-            if any(isinstance(item, (TimeoutError, asyncio.TimeoutError)) for item in leaves):
+            client_error = next((item for item in leaves if isinstance(item, ExternalMcpClientError)), None)
+            if client_error is not None:
+                code = client_error.code
+            elif any(isinstance(item, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException)) for item in leaves):
                 code = "timeout"
             elif any(getattr(getattr(item, "response", None), "status_code", None) in (401, 403) for item in leaves):
                 code = "authentication_failed"
@@ -60,10 +64,11 @@ class ExternalMcpClient:
                     stderr = stack.enter_context(open(os.devnull, "w"))
                     streams = await stack.enter_async_context(stdio_client(parameters, errlog=stderr))
                 else:
-                    streams = await stack.enter_async_context(streamablehttp_client(
-                        connection["url"], headers=connection.get("headers", {}),
-                        timeout=timedelta(seconds=self.timeout_seconds),
-                        sse_read_timeout=timedelta(seconds=self.timeout_seconds),
+                    http_client = await stack.enter_async_context(httpx.AsyncClient(
+                        headers=connection.get("headers", {}), timeout=self.timeout_seconds,
+                    ))
+                    streams = await stack.enter_async_context(streamable_http_client(
+                        connection["url"], http_client=http_client,
                     ))
                 session = await stack.enter_async_context(ClientSession(
                     streams[0], streams[1], read_timeout_seconds=timedelta(seconds=self.timeout_seconds),

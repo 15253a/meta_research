@@ -14,6 +14,8 @@ from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, ValidationError, SchemaError
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 
 from meta_research.external_mcp_client import ExternalMcpClient, ExternalMcpClientError
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -337,6 +339,8 @@ class ExternalMcpRuntime:
                 if not isinstance(tool["name"], str) or not tool["name"]:
                     raise ValueError
                 Draft202012Validator.check_schema(tool["inputSchema"])
+                if "outputSchema" in tool:
+                    Draft202012Validator.check_schema(tool["outputSchema"])
         except (SchemaError, ValueError, KeyError, TypeError) as error:
             raise ExternalMcpClientError("invalid_catalog") from error
 
@@ -402,15 +406,15 @@ class ExternalMcpRuntime:
             frozen, tool = permitted
             arguments = parameters.get("arguments", {})
             try:
-                Draft202012Validator(tool["inputSchema"]).validate(arguments)
-            except ValidationError:
+                Draft202012Validator(tool["inputSchema"], registry=Registry()).validate(arguments)
+            except (ValidationError, Unresolvable):
                 return failure(-32602, "external_mcp_arguments_invalid")
             try:
                 result = self._client.call(json.loads(frozen.service.connection_json), tool["name"], arguments)
                 if not result.get("isError", False) and "outputSchema" in tool:
                     try:
-                        Draft202012Validator(tool["outputSchema"]).validate(result.get("structuredContent"))
-                    except ValidationError:
+                        Draft202012Validator(tool["outputSchema"], registry=Registry()).validate(result.get("structuredContent"))
+                    except (ValidationError, Unresolvable):
                         return failure(-32000, "external_mcp_result_invalid")
             except ExternalMcpClientError as error:
                 return failure(-32000, error.code)

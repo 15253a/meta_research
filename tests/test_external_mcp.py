@@ -5,6 +5,8 @@ import sys
 import socket
 import subprocess
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 import pytest
 
@@ -112,6 +114,67 @@ def test_connection_deadline_and_safe_failure_reason(tmp_path):
     draft["environment"]["EXTERNAL_MCP_DELAY"] = "10"
     assert runtime.test_connection(draft) == {"status": "failed", "reason_code": "timeout", "message": "Connection initialization or discovery timed out."}
     assert not (tmp_path / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("schema_case", ["invalid_input", "invalid_output"])
+def test_connection_rejects_invalid_frozen_schemas_without_business_calls(tmp_path, schema_case):
+    draft = connection(tmp_path)
+    draft["environment"]["EXTERNAL_MCP_SCHEMA_CASE"] = schema_case
+    result = ExternalMcpRuntime(tmp_path).test_connection(draft)
+    assert result["reason_code"] == "invalid_catalog"
+    assert not (tmp_path / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "response_limit"])
+def test_discovery_preserves_nested_protocol_failure_codes(tmp_path, failure):
+    draft = connection(tmp_path)
+    if failure == "duplicate":
+        draft["environment"]["EXTERNAL_MCP_DUPLICATE"] = "1"
+    runtime = ExternalMcpRuntime(tmp_path, client=ExternalMcpClient(max_bytes=64 if failure == "response_limit" else 1024 * 1024))
+    assert runtime.test_connection(draft)["reason_code"] == ("invalid_catalog" if failure == "duplicate" else "response_too_large")
+    assert not (tmp_path / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("schema_case, reason, business_calls", [
+    ("unresolvable_input", "external_mcp_arguments_invalid", 0),
+    ("unresolvable_output", "external_mcp_result_invalid", 1),
+    ("mismatched_output", "external_mcp_result_invalid", 1),
+])
+def test_frozen_schema_validation_never_fetches_remote_references(tmp_path, schema_case, reason, business_calls):
+    schema_requests = []
+
+    class SchemaHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            schema_requests.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"type":"object"}')
+
+        def log_message(self, *_args):
+            pass
+
+    schema_server = ThreadingHTTPServer(("127.0.0.1", 0), SchemaHandler)
+    server_thread = Thread(target=schema_server.serve_forever)
+    server_thread.start()
+    try:
+        runtime = ExternalMcpRuntime(tmp_path)
+        runtime.configure_endpoint("http://127.0.0.1:9999")
+        draft = service(tmp_path)
+        draft["connection"]["environment"].update(EXTERNAL_MCP_SCHEMA_CASE=schema_case,
+            EXTERNAL_MCP_SCHEMA_URL=f"http://127.0.0.1:{schema_server.server_port}/schema")
+        runtime.save_config(services=parse_services([draft]), expected_revision=runtime.read_config().revision)
+        snapshot = runtime.operation_snapshot(operation_identity=schema_case, root_kind="idea", task_prompt="read")
+        with runtime.channel(snapshot) as access:
+            response = runtime.dispatch_http(access.token, request("tools/call", name=exposed_tool_name("lab", "read_temperature"), arguments={"sensor": "A"}))[1]
+        assert response["error"]["message"] == reason
+        ledger = tmp_path / "calls.jsonl"
+        assert (len(ledger.read_text().splitlines()) if ledger.exists() else 0) == business_calls
+        assert schema_requests == []
+    finally:
+        schema_server.shutdown()
+        schema_server.server_close()
+        server_thread.join(timeout=2)
+        assert not server_thread.is_alive()
 
 
 def test_streamable_http_real_discovery_and_business_result(tmp_path):

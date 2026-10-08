@@ -39,12 +39,28 @@ async def audited_list_tools(request):
     if audit_path:
         with Path(audit_path).open("a") as stream:
             stream.write('"tools/list"\n')
+    result = await list_tools_handler(request)
+    tools = result.root.tools
+    schema_case = os.environ.get("EXTERNAL_MCP_SCHEMA_CASE")
+    for tool in tools:
+        if tool.name == "read_temperature":
+            if schema_case == "invalid_input":
+                tool.inputSchema = {"type": "not-a-json-type"}
+            elif schema_case == "invalid_output":
+                tool.outputSchema = {"type": "not-a-json-type"}
+            elif schema_case == "unresolvable_input":
+                tool.inputSchema = {"$ref": os.environ["EXTERNAL_MCP_SCHEMA_URL"]}
+            elif schema_case == "unresolvable_output":
+                tool.outputSchema = {"$ref": os.environ["EXTERNAL_MCP_SCHEMA_URL"]}
+            elif schema_case == "mismatched_output":
+                tool.outputSchema = {"type": "integer"}
     if os.environ.get("EXTERNAL_MCP_PAGINATE"):
-        tools = (await list_tools_handler(request)).root.tools
         cursor = request.params.cursor if request.params else None
         return types.ServerResult(types.ListToolsResult(tools=tools[:1] if cursor is None else tools[1:],
             nextCursor="next-page" if cursor is None else None))
-    return await list_tools_handler(request)
+    if os.environ.get("EXTERNAL_MCP_DUPLICATE"):
+        result.root.tools.append(tools[0])
+    return result
 
 
 server._mcp_server.request_handlers[types.ListToolsRequest] = audited_list_tools
