@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchQuestRuntimeConditions, fetchQuestRuntimeDevices, ProductError, saveQuestRuntimeConditions, type QuestRuntimeConditions, type ResearchStyle } from "./api";
 import { RESEARCH_STYLES, researchStyleLabel } from "./researchStyle";
+import { ExternalMcpSettings } from "./ExternalMcpSettings";
 import {
   isConditionsObject, mergeRuntimeConditionDevices, parseRuntimeConditions, replaceRuntimeConditionsJson,
   runtimeConditionDeviceIds, runtimeConditionDevices, updateRuntimeConditionDevices,
@@ -15,10 +16,10 @@ const MAX_CONDITIONS_LENGTH = 24000;
 export function RuntimeConditions({ questRef, questionRef = null, disabled = false }: {
   questRef: string | null; questionRef?: string | null; disabled?: boolean;
 }) {
-  return questRef ? <RuntimeConditionsEntry key={questRef} questRef={questRef} questionRef={questionRef} disabled={disabled} /> : null;
+  return <RuntimeConditionsEntry key={questRef ?? "pre-quest"} questRef={questRef} questionRef={questionRef} disabled={disabled} />;
 }
 
-function RuntimeConditionsEntry({ questRef, questionRef, disabled }: { questRef: string; questionRef: string | null; disabled: boolean }) {
+function RuntimeConditionsEntry({ questRef, questionRef, disabled }: { questRef: string | null; questionRef: string | null; disabled: boolean }) {
   const [open, setOpen] = useState(false);
   const opener = useRef<HTMLButtonElement>(null);
   const close = () => {
@@ -32,7 +33,7 @@ function RuntimeConditionsEntry({ questRef, questionRef, disabled }: { questRef:
   </>;
 }
 
-function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef: string; questionRef: string | null; onClose: () => void }) {
+function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef: string | null; questionRef: string | null; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const alive = useRef(false);
   const [basis, setBasis] = useState<QuestRuntimeConditions | null>(null);
@@ -92,6 +93,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   }, []);
 
   useEffect(() => {
+    if (!questRef) { setLoading(false); return; }
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 15_000);
     let current = true;
@@ -117,6 +119,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   }, [questRef, attempt]);
 
   useEffect(() => {
+    if (!questRef) return;
     if (!questionRef) {
       setDevicesLoading(false);
       setDevicesError("暂时无法读取完整设备清单，当前已选设备仍保留。请稍后重新打开。");
@@ -139,7 +142,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   }, [questRef, questionRef, attempt]);
 
   const save = async () => {
-    if (!basis || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH) return;
+    if (!questRef || !basis || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH) return;
     setSaving(true);
     setSaved(false);
     setError(null);
@@ -166,7 +169,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
 
   return <dialog ref={dialog} className="runtime-conditions-dialog" aria-labelledby="runtime-conditions-title"
     onCancel={event => { event.preventDefault(); onClose(); }}>
-    <form onSubmit={event => { event.preventDefault(); void save(); }}>
+    {questRef ? <form onSubmit={event => { event.preventDefault(); void save(); }}>
       <header><h2 id="runtime-conditions-title">运行条件</h2><button type="button" aria-label="关闭运行条件" onClick={onClose}>×</button></header>
       <p id="runtime-conditions-help">保存后用于后续新调用，不改变正在进行的调用或已保存的研究成果。</p>
       {loading ? <p role="status">正在读取运行条件…</p> : null}
@@ -232,7 +235,8 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
         {!basis && !loading ? <button type="button" onClick={() => setAttempt(value => value + 1)}>重新读取</button> : null}
         <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || (text === basis.text && researchStyle === (basis.research_style ?? "balanced"))}>
           {saving ? "正在保存…" : "保存运行条件"}</button></footer>
-    </form>
+    </form> : <header className="runtime-conditions-pre-quest"><h2 id="runtime-conditions-title">运行条件</h2><button type="button" aria-label="关闭运行条件" onClick={onClose}>×</button></header>}
+    <ExternalMcpSettings />
   </dialog>;
 }
 

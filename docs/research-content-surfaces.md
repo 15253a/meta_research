@@ -21,6 +21,7 @@
 - 环境与现实资源：`environments.page/read/register/reference`；数字说明使用返回的精确 `content.read` 引用，现实资源保留身份、来源、条件和用途。
 - 文献：`research_memory.literature.page` 发现同一原文及不同问题的阅读判断；按返回 reader 阅读精确内容。阶段冻结文献仍用 `stage_context.read` source=literature_records。
 - 人类输入：`human_request.read`。
+- 人从运行服务器提交的轻量工作资料：`research_workspace.materials.discover/read`；创建消费者使用 HC 的精确 context reader。来源、接收身份、未读范围与后续消费者边界见[服务器工作资料引用合同](server-work-materials.md)。
 - 实施与结果层次：`target_formal_results.read` / `formal_results.read`（裸 ref 反查）。
 - 归类纠正：`artifact_roles.adjust`（移动当前归属并留理由，内容版本与回执不变）。
 

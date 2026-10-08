@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from meta_research.runtime_resources import (
+    HostResourceProbe, RuntimeResourceReader, SystemHostResourceProbe,
+)
+
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -136,6 +140,7 @@ from meta_research.writing_renderer import WritingRendererRegistry
 from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 from meta_research.root_workspace import RootWorkspaces
+from meta_research.external_mcp import ExternalMcpRuntime
 
 
 @dataclass(frozen=True)
@@ -272,6 +277,7 @@ class ProductionRuntime:
     deepfetch: FirstQuestionDeepFetchWorker
     writing: WritingReportService
     harnesses: HarnessRuntime
+    external_mcp: ExternalMcpRuntime
     root_workspaces: RootWorkspaces
     target_run_authorities: TargetRunAuthorities
     target_run_runtime: TargetRunRuntime
@@ -287,8 +293,10 @@ class ProductionRuntime:
     _resident_mcp_providers: tuple[object, ...] = ()
     _stop_requested: bool = False
     timeline_summaries: object | None = None
+    resources: RuntimeResourceReader | None = None
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
+        self.external_mcp.configure_endpoint(base_url)
         for provider in self._resident_mcp_providers:
             configure = getattr(
                 provider, "configure_resident_mcp_endpoint", None
@@ -504,8 +512,10 @@ class ProductionRuntime:
             self.request_stop()
         finally:
             try:
+                self.external_mcp.close()
                 self.runtime_protection.close()
             finally:
+                self.root_workspaces.server_files.close()
                 self._database.close()
 
 
@@ -521,6 +531,7 @@ def build_production_runtime(
     proposal_drafter: ProposalDrafter | None = None,
     intent_drafting_provider: IntentDraftingProvider | None = None,
     host_compute_probe: HostComputeProbe | None = None,
+    host_resource_probe: HostResourceProbe | None = None,
     idea_skill_provider: IdeaSkillProvider | None = None,
     plan_skill_provider: PlanSkillProvider | None = None,
     bundle_skill_provider: BundleSkillProvider | None = None,
@@ -1168,7 +1179,16 @@ def build_production_runtime(
             provider is lifecycle for lifecycle in provider_lifecycles
         ):
             provider_lifecycles.append(provider)
+    external_mcp = ExternalMcpRuntime(data_root.root)
+    external_mcp.bind_scope_authority(harnesses)
+    for provider in (intent_drafting_provider, idea_skill_provider, plan_skill_provider,
+        bundle_skill_provider, reasoning_skill_provider, deepfetch_provider, acquisition_provider, writing_skill_provider):
+        bind_external = getattr(provider, "bind_external_mcp", None)
+        if callable(bind_external):
+            bind_external(external_mcp)
+    harnesses.bind_external_mcp(external_mcp)
     runtime = ProductionRuntime(
+        external_mcp=external_mcp,
         data_root=data_root,
         owners=owners,
         authentication=Authentication(database),
@@ -1206,6 +1226,7 @@ def build_production_runtime(
         ),
         _provider_lifecycles=tuple(provider_lifecycles),
         _resident_mcp_providers=tuple(resident_mcp_providers),
+        resources=RuntimeResourceReader(host_resource_probe or SystemHostResourceProbe(), host_compute_probe),
     )
     runtime.reconcile_telemetry_authorization()
     from meta_research.timeline_summaries import create_timeline_summary_service

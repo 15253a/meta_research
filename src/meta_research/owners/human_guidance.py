@@ -18,11 +18,24 @@ from meta_research.owners.human_collaboration_ladder import guidance_binding_fro
 class HumanGuidanceMixin:
     def submit_human_guidance(
         self, *, quest_ref: str, original_text: str, strength: int = 3,
-        idempotency_key: str,
+        idempotency_key: str, work_materials=None,
     ) -> dict[str, object]:
+        commit = None
+        if work_materials is not None:
+            from meta_research.work_materials import MaterialSubmission
+            submission = MaterialSubmission.parse(work_materials)
+            if submission.receiver.get("kind") != "current" or submission.receiver.get("quest_ref") != quest_ref:
+                raise OwnerConflict("material_receiver_invalid")
+            with self._database.read() as connection:
+                replay = self._material_replay(connection, idempotency_key, work_materials)
+            if replay is None:
+                self._prepare_material_submission(work_materials)
+            def commit(connection, constraint_ref):
+                self._insert_material_submission(connection, command=work_materials, key=idempotency_key,
+                    anchor_kind="guidance", anchor_ref=constraint_ref)
         return self._collaboration_ladder.submit_human_guidance(
             quest_ref=quest_ref, original_text=original_text, strength=strength,
-            idempotency_key=idempotency_key,
+            idempotency_key=idempotency_key, work_materials=work_materials, material_committer=commit,
         )
 
     def freeze_operation_guidance(

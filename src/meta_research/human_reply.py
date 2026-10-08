@@ -18,10 +18,15 @@ class LinkedLocal:
 
 
 @dataclass(frozen=True)
+class ServerReference:
+    selection: dict[str, object]
+
+
+@dataclass(frozen=True)
 class ProvidedReply:
     note: str
     facts: dict[str, object]
-    materials: tuple[Upload | LinkedLocal, ...] = ()
+    materials: tuple[Upload | LinkedLocal | ServerReference, ...] = ()
     decision: Literal["provided"] = "provided"
 
 

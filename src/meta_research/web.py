@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.external_mcp import ExternalMcpError, parse_connection, parse_services
+
 from meta_research.snapshot_queries import SnapshotQueryCoordinator
 
 import asyncio
@@ -206,6 +208,23 @@ class QuestDraftV2Request(BaseModel):
     )
     background_and_initial_direction: str = Field(default="", max_length=12000)
     material_manifest: dict[str, object] | None = None
+
+
+class ServerSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    server: dict[str, object]
+    absolute_path: str = Field(min_length=1, max_length=16000)
+    kind: Literal["file", "directory"]
+    description: str = Field(default="", max_length=4000)
+    observation: dict[str, object]
+    availability: Literal["available"]
+
+
+class WorkMaterialSubmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    receiver: dict[str, object]
+    selections: list[ServerSelectionRequest] = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=4000)
 
 
 class CreationMaterialFileRequest(BaseModel):
@@ -518,15 +537,21 @@ class HumanReplyLinkedRequest(BaseModel):
     description: str = Field(min_length=1, max_length=4000)
 
 
+class HumanReplyServerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["server_reference"]
+    selection: ServerSelectionRequest
+
+
 class HumanRequestResponseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["provided", "declined", "deferred"]
     facts: dict[str, object] = Field(default_factory=dict)
     note: str = Field(default="", max_length=4000)
-    materials: list[HumanReplyUploadRequest | HumanReplyLinkedRequest] = Field(default_factory=list, max_length=100)
+    materials: list[HumanReplyUploadRequest | HumanReplyLinkedRequest | HumanReplyServerRequest] = Field(default_factory=list, max_length=100)
 
     def as_reply(self):
-        from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload
+        from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload, ServerReference
         from meta_research.root_workspace import _relative_parts
         from meta_research.semantic_mcp import SemanticMcpError
         if self.decision != "provided":
@@ -540,7 +565,9 @@ class HumanRequestResponseRequest(BaseModel):
             raise OwnerConflict("human_response_material_too_large")
         materials = []
         for item in self.materials:
-            if isinstance(item, HumanReplyLinkedRequest):
+            if isinstance(item, HumanReplyServerRequest):
+                materials.append(ServerReference(item.selection.model_dump()))
+            elif isinstance(item, HumanReplyLinkedRequest):
                 materials.append(LinkedLocal(item.locator, item.description))
             else:
                 try:
@@ -565,6 +592,7 @@ class HumanGuidanceSubmissionRequest(BaseModel):
     scope_ref: str = Field(min_length=1, max_length=128)
     text: str = Field(min_length=1, max_length=65536)
     strength: int = Field(default=3, ge=1, le=5, strict=True)
+    work_materials: WorkMaterialSubmissionRequest | None = None
 
 
 class GuidanceProposalConversionRequest(BaseModel):
@@ -786,6 +814,7 @@ class ResearchInputRequest(BaseModel):
     question_ref: str | None = Field(default=None,min_length=1,max_length=128)
     text: str = Field(min_length=1,max_length=65536)
     asset_bindings: list[dict[str,object]] = Field(default_factory=list,max_length=256)
+    work_materials: WorkMaterialSubmissionRequest | None = None
 
 
 class OutputLanguagePreference(BaseModel):
@@ -877,6 +906,13 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    @app.get("/api/v1/runtime/resources")
+    def runtime_resources() -> dict[str, object]:
+        if runtime.resources is None:
+            raise HTTPException(status_code=503, detail="host_resource_probe_unavailable")
+        return runtime.resources.query()
+
     web_root = Path(str(files("meta_research") / "web_dist")).resolve()
     expected_host = urlsplit(base_url).netloc
     base_url_host = urlsplit(base_url).hostname
@@ -988,7 +1024,7 @@ def create_app(
             "/auth/launch",
         }
         internal_route = path.startswith("/internal/")
-        mcp_route = path == "/mcp"
+        mcp_route = path in {"/mcp", "/mcp/external"}
         issued_session: AuthSession | None = None
         session_was_valid = False
 
@@ -1318,6 +1354,46 @@ def create_app(
         _set_session_cookie(response, session)
         return response
 
+    @app.get("/api/v1/external-mcp")
+    def get_external_mcp():
+        return runtime.external_mcp.read_config().as_dict()
+
+    @app.put("/api/v1/external-mcp")
+    async def put_external_mcp(request: Request):
+        try:
+            value = await request.json()
+            if not isinstance(value, dict) or set(value) != {"services", "expected_revision"} or not isinstance(value["expected_revision"], str):
+                raise ExternalMcpError("external_mcp_config_invalid")
+            services = parse_services(value["services"])
+            saved = await asyncio.to_thread(runtime.external_mcp.save_config, services=services, expected_revision=value["expected_revision"])
+            return saved.as_dict()
+        except (ExternalMcpError, ValueError) as error:
+            code = str(getattr(error, "code", "external_mcp_config_invalid"))
+            return _error(409 if code == "external_mcp_config_stale" else 422, code)
+
+    @app.post("/api/v1/external-mcp/test-connection")
+    async def test_external_mcp_connection(request: Request):
+        try:
+            value = await request.json()
+            if not isinstance(value, dict) or set(value) != {"connection"}:
+                raise ExternalMcpError("external_mcp_connection_invalid")
+            connection = parse_connection(value["connection"])
+        except (ExternalMcpError, ValueError) as error:
+            return _error(422, str(getattr(error, "code", "external_mcp_connection_invalid")))
+        return await asyncio.to_thread(runtime.external_mcp.test_connection, connection)
+
+    @app.post("/mcp/external")
+    async def external_mcp(request: Request) -> Response:
+        authorization = request.headers.get("authorization", "")
+        token = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else None
+        try:
+            message = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            message = None
+        status, payload, session_id = await asyncio.to_thread(runtime.external_mcp.dispatch_http, token, message)
+        headers = {"Mcp-Session-Id": session_id} if session_id else None
+        return Response(status_code=status, headers=headers) if payload is None else JSONResponse(payload, status_code=status, headers=headers)
+
     @app.post("/mcp")
     async def semantic_mcp(request: Request) -> Response:
         authorization = request.headers.get("authorization", "")
@@ -1629,6 +1705,7 @@ def create_app(
         return runtime.owners.human_collaboration.submit_human_guidance(
             quest_ref=scope.removeprefix("quest:"), original_text=submission.text,
             strength=submission.strength, idempotency_key=_idempotency_key(request),
+            work_materials=submission.work_materials.model_dump() if submission.work_materials is not None else None,
         )
 
     @app.post("/api/v1/human-collaboration/agent-proposals", status_code=201)
@@ -1819,6 +1896,19 @@ def create_app(
                 raise OwnerConflict("telemetry_provider_unavailable") from error
         return recorded
 
+    @app.get("/api/v1/server-materials/browse")
+    def browse_server_materials(request: Request, path: str = "/", cursor: str | None = None, limit: int = 50):
+        return runtime.root_workspaces.server_files.browse(
+            actor=request.state.session_token, path=path, cursor=cursor, limit=limit)
+
+    @app.get("/api/v1/server-materials/inspect")
+    def inspect_server_material(request: Request, path: str, description: str = ""):
+        return runtime.root_workspaces.server_files.inspect(path, description=description)
+
+    @app.delete("/api/v1/server-materials/cursors/{cursor}")
+    def cancel_server_material_cursor(request: Request, cursor: str):
+        return runtime.root_workspaces.server_files.cancel(actor=request.state.session_token, cursor=cursor)
+
     @app.post("/api/v1/quest-initializations", status_code=201)
     async def create_quest_initialization(
         request: Request,
@@ -1859,6 +1949,42 @@ def create_app(
         return await _await_bounded_asset_io(
             lambda: runtime.owners.human_collaboration.deliver_initialization_materials(initialization_id, delivery.model_dump(), _idempotency_key(request)),
             slots=asset_io_slots, timeout_code="quest_material_io_timeout")
+
+    @app.post("/api/v1/quest-initializations/{initialization_id}/material-references", status_code=201)
+    def register_creation_materials(initialization_id: str, request: Request, submission: WorkMaterialSubmissionRequest):
+        return runtime.owners.human_collaboration.register_work_materials(anchor_kind="creation", anchor_ref=initialization_id,
+            command=submission.model_dump(), idempotency_key=_idempotency_key(request))
+
+    @app.post("/api/v1/manual-question-creations/{context_ref}/material-references", status_code=201)
+    def register_manual_materials(context_ref: str, request: Request, submission: WorkMaterialSubmissionRequest):
+        return runtime.owners.human_collaboration.register_work_materials(anchor_kind="manual", anchor_ref=context_ref,
+            command=submission.model_dump(), idempotency_key=_idempotency_key(request))
+
+    @app.get("/api/v1/work-materials/receiver")
+    def current_material_receiver(quest_ref: str, question_ref: str | None = None):
+        return runtime.owners.human_collaboration.current_material_receiver(quest_ref, question_ref)
+
+    @app.get("/api/v1/quest-initializations/{initialization_id}/material-receiver")
+    def creation_material_receiver(initialization_id: str):
+        return runtime.owners.human_collaboration.material_receiver("creation", initialization_id)
+
+    @app.get("/api/v1/manual-question-creations/{context_ref}/material-receiver")
+    def manual_material_receiver(context_ref: str):
+        return runtime.owners.human_collaboration.material_receiver("manual", context_ref)
+
+    @app.get("/api/v1/work-materials/{reference_ref}")
+    def query_work_material(reference_ref: str):
+        return runtime.owners.human_collaboration.query_work_material(reference_ref)
+
+    @app.get("/api/v1/work-materials/{reference_ref}/discover")
+    def discover_work_material(reference_ref: str, request: Request, path: str = "", cursor: str | None = None, limit: int = 50):
+        return runtime.owners.human_collaboration.discover_work_materials(reference_ref=reference_ref, actor=request.state.session_token,
+            path=path, cursor=cursor, limit=limit)
+
+    @app.get("/api/v1/work-materials/{reference_ref}/read")
+    def read_work_material(reference_ref: str, request: Request, observation_ref: str, path: str = "", offset: int = 0, max_bytes: int = 65536):
+        return runtime.owners.human_collaboration.read_work_material(reference_ref=reference_ref, actor=request.state.session_token,
+            path=path, observation_ref=observation_ref, offset=offset, max_bytes=max_bytes)
 
     @app.post("/api/v1/quest-initializations/{initialization_id}/material-paths")
     async def deliver_creation_path(initialization_id: str, request: Request, delivery: CreationMaterialPathRequest):
@@ -2245,12 +2371,20 @@ def create_app(
     @app.post("/api/v1/research-inputs",status_code=201)
     def submit_research_input(request: Request, research_input: ResearchInputRequest) -> dict[str, object]:
         payload = research_input.model_dump()
-        if set(payload)-{"quest_ref","question_ref","text","asset_bindings"}:
+        if set(payload)-{"quest_ref","question_ref","text","asset_bindings","work_materials"}:
             raise OwnerConflict("human_input_invalid")
         return runtime.owners.human_collaboration.submit_research_input(
             quest_ref=payload.get("quest_ref"),question_ref=payload.get("question_ref"),
             text_content=payload.get("text"),asset_bindings=payload.get("asset_bindings",[]),
+            work_materials=payload.get("work_materials"),
             idempotency_key=_idempotency_key(request))
+
+    @app.get("/api/v1/research-inputs/{input_ref}")
+    def query_research_input(input_ref: str, quest_ref: str):
+        value = runtime.owners.human_collaboration.query_research_input(input_ref, quest_ref=quest_ref)
+        if value is None:
+            raise OwnerConflict("human_input_not_found")
+        return value
 
     @app.get("/api/v1/research-formal")
     def read_research_formal(quest_ref: str,ref: str) -> dict[str,object]:

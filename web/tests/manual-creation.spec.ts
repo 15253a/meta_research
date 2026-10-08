@@ -1,4 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { selectServerMaterial } from "./support/server-material-selection.js";
 
 import {
   DeterministicProduct,
@@ -25,6 +28,7 @@ type ManualRawView = {
       accepted_material_bindings: Array<Record<string, unknown>>;
     };
   };
+  work_materials: Array<{ references: Array<{ read_state: string }> }>;
   question_anchor: null | {
     question_ref: string;
     parent_question_ref: string;
@@ -141,7 +145,7 @@ test("QuestionTree preserves the fixed canvas and Manual close-only boundaries",
   expect(cancelRequests).toBe(0);
 });
 
-test("ManualCreation intakes real material before Seed and reloads the completed child", async ({
+test("ManualCreation saves an unread reference before Seed and reloads the completed child", async ({
   page,
 }) => {
   if (!product) throw new Error("deterministic product missing");
@@ -176,12 +180,6 @@ test("ManualCreation intakes real material before Seed and reloads the completed
   await dialog.getByLabel("适用范围与排除项，可选", { exact: true }).fill(
     "适用于低照度显微图像；排除合成对象。",
   );
-  await dialog.locator("#manual-material-files").setInputFiles({
-    name: "manual-evidence.md",
-    mimeType: "text/markdown",
-    buffer: Buffer.from("# exact browser material\nrare morphology evidence\n"),
-  });
-
   const commandOrder: string[] = [];
   let projectionStreamCount = 0;
   let seedRequest: unknown;
@@ -190,8 +188,8 @@ test("ManualCreation intakes real material before Seed and reloads the completed
     if (request.method() === "GET" && path === "/api/v1/events") {
       projectionStreamCount += 1;
     }
-    if (request.method() === "POST" && path === "/api/v1/research-assets/intakes") {
-      commandOrder.push("asset-intake");
+    if (request.method() === "POST" && path.endsWith("/material-references")) {
+      commandOrder.push("material-reference");
     }
     if (request.method() === "POST" && path.endsWith("/seed-confirmation")) {
       commandOrder.push("seed-confirmation");
@@ -205,38 +203,29 @@ test("ManualCreation intakes real material before Seed and reloads the completed
     }
   });
 
+  const source = resolve(dirname(fileURLToPath(import.meta.url)), "../../src/meta_research/skills/deepfetch_v4/references");
+  await selectServerMaterial(page, dialog.locator(".manual-material-card"), source, "Manual pre-Seed original directory.");
+  await dialog.getByRole("button", { name: "保存材料引用到创建上下文", exact: true }).click();
+  await expect(dialog.locator(".manual-material-card")).toContainText("已保存，尚未读取");
+
   await dialog.getByRole("button", {
     name: "确认当前 Seed，开始讨论",
   }).click();
   await expect(dialog.getByText("CreationSeed 已冻结", { exact: true })).toBeVisible();
-  expect(commandOrder.slice(0, 2)).toEqual(["asset-intake", "seed-confirmation"]);
+  expect(commandOrder.slice(0, 2)).toEqual(["material-reference", "seed-confirmation"]);
   const seed = (seedRequest as {
     seed: { accepted_material_bindings: Array<Record<string, unknown>> };
   }).seed;
-  expect(seed.accepted_material_bindings).toHaveLength(1);
-  const binding = seed.accepted_material_bindings[0];
-  expect(Object.keys(binding).sort()).toEqual([
-    "asset_ref",
-    "content_hash",
-    "manifest_hash",
-    "receipt",
-    "version_ref",
-  ]);
-  expect(Object.keys(binding.receipt as Record<string, unknown>).sort()).toEqual([
-    "issuer",
-    "kind",
-    "payload_hash",
-    "receipt_ref",
-    "status",
-    "subject_ref",
-  ]);
+  expect(seed.accepted_material_bindings).toHaveLength(0);
 
   const currentResponse = await page.request.get(
     `${product.baseUrl}/api/v1/manual-question-creations/current?quest_ref=${encodeURIComponent(root.quest_ref)}&parent_question_ref=${encodeURIComponent(root.question_ref)}`,
   );
   expect(currentResponse.ok()).toBeTruthy();
   const current = await currentResponse.json() as ManualRawView;
-  expect(current.seed?.value.accepted_material_bindings).toHaveLength(1);
+  expect(current.seed?.value.accepted_material_bindings).toHaveLength(0);
+  expect(current.work_materials).toHaveLength(1);
+  expect(current.work_materials[0].references[0].read_state).toBe("not_read");
 
   await dialog.getByRole("button", {
     name: "确认本次不运行 DeepFetch",

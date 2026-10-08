@@ -1,3 +1,4 @@
+import type { ServerMaterialSelection, WorkMaterialReceipt } from "./workMaterialApi";
 import type {
   ManualCreationAcceptedMaterialBindingView,
   ManualCreationDraftingTurn,
@@ -510,6 +511,7 @@ export type QuestCapability =
   | Omit<UnavailableCapability, "capability">;
 
 export type QuestCreationView = {
+  work_materials?: WorkMaterialReceipt[];
   initialization_id: string;
   creation_basis?: CreationResearchBasis | null;
   creation_context: "quest_initialization";
@@ -792,6 +794,7 @@ export type ManualRawReceiptState =
     };
 
 export type ManualQuestionCreationRawView = {
+  work_materials?: WorkMaterialReceipt[];
   schema_ref: "meta-research/manual-question-creation/v1";
   context_ref: string;
   creation_mode: "ManualCreation";
@@ -2142,6 +2145,7 @@ export function adaptManualQuestionCreation(
 
   return {
     creation_id: raw.context_ref,
+    work_materials: raw.work_materials ?? [],
     status: adaptManualStatus(raw.status),
     quest_ref: raw.quest_ref,
     quest_title: labels.quest_title ?? null,
@@ -2268,6 +2272,7 @@ export type GuidanceDelivery = {
 };
 
 export type CompanionSoftConstraint = {
+  work_materials?: WorkMaterialReceipt[];
   strength?: GuidanceStrength;
   deliveries?: GuidanceDelivery[];
 
@@ -2397,7 +2402,8 @@ export type HumanRequestItem = {
 
 export type HumanReplyMaterial =
   | { kind: "upload"; relative_path: string; media_type: string; content_base64: string }
-  | { kind: "linked_local"; locator: string; description: string };
+  | { kind: "linked_local"; locator: string; description: string }
+  | { kind: "server_reference"; selection: ServerMaterialSelection };
 
 type SealedRecoveryPayload = {
   algorithm: "AES-GCM";
@@ -2645,6 +2651,7 @@ export class ProductError extends Error {
   constructor(
     public readonly code: string,
     public readonly details?: Record<string, unknown>,
+    public readonly httpStatus?: number,
   ) {
     super(code);
   }
@@ -3461,6 +3468,12 @@ export function pendingHumanRequestResponse(
   return readPendingHumanRequestResponse(requestRef);
 }
 
+export async function pendingHumanRequestResponsePreview(requestRef: string): Promise<HumanRequestResponseBody | null> {
+  await hydratePendingHumanRequestRecovery();
+  const pending = readPendingHumanRequestResponse(requestRef);
+  return pending ? unsealHumanRequestResponseBody(pending.sealed_response, humanRequestResponseDeliveryBindingJson(pending)) : null;
+}
+
 export function deliverPendingHumanRequestResponse(
   requestRef: string,
 ): Promise<Record<string, unknown>> {
@@ -3567,6 +3580,15 @@ function isCorrectableHumanResponseRejection(error: unknown): boolean {
     || error.code === "human_response_linked_path_invalid"
     || error.code === "human_response_linked_path_unreadable"
     || error.code === "human_response_linked_path_changed"
+    || (error.httpStatus === 409 && [
+      "material_source_changed",
+      "material_missing",
+      "material_not_readable",
+      "material_path_invalid",
+      "material_safe_reader_unavailable",
+      "material_selection_invalid",
+      "material_unsafe",
+    ].includes(error.code))
   );
 }
 
@@ -4216,7 +4238,7 @@ async function writeJson<T>(
     } catch {
       // The status remains an actionable fallback when the daemon cannot return JSON.
     }
-    throw new ProductError(code, details);
+    throw new ProductError(code, details, response.status);
   }
   const payload = (await response.json()) as T;
   if (options?.retainPending(payload)) await options.onRetained(payload, pendingWrite);
@@ -5900,3 +5922,21 @@ export function fetchResearchContent(questRef: string, reader: ResearchContentRe
 }
 export const submitResearchInput = (quest_ref: string, question_ref: string | null, text: string) =>
   writeJson<Record<string, unknown>>("/api/v1/research-inputs", "POST", { quest_ref, question_ref, text, asset_bindings: [] });
+
+export type ExternalMcpConnection = {
+  transport: "stdio"; command: string; arguments: string[]; environment: Record<string, string>; working_directory?: string;
+} | { transport: "streamable_http"; url: string; headers: Record<string, string> };
+export type ExternalMcpService = {
+  service_id: string; name: string; connection: ExternalMcpConnection;
+  allowed_root_kinds: string[]; research_instructions: string;
+};
+export type ExternalMcpConfiguration = { revision: string; services: ExternalMcpService[]; root_kinds: string[] };
+export type ExternalMcpConnectionTest = {
+  status: "ready" | "failed"; server_name?: string; tool_count?: number; reason_code?: string;
+};
+export const fetchExternalMcp = (signal?: AbortSignal) =>
+  readResearchJson<ExternalMcpConfiguration>("/api/v1/external-mcp", signal);
+export const saveExternalMcp = (services: ExternalMcpService[], expected_revision: string) =>
+  writeJson<ExternalMcpConfiguration>("/api/v1/external-mcp", "PUT", { services, expected_revision });
+export const testExternalMcpConnection = (connection: ExternalMcpConnection) =>
+  writeJson<ExternalMcpConnectionTest>("/api/v1/external-mcp/test-connection", "POST", { connection });

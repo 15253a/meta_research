@@ -38,6 +38,7 @@ class _SequenceRunner:
         self._outputs = iter(outputs)
         self.environments: list[dict[str, str] | None] = []
         self.prompts: list[str] = []
+        self.argvs: list[list[str]] = []
 
     def __call__(
         self,
@@ -49,6 +50,7 @@ class _SequenceRunner:
         del timeout
         self.environments.append(environment)
         self.prompts.append(prompt)
+        self.argvs.append(argv)
         output_path = Path(argv[argv.index("--output-last-message") + 1])
         output_path.write_text(
             json.dumps(next(self._outputs), ensure_ascii=False),
@@ -576,7 +578,9 @@ def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(
         )
         assert completed is not None and completed["status"] == "completed"
         preflight_workspace = runtime.root_workspaces.bind_acquisition_session(session.session_ref)
-        assert runner.environments[0] == {"META_RESEARCH_PROVIDER_CWD": str(preflight_workspace.directory)}
+        assert runner.environments[0]["META_RESEARCH_PROVIDER_CWD"] == str(preflight_workspace.directory)
+        assert "META_RESEARCH_EXTERNAL_MCP_TOKEN" in runner.environments[0]
+        assert any(argument.startswith("mcp_servers.meta_research_external.url=") for argument in runner.argvs[0])
         assert "META_RESEARCH_MCP_TOKEN" not in runner.environments[0]
         assert runner.environments[1] is not None
         assert "META_RESEARCH_MCP_TOKEN" in runner.environments[1]

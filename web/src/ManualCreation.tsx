@@ -1,3 +1,5 @@
+import { useWorkMaterialDraft, WorkMaterialFields, WorkMaterialReferences } from "./WorkMaterialForm";
+import type { WorkMaterialReceipt } from "./workMaterialApi";
 import {
   useCallback,
   useEffect,
@@ -108,6 +110,7 @@ export type ManualQuestionProposalView = {
 };
 
 export type ManualQuestionCreationView = {
+  work_materials?: WorkMaterialReceipt[];
   creation_id: string;
   status:
     | "seed_draft"
@@ -426,6 +429,7 @@ export function ManualCreation({
   onConfirmProposal,
   onMaterialDraftChange,
 }: ManualCreationProps) {
+  const referenceDraft = useWorkMaterialDraft(`manual:${view.creation_id}`, `/api/v1/manual-question-creations/${encodeURIComponent(view.creation_id)}/material-receiver`);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const seedInputRef = useRef<HTMLTextAreaElement>(null);
@@ -435,8 +439,6 @@ export function ManualCreation({
   const researchActionRef = useRef<HTMLButtonElement>(null);
   const errorRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
-  const folderInputRef = useRef<HTMLInputElement>(null);
-  const filesInputRef = useRef<HTMLInputElement>(null);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
   const savePromiseRef = useRef<Promise<ManualQuestionProposalView | null> | null>(null);
@@ -588,8 +590,6 @@ export function ManualCreation({
       );
     }
     if (dialog && !dialog.open) dialog.showModal();
-    folderInputRef.current?.setAttribute("webkitdirectory", "");
-    folderInputRef.current?.setAttribute("directory", "");
 
     const openFrame = requestAnimationFrame(() => {
       setDialogOpen(true);
@@ -1061,26 +1061,6 @@ export function ManualCreation({
     setLocalFailure(null);
   };
 
-  const updateMaterials = (next: ManualCreationMaterialDraft) => {
-    setMaterialDraft(next);
-    onMaterialDraftChange?.(next);
-  };
-
-  const selectFiles = (files: FileList | null, mode: "folder" | "files") => {
-    const selected = Array.from(files ?? []);
-    if (selected.length > maxAcceptedMaterialBindings) {
-      setLocalFailure({
-        code: "accepted_material_bindings_invalid",
-        message: `一次 Seed 最多接纳 ${maxAcceptedMaterialBindings} 个材料版本。`,
-      });
-    }
-    updateMaterials({
-      mode: selected.length ? mode : "unprovided",
-      files: selected,
-      local_path: "",
-    });
-  };
-
   const toggleProposalEditor = () => {
     if (!seedConfirmed || proposalConfirmed) return;
     const next = !proposalEditing;
@@ -1274,84 +1254,13 @@ export function ManualCreation({
 
               <div className="manual-seed-start-grid">
                 <section className="manual-material-card" aria-labelledby="manual-material-title">
-                  <div className="manual-card-head">
-                    <span aria-hidden="true">⌁</span>
-                    <div>
-                      <b id="manual-material-title">提供你已有的材料</b>
-                      <p>文件、文件夹或本地路径只是待筛选输入，不冒充 RM receipt。</p>
-                    </div>
-                  </div>
-                  <div className="manual-material-actions">
-                    <button
-                      type="button"
-                      disabled={
-                        seedConfirmed || terminal || writesUnavailable || isBusy ||
-                        seedConfirmationPending
-                      }
-                      onClick={() => folderInputRef.current?.click()}
-                    >
-                      选择文件夹
-                    </button>
-                    <button
-                      type="button"
-                      disabled={
-                        seedConfirmed || terminal || writesUnavailable || isBusy ||
-                        seedConfirmationPending
-                      }
-                      onClick={() => filesInputRef.current?.click()}
-                    >
-                      选择若干文件
-                    </button>
-                  </div>
-                  <input
-                    ref={folderInputRef}
-                    className="manual-visually-hidden"
-                    type="file"
-                    multiple
-                    tabIndex={-1}
-                    aria-hidden="true"
-                    onChange={(event) => selectFiles(event.target.files, "folder")}
-                  />
-                  <input
-                    ref={filesInputRef}
-                    id="manual-material-files"
-                    className="manual-visually-hidden"
-                    type="file"
-                    multiple
-                    tabIndex={-1}
-                    aria-hidden="true"
-                    onChange={(event) => selectFiles(event.target.files, "files")}
-                  />
-                  <label className="manual-local-path">
-                    <span>或者填写本地文件夹路径 · 可选</span>
-                    <input
-                      value={materialDraft.local_path}
-                      maxLength={16_000}
-                      disabled={
-                        seedConfirmed || terminal || writesUnavailable || isBusy ||
-                        seedConfirmationPending
-                      }
-                      placeholder="例如 /data/experiments/run-07"
-                      onChange={(event) => updateMaterials({
-                        mode: event.target.value.trim() ? "path" : "unprovided",
-                        files: [],
-                        local_path: event.target.value,
-                      })}
-                    />
-                  </label>
-                  <div className="manual-material-status">
-                    {seedConfirmed
-                      ? acceptedMaterialBindings.length
-                        ? `已确认 ${acceptedMaterialBindings.length} 个 material binding · ${acceptedMaterialBindings[0].asset_ref}`
-                        : "已确认 Seed 未附 accepted material binding · unprovided"
-                      : materialDraft.mode === "folder"
-                        ? `已选择文件夹 · ${materialDraft.files.length} 个候选文件`
-                        : materialDraft.mode === "files"
-                          ? `已选择 ${materialDraft.files.length} 个候选文件`
-                          : materialDraft.mode === "path"
-                            ? `linked_local 草案 · ${materialDraft.local_path}`
-                            : "尚未提供材料 · unprovided"}
-                  </div>
+                  <div className="manual-card-head"><div><b id="manual-material-title">提供你已有的材料</b><p>保存原路径到本次创建上下文。材料提交与 Seed 确认独立。</p></div></div>
+                  <WorkMaterialFields draft={referenceDraft} disabled={terminal || writesUnavailable || isBusy || seedConfirmationPending} />
+                  <button type="button" disabled={terminal || writesUnavailable || isBusy || seedConfirmationPending || referenceDraft.busy || !!referenceDraft.pending || !referenceDraft.selection || !referenceDraft.receiver}
+                    onClick={() => { const command = referenceDraft.materialCommand(); if (command) void referenceDraft.submit(`/api/v1/manual-question-creations/${encodeURIComponent(view.creation_id)}/material-references`, command); }}>保存材料引用到创建上下文</button>
+                  <WorkMaterialReferences receipts={view.work_materials ?? []} />
+                  <p>已保存的引用尚未表示内容已解释或形成 Question。确认 Seed 不会自动接纳这些引用。</p>
+                  {acceptedMaterialBindings.length ? <p>既有材料版本绑定 · {acceptedMaterialBindings.length}</p> : null}
                 </section>
 
                 <fieldset

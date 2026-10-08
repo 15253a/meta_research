@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from meta_research.stage_context_access import stage_context_operations
 from meta_research.root_workspace import workspace_operations
+from meta_research.work_materials import material_operations
 from meta_research.environment_operations import environment_operations
 
 from collections.abc import Callable
@@ -266,6 +267,7 @@ def create_semantic_owner_gateway(
 
     operations = [
         *workspace_operations(root_workspaces),
+        *(material_operations(human_collaboration) if human_collaboration is not None else ()),
         *(
             _snapshot_operation(owner_name, query_snapshot)
             for owner_name, query_snapshot in (

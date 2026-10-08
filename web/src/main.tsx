@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { StatusHome } from "./StatusHome";
+import { HostResources } from "./HostResources";
 import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
 import { observedActiveTarget } from "./activeTargetStatus";
 import { observedTargetRetry, targetResearchFacts } from "./targetResearchFacts";
@@ -20,7 +21,6 @@ import { ResearchIcon, SpectrumStages, spectrumStage } from "./Spectrum";
 import { ResearchMotionProvider, ResearchMotionControl } from "./ResearchMotion";
 import { conversationContext, useWorkspaceStatus } from "./workspaceStatus";
 import {
-  acknowledgeAssetIntake,
   adaptManualQuestionCreation,
   cancelManualQuestionCreation,
   confirmManualCreationSeed,
@@ -28,7 +28,6 @@ import {
   confirmManualQuestionProposal,
   createHumanCommand,
   decideQuestCompletion,
-  fetchAssetIntake,
   fetchCurrentManualQuestionCreation,
   fetchLiteratureSnapshot,
   fetchManualQuestionCreation,
@@ -42,9 +41,6 @@ import {
   sendManualDraftingMessage,
   startManualCreationDeepFetch,
   startQuestCompletion,
-  submitAssetIntake,
-  type AssetIntakeRequest,
-  type AssetIntakeResult,
   type AssetReceipt,
   type AutonomousCreationView,
   type BundleStageProjection,
@@ -68,7 +64,6 @@ import {
 } from "./api";
 import {
   ManualCreation,
-  type ManualCreationMaterialDraft,
   type ManualQuestionCreationView,
 } from "./ManualCreation";
 import {
@@ -112,8 +107,6 @@ const ownerLabels: Record<string, string> = {
   human_collaboration: "人机协作",
 };
 
-const MANUAL_MAX_MATERIALS = 100;
-const MANUAL_MAX_ASSET_BYTES = 64 * 1024 * 1024;
 
 function runtimeTypedReason(reason: { code: string } | null | undefined): string {
   return reason?.code ?? "none";
@@ -249,128 +242,6 @@ async function hydrateManualResearchReceipt(
     if ((caught as Error).name === "AbortError") throw caught;
     return null;
   }
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
-  }
-  return btoa(binary);
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-}
-
-async function acceptedManualMaterialBinding(
-  initial: AssetIntakeResult,
-): Promise<ManualAcceptedMaterialBinding> {
-  let result = initial;
-  let retryCount = 0;
-  while (["queued", "processing"].includes(result.status)) {
-    await delay(Math.min(4_000, 250 * 2 ** Math.min(retryCount, 4)));
-    result = await fetchAssetIntake(result.job_ref);
-    retryCount += 1;
-  }
-
-  if (result.status === "failed") {
-    acknowledgeAssetIntake(result.job_ref);
-    throw new ProductError(result.failure?.code ?? "manual_material_intake_failed");
-  }
-  if (result.status !== "accepted" || !result.asset) {
-    acknowledgeAssetIntake(result.job_ref);
-    throw new ProductError("manual_material_intake_result_invalid");
-  }
-  if (!isAcceptedAssetReceipt(result.asset.receipt)) {
-    acknowledgeAssetIntake(result.job_ref);
-    throw new ProductError("manual_material_receipt_unavailable");
-  }
-
-  const binding: ManualAcceptedMaterialBinding = {
-    asset_ref: result.asset.asset_ref,
-    version_ref: result.asset.version_ref,
-    content_hash: result.asset.content_hash,
-    manifest_hash: result.asset.manifest_hash,
-    receipt: result.asset.receipt,
-  };
-  acknowledgeAssetIntake(result.job_ref);
-  return binding;
-}
-
-function manualMaterialDisplayName(value: string): string {
-  const name = value.trim();
-  if (!name || name.length > 512) {
-    throw new ProductError("asset_display_name_invalid");
-  }
-  return name;
-}
-
-async function intakeManualMaterials(
-  contextRef: string,
-  draft: ManualCreationMaterialDraft,
-): Promise<ManualAcceptedMaterialBinding[]> {
-  if (draft.mode === "unprovided") return [];
-
-  if (draft.mode === "path") {
-    const localPath = draft.local_path.trim();
-    const isAbsolute = localPath.startsWith("/") ||
-      /^[A-Za-z]:[\\/]/.test(localPath) ||
-      /^\\\\/.test(localPath);
-    const pathParts = localPath.replaceAll("\\", "/").split("/").filter(Boolean);
-    if (!isAbsolute || !pathParts.length || localPath.length > 16_000) {
-      throw new ProductError("asset_source_locator_absolute_required");
-    }
-    const request: AssetIntakeRequest = {
-      source_kind: "directory",
-      custody_mode: "linked_local",
-      display_name: manualMaterialDisplayName(pathParts.at(-1) ?? ""),
-      media_type: "application/x-directory",
-      source_locator: localPath,
-      asynchronous: false,
-      provenance: {
-        submitted_via: "manual_question_creation",
-        creation_context_ref: contextRef,
-        selection_mode: "path",
-      },
-    };
-    const result = await submitAssetIntake(request);
-    return [await acceptedManualMaterialBinding(result)];
-  }
-
-  const files = [...draft.files];
-  if (!files.length) throw new ProductError("manual_material_files_required");
-  if (files.length > MANUAL_MAX_MATERIALS) {
-    throw new ProductError("accepted_material_bindings_invalid");
-  }
-
-  const bindings: ManualAcceptedMaterialBinding[] = [];
-  for (const file of files) {
-    if (file.size > MANUAL_MAX_ASSET_BYTES) {
-      throw new ProductError("asset_content_too_large");
-    }
-    const relativePath = (file as File & { webkitRelativePath?: string })
-      .webkitRelativePath ?? "";
-    const request: AssetIntakeRequest = {
-      source_kind: "file",
-      custody_mode: "managed",
-      display_name: manualMaterialDisplayName(file.name),
-      media_type: file.type || "application/octet-stream",
-      content_base64: arrayBufferToBase64(await file.arrayBuffer()),
-      asynchronous: false,
-      provenance: {
-        submitted_via: "manual_question_creation",
-        creation_context_ref: contextRef,
-        selection_mode: draft.mode,
-        relative_path: relativePath || null,
-      },
-    };
-    bindings.push(
-      await acceptedManualMaterialBinding(await submitAssetIntake(request)),
-    );
-  }
-  return bindings;
 }
 
 type ShellState =
@@ -4259,7 +4130,7 @@ function WorkspaceMain({
           <BoundedDetails key={displayedTarget.target_ref} className="research-target-details" summary="查看输入、产物与交接">{() => <TargetResearchFactsView facts={displayedTargetFacts} label={displayedTarget.target_key} />}</BoundedDetails>
         </section> : null}
       </> : null}
-      {(liveContext.foreground || rootConversations.selectedRef) && !hidden ? <RootConversations model={rootConversations} connected={connected} polling={Boolean(runtimeStatus.status && !runtimeStatus.error)} targetRetry={targetRetry} /> : null}
+      {(liveContext.foreground || rootConversations.selected || rootConversations.selectedRef) && !hidden ? <RootConversations model={rootConversations} connected={connected} polling={Boolean(runtimeStatus.status && !runtimeStatus.error)} targetRetry={targetRetry} /> : null}
       <details className="research-existing-details"><summary>研究材料与阶段详情</summary>
       {showingLiveOverview && snapshot ? <p role="status">以下保留上次读取的阶段详情；当前轮次的详细结果仍在加载。</p> : null}
       <div className="lumen-lower">
@@ -5356,6 +5227,7 @@ function DetailedApp() {
           </div>
           <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
           <ResearchMotionControl />
+          <HostResources disabled={humanRequestSurfaceOpen} />
           <ForegroundResearchControlShortcut
             control={snapshot?.research_control}
             commands={snapshot?.human_collaboration?.commands.items}
@@ -5526,10 +5398,7 @@ function DetailedApp() {
             if (creation_id !== manualPanel.raw.context_ref) {
               throw new ProductError("manual_creation_context_stale");
             }
-            const acceptedBindings = await intakeManualMaterials(
-              creation_id,
-              seed.material_draft,
-            );
+            const acceptedBindings = manualPanel.raw.seed?.value.accepted_material_bindings ?? [];
             const raw = await confirmManualCreationSeed(creation_id, {
               intent: seed.intent,
               fields: seed.fields,

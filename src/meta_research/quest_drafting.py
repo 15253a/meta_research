@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -207,6 +208,26 @@ class HostComputeSnapshot:
 
 class HostComputeProbe(Protocol):
     def observe(self) -> HostComputeSnapshot: ...
+
+
+@dataclass(frozen=True)
+class HostComputeResourceDevice:
+    uuid: str
+    name: str
+    memory_total_mib: int | None
+    utilization_percent: float | None
+    memory_used_mib: int | None
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True)
+class HostComputeResourceSnapshot:
+    status: Literal["ready", "no_devices", "unavailable"]
+    observed_at: float
+    sampled_from: float
+    devices: tuple[HostComputeResourceDevice, ...]
+    adapter_kind: str = "nvidia_smi"
+    reason_code: str | None = None
 
 
 ProcessRunner = Callable[
@@ -1946,6 +1967,8 @@ def _remove_durable_job(directory: Path) -> None:
 class NvidiaSmiProbe(HostComputeProbe):
     """Read-only observation adapter for the actual NVIDIA devices on the host."""
 
+    adapter_kind = "nvidia_smi"
+
     _ARGV = [
         "nvidia-smi",
         "--query-gpu=uuid,name,memory.total",
@@ -2012,6 +2035,75 @@ class NvidiaSmiProbe(HostComputeProbe):
         return HostComputeSnapshot(
             status="ready", observed_at=observed_at, devices=devices
         )
+
+    def observe_resources(self) -> HostComputeResourceSnapshot:
+        """Sample live usage without changing the creation capacity observation."""
+        started = time.time()
+        argv = ["nvidia-smi", "--query-gpu=uuid,name,memory.total,utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits"]
+        def unavailable(reason: str, *, no_devices: bool = False) -> HostComputeResourceSnapshot:
+            return HostComputeResourceSnapshot(
+                status="no_devices" if no_devices else "unavailable", observed_at=time.time(),
+                sampled_from=started, devices=(), reason_code=reason,
+            )
+
+        try:
+            completed = self._command_runner(argv, self._timeout_seconds)
+        except FileNotFoundError:
+            return unavailable("nvidia_smi_unavailable")
+        except subprocess.TimeoutExpired:
+            return unavailable("nvidia_smi_timeout")
+        except OSError:
+            return unavailable("nvidia_smi_io_unavailable")
+        if completed.returncode != 0:
+            if completed.stdout.strip() == "No devices were found" or completed.stderr.strip() == "No devices were found":
+                return unavailable("nvidia_device_not_found", no_devices=True)
+            return unavailable("nvidia_smi_failed")
+        try:
+            devices = tuple(_parse_resource_device(line) for line in completed.stdout.splitlines())
+            if len({device.uuid for device in devices}) != len(devices):
+                raise ValueError("duplicate GPU identity")
+        except ValueError:
+            return unavailable("nvidia_smi_output_invalid")
+        if not devices:
+            return unavailable("nvidia_device_not_found", no_devices=True)
+        return HostComputeResourceSnapshot(
+            status="ready", observed_at=time.time(), sampled_from=started,
+            devices=devices,
+        )
+
+
+def _parse_resource_device(line: str) -> HostComputeResourceDevice:
+    parts = [part.strip() for part in line.split(",")]
+    if len(parts) != 5 or not parts[0].startswith("GPU-") or len(parts[0]) <= 4 or not parts[1] or any(char.isspace() for char in parts[0]):
+        raise ValueError("invalid nvidia-smi resource row")
+    reason = None
+
+    def metric(raw: str, *, integral: bool = False, maximum: float | None = None):
+        nonlocal reason
+        if raw in {"N/A", "[N/A]", "[Not Supported]", "Not Supported", ""}:
+            if reason is None:
+                reason = "gpu_metrics_unavailable"
+            return None
+        try:
+            value = int(raw) if integral else float(raw)
+            if not math.isfinite(value) or value < 0 or (maximum is not None and value > maximum):
+                raise ValueError("invalid GPU metric")
+        except ValueError:
+            reason = "gpu_metrics_invalid"
+            return None
+        return value
+
+    total = metric(parts[2], integral=True)
+    if total == 0:
+        total = None
+        reason = "gpu_metrics_invalid"
+    utilization = metric(parts[3], maximum=100)
+    used = metric(parts[4], integral=True, maximum=total)
+    return HostComputeResourceDevice(
+        uuid=parts[0], name=parts[1], memory_total_mib=total,
+        utilization_percent=utilization, memory_used_mib=used, reason_code=reason,
+    )
 
 
 def _parse_device(line: str) -> HostComputeDevice:
