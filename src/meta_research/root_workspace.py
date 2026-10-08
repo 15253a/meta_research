@@ -304,6 +304,7 @@ class RootWorkspaces:
         if (location.root_session_ref != caller.get("root_session_ref")
             or original_task_ref != caller.get("task_ref")):
             raise SemanticMcpError("workspace_destination_unbound")
+        self._ensure_directory(location.directory)
         return WorkspaceDestination(location, request["issuer"], request_ref, waiter_ref)
 
     def _visible(self, context: SemanticCallContext) -> tuple[WorkspaceLocation, ...]:
@@ -621,7 +622,7 @@ def workspace_operations(workspaces: RootWorkspaces | None) -> tuple[SemanticOpe
                 "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
              "additionalProperties": False}, {"type": "object"}),
         SemanticOperation("research_workspace.read", "research_workspace",
-            "Read at most 65536 bytes from a discovered relative working file, up to 64 MiB total. Rechecks actual work visibility and observed hash. UTF-8 or base64 content includes next_offset. Files remain pending materials.", call,
+            "Read at most 65536 bytes from a discovered working file or HumanRequest delivery.reply_reader/uploaded_readers using its workspace_ref, path and expected_sha256. Rechecks original work visibility and hash, with or without a Cycle. UTF-8 or base64 content includes next_offset. Linked locators remain at their host paths for bounded native reads. Reply delivery does not register formal assets.", call,
             {"type": "object", "properties": {"workspace_ref": {"type": "string", "maxLength": 256},
                 "path": {"type": "string", "maxLength": 1024}, "expected_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
                 "offset": {"type": "integer", "minimum": 0}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536}},

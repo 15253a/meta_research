@@ -650,6 +650,7 @@ def test_non_root_agent_external_request_round_trips_raw_business_text_and_resum
                 "disposition": "satisfied",
                 "reason_code": "human_response_accepted",
                 "accepted_evidence_refs": [],
+                "delivery": response["delivery"],
             }
             managed_after = runtime.owners.agent_runtime.query_managed_run(
                 run.run_ref

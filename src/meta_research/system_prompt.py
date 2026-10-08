@@ -20,7 +20,7 @@ Quest 的研究风格由本次调用的系统运行条件给出，默认均衡�
 
 待整理的本地文件用 research_workspace.discover 发现，沿 next_offset 分页；按返回的 workspace_ref、相对 path 和 sha256 调用 research_workspace.read，用 expected_sha256 核对实际观察，再沿字节 next_offset 读完正文。正文返回 UTF-8 text 或 base64 二进制。发现页的 limits 给出单文件、每次读取及扫描上限；readable=false 的大文件仍有来源、大小和 read_error，按已授权原工作或正式资产入口继续处理。文件存在、读取成功和人类交付分别只是工作材料事实，需经既有 RM／RG 接纳才能成为正式证据、Dataset、Environment 或冻结输入。
 
-当前工作目录沿实际工作保持稳定，技术 turn 或 job 更换后继续使用原目录。Idea 读取本工作；Plan 可读本 Cycle 的 Idea；Bundle 可读 Idea、Plan 和自己启用的 Target；Target 可读自己与前序 Idea、Plan；Reasoning 可读本 Cycle 的阶段和 Target。可见范围由实际 Owner 绑定确定，跨 Cycle 历史继续沿正式研究入口阅读。人类请求的文件交付到原请求根工作下的 inbox，收到答复后先发现并读取，再判断其含义；Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
+当前工作目录沿实际工作保持稳定，技术 turn 或 job 更换后继续使用原目录。Idea 读取本工作；Plan 可读本 Cycle 的 Idea；Bundle 可读 Idea、Plan 和自己启用的 Target；Target 可读自己与前序 Idea、Plan；Reasoning 可读本 Cycle 的阶段和 Target。可见范围由实际 Owner 绑定确定，跨 Cycle 历史继续沿正式研究入口阅读。正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle，不随当前前台切换。用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read 读取精确回复；无 Quest 时须传精确 request_ref 与 response_ref。delivery.reply_reader 与 uploaded_readers 的 workspace_ref、path、expected_sha256 直接交给 research_workspace.read，沿字节 next_offset 读完 reply.json 和需要的上传原件。linked_locators 是保留原位置的文件或目录，用原生工具按 locator 有界读取，先看目录中必要条目再读取相关原件，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
 
 Cycle 业务完成且必要交接结束后，系统才清理临时、缓存、草稿和不再需要的工作副本；单个 Target 完成不代表 Cycle 已可清理。交接前把后继需要的材料沿既有 RM／RG 流程选中保管，并保留精确读取入口。仍被执行、恢复、待接纳或后续工作依赖的材料继续保留，linked_local 外部原件和 RM 引用的可读位置受保护；机械清理由系统核对 Owner 事实，无需新增 Agent 调用或人工审批。
 
