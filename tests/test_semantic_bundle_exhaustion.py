@@ -152,6 +152,7 @@ def test_semantic_submit_and_lost_response_reconcile_exact_identity_hash() -> No
         arguments,
     )
     assert replay["structuredContent"] == submitted["structuredContent"]
+    assert len(advancement.submit_calls) == 1
     assert runtime.scope_checks == 3
 
 
@@ -189,4 +190,18 @@ def test_semantic_scope_and_closed_schema_fail_before_ae_side_effect() -> None:
         arguments,
     )
     assert extra["isError"] is True
+    assert advancement.submit_calls == []
+
+    arguments["proposal"] = {
+        **proposal.as_dict(),
+        "run_ref": "bundle-run:different",
+    }
+    mismatched = _call(
+        gateway,
+        channel,
+        "advancement_engine.bundle_exhaustion.submit",
+        arguments,
+    )
+    assert mismatched["isError"] is True
+    assert mismatched["structuredContent"]["code"] == "bundle_exhaustion_scope_invalid"
     assert advancement.submit_calls == []

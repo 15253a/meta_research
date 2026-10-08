@@ -4,6 +4,8 @@ from dataclasses import replace
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from meta_research.bundle_protocol import (
     BundleInboxBatch,
     ContentBindingProof,
@@ -19,7 +21,6 @@ from meta_research.owners.common import (
     OwnerSnapshot,
     canonical_hash,
 )
-from meta_research.owners.research_graph import AcceptedReuseEligibility
 from meta_research.owners.research_memory import (
     AcceptedImplementationRevisionContent,
 )
@@ -194,8 +195,6 @@ class _FakeResearchMemory:
 class _FakeResearchGraph:
     def __init__(self) -> None:
         self.launch_queries = 0
-        self.eligibility = None
-        self.eligibility_verifications = []
 
     def query_snapshot(self) -> OwnerSnapshot:
         return _snapshot("research_graph")
@@ -203,34 +202,6 @@ class _FakeResearchGraph:
     def query_target_launch_request(self, target_ref: str) -> TargetLaunchRequest:
         self.launch_queries += 1
         return _launch_request(target_ref)
-
-    def query_reuse_eligibility(self, eligibility_ref: str):
-        if (
-            self.eligibility is None
-            or self.eligibility.eligibility_ref != eligibility_ref
-        ):
-            return None
-        return self.eligibility
-
-    def verify_reuse_eligibility(self, **values) -> None:
-        self.eligibility_verifications.append(values)
-        accepted = self.eligibility
-        if accepted is None or (
-            values["tier"] != accepted.tier
-            or values["source_ref"] != accepted.source_ref
-            or values["exact_version_ref"] != accepted.exact_version_ref
-            or values["implementation_revision_ref"]
-            != accepted.implementation_revision_ref
-            or values["implementation_content_hash_ref"]
-            != accepted.implementation_content_hash_ref
-            or values["eligibility_anchor_ref"] != accepted.target_commit_ref
-            or values["eligibility_ref"] != accepted.eligibility_ref
-            or values["eligibility_content_hash_ref"] != accepted.payload_hash
-            or values["receipt_ref"] != accepted.receipt.receipt_ref
-            or values["receipt_subject_ref"] != accepted.receipt.subject_ref
-        ):
-            raise OwnerConflict("reuse_eligibility_receipt_invalid")
-
 
 class _FakeAgentRuntime:
     def __init__(self) -> None:
@@ -440,35 +411,100 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
     assert status == 200
     assert response is not None
 
-    def assert_closed(schema: dict[str, object]) -> None:
+    def assert_closed(schema: dict[str, object], opaque_paths=(), path=()) -> None:
+        if path in opaque_paths:
+            assert schema["type"] == "object"
+            return
         if schema["type"] == "object":
             assert schema.get("additionalProperties") is False
-            for child in schema.get("properties", {}).values():
-                assert_closed(child)
+            for name, child in schema.get("properties", {}).items():
+                assert_closed(child, opaque_paths, (*path, name))
         elif schema["type"] == "array" and "items" in schema:
-            assert_closed(schema["items"])
+            assert_closed(schema["items"], opaque_paths, (*path, "items"))
+
+    # These operations return Owner records or bounded research content directly.
+    # Name each operation so a new unconstrained output cannot silently pass.
+    owner_record_outputs = {
+        "human_guidance.read",
+        "human_guidance.read.reconcile",
+        "human_guidance.feedback",
+        "human_guidance.feedback.reconcile",
+        "research_workspace.discover",
+        "research_workspace.read",
+        "research_memory.research_notes.read",
+        "research_memory.stage_context.read",
+        "research_memory.content.read",
+        "research_memory.creation_basis.read",
+        "research_memory.literature.page",
+        "research_graph.questions.page",
+        "research_graph.baselines.page",
+        "research_graph.baselines.read",
+        "research_graph.target_formal_results.read",
+        "research_graph.formal_results.read",
+        "research_graph.question_history.read",
+        "research_graph.question_relations.read",
+        "research_graph.artifact_roles.adjust",
+        "research_graph.artifact_roles.adjust.reconcile",
+        "agent_runtime.target_run.progress",
+        *("research_memory.assets." + action for action in (
+            "page", "lifecycle", "current", "intake", "intake.reconcile",
+            "retire", "retire.reconcile",
+        )),
+        *("research_graph.datasets." + action for action in (
+            "page", "read", "register", "register.reconcile", "register_version",
+            "register_version.reconcile", "reference", "reference.reconcile",
+            "derive", "derive.reconcile",
+        )),
+        *("research_graph.environments." + action for action in (
+            "page", "read", "register", "register.reconcile", "reference",
+            "reference.reconcile",
+        )),
+    }
+    opaque_inputs = {
+        "research_graph.datasets.register": (("metadata",),),
+        "research_graph.datasets.register_version": (
+            ("metadata",), ("asset_bindings", "items"),
+        ),
+        "research_graph.environments.register": (
+            ("metadata",), ("asset_bindings", "items"),
+        ),
+        "research_memory.assets.intake": (
+            ("intake", "provenance"),
+            ("intake", "change", "evidence_bindings", "items"),
+        ),
+        "research_memory.assets.intake.reconcile": (
+            ("intake", "provenance"),
+            ("intake", "change", "evidence_bindings", "items"),
+        ),
+    }
 
     for tool in response["result"]["tools"]:
-        assert tool["inputSchema"].get("additionalProperties") is False
         try:
-            # Dataset registration accepts the researcher's content definition.
-            if tool["name"] not in {
-                "research_graph.datasets.register",
-                "research_graph.datasets.register_version",
+            # Metadata/provenance and exact Owner-issued asset bindings are
+            # content payloads; their surrounding command remains closed.
+            assert_closed(tool["inputSchema"], opaque_inputs.get(tool["name"], ()))
+            if tool["name"] in {
+                "research_memory.assets.intake",
+                "research_memory.assets.intake.reconcile",
             }:
-                assert_closed(tool["inputSchema"])
-            if not (tool["name"].startswith(("research_graph.baselines.", "research_graph.datasets."))
-                    or tool["name"] in {
-                        "research_graph.target_formal_results.read",
-                        "research_memory.research_notes.read",
-                        "research_memory.stage_context.read",
-                        "human_request.open",
-                        "human_request.open.reconcile",
-                        "agent_runtime.target_run.progress",
-                    }):
-                # Bounded content readers and human requests preserve their
-                # selected research content without a second fixed schema.
-                assert_closed(tool["outputSchema"])
+                intake = tool["inputSchema"]["properties"]["intake"]
+                binding = intake["properties"]["change"]["properties"]["evidence_bindings"]["items"]
+                assert set(binding["properties"]) == set(binding["required"]) == {
+                    "asset_ref", "version_ref", "content_hash", "manifest_hash", "receipt",
+                }
+                receipt = binding["properties"]["receipt"]
+                assert set(receipt["properties"]) == set(receipt["required"]) == {
+                    "issuer", "kind", "receipt_ref", "subject_ref", "payload_hash",
+                }
+            if tool["name"] in owner_record_outputs:
+                assert tool["outputSchema"] == {"type": "object"}
+            else:
+                # HumanRequest has a fixed receipt/scope envelope around the
+                # human's open-ended resolution facts; keep checking that envelope.
+                opaque_output = (("resolution", "facts"),) if tool["name"] in {
+                    "human_request.open", "human_request.open.reconcile",
+                } else ()
+                assert_closed(tool["outputSchema"], opaque_output)
         except AssertionError as error:
             raise AssertionError(tool["name"]) from error
 
@@ -517,8 +553,6 @@ def test_missing_matrix_is_typed_and_does_not_register_placeholder_tools():
     assert missing_names == {
         "verify_delivered_context_pack",
         "read_formal_plan",
-        "accept_reuse_eligibility",
-        "reconcile_reuse_eligibility",
         "submit_implementation_roles",
         "submit_execution_input_binding",
         "accept_result_assets",
@@ -770,130 +804,57 @@ def test_rm_implementation_content_effect_read_and_reconcile_are_exact():
     )
 
 
-def test_reuse_eligibility_read_and_composite_verification_use_owner_records():
-    gateway, graph, memory, runtime = _gateway()
-    memory.accept_implementation_content(
-        source_ref="source:semantic-reuse",
-        exact_version_ref="source-version:semantic-reuse-v1",
-        implementation_revision_ref="implementation:semantic-reuse-v1",
-        verification_evidence_ref="evidence:semantic-reuse-pin",
-        license_ref=None,
-        source_content_hash_ref=None,
-        patch_ref=None,
-        idempotency_key="fixture:implementation",
-    )
-    content = memory.accepted_content
-    payload = {
-        "eligible_tier": "accepted-local",
-        "eligibility_anchor_ref": "target-commit:reuse-anchor",
-        "source_ref": content.source_ref,
-        "exact_version_ref": content.exact_version_ref,
-        "implementation_revision_ref": content.implementation_revision_ref,
-        "implementation_content_hash_ref": content.content_hash_ref,
-    }
-    payload_hash = canonical_hash(payload)
-    graph.eligibility = AcceptedReuseEligibility(
-        eligibility_ref="reuse-eligibility:1",
-        tier="accepted-local",
-        target_commit_ref="target-commit:reuse-anchor",
-        source_ref=content.source_ref,
-        exact_version_ref=content.exact_version_ref,
-        implementation_revision_ref=content.implementation_revision_ref,
-        implementation_content_hash_ref=content.content_hash_ref,
-        payload=payload,
-        payload_hash=payload_hash,
-        accepted_at=2.0,
-        receipt=AcceptanceReceipt(
-            issuer="research_graph",
-            kind="reuse_eligibility_accepted",
-            receipt_ref="rg:reuse-eligibility-receipt",
-            subject_ref=payload_hash,
-            payload_hash="5" * 64,
+@pytest.mark.parametrize("binding", ("content_hash", "source_receipt", "content_receipt"))
+def test_rm_implementation_content_reconcile_rejects_inexact_owner_bindings(binding):
+    gateway, _graph, memory, runtime = _gateway()
+    assert {
+        "research_graph.reuse_eligibility.read",
+        "research_graph.reuse_inputs.verify",
+    }.isdisjoint(gateway.operation_ids)
+    connection = _issue(
+        gateway,
+        (
+            "research_memory.implementation_content.accept",
+            "research_memory.implementation_content.accept.reconcile",
         ),
     )
-    operation_ids = (
-        "research_graph.reuse_eligibility.read",
-        "research_graph.reuse_inputs.verify",
-    )
-    connection = _issue(gateway, operation_ids)
-    read = _call(
+    arguments = _implementation_content_arguments("implementation:accept:binding")
+    accepted = _call(
         gateway,
         connection,
-        "research_graph.reuse_eligibility.read",
-        {"eligibility_ref": "reuse-eligibility:1"},
+        "research_memory.implementation_content.accept",
+        arguments,
     )
-    assert read["isError"] is False
-    assert read["structuredContent"]["accepted"]["receipt"] == (
-        graph.eligibility.receipt.as_public_dict()
-    )
+    assert accepted["isError"] is False
+    content = memory.accepted_content
+    if binding == "content_hash":
+        memory.accepted_content = replace(content, content_hash_ref="f" * 64)
+    elif binding == "source_receipt":
+        memory.accepted_content = replace(
+            content,
+            source_verification_receipt=replace(
+                content.source_verification_receipt,
+                subject_ref="source-version:different",
+            ),
+        )
+    else:
+        memory.accepted_content = replace(
+            content,
+            content_acceptance_receipt=replace(
+                content.content_acceptance_receipt,
+                subject_ref="f" * 64,
+            ),
+        )
 
-    verified = _call(
+    reconciled = _call(
         gateway,
         connection,
-        "research_graph.reuse_inputs.verify",
-        {
-            "proofs": [
-                {
-                    "tier": "accepted-local",
-                    "source_ref": content.source_ref,
-                    "exact_version_ref": content.exact_version_ref,
-                    "implementation_revision_ref": (
-                        content.implementation_revision_ref
-                    ),
-                    "verification_receipt": {
-                        "receipt_ref": (
-                            content.source_verification_receipt.receipt_ref
-                        ),
-                        "subject_ref": (
-                            content.source_verification_receipt.subject_ref
-                        ),
-                        "verified": True,
-                        "currentness_known": True,
-                        "current": True,
-                    },
-                    "implementation_binding": {
-                        "subject_ref": content.implementation_revision_ref,
-                        "content_hash_ref": content.content_hash_ref,
-                    },
-                    "implementation_acceptance_receipt": {
-                        "receipt_ref": (
-                            content.content_acceptance_receipt.receipt_ref
-                        ),
-                        "subject_ref": (
-                            content.content_acceptance_receipt.subject_ref
-                        ),
-                        "verified": True,
-                        "currentness_known": True,
-                        "current": True,
-                    },
-                    "eligibility_anchor_ref": "target-commit:reuse-anchor",
-                    "eligibility_binding": {
-                        "subject_ref": "reuse-eligibility:1",
-                        "content_hash_ref": payload_hash,
-                    },
-                    "eligibility_receipt": {
-                        "receipt_ref": graph.eligibility.receipt.receipt_ref,
-                        "subject_ref": graph.eligibility.receipt.subject_ref,
-                        "verified": True,
-                        "currentness_known": True,
-                        "current": True,
-                    },
-                }
-            ]
-        },
+        "research_memory.implementation_content.accept.reconcile",
+        arguments,
     )
-    assert verified["isError"] is False
-    proof = verified["structuredContent"]["proofs"][0]
-    assert proof["source_verification_receipt"] == (
-        content.source_verification_receipt.as_public_dict()
+    assert reconciled["isError"] is True
+    assert reconciled["structuredContent"]["code"] == (
+        "implementation_content_reconciliation_conflict"
     )
-    assert proof["content_acceptance_receipt"] == (
-        content.content_acceptance_receipt.as_public_dict()
-    )
-    assert proof["eligibility"]["receipt"] == (
-        graph.eligibility.receipt.as_public_dict()
-    )
-    assert len(memory.source_verifications) == 1
-    assert len(memory.content_verifications) == 1
-    assert len(graph.eligibility_verifications) == 1
+    assert len(memory.accept_calls) == 1
     assert runtime.scope_checks == 2

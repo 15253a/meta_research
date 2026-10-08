@@ -301,11 +301,13 @@ def test_bundle_run_completion_rejects_legacy_target_graph_or_count(
         monkeypatch.setattr(
             runtime.owners.research_graph,
             "query_plan_evidence_catalog",
-            lambda *, quest_ref: (
+            lambda *, quest_ref, target_commit_refs=None, current_only=True: (
                 0,
                 tuple(
                     {"target_commit_root_ref": commit.commit_ref}
                     for commit in fake_commits
+                    if target_commit_refs is None
+                    or commit.commit_ref in target_commit_refs
                 ),
             ),
         )

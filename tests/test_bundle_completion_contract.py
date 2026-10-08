@@ -28,9 +28,6 @@ from meta_research.bundle_protocol import (
     ReceiptProof,
     ResultReviewRecord,
     RouteDisposition,
-    ReuseSourceProof,
-    ReuseTierDecision,
-    ReuseTrace,
     RouteSpec,
     SemanticBarrier,
     StageRunRequest,
@@ -93,26 +90,6 @@ def _candidate(
     held_fixed_bindings: tuple[HeldFixedBinding, ...] | None = None,
 ) -> TargetCandidate:
     implementation_ref = f"implementation-{label}"
-    version_ref = f"source-version-{label}"
-    implementation_hash = f"implementation-hash-{label}"
-    source = ReuseSourceProof(
-        source_ref=f"source-{label}",
-        exact_version_ref=version_ref,
-        implementation_revision_ref=implementation_ref,
-        eligible_tier="self-implementation",
-        verification_receipt=_receipt(
-            f"source-verification-receipt-{label}",
-            version_ref,
-        ),
-        implementation_binding=ContentBindingProof(
-            subject_ref=implementation_ref,
-            content_hash_ref=implementation_hash,
-        ),
-        implementation_acceptance_receipt=_receipt(
-            f"implementation-receipt-{label}",
-            implementation_hash,
-        ),
-    )
     return TargetCandidate(
         local_label=label,
         experiment_keys=experiment_keys,
@@ -129,17 +106,6 @@ def _candidate(
         ),
         implementation_revision_ref=implementation_ref,
         code_changed=False,
-        reuse_trace=ReuseTrace(
-            tier_decisions=(
-                ReuseTierDecision(
-                    tier="self-implementation",
-                    disposition="selected",
-                    reason_ref=f"reuse-reason-{label}",
-                    source_proofs=(source,),
-                ),
-            ),
-            greenfield_exception="simple-implementation",
-        ),
         routes=(RouteSpec(route_ref=f"route-{label}"),),
     )
 
