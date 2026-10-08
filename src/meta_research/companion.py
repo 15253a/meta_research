@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, cast
 
@@ -16,7 +17,7 @@ from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     _read_operation_invocation,
 )
-from meta_research.owners.common import canonical_hash
+from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.provider_supervisor import (
     ProviderSupervisorError,
     read_transport_key_for_operation,
@@ -83,16 +84,98 @@ class CodexCompanionAdapter(
             process_runner=process_runner,
             codex_home=codex_home,
         )
+        self._creation_call_lock = threading.RLock()
+        self._creation_calls = {}
+        self._creation_stops = set()
+        self._creation_outcomes = {}
 
     def capability_profile(self) -> RootCapabilityProfile:
         return root_capability_profile("companion")
 
     def cancel_job(self, job_ref: str) -> bool:
+        with self._creation_call_lock:
+            runners = [runner for key, runner in self._creation_calls.items()
+                       if key == job_ref or key.startswith(job_ref + ":")]
+            outcomes = [value for key, value in self._creation_outcomes.items()
+                        if key == job_ref or key.startswith(job_ref + ":")]
+            self._creation_stops.add(job_ref)
+        if runners:
+            return all([runner.cancel_job(runner.work.operation.operation_ref)["descendants_ended"] for runner in runners])
+        if outcomes:
+            return all(outcome["descendants_ended"] for outcome in outcomes)
+        if self._workspaces is not None:
+            from sqlalchemy import text
+            with self._workspaces._hc._database.read() as connection:
+                rows = connection.execute(text("SELECT operation_ref,state FROM hc_creation_material_operations")).all()
+            states = [row.state for row in rows if row.operation_ref == job_ref or row.operation_ref.startswith(job_ref + ":")]
+            if states:
+                return all(state in {"sealed", "failed"} for state in states)
         self._request_durable_job_stop(job_ref)
         cancel_job = getattr(self._runner, "cancel_job", None)
         if callable(cancel_job):
             cancel_job(job_ref)
         return True
+
+    def _protected_creation_invoke(self, request, *, operation_name, prompt, schema, native_session_ref, inputs):
+        from meta_research.creation_work import ProtectedCreationRunner
+        from meta_research.runtime_conditions import render_runtime_conditions
+        if self._workspaces is None or not request.job_ref:
+            raise IdeaSkillUnavailable("protected_creation_runtime_unavailable")
+        try:
+            work = self._workspaces.protected_creation(self._creation_workspace(request), inputs, operation_ref=request.job_ref)
+        except OwnerConflict as error:
+            raise IdeaSkillUnavailable(error.code) from error
+        basis = getattr(request, "basis", None)
+        if basis is None:
+            basis = getattr(request, "creation_basis", None)
+        extra = ()
+        if basis is not None:
+            work.bind_context_readers(basis, getattr(request, "literature_snapshot", None))
+            extra = ("research_memory.creation_basis.read", "research_memory.content.read")
+        guidance_root = Path(__file__).parent / "skills" / "first_creation"
+        names = ("SKILL.md", "references/source-evidence.md", "references/literature-corrections.md")
+        guidance = {name: str(guidance_root / name) for name in names}
+        files = [Path(value) for value in guidance.values()]
+        context = getattr(request, "context", None)
+        if context is not None:
+            original_binding = self._creation_workspace(request)
+            files.extend(original_binding.directory / item["path"] for item in context["manifest"])
+        runner = ProtectedCreationRunner(work, read_only_inputs=files)
+        runner.runtime_conditions = render_runtime_conditions(self._workspace,
+            initialization_id=request.initialization_id) + "\n" + runner.runtime_conditions
+        with self._creation_call_lock:
+            if request.job_ref in self._creation_calls:
+                raise IdeaSkillUnavailable("protected_creation_active")
+            self._creation_calls[request.job_ref] = runner
+            if any(request.job_ref == key or request.job_ref.startswith(key + ":") for key in self._creation_stops):
+                runner.cancel_job(request.job_ref)
+        try:
+            access = work.channel(extra)
+            prompt += "\n\nProtected creation binding and explicit guidance file locations:\n" + _canonical_json({
+                "execution": work.execution_binding, "material_references": inputs.as_dict(), "guidance_files": guidance})
+            prompt += "\nRead guidance through these exact declared locations, including its reference files. "
+            prompt += "Create the operation work directory before writing a program or result. The reference descriptors name unreadable external originals."
+            raw, native_ref, stdout = self._invoke(operation_name=operation_name, prompt=prompt, schema=schema,
+                native_session_ref=native_session_ref, job_ref=request.job_ref,
+                workspace_binding=work.binding, invocation_runner=runner, provider_execution_binding=work.execution_binding,
+                mcp_url=access.url, mcp_token=access.token, mcp_scope_binding_hash=access.scope_binding_hash,
+                semantic_mcp_protected_environment=True, authorized_operation_ids=access.operation_ids)
+            work.completed_handoff()
+            identity = work.seal()
+            return raw, native_ref, stdout, identity, work
+        except (IdeaSkillUnavailable, OwnerConflict) as error:
+            outcome = work.request_stop()
+            unknown = not outcome["descendants_ended"] or error.code == "protected_creation_unknown_outcome"
+            work.fail(unknown_outcome=unknown)
+            if unknown:
+                raise IdeaSkillUnavailable("protected_creation_unknown_outcome") from error
+            raise IdeaSkillUnavailable(error.code) from error
+        finally:
+            outcome = work.request_stop()
+            with self._creation_call_lock:
+                self._creation_outcomes[request.job_ref] = outcome
+                if outcome["descendants_ended"]:
+                    self._creation_calls.pop(request.job_ref, None)
 
     def _transport_contract_failure_code(self, operation_name: str) -> str:
         if operation_name in {"proposal-fork", "first-question-synthesis"}:
@@ -172,6 +255,18 @@ class CodexCompanionAdapter(
                 "revision": request.draft_revision, "hash": request.draft_hash}, "draft": request.draft, "material_manifest": request.manifest})
         )
         try:
+            if request.inputs is not None:
+                prompt = ("Read registered material entrances only through the granted bounded discover/read/copy MCP tools. "
+                    "Return the reference understanding schema using actual returned opaque witness_ref citations. "
+                    "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
+                    "A directory is never completely read merely because one child was read.\n"
+                    + _canonical_json({"instruction_bundle": instructions, "draft": request.draft}))
+                raw, native_ref, _stdout, identity, work = self._protected_creation_invoke(request,
+                    operation_name="initialization-understanding", prompt=prompt,
+                    schema=understanding_schema(references=True), native_session_ref=request.companion_native_session_ref, inputs=request.inputs)
+                if native_ref is None:
+                    raise DraftingUnavailable("companion_native_session_missing")
+                return InitializationUnderstandingResult(raw, native_ref, identity, work)
             raw, native_ref, _stdout = self._invoke(operation_name="initialization-understanding", prompt=prompt,
                 schema=understanding_schema(), native_session_ref=request.companion_native_session_ref,
                 job_ref=request.job_ref, workspace_binding=self._creation_workspace(request))
@@ -184,14 +279,15 @@ class CodexCompanionAdapter(
     def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         instructions = first_creation_instructions()
         child_schema = {"type": "object", "additionalProperties": False, "properties": {
-            "content": _proposal_schema(), "revision": revision_schema() if request.literature_snapshot is not None else {"type": "null"}},
+            "content": _proposal_schema(), "revision": revision_schema(references=request.basis.get("input_identity") is not None) if request.literature_snapshot is not None else {"type": "null"}},
             "required": ["content", "revision"]}
         schema = {"type": "object", "additionalProperties": False, "properties": {
             "proposal_fork_native_session_ref": {"type": "string", "minLength": 1},
             "result": child_schema}, "required": ["proposal_fork_native_session_ref", "result"]}
         child_prompt = (
-            "Read this exact context cache with native filesystem tools. Verify the manifest hashes before relying on it. "
-            "Read full originals that matter and exact literature evidence. Preserve the prepared basis and source selection. "
+            "Read the small exact context projection through its declared input paths. "
+            "Use the granted scoped Readers for selected original sources and literature evidence, and bounded material tools for new original reads. "
+            "Preserve the prepared basis and source selection. "
             "Return the six proposal fields and the route-specific revision. A direct route returns revision=null. "
             "A DeepFetch route returns a complete literature revision with explicit corrections or an honest unchanged/empty assessment. "
             "No Owner writes, receipts, human confirmation, or invented Quest Run.\n"
@@ -208,15 +304,24 @@ class CodexCompanionAdapter(
             + child_prompt + "\nEND_FIRST_QUESTION_TASK"
         )
         try:
-            raw, native_ref, _stdout = self._invoke(operation_name="first-question-synthesis", prompt=prompt, schema=schema,
-                native_session_ref=request.companion_native_session_ref, job_ref=request.job_ref,
-                workspace_binding=self._creation_workspace(request))
+            identity, work = None, None
+            if request.basis.get("input_identity") is not None:
+                from meta_research.creation_inputs import CreationInputIdentity, MaterialSet
+                prior = CreationInputIdentity.from_dict(request.basis["input_identity"])
+                inputs = MaterialSet(prior.anchor, tuple(request.basis["material_references"]["references"]))
+                raw, native_ref, _stdout, identity, work = self._protected_creation_invoke(request,
+                    operation_name="first-question-synthesis", prompt=prompt, schema=schema,
+                    native_session_ref=request.companion_native_session_ref, inputs=inputs)
+            else:
+                raw, native_ref, _stdout = self._invoke(operation_name="first-question-synthesis", prompt=prompt, schema=schema,
+                    native_session_ref=request.companion_native_session_ref, job_ref=request.job_ref,
+                    workspace_binding=self._creation_workspace(request))
             from jsonschema import Draft202012Validator
             Draft202012Validator(schema).validate(raw)
             if native_ref is None or raw["proposal_fork_native_session_ref"] == native_ref:
                 raise DraftingUnavailable("companion_proposal_fork_invalid")
             return FirstQuestionSynthesisResult(_validated_question(raw["result"]["content"]), "codex_companion_fork",
-                native_ref, raw["proposal_fork_native_session_ref"], raw["result"]["revision"])
+                native_ref, raw["proposal_fork_native_session_ref"], raw["result"]["revision"], identity, work)
         except IdeaSkillUnavailable as error:
             raise DraftingUnavailable(error.code) from error
 

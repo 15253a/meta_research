@@ -191,6 +191,21 @@ class CreationMaterialOperation:
             require_anchor(human, inputs.anchor, require_open=True)
             if material_snapshot(human, inputs.anchor) != inputs:
                 raise OwnerConflict("creation_input_stale")
+            existing = connection.execute(text("SELECT * FROM hc_creation_material_operations WHERE operation_ref=:ref"),
+                                          {"ref": operation_ref}).first()
+            if existing is not None:
+                if (json.loads(existing.material_set_json) != inputs.as_dict()
+                    or existing.workspace_ref != binding.location.workspace_ref
+                    or existing.root_session_ref != binding.location.root_session_ref):
+                    raise OwnerConflict("creation_operation_identity_invalid")
+                if existing.state != "active":
+                    raise OwnerConflict("protected_creation_unknown_outcome")
+                self.fence_ref = existing.fence_ref
+                self.binding_hash = canonical_hash({"inputs": inputs.as_dict(), "workspace": binding.seal(),
+                    "operation_ref": operation_ref, "fence_ref": self.fence_ref})
+                if self.binding_hash != existing.binding_hash:
+                    raise OwnerConflict("creation_operation_identity_invalid")
+                return
             connection.execute(text("INSERT INTO hc_creation_material_operations "
                 "(operation_ref,fence_ref,binding_hash,workspace_ref,root_session_ref,anchor_json,"
                 "material_set_json,material_set_hash,state,created_at) "

@@ -2088,6 +2088,8 @@ class CodexIdeaSkillAdapter:
         )
         if workspace_binding is not None:
             prompt += "\n\nYour working directory is " + str(workspace_binding.directory) + ". " + (
+                "Use the granted research_workspace.materials.discover/read/copy operations for registered external inputs. "
+                if provider_execution_binding is not None else
                 "Use research_workspace.discover and research_workspace.read for pending material "
                 "from this actual work and eligible earlier work."
                 if mcp_url is not None else "Read pending files only within this actual work, including its inbox.")

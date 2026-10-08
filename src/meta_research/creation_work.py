@@ -54,6 +54,8 @@ class ProtectedCreation:
         self._terminal = False
         self._executed = False
         self.sealed_identity = None
+        self.read_basis = None
+        self.read_literature = None
         self.execution_binding = {"operation_ref": operation_ref, "fence_ref": self.operation.fence_ref,
             "binding_hash": self.operation.binding_hash, "work_ref": self.work_ref,
             "work_directory": "/workspace/" + self.relative_directory,
@@ -78,6 +80,32 @@ class ProtectedCreation:
         self.owner._creation_channels[hashlib.sha256(connection.token.encode()).hexdigest()] = self.operation
         return RootResidentMcpAccess(self.owner._creation_endpoint + "/mcp", connection.token,
                                     self.operation.binding_hash, operations, self.binding)
+
+    def bind_context_readers(self, basis, literature):
+        memory = self.owner._hc._research_memory.creation_bases
+        exact = memory.query(basis["basis_ref"], basis["basis_hash"])
+        memory.require_current(exact)
+        identity = exact.get("input_identity")
+        if (identity is None or identity["anchor"] != self.operation.inputs.anchor.as_dict()
+            or identity["material_set_hash"] != self.operation.inputs.set_hash):
+            raise OwnerConflict("creation_basis_unbound")
+        self.read_basis = memory.reference(exact)
+        self.read_literature = None if literature is None else dict(literature["source_snapshot"])
+        if self.read_literature is not None:
+            metadata = memory._owner.read_literature_snapshot_metadata(self.read_literature["snapshot_ref"])
+            anchor = self.operation.inputs.anchor
+            if (metadata["snapshot_hash"] != self.read_literature["snapshot_hash"]
+                or metadata.get("creation_context_kind", "quest_initialization") != anchor.kind
+                or (metadata.get("creation_context_ref") or metadata["initialization_id"]) != anchor.ref
+                or metadata.get("context_generation") != anchor.generation):
+                raise OwnerConflict("creation_literature_unbound")
+        self.execution_binding["context_readers"] = {"basis": self.read_basis, "literature": self.read_literature}
+
+    def completed_handoff(self):
+        outcome = self.runtime.request_stop()
+        if not outcome["descendants_ended"] or outcome["status"] not in {"completed", "stopped"}:
+            raise OwnerConflict("protected_creation_unknown_outcome")
+        self._executed = True
 
     def run(self, call):
         if self._terminal:
