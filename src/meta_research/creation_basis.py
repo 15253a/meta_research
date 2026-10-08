@@ -473,6 +473,24 @@ class CreationBasisMemory:
             body["input_identity"] = identity.as_dict()
         return self._accept(body)
 
+    def accept_consumed(self, predecessor, result):
+        from meta_research.creation_inputs import CreationInputIdentity
+        if predecessor.get("input_identity") is None:
+            return predecessor
+        prior = CreationInputIdentity.from_dict(predecessor["input_identity"])
+        current = result.input_identity
+        if (current is None or result.work is None or result.work.sealed_identity != current
+            or current.anchor != prior.anchor or current.material_set_hash != prior.material_set_hash):
+            raise OwnerConflict("creation_input_identity_invalid")
+        consumed = {item.witness_ref: item for item in (*prior.consumed, *current.consumed)}
+        combined = CreationInputIdentity(prior.anchor, prior.material_set_hash, tuple(consumed.values()))
+        if combined == prior:
+            self.require_current(predecessor)
+            return predecessor
+        body = {key: value for key, value in predecessor.items() if key not in {"basis_ref", "basis_hash"}}
+        body.update(input_identity=combined.as_dict(), predecessor=self.reference(predecessor))
+        return self._accept(body)
+
     @staticmethod
     def reference(basis):
         return {"basis_ref": basis["basis_ref"], "basis_hash": basis["basis_hash"], "kind": basis["kind"]}

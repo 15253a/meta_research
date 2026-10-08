@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -140,7 +141,11 @@ class CodexCompanionAdapter(
         if context is not None:
             original_binding = self._creation_workspace(request)
             files.extend(original_binding.directory / item["path"] for item in context["manifest"])
-        runner = ProtectedCreationRunner(work, read_only_inputs=files)
+        proxy_environment = {key: os.environ[key] for key in
+            ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy") if key in os.environ}
+        for key in ("NO_PROXY", "no_proxy"):
+            proxy_environment[key] = ",".join(filter(None, (os.environ.get(key), "127.0.0.1", "localhost")))
+        runner = ProtectedCreationRunner(work, read_only_inputs=files, environment=proxy_environment)
         runner.runtime_conditions = render_runtime_conditions(self._workspace,
             initialization_id=request.initialization_id) + "\n" + runner.runtime_conditions
         with self._creation_call_lock:
@@ -454,20 +459,27 @@ class CodexCompanionAdapter(
                 operation_name="companion-turn",
             )
         try:
-            raw, native_session_ref, _stdout = (
-                self._invoke_optional_root_task_operation(
-                    operation_name="companion-turn",
-                    prompt=prompt,
-                    schema=_reply_schema(include_agent_proposal=companion),
-                    native_session_ref=request.native_session_ref,
-                    job_ref=request.job_ref,
-                    workspace_binding=(self._creation_workspace(request)
-                        if getattr(request, "root_runtime_scope", None) is None else None),
-                    root_runtime_scope=getattr(
-                        request, "root_runtime_scope", None
-                    ),
+            identity, work = None, None
+            if request.inputs is not None:
+                raw, native_session_ref, _stdout, identity, work = self._protected_creation_invoke(request,
+                    operation_name="companion-turn", prompt=prompt,
+                    schema=_reply_schema(include_agent_proposal=companion), native_session_ref=request.native_session_ref,
+                    inputs=request.inputs)
+            else:
+                raw, native_session_ref, _stdout = (
+                    self._invoke_optional_root_task_operation(
+                        operation_name="companion-turn",
+                        prompt=prompt,
+                        schema=_reply_schema(include_agent_proposal=companion),
+                        native_session_ref=request.native_session_ref,
+                        job_ref=request.job_ref,
+                        workspace_binding=(self._creation_workspace(request)
+                            if getattr(request, "root_runtime_scope", None) is None else None),
+                        root_runtime_scope=getattr(
+                            request, "root_runtime_scope", None
+                        ),
+                    )
                 )
-            )
         except IdeaSkillUnavailable as error:
             raise DraftingUnavailable(
                 error.code, native_session_ref=error.native_session_ref
@@ -501,6 +513,8 @@ class CodexCompanionAdapter(
             native_session_ref=native_session_ref,
             adapter_kind="codex_companion_root",
             agent_proposal=agent_proposal,
+            input_identity=identity,
+            work=work,
         )
 
 

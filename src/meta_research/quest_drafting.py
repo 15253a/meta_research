@@ -154,6 +154,10 @@ class IntentTurnRequest:
     context_generation: int | None = None
     root_runtime_scope: dict[str, object] | None = None
     root_session_ref: str | None = None
+    inputs: object | None = None
+    creation_basis: dict[str, object] | None = None
+    context: dict[str, object] | None = None
+    literature_snapshot: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +166,8 @@ class IntentTurnResult:
     native_session_ref: str
     adapter_kind: str
     agent_proposal: dict[str, object] | None = None
+    input_identity: object | None = None
+    work: object | None = None
 
 
 class ProposalDrafter(Protocol):

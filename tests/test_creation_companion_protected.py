@@ -24,9 +24,10 @@ QUESTION = {"title": "Compare the calibration", "unknown_statement": "Does the c
 class ProtectedCreationFixture(CodexCompanionAdapter):
     external_model_calls = False
 
-    def __init__(self, workspace, *, selection="original"):
+    def __init__(self, workspace, *, selection="original", original_custody="managed"):
         super().__init__(workspace, executable="/bin/bash")
         self.selection = selection
+        self.original_custody = original_custody
         self.calls = []
 
     def _invoke(self, **arguments):
@@ -40,7 +41,7 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
             arguments["prompt"], None, {}, runner.read_only_inputs, ()))
         assert completed.returncode == 0
         assert "# Understand existing work" in completed.stdout
-        assert "Read registered material" in arguments["prompt"] or "spawn_agent exactly once" in arguments["prompt"]
+        assert arguments["operation_name"] in {"initialization-understanding", "first-question-synthesis", "companion-turn"}
         assert "third-party Python scientific packages" in runner.runtime_conditions
         assert "protected_creation" not in str(self._runner)
         class Connection:
@@ -66,12 +67,14 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
                 "conditions": ["Calibration condition recorded in the note."], "sources": [citation]})
             if self.selection in {"original", "both"}:
                 understanding["selection"].append({"source": {"kind": "original_file", "reference_ref": ref,
-                    "path": path, "observation_ref": entry["observation"]["observation_ref"]}, "custody": "managed", "reason": "Keep the original."})
+                    "path": path, "observation_ref": entry["observation"]["observation_ref"]}, "custody": self.original_custody, "reason": "Keep the original."})
         if self.selection in {"result", "both"}:
             understanding["selection"].append({"source": {"kind": "work_file", "work_ref": work.work_ref, "path": "trial.txt", "trial_ref": None},
                 "custody": "linked_local", "reason": "Keep the selected trial."})
         if arguments["operation_name"] == "initialization-understanding":
             return understanding, "native-parent", ""
+        if arguments["operation_name"] == "companion-turn":
+            return {"reply": "The bounded notes support an editable calibration comparison."}, "native-parent", ""
         basis = self._workspaces._hc._research_memory.creation_bases.query(work.read_basis["basis_ref"], work.read_basis["basis_hash"])
         value = _value(_call(gateway, Connection(), "research_memory.creation_basis.read", basis_ref=basis["basis_ref"],
             expected_basis_hash=basis["basis_hash"], view="understanding", limit=16384))
@@ -83,7 +86,15 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
                 assert page["text"]
         denied = _call(gateway, Connection(), "research_memory.content.read", source_ref="asset_version_foreign", version_ref="asset_version_foreign")
         assert denied["isError"]
-        return {"proposal_fork_native_session_ref": "native-child", "result": {"content": QUESTION, "revision": None}}, "native-parent", ""
+        revision = None
+        if work.read_literature is not None:
+            import copy
+            snapshot = work.read_literature["snapshot_ref"]
+            summary = _value(_call(gateway, Connection(), "research_memory.content.read", source_ref=snapshot, version_ref=snapshot))
+            assert summary
+            revised = copy.deepcopy(basis["understanding"])
+            revision = {"understanding": revised, "corrections": [], "search_assessment": "The accepted literature was read within its recorded limits."}
+        return {"proposal_fork_native_session_ref": "native-child", "result": {"content": QUESTION, "revision": revision}}, "native-parent", ""
 
 
 def test_actual_adapter_methods_share_current_protected_gateway_and_readers(tmp_path):
