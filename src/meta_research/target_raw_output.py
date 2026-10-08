@@ -110,7 +110,9 @@ class TargetRawOutputStore:
             raise TargetRawOutputUnavailable("target_raw_output_operation_invalid")
         if _INVOCATION_HASH.fullmatch(transport_invocation_hash) is None:
             raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
-        if family != "codex":
+        # Both native families can be observed through this existing signed
+        # operation binding. The raw-output query remains Codex-only below.
+        if family not in {"codex", "claude"}:
             raise TargetRawOutputUnavailable("target_raw_output_family_unsupported")
         binding = (transport_invocation_hash, family)
         with self._lock:

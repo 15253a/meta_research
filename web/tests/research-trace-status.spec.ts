@@ -85,6 +85,67 @@ async function fixture(page: Page) {
   return { snapshot, catalog, bundle, target1, target2, acquisition, history, output, state, errors, writes, operation };
 }
 
+test("delegated children stay under their exact independent Target root as lifecycle updates preserve history reading", async ({ page }, testInfo) => {
+  const f = await fixture(page);
+  const child = (ref: string, parent: string, status: string) => ({
+    session_ref: ref, native_session_ref: `native-${ref}`, parent_native_session_ref: `native-${parent}`,
+    parent_session_ref: parent, operation_ref: "target-turn-1", provider: "codex", status,
+    updated_at: sourceTime + 40, label: "子智能体",
+  });
+  const first = child("child-running", f.target1.session_ref, "starting");
+  const failed = child("child-failed", f.target1.session_ref, "failed");
+  Object.assign(f.target1, { children: [first, failed, child("foreign-child", f.target2.session_ref, "running")] });
+  Object.assign(f.target2, { children: [child("child-cancelled", f.target2.session_ref, "cancelled"), child("child-unknown", f.target2.session_ref, "unknown")] });
+  const oldTarget: RootSession = { ...f.target1, session_ref: "historical-target", root_session_ref: "historical-target", cycle_ref: "previous-cycle", is_current: false,
+    status: "completed", is_executing: false, operations: [f.operation("historical-target-output", "历史实验", -100)] };
+  const historical = child("historical-child", oldTarget.session_ref, "running");
+  Object.assign(oldTarget, { children: [historical] });
+  f.catalog.sessions.push(oldTarget);
+  f.output.set("historical-target-output", Array.from({ length: 90 }, (_, index) => message(`历史公开记录 ${index}：保留此次实验的观察与说明。`)).join(""));
+  await page.goto("http://research-trace.test/?workspace=1");
+  const bundle = page.locator('.spectrum-stage[data-stage="bundle"]'), trace = page.locator("#research-activity");
+  await expect(bundle.locator(".stage-root-count")).toHaveText("4 个根 session");
+  await bundle.locator(`button[data-session-ref="${f.target1.session_ref}"]`).click();
+  await expect(trace.locator(".root-session-heading")).toContainText("独立 Target 根");
+  const rows = trace.getByRole("region", { name: "委派子智能体" });
+  await expect(rows.locator("[data-child-session-ref]")).toHaveCount(2);
+  await expect(rows.locator('[data-child-session-ref="child-running"]')).toContainText("正在启动");
+  await expect(rows.locator('[data-child-session-ref="child-failed"]')).toContainText("已失败");
+  await expect(rows).not.toContainText("foreign-child");
+  first.status = "running";
+  await expect(rows.locator('[data-child-session-ref="child-running"]')).toContainText("正在运行");
+  first.status = "completed";
+  await expect(rows.locator('[data-child-session-ref="child-running"]')).toContainText("已完成");
+  await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  await expect(trace).not.toContainText("CHILD_PRIVATE_CONVERSATION");
+  await bundle.locator(`button[data-session-ref="${f.target2.session_ref}"]`).click();
+  await expect(rows.locator("[data-child-session-ref]")).toHaveCount(2);
+  await expect(rows).toContainText("已取消"); await expect(rows).toContainText("未知 · 待核实");
+  await expect(rows.locator('[data-child-session-ref="child-running"]')).toHaveCount(0);
+  await bundle.locator(".stage-root-history > summary").click();
+  await bundle.locator('button[data-session-ref="historical-target"]').click();
+  await expect(trace).toContainText("历史公开记录 89");
+  const scroll = trace.locator(".root-session-scroll");
+  await scroll.evaluate(node => { node.scrollTop = 150; node.dispatchEvent(new Event("scroll")); });
+  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  const position = await scroll.evaluate(node => node.scrollTop);
+  expect(position).toBeGreaterThan(0);
+  historical.status = "failed";
+  await expect(rows.locator('[data-child-session-ref="historical-child"]')).toContainText("已失败");
+  await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", oldTarget.session_ref);
+  expect(await scroll.evaluate(node => node.scrollTop)).toBe(position);
+  await expect(trace).toContainText("历史公开记录 89");
+  await bundle.locator(`button[data-session-ref="${f.target1.session_ref}"]`).click();
+  await expect(rows.locator('[data-child-session-ref="child-running"]')).toContainText("已完成");
+  await trace.locator(".root-session-heading").scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("delegated-children-desktop.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: testInfo.outputPath("delegated-children-mobile.png"), fullPage: true });
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
 test("long research sessions stay bounded and live polls request only newly appended bytes", async ({ page }) => {
   const f = await fixture(page);
   f.bundle.operations = Array.from({ length: 1000 }, (_, index) => f.operation(`history-${index}`, `探索 ${index}`, index));
