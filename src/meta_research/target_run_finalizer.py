@@ -2605,8 +2605,10 @@ def _decode_result_document_value(value: object) -> TargetRootResultDocument:
         try:
             _declared_work(value)
             explicit_work = True
-        except OwnerConflict:
-            pass
+        except OwnerConflict as error:
+            # The current Owner returns field-specific inventory corrections.
+            # An empty summary need not hide that feedback as a JSON error.
+            explicit_work = error.code == 'target_formal_work_inventory_invalid'
     if (
         (schema_ref is not None and (
             type(schema_ref) is not str

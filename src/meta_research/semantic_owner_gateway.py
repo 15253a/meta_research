@@ -1035,6 +1035,9 @@ def _root_agent_human_request_operations(
                 "由 Agent 明确选择 request_kind，服务确定归属和 local waiter；持有该 operation bearer 的参与 Session 可调用。"
                 "通用请求中，capability_authorization 必须提供 required_authorization，其他分类省略该字段；"
                 "condition.guidance_asset_ref 仅用于 external_material_api_access 或 offline_action，引用已接纳资产版本。"
+                "condition.background 记录背景，attempted_work 逐项记录真实 action/result（未尝试用 []），"
+                "problem 说明困难或缺少条件，requested_delivery 说明应交付内容；impact 与 safe_response 说明后续影响和本请求页面回传方式。"
+                "这些发起时事实与当前请求修订一起保存，页面与 Markdown/HTML/PDF 共用；导出不补造尝试，不自动提交答复，也不启动助手。"
                 "acceptance_conditions 提供 1–32 条非空、去除首尾空格后互不重复的条件。"
             ),
             input_schema=_root_human_request_open_input_schema(),
@@ -1606,16 +1609,36 @@ def _valid_root_human_request_condition(value: object) -> bool:
     if not isinstance(value, dict):
         return False
     generic_fields = {"impact", "safe_response"}
-    if set(value) in (generic_fields, generic_fields | {"guidance_asset_ref"}):
+    help_fields = {"background", "attempted_work", "problem", "requested_delivery"}
+    if generic_fields <= set(value) <= generic_fields | help_fields | {"guidance_asset_ref"}:
         return all(
             isinstance(value.get(name), str) and bool(value.get(name))
             for name in ("impact", "safe_response")
+        ) and all(
+            name not in value
+            or isinstance(value[name], str) and bool(value[name].strip())
+            for name in ("background", "problem", "requested_delivery")
+        ) and (
+            "attempted_work" not in value
+            or isinstance(value["attempted_work"], list)
+            and len(value["attempted_work"]) <= 32
+            and all(
+                isinstance(attempt, dict)
+                and set(attempt) == {"action", "result"}
+                and all(
+                    isinstance(attempt[name], str) and bool(attempt[name].strip())
+                    for name in ("action", "result")
+                )
+                for attempt in value["attempted_work"]
+            )
         ) and (
             "guidance_asset_ref" not in value
             or isinstance(value.get("guidance_asset_ref"), str)
             and bool(value.get("guidance_asset_ref"))
         )
-    if set(value) != {"schema_ref", "root", "condition"}:
+    if set(value) - {"help_context"} != {"schema_ref", "root", "condition"}:
+        return False
+    if "help_context" in value and not _valid_root_human_request_condition(value["help_context"]):
         return False
     root = value.get("root")
     target = value.get("condition")
@@ -2799,6 +2822,27 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
             },
             "condition": _closed_object(
                 {
+                    "background": {
+                        **_string(max_length=4000),
+                        "description": "Recorded research background needed to understand this request.",
+                    },
+                    "attempted_work": {
+                        "type": "array",
+                        "maxItems": 32,
+                        "description": "Actual actions and their observed results; use [] if no work was attempted.",
+                        "items": _closed_object(
+                            {"action": _string(max_length=4000), "result": _string(max_length=4000)},
+                            required=("action", "result"),
+                        ),
+                    },
+                    "problem": {
+                        **_string(max_length=4000),
+                        "description": "The current difficulty or missing condition, expressed for the human reader.",
+                    },
+                    "requested_delivery": {
+                        **_string(max_length=4000),
+                        "description": "The specific judgment, material, permission, or action the human should return.",
+                    },
                     "impact": _string(max_length=4000),
                     "safe_response": _string(max_length=4000),
                     "guidance_asset_ref": {

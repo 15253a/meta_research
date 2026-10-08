@@ -258,11 +258,13 @@ export type ScopedAssetIntakePointer = {
 };
 
 export type LiteratureMode = "oa_then_institution" | "oa_only" | "provided_only";
+export type ResearchStyle = "focus" | "balanced" | "open";
 
 export type QuestDraft = {
   goal: string;
   completion_criteria: string;
   time_budget: "7d" | "30d" | "90d" | "open";
+  research_style: ResearchStyle;
   route: "direct" | "deepfetch";
   resource_envelope_ref: string | null;
   resource_envelope_hash: string | null;
@@ -2361,6 +2363,16 @@ export type HumanRequestResponseBody = {
   materials?: HumanReplyMaterial[];
 };
 
+export type HumanRequestHandoff = {
+  schema_ref: "meta-research/human-request-handoff/v1";
+  request_ref: string;
+  revision: number;
+  is_current: boolean;
+  status: HumanRequestItem["status"];
+  title: string;
+  sections: Array<{ key: string; title: string; paragraphs: string[] }>;
+};
+
 export type HumanRequestRetryResult = HumanRequestItem & {
   retry:
     | { status: "processing" | "succeeded" }
@@ -2586,15 +2598,15 @@ export class ProductError extends Error {
   }
 }
 
-export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string };
+export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle };
 
 export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSignal): Promise<QuestRuntimeConditions> {
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
 }
 
-export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string): Promise<QuestRuntimeConditions> {
+export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle): Promise<QuestRuntimeConditions> {
   return writeJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, "PUT", {
-    text, expected_revision: expectedRevision,
+    text, expected_revision: expectedRevision, research_style: researchStyle,
   });
 }
 
@@ -3279,6 +3291,30 @@ export function sendCompanionMessage(
     message,
     ...(viewContext ? { view_context: viewContext } : {}),
   });
+}
+
+export function readHumanRequestHandoff(
+  requestRef: string,
+  revision: number,
+  signal?: AbortSignal,
+): Promise<HumanRequestHandoff> {
+  return readJson(
+    `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff?revision=${revision}`,
+    signal,
+  );
+}
+
+export async function downloadHumanRequestHandoff(
+  requestRef: string,
+  revision: number,
+  format: "md" | "html" | "pdf",
+): Promise<Blob> {
+  const response = await fetch(
+    `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff.${format}?revision=${revision}`,
+    { credentials: "same-origin" },
+  );
+  if (!response.ok) throw new ProductError(`request_failed:${response.status}`);
+  return response.blob();
 }
 
 export async function respondToHumanRequest(

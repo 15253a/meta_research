@@ -235,7 +235,9 @@ class HumanCollaborationInterface(Protocol):
         self, *, quest_ref: str
     ) -> tuple[dict[str, object], ...]: ...
 
-    def query_human_request(self, request_ref: str) -> dict[str, object] | None: ...
+    def query_human_request(
+        self, request_ref: str, *, materialize_expiration: bool = True
+    ) -> dict[str, object] | None: ...
 
     def query_research_help_page(
         self, *, quest_ref: str, cursor: str | None = None, limit: int = 12
@@ -1995,11 +1997,15 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 by_ref[request_ref] = request
         return tuple(by_ref[key] for key in sorted(by_ref))
 
-    def query_human_request(self, request_ref: str) -> dict[str, object] | None:
+    def query_human_request(
+        self, request_ref: str, *, materialize_expiration: bool = True
+    ) -> dict[str, object] | None:
         """Read one exact HumanRequest across the established issuing Owners."""
 
         try:
-            return self._query_issuing_owner_request(request_ref)
+            return self._query_issuing_owner_request(
+                request_ref, materialize_expiration=materialize_expiration
+            )
         except OwnerConflict as error:
             if error.code == "human_request_not_found":
                 return None
@@ -4220,14 +4226,20 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             except OwnerConflict:
                 continue
 
-    def _query_issuing_owner_request(self, request_ref: str) -> dict[str, object]:
+    def _query_issuing_owner_request(
+        self, request_ref: str, *, materialize_expiration: bool = True
+    ) -> dict[str, object]:
         for owner in (
             self._research_graph,
             self._research_memory,
             self._agent_runtime,
             self._advancement_engine,
         ):
-            request = owner.query_human_request(request_ref)
+            request = (
+                owner.query_human_request(request_ref)
+                if materialize_expiration
+                else owner.query_human_request(request_ref, materialize_expiration=False)
+            )
             if request is not None:
                 return request
         raise OwnerConflict("human_request_not_found")
@@ -11499,7 +11511,8 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
         "literature",
         "background_and_initial_direction",
     }
-    if set(draft) == v2_fields:
+    if set(draft) in (v2_fields, v2_fields | {'research_style'}):
+        from meta_research.research_style import validate_research_style
         normalized: dict[str, object] = {}
         for field in (
             "goal",
@@ -11561,6 +11574,7 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
         normalized.update(
             {
                 "time_budget": time_budget,
+                'research_style': validate_research_style(draft.get('research_style', 'balanced')),
                 "route": route,
                 "resource_envelope_ref": envelope_ref,
                 "resource_envelope_hash": envelope_hash,
@@ -11615,6 +11629,7 @@ def _blank_v2_draft() -> dict[str, object]:
         "goal": "",
         "completion_criteria": "",
         "time_budget": "open",
+        'research_style': 'balanced',
         "route": "direct",
         "resource_envelope_ref": None,
         "resource_envelope_hash": None,

@@ -1093,6 +1093,10 @@ def build_production_runtime(
         harnesses=harnesses,
         finalizer=target_run_finalizer,
         database=database,
+        root_workspaces=root_workspaces,
+        advancement_engine=owners.advancement_engine,
+        protected_storage_roots=(data_root.objects, data_root.provider_homes,
+            data_root.run / 'harness-supervisor', data_root.database),
     )
     bundle_stage = BundleStageWorker(
         feed,

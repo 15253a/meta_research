@@ -11,6 +11,7 @@ import tempfile
 import threading
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.research_style import validate_research_style, render_research_style
 
 
 _LOCK = threading.RLock()
@@ -154,30 +155,39 @@ def _initial_conditions(root: Path, *, quest_ref=None, run_ref=None,
         + json.dumps(values, ensure_ascii=False, indent=2)
     )
     scope = quest_ref or _INIT_PREFIX + initialization_id
+    style = validate_research_style(draft.get('research_style', 'balanced'))
     # An accepted Quest inherits edits made during its own initialization. A
     # Quest-specific save then takes precedence without changing accepted facts.
     if quest_ref is not None:
-        initial_text = _read(root, _INIT_PREFIX + initialization_id, initial_text)["text"]
-    return scope, initial_text
+        inherited = _read(root, _INIT_PREFIX + initialization_id, initial_text, style)
+        initial_text, style = inherited['text'], inherited['research_style']
+    return scope, initial_text, style
 
 
-def _value(quest_ref: str, text: str) -> dict[str, str]:
-    return {"quest_ref": quest_ref, "text": text,
-            "revision": canonical_hash({"quest_ref": quest_ref, "text": text})}
+def _value(quest_ref: str, text: str, research_style: str = 'balanced') -> dict[str, str]:
+    fields = {'quest_ref': quest_ref, 'text': text,
+              'research_style': validate_research_style(research_style)}
+    return {**fields, 'revision': canonical_hash(fields)}
 
 
-def _read(root: Path, quest_ref: str, default_text: str) -> dict[str, str]:
+def _read(root: Path, quest_ref: str, default_text: str, default_style: str = 'balanced') -> dict[str, str]:
     path = root / "runtime-conditions" / (canonical_hash(quest_ref) + ".json")
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return _value(quest_ref, default_text)
+        return _value(quest_ref, default_text, default_style)
     except (ValueError, UnicodeError) as error:
         raise OwnerConflict("runtime_conditions_invalid") from error
     if (not isinstance(saved, dict) or saved.get("quest_ref") != quest_ref
-            or not isinstance(saved.get("text"), str) or len(saved["text"]) > _LIMIT
-            or saved != _value(quest_ref, saved["text"])):
+            or not isinstance(saved.get("text"), str) or len(saved["text"]) > _LIMIT):
         raise OwnerConflict("runtime_conditions_invalid")
+    if 'research_style' not in saved:
+        legacy = {'quest_ref': quest_ref, 'text': saved['text']}
+        if saved != {**legacy, 'revision': canonical_hash(legacy)}:
+            raise OwnerConflict('runtime_conditions_invalid')
+        return _value(quest_ref, saved['text'], default_style)
+    if saved != _value(quest_ref, saved['text'], saved['research_style']):
+        raise OwnerConflict('runtime_conditions_invalid')
     return saved
 
 
@@ -188,11 +198,11 @@ def read_runtime_conditions(workspace: Path, quest_ref: str) -> dict[str, str]:
     initial = _initial_conditions(root, quest_ref=quest_ref)
     if initial is None:
         raise OwnerConflict("runtime_conditions_quest_not_found")
-    return _read(root, initial[0], initial[1])
+    return _read(root, *initial)
 
 
 def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
-                            expected_revision: str) -> dict[str, str]:
+                            expected_revision: str, research_style: str | None = None) -> dict[str, str]:
     if not isinstance(text, str) or not text.strip() or len(text) > _LIMIT:
         raise OwnerConflict("runtime_conditions_text_invalid")
     with _LOCK:
@@ -205,7 +215,7 @@ def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
         directory.mkdir(parents=True, exist_ok=True)
         scope = current["quest_ref"]
         path = directory / (canonical_hash(scope) + ".json")
-        saved = _value(scope, text)
+        saved = _value(scope, text, current['research_style'] if research_style is None else research_style)
         fd, name = tempfile.mkstemp(prefix=".conditions-", dir=directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -228,11 +238,11 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
                                   initialization_id=initialization_id, target_ref=target_ref)
     if initial is None:
         return ""
-    scope, default_text = initial
-    current = _read(root, scope, default_text)
+    current = _read(root, *initial)
     return (
         "本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。"
         "同类旧运行条件以本段为准；已经接纳的研究成果、精确输入与正式授权仍按原记录核验。\n"
+        + render_research_style(current['research_style']) + '\n'
         + json.dumps(current, ensure_ascii=False, separators=(",", ":"))
     )
 

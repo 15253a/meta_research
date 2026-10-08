@@ -29,6 +29,7 @@ from meta_research.owners.research_memory import (
 from meta_research.reasoning_contract import (
     SCIENTIFIC_OUTCOMES,
     ReasoningContractError,
+    assemble_reasoning_authoritative_metadata,
     current_target_evidence_leaves,
     plan_evidence_reuse_leaves,
 )
@@ -38,6 +39,7 @@ from meta_research.reasoning_skill import (
     ReasoningSkillDraft,
     ReasoningSkillProvider,
     ReasoningSkillRequest,
+    ReasoningSkillResult,
     ReasoningSkillUnavailable,
     RecoverableReasoningSkillCandidateError,
     validate_reasoning_autonomous_checkpoint_result,
@@ -395,6 +397,10 @@ class ReasoningStageWorker:
                     raise OwnerConflict("reasoning_summary_binding_invalid")
                 summary = {"kind": "LiteratureSnapshot", "source_ref": facts["snapshot_ref"], "version_ref": facts["snapshot_ref"], "summary_ref": snapshot["summary_ref"], "summary_hash": snapshot["summary_hash"], "summary": snapshot["summary"]}
             decision = self._provider.decide_after_deepfetch(skill_request, checkpoint.checkpoint, facts, summary)
+            if isinstance(decision.get("final_output"), dict):
+                decision = {**decision, "final_output": _assemble_provider_document(
+                    skill_request, decision["final_output"],
+                )}
             validate_reasoning_deepfetch_decision(skill_request, decision, facts)
             if self._agent_runtime.park_root_provider_session_for_human_request(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=run.native_session_ref, runtime_binding_hash=run.runtime_binding_hash):
                 self._finish_provider_job(job_ref)
@@ -496,6 +502,9 @@ class ReasoningStageWorker:
             try:
                 try:
                     draft = self._provider.generate_draft(skill_request)
+                    draft = replace(draft, draft=_assemble_provider_document(
+                        skill_request, draft.draft,
+                    ))
                     draft_hash, _outcome_hash, _transition_hash = (
                         validate_reasoning_skill_draft(skill_request, draft)
                     )
@@ -643,6 +652,7 @@ class ReasoningStageWorker:
         try:
             try:
                 result = self._provider.review_draft(skill_request, draft)
+                result = _assemble_provider_result(skill_request, result)
                 if isinstance(result, ReasoningAutonomousCheckpointResult):
                     (
                         checkpoint_hash,
@@ -1032,6 +1042,7 @@ class ReasoningStageWorker:
                     checkpoint,
                     creation_result,
                 )
+                result = _assemble_provider_result(skill_request, result)
                 (
                     reviewed_checkpoint_hash,
                     final_output_hash,
@@ -1518,6 +1529,34 @@ def _is_current_reasoning_foreground(
         and foreground.get("status") == "active"
         and type(foreground.get("epoch")) is int
         and cast(int, foreground["epoch"]) >= 1
+    )
+
+
+def _assemble_provider_document(
+    request: ReasoningSkillRequest, output: dict[str, object],
+) -> dict[str, object]:
+    try:
+        return assemble_reasoning_authoritative_metadata(
+            output,
+            frozen_research_context=cast(dict[str, object], request.context_pack["research_context"]),
+        )
+    except ReasoningContractError as error:
+        raise RecoverableReasoningSkillCandidateError(str(error)) from error
+
+
+def _assemble_provider_result(
+    request: ReasoningSkillRequest,
+    result: ReasoningSkillResult | ReasoningAutonomousCheckpointResult,
+) -> ReasoningSkillResult | ReasoningAutonomousCheckpointResult:
+    if isinstance(result, ReasoningAutonomousCheckpointResult):
+        return replace(result,
+            primary_draft=_assemble_provider_document(request, result.primary_draft),
+            reviewed_checkpoint=_assemble_provider_document(request, result.reviewed_checkpoint),
+        )
+    output = _assemble_provider_document(request, result.outcome_document())
+    return replace(result,
+        reviewed_draft=_assemble_provider_document(request, result.reviewed_draft),
+        scientific_outcome=cast(dict[str, object], output["scientific_outcome"]),
     )
 
 

@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useReplyStream } from "./chatReplyStream";
+import { MetaTrace } from "./MetaTrace";
 import {
   authorizeHumanCommand,
   confirmHumanCommand,
@@ -15,12 +16,14 @@ import {
   convertAgentProposalToSoftConstraint,
   deliverPendingHumanRequestResponse,
   createHumanCommand,
+  downloadHumanRequestHandoff,
   executeHumanCommand,
   hydratePendingHumanRequestRecovery,
   pendingHumanRequestResponse,
   hasLegacyHumanRequestMaterial,
   previewHumanCommand,
   ProductError,
+  readHumanRequestHandoff,
   reconcileHumanRequestResponses,
   respondToHumanRequest,
   retryHumanRequest,
@@ -36,6 +39,7 @@ import {
   type HumanCommandDraft,
   type HumanCapabilityCommandDraft,
   type HumanRequestImpactPreview,
+  type HumanRequestHandoff,
   type HumanRequestItem,
   type HumanRequestResponseBody,
   type HumanReplyMaterial,
@@ -453,7 +457,7 @@ export function QuestCompanion({
       tabIndex={0}
     >
       <header className="lumen-companion-head">
-        <span className="lumen-orb" aria-hidden="true" />
+        <span className="lumen-orb" aria-hidden="true"><MetaTrace variant="assistant" /></span>
         <div>
           <b>研究助手</b>
           <small>{questionContext
@@ -2252,6 +2256,7 @@ function HumanRequestView({
       </header>
       <div className="hc-request-workspace">
         <main className="hc-request-core">
+          <RequestHandoff key={`${request.request_ref}:${request.revision}`} request={request} onChanged={onChanged} />
           <RequestForm
             request={request}
             commands={collaboration?.commands.items ?? []}
@@ -2269,6 +2274,76 @@ function HumanRequestView({
         />
       </div>
     </>
+  );
+}
+
+function RequestHandoff({ request, onChanged }: { request: HumanRequestItem; onChanged: () => void }) {
+  const [handoff, setHandoff] = useState<HumanRequestHandoff | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [readAttempt, setReadAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    void readHumanRequestHandoff(request.request_ref, request.revision, controller.signal)
+      .then((value) => setHandoff(value))
+      .catch((caught) => {
+        if (!controller.signal.aborted) setError(reasonCode(caught));
+      });
+    return () => controller.abort();
+  }, [request.request_ref, request.revision, readAttempt]);
+  const download = async (format: "md" | "html" | "pdf") => {
+    if (!handoff || downloading) return;
+    setDownloading(format);
+    setError(null);
+    try {
+      const blob = await downloadHumanRequestHandoff(request.request_ref, request.revision, format);
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `human-request-${request.request_id}-r${request.revision}.${format}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
+    } catch (caught) {
+      setError(reasonCode(caught));
+    } finally {
+      setDownloading(null);
+    }
+  };
+  return (
+    <section className="hc-handoff" aria-label="求助交接材料">
+      <header><h3>求助交接材料</h3><small>请求修订 {request.revision}</small></header>
+      <div className="hc-handoff-downloads" aria-label="下载求助交接材料" aria-busy={downloading !== null}>
+        {([ ["md", "Markdown"], ["html", "HTML"], ["pdf", "PDF"] ] as const).map(([format, label]) => (
+          <button key={format} type="button" disabled={!handoff || downloading !== null} onClick={() => void download(format)}>
+            {downloading === format ? `正在下载 ${label}…` : `下载 ${label}`}
+          </button>
+        ))}
+      </div>
+      {error ? <div role="alert">
+        <p>{error === "request_failed:409"
+          ? "这张请求的修订无法确认，请重新读取后下载交接材料。"
+          : "交接材料暂时无法读取，请重试。"}</p>
+        <button type="button" onClick={() => {
+          setError(null);
+          setReadAttempt((attempt) => attempt + 1);
+          onChanged();
+        }}>重新读取请求</button>
+      </div> : null}
+      {!handoff && !error ? <p role="status">正在读取求助说明…</p> : null}
+      {handoff?.is_current === false ? (
+        <p>这是历史请求修订；正式提交前，请先确认当前请求。</p>
+      ) : null}
+      {handoff?.sections.map((section) => (
+        <section key={section.key}>
+          <h4>{section.title}</h4>
+          {section.paragraphs.map((paragraph, index) => (
+            <p key={index}>{renderAgentText(paragraph)}</p>
+          ))}
+        </section>
+      ))}
+    </section>
   );
 }
 

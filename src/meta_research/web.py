@@ -60,6 +60,9 @@ from meta_research.root_operation_diagnostics import (
 from meta_research.stage_root_observations import StageRootObservationError
 from meta_research.root_session_observations import RootSessionObservations
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
+from meta_research.human_request_handoff import (
+    build_human_request_handoff, handoff_html, handoff_markdown, handoff_pdf,
+)
 
 
 SESSION_COOKIE = "meta_research_session"
@@ -194,6 +197,7 @@ class QuestDraftV2Request(BaseModel):
     goal: str = Field(max_length=4000)
     completion_criteria: str = Field(max_length=4000)
     time_budget: Literal["7d", "30d", "90d", "open"] = "open"
+    research_style: Literal['focus', 'balanced', 'open'] = 'balanced'
     route: Literal["direct", "deepfetch"] = "direct"
     resource_envelope_ref: str | None = Field(default=None, max_length=64)
     resource_envelope_hash: str | None = Field(default=None, max_length=64)
@@ -752,6 +756,7 @@ class RuntimeConditionsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=24000)
     expected_revision: str = Field(min_length=64, max_length=64)
+    research_style: Literal['focus', 'balanced', 'open'] | None = None
 
 
 def create_app(
@@ -1431,6 +1436,42 @@ def create_app(
             lambda: runtime.owners.human_collaboration.query_manual_drafting_reply(
                 context_ref, turn_ref
             ),
+        )
+
+    def read_human_request_revision(request_ref: str, revision: int) -> dict[str, object]:
+        with runtime._database.read_snapshot():
+            recorded = runtime.owners.human_collaboration.query_human_request(
+                request_ref, materialize_expiration=False
+            )
+            if recorded is None:
+                raise OwnerConflict("human_request_not_found")
+            if recorded["revision"] != revision:
+                raise OwnerConflict("human_request_revision_conflict")
+            return recorded
+
+    @app.get("/api/v1/human-requests/{request_ref}")
+    def read_human_request(
+        request_ref: str, revision: int = Query(ge=1)
+    ) -> dict[str, object]:
+        return read_human_request_revision(request_ref, revision)
+
+    @app.get("/api/v1/human-requests/{request_ref}/handoff")
+    def read_human_request_handoff(
+        request_ref: str, revision: int = Query(ge=1)
+    ) -> dict[str, object]:
+        return build_human_request_handoff(read_human_request_revision(request_ref, revision))
+
+    @app.get("/api/v1/human-requests/{request_ref}/handoff.{format}")
+    def download_human_request_handoff(
+        request_ref: str, format: Literal["md", "html", "pdf"], revision: int = Query(ge=1)
+    ) -> Response:
+        recorded = read_human_request_revision(request_ref, revision)
+        handoff = build_human_request_handoff(recorded)
+        body = {"md": handoff_markdown, "html": handoff_html, "pdf": handoff_pdf}[format](handoff)
+        filename = f"human-request-{recorded['request_id']}-r{revision}.{format}"
+        return Response(
+            content=body, media_type={"md": "text/markdown", "html": "text/html", "pdf": "application/pdf"}[format],
+            headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"},
         )
 
     @app.post("/api/v1/human-requests/{request_ref}/responses", status_code=201)

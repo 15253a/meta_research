@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from meta_research.provider_supervisor import (
     write_exit_receipt,
 )
 from meta_research.reasoning_skill import CodexReasoningSkillAdapter
+from meta_research.runtime_conditions import read_runtime_conditions, save_runtime_conditions
+from test_runtime_conditions import root
 from test_deepfetch_adapter import (
     DurableSegmentSequenceRunner, RecordingRunner, _deepfetch_web_evidence_gate_output_schema,
     _request,
@@ -32,7 +35,8 @@ class _SignedRunner:
 
     def __call__(self, argv, prompt, timeout, environment=None):
         self.calls.append((argv, prompt))
-        Path(argv[argv.index("--output-last-message") + 1]).write_text('{"ok":true}')
+        Path(argv[argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(getattr(self, 'output', {'ok': True})))
         return subprocess.CompletedProcess(
             argv, 0,
             '{"type":"thread.started","thread_id":"runtime-native"}\n'
@@ -64,6 +68,37 @@ def _idea_call(adapter, *, job="job:initial", prompt="Research the actual questi
         native_session_ref=native, job_ref=job, run_ref="stage-run:current",
         attempt_ref=None, root_session_ref="session:current", fence_ref=None,
     )
+
+
+def test_public_idea_provider_receives_saved_style_and_restores_original_operation_snapshot(root):
+    from test_idea_skill_contract import _request as idea_request, _idea_set
+    original = read_runtime_conditions(root, 'quest-one')
+    current = save_runtime_conditions(root, 'quest-one', text=original['text'],
+        research_style='focus', expected_revision=original['revision'])
+    runner = _SignedRunner()
+    runner.output = {'outcome': _idea_set()}
+    workspace = root/'idea-provider'
+    adapter = CodexIdeaSkillAdapter(workspace, executable=sys.executable, process_runner=runner)
+    request = idea_request(runtime_binding=adapter.runtime_binding(), run_ref='run-one',
+        job_ref='style:first-operation')
+    first = adapter.generate_draft(request)
+    first_prompt = runner.calls[0][1]
+    assert '聚焦攻关：集中推进当前研究目标' in first_prompt
+    assert 'GPU-one-3' in first_prompt and '30d' in first_prompt
+    assert '不取消或覆盖人的持续条件' in first_prompt
+    save_runtime_conditions(root, 'quest-one', text=current['text'],
+        research_style='open', expected_revision=current['revision'])
+    # Reconstructed provider replays the same signed operation after the edit.
+    reconstructed = CodexIdeaSkillAdapter(workspace, executable=sys.executable, process_runner=runner)
+    assert reconstructed.generate_draft(request) == first
+    assert len(runner.calls) == 1
+    reconstructed.generate_draft(replace(request, job_ref='style:next-operation',
+        native_session_ref=first.primary_session_ref))
+    next_prompt = runner.calls[1][1]
+    assert '开放探索：主动探索新方向' in next_prompt
+    assert '联系已有研究积累' in next_prompt
+    assert 'GPU-one-3' in next_prompt and '30d' in next_prompt
+    assert '不取消或覆盖人的持续条件' in next_prompt
 
 
 @pytest.fixture

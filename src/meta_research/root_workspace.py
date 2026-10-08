@@ -172,6 +172,19 @@ class RootWorkspaces:
                 launch.stage_request_ref, target_ref))
         return tuple(locations)
 
+    def read_cycle_stage_workspace_locations(self, cycle_ref: str) -> tuple[WorkspaceLocation, ...]:
+        """Locate recorded stage work without creating or reopening directories."""
+        locations = []
+        for request in self._ae.query_cycle_stage_requests(cycle_ref):
+            run = getattr(self._ar, 'query_' + request.stage + '_stage_run')(request.request_ref)
+            if run is None:
+                continue
+            location = self._runtime_location(run.run_ref)
+            if location.cycle_ref != cycle_ref or location.request_ref != request.request_ref:
+                raise OwnerConflict('workspace_lineage_invalid')
+            locations.append(location)
+        return tuple(locations)
+
     def _target_location(self, target_ref: str) -> WorkspaceLocation:
         return self._target_locations(target_ref)[0]
 

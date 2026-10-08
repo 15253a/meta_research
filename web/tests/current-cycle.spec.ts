@@ -329,7 +329,7 @@ async function openCurrentCycle(page: Page, activeBundle = false) {
   const reasoning = session("reasoning-root-session-143", "stage", "Reasoning", "reasoning", "waiting", [operation("reasoning-primary-143", "形成研究判断", "primary")]);
   const bundle = session("bundle-root-session-143", "stage", "Bundle", "bundle", "completed", [operation("bundle-primary-143", "初始实验安排", "primary")]);
   const target = session("target-root-session-143-a", "target", "Target T1 · 检验关键假设 A", "bundle", "completed", [operation("target-turn-143-a", "检验关键假设 A", "harness_turn:1")]);
-  target.short_title = "Target T1"; target.target_ref = "target-143-a"; target.owner_session_ref = bundle.session_ref;
+  target.short_title = "Target T1"; target.target_ref = "target-143-a"; target.run_ref = "target-run-143-a"; target.owner_session_ref = bundle.session_ref;
   const deepfetch = session("deepfetch-root-session-143", "deepfetch", "DeepFetch · 文献检索", "reasoning", "executing", [operation("deepfetch-turn-143", "检索资料", "turn:1", "executing")]);
   deepfetch.owner_session_ref = reasoning.session_ref; deepfetch.creation_context_kind = "autonomous_question_creation";
   const acquisition = session("acquisition-root-session-143", "acquisition", "Acquisition · 获取资料", null, "waiting", []);
@@ -463,6 +463,72 @@ test("QuestionTree marks only the foreground Question and keeps its facts separa
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
   }
   expect(f.nonGetRequests).toEqual([]); expect(f.errors).toEqual([]);
+});
+
+test("static reading respects reduced motion and persists without pausing research", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const f = await openCurrentCycle(page, true);
+  const control = page.getByRole("button", { name: "静止画面", exact: true });
+  await expect(control).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("html")).toHaveAttribute("data-research-motion", "still");
+  await expect(page.getByTestId("current-cycle-overview")).toHaveAttribute("data-cycle-ref", CYCLE_REF);
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await expect(control).toHaveAttribute("aria-pressed", "false");
+  await control.click();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(control).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("html")).toHaveAttribute("data-research-motion", "still");
+  expect(f.nonGetRequests).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test("research decoration stops offscreen, in background and without an actual execution", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const f = await openCurrentCycle(page, true);
+  const spectrum = page.getByRole("region", { name: "研究光谱", exact: true });
+  await spectrum.scrollIntoViewIfNeeded();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  const main = page.locator("main.lumen-main");
+  await main.evaluate(node => { node.scrollTop = node.scrollHeight; });
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  await spectrum.scrollIntoViewIfNeeded();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  f.target.is_executing = false;
+  f.target.status = "waiting";
+  f.catalog.active_session_refs = [];
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false", { timeout: 15_000 });
+  expect(f.nonGetRequests).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test("a running stage lease does not animate a waiting root with no executing Target", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1700 });
+  const f = await openCurrentCycle(page, true);
+  f.target.is_executing = false;
+  f.target.status = "waiting";
+  f.catalog.active_session_refs = [];
+  f.snapshot.bundle_stage!.run = {
+    run_ref: f.bundle.run_ref!, status: "active", attempt_ref: "bundle-attempt-waiting", blocker: null,
+  };
+  f.snapshot.research_control.managed_runs.push({ ...f.snapshot.research_control.managed_runs[0],
+    run_ref: f.bundle.run_ref!, run_kind: "bundle_stage", epoch: 3, status: "running", root_session_ref: f.bundle.session_ref,
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const brief = page.getByRole("region", { name: "研究近况", exact: true });
+  await expect(brief).toHaveAttribute("data-motion-active", "false");
+  await expect(brief).toContainText("等待继续条件");
+  expect(f.nonGetRequests).toEqual([]);
+  expect(f.errors).toEqual([]);
 });
 
 test("root activity preserves source and Cycle scope, reports empty output honestly, and follows the main view", async ({ page }) => {
