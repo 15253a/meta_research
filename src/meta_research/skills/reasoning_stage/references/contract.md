@@ -25,9 +25,13 @@ candidate_completion: CandidateCompletion | null
 
 每项科学引用恰含 `kind + ref + finding`，引用冻结闭包、Plan 精确复用或同 Quest 可核验历史。Owner 逐条检查精确版本、范围和来源；引用类别、数量和是否测量不预设科研资格。纯理论可零外部引用，仍说明推导和局限。disposition 对 claim、missing 和 uncertainty 的具体形状由当前 `reasoning_contract.py` 校验。
 
-以字符串 ref 为元素的引用数组，每项只放一个原样精确 ref，数组内不重复；多个来源用独立数组项，不用分号、逗号或说明文字拼进同一字符串。`causal_interpretation` 的 `target_commit_refs`、`changed_axis_fact_refs`、`held_fixed_fact_refs`、`provenance_refs` 分别原样采用 ContextPack `research_context.causal_context` 中的对应完整数组，保持顺序与空数组，不跨字段搬移引用；`attribution_basis_refs` 只列实际引用的依据，解释写入 statement、finding 等正文。
+本次冻结 `research_context/v3` 的可用来源与已知历史身份由系统装配。模型输出的 `causal_interpretation` 只写 `attribution_basis_refs`、`claim_scope`、`statement`、`sufficiency_rationale`、`confounders`；`research_synthesis.current_question` 只写 `question_ref` 与 `progress`。四组冻结因果来源数组和 `prior_accepted_outcome_refs` 在模型完成后、hash 与接纳前由系统绑定同一冻结版本，随正式内容保存并供后继读取。可用来源不会因此成为已阅读、已采用或已支持某结论的证据。
 
-`research_synthesis.current_question.prior_accepted_outcome_refs` 按冻结 `research_context.graph_binding.prior_current_question_outcomes` 的顺序逐项复制完整 `outcome_ref`，没有历史时写 `[]`。每个字符串写完一个完整 ref 就闭合引号，再进入下一项；逐项核对整个列表，认识变化写入 `progress`。
+`evidence` 和 `attribution_basis_refs` 由 Agent 选择实际采用的精确依据。以字符串 ref 为元素的引用数组每项放一个完整 ref，多个来源各列一项；解释写入 statement、finding 等正文。例如冻结来源含两个 TargetCommit，但只有一份文献与本次结论相关时，选择该文献作为 evidence／attribution basis，分别解释支持范围和因果局限；系统仍保存两个 TargetCommit 的可用来源绑定。
+
+每个冻结父 Question 的 `impact` 与 `statement` 仍由 Agent 独立判断，保持 `question_ref` 将判断明确关联到其对象，系统再按冻结父链顺序整理。这个引用承载判断对象的语义，不能从无对象的正文推定。系统携带当前 Question 的已知历史 outcome 身份，认识变化由 `progress` 表达。错误来源、错版本和冲突身份会指出具体对象并拒绝，沿反馈修订真实声明。
+
+恢复冻结 `research_context/v2` 的历史操作时，使用[历史输出契约](legacy-v2-contract.md)；既有内容与 hash 保持原契约。
 
 `support_scope`、`limitations`、`causal_interpretation` 和四尺度 `research_synthesis` 表达认识和继续／改变／等待理由，允许认识未变。AE 冻结 graph revision、活动问题、父链、当前 Question 历史页、Goal revision、上游 Commit 和 Target 来源；有界历史页含总量与继续入口，不代表完整历史。正文按当前冻结版本核验，恢复不切换 latest。
 

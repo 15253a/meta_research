@@ -380,6 +380,297 @@ def test_affirmed_accepts_a_frozen_literature_record() -> None:
     assert len(outcome_hash) == 64
 
 
+def test_reasoning_assembles_frozen_sources_without_adopting_available_evidence() -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    context["causal_context"] = {
+        "target_commit_refs": ["target-commit:1", "target-commit:2"],
+        "changed_axis_fact_refs": ["changed-axis-fact:1"],
+        "held_fixed_fact_refs": ["held-fixed-fact:1"],
+        "provenance_refs": ["provenance:1"],
+    }
+    outcome = output["scientific_outcome"]
+    assert isinstance(outcome, dict)
+    causal = outcome["causal_interpretation"]
+    assert isinstance(causal, dict)
+    for field in context["causal_context"]:
+        del causal[field]
+    current = outcome["research_synthesis"]["current_question"]
+    del current["prior_accepted_outcome_refs"]
+    original = deepcopy(output)
+
+    assembled = assemble_reasoning_authoritative_metadata(
+        output, frozen_research_context=context,
+    )
+
+    bound = assembled["scientific_outcome"]
+    assert isinstance(bound, dict)
+    assert bound["causal_interpretation"] == {
+        "target_commit_refs": ["target-commit:1", "target-commit:2"],
+        "changed_axis_fact_refs": ["changed-axis-fact:1"],
+        "held_fixed_fact_refs": ["held-fixed-fact:1"],
+        "provenance_refs": ["provenance:1"],
+        "attribution_basis_refs": ["literature-record:1"],
+        "claim_scope": "The bounded association in the accepted literature.",
+        "statement": "The literature supports an association, not an intervention.",
+        "sufficiency_rationale": "No causal TargetCommit was frozen.",
+        "confounders": ["No controlled intervention was frozen."],
+    }
+    assert bound["research_synthesis"]["current_question"] == {
+        "question_ref": "question:1",
+        "prior_accepted_outcome_refs": ["scientific-outcome:prior"],
+        "progress": "The current outcome narrows the prior uncertainty.",
+    }
+    assert bound["evidence"] == [
+        {"kind": "LiteratureRecord", "ref": "literature-record:1", "finding": "supporting"}
+    ]
+    assert output == original
+    assert validate_reasoning_stage_output(
+        assembled,
+        frozen_evidence_closure=[*_literature_closure(), *_metric_result_closure()],
+        frozen_research_context=context,
+    )[0] == canonical_hash(assembled)
+
+
+def test_reasoning_normalizes_known_source_subsets_and_order() -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    context["causal_context"] = {
+        "target_commit_refs": ["target-commit:1", "target-commit:2"],
+        "changed_axis_fact_refs": ["changed-axis-fact:1", "changed-axis-fact:2"],
+        "held_fixed_fact_refs": ["held-fixed-fact:1"],
+        "provenance_refs": ["provenance:1"],
+    }
+    context["graph_binding"]["prior_current_question_outcomes"].append({
+        "cycle_ref": "cycle:prior-2",
+        "request_ref": "stage-request:prior-2",
+        "outcome_ref": "scientific-outcome:prior-2",
+        "disposition": "uncertain",
+        "outcome_receipt_ref": "rg-reasoning-receipt:prior-2",
+    })
+    outcome = output["scientific_outcome"]
+    causal = outcome["causal_interpretation"]
+    causal["target_commit_refs"] = ["target-commit:2", "target-commit:1"]
+    causal["changed_axis_fact_refs"] = ["changed-axis-fact:2"]
+    outcome["research_synthesis"]["current_question"]["prior_accepted_outcome_refs"] = [
+        "scientific-outcome:prior-2", "scientific-outcome:prior",
+    ]
+
+    assembled = assemble_reasoning_authoritative_metadata(
+        output, frozen_research_context=context,
+    )
+
+    bound = assembled["scientific_outcome"]
+    assert bound["causal_interpretation"]["target_commit_refs"] == [
+        "target-commit:1", "target-commit:2",
+    ]
+    assert bound["causal_interpretation"]["changed_axis_fact_refs"] == [
+        "changed-axis-fact:1", "changed-axis-fact:2",
+    ]
+    assert bound["causal_interpretation"]["held_fixed_fact_refs"] == ["held-fixed-fact:1"]
+    assert bound["causal_interpretation"]["provenance_refs"] == ["provenance:1"]
+    assert bound["research_synthesis"]["current_question"]["prior_accepted_outcome_refs"] == [
+        "scientific-outcome:prior", "scientific-outcome:prior-2",
+    ]
+    assert validate_reasoning_stage_output(
+        assembled,
+        frozen_evidence_closure=_literature_closure(),
+        frozen_research_context=context,
+    )[0] == canonical_hash(assembled)
+
+
+@pytest.mark.parametrize("field,wrong_ref", [
+    ("target_commit_refs", "target-commit:wrong-version"),
+    ("changed_axis_fact_refs", "changed-axis-fact:other-execution"),
+    ("held_fixed_fact_refs", "held-fixed-fact:forged"),
+    ("provenance_refs", "provenance:outside-scope"),
+    ("prior_accepted_outcome_refs", "scientific-outcome:other-question"),
+])
+def test_reasoning_reports_the_conflicting_authoritative_source(
+    field: str, wrong_ref: str,
+) -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    outcome = output["scientific_outcome"]
+    target = (outcome["research_synthesis"]["current_question"]
+              if field == "prior_accepted_outcome_refs"
+              else outcome["causal_interpretation"])
+    target[field] = [wrong_ref]
+    original = deepcopy(output)
+
+    with pytest.raises(
+        ReasoningContractError,
+        match=rf"scientific_outcome_authoritative_metadata_conflict:.*{field}.*{wrong_ref}",
+    ):
+        assemble_reasoning_authoritative_metadata(output, frozen_research_context=context)
+
+    assert output == original
+
+
+@pytest.mark.parametrize("field,supplied,expected", [
+    ("cycle_ref", "cycle:stale", "cycle:1"),
+    ("question_ref", "question:other", "question:1"),
+    ("quest_ref", "quest:outside-scope", "quest:1"),
+    ("goal_revision_ref", "goal-revision:old", "goal-revision:1"),
+])
+def test_new_reasoning_reports_the_conflicting_execution_context_identity(
+    field: str, supplied: str, expected: str,
+) -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    output["scientific_outcome"][field] = supplied
+    original = deepcopy(output)
+
+    with pytest.raises(
+        ReasoningContractError,
+        match=(rf"scientific_outcome_authoritative_metadata_conflict:scientific_outcome.{field}"
+               rf":supplied={supplied}:expected={expected}"),
+    ):
+        assemble_reasoning_authoritative_metadata(output, frozen_research_context=context)
+
+    assert output == original
+    context["schema_ref"] = "meta-research/reasoning-research-context/v2"
+    assert assemble_reasoning_authoritative_metadata(
+        output, frozen_research_context=context,
+    ) == original
+
+
+def test_reasoning_orders_parent_identities_without_inventing_their_impact() -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    graph = context["graph_binding"]
+    graph["active_question_refs"] = ["question:1", "question:grandparent", "question:parent"]
+    graph["parent_question_bindings"][0]["parent_question_ref"] = "question:grandparent"
+    graph["parent_question_bindings"].append({
+        "question_ref": "question:grandparent",
+        "parent_question_ref": None,
+        "question_receipt_ref": "rg-question-receipt:grandparent",
+    })
+    output["scientific_outcome"]["research_synthesis"]["parent_questions"].insert(0, {
+        "question_ref": "question:grandparent",
+        "impact": "no_material",
+        "statement": "This bounded result does not resolve the wider ancestor question.",
+    })
+
+    assembled = assemble_reasoning_authoritative_metadata(
+        output, frozen_research_context=context,
+    )
+
+    assert assembled["scientific_outcome"]["research_synthesis"]["parent_questions"] == [
+        {
+            "question_ref": "question:parent",
+            "impact": "material",
+            "statement": "The bounded result supports one parent branch.",
+        },
+        {
+            "question_ref": "question:grandparent",
+            "impact": "no_material",
+            "statement": "This bounded result does not resolve the wider ancestor question.",
+        },
+    ]
+    assert validate_reasoning_stage_output(
+        assembled,
+        frozen_evidence_closure=_literature_closure(),
+        frozen_research_context=context,
+    )[0] == canonical_hash(assembled)
+
+
+def test_reasoning_requires_agent_impact_for_each_known_parent() -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    output["scientific_outcome"]["research_synthesis"]["parent_questions"] = []
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="scientific_outcome_research_synthesis_invalid:.*missing_impact_for:question:parent",
+    ):
+        assemble_reasoning_authoritative_metadata(output, frozen_research_context=context)
+
+
+@pytest.mark.parametrize("legacy_shape", ["omitted", "reversed"])
+def test_historical_reasoning_keeps_its_frozen_output_contract(legacy_shape: str) -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["causal_context"]["target_commit_refs"] = ["target-commit:1", "target-commit:2"]
+    causal = output["scientific_outcome"]["causal_interpretation"]
+    if legacy_shape == "omitted":
+        del causal["target_commit_refs"]
+    else:
+        causal["target_commit_refs"] = ["target-commit:2", "target-commit:1"]
+    original_hash = canonical_hash(output)
+
+    historical = assemble_reasoning_authoritative_metadata(
+        output, frozen_research_context=context,
+    )
+
+    assert canonical_hash(historical) == original_hash
+    assert historical == output
+    with pytest.raises(ReasoningContractError, match="scientific_outcome_causal_interpretation_invalid"):
+        validate_reasoning_stage_output(
+            historical,
+            frozen_evidence_closure=_literature_closure(),
+            frozen_research_context=context,
+        )
+
+
+@pytest.mark.parametrize("conflict", ["unknown", "duplicate"])
+def test_reasoning_keeps_parent_impact_bound_to_a_unique_known_question(conflict: str) -> None:
+    from meta_research.reasoning_contract import (
+        assemble_reasoning_authoritative_metadata,
+    )
+
+    output = _stage_output()
+    context = _research_context()
+    context["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    parents = output["scientific_outcome"]["research_synthesis"]["parent_questions"]
+    if conflict == "unknown":
+        parents[0]["question_ref"] = "question:outside-quest"
+        wrong_ref = "question:outside-quest"
+    else:
+        parents.append(deepcopy(parents[0]))
+        wrong_ref = "question:parent"
+
+    with pytest.raises(
+        ReasoningContractError,
+        match=rf"scientific_outcome_authoritative_metadata_conflict:.*parent_questions.question_ref:{wrong_ref}",
+    ):
+        assemble_reasoning_authoritative_metadata(output, frozen_research_context=context)
+
+
 def test_scientific_outcome_requires_complete_multiscale_synthesis() -> None:
     outcome = _scientific_outcome()
     synthesis = outcome["research_synthesis"]
