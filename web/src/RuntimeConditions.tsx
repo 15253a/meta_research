@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchQuestRuntimeConditions, fetchQuestRuntimeDevices, ProductError, saveQuestRuntimeConditions, type QuestRuntimeConditions, type ResearchStyle } from "./api";
 import { RESEARCH_STYLES, researchStyleLabel } from "./researchStyle";
 import { ExternalMcpSettings } from "./ExternalMcpSettings";
+import { SearchSourcesSettings } from "./SearchSourcesSettings";
 import {
   isConditionsObject, mergeRuntimeConditionDevices, parseRuntimeConditions, replaceRuntimeConditionsJson,
   runtimeConditionDeviceIds, runtimeConditionDevices, updateRuntimeConditionDevices,
@@ -236,6 +237,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
         <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || (text === basis.text && researchStyle === (basis.research_style ?? "balanced"))}>
           {saving ? "正在保存…" : "保存运行条件"}</button></footer>
     </form> : <header className="runtime-conditions-pre-quest"><h2 id="runtime-conditions-title">运行条件</h2><button type="button" aria-label="关闭运行条件" onClick={onClose}>×</button></header>}
+    <SearchSourcesSettings scope={questRef ? { kind: "quest", questRef } : { kind: "shared-only" }} />
     <ExternalMcpSettings />
   </dialog>;
 }

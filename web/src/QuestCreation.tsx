@@ -31,6 +31,7 @@ import {
 } from "./api";
 import { RESEARCH_STYLES } from "./researchStyle";
 import { CreationUnderstanding } from "./CreationUnderstanding";
+import { SearchSourcesSettings } from "./SearchSourcesSettings";
 import "./quest-creation.css";
 import { ProposalOutput } from "./ProposalOutput";
 import { useReplyStream } from "./chatReplyStream";
@@ -61,6 +62,7 @@ const blankDraft: QuestDraft = {
   literature: {
     mode: "oa_then_institution",
     library_entry_url: "",
+    institution_required: false,
     scope_exclusions: "",
     accepted_material_bindings: [],
   },
@@ -1557,6 +1559,7 @@ export function QuestCreationWorkbench({
                         literature: {
                           ...draft.literature,
                           mode: event.target.value as QuestDraft["literature"]["mode"],
+                          institution_required: event.target.value === "oa_then_institution" && Boolean(draft.literature.institution_required),
                         },
                       })}
                       onBlur={() => void persistDraft()}
@@ -1624,8 +1627,14 @@ export function QuestCreationWorkbench({
                           onBlur={() => void persistDraft()}
                         />
                       </label>
+                      <label className="quest-field">
+                        <span><input type="checkbox" aria-label="必须使用机构访问" checked={draft.literature.institution_required ?? false}
+                          disabled={!creation || draftInteractionLocked}
+                          onChange={event => updateDraft({ ...draft, literature: { ...draft.literature, institution_required: event.currentTarget.checked } })}
+                          onBlur={() => void persistDraft()} /> 必须使用机构访问</span>
+                      </label>
                       <small className="quest-library-boundary">
-                        不收集密码、Cookie、token、OTP 或浏览器 profile；入口 URL 只是 Quest 配置。
+                        图书馆用于获取已发现文献的全文。未填可选入口时继续公开全文路线；明确要求机构访问时保留权限求助。不收集密码、Cookie、token、OTP 或浏览器 profile。
                       </small>
                     </>
                   ) : draft.literature.mode === "oa_only" ? (
@@ -1657,6 +1666,19 @@ export function QuestCreationWorkbench({
                     </small>
                   ) : null}
                 </div>
+                <SearchSourcesSettings scope={creation ? { kind: "initialization", initializationId: creation.initialization_id } : { kind: "shared-only" }}
+                  onEnsureInitialization={async () => {
+                    const saved = await persistDraft();
+                    if (!saved) throw new Error("创建草稿尚未保存，请稍后重试。");
+                    return saved.initialization_id;
+                  }}
+                  onSelectionSaved={() => {
+                    const basis = creationRef.current;
+                    if (!basis) return;
+                    void fetchQuestCreation(basis.initialization_id).then(next => {
+                      if (mountedRef.current && creationRef.current?.initialization_id === basis.initialization_id) applyView(next, { syncProposal: !proposalDirtyRef.current });
+                    }).catch(showError);
+                  }} />
               </section>
 
               <section className="quest-journey-section" data-journey-section="materials" aria-labelledby="quest-materials-title">
@@ -2256,6 +2278,7 @@ function cloneDraft(value: QuestDraft): QuestDraft {
     research_style: value.research_style ?? "balanced",
     literature: {
       ...value.literature,
+      institution_required: value.literature.institution_required ?? false,
       accepted_material_bindings: value.literature.accepted_material_bindings.map(
         (binding) => ({ ...binding }),
       ),
@@ -2312,6 +2335,7 @@ function legacyDraftForWorkbench(value: LegacyQuestDraft): QuestDraft {
     literature: {
       mode: literatureMode[value.literature_scope] ?? "oa_only",
       library_entry_url: "",
+      institution_required: false,
       scope_exclusions: "",
       accepted_material_bindings: [],
     },
@@ -2402,6 +2426,7 @@ function literatureAcquisitionConfigChanged(
   right: QuestDraft,
 ): boolean {
   return left.literature.mode !== right.literature.mode ||
+    Boolean(left.literature.institution_required) !== Boolean(right.literature.institution_required) ||
     left.literature.library_entry_url.trim() !==
       right.literature.library_entry_url.trim();
 }

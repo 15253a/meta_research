@@ -272,6 +272,7 @@ export type QuestDraft = {
   literature: {
     mode: LiteratureMode;
     library_entry_url: string;
+    institution_required?: boolean;
     scope_exclusions: string;
     accepted_material_bindings: Array<Record<string, unknown>>;
   };
@@ -6089,3 +6090,66 @@ export const saveExternalMcp = (services: ExternalMcpService[], expected_revisio
   writeJson<ExternalMcpConfiguration>("/api/v1/external-mcp", "PUT", { services, expected_revision });
 export const testExternalMcpConnection = (connection: ExternalMcpConnection) =>
   writeJson<ExternalMcpConnectionTest>("/api/v1/external-mcp/test-connection", "POST", { connection });
+
+export type SearchSourceCredential = { mode: "keep" | "clear" } | { mode: "replace"; value: string };
+export type SearchSourceApiContract = {
+  endpoint: string; method: "GET"; query_parameter: string; limit_parameter?: string;
+  fixed_parameters?: Record<string, string>;
+  auth: { kind: "none" | "bearer" } | { kind: "header" | "query"; name: string };
+  items_path: string[];
+  fields: { title: string[]; url: string[]; doi?: string[]; arxiv?: string[]; version?: string[]; abstract?: string[] };
+  result_kind: "paper_metadata" | "abstract" | "web_lead";
+};
+type SearchSourceCommon = { name: string; instructions: string };
+export type SearchSourceSafeForm = SearchSourceCommon & (
+  | { kind: "website"; url: string }
+  | { kind: "api"; template: "crossref"; contract?: never }
+  | { kind: "api"; template: "custom"; contract: SearchSourceApiContract }
+  | { kind: "mcp"; connection_transport?: ExternalMcpConnection["transport"] }
+);
+export type SearchSourceForm = SearchSourceCommon & (
+  | { kind: "website"; url: string }
+  | { kind: "api"; template: "crossref"; credential: SearchSourceCredential }
+  | { kind: "api"; template: "custom"; contract: SearchSourceApiContract; credential: SearchSourceCredential }
+  | { kind: "mcp"; connection: { mode: "keep" } | { mode: "replace"; value: ExternalMcpConnection } }
+);
+export type SearchSourceTestReport = {
+  test_ref: string; configuration_token: string; tested_at: string;
+  capabilities: Record<string, { status: "verified" | "unverified" | "limited" | "failed"; reason: string }>;
+  tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>;
+  result_count: number | null;
+};
+export type SearchSourceView = {
+  source_id: string; version: number; form: SearchSourceSafeForm; credential_present: boolean;
+  connection_present: boolean; test: SearchSourceTestReport | null; needs_retest: boolean;
+};
+export type SearchSourceScope = { kind: "initialization"; initializationId: string } | { kind: "quest"; questRef: string };
+export type SearchSourceSelection = {
+  scope: { kind: "initialization"; initialization_id: string } | { kind: "quest"; quest_ref: string };
+  revision: number; allowed_source_ids: string[]; selection_hash: string;
+};
+export type SearchSourceSaveResult = {
+  source: SearchSourceView; receipt: { scope: "shared"; source_id: string; version: number };
+};
+export type SearchSourceSelectionResult = {
+  selection: SearchSourceSelection; receipt: { scope: SearchSourceSelection["scope"]; revision: number };
+};
+export const fetchSearchSources = (signal?: AbortSignal) =>
+  readResearchJson<{ sources: SearchSourceView[]; templates: Array<{ template_id?: string; id?: string; name?: string }> }>("/api/v1/search-sources", signal);
+export const testSearchSource = (form: SearchSourceForm, probe_query: string, source?: SearchSourceView) =>
+  writeJson<SearchSourceTestReport>("/api/v1/search-sources/test", "POST", {
+    form, probe_query, ...(source ? { source_id: source.source_id, expected_version: source.version } : {}),
+  });
+export const saveSearchSource = (form: SearchSourceForm, source?: SearchSourceView, matching_test_ref?: string) =>
+  writeJson<SearchSourceSaveResult>(source ? `/api/v1/search-sources/${encodeURIComponent(source.source_id)}` : "/api/v1/search-sources", source ? "PUT" : "POST", {
+    form, ...(source ? { expected_version: source.version } : {}), ...(matching_test_ref ? { matching_test_ref } : {}),
+  });
+function searchSourceScopePath(scope: SearchSourceScope) {
+  return scope.kind === "initialization"
+    ? `/api/v1/quest-initializations/${encodeURIComponent(scope.initializationId)}/search-sources`
+    : `/api/v1/quests/${encodeURIComponent(scope.questRef)}/search-sources`;
+}
+export const fetchSearchSourceSelection = (scope: SearchSourceScope, signal?: AbortSignal) =>
+  readResearchJson<{ selection: SearchSourceSelection; sources: SearchSourceView[] }>(searchSourceScopePath(scope), signal);
+export const saveSearchSourceSelection = (scope: SearchSourceScope, allowed_source_ids: string[], expected_revision: number) =>
+  writeJson<SearchSourceSelectionResult>(searchSourceScopePath(scope), "PUT", { allowed_source_ids, expected_revision });

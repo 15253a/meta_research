@@ -9,7 +9,8 @@ async function workspace(page: Page, preQuest = false) {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];
   if (preQuest) {
-    snapshot.research_space.current_quest = null; snapshot.research_space.current_question = null;
+    snapshot.research_space.current_quest = { ...snapshot.research_space.current_quest, status: "not_bound", quest_ref: null, guidance_alignment: [] };
+    snapshot.research_space.current_question = { ...snapshot.research_space.current_question, status: "not_bound", quest_ref: null, question_ref: null };
     snapshot.research_space.status = "empty"; snapshot.research_control.foreground = null; snapshot.research_control.quest_ref = null;
   }
   const state = {
