@@ -38,3 +38,26 @@ def test_an_unread_source_can_be_selected_but_cannot_support_a_content_claim():
     value["work_already_done"] = [{"ref": "work", "text": "Calibration was verified.", "kind": "reported_work", "conditions": [], "sources": [witness]}]
     with pytest.raises(OwnerConflict, match="creation_understanding_invalid"):
         validate_understanding(value, manifest, lambda entry, offset, length: content[offset:offset + length])
+
+
+@pytest.mark.parametrize("field", ["work_already_done", "claims_and_conditions", "conflicts"])
+def test_reference_schema_rejects_uncited_runtime_facts_like_content_validator(field):
+    from jsonschema import Draft202012Validator, ValidationError
+    from meta_research.creation_basis import understanding_schema, validate_reference_understanding
+    from meta_research.creation_inputs import CreationAnchor, CreationInputIdentity, MaterialSet
+
+    value = empty_understanding()
+    value[field] = [{"ref": "work-parent-boundary", "text": "The native parent ran a program and rejected external writes.",
+        "kind": "reported_work", "conditions": ["Runtime receipt only."], "sources": []}]
+    schema = Draft202012Validator(understanding_schema(references=True))
+    with pytest.raises(ValidationError):
+        schema.validate(value)
+    anchor = CreationAnchor("quest_initialization", "initialization", None, 1, "a" * 64)
+    inputs = MaterialSet(anchor, ())
+    with pytest.raises(OwnerConflict, match="creation_understanding_invalid"):
+        validate_reference_understanding(value, inputs, CreationInputIdentity(anchor, inputs.set_hash, ()), None)
+    value[field] = []
+    value["gaps"] = [{"ref": "gap", "text": "No research evidence supports this runtime observation.",
+        "kind": "agent_inference", "conditions": [], "sources": []}]
+    schema.validate(value)
+    validate_reference_understanding(value, inputs, CreationInputIdentity(anchor, inputs.set_hash, ()), None)

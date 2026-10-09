@@ -128,8 +128,15 @@ def understanding_schema(*, references=False) -> dict[str, object]:
             "source": {"oneOf": [original, work]},
             "custody": {"type": "string", "enum": ["managed", "linked_local"]},
             "reason": {"type": "string", "minLength": 1}}, "required": ["source", "custody", "reason"]}
+    statements = {}
+    for key in UNDERSTANDING_FIELDS:
+        item = statement
+        if references and key not in {"material_composition", "gaps", "unfinished_questions"}:
+            item = {**statement, "properties": {**statement["properties"],
+                "sources": {**statement["properties"]["sources"], "minItems": 1}}}
+        statements[key] = {"type": "array", "items": item}
     return {"type": "object", "additionalProperties": False, "properties": {
-        **{key: {"type": "array", "items": statement} for key in UNDERSTANDING_FIELDS},
+        **statements,
         "coverage": {"type": "array", "items": coverage},
         "selection": {"type": "array", "items": selection}},
         "required": [*UNDERSTANDING_FIELDS, "coverage", "selection"]}
