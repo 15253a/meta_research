@@ -31,6 +31,7 @@ import {
   fetchCurrentManualQuestionCreation,
   fetchLiteratureSnapshot,
   fetchManualQuestionCreation,
+  fetchQuestGoalHistory,
   fetchSnapshot,
   fetchStageRawOutput,
   fetchTargetRawOutput,
@@ -53,6 +54,7 @@ import {
   type HumanRequestItem,
   type PlanStageProjection,
   type PublicSnapshot,
+  type QuestGoalHistory,
   type QuestionTreeItem,
   type QuestCompletionView,
   type ReasoningStageProjection,
@@ -988,6 +990,53 @@ function nextStepSummary(snapshot: PublicSnapshot): string {
   return `等待 ${stage.kind} 当前步骤形成可确认结果`;
 }
 
+function GoalHistory({ questRef, initial }: { questRef: string; initial: QuestGoalHistory }) {
+  const [page, setPage] = useState(initial);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function load(offset: number) {
+    setLoading(true);
+    setError(null);
+    try {
+      setPage(await fetchQuestGoalHistory(questRef, offset));
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "目标历史读取失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+  return <>
+    <ol start={page.offset + 1}>{page.items.map((revision) => (
+      <li key={revision.goal_revision_ref}>
+        <b>版本 {revision.sequence ?? 0} · {revision.goal.goal}</b>
+        <p>完成标准：{revision.goal.completion_criteria}</p>
+        {revision.judgment ? <p>调整理由：{revision.judgment}</p> : null}
+        {revision.criteria_review ? <p>标准评审：{revision.criteria_review}</p> : null}
+        {revision.conditions ? <>
+          <p>当时运行条件：{revision.conditions.runtime_conditions.text}</p>
+          <ul>{revision.conditions.enduring.map((condition) => (
+            <li key={condition.condition_ref}>
+              {condition.source_text} · {condition.meaning}
+              {typeof condition.source.delivery_ref === "string" ? <span> · 来源 {condition.source.delivery_ref}</span> : null}
+            </li>
+          ))}</ul>
+          <ul>{revision.conditions_review?.assessments.map((assessment) => (
+            <li key={assessment.condition_ref}>
+              {assessment.disposition === "preserved" ? "继续保留" : "后续人类指导取代"} · {assessment.explanation}
+              {assessment.superseding_delivery_ref ? <span> · 来源 {assessment.superseding_delivery_ref}</span> : null}
+            </li>
+          ))}</ul>
+        </> : <p>初始化版本未记录条件快照。</p>}
+      </li>
+    ))}</ol>
+    {error ? <p role="alert">{error}</p> : null}
+    <nav aria-label="目标历史分页">
+      <button type="button" disabled={loading || page.offset === 0} onClick={() => void load(Math.max(0, page.offset - 20))}>上一页</button>
+      <button type="button" disabled={loading || page.next_offset === null} onClick={() => page.next_offset !== null && void load(page.next_offset)}>下一页</button>
+    </nav>
+  </>;
+}
+
 function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
   const quest = snapshot.research_space.current_quest ?? {
     status: "unavailable" as const,
@@ -1034,6 +1083,11 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
               </li>
             ))}</ul>
           </details>
+        ) : null}
+        {quest.status === "ready" && quest.quest_ref && quest.history ? (
+          <BoundedDetails summary="目标与条件历史">
+            {() => <GoalHistory key={quest.goal_revision_ref} questRef={quest.quest_ref!} initial={quest.history!} />}
+          </BoundedDetails>
         ) : null}
       </article>
       <article>

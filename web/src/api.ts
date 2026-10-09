@@ -1979,7 +1979,7 @@ export type PublicSnapshot = {
         }>;
       } | null;
       guidance_alignment?: GoalGuidanceAlignment[];
-      history?: { items: Array<Record<string, unknown>>; offset: number; next_offset: number | null } | null;
+      history?: QuestGoalHistory | null;
       projection_digest: string | null;
       reason: { code: string } | null;
     };
@@ -2727,6 +2727,27 @@ export class ProductError extends Error {
 }
 
 export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle };
+
+export type QuestGoalRevisionDetail = {
+  goal_revision_ref: string;
+  sequence?: number;
+  goal: { goal: string; completion_criteria: string };
+  judgment?: string;
+  criteria_review?: string;
+  conditions: {
+    runtime_conditions: QuestRuntimeConditions;
+    enduring: Array<{ condition_ref: string; source_text: string; meaning: string; source: Record<string, unknown> }>;
+  } | null;
+  conditions_review: {
+    assessments: Array<{ condition_ref: string; disposition: string; explanation: string; superseding_delivery_ref?: string }>;
+  } | null;
+};
+
+export type QuestGoalHistory = { items: QuestGoalRevisionDetail[]; offset: number; next_offset: number | null };
+
+export function fetchQuestGoalHistory(questRef: string, offset: number): Promise<QuestGoalHistory> {
+  return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/goal/history?offset=${offset}&limit=20`);
+}
 
 export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSignal): Promise<QuestRuntimeConditions> {
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
