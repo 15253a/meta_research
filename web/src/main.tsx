@@ -83,7 +83,7 @@ import "./shell.css";
 import { ResearchOverview, ResearchBrief, ResearchTimeline, StageHistoryStrip, cycleOrdinalLabel, overviewQuestRef, useResearchOverview } from "./ResearchOverview";
 import { MetaTrace } from "./MetaTrace";
 import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
-import { ExperimentLogs, ExperimentOutputViews } from "./ExperimentLogs";
+import { ExperimentLogs, ExperimentOutputViews, ParallelExecutionLogs } from "./ExperimentLogs";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
 import { RootConversations, StageRootSessions, useRootConversations } from "./RootConversations";
 import { RuntimeConditions } from "./RuntimeConditions";
@@ -4122,6 +4122,8 @@ function WorkspaceMain({
           <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} observationPointers={targetRootObservationPointers} rootConversations={rootConversations} />
           <div><button onClick={onBrowseAssets}>研究资料 ↗</button><button onClick={onBrowseQuestions}>问题树 ↗</button></div>
         </div>
+        <ParallelExecutionLogs targets={allStageSurfaces(snapshot).flatMap(surface => surface.kind === "Bundle" ? surface.projection.target_graph.targets : [])}
+          blocked={humanRequestModalOpen} paused={hidden} />
         {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{requests[0].obligation}</span></span><b>查看并回应 ↗</b></button> : null}
         {rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
           <header><h2>{displayedTarget.target_key}</h2><p>{displayedTargetFacts.summary}</p></header>

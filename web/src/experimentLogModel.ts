@@ -11,6 +11,7 @@ export type ExperimentLogList = {
   schema_ref: "meta-research/experiment-log-list/v1";
   target_ref: string;
   target_run_ref: string | null;
+  target_status?: string | null;
   workspace_ref: string | null;
   status: "ready" | "empty" | "unavailable";
   logs: ExperimentLogFile[];
@@ -59,6 +60,7 @@ export function validateExperimentLogList(
 ): ExperimentLogList {
   if (value.schema_ref !== "meta-research/experiment-log-list/v1"
     || value.target_ref !== targetRef || value.target_run_ref !== targetRunRef
+    || value.target_status !== undefined && value.target_status !== null && typeof value.target_status !== "string"
     || !["ready", "empty", "unavailable"].includes(value.status) || !Array.isArray(value.logs)
     || value.logs.some(log => !log || typeof log.log_ref !== "string" || !log.log_ref
       || typeof log.name !== "string" || typeof log.relative_path !== "string"
