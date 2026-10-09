@@ -107,6 +107,7 @@ from meta_research.acquisition import (
     AcquisitionRuntimeBinding,
     AcquisitionSession,
     AcquisitionUnavailable,
+    effective_acquisition_config,
     aggregate_batch_status,
     canonical_hash as acquisition_hash,
     freeze_acquisition_item_artifacts,
@@ -13738,14 +13739,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if (
             not initialization_id
             or draft_revision < 1
-            or set(config) != {"mode", "library_entry_url"}
-            or config.get("mode")
-            not in {"oa_then_institution", "oa_only", "provided_only"}
-            or not isinstance(config.get("library_entry_url"), str)
         ):
             raise OwnerConflict("acquisition_preflight_request_invalid")
-        mode = str(config["mode"])
-        library_entry_url = str(config["library_entry_url"])
+        try:
+            effective_config = effective_acquisition_config(config)
+        except AcquisitionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        mode = str(effective_config["mode"])
+        library_entry_url = str(effective_config["library_entry_url"])
         normalized_config = {
             "schema_ref": "meta-research/acquisition-session-config/v1",
             "mode": mode,

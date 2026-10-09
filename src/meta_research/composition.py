@@ -142,6 +142,7 @@ from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillPr
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 from meta_research.root_workspace import RootWorkspaces
 from meta_research.external_mcp import ExternalMcpRuntime
+from meta_research.search_sources import SearchSourceRegistry
 
 
 @dataclass(frozen=True)
@@ -279,6 +280,7 @@ class ProductionRuntime:
     writing: WritingReportService
     harnesses: HarnessRuntime
     external_mcp: ExternalMcpRuntime
+    search_sources: SearchSourceRegistry
     root_workspaces: RootWorkspaces
     target_run_authorities: TargetRunAuthorities
     target_run_runtime: TargetRunRuntime
@@ -980,6 +982,13 @@ def build_production_runtime(
             bind_workspaces(root_workspaces)
     human_collaboration._creation_workspaces = root_workspaces
     research_memory.creation_bases.workspaces = root_workspaces
+    external_mcp = ExternalMcpRuntime(data_root.root)
+    search_sources = SearchSourceRegistry(data_root.root, external_mcp=external_mcp)
+    human_collaboration.bind_search_sources(search_sources)
+    advancement_engine.bind_search_sources(search_sources)
+    bind_sources = getattr(deepfetch_provider, "bind_search_sources", None)
+    if callable(bind_sources):
+        bind_sources(search_sources)
     semantic_gateway = create_semantic_owner_gateway(
         root_workspaces=root_workspaces,
         research_graph=owners.research_graph,
@@ -1194,7 +1203,6 @@ def build_production_runtime(
             provider is lifecycle for lifecycle in provider_lifecycles
         ):
             provider_lifecycles.append(provider)
-    external_mcp = ExternalMcpRuntime(data_root.root)
     external_mcp.bind_scope_authority(harnesses)
     for provider in (intent_drafting_provider, idea_skill_provider, plan_skill_provider,
         bundle_skill_provider, reasoning_skill_provider, deepfetch_provider, acquisition_provider, writing_skill_provider):
@@ -1204,6 +1212,7 @@ def build_production_runtime(
     harnesses.bind_external_mcp(external_mcp)
     runtime = ProductionRuntime(
         external_mcp=external_mcp,
+        search_sources=search_sources,
         data_root=data_root,
         owners=owners,
         authentication=Authentication(database),

@@ -402,6 +402,7 @@ class AutonomousCreationService:
                 config = {
                     "mode": literature.get("mode"),
                     "library_entry_url": literature.get("library_entry_url"),
+                    "institution_required": literature.get("institution_required", False),
                 }
                 initialization_id = _require_ref(
                     _field(quest, "initialization_id"),

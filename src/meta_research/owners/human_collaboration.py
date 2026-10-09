@@ -17,7 +17,7 @@ from urllib.parse import parse_qsl, urlsplit
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Row
 
-from meta_research.acquisition import AcquisitionProvider
+from meta_research.acquisition import AcquisitionProvider, effective_acquisition_config
 from meta_research.control_contract import (
     QUESTION_ACTIONS,
     SWITCH_ACTIONS,
@@ -27,6 +27,7 @@ from meta_research.database import Database
 from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload, ServerReference
 from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
+from meta_research.search_sources import InitializationScope, SearchSourceError, SearchSourceRegistry, parse_basis
 from meta_research.feed import DurableFeed
 from meta_research.manual_creation import (
     ManualQuestionCreation,
@@ -231,6 +232,10 @@ def _drafting_runtime_effect(
 
 class HumanCollaborationInterface(Protocol):
     """Whole public Interface for intent, preview, confirmation, and recovery."""
+
+    def bind_search_sources(self, registry: SearchSourceRegistry) -> None: ...
+
+    def save_search_source_selection(self, initialization_id: str, *, allowed_source_ids: list[str], expected_revision: int) -> dict[str, object]: ...
 
     def query_snapshot(self) -> OwnerSnapshot: ...
 
@@ -1774,6 +1779,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         self._intent_drafting_provider = intent_drafting_provider
         self._acquisition_provider = acquisition_provider
         self._runtime_protection = runtime_protection
+        self._search_sources: SearchSourceRegistry | None = None
         self._manual_creation = ManualQuestionCreation(
             database,
             feed,
@@ -1805,6 +1811,21 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         self._upgrade_active_legacy_draft()
         self._recover_interrupted_drafting()
         self._recover_interrupted_control_commands()
+
+    def bind_search_sources(self, registry: SearchSourceRegistry) -> None:
+        self._search_sources = registry
+        self._manual_creation.bind_search_sources(registry)
+
+    def save_search_source_selection(self, initialization_id: str, *, allowed_source_ids: list[str], expected_revision: int) -> dict[str, object]:
+        if self._search_sources is None:
+            raise OwnerConflict("search_source_registry_unavailable")
+        with self._database.fenced_write() as connection:
+            row = self._require_initialization(connection, initialization_id)
+            if row.status in {"confirmed", "completed", "cancelled"}:
+                raise OwnerConflict("quest_initialization_is_terminal")
+            return self._search_sources.select(InitializationScope(initialization_id),
+                allowed_source_ids=tuple(allowed_source_ids) if isinstance(allowed_source_ids, list) else allowed_source_ids,
+                expected_revision=expected_revision)
 
     def _recover_interrupted_control_commands(self, *, limit: int | None = None) -> bool:
         """Finish or safely unwind confirmed cross-Owner control sagas."""
@@ -4385,6 +4406,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                             "library_entry_url": literature[
                                 "library_entry_url"
                             ],
+                            "institution_required": literature.get("institution_required", False),
                         },
                         provider=self._acquisition_provider,
                     )
@@ -5265,6 +5287,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         config = {
             "mode": literature["mode"],
             "library_entry_url": literature["library_entry_url"],
+            "institution_required": literature.get("institution_required", False),
         }
         if replay is None:
             self._agent_runtime.prepare_acquisition_session(
@@ -5404,7 +5427,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             raise OwnerConflict("acquisition_session_stale")
         if acquisition_session.status != "ready" or acquisition_session.slot_held:
             raise OwnerConflict("acquisition_session_not_ready")
-        existing = connection.execute(
+        source_basis = None if self._search_sources is None else self._search_sources.capture(InitializationScope(initialization_id))
+        existing_rows = connection.execute(
             text(
                 "SELECT * FROM hc_deepfetch_requests WHERE initialization_id = "
                 ":initialization_id AND draft_revision = :draft_revision AND "
@@ -5415,7 +5439,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "draft_revision": int(row.draft_revision),
                 "draft_hash": row.draft_hash,
             },
-        ).first()
+        ).all()
+        existing = next((candidate for candidate in existing_rows if
+            decoded_object(candidate.scope_json).get("search_source_basis") == (None if source_basis is None else source_basis.as_dict())), None)
         if existing is not None:
             if existing.status == "failed":
                 failed_run = self._agent_runtime.query_deepfetch_run(
@@ -5462,6 +5488,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             return str(existing.request_ref)
 
         scope = _deepfetch_scope(draft)
+        if source_basis is not None:
+            scope["search_source_basis"] = source_basis.as_dict()
         scope_json = canonical_json(scope)
         scope_hash = canonical_hash(scope)
         material_bindings = [
@@ -7732,7 +7760,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 )
                 raise
         try:
-            with self._database.write() as connection:
+            with self._database.fenced_write() as connection:
                 replay = self._query_command(
                     connection, idempotency_key, "confirm", request_hash
                 )
@@ -7769,6 +7797,12 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                                 connection, row, request
                             )
                         _validate_question_content(decoded_object(row.proposal_json))
+                        confirmed_search_basis = None if self._search_sources is None else self._search_sources.capture(InitializationScope(initialization_id)).as_dict()
+                        if confirmed_search_basis is not None and preflight_draft.get("route") == "deepfetch":
+                            prepared = connection.execute(text("SELECT d.scope_json FROM hc_deepfetch_requests d JOIN hc_question_proposals p ON p.literature_snapshot_ref=d.snapshot_ref WHERE p.proposal_ref=:proposal"),
+                                {"proposal": proposal_ref}).first()
+                            if prepared is None or decoded_object(prepared.scope_json).get("search_source_basis") != confirmed_search_basis:
+                                raise OwnerConflict("literature_snapshot_stale")
                         confirmation_ref = new_ref("hc_confirmation")
                         confirmation_hash = _confirmation_receipt_hash(request)
                         now = time.time()
@@ -7782,7 +7816,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                                 "confirmed_proposal_ref = :proposal_ref, "
                                 "confirmed_proposal_hash = :proposal_hash, "
                                 "confirmed_preview_ref = :preview_ref, "
-                                "confirmed_preview_hash = :preview_hash, updated_at = :now "
+                                "confirmed_preview_hash = :preview_hash, confirmed_search_basis_json = :source_basis, updated_at = :now "
                                 "WHERE initialization_id = :initialization_id"
                             ),
                             {
@@ -7795,6 +7829,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                                 "proposal_hash": proposal_hash,
                                 "preview_ref": preview_ref,
                                 "preview_hash": preview_hash,
+                                "source_basis": None if confirmed_search_basis is None else canonical_json(confirmed_search_basis),
                                 "now": now,
                             },
                         )
@@ -8642,6 +8677,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             deepfetch_request is not None
             and int(deepfetch_request.draft_revision) == int(row.draft_revision)
             and deepfetch_request.draft_hash == row.draft_hash
+            and (self._search_sources is None or decoded_object(deepfetch_request.scope_json).get("search_source_basis")
+                == (decoded_object(row.confirmed_search_basis_json) if row.confirmed_search_basis_json is not None
+                    else self._search_sources.capture(InitializationScope(initialization_id)).as_dict()))
         )
         if current_draft_value.get("route") == "deepfetch":
             proposal_current = proposal_current and (
@@ -9382,6 +9420,14 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     _dispatch_failure_reason(error, "quest_acceptance_io_unavailable"),
                 )
                 return False
+        if self._search_sources is not None and row.confirmed_search_basis_json is not None:
+            try:
+                self._search_sources.transfer_initialization(initialization_id, quest.quest_ref,
+                    confirmed_basis=parse_basis(json.loads(row.confirmed_search_basis_json)))
+            except (SearchSourceError, OSError) as error:
+                self._record_dispatch_failure(initialization_id, "quest_search_sources",
+                    error.code if isinstance(error, SearchSourceError) else "search_source_transfer_io_unavailable")
+                return False
         try:
             with self._database.read() as connection:
                 companion_native_session_ref = connection.execute(
@@ -10040,7 +10086,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             return None
         request = connection.execute(
             text(
-                "SELECT request_ref, snapshot_ref FROM hc_deepfetch_requests WHERE "
+                "SELECT request_ref, snapshot_ref, scope_json FROM hc_deepfetch_requests WHERE "
                 "initialization_id = :initialization_id AND draft_revision = "
                 ":draft_revision AND draft_hash = :draft_hash AND status = "
                 "'succeeded'"
@@ -10050,7 +10096,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "draft_revision": int(row.draft_revision),
                 "draft_hash": row.draft_hash,
             },
-        ).first()
+        ).all()
+        current_basis = None if self._search_sources is None else (decoded_object(row.confirmed_search_basis_json)
+            if row.confirmed_search_basis_json is not None else self._search_sources.capture(InitializationScope(initialization_id)).as_dict())
+        request = next((candidate for candidate in request if decoded_object(candidate.scope_json).get("search_source_basis") == current_basis), None)
         if request is None or request.snapshot_ref is None:
             raise OwnerConflict("literature_snapshot_required")
         snapshot = self._research_memory.query_literature_snapshot(
@@ -11607,8 +11656,11 @@ def _acquisition_config_hash(draft: dict[str, object]) -> str:
     return canonical_hash(
         {
             "schema_ref": "meta-research/acquisition-session-config/v1",
-            "mode": literature.get("mode"),
-            "library_entry_url": literature.get("library_entry_url"),
+            **effective_acquisition_config({
+                "mode": literature.get("mode"),
+                "library_entry_url": literature.get("library_entry_url"),
+                "institution_required": literature.get("institution_required", False),
+            }),
         }
     )
 
@@ -11819,16 +11871,22 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
         ):
             raise OwnerConflict("resource_envelope_binding_invalid")
         literature = draft["literature"]
-        if not isinstance(literature, dict) or set(literature) != {
+        if not isinstance(literature, dict) or set(literature) - {
             "mode",
             "library_entry_url",
             "scope_exclusions",
             "accepted_material_bindings",
-        }:
+            "institution_required",
+        } or not {
+            "mode", "library_entry_url", "scope_exclusions", "accepted_material_bindings"
+        } <= set(literature):
             raise OwnerConflict("literature_configuration_invalid")
         mode = literature["mode"]
         if mode not in {"oa_then_institution", "oa_only", "provided_only"}:
             raise OwnerConflict("literature_mode_invalid")
+        institution_required = literature.get("institution_required", False)
+        if type(institution_required) is not bool or (institution_required and mode != "oa_then_institution"):
+            raise OwnerConflict("literature_configuration_invalid")
         library_entry_url = literature["library_entry_url"]
         scope_exclusions = literature["scope_exclusions"]
         bindings = literature["accepted_material_bindings"]
@@ -11861,6 +11919,7 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
                     "library_entry_url": library_entry_url,
                     "scope_exclusions": scope_exclusions.strip(),
                     "accepted_material_bindings": normalized_bindings,
+                    **({"institution_required": institution_required} if "institution_required" in literature else {}),
                 },
             }
         )
@@ -11919,6 +11978,7 @@ def _blank_v2_draft() -> dict[str, object]:
         "literature": {
             "mode": "oa_then_institution",
             "library_entry_url": "",
+            "institution_required": False,
             "scope_exclusions": "",
             "accepted_material_bindings": [],
         },

@@ -8,10 +8,11 @@ from typing import cast
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Row
 
-from meta_research.acquisition import AcquisitionProvider
+from meta_research.acquisition import AcquisitionProvider, effective_acquisition_config
 from meta_research.database import Database
 from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
+from meta_research.search_sources import QuestScope, SearchSourceRegistry
 from meta_research.feed import DurableFeed
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.common import (
@@ -567,7 +568,11 @@ class ManualQuestionCreation:
         self._acquisition_provider = acquisition_provider
         self._intent_drafting_provider = intent_drafting_provider
         self._runtime_protection = runtime_protection
+        self._search_sources: SearchSourceRegistry | None = None
         self._recover_drafting_claims(recover_all=True)
+
+    def bind_search_sources(self, registry: SearchSourceRegistry) -> None:
+        self._search_sources = registry
 
     def open(
         self,
@@ -1032,6 +1037,7 @@ class ManualQuestionCreation:
         config = {
             "mode": literature.get("mode"),
             "library_entry_url": literature.get("library_entry_url"),
+            "institution_required": literature.get("institution_required", False),
         }
         session = self._agent_runtime.query_acquisition_session(
             quest_ref=quest.quest_ref
@@ -1053,7 +1059,7 @@ class ManualQuestionCreation:
             != canonical_hash(
                 {
                     "schema_ref": "meta-research/acquisition-session-config/v1",
-                    **config,
+                    **effective_acquisition_config(config),
                 }
             )
             or session.status != "ready"
@@ -1088,6 +1094,9 @@ class ManualQuestionCreation:
             "scope_exclusions": literature.get("scope_exclusions"),
         }
         scope_hash = canonical_hash(scope)
+        if self._search_sources is not None:
+            scope["search_source_basis"] = self._search_sources.capture(QuestScope(quest.quest_ref)).as_dict()
+            scope_hash = canonical_hash(scope)
         if prepared_basis is not None:
             memory = self._research_memory.creation_bases
             scope["creation_basis"] = memory.reference(prepared_basis)
