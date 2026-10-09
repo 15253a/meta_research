@@ -2112,6 +2112,10 @@ def create_app(
             idempotency_key=_idempotency_key(request),
         )
 
+    @app.post("/api/v1/quest-initializations/{initialization_id}/intent-session/new")
+    def start_new_intent_session(initialization_id: str, request: Request) -> dict[str, object]:
+        return runtime.owners.human_collaboration.start_new_intent_session(initialization_id, _idempotency_key(request))
+
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/confirmation-preview",
         status_code=201,

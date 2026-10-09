@@ -457,6 +457,11 @@ class CodexCompanionAdapter(
                 "意图，但只能回复建议；不得修改草稿、确认 bundle 或签发 receipt。"
             )
             context_identity = f"initialization_id={request.initialization_id}\n"
+            if request.draft.get("companion_context"):
+                role_instruction += (
+                    "旧对话可沿 companion_context.prior_conversations 中的工作区路径按需读取；"
+                    "新会话不自动导入旧对话全文。"
+                )
         prompt = (
             role_instruction
             + CHAT_REPLY_PROGRESS_INSTRUCTION

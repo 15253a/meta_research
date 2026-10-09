@@ -253,14 +253,21 @@ class RootWorkspaces:
         session = creation.get("intent_session")
         if not isinstance(session, dict) or session.get("ref") != root_session_ref:
             raise SemanticMcpError("workspace_initialization_scope_invalid")
-        location = WorkspaceLocation("workspace:" + canonical_hash({"initialization_id": initialization_id,
+        location = self._initialization_location(initialization_id, root_session_ref)
+        self._ensure_directory(location.directory)
+        return WorkspaceBinding(location, canonical_hash({"owner": "human_collaboration",
+            "initialization_id": initialization_id, "root_session_ref": root_session_ref}))
+
+    def _initialization_location(self, initialization_id: str, root_session_ref: str) -> WorkspaceLocation:
+        return WorkspaceLocation("workspace:" + canonical_hash({"initialization_id": initialization_id,
             "root_session_ref": root_session_ref}), "companion", root_session_ref,
             root_session_ref, self._bases["companion"] / canonical_hash({
                 "initialization_id": initialization_id, "root_session_ref": root_session_ref}),
             initialization_id=initialization_id)
-        self._ensure_directory(location.directory)
-        return WorkspaceBinding(location, canonical_hash({"owner": "human_collaboration",
-            "initialization_id": initialization_id, "root_session_ref": root_session_ref}))
+
+    def initialization_workspace_metadata(self, initialization_id: str, root_session_ref: str) -> dict[str, str]:
+        location = self._initialization_location(initialization_id, root_session_ref)
+        return {"workspace_ref": location.workspace_ref, "workspace_path": str(location.directory)}
 
     def destination_for_initialization(self, initialization_id: str, root_session_ref: str) -> WorkspaceDestination:
         return WorkspaceDestination(self.bind_initialization(initialization_id, root_session_ref).location,
@@ -310,6 +317,14 @@ class RootWorkspaces:
                                     generation: int, document: dict[str, object]) -> dict[str, object]:
         """Publish an exact old conversation for optional reading in a fresh native Session."""
         binding = self.bind_companion_session(scope_ref, root_session_ref)
+        return self._save_conversation(binding, generation, document)
+
+    def save_initialization_conversation(self, initialization_id: str, root_session_ref: str,
+                                        generation: int, document: dict[str, object]) -> dict[str, object]:
+        return self._save_conversation(self.bind_initialization(initialization_id, root_session_ref), generation, document)
+
+    def _save_conversation(self, binding: WorkspaceBinding, generation: int,
+                           document: dict[str, object]) -> dict[str, object]:
         root = binding.directory
         filename = f"native-session-{generation}.json"
         path = "companion-history/" + filename

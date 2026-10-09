@@ -534,6 +534,8 @@ export type IntentSessionTurn = {
   assistant_content: string | null;
   assistant_content_hash: string | null;
   reason: null | { code: string };
+  native_session_generation?: number;
+  native_session_ref?: string | null;
 };
 
 export type TargetAssertion = {
@@ -622,6 +624,13 @@ export type QuestCreationView = {
     ref: string;
     status: "open" | "closed";
     turns: IntentSessionTurn[];
+    native_session_generation?: number;
+    native_session_ref?: string | null;
+    native_sessions?: Array<{ generation: number; native_session_ref: string | null; created_at: number }>;
+    can_start_new_session?: boolean;
+    switch_block_reason?: string | null;
+    workspace_ref?: string | null;
+    workspace_path?: string | null;
   };
   acquisition_session: AcquisitionSessionProjection | null;
   deepfetch: DeepFetchProjection | null;
@@ -4304,6 +4313,14 @@ export function sendIntentMessage(
       expected_draft_hash: creation.quest_draft.hash,
       message,
     },
+  );
+}
+
+export function startNewIntentSession(initializationId: string): Promise<QuestCreationView> {
+  return writeJson(
+    `/api/v1/quest-initializations/${encodeURIComponent(initializationId)}/intent-session/new`,
+    "POST",
+    {},
   );
 }
 
