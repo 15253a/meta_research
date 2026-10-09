@@ -178,6 +178,9 @@ def test_manual_creation_confirms_an_immutable_user_seed_in_its_own_context(
             "accepted_material_bindings": [],
             "deepfetch_preference": "later",
         }
+        with runtime.owners.human_collaboration._database.write() as connection:
+            from sqlalchemy import text
+            connection.execute(text("DELETE FROM hc_manual_drafting_sessions WHERE context_ref=:ref"), {"ref": opened["context_ref"]})
         confirmed = human.confirm_manual_creation_seed(
             opened["context_ref"],
             seed=seed,

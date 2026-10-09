@@ -718,10 +718,16 @@ class ManualQuestionCreation:
     def prepare_material_basis(self, context_ref, *, idempotency_key):
         from meta_research.creation_basis import InitializationUnderstandingRequest, empty_manifest
         _validate_idempotency_key(idempotency_key)
-        with self._database.read() as connection:
+        with self._database.write() as connection:
             row = self._require_context(connection, context_ref)
             session = connection.execute(text("SELECT * FROM hc_manual_drafting_sessions WHERE context_ref=:ref"),
-                {"ref": context_ref}).one()
+                {"ref": context_ref}).first()
+            if session is None and row.terminal_decision is None:
+                connection.execute(text("INSERT INTO hc_manual_drafting_sessions "
+                    "(session_ref,context_ref,status,created_at,updated_at) VALUES (:session,:ref,'open',:now,:now)"),
+                    {"session": new_ref("manual_drafting_session"), "ref": context_ref, "now": time.time()})
+                session = connection.execute(text("SELECT * FROM hc_manual_drafting_sessions WHERE context_ref=:ref"),
+                    {"ref": context_ref}).one()
         self._require_row_target_current(row)
         if row.terminal_decision is not None:
             return self._material_basis(row, require_current=False)

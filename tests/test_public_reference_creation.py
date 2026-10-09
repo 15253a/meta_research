@@ -174,6 +174,56 @@ def test_material_only_append_rejects_old_save_preview_confirm_and_regenerates(t
         runtime.close()
 
 
+def test_material_append_during_actual_protected_call_rejects_late_understanding(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    source = tmp_path / "note.txt"
+    source.write_text("Original16 applies in room conditions.")
+    extra = tmp_path / "extra.txt"
+    extra.write_text("An additional condition must be read.")
+    late = tmp_path / "late.txt"
+    late.write_text("This fact arrived while the provider was active.")
+    runtime, adapter = reference_runtime(tmp_path / "runtime", selection="original")
+    client, headers = _authenticate(runtime)
+    entered, release = Event(), Event()
+    invoke = adapter._invoke
+    try:
+        ready = reference_ready(runtime, client, headers, source)
+        endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        register(client, headers, runtime, ready, extra, "before-active")
+        def paused(**arguments):
+            result = invoke(**arguments)
+            entered.set()
+            assert release.wait(20)
+            return result
+        adapter._invoke = paused
+        queued = client.post(endpoint + "/proposal-generations", headers=_write_headers(headers, "active-generate"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"]})
+        assert queued.status_code == 202, queued.text
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(runtime.owners.human_collaboration.process_drafting_once)
+            try:
+                assert entered.wait(20)
+                register(client, headers, runtime, ready, late, "during-active")
+            finally:
+                release.set()
+            assert pending.result(timeout=30)
+        rejected = client.get(endpoint).json()
+        assert rejected["proposal_generation"]["status"] == "failed", rejected["proposal_generation"]
+        assert rejected["creation_basis"]["basis_ref"] == ready["creation_basis"]["basis_ref"]
+        assert rejected["proposal"]["hash"] == ready["proposal"]["hash"]
+        assert rejected["creation_basis"]["freshness"] == "stale"
+        adapter._invoke = invoke
+        fresh = generate(runtime, client, headers, rejected, key="after-active")
+        assert len(fresh["creation_basis"]["material_references"]["references"]) == 3
+        assert source.read_text() == "Original16 applies in room conditions."
+    finally:
+        release.set()
+        client.close()
+        runtime.close()
+
+
 def test_reference_deepfetch_consumes_scoped_literature_before_confirmation(tmp_path):
     source = tmp_path / "note.txt"
     source.write_text("Original16 needs a condition-specific comparison.")
