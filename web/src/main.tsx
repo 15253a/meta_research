@@ -1049,16 +1049,19 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
   };
   return (
     <section
-      className="lumen-return-summary"
-      aria-label="低密度返场摘要"
+      className="lumen-card research-goal-summary"
+      aria-label="当前目标与完成标准"
       data-testid="return-summary"
     >
       <article>
-        <small>Goal 对齐 · RG</small>
+        <h2>当前目标</h2>
         <b>{quest.status === "ready" ? quest.goal : quest.reason?.code ?? "unavailable"}</b>
         <span>{quest.status === "ready"
-          ? `完成标准：${quest.completion_criteria} · 版本 ${quest.sequence ?? 0} · ${quest.goal_revision_ref}`
-          : "不会从浏览器草案推断 Goal"}</span>
+          ? `完成标准：${quest.completion_criteria} · 版本 ${quest.sequence ?? 0}`
+          : "当前目标暂不可用"}</span>
+        {quest.status === "ready" && quest.guidance_alignment?.length ? (
+          <p role="status">人类指导：{quest.guidance_alignment.some((item) => item.status === "pending") ? "待对齐" : "已对齐"}</p>
+        ) : null}
         {quest.status === "ready" && quest.judgment ? <span>调整理由：{quest.judgment}</span> : null}
         {quest.status === "ready" && quest.conditions?.enduring.length ? (
           <details><summary>持续条件 · {quest.conditions.enduring.length}</summary>
@@ -1091,21 +1094,6 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
             {() => <GoalHistory key={quest.goal_revision_ref} questRef={quest.quest_ref!} initial={quest.history!} />}
           </BoundedDetails>
         ) : null}
-      </article>
-      <article>
-        <small>关键变化 · accepted state</small>
-        <b>{acceptedChangeSummary(snapshot)}</b>
-        <span>只报告已经确认的当前事实</span>
-      </article>
-      <article>
-        <small>当前阻塞</small>
-        <b>{currentBlockerSummary(snapshot)}</b>
-        <span>局部等待与 Quest-wide wait 不合并</span>
-      </article>
-      <article>
-        <small>下一步</small>
-        <b>{nextStepSummary(snapshot)}</b>
-        <span>页面只解释已经确认的状态，不替研究流程作决定</span>
       </article>
     </section>
   );
@@ -4195,6 +4183,7 @@ function WorkspaceMain({
         ) : null}
       </section>
 
+      {snapshot?.research_space.current_quest.status === "ready" ? <ReturnSummary snapshot={snapshot} /> : null}
       {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchBrief snapshot={snapshot} overview={overview.data} error={overview.error} rootConversations={rootConversations} /> : null}
       {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchTimeline snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} rootConversations={rootConversations} /> : null}
       {snapshot && foreground && !showingLiveOverview ? <>
