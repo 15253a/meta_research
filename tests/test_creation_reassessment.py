@@ -66,6 +66,8 @@ def reassessment_delta(memory, predecessor, reference, citations, dispositions=N
 @pytest.fixture
 def scenario(tmp_path, request):
     custody = getattr(request, "param", None)
+    if getattr(request.node, "callspec", None) and request.node.callspec.params.get("invalid") == "duplicate_inheritance":
+        custody = "managed"
     source = tmp_path / "original"
     source.mkdir()
     for name, content in {"a.txt": "A reports 16.", "b.txt": "B reports 25.", "c.txt": "Unexamined."}.items():
@@ -123,7 +125,7 @@ def test_only_changed_child_is_read_and_original_operation_is_preserved(scenario
 
 
 @pytest.mark.parametrize("invalid", ["predecessor", "witness", "missing_decision", "changed_inheritance", "directory_read", "race",
-    "needs_recheck_replacement", "out_of_scope_replacement"])
+    "needs_recheck_replacement", "out_of_scope_replacement", "duplicate_inheritance"])
 def test_reassessment_rejects_forgery_and_racing_changes(scenario, invalid):
     runtime, _, source, _, _, _, predecessor, citations = scenario
     memory = runtime.owners.research_memory.creation_bases
@@ -139,14 +141,21 @@ def test_reassessment_rejects_forgery_and_racing_changes(scenario, invalid):
         delta["inherited_evidence"][0]["witness_ref"] = citations["b.txt"]["witness_ref"]
     elif invalid == "directory_read":
         delta["additions"]["coverage"][0]["kind"] = "read"
+    elif invalid == "duplicate_inheritance":
+        selected = next(item for item in predecessor["sources"] if item["binding"] is not None)
+        delta["inherited_selection_keys"] = [selected["material_key"]]
+        delta["inherited_evidence"].append({"kind": "managed_history", "witness_ref": citations["a.txt"]["witness_ref"],
+            "selected_material_key": selected["material_key"]})
     elif invalid.endswith("_replacement"):
         delta["decisions"][0].update(disposition=invalid.removesuffix("_replacement"),
             affected_scope="A needs a future check.", creation_limit="future_research", replacement_refs=["invented"])
     else:
         (source / "a.txt").write_text("Changed while accepting.")
     result = InitializationUnderstandingResult({}, input_identity=result.input_identity, work=result.work, reassessment=delta)
-    with pytest.raises(OwnerConflict):
+    with pytest.raises(OwnerConflict) as failure:
         memory.accept_reference_prepared(request, result)
+    if invalid == "duplicate_inheritance":
+        assert str(failure.value.__cause__) == "duplicate inherited evidence"
     assert memory.query(predecessor["basis_ref"], predecessor["basis_hash"])["understanding"]["claims_and_conditions"][0]["text"] == "A reports 16."
 
 

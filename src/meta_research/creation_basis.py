@@ -163,10 +163,10 @@ def reassessment_schema():
             "creation_limit": {"enum": ["none", "required_first_question", "future_research"]},
             "replacement_refs": strings})},
         "additions": {**understanding_schema(references=True), "description": "Only new statements and new selections, plus complete current entrance coverage. Managed history cannot count as a current read range."},
-        "inherited_evidence": {"type": "array", "description": "Explicit prior witnesses. live_source requires unchanged observation and bytes. managed_history requires an exact inherited managed selected version and supports historical content only.", "items": record({
+        "inherited_evidence": {"type": "array", "description": "Each witness_ref appears at most once. Use eligible live_source with unchanged observation and bytes for current reuse. managed_history requires an exact inherited managed selected version and supports historical content only. Never emit both kinds for one witness. Retain selected versions separately in inherited_selection_keys; managed custody does not require a managed_history entry for a live witness.", "items": record({
             "kind": {"enum": ["live_source", "managed_history"]}, "witness_ref": string,
             "selected_material_key": {"type": ["string", "null"]}})},
-        "inherited_selection_keys": strings,
+        "inherited_selection_keys": {**strings, "description": "Reuse exact selected versions independently of witness disposition. A live_source witness may also retain its managed selected version here without a second inherited_evidence entry."},
         "literature_decisions": {"type": "array", "items": record({
             "snapshot_ref": string, "snapshot_hash": string,
             "disposition": {"enum": ["retain", "needs_recheck", "out_of_scope"]},

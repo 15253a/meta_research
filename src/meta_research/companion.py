@@ -274,6 +274,9 @@ class CodexCompanionAdapter(
                 if request.reassessment is not None:
                     prompt += ("\nJudge each prior statement's applicability and conditions. "
                         "Read only affected content. Explicitly inherit eligible witnesses with their original operation identity. "
+                        "Emit each inherited witness once, using eligible live_source for current reuse. Never emit the same witness "
+                        "as both live_source and managed_history. Retain its selected exact version separately in inherited_selection_keys; "
+                        "managed custody does not require a managed_history entry for a live witness. "
                         "Managed history supports historical statements, never current read coverage. Mark necessary first-Question "
                         "checks versus future research without a global waiting gate. Decide separately for every old literature snapshot. "
                         "Reuse selected exact versions instead of selecting them for intake again.")
