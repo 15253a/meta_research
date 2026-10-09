@@ -85,6 +85,30 @@ def test_stdio_connection_test_discovers_without_business_calls(tmp_path):
     assert not (tmp_path / "calls.jsonl").exists()
 
 
+def test_direct_search_service_is_independent_and_restores_its_original_connection(tmp_path):
+    runtime = ExternalMcpRuntime(tmp_path)
+    current = runtime.read_config()
+    draft = service(tmp_path, allowed_root_kinds=["deepfetch"])
+    probe = runtime.test_direct_connection(draft["connection"])
+    assert probe["status"] == "ready"
+    assert {tool["name"] for tool in probe["tools"]} == {"read_temperature", "connectivity_action"}
+    snapshot = runtime.direct_service_snapshot(operation_identity="source-run", services=parse_services([draft]),
+        configuration_revision="first", task_prompt="Search the configured source")
+    draft["connection"]["command"] = str(tmp_path / "unavailable")
+    restored = runtime.direct_service_snapshot(operation_identity="source-run", services=parse_services([draft]),
+        configuration_revision="second", task_prompt="Search the configured source", binding=snapshot.binding(), recovery=True)
+    assert restored == snapshot
+    assert runtime.read_config() == current
+    assert not (tmp_path / "calls.jsonl").exists()
+    result = runtime.call_direct(binding=restored.binding(), service_id="lab", tool_name="read_temperature", arguments={"sensor": "source"})
+    assert result["structuredContent"] == {"sensor": "source", "temperature": 23.75}
+    assert (tmp_path / "calls.jsonl").read_text().splitlines() == ['{"name": "read_temperature", "sensor": "source"}']
+    with pytest.raises(ExternalMcpError, match="capability_unavailable"):
+        runtime.call_direct(binding=restored.binding(), service_id="lab", tool_name="invented", arguments={})
+    with pytest.raises(ExternalMcpError, match="external_mcp_snapshot_missing"):
+        runtime.direct_service_snapshot(operation_identity="absent", services=(), configuration_revision="empty", task_prompt="Search", recovery=True)
+
+
 @pytest.mark.parametrize("failure_stage", ["tools/call", "initialize"])
 def test_call_failure_identifies_original_work_and_requires_a_verified_repair(tmp_path, failure_stage):
     failure_file = tmp_path / "failure.txt"
