@@ -284,18 +284,60 @@ export type CreationMaterialManifest = {
   submissions: Array<{ submission_ref: string; complete: boolean }>;
 };
 
+export type CreationAnchor = {
+  kind: "quest_initialization" | "manual_question_creation";
+  ref: string;
+  generation: number | null;
+  draft_revision: number;
+  draft_hash: string;
+};
+
+export type CreationReadWitness = {
+  witness_ref: string;
+  operation_ref: string;
+  reference_ref: string;
+  path: string;
+  observation_ref: string;
+  offset: number;
+  length: number;
+  chunk_sha256: string;
+};
+
+export type CreationInputIdentity = {
+  anchor: CreationAnchor;
+  material_set_hash: string;
+  consumed: CreationReadWitness[];
+};
+
+export type CreationMaterialSource =
+  | { kind: "material_reference"; reference_ref: string }
+  | { kind: "original_file"; reference_ref: string; path: string; observation_ref: string }
+  | { kind: "work_file"; work_ref: string; path: string; trial_ref: string | null };
+
 export type CreationResearchBasis = {
   basis_ref: string;
   basis_hash: string;
   kind: "prepared" | "literature_revised";
   freshness: "current" | "stale";
-  human_reviewed_draft: { revision: number; hash: string } | null;
+  human_reviewed_draft?: { revision: number; hash: string } | null;
+  input_identity?: CreationInputIdentity | null;
+  input_identity_hash?: string | null;
+  material_references?: {
+    anchor: CreationAnchor;
+    references: Array<{ reference_ref: string; submission_ref: string; source: ServerMaterialSelection; description: string }>;
+    set_hash: string;
+  };
   understanding: Record<"material_composition" | "work_already_done" | "claims_and_conditions" | "conflicts" | "gaps" | "unfinished_questions", Array<{
     ref: string; text: string; kind: "reported_work" | "agent_inference"; conditions: string[];
-    sources: Array<{ material_key: string; location: string; offset: number; length: number }>;
+    sources: Array<{ material_key: string; location: string; offset: number; length: number } & Partial<CreationReadWitness>>;
   }>>;
   sources: Array<{ material_key: string; relative_path: string; selection_reason: string | null;
-    coverage: { kind: "read" | "partial" | "unread"; unread_description: string } }>;
+    source?: CreationMaterialSource;
+    custody?: "managed" | "linked_local" | null;
+    binding?: AssetEvidenceBinding | null;
+    intake_state?: "pending" | "accepted" | "failed" | null;
+    coverage: { kind: "read" | "partial" | "unread"; unread_description: string;
+      read_ranges?: Array<{ material_key: string; location: string; offset: number; length: number } & Partial<CreationReadWitness>> } }>;
   corrections: Array<{ prior_statement_ref: string; disposition: string; explanation: string;
     original_sources: string[]; literature_sources: Array<{ paper_id: string; locator: string }> }>;
   search_assessment: { assessment: string; completion: string; limitations: string[] } | null;
@@ -795,6 +837,7 @@ export type ManualRawReceiptState =
 
 export type ManualQuestionCreationRawView = {
   work_materials?: WorkMaterialReceipt[];
+  creation_basis?: CreationResearchBasis | null;
   schema_ref: "meta-research/manual-question-creation/v1";
   context_ref: string;
   creation_mode: "ManualCreation";
@@ -2198,7 +2241,9 @@ export function adaptManualQuestionCreation(
 
   return {
     creation_id: raw.context_ref,
+    generation: raw.generation,
     work_materials: raw.work_materials ?? [],
+    creation_basis: raw.creation_basis ?? null,
     status: adaptManualStatus(raw.status),
     quest_ref: raw.quest_ref,
     quest_title: labels.quest_title ?? null,
@@ -3353,6 +3398,16 @@ export function confirmManualCreationSeed(
   );
 }
 
+export function prepareManualCreationUnderstanding(
+  contextRef: string,
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/understanding`,
+    "POST",
+    {},
+  );
+}
+
 export function startManualCreationDeepFetch(
   contextRef: string,
   expectedSeedRef: string,
@@ -3399,6 +3454,7 @@ export function saveManualQuestionProposal(
   contextRef: string,
   input: {
     expected_basis_hash: string;
+    expected_input_identity_hash?: string | null;
     expected_proposal_ref: string | null;
     expected_proposal_hash: string | null;
     content: ManualQuestionContent;

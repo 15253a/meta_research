@@ -127,6 +127,7 @@ _DRAFTING_RECONCILIATION_CODES = frozenset(
         "codex_job_spool_invalid",
         "codex_job_spool_conflict",
         "codex_operation_reconciliation_pending",
+        "protected_creation_unknown_outcome",
     }
 )
 _COMPLETED_CUSTODY_AUDIT_SECONDS = 60
@@ -611,6 +612,8 @@ class HumanCollaborationInterface(Protocol):
         idempotency_key: str,
     ) -> dict[str, object]: ...
 
+    def prepare_manual_creation_understanding(self, context_ref: str, *, idempotency_key: str) -> dict[str, object]: ...
+
     def save_manual_question_proposal(
         self,
         context_ref: str,
@@ -620,6 +623,7 @@ class HumanCollaborationInterface(Protocol):
         idempotency_key: str,
         expected_proposal_ref: str | None = None,
         expected_proposal_hash: str | None = None,
+        expected_input_identity_hash: str | None = None,
     ) -> dict[str, object]: ...
 
     def confirm_manual_question_proposal(
@@ -5049,11 +5053,21 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         if proposal_record is not None and proposal_record.creation_basis_ref is not None:
             basis = memory.query(proposal_record.creation_basis_ref, proposal_record.creation_basis_hash)
         else:
-            basis = memory.prepared(initialization_id, int(row.draft_revision), row.draft_hash)
+            from meta_research.creation_inputs import CreationAnchor
+            inputs = self.creation_material_snapshot(CreationAnchor("quest_initialization", initialization_id, None,
+                int(row.draft_revision), row.draft_hash))
+            basis = memory.prepared(initialization_id, int(row.draft_revision), row.draft_hash,
+                inputs if inputs.references else None)
         if basis is None:
             return None
-        return {**basis, "sources": memory.source_views(basis),
-            "freshness": "current" if basis["draft"]["revision"] == int(row.draft_revision) and basis["draft"]["hash"] == row.draft_hash else "stale",
+        current = basis["draft"]["revision"] == int(row.draft_revision) and basis["draft"]["hash"] == row.draft_hash
+        try:
+            memory.require_current(basis)
+        except OwnerConflict:
+            current = False
+        return {**basis, "sources": memory.source_views(basis), "understanding": memory.understanding_view(basis),
+            "input_identity_hash": None if basis.get("input_identity") is None else canonical_hash(basis["input_identity"]),
+            "freshness": "current" if current else "stale",
             "human_reviewed_draft": {"revision": int(row.proposal_basis_revision), "hash": row.proposal_basis_hash}
                 if row.proposal_ref is not None and (int(row.proposal_basis_revision), row.proposal_basis_hash)
                     != (basis["draft"]["revision"], basis["draft"]["hash"]) else None}
@@ -5071,7 +5085,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             InitializationUnderstandingRequest, empty_manifest, empty_understanding,
         )
         memory = self._research_memory.creation_bases
-        existing = memory.prepared(initialization_id, revision, draft_hash)
+        from meta_research.creation_inputs import CreationAnchor
+        inputs = self.creation_material_snapshot(CreationAnchor("quest_initialization", initialization_id, None, revision, draft_hash))
+        existing = memory.prepared(initialization_id, revision, draft_hash, inputs if inputs.references else None)
         if existing is not None:
             return existing
         current = self.query_quest_creation(initialization_id)
@@ -5083,8 +5099,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         with self._database.read() as connection:
             native_ref = connection.execute(text("SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": initialization_id}).scalar_one_or_none()
         request = InitializationUnderstandingRequest(initialization_id, revision, draft_hash, draft, manifest,
-            job_ref + ":understanding", current["intent_session"]["ref"], native_ref)
-        if manifest["entries"]:
+            job_ref + ":understanding", current["intent_session"]["ref"], native_ref,
+            inputs=inputs if inputs.references else None)
+        if manifest["entries"] or inputs.references:
             understand = getattr(self._proposal_drafter, "understand_initialization", None)
             if not callable(understand):
                 raise OwnerConflict("creation_understanding_provider_unavailable")
@@ -5098,6 +5115,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                         raise OwnerConflict("companion_native_session_stale")
         else:
             understanding = empty_understanding()
+        if inputs.references:
+            return memory.accept_reference_prepared(request, result)
         return memory.accept_prepared(request, understanding)
 
     def prepare_deepfetch_creation_basis(self, request):
@@ -5704,6 +5723,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     or row.proposal_hash != expected_proposal_hash
                 ):
                     raise OwnerConflict("question_proposal_stale")
+                self._require_proposal_inputs(connection, row.proposal_ref)
                 if row.draft_schema_ref == DRAFT_V2_SCHEMA:
                     _validate_generation_basis(draft)
                     self._require_current_resource_envelope(
@@ -6612,14 +6632,17 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     if result.revision is None:
                         raise OwnerConflict("creation_literature_revision_required")
                     basis = self._research_memory.creation_bases.accept_revision(basis,
-                        literature_snapshot["source_snapshot"], result.revision)
+                        literature_snapshot["source_snapshot"], result.revision, result)
                 elif result.revision is not None:
                     raise OwnerConflict("creation_direct_revision_invalid")
+                else:
+                    basis = self._research_memory.creation_bases.accept_consumed(basis, result)
             else:
-                if frozen_draft.get("material_manifest", {}).get("entries"):
+                if frozen_draft.get("material_manifest", {}).get("entries") or basis.get("input_identity") is not None:
                     raise OwnerConflict("creation_synthesis_provider_unavailable")
                 result = self._proposal_drafter.draft(request)
             content = _validate_question_content(result.content)
+            self._research_memory.creation_bases.require_current(basis)
             if result.adapter_kind == "codex_companion_fork" and (
                 not isinstance(result.companion_native_session_ref, str)
                 or not result.companion_native_session_ref
@@ -7106,6 +7129,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             if isinstance(value, str):
                 native_session_ref = value
         try:
+            from meta_research.creation_inputs import CreationAnchor
+            inputs = self.creation_material_snapshot(CreationAnchor("quest_initialization", str(initialization_id), None,
+                int(turn.basis_revision), turn.basis_hash))
             result = self._intent_drafting_provider.reply(
                 IntentTurnRequest(
                     initialization_id=str(initialization_id),
@@ -7116,6 +7142,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     native_session_ref=native_session_ref,
                     job_ref=provider_job_ref,
                     root_session_ref=turn.session_ref,
+                    inputs=inputs if inputs.references else None,
                 )
             )
             if not isinstance(result.reply, str):
@@ -8330,7 +8357,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 {"request_ref": request_ref, "reason_code": failure_code},
             )
 
-    def _quest_creation_materials(self, draft, proposal_ref):
+    def _quest_creation_materials(self, draft, proposal_ref, *, require_current=True):
         material_bindings = _accepted_material_bindings(draft)
         with self._database.read() as connection:
             basis_row = connection.execute(
@@ -8342,6 +8369,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             creation_basis = self._research_memory.creation_bases.query(
                 basis_row.creation_basis_ref, basis_row.creation_basis_hash
             )
+            with self._database.read() as connection:
+                initialization = self._require_initialization(connection, creation_basis["draft"]["initialization_id"])
+            if require_current and initialization.status not in {"confirmed", "completed"}:
+                self._research_memory.creation_bases.require_current(creation_basis)
             material_bindings = (
                 *material_bindings,
                 *(self._research_memory.query_asset_version(source["binding"]["version_ref"]).as_binding()
@@ -8548,7 +8579,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             except OwnerConflict as error:
                 broad_authorization_failure = error
         material_bindings, _ = self._quest_creation_materials(
-            current_draft_value, row.confirmed_proposal_ref or row.proposal_ref
+            current_draft_value, row.confirmed_proposal_ref or row.proposal_ref, require_current=False
         )
         material_roles = ()
         material_failure: OwnerConflict | None = None
@@ -8591,10 +8622,12 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         except OwnerConflict as error:
             cycle = None
             cycle_failure = error
+        creation_basis_view = self._creation_basis_view(initialization_id, row, proposal_record)
         proposal_basis_current = (
             row.proposal_ref is not None
             and row.proposal_basis_revision == row.draft_revision
             and row.proposal_basis_hash == row.draft_hash
+            and (creation_basis_view is None or creation_basis_view["freshness"] == "current")
         )
         proposal_complete = False
         if proposal_basis_current and proposal_value is not None:
@@ -8855,7 +8888,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             "creation_context": "quest_initialization",
             "route": draft_value.get("route", "direct"),
             "status": status,
-            "creation_basis": self._creation_basis_view(initialization_id, row, proposal_record),
+            "creation_basis": creation_basis_view,
             "quest_draft": {
                 "revision": int(row.draft_revision),
                 "hash": row.draft_hash,
@@ -9130,6 +9163,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 ) from error
             raise
 
+    def prepare_manual_creation_understanding(self, context_ref: str, *, idempotency_key: str) -> dict[str, object]:
+        self._manual_creation.prepare_material_basis(context_ref, idempotency_key=idempotency_key)
+        return self._manual_creation.query(context_ref)
+
     def save_manual_question_proposal(
         self,
         context_ref: str,
@@ -9139,11 +9176,13 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         idempotency_key: str,
         expected_proposal_ref: str | None = None,
         expected_proposal_hash: str | None = None,
+        expected_input_identity_hash: str | None = None,
     ) -> dict[str, object]:
         return self._manual_creation.save_proposal(
             context_ref,
             content=content,
             expected_basis_hash=expected_basis_hash,
+            expected_input_identity_hash=expected_input_identity_hash,
             expected_proposal_ref=expected_proposal_ref,
             expected_proposal_hash=expected_proposal_hash,
             idempotency_key=idempotency_key,
@@ -10059,6 +10098,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 return False
             try:
                 _validate_question_content(decoded_object(row.proposal_json))
+                self._require_proposal_inputs(connection, row.proposal_ref)
             except (OwnerConflict, TypeError, ValueError, json.JSONDecodeError):
                 return False
             draft = decoded_object(row.draft_json)
@@ -10540,9 +10580,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         )
         return proposal_ref, proposal_hash
 
-    @staticmethod
     def _validate_current_proposal(
-        connection: Connection, row: Row, request: dict[str, object]
+        self, connection: Connection, row: Row, request: dict[str, object]
     ) -> None:
         _require_initialization_artifact_integrity(connection, row)
         if (
@@ -10557,6 +10596,14 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             or row.proposal_basis_hash != row.draft_hash
         ):
             raise OwnerConflict("question_proposal_stale")
+        self._require_proposal_inputs(connection, row.proposal_ref)
+
+    def _require_proposal_inputs(self, connection, proposal_ref):
+        row = connection.execute(text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"),
+                                 {"ref": proposal_ref}).first()
+        if row is not None and row.creation_basis_ref is not None:
+            memory = self._research_memory.creation_bases
+            memory.require_current(memory.query(row.creation_basis_ref, row.creation_basis_hash))
 
     def _validate_current_preview_binding(
         self, connection: Connection, row: Row, request: dict[str, object]

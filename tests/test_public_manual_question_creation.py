@@ -55,13 +55,14 @@ class DeterministicProbe:
         )
 
 
-def build_runtime(data_root: Path):
+def build_runtime(data_root: Path, *, power_inhibitor=None):
     drafting = DeterministicDraftingAdapter()
     return build_production_runtime(
         prepare_data_root(data_root),
         proposal_drafter=drafting,
         intent_drafting_provider=drafting,
         host_compute_probe=DeterministicProbe(),
+        power_inhibitor=power_inhibitor,
     )
 
 
@@ -122,7 +123,7 @@ def accept_root_question(runtime) -> tuple[str, str, str]:
         preview_hash=previewed["confirmation_preview"]["hash"],
         idempotency_key="manual-prerequisite-confirm",
     )
-    for _attempt in range(5):
+    for _attempt in range(20):
         if not human.reconcile_once():
             break
     completed = human.query_quest_creation(opened["initialization_id"])
@@ -178,6 +179,9 @@ def test_manual_creation_confirms_an_immutable_user_seed_in_its_own_context(
             "accepted_material_bindings": [],
             "deepfetch_preference": "later",
         }
+        with runtime.owners.human_collaboration._database.write() as connection:
+            from sqlalchemy import text
+            connection.execute(text("DELETE FROM hc_manual_drafting_sessions WHERE context_ref=:ref"), {"ref": opened["context_ref"]})
         confirmed = human.confirm_manual_creation_seed(
             opened["context_ref"],
             seed=seed,

@@ -379,6 +379,7 @@ class SaveManualQuestionProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_basis_hash: str = Field(min_length=64, max_length=64)
+    expected_input_identity_hash: str | None = Field(default=None, min_length=64, max_length=64)
     expected_proposal_ref: str | None = Field(default=None, max_length=64)
     expected_proposal_hash: str | None = Field(
         default=None, min_length=64, max_length=64
@@ -2226,6 +2227,10 @@ def create_app(
             context_ref
         )
 
+    @app.post("/api/v1/manual-question-creations/{context_ref}/understanding")
+    def prepare_manual_creation_understanding(context_ref: str, request: Request) -> dict[str, object]:
+        return runtime.owners.human_collaboration.prepare_manual_creation_understanding(context_ref, idempotency_key=_idempotency_key(request))
+
     @app.post(
         "/api/v1/manual-question-creations/{context_ref}/seed-confirmation",
         status_code=201,
@@ -2303,6 +2308,7 @@ def create_app(
                 context_ref,
                 content=proposal.content.model_dump(),
                 expected_basis_hash=proposal.expected_basis_hash,
+                expected_input_identity_hash=proposal.expected_input_identity_hash,
                 expected_proposal_ref=proposal.expected_proposal_ref,
                 expected_proposal_hash=proposal.expected_proposal_hash,
                 idempotency_key=_idempotency_key(request),

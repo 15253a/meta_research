@@ -37,6 +37,7 @@ import {
   fetchTargetRawOutput,
   followProjection,
   openManualQuestionCreation,
+  prepareManualCreationUnderstanding,
   ProductError,
   saveManualQuestionProposal,
   sendManualDraftingMessage,
@@ -5536,9 +5537,17 @@ function DetailedApp() {
               ? { ...current, raw }
               : current);
           }}
+          onUnderstandMaterials={async ({ creation_id }) => {
+            if (creation_id !== manualPanel.raw.context_ref) {
+              throw new ProductError("manual_creation_context_stale");
+            }
+            const raw = await prepareManualCreationUnderstanding(creation_id);
+            await applyManualRaw(raw, manualPanel);
+          }}
           onSaveProposal={async ({
             creation_id,
             expected_basis_hash,
+            expected_input_identity_hash,
             expected_proposal_ref,
             expected_proposal_hash,
             content,
@@ -5548,6 +5557,7 @@ function DetailedApp() {
             }
             const raw = await saveManualQuestionProposal(creation_id, {
               expected_basis_hash,
+              expected_input_identity_hash,
               expected_proposal_ref,
               expected_proposal_hash,
               content,

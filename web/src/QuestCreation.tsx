@@ -10,7 +10,6 @@ import {
 } from "react";
 import {
   cancelQuest,
-  type CreationResearchBasis,
   confirmQuest,
   createQuest,
   fetchQuestCreation,
@@ -31,6 +30,7 @@ import {
   type QuestDraft,
 } from "./api";
 import { RESEARCH_STYLES } from "./researchStyle";
+import { CreationUnderstanding } from "./CreationUnderstanding";
 import "./quest-creation.css";
 import { ProposalOutput } from "./ProposalOutput";
 import { useReplyStream } from "./chatReplyStream";
@@ -511,6 +511,22 @@ export function QuestCreationWorkbench({
     }
     throw new ProductError("quest_initialization_poll_timeout");
   }, [applyView]);
+
+  const refreshMaterials = async () => {
+    const basis = creationRef.current;
+    if (!basis) return;
+    const token = beginOperation("reviewing");
+    try {
+      const next = await fetchQuestCreation(basis.initialization_id);
+      if (operationIsCurrent("reviewing", token)) {
+        applyView(next, { syncDraft: true, syncProposal: true });
+      }
+    } catch (caught) {
+      if (operationIsCurrent("reviewing", token)) showError(caught);
+    } finally {
+      finishOperation("reviewing", token);
+    }
+  };
 
   const settleAcquisitionSession = useCallback(async (
     basis: QuestCreationView,
@@ -1282,6 +1298,8 @@ export function QuestCreationWorkbench({
     proposalSaveState !== "unsaved" &&
     confirmationIsCurrent(creation) &&
     !anyOperationActive &&
+    !referenceDraft.busy &&
+    !referenceDraft.pending &&
     !proposalGenerationActive &&
     !terminal,
   );
@@ -1649,9 +1667,9 @@ export function QuestCreationWorkbench({
                 <div className="quest-material-card">
                   <p>保存服务器原路径及说明到本次创建草稿。提交不读取内容；材料解释由后续创建工作处理。</p>
                   <WorkMaterialFields draft={referenceDraft} disabled={!creation || draftInteractionLocked}
-                    onRetried={() => { onChanged(); }} />
+                    onRetried={() => { void refreshMaterials(); }} />
                   <button type="button" disabled={!creation || draftInteractionLocked || referenceDraft.busy || !!referenceDraft.pending || !referenceDraft.selection || !referenceDraft.receiver}
-                    onClick={() => { const command = referenceDraft.materialCommand(); if (command) void referenceDraft.submit(`/api/v1/quest-initializations/${encodeURIComponent(materialAnchor)}/material-references`, command).then(result => { if (result) onChanged(); }); }}>保存材料引用到创建草稿</button>
+                    onClick={() => { const command = referenceDraft.materialCommand(); if (command) void referenceDraft.submit(`/api/v1/quest-initializations/${encodeURIComponent(materialAnchor)}/material-references`, command).then(result => { if (result) void refreshMaterials(); }); }}>保存材料引用到创建草稿</button>
                   <WorkMaterialReferences receipts={creation?.work_materials ?? []} />
                   {draft.material_manifest?.entries.map(entry => <p key={entry.material_key}>既有创建材料 · {entry.relative_path}</p>)}
                   {draft.literature.accepted_material_bindings.map(binding => <p key={String(binding.version_ref)}>既有原件版本 · {String(binding.version_ref)}</p>)}
@@ -2435,6 +2453,7 @@ function confirmationIsCurrent(creation: QuestCreationView): boolean {
   const preview = creation.confirmation_preview;
   return Boolean(
     proposal &&
+    creation.creation_basis?.freshness !== "stale" &&
     proposal.status === "current" &&
     proposal.basis_revision === creation.quest_draft.revision &&
     proposal.basis_hash === creation.quest_draft.hash &&
@@ -3016,49 +3035,13 @@ function boundaryDraft(draft: QuestDraft, boundary: string): QuestDraft {
   };
 }
 
-function CreationUnderstanding({ basis }: { basis: CreationResearchBasis }) {
-  const labels: Record<keyof CreationResearchBasis["understanding"], string> = {
-    material_composition: "资料构成", work_already_done: "已完成工作", claims_and_conditions: "已有结论与条件",
-    conflicts: "冲突", gaps: "证据缺口", unfinished_questions: "尚未解决的问题",
-  };
-  const sources = new Map(basis.sources.map((source) => [source.material_key, source.relative_path]));
-  return <section className="quest-journey-section quest-understanding" aria-labelledby="quest-understanding-title">
-    <div className="quest-section-heading">
-      <b id="quest-understanding-title">已有课题的理解</b>
-      <small>{basis.kind === "literature_revised" ? "结合文献修正后" : "根据已有资料"}</small>
-    </div>
-    {basis.freshness === "stale" ? <p role="status">创建依据已经变化。下面保留生成时的理解；重新生成会重新阅读当前资料。</p> : null}
-    {(Object.keys(labels) as Array<keyof typeof labels>).map((field) => <div key={field}>
-      <h3>{labels[field]}</h3>
-      {basis.understanding[field].length ? <ul>{basis.understanding[field].map((statement) => <li key={statement.ref}>
-        <p>{statement.text}</p>
-        {statement.conditions.length ? <small>条件：{statement.conditions.join("；")}</small> : null}
-        <small>{statement.kind === "agent_inference" ? "系统推断" : "资料报告"}
-          {statement.sources.map((citation) => ` · ${sources.get(citation.material_key) ?? citation.material_key} ${citation.location}`).join("")}</small>
-      </li>)}</ul> : <p>当前资料未形成这一项结论。</p>}
-    </div>)}
-    <details open><summary>阅读覆盖与原件选择</summary><ul>{basis.sources.map((source) => <li key={source.material_key}>
-      <b>{source.relative_path}</b> · {{ read: "已读", partial: "部分已读", unread: "未读" }[source.coverage.kind]}
-      {source.coverage.unread_description ? <p>{source.coverage.unread_description}</p> : null}
-      <p>{source.selection_reason ? `原件已保留：${source.selection_reason}` : "资料保留在本次工作区，后续可继续读取。"}</p>
-    </li>)}</ul></details>
-    {basis.kind === "literature_revised" ? <div>
-      <h3>文献带来的修正</h3>
-      {basis.corrections.length ? <ul>{basis.corrections.map((correction, index) => <li key={`${correction.prior_statement_ref}-${index}`}>
-        <p>{correction.explanation}</p>
-        <small>原资料：{correction.original_sources.map((key) => sources.get(key) ?? key).join("、")}</small>
-        <small>文献：{correction.literature_sources.map((citation) => `${citation.paper_id} · ${citation.locator}`).join("；")}</small>
-      </li>)}</ul> : <p>本次文献结果未支持新增修正。</p>}
-      <p>{basis.search_assessment?.assessment}</p>
-      {basis.search_assessment?.limitations.length ? <ul>{basis.search_assessment.limitations.map((limit) => <li key={limit}>{limit}</li>)}</ul> : null}
-    </div> : null}
-  </section>;
-}
-
 function messageFor(code: string): string {
   const messages: Record<string, string> = {
     quest_draft_stale: "Quest basis 已变化；已停止当前写入，请重新检查字段。",
     question_proposal_stale: "首问题依据已变化；旧 Proposal 保留，请重新生成或编辑后复核。",
+    creation_input_stale: "材料集合或已读内容已经变化，请重新生成理解与问题预览。",
+    creation_understanding_required: "请先读取当前材料并形成创建理解。",
+    creation_source_not_accepted: "选中材料尚未完成正式接纳，请刷新状态后重试。",
     quest_reload_stale: "载入期间 durable 版本再次推进；本地未保存修改仍保留，请重新载入。",
     confirmation_preview_required: "Impact Preview 尚未绑定当前 Quest 与首问题，不能确认。",
     confirmation_preview_stale: "Impact Preview 已陈旧；等待系统自动刷新后再确认。",

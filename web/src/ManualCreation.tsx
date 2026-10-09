@@ -1,5 +1,7 @@
 import { useWorkMaterialDraft, WorkMaterialFields, WorkMaterialReferences } from "./WorkMaterialForm";
 import type { WorkMaterialReceipt } from "./workMaterialApi";
+import type { CreationResearchBasis } from "./api";
+import { CreationUnderstanding } from "./CreationUnderstanding";
 import {
   useCallback,
   useEffect,
@@ -111,7 +113,9 @@ export type ManualQuestionProposalView = {
 
 export type ManualQuestionCreationView = {
   work_materials?: WorkMaterialReceipt[];
+  creation_basis?: CreationResearchBasis | null;
   creation_id: string;
+  generation?: number;
   status:
     | "seed_draft"
     | "seed_confirmed"
@@ -162,6 +166,7 @@ export type ManualCreationSeedConfirmationDraft = {
 export type ManualCreationProposalSaveInput = {
   creation_id: string;
   expected_basis_hash: string;
+  expected_input_identity_hash: string | null;
   expected_proposal_ref: string | null;
   expected_proposal_hash: string | null;
   content: ManualQuestionContent;
@@ -193,6 +198,7 @@ export type ManualCreationProps = {
     message: string;
   }) => void | Promise<void>;
   onRefreshDraftSession?: () => void | Promise<void>;
+  onUnderstandMaterials?: (input: { creation_id: string }) => void | Promise<void>;
   onSaveProposal: (
     input: ManualCreationProposalSaveInput,
   ) => ManualQuestionProposalView | Promise<ManualQuestionProposalView>;
@@ -208,6 +214,8 @@ export type ManualCreationProps = {
 type ResearchPreference = "deepfetch" | "waiver" | "later";
 type BusyAction =
   | "seed"
+  | "materials"
+  | "understanding"
   | "deepfetch"
   | "waiver"
   | "message"
@@ -359,9 +367,15 @@ function errorDetail(caught: unknown): { code: string; message: string } {
     const code = "code" in caught && typeof caught.code === "string"
       ? caught.code
       : "manual_creation_action_failed";
-    const message = "message" in caught && typeof caught.message === "string"
+    const messages: Record<string, string> = {
+      creation_input_stale: "材料集合或已读内容已经变化，请刷新理解后复核问题草案。",
+      creation_understanding_required: "请先阅读当前材料并形成理解，再继续保存或确认。",
+      creation_source_not_accepted: "选中材料尚未完成正式接纳，请刷新状态后重试。",
+      manual_proposal_basis_stale: "问题草案依据已变化，请复核并保存当前版本后再确认。",
+    };
+    const message = messages[code] ?? ("message" in caught && typeof caught.message === "string"
       ? caught.message
-      : code;
+      : code);
     return { code, message };
   }
   return {
@@ -398,21 +412,18 @@ function deepFetchCopy(deepfetch: ManualCreationDeepFetchView | null): string {
 }
 
 function actionLabel(action: BusyAction | null): string | null {
-  return action === "seed"
-    ? "正在确认 Seed…"
-    : action === "deepfetch"
-      ? "正在启动 DeepFetch…"
-      : action === "waiver"
-        ? "正在确认 waiver…"
-        : action === "message"
-          ? "正在发送…"
-          : action === "proposal"
-            ? "正在保存 Proposal…"
-            : action === "confirm"
-              ? "正在确认最终问题…"
-              : action === "cancel"
-                ? "正在取消 CreationContext…"
-                : null;
+  const labels: Record<BusyAction, string> = {
+    materials: "正在刷新材料状态…",
+    understanding: "正在阅读已有材料…",
+    seed: "正在确认 Seed…",
+    deepfetch: "正在启动 DeepFetch…",
+    waiver: "正在确认 waiver…",
+    message: "正在发送…",
+    proposal: "正在保存 Proposal…",
+    confirm: "正在确认最终问题…",
+    cancel: "正在取消 CreationContext…",
+  };
+  return action === null ? null : labels[action];
 }
 
 export function ManualCreation({
@@ -425,6 +436,7 @@ export function ManualCreation({
   onConfirmWaiver,
   onSendDraftMessage,
   onRefreshDraftSession,
+  onUnderstandMaterials,
   onSaveProposal,
   onConfirmProposal,
   onMaterialDraftChange,
@@ -544,7 +556,10 @@ export function ManualCreation({
   const proposalConfirmationPending =
     proposalConfirmationDispatched && !proposalConfirmed;
   const acceptedMaterialBindings = view.seed.value?.accepted_material_bindings ?? [];
-  const isBusy = busyAction !== null || proposalSaving || closing;
+  const hasWorkMaterials = (view.work_materials ?? []).some((receipt) => receipt.references.length > 0);
+  const materialUnderstandingNeeded = view.creation_basis?.freshness === "stale"
+    || (hasWorkMaterials && !view.creation_basis);
+  const isBusy = busyAction !== null || proposalSaving || closing || referenceDraft.busy;
   const authoritativeProposal = savedProposal ?? view.proposal;
   const proposalDirty = !authoritativeProposal || !contentEquals(
     proposalDraft,
@@ -558,6 +573,9 @@ export function ManualCreation({
   const canConfirmProposal =
     seedConfirmed &&
     researchSatisfied &&
+    !materialUnderstandingNeeded &&
+    authoritativeProposal?.status !== "stale" &&
+    !referenceDraft.pending &&
     questionComplete(proposalDraft) &&
     !proposalConfirmed &&
     !proposalConfirmationDispatched &&
@@ -668,7 +686,7 @@ export function ManualCreation({
     const incoming = view.proposal;
     if (!incoming) return;
     const current = savedProposalRef.current;
-    if (current?.ref === incoming.ref && current.hash === incoming.hash) return;
+    if (current?.ref === incoming.ref && current.hash === incoming.hash && current.status === incoming.status) return;
     const wasDirty = current == null || !contentEquals(
       proposalDraftRef.current,
       current.content,
@@ -680,7 +698,7 @@ export function ManualCreation({
       proposalDraftRef.current = next;
       setProposalDraft(next);
     }
-  }, [view.proposal?.hash, view.proposal?.ref]);
+  }, [view.proposal?.hash, view.proposal?.ref, view.proposal?.status]);
 
   useEffect(() => {
     if (view.research.decision === "deepfetch") setResearchPreference("deepfetch");
@@ -771,6 +789,23 @@ export function ManualCreation({
       if (mountedRef.current) setBusyAction(null);
     }
   }, []);
+
+  const submitMaterials = async () => {
+    const command = referenceDraft.materialCommand();
+    if (!command) return;
+    await runAction("materials", async () => {
+      const accepted = await referenceDraft.submit(
+        `/api/v1/manual-question-creations/${encodeURIComponent(view.creation_id)}/material-references`,
+        command,
+      );
+      if (accepted) await onRefreshDraftSession?.();
+    });
+  };
+
+  const understandMaterials = async () => {
+    if (!onUnderstandMaterials) return;
+    await runAction("understanding", () => onUnderstandMaterials({ creation_id: view.creation_id }));
+  };
 
   const seedIdentity = useCallback(() => {
     if (
@@ -911,6 +946,10 @@ export function ManualCreation({
 
   const persistProposal = useCallback(async (): Promise<ManualQuestionProposalView | null> => {
     const expectedBasisHash = view.research.basis_hash;
+    if (materialUnderstandingNeeded) {
+      setLocalFailure(errorDetail({ code: view.creation_basis ? "creation_input_stale" : "creation_understanding_required" }));
+      return null;
+    }
     if (
       !seedConfirmed ||
       !researchSatisfied ||
@@ -934,17 +973,21 @@ export function ManualCreation({
       proposalDraftRef.current = captured;
       if (mountedRef.current) setProposalDraft(captured);
     }
-    if (basis && contentEquals(captured, basis.content)) return basis;
+    if (basis?.status === "current" && contentEquals(captured, basis.content)) return basis;
 
     setProposalSaving(true);
     setLocalFailure(null);
     const promise = Promise.resolve().then(() => onSaveProposal({
       creation_id: view.creation_id,
       expected_basis_hash: expectedBasisHash,
+      expected_input_identity_hash: view.creation_basis?.input_identity_hash ?? null,
       expected_proposal_ref: basis?.ref ?? null,
       expected_proposal_hash: basis?.hash ?? null,
       content: captured,
     })).then((saved) => {
+      if (saved.status !== "current") {
+        throw Object.assign(new Error("问题草案尚未绑定当前创建依据。"), { code: "manual_proposal_basis_stale" });
+      }
       if (!contentEquals(saved.content, captured)) {
         throw Object.assign(new Error(
           "公开保存响应与刚才编辑的 Proposal 不一致；没有继续确认。",
@@ -967,11 +1010,13 @@ export function ManualCreation({
     return saved;
   }, [
     onSaveProposal,
+    materialUnderstandingNeeded,
     proposalConfirmed,
     researchSatisfied,
     seedConfirmed,
     terminal,
     view.creation_id,
+    view.creation_basis,
     view.research.basis_hash,
     writesUnavailable,
   ]);
@@ -1126,17 +1171,21 @@ export function ManualCreation({
       : contentAccepted
         ? "精确 Proposal 已确认 · RM 已接纳，等待 RG identity"
         : "精确 Proposal 已确认 · 等待 RM / RG 分别接纳"
-    : !seedConfirmed
-      ? seedDraft.trim()
-        ? "描述已填写 · 其他空字段 = unprovided"
-        : "请先写一句自然语言描述 · 其他空字段 = unprovided"
-      : proposalIssue
-        ? `问题草案需修正：${proposalIssue.code}`
-        : !researchSatisfied
-          ? "还需完成 DeepFetch 或确认独立 waiver"
-          : proposalIsCurrent
-            ? "当前精确 Proposal 已保存 · 可以确认最终问题"
-            : "当前 Proposal 会先保存精确 identity，再提交确认";
+    : materialUnderstandingNeeded
+      ? "材料依据需要更新，请先阅读或刷新已有材料。"
+      : !seedConfirmed
+        ? seedDraft.trim()
+          ? "描述已填写 · 其他空字段 = unprovided"
+          : "请先写一句自然语言描述 · 其他空字段 = unprovided"
+        : proposalIssue
+          ? `问题草案需修正：${proposalIssue.code}`
+          : !researchSatisfied
+            ? "还需完成 DeepFetch 或确认独立 waiver"
+            : authoritativeProposal?.status === "stale"
+              ? "请复核问题草案并离开编辑字段，保存当前依据后再确认。"
+              : proposalIsCurrent
+                ? "当前精确 Proposal 已保存 · 可以确认最终问题"
+                : "当前 Proposal 会先保存精确 identity，再提交确认";
   const pendingActionLabel = closing
     ? "正在保存问题草案并关闭…"
     : proposalSaving
@@ -1255,11 +1304,17 @@ export function ManualCreation({
               <div className="manual-seed-start-grid">
                 <section className="manual-material-card" aria-labelledby="manual-material-title">
                   <div className="manual-card-head"><div><b id="manual-material-title">提供你已有的材料</b><p>保存原路径到本次创建上下文。材料提交与 Seed 确认独立。</p></div></div>
-                  <WorkMaterialFields draft={referenceDraft} disabled={terminal || writesUnavailable || isBusy || seedConfirmationPending} />
+                  <WorkMaterialFields draft={referenceDraft} disabled={terminal || writesUnavailable || isBusy || seedConfirmationPending}
+                    onRetried={() => { void runAction("materials", () => onRefreshDraftSession?.()); }} />
                   <button type="button" disabled={terminal || writesUnavailable || isBusy || seedConfirmationPending || referenceDraft.busy || !!referenceDraft.pending || !referenceDraft.selection || !referenceDraft.receiver}
-                    onClick={() => { const command = referenceDraft.materialCommand(); if (command) void referenceDraft.submit(`/api/v1/manual-question-creations/${encodeURIComponent(view.creation_id)}/material-references`, command); }}>保存材料引用到创建上下文</button>
+                    onClick={() => void submitMaterials()}>保存材料引用到创建上下文</button>
                   <WorkMaterialReferences receipts={view.work_materials ?? []} />
                   <p>已保存的引用尚未表示内容已解释或形成 Question。确认 Seed 不会自动接纳这些引用。</p>
+                  {onUnderstandMaterials && hasWorkMaterials ? <button type="button"
+                    disabled={terminal || writesUnavailable || isBusy || seedConfirmationPending || !!referenceDraft.pending || proposalConfirmationPending}
+                    onClick={() => void understandMaterials()}>
+                    {busyAction === "understanding" ? "正在阅读已有材料…" : view.creation_basis ? "刷新材料理解" : "阅读已有材料"}
+                  </button> : null}
                   {acceptedMaterialBindings.length ? <p>既有材料版本绑定 · {acceptedMaterialBindings.length}</p> : null}
                 </section>
 
@@ -1305,6 +1360,8 @@ export function ManualCreation({
                 </fieldset>
               </div>
 
+              {view.creation_basis ? <CreationUnderstanding basis={view.creation_basis} /> : null}
+
               <div className="manual-seed-divider">
                 <span>{seedConfirmed
                   ? "精确 QuestionProposal · 四项必填，两项可选"
@@ -1313,7 +1370,7 @@ export function ManualCreation({
 
               <div className="manual-proposal-source">
                 <b>{seedConfirmed ? "可编辑 QuestionProposal" : "Seed 阶段的可选结构化草稿"}</b>
-                <span>{proposalDirty ? "本地编辑待同步" : "当前精确 Proposal 已同步"}</span>
+                <span>{authoritativeProposal?.status === "stale" ? "创建依据已变化，请复核并保存草案" : proposalDirty ? "本地编辑待同步" : "当前精确 Proposal 已同步"}</span>
                 <code>
                   {authoritativeProposal && !proposalDirty
                     ? `${authoritativeProposal.ref} · ${authoritativeProposal.hash.slice(0, 12)}`
@@ -1591,6 +1648,7 @@ export function ManualCreation({
               type="button"
               disabled={
                 !seedDraft.trim() || terminal || writesUnavailable || isBusy ||
+                materialUnderstandingNeeded || !!referenceDraft.pending ||
                 seedDraft.trim().length > seedIntentMaxLength ||
                 materialDraft.files.length > maxAcceptedMaterialBindings ||
                 contentIssue(proposalDraft, false) !== null ||

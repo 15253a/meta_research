@@ -187,6 +187,23 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
     from meta_research.asset_lifecycle_operations import asset_lifecycle_operations
     def invoke(context, arguments):
         try:
+            if context.phase == "creation_materials":
+                operation = human_collaboration._creation_material_operation(context)
+                operation.authorize(context)
+                work = operation.work
+                if work.read_basis is None or arguments["source_ref"] != arguments["version_ref"]:
+                    raise OwnerConflict("content_source_unbound")
+                basis = research_memory.creation_bases.query(work.read_basis["basis_ref"], work.read_basis["basis_hash"])
+                research_memory.creation_bases.require_current(basis)
+                version = arguments["version_ref"]
+                snapshot = work.read_literature
+                page_arguments = {key: value for key, value in arguments.items() if key not in {"source_ref", "version_ref"}}
+                if snapshot is not None and version == snapshot["snapshot_ref"]:
+                    return {**research_memory.read_literature_content_page(version, **page_arguments),
+                        "source_ref": version, "version_ref": version}
+                if version not in {item["binding"]["version_ref"] for item in basis["sources"] if item["binding"] is not None}:
+                    raise OwnerConflict("content_source_unbound")
+                return research_memory.read_asset_content_page(version, **page_arguments)
             quest_ref=_quest(agent_runtime,context)
             return read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,**arguments)
         except OwnerConflict as error:

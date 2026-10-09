@@ -82,6 +82,7 @@ _UNKNOWN_DRAFTING_OUTCOMES = frozenset(
         "codex_job_outcome_unknown",
         "codex_job_spool_conflict",
         "codex_job_spool_invalid",
+        "protected_creation_unknown_outcome",
     }
 )
 
@@ -192,6 +193,7 @@ def _proposal_binding(
     basis_hash: str,
     revision: int,
     content: dict[str, object],
+    input_identity_hash: str | None = None,
 ) -> dict[str, object]:
     return {
         "schema_ref": QUESTION_PROPOSAL_SCHEMA,
@@ -201,6 +203,7 @@ def _proposal_binding(
         "basis_hash": basis_hash,
         "revision": revision,
         "content": content,
+        **({} if input_identity_hash is None else {"input_identity_hash": input_identity_hash}),
     }
 
 
@@ -390,6 +393,17 @@ def _verify_manual_research_lineage(
         scope = decoded_object(request.scope_json)
         materials = json.loads(request.material_bindings_json)
         expected_materials = [binding.as_dict() for binding in seed_bindings]
+        basis_reference = scope.get("creation_basis") if isinstance(scope, dict) else None
+        if basis_reference is not None:
+            memory = research_memory.creation_bases
+            basis = memory.query(basis_reference["basis_ref"], basis_reference["basis_hash"])
+            anchor = basis["input_identity"]["anchor"]
+            if (memory.reference(basis) != basis_reference
+                or anchor["kind"] != "manual_question_creation"
+                or anchor["ref"] != creation.context_ref
+                or anchor["generation"] != int(creation.generation)):
+                raise OwnerConflict("manual_question_research_lineage_invalid")
+            expected_materials.extend(item["binding"] for item in basis["sources"] if item["binding"] is not None)
         if (
             not isinstance(scope, dict)
             or not isinstance(materials, list)
@@ -503,6 +517,7 @@ class SQLiteManualQuestionConfirmationVerifier:
                 basis_hash=row.research_basis_hash,
                 revision=int(row.proposal_revision),
                 content=content,
+                input_identity_hash=row.proposal_input_identity_hash,
             )
         )
         if (
@@ -673,7 +688,90 @@ class ManualQuestionCreation:
                     request_hash,
                     context_ref,
                 )
+            existing_session = connection.execute(text("SELECT session_ref FROM hc_manual_drafting_sessions WHERE context_ref=:ref"),
+                {"ref": context_ref}).first()
+            if existing_session is None:
+                connection.execute(text("INSERT INTO hc_manual_drafting_sessions "
+                    "(session_ref,context_ref,status,created_at,updated_at) VALUES (:session,:ref,'open',:now,:now)"),
+                    {"session": new_ref("manual_drafting_session"), "ref": context_ref, "now": time.time()})
         return self.query(context_ref)
+
+    def _material_inputs(self, row):
+        from meta_research.creation_inputs import CreationAnchor
+        anchor = CreationAnchor("manual_question_creation", str(row.context_ref), int(row.generation), int(row.generation),
+            canonical_hash({"context_ref": row.context_ref, "generation": int(row.generation),
+                "quest_ref": row.quest_ref, "parent_question_ref": row.parent_question_ref}))
+        memory = self._research_memory.creation_bases
+        return memory.workspaces._hc.creation_material_snapshot(anchor)
+
+    def _material_basis(self, row, *, require_current=True):
+        if row.creation_basis_ref is None:
+            if require_current and self._material_inputs(row).references:
+                raise OwnerConflict("creation_understanding_required")
+            return None
+        memory = self._research_memory.creation_bases
+        basis = memory.query(row.creation_basis_ref, row.creation_basis_hash)
+        if require_current:
+            memory.require_current(basis)
+        return basis
+
+    def prepare_material_basis(self, context_ref, *, idempotency_key):
+        from meta_research.creation_basis import InitializationUnderstandingRequest, empty_manifest
+        _validate_idempotency_key(idempotency_key)
+        with self._database.write() as connection:
+            row = self._require_context(connection, context_ref)
+            session = connection.execute(text("SELECT * FROM hc_manual_drafting_sessions WHERE context_ref=:ref"),
+                {"ref": context_ref}).first()
+            if session is None and row.terminal_decision is None:
+                connection.execute(text("INSERT INTO hc_manual_drafting_sessions "
+                    "(session_ref,context_ref,status,created_at,updated_at) VALUES (:session,:ref,'open',:now,:now)"),
+                    {"session": new_ref("manual_drafting_session"), "ref": context_ref, "now": time.time()})
+                session = connection.execute(text("SELECT * FROM hc_manual_drafting_sessions WHERE context_ref=:ref"),
+                    {"ref": context_ref}).one()
+        self._require_row_target_current(row)
+        if row.terminal_decision is not None:
+            return self._material_basis(row, require_current=False)
+        if session.status != "open":
+            raise OwnerConflict("manual_question_creation_is_terminal")
+        inputs = self._material_inputs(row)
+        if not inputs.references:
+            return None
+        memory = self._research_memory.creation_bases
+        current_basis = self._material_basis(row, require_current=False)
+        if current_basis is not None:
+            try:
+                memory.require_current(current_basis)
+            except OwnerConflict:
+                pass
+            else:
+                return current_basis
+        basis = memory.prepared(context_ref, inputs.anchor.draft_revision, inputs.anchor.draft_hash, inputs)
+        if basis is None:
+            understand = getattr(self._intent_drafting_provider, "understand_initialization", None)
+            if not callable(understand):
+                raise OwnerConflict("creation_understanding_provider_unavailable")
+            request = InitializationUnderstandingRequest(str(row.quest_initialization_id), inputs.anchor.draft_revision,
+                inputs.anchor.draft_hash, {"creation_context_ref": context_ref, "parent_question_ref": row.parent_question_ref,
+                    "confirmed_seed": None if row.seed_json is None else _decoded_dict(row.seed_json, "manual_creation_seed_invalid")},
+                empty_manifest(), "manual_understanding_" + canonical_hash({"context": context_ref, "inputs": inputs.as_dict(), "key": idempotency_key}),
+                str(session.session_ref), session.native_session_ref, "manual_question_creation", context_ref, int(row.generation), inputs)
+            try:
+                result = understand(request)
+            except DraftingUnavailable as error:
+                raise OwnerConflict(error.code) from error
+            basis = memory.accept_reference_prepared(request, result)
+            if result.companion_native_session_ref is not None:
+                with self._database.write() as connection:
+                    connection.execute(text("UPDATE hc_manual_drafting_sessions SET native_session_ref=:native WHERE session_ref=:session AND status='open'"),
+                        {"native": result.companion_native_session_ref, "session": session.session_ref})
+        with self._database.write() as connection:
+            current = self._require_context(connection, context_ref)
+            memory.require_current(basis)
+            if current.terminal_decision is not None:
+                raise OwnerConflict("manual_question_creation_is_terminal")
+            connection.execute(text("UPDATE hc_manual_question_creations SET creation_basis_ref=:basis,creation_basis_hash=:hash WHERE context_ref=:ref"),
+                {"basis": basis["basis_ref"], "hash": basis["basis_hash"], "ref": context_ref})
+        return basis
 
     def confirm_seed(
         self,
@@ -684,6 +782,7 @@ class ManualQuestionCreation:
     ) -> dict[str, object]:
         _validate_idempotency_key(idempotency_key)
         normalized = _validate_seed(seed)
+        self.prepare_material_basis(context_ref, idempotency_key="seed:" + idempotency_key)
         self._verify_material_bindings(normalized)
         request_hash = canonical_hash(
             {
@@ -727,7 +826,6 @@ class ManualQuestionCreation:
                         SEED_RECEIPT_KIND, seed_ref, bindings
                     )
                     assert_asset_payload_usable(connection, normalized)
-                    session_ref = new_ref("manual_drafting_session")
                     connection.execute(
                         text(
                             "UPDATE hc_manual_question_creations SET status = "
@@ -744,18 +842,6 @@ class ManualQuestionCreation:
                             "seed_hash": seed_hash,
                             "receipt_ref": receipt_ref,
                             "receipt_hash": receipt_hash,
-                            "now": now,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "INSERT INTO hc_manual_drafting_sessions "
-                            "(session_ref, context_ref, status, created_at, updated_at) "
-                            "VALUES (:session_ref, :context_ref, 'open', :now, :now)"
-                        ),
-                        {
-                            "session_ref": session_ref,
-                            "context_ref": context_ref,
                             "now": now,
                         },
                     )
@@ -794,6 +880,7 @@ class ManualQuestionCreation:
         idempotency_key: str,
     ) -> dict[str, object]:
         _validate_idempotency_key(idempotency_key)
+        self.prepare_material_basis(context_ref, idempotency_key="waiver:" + idempotency_key)
         request_hash = canonical_hash(
             {
                 "command": "record_manual_deepfetch_waiver",
@@ -931,6 +1018,7 @@ class ManualQuestionCreation:
         if replay is not None:
             return self.query(context_ref)
         self._require_seed_cas(initial, expected_seed_ref, expected_seed_hash)
+        prepared_basis = self.prepare_material_basis(context_ref, idempotency_key="deepfetch:" + idempotency_key)
         self._require_row_target_current(initial)
         quest, _parent = self._require_current_target(
             str(initial.quest_ref), str(initial.parent_question_ref)
@@ -1000,6 +1088,13 @@ class ManualQuestionCreation:
             "scope_exclusions": literature.get("scope_exclusions"),
         }
         scope_hash = canonical_hash(scope)
+        if prepared_basis is not None:
+            memory = self._research_memory.creation_bases
+            scope["creation_basis"] = memory.reference(prepared_basis)
+            scope["existing_work_retrieval"] = {field: prepared_basis["understanding"][field]
+                for field in ("claims_and_conditions", "conflicts", "gaps", "unfinished_questions")}
+            materials.extend(item["binding"] for item in prepared_basis["sources"] if item["binding"] is not None)
+            scope_hash = canonical_hash(scope)
         material_hash = canonical_hash(materials)
         context_basis_hash = canonical_hash(
             {
@@ -1583,6 +1678,7 @@ class ManualQuestionCreation:
         idempotency_key: str,
     ) -> dict[str, object]:
         _validate_idempotency_key(idempotency_key)
+        self.prepare_material_basis(context_ref, idempotency_key="drafting:" + idempotency_key)
         if not isinstance(message, str) or not message.strip():
             raise OwnerConflict("manual_drafting_message_required")
         if len(message) > INTENT_MESSAGE_MAX_LENGTH:
@@ -1651,6 +1747,10 @@ class ManualQuestionCreation:
                         "edit or confirm it."
                     ),
                 }
+                material_basis = self._material_basis(row)
+                if material_basis is not None:
+                    drafting_context["creation_basis"] = self._research_memory.creation_bases.reference(material_basis)
+                    drafting_context["input_identity_hash"] = canonical_hash(material_basis["input_identity"])
                 drafting_context_json = canonical_json(drafting_context)
                 ordinal = int(
                     connection.execute(
@@ -1992,6 +2092,17 @@ class ManualQuestionCreation:
             )
 
         try:
+            basis = self._material_basis(creation)
+            if basis is not None and (drafting_context.get("creation_basis") != self._research_memory.creation_bases.reference(basis)
+                or drafting_context.get("input_identity_hash") != canonical_hash(basis["input_identity"])):
+                raise DraftingUnavailable("creation_input_stale")
+            inputs = self._material_inputs(creation)
+            literature = None if creation.literature_snapshot_ref is None else self._research_memory.read_literature_proposal_evidence(str(creation.literature_snapshot_ref))
+            projection = None
+            if basis is not None:
+                roots = self._research_memory.creation_bases.workspaces
+                binding = roots.bind_manual_creation(str(creation.context_ref), str(session.session_ref), int(creation.generation))
+                projection = self._research_memory.creation_bases.project(basis, literature, binding)
             result = self._intent_drafting_provider.reply(
                 IntentTurnRequest(
                     initialization_id=str(creation.quest_initialization_id),
@@ -2009,8 +2120,17 @@ class ManualQuestionCreation:
                     creation_context_ref=str(creation.context_ref),
                     context_generation=int(creation.generation),
                     root_session_ref=str(session.session_ref),
+                    inputs=inputs if inputs.references else None,
+                    creation_basis=basis, context=projection, literature_snapshot=literature,
                 )
             )
+            if basis is not None:
+                memory = self._research_memory.creation_bases
+                basis = (memory.accept_consumed(basis, result) if literature is None else
+                    memory.accept_revision(basis, literature["source_snapshot"], result.revision, result))
+                with self._database.write() as connection:
+                    connection.execute(text("UPDATE hc_manual_question_creations SET creation_basis_ref=:ref,creation_basis_hash=:hash WHERE context_ref=:context AND terminal_decision IS NULL"),
+                        {"ref": basis["basis_ref"], "hash": basis["basis_hash"], "context": creation.context_ref})
             if not isinstance(result.reply, str):
                 raise DraftingUnavailable("intent_reply_invalid")
             reply = result.reply.strip()
@@ -2022,7 +2142,7 @@ class ManualQuestionCreation:
                 or len(result.native_session_ref) > 256
             ):
                 raise DraftingUnavailable("intent_session_ref_invalid")
-        except DraftingUnavailable as error:
+        except (DraftingUnavailable, OwnerConflict) as error:
             if error.code == "codex_cli_stopped":
                 return self._requeue_interrupted_drafting_turn(
                     str(turn.turn_ref),
@@ -2455,6 +2575,7 @@ class ManualQuestionCreation:
         idempotency_key: str,
         expected_proposal_ref: str | None = None,
         expected_proposal_hash: str | None = None,
+        expected_input_identity_hash: str | None = None,
     ) -> dict[str, object]:
         _validate_idempotency_key(idempotency_key)
         normalized = _validate_question_content(content)
@@ -2466,6 +2587,7 @@ class ManualQuestionCreation:
                 "expected_basis_hash": expected_basis_hash,
                 "expected_proposal_ref": expected_proposal_ref,
                 "expected_proposal_hash": expected_proposal_hash,
+                **({} if expected_input_identity_hash is None else {"expected_input_identity_hash": expected_input_identity_hash}),
             }
         )
         with self._database.read() as connection:
@@ -2477,6 +2599,10 @@ class ManualQuestionCreation:
             )
             if replay is None:
                 row = self._require_context(connection, context_ref)
+                basis = self._material_basis(row)
+                input_hash = None if basis is None else canonical_hash(basis["input_identity"])
+                if input_hash != expected_input_identity_hash:
+                    raise OwnerConflict("creation_input_stale")
                 if (
                     row.status != "research_ready"
                     or row.research_basis_hash != expected_basis_hash
@@ -2487,7 +2613,7 @@ class ManualQuestionCreation:
                     current = _decoded_dict(
                         row.proposal_json, "manual_proposal_invalid"
                     )
-                    if current == normalized:
+                    if current == normalized and row.proposal_input_identity_hash == input_hash:
                         proposal_ref = str(row.proposal_ref)
                     else:
                         if (
@@ -2554,6 +2680,9 @@ class ManualQuestionCreation:
                         raise OwnerConflict("manual_proposal_confirmation_conflict")
                     confirmation_ref = str(row.confirmation_ref)
                 else:
+                    basis = self._material_basis(row)
+                    if row.proposal_input_identity_hash != (None if basis is None else canonical_hash(basis["input_identity"])):
+                        raise OwnerConflict("creation_input_stale")
                     if (
                         row.status != "research_ready"
                         or row.proposal_ref != proposal_ref
@@ -2573,6 +2702,7 @@ class ManualQuestionCreation:
                             basis_hash=row.research_basis_hash,
                             revision=int(row.proposal_revision),
                             content=content,
+                            input_identity_hash=row.proposal_input_identity_hash,
                         )
                     )
                     if expected_hash != proposal_hash:
@@ -3081,6 +3211,8 @@ class ManualQuestionCreation:
     ) -> str:
         revision = int(row.proposal_revision) + 1
         proposal_ref = new_ref("manual_question_proposal")
+        basis = self._material_basis(row)
+        input_hash = None if basis is None else canonical_hash(basis["input_identity"])
         proposal_hash = canonical_hash(
             _proposal_binding(
                 context_ref=row.context_ref,
@@ -3089,6 +3221,7 @@ class ManualQuestionCreation:
                 basis_hash=row.research_basis_hash,
                 revision=revision,
                 content=content,
+                input_identity_hash=input_hash,
             )
         )
         now = time.time()
@@ -3097,7 +3230,7 @@ class ManualQuestionCreation:
                 "UPDATE hc_manual_question_creations SET proposal_revision = "
                 ":revision, proposal_ref = :proposal_ref, proposal_json = "
                 ":proposal_json, proposal_hash = :proposal_hash, "
-                "proposal_basis_hash = :basis_hash, updated_at = :now WHERE "
+                "proposal_basis_hash = :basis_hash, proposal_input_identity_hash=:input_hash, updated_at = :now WHERE "
                 "context_ref = :context_ref AND status = 'research_ready' AND "
                 "terminal_decision IS NULL"
             ),
@@ -3108,6 +3241,7 @@ class ManualQuestionCreation:
                 "proposal_json": canonical_json(content),
                 "proposal_hash": proposal_hash,
                 "basis_hash": row.research_basis_hash,
+                "input_hash": input_hash,
                 "now": now,
             },
         )
@@ -3135,6 +3269,30 @@ class ManualQuestionCreation:
         if row.terminal_decision != "commit" or row.confirmation_ref is None:
             raise OwnerConflict("manual_question_not_confirmed")
         quest, parent = self._require_row_target_current(row)
+        basis = self._material_basis(row, require_current=False)
+        if basis is not None:
+            accepted_version_refs = {
+                role.version_ref
+                for role in self._research_graph.query_asset_roles(
+                    quest_ref=quest.quest_ref, role="quest_source_material"
+                )
+            }
+            for source in basis["sources"]:
+                if source["binding"] is not None:
+                    binding = self._research_memory.query_asset_version(source["binding"]["version_ref"]).as_binding()
+                    self._research_memory.verify_asset_binding(asset_ref=binding.asset_ref, version_ref=binding.version_ref,
+                        content_hash=binding.content_hash, manifest_hash=binding.manifest_hash, receipt=binding.receipt)
+                    if binding.version_ref not in accepted_version_refs:
+                        self._research_graph.accept_asset_role(
+                            binding=binding,
+                            role="quest_source_material",
+                            quest_ref=quest.quest_ref,
+                            idempotency_key="manual-source-material:" + canonical_hash({
+                                "context_ref": context_ref,
+                                "version_ref": binding.version_ref,
+                            }),
+                        )
+                        return
         content = _validate_question_content(
             _decoded_dict(row.proposal_json, "manual_proposal_invalid")
         )
@@ -3219,6 +3377,9 @@ class ManualQuestionCreation:
                 content=accepted_content,
                 confirmation=confirmation,
             )
+        basis = self._material_basis(row, require_current=False)
+        if basis is not None:
+            self._research_memory.creation_bases.associate_question(accepted_question.as_binding(), basis)
         if row.research_choice == "deepfetch":
             with self._database.write() as connection:
                 current = self._require_context(connection, context_ref)
@@ -3655,6 +3816,13 @@ class ManualQuestionCreation:
                 raise OwnerConflict("manual_literature_snapshot_binding_invalid")
             literature_snapshot = accepted_snapshot.as_public_dict()
 
+        material_basis = self._material_basis(row, require_current=False)
+        material_current = True
+        if material_basis is not None:
+            try:
+                self._research_memory.creation_bases.require_current(material_basis)
+            except OwnerConflict:
+                material_current = False
         proposal = None
         if row.proposal_ref is not None:
             proposal_content = _decoded_dict(
@@ -3668,6 +3836,7 @@ class ManualQuestionCreation:
                     basis_hash=row.proposal_basis_hash,
                     revision=int(row.proposal_revision),
                     content=proposal_content,
+                    input_identity_hash=row.proposal_input_identity_hash,
                 )
             ):
                 raise OwnerConflict("manual_proposal_invalid")
@@ -3681,7 +3850,8 @@ class ManualQuestionCreation:
                     "confirmed"
                     if row.confirmation_ref is not None
                     else "current"
-                    if row.proposal_basis_hash == row.research_basis_hash
+                    if row.proposal_basis_hash == row.research_basis_hash and material_current
+                    and row.proposal_input_identity_hash == (None if material_basis is None else canonical_hash(material_basis["input_identity"]))
                     else "stale"
                 ),
             }
@@ -3778,6 +3948,11 @@ class ManualQuestionCreation:
             "parent_question_ref": row.parent_question_ref,
             "status": row.status,
             "seed": seed,
+            "creation_basis": (None if material_basis is None else {**material_basis,
+                "sources": self._research_memory.creation_bases.source_views(material_basis),
+                "understanding": self._research_memory.creation_bases.understanding_view(material_basis),
+                "input_identity_hash": canonical_hash(material_basis["input_identity"]),
+                "freshness": "current" if material_current else "stale"}),
             "research_path": {
                 **(
                     {}

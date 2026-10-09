@@ -9,6 +9,7 @@ from meta_research.deepfetch import CodexDeepFetchAdapter
 from meta_research.external_mcp import ExternalMcpRuntime, parse_services
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
 from meta_research.owners.common import canonical_hash
+from meta_research.quest_drafting import IntentTurnRequest
 from meta_research.writing_skill import CodexWritingSkillAdapter
 from test_deepfetch_adapter import RecordingRunner, _request, _deepfetch_web_evidence_gate_output_schema
 from test_external_mcp import service
@@ -51,7 +52,7 @@ def test_public_companion_before_quest_replays_frozen_context(tmp_path):
     executable = str(_fake_codex(tmp_path / "fake-companion"))
     adapter = CodexCompanionAdapter(workspace, executable=executable, process_runner=runner)
     adapter.bind_external_mcp(external)
-    request = SimpleNamespace(initialization_id="initialization:before-quest", draft_revision=1, draft_hash="b" * 64,
+    request = IntentTurnRequest(initialization_id="initialization:before-quest", draft_revision=1, draft_hash="b" * 64,
         draft={}, message="What should we research?", native_session_ref=None, job_ref="companion:before-quest",
         creation_context_kind="quest_initialization", creation_context_ref=None, context_generation=None)
     first = adapter.reply(request)

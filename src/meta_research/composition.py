@@ -299,6 +299,7 @@ class ProductionRuntime:
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         self.external_mcp.configure_endpoint(base_url)
+        self.root_workspaces.configure_creation_endpoint(base_url)
         for provider in self._resident_mcp_providers:
             configure = getattr(
                 provider, "configure_resident_mcp_endpoint", None
@@ -971,6 +972,7 @@ def build_production_runtime(
         deepfetch_locator=getattr(deepfetch_provider, "research_workspace_path", None),
     )
     human_collaboration.bind_reply_workspaces(root_workspaces)
+    root_workspaces.configure_creation_runtime(executable=codex_executable, credentials_home=data_root.codex_home)
     human_collaboration.recover_response_deliveries()
     for provider in (*workspace_providers.values(), proposal_drafter, deepfetch_provider):
         bind_workspaces = getattr(provider, "bind_workspaces", None)
@@ -989,6 +991,7 @@ def build_production_runtime(
         human_collaboration=owners.human_collaboration,
         target_run_agent=target_run_agent,
     )
+    root_workspaces.bind_creation_gateway(semantic_gateway)
     harness_operation_canceller = None
     target_raw_output_store = TargetRawOutputStore(
         data_root.run / "harness-supervisor"
@@ -1027,6 +1030,7 @@ def build_production_runtime(
         root_operation_diagnostic_recorder=root_operation_diagnostics,
     )
     harnesses.bind_resident_mcp_scope_verifier(owners.agent_runtime)
+    harnesses.bind_creation_channels(root_workspaces)
     harnesses.bind_human_guidance_authority(owners.human_collaboration)
     for provider in (idea_skill_provider, plan_skill_provider, bundle_skill_provider, reasoning_skill_provider):
         bind_guidance = getattr(provider, "bind_human_guidance_authority", None)
