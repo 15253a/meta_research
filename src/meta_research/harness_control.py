@@ -46,7 +46,7 @@ class DurableHarnessOperationCanceller:
             or re.fullmatch(r"[0-9a-f]{64}", invocation_hash) is None
         ):
             raise HarnessCancellationError("harness_cancel_identity_invalid")
-        transport_invocation_hash = self._transport_invocation_hash(
+        transport_invocation_hash = self._resolve_transport_invocation_hash(
             invocation_hash
         )
         operation = (
@@ -96,16 +96,15 @@ class DurableHarnessOperationCanceller:
                 "harness_cancel_transport_invalid"
             ) from error
 
-    def _transport_invocation_hash(self, owner_invocation_hash: str) -> str:
+    def _resolve_transport_invocation_hash(self, owner_or_transport_hash: str) -> str:
         binding_path = (
             self._workspace
             / "owner-invocation-bindings"
-            / owner_invocation_hash[:2]
-            / f"{owner_invocation_hash}.json"
+            / owner_or_transport_hash[:2]
+            / f"{owner_or_transport_hash}.json"
         )
         if not binding_path.exists():
-            # Historical callers supplied the transport identity directly.
-            return owner_invocation_hash
+            return owner_or_transport_hash
         if binding_path.is_symlink() or binding_path.parent.is_symlink():
             raise HarnessCancellationError("harness_cancel_binding_invalid")
         try:
@@ -126,7 +125,7 @@ class DurableHarnessOperationCanceller:
             }
             or binding.get("schema_ref")
             != "meta-research/harness-operation-binding/v1"
-            or binding.get("owner_invocation_hash") != owner_invocation_hash
+            or binding.get("owner_invocation_hash") != owner_or_transport_hash
             or type(transport_hash) is not str
             or re.fullmatch(r"[0-9a-f]{64}", transport_hash) is None
             or type(binding.get("provider_operation_ref")) is not str

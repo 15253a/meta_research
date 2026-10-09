@@ -109,11 +109,7 @@ _REVIEWED_FROZEN_INPUT_RECOVERY_BUNDLE_BINDING_PAIRS = frozenset({
 
 # Directional, complete profile identities for historical reads only. Fixtures
 # retain the full objects and their reviewed capability/model/config differences.
-_REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
-    # 2026-10-09 issue #181 adds only the shared, public Quest-goal operation
-    # guidance to every working root. Preserve the complete preceding combined
-    # deployment identities as historical reads; execution bindings remain
-    # exact and frozen invocations are never rewritten.
+_QUEST_GOAL_GUIDANCE_ROOT_PROFILE_TRANSITIONS = frozenset({
     *(
         (before, "7095b640388dd7b4c32c1aff0538454578ca7658690922e8b57ccfb7a641771b")
         for before in (
@@ -130,6 +126,10 @@ _REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
             "e8e691b757cb608562d9766f8c9507f1f2feb9ad71b43de92296f310832bde55",
         )
     ),
+})
+
+_REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
+    *_QUEST_GOAL_GUIDANCE_ROOT_PROFILE_TRANSITIONS,
     # 2026-10-08 PR #202-#210 integration: this exact combined prompt retains
     # the baseline's historical read identities and the separately accepted
     # research-style, cleanup, help-handoff, reply and guidance prompt profiles.

@@ -321,8 +321,6 @@ def test_goal_evolution_wakes_a_higher_reasoning_epoch_without_rewriting_history
         evolved = runtime.owners.research_graph.evolve_quest_goal(**evolution)
         new_goal_ref = evolved["goal"]["goal_revision_ref"]
 
-        # The accepted CandidateCompletion and its StageCommit remain historical
-        # facts, but no longer describe the current goal head.
         historical_candidate = (
             runtime.owners.research_graph.query_candidate_completion(
                 source_outcome_ref=str(reasoning_decision.outcome_ref),
@@ -378,9 +376,6 @@ def test_goal_evolution_wakes_a_higher_reasoning_epoch_without_rewriting_history
         assert replayed["source_epoch"] == old_foreground["epoch"]
         assert replayed["epoch"] == new_foreground["epoch"]
 
-        # The ordinary Reasoning worker consumes the fresh active epoch. It
-        # issues a new immutable request whose context is cut at the evolved
-        # goal, without reopening or replacing the old request/commit.
         assert runtime.reasoning_stage.process_once()
         new_request = (
             runtime.owners.advancement_engine.query_reasoning_stage_request(

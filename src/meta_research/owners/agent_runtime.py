@@ -29544,7 +29544,6 @@ def _goal_work_disposition_from_intent(
     terminal_fact_ref: str,
     require_current: bool,
 ) -> GoalWorkDisposition:
-    """Re-enter RG's immutable goal intent and derive framework custody facts."""
 
     expected_kind = "stop" if disposition == "cancelled" else "do_not_start"
     row = connection.execute(

@@ -143,7 +143,7 @@ def test_harness_cancel_target_root_resolves_owner_hash_to_signed_transport_proc
                     "META_RESEARCH_HARNESS_WORKSPACE": str(provider_workspace),
                 },
             )
-        except BaseException as error:  # surfaced on the test thread below
+        except BaseException as error:
             outcome["error"] = error
 
     thread = threading.Thread(target=invoke, daemon=True)
