@@ -388,11 +388,20 @@ class CreationBasisMemory:
             "evidence_facts": facts, "prior_sources": self.source_views(predecessor),
             "prior_literature": self._literature_relations(predecessor)}
 
-    @staticmethod
-    def _literature_relations(basis):
+    def _literature_relations(self, basis):
         relations = [copy.deepcopy(item) for item in basis.get("inherited_literature", [])]
         if basis.get("literature_snapshot") is not None:
-            relations.append({"snapshot": basis["literature_snapshot"], "original_basis": basis["predecessor"]})
+            original = basis.get("literature_original_binding")
+            if original is None:
+                original = basis["predecessor"]
+                while original is not None:
+                    prior = self.query(original["basis_ref"], original["basis_hash"])
+                    if prior.get("literature_snapshot") != basis["literature_snapshot"]:
+                        break
+                    original = prior.get("literature_original_binding") or prior["predecessor"]
+                    if prior.get("literature_original_binding") is not None:
+                        break
+            relations.append({"snapshot": basis["literature_snapshot"], "original_basis": original})
         return {item["snapshot"]["snapshot_ref"]: item for item in relations}
 
     def _historical_witness(self, predecessor, witness, source_key):
@@ -434,7 +443,7 @@ class CreationBasisMemory:
                 elif decision["disposition"] == "replace":
                     if not decision["replacement_refs"] or not set(decision["replacement_refs"]).issubset(additions):
                         raise ValueError("replacement refs")
-                elif not decision["affected_scope"].strip() or decision["creation_limit"] == "none":
+                elif decision["replacement_refs"] or not decision["affected_scope"].strip() or decision["creation_limit"] == "none":
                     raise ValueError("excluded scope")
             prior_witnesses = {item["witness_ref"]: item for item in predecessor["input_identity"]["consumed"]}
             for inherited in predecessor.get("inherited_evidence", []):
@@ -693,7 +702,8 @@ class CreationBasisMemory:
         coverage = {item["material_key"]: item for item in revision["understanding"]["coverage"]}
         body = {key: value for key, value in predecessor.items() if key not in {"basis_ref", "basis_hash"}}
         body.update(kind="literature_revised", predecessor=self.reference(predecessor),
-            literature_snapshot=snapshot, understanding=revision["understanding"], corrections=revision["corrections"],
+            literature_snapshot=snapshot, literature_original_binding=self.reference(predecessor),
+            understanding=revision["understanding"], corrections=revision["corrections"],
             sources=[{**source, "coverage": coverage.get(source["material_key"], source["coverage"])} for source in predecessor["sources"]],
             search_assessment={"assessment": revision["search_assessment"], "completion": metadata["completion"], "limitations": metadata["limitations"]})
         if identity is not None:

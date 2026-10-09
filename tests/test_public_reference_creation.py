@@ -256,6 +256,50 @@ def test_requested_new_deepfetch_keeps_inherited_snapshot_and_new_binding_distin
         runtime.close()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_literature_origin_survives_actual_consumption_then_reassessment(tmp_path, legacy):
+    from meta_research.creation_basis import InitializationUnderstandingResult
+    from test_creation_reassessment import read_materials
+
+    source = tmp_path / "original"
+    source.mkdir()
+    (source / "note.txt").write_text("Original16 needs a condition-specific comparison.")
+    (source / "additional.txt").write_text("This additional range was read only after literature acceptance.")
+    runtime, adapter = reference_runtime(tmp_path / "runtime", selection="original")
+    client, headers = _authenticate(runtime)
+    try:
+        ready = reference_ready(runtime, client, headers, source, route="deepfetch")
+        memory = runtime.owners.research_memory.creation_bases
+        revised = memory.query(ready["creation_basis"]["basis_ref"])
+        original = revised["predecessor"]
+        assert revised["literature_original_binding"] == original
+        inputs = memory.require_current(revised)
+        reference = inputs.references[0]["reference_ref"]
+        _, work, identity, _ = read_materials(runtime, adapter.calls[-1][1].operation.binding, inputs,
+            "post-literature-consumption", reference, ["additional.txt"])
+        consumed = memory.accept_consumed(revised, InitializationUnderstandingResult({}, input_identity=identity, work=work))
+        assert consumed["predecessor"] == memory.reference(revised)
+        assert consumed["literature_original_binding"] == original
+        assert any(item["operation_ref"] == "post-literature-consumption" for item in consumed["input_identity"]["consumed"])
+        if legacy:
+            consumed = memory._accept({key: value for key, value in consumed.items()
+                if key not in {"basis_ref", "basis_hash", "literature_original_binding"}})
+        assert memory._literature_relations(consumed)[revised["literature_snapshot"]["snapshot_ref"]]["original_basis"] == original
+        endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        edited = client.put(endpoint + "/draft", headers=_write_headers(headers, "origin-goal"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"],
+            "draft": {**ready["quest_draft"]["value"], "goal": "Compare only the changed cold condition.", "route": "direct"}})
+        assert edited.status_code == 200, edited.text
+        current = generate(runtime, client, headers, edited.json(), key="origin-reassessment")
+        inherited = current["creation_basis"]["inherited_literature"][0]
+        assert inherited["snapshot"] == revised["literature_snapshot"]
+        assert inherited["original_basis"] == original
+        assert inherited["snapshot"]["binding"]["run_ref"] == revised["literature_snapshot"]["binding"]["run_ref"]
+    finally:
+        client.close()
+        runtime.close()
+
+
 def test_material_append_during_actual_protected_call_rejects_late_understanding(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -362,6 +406,15 @@ def test_new_reference_consumer_custody_failure_readback_and_recovery(tmp_path):
     try:
         ready = reference_ready(runtime, client, headers, source)
         endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        before = ready["creation_basis"]
+        changed = client.put(endpoint + "/draft", headers=_write_headers(headers, "failure-goal-change"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"],
+            "draft": {**ready["quest_draft"]["value"], "goal": "Continue the preserved result under a new condition."}})
+        assert changed.status_code == 200, changed.text
+        ready = generate(runtime, client, headers, changed.json(), key="failure-inherited")
+        inherited = [item for item in ready["creation_basis"]["sources"] if item["binding"] is not None]
+        assert [item["binding"] for item in inherited] == [item["binding"] for item in before["sources"] if item["binding"] is not None]
+        assert all(item["inherited_from"]["basis_hash"] == before["basis_hash"] for item in inherited)
         confirmed = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "confirm"), json=_confirmation_payload(ready))
         assert confirmed.status_code == 202, confirmed.text
         objects.rename(unavailable)

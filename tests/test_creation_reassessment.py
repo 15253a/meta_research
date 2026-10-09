@@ -122,7 +122,8 @@ def test_only_changed_child_is_read_and_original_operation_is_preserved(scenario
     assert view["applicability"]["decisions"][1]["replacement_refs"] == ["b-new"]
 
 
-@pytest.mark.parametrize("invalid", ["predecessor", "witness", "missing_decision", "changed_inheritance", "directory_read", "race"])
+@pytest.mark.parametrize("invalid", ["predecessor", "witness", "missing_decision", "changed_inheritance", "directory_read", "race",
+    "needs_recheck_replacement", "out_of_scope_replacement"])
 def test_reassessment_rejects_forgery_and_racing_changes(scenario, invalid):
     runtime, _, source, _, _, _, predecessor, citations = scenario
     memory = runtime.owners.research_memory.creation_bases
@@ -138,6 +139,9 @@ def test_reassessment_rejects_forgery_and_racing_changes(scenario, invalid):
         delta["inherited_evidence"][0]["witness_ref"] = citations["b.txt"]["witness_ref"]
     elif invalid == "directory_read":
         delta["additions"]["coverage"][0]["kind"] = "read"
+    elif invalid.endswith("_replacement"):
+        delta["decisions"][0].update(disposition=invalid.removesuffix("_replacement"),
+            affected_scope="A needs a future check.", creation_limit="future_research", replacement_refs=["invented"])
     else:
         (source / "a.txt").write_text("Changed while accepting.")
     result = InitializationUnderstandingResult({}, input_identity=result.input_identity, work=result.work, reassessment=delta)
