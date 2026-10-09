@@ -20,6 +20,7 @@ from meta_research.owners.research_memory import (
     ASSET_PROJECTION_MAX_PAGE_SIZE,
     ASSET_PROJECTION_PAGE_SIZE,
 )
+from meta_research.runtime_conditions import read_runtime_conditions
 
 if TYPE_CHECKING:
     from meta_research.autonomous_creation import AutonomousCreationService
@@ -371,16 +372,30 @@ class PublicProjection:
         include_history: bool = True,
         include_stages: bool = True,
     ) -> dict[str, object]:
-        cut = self._database.read_snapshot() if self._database else nullcontext()
-        with measure_query("snapshot") as timing, cut:
-            snapshot = self._query_snapshot(
-                asset_offset=asset_offset, asset_limit=asset_limit,
-                include_assets=include_assets, include_history=include_history,
-                include_stages=include_stages,
-            )
-            snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
-            snapshot["query_diagnostics"] = timing.public()
-            return snapshot
+        with measure_query("snapshot") as timing:
+            prepared_scope = None
+            if self._database:
+                prepared_scope = self._human_collaboration.query_collaboration_scope()
+                if prepared_scope.startswith("quest:"):
+                    read_runtime_conditions(
+                        self._database.path.parent,
+                        prepared_scope.removeprefix("quest:"),
+                    )
+            cut = self._database.read_snapshot() if self._database else nullcontext()
+            with cut:
+                if (
+                    self._database
+                    and self._human_collaboration.query_collaboration_scope() != prepared_scope
+                ):
+                    raise SnapshotConsistencyUnavailable
+                snapshot = self._query_snapshot(
+                    asset_offset=asset_offset, asset_limit=asset_limit,
+                    include_assets=include_assets, include_history=include_history,
+                    include_stages=include_stages,
+                )
+                snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
+                snapshot["query_diagnostics"] = timing.public()
+                return snapshot
 
     def _query_snapshot(
         self,
