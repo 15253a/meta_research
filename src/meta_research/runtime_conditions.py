@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 from contextlib import closing
-import os
 from pathlib import Path
 import sqlite3
-import tempfile
 import threading
+import time
+
+from sqlalchemy import text as sql_text
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.research_style import validate_research_style, render_research_style
@@ -170,12 +171,14 @@ def _value(quest_ref: str, text: str, research_style: str = 'balanced') -> dict[
     return {**fields, 'revision': canonical_hash(fields)}
 
 
-def _read(root: Path, quest_ref: str, default_text: str, default_style: str = 'balanced') -> dict[str, str]:
+def _legacy_value(
+    root: Path, quest_ref: str, default_text: str, default_style: str
+) -> tuple[dict[str, str], str]:
     path = root / "runtime-conditions" / (canonical_hash(quest_ref) + ".json")
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return _value(quest_ref, default_text, default_style)
+        return _value(quest_ref, default_text, default_style), "initial_default"
     except (ValueError, UnicodeError) as error:
         raise OwnerConflict("runtime_conditions_invalid") from error
     if (not isinstance(saved, dict) or saved.get("quest_ref") != quest_ref
@@ -185,10 +188,117 @@ def _read(root: Path, quest_ref: str, default_text: str, default_style: str = 'b
         legacy = {'quest_ref': quest_ref, 'text': saved['text']}
         if saved != {**legacy, 'revision': canonical_hash(legacy)}:
             raise OwnerConflict('runtime_conditions_invalid')
-        return _value(quest_ref, saved['text'], default_style)
+        return _value(quest_ref, saved['text'], default_style), "legacy_file"
     if saved != _value(quest_ref, saved['text'], saved['research_style']):
         raise OwnerConflict('runtime_conditions_invalid')
-    return saved
+    return saved, "legacy_file"
+
+
+def _stored_value(scope: str, encoded: str, revision: str) -> dict[str, str]:
+    try:
+        value = json.loads(encoded)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("runtime_conditions_invalid") from error
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("text"), str)
+        or not value["text"].strip()
+        or len(value["text"]) > _LIMIT
+        or not isinstance(value.get("research_style"), str)
+    ):
+        raise OwnerConflict("runtime_conditions_invalid")
+    try:
+        expected = _value(scope, value["text"], value["research_style"])
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("runtime_conditions_invalid") from error
+    if value != expected or value.get("revision") != revision:
+        raise OwnerConflict("runtime_conditions_invalid")
+    return expected
+
+
+def _read(
+    root: Path, quest_ref: str, default_text: str, default_style: str = "balanced"
+) -> dict[str, str]:
+    database = root / "meta-research.sqlite3"
+    with closing(sqlite3.connect(database)) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT v.value_json,v.revision FROM hc_runtime_condition_heads h "
+            "JOIN hc_runtime_condition_versions v ON v.scope_ref=h.scope_ref "
+            "AND v.revision=h.current_revision WHERE h.scope_ref=?",
+            (quest_ref,),
+        ).fetchone()
+        if row is not None:
+            return _stored_value(quest_ref, row["value_json"], row["revision"])
+    imported, source_kind = _legacy_value(
+        root, quest_ref, default_text, default_style
+    )
+    with closing(sqlite3.connect(database, timeout=5.0)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA busy_timeout=5000")
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT v.value_json,v.revision FROM hc_runtime_condition_heads h "
+            "JOIN hc_runtime_condition_versions v ON v.scope_ref=h.scope_ref "
+            "AND v.revision=h.current_revision WHERE h.scope_ref=?",
+            (quest_ref,),
+        ).fetchone()
+        if row is None:
+            now = time.time()
+            db.execute(
+                "INSERT INTO hc_runtime_condition_versions "
+                "(scope_ref,revision,value_json,source_kind,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    quest_ref,
+                    imported["revision"],
+                    json.dumps(
+                        imported,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    source_kind,
+                    now,
+                ),
+            )
+            db.execute(
+                "INSERT INTO hc_runtime_condition_heads "
+                "(scope_ref,current_revision,updated_at) VALUES (?,?,?)",
+                (quest_ref, imported["revision"], now),
+            )
+            db.commit()
+            return imported
+        db.commit()
+        return _stored_value(quest_ref, row["value_json"], row["revision"])
+
+
+def read_runtime_conditions_in_transaction(
+    connection, quest_ref: str, *, revision: str | None = None
+) -> dict[str, str]:
+    if revision is not None:
+        row = connection.execute(
+            sql_text(
+                "SELECT value_json,revision FROM hc_runtime_condition_versions "
+                "WHERE scope_ref=:scope_ref AND revision=:revision"
+            ),
+            {"scope_ref": quest_ref, "revision": revision},
+        ).first()
+        if row is None:
+            raise OwnerConflict("runtime_conditions_revision_not_found")
+        return _stored_value(quest_ref, row.value_json, row.revision)
+    row = connection.execute(
+        sql_text(
+            "SELECT v.value_json,v.revision FROM hc_runtime_condition_heads h "
+            "JOIN hc_runtime_condition_versions v ON v.scope_ref=h.scope_ref "
+            "AND v.revision=h.current_revision WHERE h.scope_ref=:scope_ref"
+        ),
+        {"scope_ref": quest_ref},
+    ).first()
+    if row is None:
+        raise OwnerConflict("runtime_conditions_unseeded")
+    return _stored_value(quest_ref, row.value_json, row.revision)
 
 
 def read_runtime_conditions(workspace: Path, quest_ref: str) -> dict[str, str]:
@@ -211,21 +321,45 @@ def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
             raise OwnerConflict("runtime_conditions_stale")
         root = _data_root(workspace)
         assert root is not None
-        directory = root / "runtime-conditions"
-        directory.mkdir(parents=True, exist_ok=True)
         scope = current["quest_ref"]
-        path = directory / (canonical_hash(scope) + ".json")
         saved = _value(scope, text, current['research_style'] if research_style is None else research_style)
-        fd, name = tempfile.mkstemp(prefix=".conditions-", dir=directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(saved, stream, ensure_ascii=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(name, path)
-        finally:
-            if os.path.exists(name):
-                os.unlink(name)
+        with closing(sqlite3.connect(root / "meta-research.sqlite3", timeout=5.0)) as db:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("BEGIN IMMEDIATE")
+            head = db.execute(
+                "SELECT current_revision FROM hc_runtime_condition_heads "
+                "WHERE scope_ref=?",
+                (scope,),
+            ).fetchone()
+            if head is None or head[0] != expected_revision:
+                raise OwnerConflict("runtime_conditions_stale")
+            now = time.time()
+            db.execute(
+                "INSERT OR IGNORE INTO hc_runtime_condition_versions "
+                "(scope_ref,revision,value_json,source_kind,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    scope,
+                    saved["revision"],
+                    json.dumps(
+                        saved,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "human_update",
+                    now,
+                ),
+            )
+            changed = db.execute(
+                "UPDATE hc_runtime_condition_heads SET current_revision=?,updated_at=? "
+                "WHERE scope_ref=? AND current_revision=?",
+                (saved["revision"], now, scope, expected_revision),
+            ).rowcount
+            if changed != 1:
+                raise OwnerConflict("runtime_conditions_stale")
+            db.commit()
         return saved
 
 

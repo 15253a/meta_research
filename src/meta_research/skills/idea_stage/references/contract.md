@@ -12,6 +12,8 @@
 
 同一 submission identity 仅绑定一个不可变规范 payload 与调用闭包。RM 内容 checkpoint、RG 决策、AR 完成和 AE commit 各自持久保存。`rejected` 形成有来源的后继；`stale` 重验精确绑定；`needs_input` 等待精确依赖；`outcome_unknown` 先对账；`technical_blocker` 在副作用已明确后按正常路径恢复。
 
+当本根对正式指导或新证据的判断确实需要改变整个 Quest 目标时，用 `research_graph.quest_goal.read` 读本操作冻结切面，并按共享指导合同用 `research_graph.quest_goal.evolve` 提交目标、完整完成标准、持续条件与全部工作安排。本次切面过期后不刷新，由新签发的逻辑根操作重读。
+
 ## ExhaustionProposal
 
 仅在所有待提交、已接纳未消费结果、人类待办、技术阻塞、未知结果和既有 StageCommit 均完成对账，且 `IdeaSet` 与 `NoViableCandidate` 都无法辩护时提出。次数、评分或单次失败不是耗尽依据。AE 独占是否形成 StageCommit 的判断；等待和技术问题不能改写为科学耗尽。

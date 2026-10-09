@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     child_environment = dict(os.environ)
     child_environment.pop("META_RESEARCH_HARNESS_FAMILY", None)
     child_environment.pop("META_RESEARCH_PROVIDER_OPERATION_REF", None)
+    child_environment.pop("META_RESEARCH_OWNER_INVOCATION_HASH", None)
     workspace_value = child_environment.pop(
         "META_RESEARCH_HARNESS_WORKSPACE", ""
     )

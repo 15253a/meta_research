@@ -1,3 +1,8 @@
+import hashlib
+import os
+from pathlib import Path
+import stat
+
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.research_content import _quest
@@ -5,12 +10,42 @@ from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from sqlalchemy import text
 
 
-def asset_lifecycle_operations(graph, memory, agent_runtime):
+_TARGET_NOTE_SCHEMA = "meta-research/target-workspace-note/v1"
+_TARGET_NOTE_PATHS = frozenset(
+    {"outputs/analysis/research-note.md", "handoff/final-message.md"}
+)
+_TARGET_NOTE_RESERVED_PROVENANCE = frozenset(
+    {
+        "producer_kind",
+        "target_ref",
+        "target_run_ref",
+        "workspace_ref",
+        "relative_path",
+        "source_content_hash",
+        "source_locator",
+    }
+)
+
+
+def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=None):
     string = {"type": "string", "minLength": 1, "maxLength": 16000}
     integer = {"type": "integer", "minimum": 0}
 
-    def scope(context, version_ref=None):
-        quest_ref = _quest(agent_runtime, context)
+    def scope(context, version_ref=None, *, reconcile=False):
+        if reconcile:
+            verified = agent_runtime.verify_root_agent_human_request_reconcile_scope(
+                root_kind=context.root_kind,
+                run_ref=context.run_ref,
+                attempt_ref=context.attempt_ref,
+                root_session_ref=context.root_session_ref,
+                fence_ref=context.fence_ref,
+                runtime_binding_hash=context.capability_binding_hash,
+            )
+            quest_ref = verified.get("quest_ref")
+            if not isinstance(quest_ref, str) or not quest_ref:
+                raise OwnerConflict("content_quest_scope_required")
+        else:
+            quest_ref = _quest(agent_runtime, context)
         if version_ref is not None:
             graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
         return quest_ref
@@ -92,11 +127,50 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
 
     def effect(context, arguments, action, reconcile):
         try:
-            quest = scope(context)
+            quest = scope(context, reconcile=reconcile)
             effect_key = key(context, arguments["effect_id"], action)
             if action == "intake":
                 values = dict(arguments["intake"])
-                values["content"] = values.pop("text").encode("utf-8")
+                selector = values.pop("target_workspace_note", None)
+                text_value = values.pop("text", None)
+                if selector is not None:
+                    if values.get("asset_ref") is not None or values.get("change") is not None:
+                        raise OwnerConflict("target_note_selector_invalid")
+                    if "provenance" in values:
+                        raise OwnerConflict("target_note_provenance_reserved")
+                    if target_run_agent is None:
+                        raise OwnerConflict("target_note_intake_unavailable")
+                    expected = _target_note_provenance(selector)
+                    replay = memory.query_target_note_intake_effect_record(
+                        effect_key
+                    )
+                    if replay is not None:
+                        _verify_target_note_replay(
+                            replay["binding"],
+                            values=values,
+                            quest_ref=quest,
+                            provenance=expected,
+                        )
+                        result = replay["result"]
+                        return {
+                            "status": result["status"],
+                            "result": result,
+                        } if reconcile else result
+                    if reconcile:
+                        return {"status": "not_found", "result": None}
+                    content = _read_target_note(
+                        graph=graph,
+                        target_run_agent=target_run_agent,
+                        quest_ref=quest,
+                        selector=selector,
+                    )
+                    values["content"] = content
+                    values["provenance"] = expected
+                else:
+                    _reject_target_note_provenance(values.get("provenance"))
+                    if not isinstance(text_value, str):
+                        raise OwnerConflict("asset_content_required")
+                    values["content"] = text_value.encode("utf-8")
                 values["origin_quest_ref"] = quest
                 values["effect_scope_required"] = True
                 request = AssetIntakeRequest(**values)
@@ -117,12 +191,24 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                 def effect_scope():
                     if scope(context) != quest:
                         raise OwnerConflict("asset_quest_scope_invalid")
+                    if selector is not None:
+                        _verify_target_note_workspace(
+                            graph=graph,
+                            target_run_agent=target_run_agent,
+                            quest_ref=quest,
+                            provenance=expected,
+                        )
                     if change is not None:
                         scope(context, change["predecessor_version_ref"])
                         for binding in change.get("evidence_bindings", []):
                             scope(context, binding["version_ref"])
 
-                result = memory.submit_asset_intake(
+                submit = (
+                    memory.submit_target_note_intake
+                    if selector is not None
+                    else memory.submit_asset_intake
+                )
+                result = submit(
                     request, idempotency_key=effect_key, effect_scope=effect_scope
                 )
                 return result.as_public_dict()
@@ -179,17 +265,51 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
     intake_schema = {
         "type": "object",
         "properties": {
-            "source_kind": {"type": "string", "enum": ["text"]},
+            "source_kind": {"type": "string", "enum": ["text", "file"]},
             "custody_mode": {"type": "string", "enum": ["managed"]},
             "display_name": string,
             "media_type": string,
             "text": {"type": "string", "maxLength": 16000000},
+            "target_workspace_note": {
+                "type": "object",
+                "properties": {
+                    "target_ref": string,
+                    "target_run_ref": string,
+                    "workspace_ref": string,
+                    "relative_path": {
+                        "type": "string",
+                        "enum": sorted(_TARGET_NOTE_PATHS),
+                    },
+                    "expected_content_hash": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                    },
+                },
+                "required": [
+                    "target_ref",
+                    "target_run_ref",
+                    "workspace_ref",
+                    "relative_path",
+                    "expected_content_hash",
+                ],
+                "additionalProperties": False,
+            },
             "provenance": {"type": "object"},
             "asset_ref": string,
             "change": {"type": "object"},
         },
-        "required": ["source_kind", "custody_mode", "display_name", "text"],
+        "required": ["source_kind", "custody_mode", "display_name"],
         "additionalProperties": False,
+        "oneOf": [
+            {"required": ["text"], "not": {"required": ["target_workspace_note"]}},
+            {
+                "required": ["target_workspace_note"],
+                "allOf": [
+                    {"not": {"required": ["text"]}},
+                    {"not": {"required": ["provenance"]}},
+                ],
+            },
+        ],
     }
     binding_schema = {
         "type": "object",
@@ -346,3 +466,169 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                 )
             )
     return tuple(operations)
+
+
+def _target_note_provenance(selector: object) -> dict[str, object]:
+    required = {
+        "target_ref",
+        "target_run_ref",
+        "workspace_ref",
+        "relative_path",
+        "expected_content_hash",
+    }
+    if not isinstance(selector, dict) or set(selector) != required:
+        raise OwnerConflict("target_note_selector_invalid")
+    if any(
+        not isinstance(selector.get(name), str) or not selector[name]
+        for name in required
+    ):
+        raise OwnerConflict("target_note_selector_invalid")
+    if (
+        selector["relative_path"] not in _TARGET_NOTE_PATHS
+        or len(selector["expected_content_hash"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in selector["expected_content_hash"]
+        )
+    ):
+        raise OwnerConflict("target_note_selector_invalid")
+    return {
+        "schema_ref": _TARGET_NOTE_SCHEMA,
+        "producer_kind": "target_workspace",
+        "target_ref": selector["target_ref"],
+        "target_run_ref": selector["target_run_ref"],
+        "workspace_ref": selector["workspace_ref"],
+        "relative_path": selector["relative_path"],
+        "source_content_hash": selector["expected_content_hash"],
+        "source_locator": (
+            "target-workspace://"
+            + selector["workspace_ref"]
+            + "/"
+            + selector["relative_path"]
+        ),
+    }
+
+
+def _reject_target_note_provenance(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise OwnerConflict("asset_provenance_invalid")
+    if (
+        value.get("schema_ref") == _TARGET_NOTE_SCHEMA
+        or bool(set(value) & _TARGET_NOTE_RESERVED_PROVENANCE)
+    ):
+        raise OwnerConflict("target_note_provenance_reserved")
+
+
+def _verify_target_note_replay(
+    binding: object,
+    *,
+    values: dict[str, object],
+    quest_ref: str,
+    provenance: dict[str, object],
+) -> None:
+    expected_selector = {
+        "target_ref": provenance["target_ref"],
+        "target_run_ref": provenance["target_run_ref"],
+        "workspace_ref": provenance["workspace_ref"],
+        "relative_path": provenance["relative_path"],
+        "expected_content_hash": provenance["source_content_hash"],
+    }
+    expected_intake = {
+        "source_kind": values.get("source_kind"),
+        "custody_mode": values.get("custody_mode"),
+        "display_name": str(values.get("display_name", "")).strip(),
+        "media_type": str(
+            values.get("media_type", "application/octet-stream")
+        ).strip(),
+        "provenance": provenance,
+        "asset_ref": values.get("asset_ref"),
+        "asynchronous": False,
+        "origin_quest_ref": quest_ref,
+        "effect_scope_required": True,
+    }
+    if binding != {
+        "schema_ref": "meta-research/target-note-intake-effect/v1",
+        "quest_ref": quest_ref,
+        "selector": expected_selector,
+        "intake": expected_intake,
+    }:
+        raise OwnerConflict("asset_intake_idempotency_conflict")
+
+
+def _verify_target_note_workspace(
+    *, graph, target_run_agent, quest_ref: str, provenance: dict[str, object]
+) -> Path:
+    try:
+        graph.verify_target_quest_scope(
+            str(provenance["target_ref"]), quest_ref=quest_ref
+        )
+        workspace, workspace_path = target_run_agent.read_target_workspace_location(
+            provenance["target_run_ref"]
+        )
+    except OwnerConflict as error:
+        raise OwnerConflict("target_note_workspace_invalid") from error
+    if (
+        workspace.target_ref != provenance["target_ref"]
+        or workspace.target_run_ref != provenance["target_run_ref"]
+        or workspace.workspace_ref != provenance["workspace_ref"]
+    ):
+        raise OwnerConflict("target_note_workspace_invalid")
+    try:
+        path = Path(workspace_path)
+        if stat.S_ISLNK(path.lstat().st_mode):
+            raise OwnerConflict("target_note_symlink_forbidden")
+        return path.resolve(strict=True)
+    except OwnerConflict:
+        raise
+    except OSError as error:
+        raise OwnerConflict("target_note_workspace_invalid") from error
+
+
+def _read_target_note(*, graph, target_run_agent, quest_ref: str, selector: object) -> bytes:
+    provenance = _target_note_provenance(selector)
+    root = _verify_target_note_workspace(
+        graph=graph,
+        target_run_agent=target_run_agent,
+        quest_ref=quest_ref,
+        provenance=provenance,
+    )
+    relative = Path(str(provenance["relative_path"]))
+    path = root.joinpath(relative)
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except OSError as error:
+            raise OwnerConflict("target_note_source_unavailable") from error
+        if stat.S_ISLNK(mode):
+            raise OwnerConflict("target_note_symlink_forbidden")
+    resolved = path.resolve(strict=True)
+    if os.path.commonpath((str(root), str(resolved))) != str(root):
+        raise OwnerConflict("target_note_path_invalid")
+    try:
+        with path.open("rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 16_000_000:
+                raise OwnerConflict("target_note_source_invalid")
+            content = source.read(16_000_001)
+            after = os.fstat(source.fileno())
+    except OwnerConflict:
+        raise
+    except OSError as error:
+        raise OwnerConflict("target_note_source_unavailable") from error
+    if (
+        len(content) > 16_000_000
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    ):
+        raise OwnerConflict("target_note_source_changed")
+    try:
+        content.decode("utf-8")
+    except UnicodeError as error:
+        raise OwnerConflict("target_note_utf8_required") from error
+    if hashlib.sha256(content).hexdigest() != provenance["source_content_hash"]:
+        raise OwnerConflict("target_note_hash_mismatch")
+    return content

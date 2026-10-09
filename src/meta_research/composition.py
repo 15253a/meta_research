@@ -34,6 +34,7 @@ from meta_research.deepfetch import (
 from meta_research.feed import DurableFeed
 from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.harness import HarnessRuntime
+from meta_research.goal_work_reconciler import GoalWorkReconciler
 from meta_research.harness_control import DurableHarnessOperationCanceller
 from meta_research.harness_adapters import (
     CodexHarnessAdapter,
@@ -282,6 +283,7 @@ class ProductionRuntime:
     target_run_authorities: TargetRunAuthorities
     target_run_runtime: TargetRunRuntime
     target_root_lifecycle: SQLiteTargetRootLifecycleAuthority
+    goal_work_reconciler: GoalWorkReconciler
     target_run_finalizer: TargetRunFinalizer
     target_root_readiness: dict[str, object]
     runtime_protection: RuntimeProtection
@@ -916,10 +918,18 @@ def build_production_runtime(
         agent_runtime,
         workspace_root=data_root.run / "target-workspaces",
     )
+    research_graph.bind_quest_goal_custody_verifiers(
+        research_memory=research_memory,
+        target_run_agent=target_run_agent,
+    )
     target_root_lifecycle = SQLiteTargetRootLifecycleAuthority(
         database,
         feed,
         target_run_agent,
+        owners.agent_runtime,
+    )
+    goal_work_reconciler = GoalWorkReconciler(
+        research_graph, target_root_lifecycle, advancement_engine
     )
     target_root_memory = SQLiteTargetRootCompletionMemoryAuthority(
         database,
@@ -1095,6 +1105,7 @@ def build_production_runtime(
         owners.research_graph,
         reasoning_skill_provider,
         autonomous_creation=autonomous_creation,
+        human_guidance=owners.human_collaboration,
     )
     deepfetch = FirstQuestionDeepFetchWorker(
         _DeepFetchRequestAuthorityRouter(
@@ -1210,6 +1221,7 @@ def build_production_runtime(
         ),
         target_run_runtime=target_run_runtime,
         target_root_lifecycle=target_root_lifecycle,
+        goal_work_reconciler=goal_work_reconciler,
         target_run_finalizer=target_run_finalizer,
         target_root_readiness={
             "name": "target_root_lifecycle",

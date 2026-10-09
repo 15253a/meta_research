@@ -12,6 +12,7 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 正式人类指导按本回合加载的[共享指导合同](../human-guidance.md)读取原文、声明处理并延续约束。
 外部 MCP 发现或调用失败影响当前实施时，按本回合外部 MCP 上下文中的[故障协作与恢复](../external-mcp-recovery.md)核对影响、请求人的明确路线选择，并由本 Target 根核验后继续。
+指导或证据要求改变整个 Quest 方向时，用 `research_graph.quest_goal.read` 核对本逻辑操作的冻结 Goal／条件／工作切面，按共享合同用 `research_graph.quest_goal.evolve` 作完整判断；未知效果仅用 `.reconcile` 对账原 effect。新工作使切面 stale 时，交还后由新签发操作取新切面，不更改本 Target 已冻结的局部科学合同。
 ## 1. 读取合同和真实输入
 
 按根系统提示的六入口查找与本 Target 相关的已有工作和资源，从冻结输入 manifest 读取实际需要的数据、划分、预测、方法实现与协议。摘要或 hash 不替代原件；缺少材料时指出精确来源和缺口，沿既有输入交接处理。既有结果只按适用范围复用，不因新 Target 或空工作区重复已完成研究。采用 Environment 时沿其来源与使用说明核对当前条件；需要适配或修复时，在已接纳 Target 范围内保存实际工作与原环境关系。

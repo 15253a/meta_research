@@ -60,6 +60,40 @@ from meta_research.target_run_runtime_contract import (
 AR_TARGET_ROOT_COMPLETION_RECEIPT_KIND = "target_root_completion_accepted"
 
 
+def _current_goal_work_intent(
+    connection, *, intent_ref: str, decision_kind: str
+) -> dict[str, object]:
+    row = connection.execute(
+        text(
+            "SELECT i.*,r.quest_ref,h.current_revision_ref FROM "
+            "rg_goal_work_intents i JOIN rg_quest_goal_revisions r ON "
+            "r.revision_ref=i.revision_ref JOIN rg_quest_goal_heads h ON "
+            "h.quest_ref=r.quest_ref WHERE i.intent_ref=:intent_ref"
+        ),
+        {"intent_ref": intent_ref},
+    ).first()
+    if (
+        row is None
+        or row.decision_kind != decision_kind
+        or row.revision_ref != row.current_revision_ref
+    ):
+        raise OwnerConflict("goal_work_intent_obsolete")
+    try:
+        decision = json.loads(row.decision_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("goal_work_intent_invalid") from error
+    if (
+        not isinstance(decision, dict)
+        or canonical_hash(decision) != row.decision_hash
+        or decision.get("kind") != decision_kind
+        or not isinstance(decision.get("work"), dict)
+        or canonical_hash(decision["work"]) != row.work_hash
+        or decision["work"].get("work_ref") != row.work_ref
+    ):
+        raise OwnerConflict("goal_work_intent_invalid")
+    return {"row": row, "decision": decision}
+
+
 @dataclass(frozen=True, slots=True)
 class TargetRootLifecycleRecord:
     lifecycle_ref: str
@@ -153,10 +187,12 @@ class SQLiteTargetRootLifecycleAuthority:
         database: Database,
         feed: DurableFeed,
         target_agent: SQLiteTargetRunAgentAuthority,
+        work_disposition_publisher: object | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._target_agent = target_agent
+        self._work_disposition_publisher = work_disposition_publisher
 
     def activate(
         self,
@@ -1945,11 +1981,235 @@ class SQLiteTargetRootLifecycleAuthority:
             raise OwnerConflict("target_root_cancel_integrity_invalid")
         return requested
 
+    def request_cancel_exact(self, *, intent_ref: str) -> TargetRootLifecycleRecord:
+        """Apply one current RG stop intent to its exact Target identity."""
+
+        if not isinstance(intent_ref, str) or not intent_ref or len(intent_ref) > 96:
+            raise OwnerConflict("goal_work_intent_invalid")
+        now = time.time()
+        with self._database.fenced_write() as connection:
+            intent = _current_goal_work_intent(
+                connection, intent_ref=intent_ref, decision_kind="stop"
+            )
+            work = intent["decision"]["work"]
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_lifecycles WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": work["target_ref"]},
+            ).first()
+            generation = connection.execute(
+                text(
+                    "SELECT MAX(ordinal) FROM ar_target_run_handles WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": work["target_ref"]},
+            ).scalar_one()
+            frontier = connection.execute(
+                text(
+                    "SELECT state_revision,state,terminal_fact_ref,currentness_known,"
+                    "current FROM ar_target_frontier_entries WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": work["target_ref"]},
+            ).first()
+            if row is None:
+                raise OwnerConflict("goal_work_intent_obsolete")
+            if row.cancel_goal_intent_ref is not None:
+                if row.cancel_goal_intent_ref != intent_ref:
+                    raise OwnerConflict("goal_work_intent_conflict")
+            elif (
+                row.status != "running"
+                or row.completion_ref is not None
+                or row.cancel_ref is not None
+                or row.target_run_ref != work["run_ref"]
+                or row.target_attempt_ref != work["attempt_ref"]
+                or generation != work["lifecycle_generation"]
+                or work["state"] != "running"
+                or frontier is None
+                or int(frontier.state_revision) != work["state_revision"]
+                or frontier.state != "running"
+                or frontier.terminal_fact_ref is not None
+                or bool(frontier.currentness_known) is not True
+                or bool(frontier.current) is not True
+            ):
+                raise OwnerConflict("goal_work_intent_obsolete")
+            else:
+                cancel_ref = new_ref("target_root_cancel")
+                updated = connection.execute(
+                    text(
+                        "UPDATE ar_target_root_lifecycles SET cancel_ref=:cancel_ref,"
+                        "cancel_reason=:reason,cancel_requested_at=:now,updated_at=:now,"
+                        "cancel_goal_intent_ref=:intent_ref WHERE target_ref=:target_ref "
+                        "AND target_run_ref=:target_run_ref AND target_attempt_ref=:attempt_ref "
+                        "AND status='running' AND completion_ref IS NULL AND "
+                        "cancel_ref IS NULL AND cancel_goal_intent_ref IS NULL"
+                    ),
+                    {
+                        "cancel_ref": cancel_ref,
+                        "reason": "quest goal work intent " + intent_ref,
+                        "now": now,
+                        "intent_ref": intent_ref,
+                        "target_ref": work["target_ref"],
+                        "target_run_ref": work["run_ref"],
+                        "attempt_ref": work["attempt_ref"],
+                    },
+                )
+                if updated.rowcount != 1:
+                    raise OwnerConflict("goal_work_intent_conflict")
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision=revision+1 "
+                        "WHERE singleton='owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.target_root_cancel_requested",
+                    {
+                        "target_ref": work["target_ref"],
+                        "cancel_ref": cancel_ref,
+                        "goal_intent_ref": intent_ref,
+                    },
+                )
+        requested = self.query(work["target_ref"])
+        if requested is None or requested.cancel_ref is None:
+            raise OwnerConflict("target_root_cancel_integrity_invalid")
+        return requested
+
+    def block_admission_exact(self, *, intent_ref: str) -> dict[str, object]:
+        """Prevent one still-queued admitted TargetRun from activating."""
+
+        if not isinstance(intent_ref, str) or not intent_ref or len(intent_ref) > 96:
+            raise OwnerConflict("goal_work_intent_invalid")
+        publisher = self._work_disposition_publisher
+        if publisher is not None:
+            notice = publisher.publish_target_not_started(intent_ref=intent_ref)
+            return {
+                "status": "blocked",
+                "target_ref": notice.target_ref,
+                "target_run_ref": notice.target_run_ref,
+                "intent_ref": intent_ref,
+                "notice_ref": notice.notice_ref,
+            }
+        with self._database.fenced_write() as connection:
+            intent = _current_goal_work_intent(
+                connection, intent_ref=intent_ref, decision_kind="do_not_start"
+            )
+            work = intent["decision"]["work"]
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_goal_admission_blocks WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": work["target_ref"]},
+            ).first()
+            if existing is not None:
+                if (
+                    existing.intent_ref != intent_ref
+                    or existing.target_run_ref != work["run_ref"]
+                    or int(existing.state_revision) != work["state_revision"]
+                ):
+                    raise OwnerConflict("goal_work_intent_conflict")
+                return {
+                    "status": "blocked",
+                    "target_ref": existing.target_ref,
+                    "target_run_ref": existing.target_run_ref,
+                    "intent_ref": existing.intent_ref,
+                }
+            launch = connection.execute(
+                text(
+                    "SELECT target_run_ref FROM ar_target_launches WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": work["target_ref"]},
+            ).first()
+            activated = connection.execute(
+                text(
+                    "SELECT 1 FROM ar_target_run_activations WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": work["target_ref"]},
+            ).first()
+            frontier = connection.execute(
+                text(
+                    "SELECT state_revision,state,terminal_fact_ref,currentness_known,"
+                    "current FROM ar_target_frontier_entries WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": work["target_ref"]},
+            ).first()
+            if (
+                launch is None
+                or launch.target_run_ref != work["run_ref"]
+                or activated is not None
+                or work["state"] != "queued"
+                or frontier is None
+                or int(frontier.state_revision) != work["state_revision"]
+                or frontier.state != "running"
+                or frontier.terminal_fact_ref is not None
+                or bool(frontier.currentness_known) is not True
+                or bool(frontier.current) is not True
+            ):
+                raise OwnerConflict("goal_work_intent_obsolete")
+            connection.execute(
+                text(
+                    "INSERT INTO ar_target_goal_admission_blocks "
+                    "(target_ref,target_run_ref,intent_ref,state_revision,created_at) "
+                    "VALUES (:target_ref,:target_run_ref,:intent_ref,:state_revision,:now)"
+                ),
+                {
+                    "target_ref": work["target_ref"],
+                    "target_run_ref": work["run_ref"],
+                    "intent_ref": intent_ref,
+                    "state_revision": work["state_revision"],
+                    "now": time.time(),
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision=revision+1 "
+                    "WHERE singleton='owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.target_admission_blocked",
+                {
+                    "target_ref": work["target_ref"],
+                    "target_run_ref": work["run_ref"],
+                    "goal_intent_ref": intent_ref,
+                },
+            )
+            return {
+                "status": "blocked",
+                "target_ref": work["target_ref"],
+                "target_run_ref": work["run_ref"],
+                "intent_ref": intent_ref,
+            }
+
     def mark_cancelled(self, *, target_ref: str) -> TargetRootLifecycleRecord:
         """Record a verified mechanical stop without minting formal results."""
 
         if type(target_ref) is not str or not target_ref or len(target_ref) > 96:
             raise OwnerConflict("target_root_cancel_invalid")
+        publisher = self._work_disposition_publisher
+        if publisher is not None:
+            with self._database.read() as connection:
+                cancellation = connection.execute(
+                    text(
+                        "SELECT cancel_goal_intent_ref FROM "
+                        "ar_target_root_lifecycles WHERE target_ref=:target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+            if cancellation is not None and cancellation.cancel_goal_intent_ref is not None:
+                publisher.publish_target_root_cancellation(target_ref=target_ref)
+                cancelled = self.query(target_ref)
+                if cancelled is None or cancelled.status != "cancelled":
+                    raise OwnerConflict("target_root_cancel_integrity_invalid")
+                return cancelled
         now = time.time()
         with self._database.fenced_write() as connection:
             row = connection.execute(

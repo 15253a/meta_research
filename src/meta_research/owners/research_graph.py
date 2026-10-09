@@ -139,6 +139,15 @@ from meta_research.owners.human_requests import (
     HumanRequestOwnerMixin,
     HumanResponseVerifier,
 )
+from meta_research.owners.quest_goals import (
+    COMPLETION_CONDITION_SOURCE_FIELDS,
+    QuestGoalOwnerMixin,
+    completion_condition_source,
+    initial_goal_binding,
+    query_goal_revision_in_transaction,
+    seed_goal_head,
+    verify_goal_revision_ancestry_in_transaction,
+)
 from meta_research.owners.research_datasets import ResearchDatasetOwnerInterface, ResearchDatasetOwnerMixin
 from meta_research.owners.research_environments import ResearchEnvironmentOwnerInterface, ResearchEnvironmentOwnerMixin
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
@@ -1436,6 +1445,10 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
         manifest_reader: TargetRootCompletionManifestReader,
     ) -> None: ...
 
+    def bind_quest_goal_custody_verifiers(
+        self, *, research_memory: object, target_run_agent: object
+    ) -> None: ...
+
     def verify_target_execution_closure(
         self, *, closure_ref: str, receipt: AcceptanceReceipt
     ) -> dict[str, object]: ...
@@ -1802,9 +1815,15 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
         self, quest_ref: str
     ) -> dict[str, object] | None: ...
 
+    def query_runtime_conditions_revision(self, quest_ref: str) -> str: ...
+
     def verify_quest_goal_revision(
         self, binding: dict[str, object]
     ) -> None: ...
+
+    def verify_target_quest_scope(
+        self, target_ref: str, *, quest_ref: str
+    ) -> dict[str, str]: ...
 
     def query_candidate_completion(
         self, *, source_outcome_ref: str, candidate_completion_ref: str
@@ -4299,9 +4318,14 @@ class SQLiteResearchGraphReceiptVerifier:
             != lineage.completion_milestone_basis_refs
         ):
             raise OwnerConflict("candidate_completion_frozen_lineage_invalid")
-        goal_revision = self.query_current_quest_goal_revision(
-            _required_completion_ref(candidate, "current_quest_ref")
-        )
+        quest_ref = _required_completion_ref(candidate, "current_quest_ref")
+        with self._database.read() as connection:
+            goal_revision = query_goal_revision_in_transaction(
+                connection,
+                quest_ref=quest_ref,
+                revision_ref=lineage.goal_revision_ref,
+            )
+            condition_source = completion_condition_source(connection, row)
         if goal_revision is None or (
             goal_revision.get("goal_revision_ref") != lineage.goal_revision_ref
         ):
@@ -4310,6 +4334,7 @@ class SQLiteResearchGraphReceiptVerifier:
             row=row,
             candidate=candidate,
             goal_revision=goal_revision,
+            condition_source=condition_source,
         )
 
     def verify_quest_completion_acceptance(
@@ -4392,13 +4417,11 @@ class SQLiteResearchGraphReceiptVerifier:
         if not isinstance(quest_ref, str) or not quest_ref:
             raise OwnerConflict("quest_goal_revision_invalid")
         with self._database.read() as connection:
-            row = connection.execute(
-                text("SELECT * FROM rg_quests WHERE quest_ref = :quest_ref"),
-                {"quest_ref": quest_ref},
-            ).first()
-        if row is None:
+            binding = query_goal_revision_in_transaction(
+                connection, quest_ref=quest_ref
+            )
+        if binding is None:
             return None
-        binding = _quest_goal_revision_binding(row)
         self.verify_quest_goal_revision(binding)
         return binding
 
@@ -4410,14 +4433,22 @@ class SQLiteResearchGraphReceiptVerifier:
         quest_ref = binding.get("quest_ref")
         if not isinstance(quest_ref, str) or not quest_ref:
             raise OwnerConflict("quest_goal_revision_invalid")
+        revision_ref = binding.get("goal_revision_ref")
+        if not isinstance(revision_ref, str) or not revision_ref:
+            raise OwnerConflict("quest_goal_revision_invalid")
         with self._database.read() as connection:
-            row = connection.execute(
-                text("SELECT * FROM rg_quests WHERE quest_ref = :quest_ref"),
+            stored = query_goal_revision_in_transaction(
+                connection, quest_ref=quest_ref, revision_ref=revision_ref
+            )
+            quest = connection.execute(
+                text("SELECT * FROM rg_quests WHERE quest_ref=:quest_ref"),
                 {"quest_ref": quest_ref},
             ).first()
-        if row is None or binding != _quest_goal_revision_binding(row):
+            if stored == binding:
+                verify_goal_revision_ancestry_in_transaction(connection, binding)
+        if stored != binding or quest is None:
             raise OwnerConflict("quest_goal_revision_invalid")
-        accepted = _accepted_quest(row)
+        accepted = _accepted_quest(quest)
         self.verify_quest_receipt(
             initialization_id=accepted.initialization_id,
             quest_ref=accepted.quest_ref,
@@ -4426,6 +4457,25 @@ class SQLiteResearchGraphReceiptVerifier:
             confirmation_ref=accepted.confirmation.receipt_ref,
             receipt=accepted.receipt,
         )
+
+    def verify_current_quest_goal_revision(
+        self, binding: dict[str, object]
+    ) -> None:
+        self.verify_quest_goal_revision(binding)
+        with self._database.read() as connection:
+            head = connection.execute(
+                text(
+                    "SELECT current_revision_ref,status FROM rg_quest_goal_heads "
+                    "WHERE quest_ref=:quest_ref"
+                ),
+                {"quest_ref": binding["quest_ref"]},
+            ).first()
+        if (
+            head is None
+            or head.status != "open"
+            or head.current_revision_ref != binding["goal_revision_ref"]
+        ):
+            raise OwnerConflict("quest_goal_revision_stale")
 
     def query_reasoning_research_context(
         self, *, quest_ref: str, question_ref: str
@@ -6706,7 +6756,7 @@ class SQLiteResearchGraphReceiptVerifier:
 
 
 
-class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
+class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -6764,6 +6814,8 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             TargetRootCompletionManifestReader | None
         ) = None
         self._autonomous_question_dispatch_verifier = None
+        self._quest_goal_research_memory = None
+        self._quest_goal_target_run_agent = None
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         # Receipt verification is constructed first in production composition.
         # Bind this owning RG facade afterward so launch verification can read
@@ -6833,6 +6885,20 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             raise OwnerConflict("target_root_completion_readers_already_bound")
         self._target_root_completion_reader = completion_reader
         self._target_root_manifest_reader = manifest_reader
+
+    def bind_quest_goal_custody_verifiers(
+        self, *, research_memory: object, target_run_agent: object
+    ) -> None:
+        if (
+            self._quest_goal_research_memory is not None
+            and self._quest_goal_research_memory is not research_memory
+        ) or (
+            self._quest_goal_target_run_agent is not None
+            and self._quest_goal_target_run_agent is not target_run_agent
+        ):
+            raise OwnerConflict("quest_goal_custody_verifier_already_bound")
+        self._quest_goal_research_memory = research_memory
+        self._quest_goal_target_run_agent = target_run_agent
 
     def _verify_target_root_issuers(
         self,
@@ -9410,6 +9476,18 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                 ),
                 {"quest_ref": quest_ref, "updated_at": time.time()},
             )
+            seed_goal_head(
+                connection,
+                quest_ref=quest_ref,
+                revision_ref="quest_goal_revision_"
+                + canonical_hash(
+                    {
+                        "quest_ref": quest_ref,
+                        "draft_revision": draft_revision,
+                        "draft_hash": draft_hash,
+                    }
+                )[:32],
+            )
             connection.execute(
                 text(
                     "UPDATE research_graph_state SET revision = revision + 1, "
@@ -11901,6 +11979,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             "quest_ref": quest_ref,
             "goal_revision_ref": goal_revision_ref,
             "completion_milestone_basis_refs": milestone_refs,
+            **{key: source[key] for key in COMPLETION_CONDITION_SOURCE_FIELDS if key in source},
         }
         human_preview_ref = human_receipt.subject_ref
         human_preview_hash = canonical_hash(preview_document)
@@ -11957,7 +12036,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         }
         request_hash = canonical_hash(request)
         bindings = {**request, "request_hash": request_hash}
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
                     "SELECT * FROM rg_quest_completion_acceptances WHERE "
@@ -11985,6 +12064,24 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                 ):
                     raise OwnerConflict("quest_completion_acceptance_conflict")
                 return _accepted_quest_completion(existing).as_public_dict()
+            self.assert_current_quest_goal_revision(
+                goal_revision, connection=connection
+            )
+            condition_revision = source.get("runtime_conditions_revision")
+            if not isinstance(condition_revision, str):
+                raise OwnerConflict("quest_completion_conditions_unbound")
+            current_conditions = self._quest_goal_conditions_in_transaction(
+                connection, quest_ref=quest_ref, revision_ref=goal_revision_ref
+            )
+            if current_conditions["runtime_conditions"]["revision"] != condition_revision:
+                raise OwnerConflict("quest_completion_conditions_stale")
+            alignment = self._quest_goal_alignment_in_transaction(
+                connection,
+                quest_ref=quest_ref,
+                current_ref=goal_revision_ref,
+            )
+            if any(item["status"] == "pending" for item in alignment):
+                raise OwnerConflict("quest_completion_goal_alignment_pending")
             completion_ref = new_ref("quest_completion")
             receipt_ref = new_ref("rg_quest_completion_receipt")
             receipt_hash = _receipt_hash(
@@ -12028,6 +12125,22 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                     "WHERE singleton = 'owner'"
                 )
             )
+            updated_head = connection.execute(
+                text(
+                    "UPDATE rg_quest_goal_heads SET status='completion_committed',"
+                    "completion_acceptance_ref=:completion_ref,updated_at=:updated_at "
+                    "WHERE quest_ref=:quest_ref AND current_revision_ref=:revision_ref "
+                    "AND status='open'"
+                ),
+                {
+                    "completion_ref": completion_ref,
+                    "updated_at": accepted_at,
+                    "quest_ref": quest_ref,
+                    "revision_ref": goal_revision_ref,
+                },
+            )
+            if updated_head.rowcount != 1:
+                raise OwnerConflict("quest_completion_goal_stale")
             self._feed.record(
                 connection,
                 "research_graph.quest_completion_accepted",
@@ -12077,8 +12190,8 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
     def query_current_quest_goal_revision(
         self, quest_ref: str
     ) -> dict[str, object] | None:
-        return self._receipt_verifier.query_current_quest_goal_revision(
-            quest_ref
+        return QuestGoalOwnerMixin.query_current_quest_goal_revision(
+            self, quest_ref
         )
 
     def query_reasoning_research_context(
@@ -12096,7 +12209,35 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
     def verify_quest_goal_revision(
         self, binding: dict[str, object]
     ) -> None:
-        self._receipt_verifier.verify_quest_goal_revision(binding)
+        QuestGoalOwnerMixin.verify_quest_goal_revision(self, binding)
+
+    def verify_target_quest_scope(
+        self, target_ref: str, *, quest_ref: str
+    ) -> dict[str, str]:
+        if (
+            not isinstance(target_ref, str)
+            or not target_ref
+            or not isinstance(quest_ref, str)
+            or not quest_ref
+        ):
+            raise OwnerConflict("target_quest_scope_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT t.target_ref,g.quest_ref FROM rg_targets t JOIN "
+                    "rg_target_graphs g ON g.graph_ref=t.graph_ref WHERE "
+                    "t.target_ref=:target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if row is None or row.quest_ref != quest_ref:
+            raise OwnerConflict("target_quest_scope_invalid")
+        return {"target_ref": row.target_ref, "quest_ref": row.quest_ref}
+
+    def verify_current_quest_goal_revision(
+        self, binding: dict[str, object]
+    ) -> None:
+        self._receipt_verifier.verify_current_quest_goal_revision(binding)
 
     def decide_idea_outcome(
         self,
@@ -19415,6 +19556,7 @@ def _candidate_completion_public_binding(
     row,
     candidate: dict[str, object],
     goal_revision: dict[str, object],
+    condition_source: dict[str, str],
 ) -> dict[str, object]:
     basis_refs = candidate.get("completion_milestone_basis_refs")
     if (
@@ -19453,6 +19595,7 @@ def _candidate_completion_public_binding(
         "candidate_completion_hash": row.transition_hash,
         "candidate_completion": dict(candidate),
         "source": {
+            **condition_source,
             "quest_ref": candidate["source_quest_ref"],
             "cycle_ref": candidate["source_cycle_ref"],
             "reasoning_stage_run_request_ref": candidate[
@@ -19546,25 +19689,7 @@ def _accepted_quest_completion(row) -> AcceptedQuestCompletion:
 
 
 def _quest_goal_revision_binding(row) -> dict[str, object]:
-    _verify_quest_goal_integrity(row)
-    try:
-        goal = decoded_object(row.goal_json)
-    except (TypeError, ValueError) as error:
-        raise OwnerConflict("quest_goal_revision_invalid") from error
-    identity = {
-        "quest_ref": row.quest_ref,
-        "draft_revision": int(row.draft_revision),
-        "draft_hash": row.draft_hash,
-    }
-    return {
-        "kind": "QuestGoalRevision",
-        "goal_revision_ref": (
-            "quest_goal_revision_" + canonical_hash(identity)[:32]
-        ),
-        **identity,
-        "goal": goal,
-        "rg_quest_acceptance_receipt_ref": row.receipt_ref,
-    }
+    return initial_goal_binding(row)
 
 
 def _idea_decision_bindings(row) -> dict[str, object]:

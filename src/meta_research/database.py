@@ -15,6 +15,7 @@ class Database:
     """Process-local access to the daemon's SQLite writer."""
 
     def __init__(self, path: Path) -> None:
+        self.path = Path(path)
         url = URL.create("sqlite+pysqlite", database=str(path))
         self._engine: Engine = create_engine(url, future=True)
         self._write_lock = threading.RLock()

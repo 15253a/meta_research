@@ -1,0 +1,89 @@
+{
+  "ticket": 181,
+  "base_commit": "546bfa88b6796d1d510e20f7c819ecad118e97e4",
+  "product_commit": "e85197c7c31b653624614b907eb33d69074abb90",
+  "product_tree": "72ba9df7b7a821d222218a63f8ed259fe395d95a",
+  "workflow": "pstack0.15.9 Feature, no Matt skills",
+  "acceptance_verified": true,
+  "accepted_scope": "ticket-local actual Agent/AR/Harness/RM/browser positive sample plus exact listed Linux product gates",
+  "final_native_receipt_sha256": "37f30891ded5ba7a2fe2d120054560bfa0e256a03c671ad123ce860e94b2f10a",
+  "backend": {
+    "passed": 188,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "scope": "16 selectors; selected ticket regression, not full repository suite",
+    "native_execution_sha256": "90c0022c48d9cc9a879d43a4e56874638dcfd47528de05b42ff2458bc8270478",
+    "source_files_verified": 1024
+  },
+  "frontend": {
+    "node_passed": 32,
+    "app_and_e2e_types_passed": true,
+    "same_git_web_subtree_as_final_product": true,
+    "final_build_passed": true
+  },
+  "actual_agent_runs": [
+    {
+      "run": "run-20261009T064310.901781Z",
+      "selected_model": "gpt-6.1-sol",
+      "calls": 6,
+      "correlation": "native_meta",
+      "expected_confirmation_loss_items": [],
+      "alternate_uses": 0
+    },
+    {
+      "run": "run-20261009T064623.527501Z",
+      "selected_model": "gpt-6.1-sol",
+      "calls": 8,
+      "correlation": "native_meta",
+      "expected_confirmation_loss_items": [
+        "exec-d54e70b0-e33e-4de2-bc83-ef869ad5ad54"
+      ],
+      "alternate_uses": 0
+    },
+    {
+      "run": "run-20261009T064907.861625Z",
+      "selected_model": "gpt-6.1-sol",
+      "calls": 7,
+      "correlation": "native_meta",
+      "expected_confirmation_loss_items": [],
+      "alternate_uses": 0
+    }
+  ],
+  "browser": {
+    "phases": [
+      "pending",
+      "evolved",
+      "later-direction",
+      "restart"
+    ],
+    "excluded_original_premature_restart": true,
+    "initial_generation": "20261009T064208.019248Z",
+    "restored_generation": "20261009T070054.765607Z",
+    "initial_pid": 752138,
+    "restored_pid": 846130,
+    "new_admissions": 0,
+    "new_provider_calls": 0,
+    "mock_routes": 0
+  },
+  "required_independent_trail_review": "separate gpt-6.1-sol agent under user same-model exception; final publication delta pending",
+  "production": {
+    "deployed": false,
+    "controls_issued": 0,
+    "identity_unchanged": true,
+    "readiness": "unavailable",
+    "observed_errors": [
+      "autonomous_creation_operation_timeout",
+      "asset_verification_io_timeout"
+    ]
+  },
+  "limitations": [
+    "tiny synthetic working observations, no formal scientific Target result",
+    "fixture stop uses disclosed tiny-OS adapter; default supervisor path is separate Linux gate",
+    "source clause and local working files preserved at sample time; future long-term effectiveness unproven",
+    "restart after owned cleanup proves durable state, not physical A continuation",
+    "No independently reported upstream model; native thread/start selected model used.",
+    "Source acceptance excludes subsequent audit-only docs; no tests repeated for documentation.",
+    "Full raw model transcripts and local fixture databases remain local; hashes and this bounded public summary are published."
+  ]
+}

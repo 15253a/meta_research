@@ -458,7 +458,31 @@ class SemanticBarrier:
     route_dispositions: Tuple[RouteDisposition, ...]
 
 
-TargetTerminal = Union[TechnicalBlocker, AcceptedMeasurementClosure, SemanticBarrier]
+@dataclass(frozen=True, slots=True)
+class GoalWorkDisposition:
+    """Framework-authored non-scientific disposition of admitted Target work."""
+
+    disposition: str
+    target_ref: str
+    target_run_ref: str
+    execution_attempt_ref: Optional[str]
+    execution_fence_ref: Optional[str]
+    terminal_fact_ref: str
+    goal_work_intent_ref: str
+    goal_revision_ref: str
+    goal_revision_receipt_ref: str
+    goal_revision_receipt_hash: str
+    reason: str
+    retention_kind: Optional[str]
+    custody_refs: Tuple[str, ...]
+
+
+TargetTerminal = Union[
+    TechnicalBlocker,
+    AcceptedMeasurementClosure,
+    SemanticBarrier,
+    GoalWorkDisposition,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,8 +503,8 @@ class TargetWorkNotice:
     kind: str
     target_ref: str
     target_run_ref: str
-    execution_attempt_ref: str
-    execution_fence_ref: str
+    execution_attempt_ref: Optional[str]
+    execution_fence_ref: Optional[str]
     terminal_fact_ref: str
     handoff_manifest_ref: str
     handoff_manifest_sha256: str
@@ -571,6 +595,7 @@ _CANONICAL_TYPES = frozenset(
         ExternalOperationReconciliation,
         RouteDisposition,
         SemanticBarrier,
+        GoalWorkDisposition,
         TargetRunHandoff,
         TargetWorkNotice,
         BundleInboxBatch,
@@ -833,10 +858,12 @@ def validate_target_work_notice(notice: TargetWorkNotice) -> str:
         notice.terminal_transition_ref,
         notice.target_ref,
         notice.target_run_ref,
-        notice.execution_attempt_ref,
-        notice.execution_fence_ref,
         notice.terminal_fact_ref,
         notice.handoff_manifest_ref,
+    )
+    execution_refs = (
+        notice.execution_attempt_ref,
+        notice.execution_fence_ref,
     )
     if (
         notice.sequence < 1
@@ -856,9 +883,24 @@ def validate_target_work_notice(notice: TargetWorkNotice) -> str:
         or len(set(notice.pending_obligation_refs))
         != len(notice.pending_obligation_refs)
         or any(not value.strip() for value in refs + notice.pending_obligation_refs)
+        or (
+            any(value is None for value in execution_refs)
+            and not (
+                notice.kind == "semantic_change_required"
+                and execution_refs == (None, None)
+            )
+        )
+        or any(
+            value is not None and not value.strip() for value in execution_refs
+        )
         or any(
             len(value.encode("utf-8")) > BUNDLE_NOTICE_REF_MAX_UTF8_BYTES
             for value in refs + notice.pending_obligation_refs
+        )
+        or any(
+            value is not None
+            and len(value.encode("utf-8")) > BUNDLE_NOTICE_REF_MAX_UTF8_BYTES
+            for value in execution_refs
         )
         or len(notice.handoff_manifest_sha256) != 64
         or len(notice.payload_sha256) != 64
@@ -894,6 +936,30 @@ def validate_target_run_handoff(handoff: TargetRunHandoff) -> str:
         max_serialized_bytes=BUNDLE_HANDOFF_MAX_SERIALIZED_BYTES,
     )
     terminal = handoff.terminal
+    if type(terminal) is GoalWorkDisposition:
+        _validate_goal_work_disposition(terminal)
+        if terminal.disposition == "not_started":
+            valid = not any(
+                (
+                    handoff.handle_history,
+                    handoff.code_review_preflights,
+                    handoff.stop_decisions,
+                    handoff.recovered_blockers,
+                    handoff.recovery_evidence_refs,
+                )
+            )
+        else:
+            valid = bool(handoff.handle_history) and (
+                not handoff.code_review_preflights
+                and not handoff.stop_decisions
+                and len(handoff.recovered_blockers)
+                == len(handoff.handle_history) - 1
+                and handoff.recovery_evidence_refs
+                == tuple(sorted(set(handoff.recovery_evidence_refs)))
+            )
+        if not valid:
+            raise BundleProtocolError("Goal work handoff is incomplete")
+        return digest
     is_root_completion = (
         type(terminal) is AcceptedMeasurementClosure
         and terminal.root_completion_receipt is not None
@@ -927,6 +993,47 @@ def validate_target_run_handoff(handoff: TargetRunHandoff) -> str:
     ):
         raise BundleProtocolError("TargetRun handoff is incomplete")
     return digest
+
+
+def _validate_goal_work_disposition(value: GoalWorkDisposition) -> None:
+    refs = (
+        value.target_ref,
+        value.target_run_ref,
+        value.terminal_fact_ref,
+        value.goal_work_intent_ref,
+        value.goal_revision_ref,
+        value.goal_revision_receipt_ref,
+    )
+    if (
+        value.disposition not in {"cancelled", "not_started"}
+        or any(not item.strip() for item in refs)
+        or len(value.goal_revision_receipt_hash) != 64
+        or any(character not in "0123456789abcdef" for character in value.goal_revision_receipt_hash)
+        or not value.reason.strip()
+        or "\n" in value.reason
+        or "\r" in value.reason
+        or len(value.reason.encode("utf-8")) > BUNDLE_NOTICE_REASON_MAX_UTF8_BYTES
+        or value.custody_refs != tuple(sorted(set(value.custody_refs)))
+        or any(not item.strip() for item in value.custody_refs)
+    ):
+        raise BundleProtocolError("Goal work disposition is invalid")
+    if value.disposition == "not_started":
+        if (
+            value.execution_attempt_ref is not None
+            or value.execution_fence_ref is not None
+            or value.terminal_fact_ref != value.goal_work_intent_ref
+            or value.retention_kind is not None
+            or value.custody_refs
+        ):
+            raise BundleProtocolError("Goal work non-start disposition is invalid")
+        return
+    if (
+        not value.execution_attempt_ref
+        or not value.execution_fence_ref
+        or value.retention_kind not in {"selected", "pending", "inspected_none"}
+        or not value.custody_refs
+    ):
+        raise BundleProtocolError("Goal work cancellation disposition is invalid")
 
 
 def validate_bundle_report(report: BundleReport) -> str:

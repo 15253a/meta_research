@@ -20,6 +20,7 @@ from meta_research.owners.research_memory import (
     ASSET_PROJECTION_MAX_PAGE_SIZE,
     ASSET_PROJECTION_PAGE_SIZE,
 )
+from meta_research.runtime_conditions import read_runtime_conditions
 
 if TYPE_CHECKING:
     from meta_research.autonomous_creation import AutonomousCreationService
@@ -371,16 +372,30 @@ class PublicProjection:
         include_history: bool = True,
         include_stages: bool = True,
     ) -> dict[str, object]:
-        cut = self._database.read_snapshot() if self._database else nullcontext()
-        with measure_query("snapshot") as timing, cut:
-            snapshot = self._query_snapshot(
-                asset_offset=asset_offset, asset_limit=asset_limit,
-                include_assets=include_assets, include_history=include_history,
-                include_stages=include_stages,
-            )
-            snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
-            snapshot["query_diagnostics"] = timing.public()
-            return snapshot
+        with measure_query("snapshot") as timing:
+            prepared_scope = None
+            if self._database:
+                prepared_scope = self._human_collaboration.query_collaboration_scope()
+                if prepared_scope.startswith("quest:"):
+                    read_runtime_conditions(
+                        self._database.path.parent,
+                        prepared_scope.removeprefix("quest:"),
+                    )
+            cut = self._database.read_snapshot() if self._database else nullcontext()
+            with cut:
+                if (
+                    self._database
+                    and self._human_collaboration.query_collaboration_scope() != prepared_scope
+                ):
+                    raise SnapshotConsistencyUnavailable
+                snapshot = self._query_snapshot(
+                    asset_offset=asset_offset, asset_limit=asset_limit,
+                    include_assets=include_assets, include_history=include_history,
+                    include_stages=include_stages,
+                )
+                snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
+                snapshot["query_diagnostics"] = timing.public()
+                return snapshot
 
     def _query_snapshot(
         self,
@@ -933,6 +948,19 @@ def _query_current_quest_goal(
         "draft_hash": None,
         "goal": None,
         "completion_criteria": None,
+        "origin": None,
+        "sequence": None,
+        "parent_ref": None,
+        "criteria_review": None,
+        "judgment": None,
+        "following_direction": None,
+        "author": None,
+        "cause": None,
+        "receipt": None,
+        "conditions": None,
+        "work": None,
+        "guidance_alignment": [],
+        "history": None,
         "projection_digest": None,
     }
     if quest_ref is None:
@@ -971,6 +999,12 @@ def _query_current_quest_goal(
         or not isinstance(goal_document.get("completion_criteria"), str)
     ):
         raise OwnerConflict("quest_goal_projection_invalid")
+    view_query = getattr(research_graph, "query_quest_goal_view", None)
+    view = view_query(quest_ref) if callable(view_query) else None
+    if view is not None and (
+        not isinstance(view, dict) or view.get("current") != binding
+    ):
+        raise OwnerConflict("quest_goal_projection_invalid")
     return {
         "status": "ready",
         "quest_ref": quest_ref,
@@ -979,6 +1013,19 @@ def _query_current_quest_goal(
         "draft_hash": binding["draft_hash"],
         "goal": goal_document["goal"],
         "completion_criteria": goal_document["completion_criteria"],
+        "origin": binding.get("origin", "initialization"),
+        "sequence": int(binding.get("sequence", 0)),
+        "parent_ref": binding.get("parent_ref"),
+        "criteria_review": binding.get("criteria_review"),
+        "judgment": binding.get("judgment"),
+        "following_direction": binding.get("following_direction"),
+        "author": binding.get("author"),
+        "cause": binding.get("cause"),
+        "receipt": binding.get("receipt"),
+        "conditions": None if view is None else view.get("conditions"),
+        "work": None if view is None else view.get("work"),
+        "guidance_alignment": [] if view is None else view.get("guidance_alignment", []),
+        "history": None if view is None else view.get("history"),
         "projection_digest": canonical_hash(binding),
         "reason": None,
     }

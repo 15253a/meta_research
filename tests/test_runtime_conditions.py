@@ -34,6 +34,15 @@ def root(tmp_path):
             CREATE TABLE hc_deepfetch_requests(request_ref TEXT PRIMARY KEY, initialization_id TEXT);
             CREATE TABLE hc_manual_deepfetch_requests(request_ref TEXT PRIMARY KEY,
                 initialization_id TEXT, quest_ref TEXT);
+            CREATE TABLE hc_runtime_condition_versions(
+                scope_ref TEXT NOT NULL, revision TEXT NOT NULL, value_json TEXT NOT NULL,
+                source_kind TEXT NOT NULL, created_at REAL NOT NULL,
+                PRIMARY KEY(scope_ref, revision));
+            CREATE TABLE hc_runtime_condition_heads(
+                scope_ref TEXT PRIMARY KEY, current_revision TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(scope_ref, current_revision)
+                    REFERENCES hc_runtime_condition_versions(scope_ref, revision));
         """)
         for name, count, accepted in (("one", 4, True), ("two", 1, True), ("draft", 0, False)):
             devices = [{"uuid": f"GPU-{name}-{i}", "name": "NVIDIA A100-SXM4-80GB",
@@ -105,16 +114,24 @@ def test_research_style_round_trip_preserves_persistent_conditions(root, style, 
 
 def test_edits_persist_refresh_and_leave_other_quest_and_database_unchanged(root):
     database = root / "meta-research.sqlite3"
-    before = database.read_bytes()
     original = read_runtime_conditions(root, "quest-one")
     other = read_runtime_conditions(root, "quest-two")
+    with sqlite3.connect(database) as db:
+        before = {
+            table: db.execute(f"SELECT * FROM {table}").fetchall()
+            for table in ("rg_quests", "hc_quest_initializations", "hc_resource_envelopes")
+        }
     saved = save_runtime_conditions(root, "quest-one", text="预算七天，只使用 GPU-one-0。",
                                     expected_revision=original["revision"])
     assert read_runtime_conditions(Path(str(root)), "quest-one") == saved
     assert "预算七天" in render_runtime_conditions(root, run_ref="run-one")
     assert read_runtime_conditions(root, "quest-two") == other
     assert "预算七天" not in render_runtime_conditions(root, run_ref="run-two")
-    assert database.read_bytes() == before
+    with sqlite3.connect(database) as db:
+        assert before == {
+            table: db.execute(f"SELECT * FROM {table}").fetchall()
+            for table in ("rg_quests", "hc_quest_initializations", "hc_resource_envelopes")
+        }
 
 
 @pytest.mark.parametrize("scope", [
@@ -210,6 +227,36 @@ def test_empty_or_oversized_edit_is_rejected_without_new_file(root):
         with pytest.raises(OwnerConflict, match="runtime_conditions_text_invalid"):
             save_runtime_conditions(root, "quest-one", text=value, expected_revision=original["revision"])
     assert not (root / "runtime-conditions").exists()
+
+
+def test_legacy_file_is_imported_once_and_retained_as_evidence(root):
+    scope = "quest-one"
+    legacy = {"quest_ref": scope, "text": "旧条件"}
+    legacy["revision"] = canonical_hash(legacy)
+    directory = root / "runtime-conditions"
+    directory.mkdir()
+    path = directory / f"{canonical_hash(scope)}.json"
+    original_bytes = json.dumps(legacy, ensure_ascii=False).encode("utf-8")
+    path.write_bytes(original_bytes)
+
+    imported = read_runtime_conditions(root, scope)
+    assert imported["text"] == "旧条件"
+    assert imported["research_style"] == "balanced"
+    updated = save_runtime_conditions(
+        root,
+        scope,
+        text="新条件",
+        expected_revision=imported["revision"],
+    )
+
+    assert read_runtime_conditions(root, scope) == updated
+    assert path.read_bytes() == original_bytes
+    with sqlite3.connect(root / "meta-research.sqlite3") as db:
+        assert db.execute(
+            "SELECT source_kind FROM hc_runtime_condition_versions "
+            "WHERE scope_ref=? AND revision=?",
+            (scope, imported["revision"]),
+        ).fetchone() == ("legacy_file",)
 
 
 def test_prompt_framing_round_trip_and_invalid_length():

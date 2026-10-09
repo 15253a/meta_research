@@ -31,6 +31,8 @@ AE 管 request、epoch、StageCommit 和 skip；AR 管 Run、Attempt、根 Sessi
 
 系统依次验证精确输入及 current scope，核验已选来源，以独立操作身份保存 RM 内容、提交 RG 决策，接纳后形成 AR 执行完成事实，最后由 AE 提交 StageCommit。Agent 交付科学内容，不手工重建这些 receipts。
 
+证据或正式人类指导要求改变 Quest 方向时，用 `research_graph.quest_goal.read` 核对本逻辑操作的冻结切面，按共享指导合同作完整判断，再用 `research_graph.quest_goal.evolve` 提交；未知效果用相同 effect 的 `.reconcile`。新入场工作使切面过期时，新逻辑根操作才会得到新切面。
+
 ## 反馈与恢复
 
 | 结果 | 处理 |

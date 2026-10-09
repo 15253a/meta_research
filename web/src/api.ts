@@ -1927,6 +1927,59 @@ export type PublicSnapshot = {
       draft_hash: string | null;
       goal: string | null;
       completion_criteria: string | null;
+      origin?: "initialization" | "evolution";
+      sequence?: number;
+      parent_ref?: string | null;
+      criteria_review?: string | null;
+      judgment?: string | null;
+      following_direction?: string | null;
+      author?: Record<string, unknown> | null;
+      cause?: Record<string, unknown> | null;
+      receipt?: Record<string, unknown> | null;
+      conditions?: {
+        basis_ref: string;
+        runtime_conditions: { quest_ref: string; text: string; revision: string; research_style: string };
+        enduring: Array<{
+          condition_ref: string;
+          source_text: string;
+          meaning: string;
+          status: string;
+          source: Record<string, unknown>;
+        }>;
+      } | null;
+      work?: {
+        intents: Array<{
+          intent_ref: string;
+          revision_ref: string;
+          actual_status: string;
+          decision: {
+            kind: "continue" | "stop" | "do_not_start" | "finish_stage_boundary";
+            reason: string;
+            work: Record<string, unknown>;
+            retention?: {
+              kind: "selected";
+              assets: Array<{
+                asset_ref: string;
+                version_ref: string;
+                content_hash: string;
+                manifest_hash: string;
+                meaning: string;
+                receipt: Record<string, unknown>;
+              }>;
+            } | {
+              kind: "pending";
+              workspace_ref: string;
+              remaining_review: string;
+            } | {
+              kind: "inspected_none";
+              workspace_ref: string;
+              explanation: string;
+            };
+          };
+        }>;
+      } | null;
+      guidance_alignment?: GoalGuidanceAlignment[];
+      history?: QuestGoalHistory | null;
       projection_digest: string | null;
       reason: { code: string } | null;
     };
@@ -2248,6 +2301,21 @@ export type CompanionMessage = {
 
 export type GuidanceStrength = 1 | 2 | 3 | 4 | 5;
 
+export type GoalGuidanceAlignment = {
+  guide_ref: {
+    constraint_ref: string;
+    revision: number;
+    guidance_hash: string;
+    receipt_ref: string;
+    receipt_hash: string;
+  };
+  status: "pending" | "aligned";
+  reason: "awaiting_goal_evolution" | null;
+  aligned_revision: string | null;
+  current_revision: string;
+  authored_by: Record<string, unknown> | null;
+};
+
 export type GuidanceTreatment = {
   understanding: string;
   changes: string;
@@ -2280,6 +2348,7 @@ export type CompanionSoftConstraint = {
   scope_ref?: string | null;
   source_proposal_ref?: string | null;
   revision?: number;
+  guidance_hash?: string;
   guidance?: Record<string, unknown>;
   text?: string;
   content?: string;
@@ -2658,6 +2727,30 @@ export class ProductError extends Error {
 }
 
 export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle };
+
+export type QuestGoalRevisionDetail = {
+  goal_revision_ref: string;
+  sequence?: number;
+  goal: { goal: string; completion_criteria: string };
+  judgment?: string;
+  criteria_review?: string;
+  conditions: {
+    runtime_conditions: QuestRuntimeConditions;
+    enduring: Array<{
+      condition_ref: string; source_text: string; meaning: string; source: Record<string, unknown>;
+      status: "active" | "human_superseded"; superseding_source?: Record<string, unknown>;
+    }>;
+  } | null;
+  conditions_review: {
+    assessments: Array<{ condition_ref: string; disposition: string; explanation: string; superseding_delivery_ref?: string }>;
+  } | null;
+};
+
+export type QuestGoalHistory = { items: QuestGoalRevisionDetail[]; offset: number; next_offset: number | null };
+
+export function fetchQuestGoalHistory(questRef: string, offset: number): Promise<QuestGoalHistory> {
+  return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/goal/history?offset=${offset}&limit=20`);
+}
 
 export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSignal): Promise<QuestRuntimeConditions> {
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);

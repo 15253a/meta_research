@@ -26,6 +26,7 @@ from meta_research.bundle_protocol import (
     CodeReviewScope,
     ContentBindingProof,
     FormalPlan,
+    GoalWorkDisposition,
     MonitorObservation,
     ReceiptProof,
     ResultReviewRecord,
@@ -1002,7 +1003,12 @@ def _validate_terminal_blocker(
 
 
 def _terminal_notice_projection(
-    terminal: AcceptedMeasurementClosure | TechnicalBlocker | SemanticBarrier,
+    terminal: (
+        AcceptedMeasurementClosure
+        | TechnicalBlocker
+        | SemanticBarrier
+        | GoalWorkDisposition
+    ),
     *,
     semantic_barrier_fact_ref: str | None,
 ) -> tuple[str, str, str, tuple[str, ...]]:
@@ -1023,11 +1029,23 @@ def _terminal_notice_projection(
             terminal.reason,
             tuple(item.disposition_ref for item in terminal.route_dispositions),
         )
+    if type(terminal) is GoalWorkDisposition:
+        return (
+            "semantic_change_required",
+            terminal.terminal_fact_ref,
+            terminal.reason,
+            terminal.custody_refs,
+        )
     _fail("TargetRun handoff has an unknown terminal type")
 
 
 def _is_target_root_completion_terminal(
-    terminal: AcceptedMeasurementClosure | TechnicalBlocker | SemanticBarrier,
+    terminal: (
+        AcceptedMeasurementClosure
+        | TechnicalBlocker
+        | SemanticBarrier
+        | GoalWorkDisposition
+    ),
 ) -> bool:
     """Return whether ``terminal`` carries the root-lifecycle issuer proof.
 
@@ -1041,6 +1059,129 @@ def _is_target_root_completion_terminal(
         type(terminal) is AcceptedMeasurementClosure
         and getattr(terminal, "root_completion_receipt", None) is not None
     )
+
+
+def validate_goal_work_nonstart_notice(
+    handoff: TargetRunHandoff,
+    notice: TargetWorkNotice,
+) -> str:
+    """Validate an admitted Target that was authoritatively never started."""
+
+    digest = validate_target_run_handoff(handoff)
+    validate_target_work_notice(notice)
+    terminal = handoff.terminal
+    if type(terminal) is not GoalWorkDisposition or terminal.disposition != "not_started":
+        _fail("Target non-start handoff has an invalid disposition")
+    expected_kind, terminal_fact_ref, reason, obligations = (
+        _terminal_notice_projection(terminal, semantic_barrier_fact_ref=None)
+    )
+    if (
+        notice.kind != expected_kind
+        or notice.target_ref != terminal.target_ref
+        or notice.target_run_ref != terminal.target_run_ref
+        or notice.execution_attempt_ref is not None
+        or notice.execution_fence_ref is not None
+        or notice.terminal_fact_ref != terminal_fact_ref
+        or notice.compact_reason != reason
+        or notice.pending_obligation_refs != obligations
+        or notice.handoff_manifest_sha256 != digest
+        or notice.payload_sha256 != _notice_payload_digest(notice)
+    ):
+        _fail("Target non-start notice is inconsistent with its handoff")
+    return digest
+
+
+def _validate_goal_work_cancellation_handoff_notice(
+    handoff: TargetRunHandoff,
+    notice: TargetWorkNotice,
+    frontier: TargetFrontierEntry,
+    reconfirmed_frontier: TargetFrontierEntry,
+    *,
+    digest: str,
+    initial_handle: TargetWorkHandle,
+    target_spec_binding: ContentBindingProof,
+    target_spec_acceptance_receipt: ReceiptProof,
+    expected_review_scopes: tuple[CodeReviewScope, ...],
+) -> str:
+    terminal = handoff.terminal
+    if (
+        type(terminal) is not GoalWorkDisposition
+        or terminal.disposition != "cancelled"
+        or expected_review_scopes
+        or not handoff.handle_history
+        or handoff.handle_history[0] != initial_handle
+        or handoff.code_review_preflights
+        or handoff.stop_decisions
+        or len(handoff.recovered_blockers) != len(handoff.handle_history) - 1
+    ):
+        _fail("Target cancellation handoff contains invalid execution history")
+    commits = initial_handle.accepted_input_target_commit_refs
+    assets = tuple(
+        proof.asset_ref for proof in initial_handle.accepted_input_asset_proofs
+    )
+    required_recovery_evidence: set[str] = set()
+    for index, handle in enumerate(handoff.handle_history):
+        validate_target_work_handle(
+            handle,
+            target_ref=initial_handle.target_ref,
+            accepted_input_target_commit_refs=commits,
+            accepted_input_asset_refs=assets,
+        )
+        if index:
+            required_recovery_evidence.update(
+                validate_technical_blocker_recovery(
+                    handoff.recovered_blockers[index - 1],
+                    old_handle=handoff.handle_history[index - 1],
+                    replacement_handle=handle,
+                    previous_preflight=None,
+                    replacement_preflight=None,
+                    expected_replacement_review_scope=None,
+                    accepted_input_target_commit_refs=commits,
+                    accepted_input_asset_refs=assets,
+                )
+            )
+    if not required_recovery_evidence.issubset(handoff.recovery_evidence_refs):
+        _fail("Target cancellation recovery evidence is incomplete")
+    final_handle = handoff.handle_history[-1]
+    if (
+        terminal.target_ref != final_handle.target_ref
+        or terminal.target_run_ref != final_handle.target_run_ref
+        or terminal.execution_attempt_ref != final_handle.execution_attempt_ref
+        or terminal.execution_fence_ref != final_handle.execution_fence_ref
+    ):
+        _fail("Target cancellation points at a stale final handle")
+    validate_target_frontier_entry(
+        frontier,
+        target_ref=initial_handle.target_ref,
+        target_spec_binding=target_spec_binding,
+        target_spec_acceptance_receipt=target_spec_acceptance_receipt,
+        accepted_input_target_commit_refs=commits,
+        accepted_input_asset_refs=assets,
+    )
+    if (
+        frontier.state != "terminal"
+        or frontier.current_handle != final_handle
+        or reconfirmed_frontier != frontier
+    ):
+        _fail("Target cancellation frontier changed during handoff validation")
+    expected_kind, terminal_fact_ref, reason, obligations = (
+        _terminal_notice_projection(terminal, semantic_barrier_fact_ref=None)
+    )
+    if (
+        notice.kind != expected_kind
+        or notice.terminal_fact_ref != terminal_fact_ref
+        or notice.compact_reason != reason
+        or notice.pending_obligation_refs != obligations
+        or frontier.terminal_fact_ref != terminal_fact_ref
+        or notice.target_ref != final_handle.target_ref
+        or notice.target_run_ref != final_handle.target_run_ref
+        or notice.execution_attempt_ref != final_handle.execution_attempt_ref
+        or notice.execution_fence_ref != final_handle.execution_fence_ref
+        or notice.handoff_manifest_sha256 != digest
+        or notice.payload_sha256 != _notice_payload_digest(notice)
+    ):
+        _fail("Target cancellation notice is inconsistent with its handoff")
+    return digest
 
 
 def _validate_target_root_completion_handoff_notice(
@@ -1209,6 +1350,20 @@ def validate_target_run_handoff_notice(
         _fail("TargetRun handoff does not start with the admitted handle")
     if _is_target_root_completion_terminal(handoff.terminal):
         return _validate_target_root_completion_handoff_notice(
+            handoff,
+            notice,
+            frontier,
+            reconfirmed_frontier,
+            digest=digest,
+            initial_handle=initial_handle,
+            target_spec_binding=target_spec_binding,
+            target_spec_acceptance_receipt=target_spec_acceptance_receipt,
+            expected_review_scopes=expected_review_scopes,
+        )
+    if type(handoff.terminal) is GoalWorkDisposition:
+        if handoff.terminal.disposition != "cancelled":
+            _fail("Target non-start disposition requires the non-start validator")
+        return _validate_goal_work_cancellation_handoff_notice(
             handoff,
             notice,
             frontier,

@@ -911,6 +911,17 @@ a:focus-visible,
   scrollbar-width: none;
 }
 
+.research-goal-summary {
+  margin: 16px 0;
+  overflow-wrap: anywhere;
+}
+
+.research-goal-summary article > b,
+.research-goal-summary article > span {
+  display: block;
+  margin-bottom: 8px;
+}
+
 .lumen-return-summary article {
   display: grid;
   min-width: 154px;
