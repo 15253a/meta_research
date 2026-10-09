@@ -1093,6 +1093,26 @@ class QuestGoalOwnerMixin:
             newer = _guidance_delivery_source(connection, delivery_ref)
             if float(newer["created_at"]) <= float(source.get("created_at", 0)):
                 raise OwnerConflict("goal_condition_supersession_invalid")
+            result.append(
+                {
+                    "condition_ref": row.condition_ref,
+                    "source_json": row.source_json,
+                    "source_hash": row.source_hash,
+                    "source_text": row.source_text,
+                    "meaning": row.meaning,
+                    "status": "human_superseded",
+                    "superseding_source_json": canonical_json(
+                        {
+                            "kind": "human_guidance",
+                            "delivery_ref": delivery_ref,
+                            "guide_ref": newer["guide_ref"],
+                            "guidance_binding": newer["binding"],
+                            "original_text": newer["original_text"],
+                            "created_at": newer["created_at"],
+                        }
+                    ),
+                }
+            )
         for clause in conditions["newly_identified"]:
             source = _guidance_delivery_source(connection, clause["delivery_ref"])
             if source["quest_ref"] != quest_ref or source["read_at"] is None:
@@ -1333,13 +1353,16 @@ def _condition_public(row) -> dict[str, object]:
     source = decoded_object(row.source_json)
     if canonical_hash(source) != row.source_hash:
         raise OwnerConflict("goal_condition_invalid")
-    return {
+    value = {
         "condition_ref": row.condition_ref,
         "source": source,
         "source_text": row.source_text,
         "meaning": row.meaning,
         "status": row.status,
     }
+    if row.superseding_source_json is not None:
+        value["superseding_source"] = decoded_object(row.superseding_source_json)
+    return value
 
 
 def _goal_effect_replay(connection, effect_key: str, command: dict[str, object]):

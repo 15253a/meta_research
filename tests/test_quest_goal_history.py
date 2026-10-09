@@ -18,7 +18,7 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
     tmp_path: Path,
 ) -> None:
     runtime = _current_bundle_runtime(tmp_path / "history")
-    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
+    runtime.configure_resident_mcp_endpoint("http://testserver")
     try:
         target, _, _, admission, _ = _admit_independent_target_root(runtime)
         launch = runtime.owners.agent_runtime.query_admitted_target_launch(
@@ -117,14 +117,16 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
                 effect_id=f"history-evolution-{len(observed)}",
                 decision=decision,
             )
-            observed.append({"cut": cut, "decision": decision, "result": result})
+            observed.append(
+                {"cut": cut, "decision": decision, "result": result, "delivery": exact}
+            )
             return invoke(invocation)
 
         adapter.invoke = evolve_with_sourced_conditions
         first = runtime.harnesses.run_or_resume_target_root(
             admission.run.request_ref,
             prompt="Apply the device audit direction to the Quest.",
-            mcp_base_url="http://127.0.0.1:8999",
+            mcp_base_url="http://testserver",
         )
         assert first.status == "executed"
         initial_runtime = observed[0]["cut"]["conditions"]["runtime_conditions"]
@@ -145,7 +147,7 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
         second = runtime.harnesses.run_or_resume_target_root(
             admission.run.request_ref,
             prompt="Review the newer direction and its condition change.",
-            mcp_base_url="http://127.0.0.1:8999",
+            mcp_base_url="http://testserver",
         )
         assert second.status == "executed"
         latest_runtime = save_runtime_conditions(
@@ -171,12 +173,30 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
         ]["delivery_ref"]
         assert earlier["conditions_review"] == observed[0]["decision"]["conditions"]
         assert current["conditions"]["runtime_conditions"] == updated_runtime
-        assert current["conditions"]["enduring"] == []
+        superseded, = current["conditions"]["enduring"]
+        superseding_source = superseded["superseding_source"]
+        assert superseded == {
+            **condition,
+            "status": "human_superseded",
+            "superseding_source": {
+                "kind": "human_guidance",
+                "delivery_ref": observed[1]["decision"]["cause"]["delivery_ref"],
+                "guide_ref": observed[1]["delivery"]["guide_ref"],
+                "guidance_binding": observed[1]["delivery"]["binding"],
+                "original_text": "The independent device audit is no longer required.",
+                "created_at": superseding_source["created_at"],
+            },
+        }
+        assert superseding_source["created_at"] > condition["source"]["created_at"]
+        assert graph.query_quest_goal_view(quest_ref)["conditions"]["enduring"] == []
         assert current["conditions_review"] == observed[1]["decision"]["conditions"]
         assessment, = current["conditions_review"]["assessments"]
         assert assessment["condition_ref"] == condition["condition_ref"]
         assert assessment["disposition"] == "human_superseded"
         assert assessment["superseding_delivery_ref"] == current["cause"]["delivery_ref"]
+        assert assessment["explanation"] == (
+            "The newer human direction removes the audit condition."
+        )
         assert read_runtime_conditions(runtime.data_root.root, quest_ref) == latest_runtime
         for detail, operation in zip((earlier, current), observed, strict=True):
             revision_ref = detail["goal_revision_ref"]
