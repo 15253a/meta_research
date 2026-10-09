@@ -5066,6 +5066,8 @@ class SQLiteAdvancementEngine(
                     "r.stage='reasoning' AND r.epoch=h.epoch JOIN "
                     "ae_stage_commits c ON c.request_ref=r.request_ref WHERE "
                     "h.stage='reasoning' AND h.status='active' AND "
+                    "EXISTS (SELECT 1 FROM rg_quest_goal_heads z WHERE "
+                    "z.quest_ref=h.quest_ref AND z.status='open') AND "
                     "h.pending_operation_ref IS NULL AND g.status='active' AND "
                     "y.status='ongoing' AND c.disposition='completed' ORDER BY "
                     "h.updated_at,h.quest_ref"
@@ -5095,7 +5097,9 @@ class SQLiteAdvancementEngine(
             if research_context.get("goal_revision_ref") == current.get(
                 "goal_revision_ref"
             ):
-                continue
+                with self._database.read() as connection:
+                    if not self._completion_conditions_stale(connection, closure, row.quest_ref):
+                        continue
             return {
                 "quest_ref": row.quest_ref,
                 "cycle_ref": row.cycle_ref,
@@ -5183,12 +5187,13 @@ class SQLiteAdvancementEngine(
                     not isinstance(context_pack, dict)
                     or canonical_hash(context_pack) != row.context_pack_hash
                     or not isinstance(research_context, dict)
-                    or research_context.get("goal_revision_ref")
-                    == goal_revision_ref
                     or not isinstance(closure, dict)
                     or canonical_hash(closure) != row.closure_hash
                     or closure.get("transition_kind") != "candidate_completion"
                 ):
+                    raise OwnerConflict("goal_reasoning_reassessment_invalid")
+                if (research_context.get("goal_revision_ref") == goal_revision_ref
+                        and not self._completion_conditions_stale(connection, closure, quest_ref)):
                     raise OwnerConflict("goal_reasoning_reassessment_invalid")
                 now = time.time()
                 next_epoch = int(row.epoch) + 1
@@ -5269,6 +5274,24 @@ class SQLiteAdvancementEngine(
             goal_revision_ref=goal_revision_ref,
             replayed=False,
         )
+
+    def _completion_conditions_stale(self, connection, closure, quest_ref):
+        from meta_research.runtime_conditions import read_runtime_conditions_in_transaction
+
+        candidate = closure.get("transition")
+        if not isinstance(candidate, dict):
+            raise OwnerConflict("goal_reasoning_reassessment_invalid")
+        binding = self._reasoning_outcome_verifier.query_candidate_completion(
+            source_outcome_ref=candidate["source_scientific_outcome_ref"],
+            candidate_completion_ref=closure["transition_ref"],
+        )
+        if binding is None or not isinstance(binding.get("source"), dict):
+            raise OwnerConflict("goal_reasoning_reassessment_invalid")
+        revision = binding["source"].get("runtime_conditions_revision")
+        if not isinstance(revision, str):
+            return True
+        current = read_runtime_conditions_in_transaction(connection, quest_ref)
+        return revision != current["revision"]
 
     def _goal_reasoning_reassessment_result(
         self, grant_ref: str, *, goal_revision_ref: str, replayed: bool

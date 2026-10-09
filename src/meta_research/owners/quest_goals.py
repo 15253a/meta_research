@@ -31,6 +31,59 @@ from meta_research.runtime_conditions import (
 
 
 _RG_OWNER = "research_graph"
+COMPLETION_CONDITION_SOURCE_FIELDS = {
+    "runtime_conditions_revision", "conditions_snapshot_ref", "conditions_snapshot_hash",
+}
+
+
+def completion_condition_source(connection, reasoning) -> dict[str, str]:
+    row = connection.execute(text(
+        "SELECT * FROM hc_reasoning_completion_conditions WHERE submission_ref=:ref"
+    ), {"ref": reasoning.submission_ref}).first()
+    if row is None:
+        return {}
+    binding = decoded_object(row.binding_json)
+    scope = binding.get("scope")
+    guidance = binding.get("guidance_binding")
+    if (canonical_hash(binding) != row.binding_hash
+            or not isinstance(scope, dict) or not isinstance(guidance, dict)
+            or scope.get("root_kind") != "reasoning"
+            or scope.get("run_ref") != reasoning.run_ref
+            or scope.get("attempt_ref") != reasoning.attempt_ref
+            or scope.get("fence_ref") != reasoning.fence_ref
+            or binding.get("payload_hash") != reasoning.payload_hash):
+        raise OwnerConflict("candidate_completion_conditions_invalid")
+    snapshot = connection.execute(text(
+        "SELECT * FROM hc_guidance_snapshots WHERE snapshot_ref=:ref"
+    ), {"ref": guidance.get("snapshot_ref")}).first()
+    if snapshot is None:
+        raise OwnerConflict("candidate_completion_conditions_invalid")
+    payload = decoded_object(snapshot.snapshot_json)
+    direction = payload.get("direction_cut")
+    candidate = decoded_object(reasoning.transition_json)
+    if (canonical_hash(payload) != snapshot.snapshot_hash
+            or guidance != {
+                "identity": payload.get("identity"),
+                "quest_ref": payload.get("quest_ref"),
+                "snapshot_ref": snapshot.snapshot_ref,
+                "snapshot_hash": snapshot.snapshot_hash,
+            }
+            or not isinstance(direction, dict)
+            or payload.get("quest_ref") != candidate.get("current_quest_ref")
+            or direction.get("conditions") != binding.get("conditions")):
+        raise OwnerConflict("candidate_completion_conditions_invalid")
+    conditions = binding["conditions"]
+    runtime = conditions["runtime_conditions"]
+    frozen = read_runtime_conditions_in_transaction(
+        connection, str(guidance["quest_ref"]), revision=str(runtime["revision"])
+    )
+    if frozen != runtime:
+        raise OwnerConflict("candidate_completion_conditions_invalid")
+    return {
+        "runtime_conditions_revision": frozen["revision"],
+        "conditions_snapshot_ref": snapshot.snapshot_ref,
+        "conditions_snapshot_hash": snapshot.snapshot_hash,
+    }
 
 
 def initial_goal_revision_ref(row) -> str:
@@ -274,6 +327,10 @@ def verify_goal_revision_ancestry_in_transaction(
     ):
         raise OwnerConflict("quest_goal_revision_invalid")
 class QuestGoalOwnerMixin:
+    def query_runtime_conditions_revision(self, quest_ref: str) -> str:
+        with self._database.read() as connection:
+            return read_runtime_conditions_in_transaction(connection, quest_ref)["revision"]
+
     def query_current_quest_goal_revision(
         self, quest_ref: str
     ) -> dict[str, object] | None:

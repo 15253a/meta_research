@@ -1105,6 +1105,7 @@ def build_production_runtime(
         owners.research_graph,
         reasoning_skill_provider,
         autonomous_creation=autonomous_creation,
+        human_guidance=owners.human_collaboration,
     )
     deepfetch = FirstQuestionDeepFetchWorker(
         _DeepFetchRequestAuthorityRouter(

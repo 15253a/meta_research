@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread, current_thread
+import json
 
 import pytest
 from sqlalchemy import text
@@ -18,6 +19,8 @@ from meta_research.quest_goal import (
     WorkDecision,
     WorkHandle,
 )
+import meta_research.runtime_conditions as runtime_conditions
+from test_corrected_quest_initialization import _authenticated_client
 from test_public_quest_completion import (
     _CandidateCompletionReasoningSkill,
     _DeterministicDraftingAdapter,
@@ -368,6 +371,7 @@ def test_goal_evolution_wakes_a_higher_reasoning_epoch_without_rewriting_history
                 goal_revision_ref=str(new_goal_ref),
                 idempotency_key=(
                     "goal-reasoning-reassessment-" + str(new_goal_ref)
+                    + ":" + str(old_foreground["epoch"])
                 ),
             )
         )
@@ -404,4 +408,171 @@ def test_goal_evolution_wakes_a_higher_reasoning_epoch_without_rewriting_history
                 {"cycle_ref": old_foreground["cycle_ref"]},
             ).all() == old_plan_rows
     finally:
+        runtime.close()
+
+
+def test_public_condition_edit_keeps_candidate_frozen_and_reopens_reasoning(tmp_path):
+    runtime = _runtime(tmp_path / "condition-reassessment")
+    try:
+        quest, accepted, decision, transition = _accepted_candidate(runtime)
+        quest_ref = str(quest["quest_ref"])
+        candidate_ref = str(transition["transition_ref"])
+        graph = runtime.owners.research_graph
+        historical = graph.query_candidate_completion(
+            source_outcome_ref=decision.outcome_ref,
+            candidate_completion_ref=candidate_ref,
+        )
+        source = historical["source"]
+        initial = runtime_conditions.read_runtime_conditions(runtime.data_root.root, quest_ref)
+        assert source["runtime_conditions_revision"] == initial["revision"]
+        with runtime._database.read() as connection:
+            snapshot = connection.execute(text(
+                "SELECT * FROM hc_guidance_snapshots WHERE snapshot_ref=:ref"
+            ), {"ref": source["conditions_snapshot_ref"]}).one()
+            frozen = json.loads(snapshot.snapshot_json)
+            assert frozen["operation"]["operation_name"] == "review"
+            assert frozen["identity"]["run_ref"] == accepted["run"]["run_ref"]
+            assert frozen["direction_cut"]["conditions"]["runtime_conditions"] == initial
+            assert snapshot.snapshot_hash == source["conditions_snapshot_hash"]
+        committed = _finish_reasoning_stage(runtime)
+        old_epoch = committed["stage_run_request"]["epoch"]
+        old_commit = committed["stage_commit"]["commit_ref"]
+        client, headers = _authenticated_client(runtime)
+        edited = client.put(
+            f"/api/v1/quests/{quest_ref}/runtime-conditions",
+            json={"text": "The completion must satisfy the revised resource condition.",
+                  "expected_revision": initial["revision"]},
+            headers=headers,
+        )
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["revision"] != initial["revision"]
+        assert graph.query_candidate_completion(
+            source_outcome_ref=decision.outcome_ref,
+            candidate_completion_ref=candidate_ref,
+        ) == historical
+        with pytest.raises(OwnerConflict) as stale:
+            runtime.quest_completion.start(
+                source_outcome_ref=decision.outcome_ref,
+                candidate_completion_ref=candidate_ref,
+                idempotency_key="condition-edited-before-completion-start",
+            )
+        assert stale.value.code == "candidate_completion_stale"
+        assert runtime.goal_work_reconciler.process_once()
+        foreground = runtime.owners.advancement_engine.query_foreground(quest_ref)
+        assert foreground["stage"] == "reasoning"
+        assert foreground["epoch"] == old_epoch + 1
+        assert runtime.owners.advancement_engine.query_reasoning_stage_commit(
+            committed["stage_run_request"]["request_ref"]
+        ).commit_ref == old_commit
+        assert graph.query_candidate_completion(
+            source_outcome_ref=decision.outcome_ref,
+            candidate_completion_ref=candidate_ref,
+        ) == historical
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("winner", ["completion", "conditions"])
+def test_completion_and_public_condition_edit_use_the_final_sqlite_writer_order(
+    tmp_path, monkeypatch, winner,
+):
+    runtime = _runtime(tmp_path / winner)
+    original_fenced_write = runtime._database.fenced_write
+    original_condition_lock = runtime_conditions._LOCK
+    reached = {name: Event() for name in ("completion", "conditions")}
+    allowed = {name: Event() for name in reached}
+    threads = {}
+    try:
+        quest, accepted, decision, transition = _accepted_candidate(runtime)
+        quest_ref = str(quest["quest_ref"])
+        command, candidate = _completion_command(runtime, transition, decision)
+        source = runtime.quest_completion.query_current()["source"]
+        preview = runtime.quest_completion.query_current()["human_confirmation"]["preview"]
+        assert preview["runtime_conditions_revision"] == source["runtime_conditions_revision"]
+        assert preview["conditions_snapshot_ref"] == source["conditions_snapshot_ref"]
+        client, headers = _authenticated_client(runtime)
+
+        @contextmanager
+        def ordered_fenced_write():
+            if current_thread().name == "completion":
+                reached["completion"].set()
+                assert allowed["completion"].wait(10)
+            with original_fenced_write() as connection:
+                yield connection
+
+        @contextmanager
+        def ordered_condition_write():
+            reached["conditions"].set()
+            assert allowed["conditions"].wait(10)
+            with original_condition_lock:
+                yield
+
+        runtime._database.fenced_write = ordered_fenced_write
+        monkeypatch.setattr(runtime_conditions, "_LOCK", ordered_condition_write())
+        results = {}
+        errors = {}
+
+        def call(name, operation):
+            try:
+                results[name] = operation()
+            except BaseException as error:
+                errors[name] = error
+
+        threads = {
+            "completion": Thread(target=call, name="completion", args=(
+                "completion", lambda: runtime.owners.research_graph.accept_quest_completion(**command),
+            )),
+            "conditions": Thread(target=call, name="conditions", args=(
+                "conditions", lambda: client.put(
+                    f"/api/v1/quests/{quest_ref}/runtime-conditions",
+                    json={"text": "Require the newly revised resource condition before completion.",
+                          "expected_revision": source["runtime_conditions_revision"]},
+                    headers=headers,
+                ),
+            )),
+        }
+        for thread in threads.values():
+            thread.start()
+        assert all(event.wait(10) for event in reached.values())
+        allowed[winner].set()
+        threads[winner].join(10)
+        assert not threads[winner].is_alive()
+        loser = "conditions" if winner == "completion" else "completion"
+        allowed[loser].set()
+        threads[loser].join(10)
+        assert not threads[loser].is_alive()
+        assert results["conditions"].status_code == 200, results["conditions"].text
+        assert results["conditions"].json()["revision"] != source["runtime_conditions_revision"]
+        historical = runtime.owners.research_graph.query_candidate_completion(
+            source_outcome_ref=decision.outcome_ref,
+            candidate_completion_ref=command["candidate_completion_ref"],
+        )
+        assert historical["candidate_completion"] == candidate
+        assert historical["source"] == source
+        acceptance = runtime.owners.research_graph.query_quest_completion_acceptance(
+            command["candidate_completion_ref"]
+        )
+        if winner == "conditions":
+            assert set(errors) == {"completion"}
+            assert isinstance(errors["completion"], OwnerConflict)
+            assert errors["completion"].code == "quest_completion_conditions_stale"
+            assert acceptance is None
+            assert runtime.quest_completion.query_current()["status"] == "stale"
+            assert not runtime.quest_completion.process_once()
+        else:
+            assert errors == {}
+            assert acceptance == results["completion"]
+            assert runtime.owners.research_graph.accept_quest_completion(**command) == acceptance
+        with runtime._database.read() as connection:
+            head = connection.execute(text(
+                "SELECT status FROM rg_quest_goal_heads WHERE quest_ref=:ref"
+            ), {"ref": quest_ref}).scalar_one()
+        assert head == ("open" if winner == "conditions" else "completion_committed")
+    finally:
+        for event in allowed.values():
+            event.set()
+        for thread in threads.values():
+            thread.join(10)
+        runtime._database.fenced_write = original_fenced_write
+        monkeypatch.setattr(runtime_conditions, "_LOCK", original_condition_lock)
         runtime.close()

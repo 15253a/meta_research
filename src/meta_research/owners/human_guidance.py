@@ -19,6 +19,41 @@ from meta_research.runtime_conditions import read_runtime_conditions
 
 
 class HumanGuidanceMixin:
+    def bind_reasoning_completion_conditions(
+        self, *, operation: StageGuidanceOperation, submission_ref: str,
+        output: dict[str, object], payload_hash: str,
+    ) -> None:
+        if operation.scope.root_kind != "reasoning" or not submission_ref:
+            raise OwnerConflict("reasoning_completion_conditions_invalid")
+        cut = self.freeze_operation_guidance(operation)
+        if cut.direction_cut is None:
+            raise OwnerConflict("goal_direction_cut_missing")
+        binding = {
+            "scope": operation.scope.as_dict(),
+            "guidance_binding": cut.binding.as_dict(),
+            "output_hash": canonical_hash(output),
+            "payload_hash": payload_hash,
+            "conditions": cut.direction_cut["conditions"],
+        }
+        with self._database.fenced_write() as connection:
+            self._agent_runtime.verify_stage_guidance_operation(operation)
+            row = connection.execute(text(
+                "SELECT * FROM hc_reasoning_completion_conditions "
+                "WHERE submission_ref=:submission_ref"
+            ), {"submission_ref": submission_ref}).first()
+            if row is not None:
+                if (decoded_object(row.binding_json) != binding
+                        or row.binding_hash != canonical_hash(binding)):
+                    raise OwnerConflict("reasoning_completion_conditions_conflict")
+                return
+            connection.execute(text(
+                "INSERT INTO hc_reasoning_completion_conditions "
+                "(submission_ref,binding_json,binding_hash) VALUES "
+                "(:submission_ref,:binding_json,:binding_hash)"
+            ), {"submission_ref": submission_ref,
+                "binding_json": canonical_json(binding),
+                "binding_hash": canonical_hash(binding)})
+
     def submit_human_guidance(
         self, *, quest_ref: str, original_text: str, strength: int = 3,
         idempotency_key: str, work_materials=None,

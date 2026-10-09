@@ -30,6 +30,7 @@ class GoalWorkReconciler:
             idempotency_key=(
                 "goal-reasoning-reassessment-"
                 + str(reassessment["goal_revision_ref"])
+                + ":" + str(reassessment["source_epoch"])
             )
         )
         return True

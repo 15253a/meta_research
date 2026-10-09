@@ -140,7 +140,9 @@ from meta_research.owners.human_requests import (
     HumanResponseVerifier,
 )
 from meta_research.owners.quest_goals import (
+    COMPLETION_CONDITION_SOURCE_FIELDS,
     QuestGoalOwnerMixin,
+    completion_condition_source,
     initial_goal_binding,
     query_goal_revision_in_transaction,
     seed_goal_head,
@@ -1812,6 +1814,8 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
     def query_current_quest_goal_revision(
         self, quest_ref: str
     ) -> dict[str, object] | None: ...
+
+    def query_runtime_conditions_revision(self, quest_ref: str) -> str: ...
 
     def verify_quest_goal_revision(
         self, binding: dict[str, object]
@@ -4321,6 +4325,7 @@ class SQLiteResearchGraphReceiptVerifier:
                 quest_ref=quest_ref,
                 revision_ref=lineage.goal_revision_ref,
             )
+            condition_source = completion_condition_source(connection, row)
         if goal_revision is None or (
             goal_revision.get("goal_revision_ref") != lineage.goal_revision_ref
         ):
@@ -4329,6 +4334,7 @@ class SQLiteResearchGraphReceiptVerifier:
             row=row,
             candidate=candidate,
             goal_revision=goal_revision,
+            condition_source=condition_source,
         )
 
     def verify_quest_completion_acceptance(
@@ -11973,6 +11979,7 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
             "quest_ref": quest_ref,
             "goal_revision_ref": goal_revision_ref,
             "completion_milestone_basis_refs": milestone_refs,
+            **{key: source[key] for key in COMPLETION_CONDITION_SOURCE_FIELDS if key in source},
         }
         human_preview_ref = human_receipt.subject_ref
         human_preview_hash = canonical_hash(preview_document)
@@ -12060,6 +12067,14 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
             self.assert_current_quest_goal_revision(
                 goal_revision, connection=connection
             )
+            condition_revision = source.get("runtime_conditions_revision")
+            if not isinstance(condition_revision, str):
+                raise OwnerConflict("quest_completion_conditions_unbound")
+            current_conditions = self._quest_goal_conditions_in_transaction(
+                connection, quest_ref=quest_ref, revision_ref=goal_revision_ref
+            )
+            if current_conditions["runtime_conditions"]["revision"] != condition_revision:
+                raise OwnerConflict("quest_completion_conditions_stale")
             alignment = self._quest_goal_alignment_in_transaction(
                 connection,
                 quest_ref=quest_ref,
@@ -19541,6 +19556,7 @@ def _candidate_completion_public_binding(
     row,
     candidate: dict[str, object],
     goal_revision: dict[str, object],
+    condition_source: dict[str, str],
 ) -> dict[str, object]:
     basis_refs = candidate.get("completion_milestone_basis_refs")
     if (
@@ -19579,6 +19595,7 @@ def _candidate_completion_public_binding(
         "candidate_completion_hash": row.transition_hash,
         "candidate_completion": dict(candidate),
         "source": {
+            **condition_source,
             "quest_ref": candidate["source_quest_ref"],
             "cycle_ref": candidate["source_cycle_ref"],
             "reasoning_stage_run_request_ref": candidate[

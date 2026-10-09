@@ -38,6 +38,13 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint("length(current_revision) = 64"),
     )
+    op.create_table(
+        "hc_reasoning_completion_conditions",
+        sa.Column("submission_ref", sa.String(96), primary_key=True),
+        sa.Column("binding_json", sa.Text(), nullable=False),
+        sa.Column("binding_hash", sa.String(64), nullable=False),
+        sa.CheckConstraint("length(binding_hash) = 64"),
+    )
 
     op.create_table(
         "rg_quest_goal_heads",

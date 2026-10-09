@@ -39,7 +39,7 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
             delivery = next(
                 item
                 for item in inbox["deliveries"]
-                if item["guide"]["constraint_ref"]
+                if item["constraint_ref"]
                 == submitted[-1]["constraint_ref"]
             )
             exact = _tool(
