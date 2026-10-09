@@ -23,6 +23,7 @@ HANDOFF_PROFILES = Path(__file__).parent / "fixtures" / "root_prompt_bundle_hand
 WORKSPACE_PROFILES = Path(__file__).parent / "fixtures" / "root_workspace_20261007" / "profiles.json"
 COMBINED_PROFILES = Path(__file__).parent / "fixtures" / "batch_merge_20261008" / "profiles.json"
 QUEST_GOAL_PROFILES = Path(__file__).parent / "fixtures" / "quest_goal_20261009" / "profiles.json"
+MATERIAL_PROCESSING_PROFILES = Path(__file__).parent / "fixtures" / "material_processing_20261010" / "profiles.json"
 
 
 def load(name):
@@ -40,10 +41,17 @@ def binding(value):
 def test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles(root_kind):
     previous = json.loads(COMBINED_PROFILES.read_text(encoding="utf-8"))
     document = json.loads(QUEST_GOAL_PROFILES.read_text(encoding="utf-8"))
+    processing = json.loads(MATERIAL_PROCESSING_PROFILES.read_text(encoding="utf-8"))
     current = root_capabilities.root_capability_profile(root_kind)
-    assert current.as_dict() == document["current_profile"]
-    assert current.digest == document["current_profile_hash"] == canonical_hash(document["current_profile"])
-    historical = reviewed_historical_root_profile_hashes(current.digest)
+    # Keep the dated Quest-goal profile immutable; the new prompt has its own snapshot.
+    assert processing["before_profile"] == document["current_profile"]
+    assert processing["before_profile_hash"] == document["current_profile_hash"]
+    assert current.as_dict() == processing["after_profile"]
+    assert current.digest == processing["after_profile_hash"] == canonical_hash(processing["after_profile"])
+    assert reviewed_historical_root_profile_hashes(current.digest) == frozenset(processing["historical_read_hashes"])
+    assert document["current_profile_hash"] in reviewed_historical_root_profile_hashes(current.digest)
+    assert canonical_hash(document["current_profile"]) == document["current_profile_hash"]
+    historical = reviewed_historical_root_profile_hashes(document["current_profile_hash"])
     assert historical == frozenset(document["historical_read_hashes"])
     assert document["previous_profile_hash"] == previous["current_profile_hash"]
     for item in [previous["base_profile"], *previous["single_pr_profiles"]]:
