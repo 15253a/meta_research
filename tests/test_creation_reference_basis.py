@@ -65,7 +65,24 @@ def test_exact_original_result_selection_custody_and_small_projection(tmp_path, 
                 value["selection"].append({"source": WorkFile(work.work_ref, "result.txt").as_dict(),
                     "custody": "linked_local", "reason": "Retain the explicitly selected trial result."})
             memory = runtime.owners.research_memory.creation_bases
+            os.symlink(source, work.work_directory / "external-original")
+            (work.runtime.work_directory / "companion-kept.txt").write_text("Other Companion state.")
+            if selection == "neither":
+                from sqlalchemy import text
+                with memory._database.write() as connection:
+                    connection.execute(text("INSERT INTO hc_creation_material_copies "
+                        "(effect_key,operation_ref,fence_ref,request_hash,state) VALUES ('pending-copy',:operation,:fence,:hash,'pending')"),
+                        {"operation": work.operation.operation_ref, "fence": work.operation.fence_ref, "hash": "0" * 64})
             basis = memory.accept_reference_prepared(request, InitializationUnderstandingResult(value, input_identity=identity, work=work))
+            if selection == "neither":
+                assert work.work_directory.exists()
+                assert work.cleanup_after_acceptance(basis) == {"status": "retained", "reason": "creation_copy_pending"}
+                with memory._database.write() as connection:
+                    connection.execute(text("UPDATE hc_creation_material_copies SET state='failed' WHERE effect_key='pending-copy'"))
+                assert work.cleanup_after_acceptance(basis) == {"status": "cleaned"}
+            assert not work.work_directory.exists()
+            assert (work.runtime.work_directory / "companion-kept.txt").read_text() == "Other Companion state."
+            assert work.cleanup_after_acceptance(basis) == {"status": "cleaned"}
             selected = [item for item in basis["sources"] if item["binding"] is not None]
             assert len(selected) == len(value["selection"])
             assert CreationInputIdentity.from_dict(basis["input_identity"]) == identity
@@ -102,15 +119,35 @@ def test_selected_original_linked_custody_reports_drift_and_work_symlink_is_refu
             value["selection"] = [{"source": OriginalFile(ref["reference_ref"], "", entry["observation"]["observation_ref"]).as_dict(),
                 "custody": "linked_local", "reason": "Keep the exact original locator."}]
             memory = runtime.owners.research_memory.creation_bases
-            basis = memory.accept_reference_prepared(request, InitializationUnderstandingResult(value, input_identity=identity, work=work))
-            selected = next(item for item in basis["sources"] if item["binding"] is not None)
-            assert memory.read_source(basis, selected["material_key"])["content"] == b"original 16\n"
             os.symlink(source, work.work_directory / "unsafe.txt")
             with pytest.raises(OwnerConflict, match="creation_work_unsafe"):
                 work.retain_source(WorkFile(work.work_ref, "unsafe.txt").as_dict())
+            basis = memory.accept_reference_prepared(request, InitializationUnderstandingResult(value, input_identity=identity, work=work))
+            selected = next(item for item in basis["sources"] if item["binding"] is not None)
+            assert memory.read_source(basis, selected["material_key"])["content"] == b"original 16\n"
             assert source.read_bytes() == b"original 16\n"
             source.write_bytes(b"changed 36\n")
             with pytest.raises(OwnerConflict):
                 memory.read_source(basis, selected["material_key"])
+    finally:
+        runtime.close()
+
+
+def test_pending_selected_intake_retains_sealed_work_for_recovery(tmp_path, monkeypatch):
+    source = tmp_path / "original.txt"
+    source.write_bytes(b"original 16\n")
+    runtime = _make(tmp_path / "runtime")
+    try:
+        with TestClient(create_app(runtime, base_url="http://testserver", control_key="control")) as client:
+            request, value, identity, work, _, _, _ = _understood(runtime, client, source, "pending-intake")
+            value["selection"] = [{"source": WorkFile(work.work_ref, "result.txt").as_dict(),
+                "custody": "managed", "reason": "Retain only after formal intake completes."}]
+            memory = runtime.owners.research_memory.creation_bases
+            monkeypatch.setattr(memory._owner, "_process_asset_job", lambda *args, **kwargs: None)
+            with pytest.raises(OwnerConflict, match="creation_source_not_accepted"):
+                memory.accept_reference_prepared(request, InitializationUnderstandingResult(value, input_identity=identity, work=work))
+            assert (work.work_directory / "result.txt").read_bytes() == b"result 25\n"
+            assert memory.prepared(request.initialization_id, request.draft_revision, request.draft_hash, request.inputs) is None
+            assert source.read_bytes() == b"original 16\n"
     finally:
         runtime.close()

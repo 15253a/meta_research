@@ -47,6 +47,23 @@ def _call(script: str, *, arguments=(), inputs=(), outputs=(), environment=None,
     )
 
 
+def test_exclusive_sealed_work_fences_new_calls_and_rejects_unknown_receipts(runtime):
+    other = ProtectedCreationRuntime(runtime.jail_root, runtime.executable, runtime.credentials_home)
+    with runtime.exclusive_sealed_work() as directory:
+        assert directory == runtime.work_directory
+        with pytest.raises(ProtectedCreationError, match="protected_creation_active"):
+            other.run(_call("print('must not launch')"))
+    active = runtime._control / "active.json"
+    original = active.read_bytes()
+    try:
+        active.write_text('{"receipt":"missing.receipt.json"}')
+        with pytest.raises(ProtectedCreationError, match="protected_creation_unknown_outcome"):
+            with other.exclusive_sealed_work():
+                pytest.fail("Unknown native outcome cannot authorize cleanup.")
+    finally:
+        active.write_bytes(original)
+
+
 @pytest.fixture(scope="module")
 def wrapper_runtime(runtime, tmp_path_factory):
     root = tmp_path_factory.mktemp("managed-wrapper")

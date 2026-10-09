@@ -33,12 +33,12 @@ class ReferenceReadingDeepFetch(DeterministicDeepFetchProvider):
         return super().execute(request)
 
 
-def reference_runtime(path, *, selection="both", original_custody="managed"):
+def reference_runtime(path, *, selection="both", original_custody="managed", power_inhibitor=None):
     adapter = ProtectedCreationFixture(path / "adapter", selection=selection, original_custody=original_custody)
     provider = ReferenceReadingDeepFetch()
     runtime = build_production_runtime(prepare_data_root(path / "data"), proposal_drafter=adapter,
         intent_drafting_provider=adapter, host_compute_probe=DeterministicProbe(),
-        deepfetch_provider=provider, acquisition_provider=RecordingAcquisitionProvider())
+        deepfetch_provider=provider, acquisition_provider=RecordingAcquisitionProvider(), power_inhibitor=power_inhibitor)
     provider.runtime = runtime
     runtime.root_workspaces.configure_creation_runtime(executable="/bin/bash", credentials_home=path / "credentials")
     return runtime, adapter

@@ -309,6 +309,22 @@ class ProtectedCreationRuntime:
             raise ProtectedCreationError("protected_creation_unknown_outcome")
         return previous
 
+    @contextmanager
+    def exclusive_sealed_work(self):
+        self._check_platform()
+        if not self._guard.acquire(blocking=False):
+            raise ProtectedCreationError("protected_creation_active")
+        try:
+            _owned_directory(self._control, 0, private=True)
+            with _runtime_lock(self._control / "lock"):
+                previous = self._check_previous_seal()
+                if previous is None or previous["status"] not in {"completed", "stopped"}:
+                    raise ProtectedCreationError("protected_creation_unknown_outcome")
+                _owned_directory(self.work_directory, _UID)
+                yield self.work_directory
+        finally:
+            self._guard.release()
+
     @staticmethod
     def _check_platform() -> None:
         if sys.platform != "linux" or os.geteuid() != 0 or os.uname().machine != "x86_64":

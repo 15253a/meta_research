@@ -31,6 +31,20 @@ def owned_directory(path):
             os.close(descriptor)
 
 
+def _remove_owned_contents(directory):
+    for name in os.listdir(directory):
+        details = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISDIR(details.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                _remove_owned_contents(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=directory)
+        else:
+            os.unlink(name, dir_fd=directory)
+
+
 class ProtectedCreation:
     def __init__(self, owner, binding, inputs, operation_ref):
         if owner._creation_runtime_configuration is None:
@@ -290,6 +304,57 @@ class ProtectedCreation:
             return identity
         finally:
             self._revoke()
+
+    def cleanup_after_acceptance(self, basis):
+        from sqlalchemy import text
+        from meta_research.protected_creation_runtime import ProtectedCreationError
+
+        if self.sealed_identity is None or not self._terminal:
+            return {"status": "retained", "reason": "creation_work_not_sealed"}
+        try:
+            memory = self.owner._hc._research_memory.creation_bases
+            exact = memory.query(basis["basis_ref"], basis["basis_hash"])
+            memory.require_current(exact)
+            identity = exact["input_identity"]
+            if (identity["anchor"] != self.sealed_identity.anchor.as_dict()
+                or identity["material_set_hash"] != self.sealed_identity.material_set_hash):
+                raise OwnerConflict("creation_input_stale")
+            with self.owner._hc._database.read() as connection:
+                row = connection.execute(text("SELECT state FROM hc_creation_material_operations WHERE operation_ref=:ref"),
+                    {"ref": self.operation.operation_ref}).one()
+                pending = connection.execute(text("SELECT 1 FROM hc_creation_material_copies WHERE operation_ref=:ref AND state='pending' LIMIT 1"),
+                    {"ref": self.operation.operation_ref}).first()
+            if row.state != "sealed":
+                raise OwnerConflict("creation_work_not_sealed")
+            if pending is not None:
+                raise OwnerConflict("creation_copy_pending")
+            for source in exact["sources"]:
+                if source["selection_reason"] is None:
+                    continue
+                if source["intake_state"] != "accepted" or source["binding"] is None:
+                    raise OwnerConflict("creation_source_not_accepted")
+                binding = source["binding"]
+                memory._owner.verify_asset_binding(asset_ref=binding["asset_ref"], version_ref=binding["version_ref"],
+                    content_hash=binding["content_hash"], manifest_hash=binding["manifest_hash"],
+                    receipt=memory._owner.query_asset_version(binding["version_ref"]).receipt)
+            with self.runtime.exclusive_sealed_work() as workspace, owned_directory(workspace) as directory:
+                operations = os.open("operations", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                try:
+                    name = self.relative_directory.split("/")[1]
+                    try:
+                        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=operations)
+                    except FileNotFoundError:
+                        return {"status": "cleaned"}
+                    try:
+                        _remove_owned_contents(child)
+                    finally:
+                        os.close(child)
+                    os.rmdir(name, dir_fd=operations)
+                finally:
+                    os.close(operations)
+            return {"status": "cleaned"}
+        except (OwnerConflict, ProtectedCreationError, OSError) as error:
+            return {"status": "retained", "reason": getattr(error, "code", "creation_work_unsafe")}
 
     def fail(self, *, unknown_outcome=False):
         self.operation.fail(unknown_outcome=unknown_outcome)

@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(os.name != "posix" or os.geteuid() != 0, reason=
 
 
 def manual_reference_runtime(path, **options):
-    initial = build_runtime(path / "data")
+    initial = build_runtime(path / "data", power_inhibitor=options.get("power_inhibitor"))
     try:
         anchor = accept_root_question(initial)
     finally:

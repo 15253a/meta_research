@@ -291,6 +291,10 @@ class WorkMaterialsMixin:
                    "observation_ref": observation_ref, "max_bytes": max_bytes}
         key, request_hash = context.effect_key(effect_id), canonical_hash(request)
         with self._database.fenced_write() as connection:
+            active = connection.execute(text("SELECT state,fence_ref FROM hc_creation_material_operations WHERE operation_ref=:ref"),
+                {"ref": operation.operation_ref}).one()
+            if active.state != "active" or active.fence_ref != operation.fence_ref:
+                raise OwnerConflict("creation_material_scope_invalid")
             row = connection.execute(text("SELECT * FROM hc_creation_material_copies WHERE effect_key=:key"), {"key": key}).first()
             if row is not None:
                 if row.request_hash != request_hash:

@@ -422,7 +422,9 @@ class CreationBasisMemory:
                 "binding": accepted.asset.as_binding().as_dict(),
                 "coverage": (coverage[source["reference_ref"]] if source["kind"] == "original_file" else {
                     "kind": "partial", "read_ranges": [], "unread_description": "Result of the sealed native operation; input witnesses describe the original entrance."})})
-        return self._accept(body)
+        accepted = self._accept(body)
+        work.cleanup_after_acceptance(accepted)
+        return accepted
 
     def accept_revision(self, predecessor, snapshot, revision, result=None):
         from jsonschema import Draft202012Validator
@@ -478,7 +480,10 @@ class CreationBasisMemory:
             search_assessment={"assessment": revision["search_assessment"], "completion": metadata["completion"], "limitations": metadata["limitations"]})
         if identity is not None:
             body["input_identity"] = identity.as_dict()
-        return self._accept(body)
+        accepted = self._accept(body)
+        if result is not None and result.work is not None:
+            result.work.cleanup_after_acceptance(accepted)
+        return accepted
 
     def accept_consumed(self, predecessor, result):
         from meta_research.creation_inputs import CreationInputIdentity
@@ -493,10 +498,13 @@ class CreationBasisMemory:
         combined = CreationInputIdentity(prior.anchor, prior.material_set_hash, tuple(consumed.values()))
         if combined == prior:
             self.require_current(predecessor)
+            result.work.cleanup_after_acceptance(predecessor)
             return predecessor
         body = {key: value for key, value in predecessor.items() if key not in {"basis_ref", "basis_hash"}}
         body.update(input_identity=combined.as_dict(), predecessor=self.reference(predecessor))
-        return self._accept(body)
+        accepted = self._accept(body)
+        result.work.cleanup_after_acceptance(accepted)
+        return accepted
 
     @staticmethod
     def reference(basis):

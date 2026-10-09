@@ -55,13 +55,14 @@ class DeterministicProbe:
         )
 
 
-def build_runtime(data_root: Path):
+def build_runtime(data_root: Path, *, power_inhibitor=None):
     drafting = DeterministicDraftingAdapter()
     return build_production_runtime(
         prepare_data_root(data_root),
         proposal_drafter=drafting,
         intent_drafting_provider=drafting,
         host_compute_probe=DeterministicProbe(),
+        power_inhibitor=power_inhibitor,
     )
 
 
