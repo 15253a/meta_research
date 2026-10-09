@@ -87,3 +87,6 @@ and fixture-backed current-Cycle scenario pass. Keep the ManualCreation failure
 visible when choosing subsequent validation; the preparation work does not
 change the focus assertion or product
 behavior.
+
+For workspace and public API response-time budgets, the dedicated Linux CI,
+and `npm run test:response-time`, see [response-time CI](../docs/response-time-ci.md).

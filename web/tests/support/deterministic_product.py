@@ -530,8 +530,6 @@ class DeterministicIdeaSkill:
         return IdeaSkillResult(
             reviewed_draft=draft.draft,
             final_outcome=draft.draft,
-            findings=(),
-            dispositions=(),
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -1110,8 +1108,6 @@ class ControlledDeterministicPlanSkill:
         return PlanSkillResult(
             reviewed_draft=draft.draft,
             final_plan=draft.draft,
-            findings=(),
-            dispositions=(),
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,

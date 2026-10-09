@@ -5,6 +5,7 @@ const writingFixedRaster = /@writing-fixed-raster/;
 
 export default defineConfig({
   testDir: "./tests",
+  testIgnore: "**/response-time/**",
   fullyParallel: false,
   workers: 1,
   retries: 0,
