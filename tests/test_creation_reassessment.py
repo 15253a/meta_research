@@ -64,7 +64,8 @@ def reassessment_delta(memory, predecessor, reference, citations, dispositions=N
 
 
 @pytest.fixture
-def scenario(tmp_path):
+def scenario(tmp_path, request):
+    custody = getattr(request, "param", None)
     source = tmp_path / "original"
     source.mkdir()
     for name, content in {"a.txt": "A reports 16.", "b.txt": "B reports 25.", "c.txt": "Unexamined."}.items():
@@ -80,6 +81,10 @@ def scenario(tmp_path):
             understanding["coverage"] = [{"material_key": reference["reference_ref"], "kind": "partial",
                 "read_ranges": list(citations.values()), "unread_description": "c.txt remains unread."}]
             understanding["claims_and_conditions"] = [statement("a", "A reports 16.", citations["a.txt"]), statement("b", "B reports 25.", citations["b.txt"])]
+            if custody is not None:
+                observed = next(item for item in identity.consumed if item.path == "a.txt")
+                understanding["selection"] = [{"source": {"kind": "original_file", "reference_ref": reference["reference_ref"],
+                    "path": "a.txt", "observation_ref": observed.observation_ref}, "custody": custody, "reason": "Keep the exact historical A trial."}]
             memory = runtime.owners.research_memory.creation_bases
             basis = memory.accept_reference_prepared(request, InitializationUnderstandingResult(understanding, input_identity=identity, work=work))
             yield runtime, client, source, binding, inputs, reference, basis, citations
@@ -139,3 +144,34 @@ def test_reassessment_rejects_forgery_and_racing_changes(scenario, invalid):
     with pytest.raises(OwnerConflict):
         memory.accept_reference_prepared(request, result)
     assert memory.query(predecessor["basis_ref"], predecessor["basis_hash"])["understanding"]["claims_and_conditions"][0]["text"] == "A reports 16."
+
+
+@pytest.mark.parametrize("scenario", ["managed", "linked_local"], indirect=True)
+def test_historical_bytes_require_managed_custody_and_never_count_as_current_reads(scenario, monkeypatch):
+    runtime, _, source, binding, inputs, reference, predecessor, citations = scenario
+    memory = runtime.owners.research_memory.creation_bases
+    selected = next(item for item in predecessor["sources"] if item["binding"] is not None)
+    (source / "a.txt").write_text("A now reports 99.")
+    request, work, identity, _ = read_materials(runtime, binding, inputs, "historical-understanding", reference["reference_ref"], [])
+    context = memory.reassessment_context(inputs)
+    request = InitializationUnderstandingRequest(**{**request.__dict__, "reassessment": context})
+    delta = reassessment_delta(memory, predecessor, reference["reference_ref"], {"b.txt": citations["b.txt"]}, {"a": "retain", "b": "retain"})
+    delta["additions"]["coverage"][0]["unread_description"] = "Current a.txt and c.txt were not read. A is historical evidence only."
+    delta["inherited_evidence"].append({"kind": "managed_history", "witness_ref": citations["a.txt"]["witness_ref"], "selected_material_key": selected["material_key"]})
+    delta["inherited_selection_keys"] = [selected["material_key"]]
+    result = InitializationUnderstandingResult({}, input_identity=identity, work=work, reassessment=delta)
+    monkeypatch.setattr(memory._owner, "submit_asset_intake", lambda *args, **kwargs: pytest.fail("Inherited versions must not be intaken again."))
+    if selected["custody"] == "linked_local":
+        with pytest.raises(OwnerConflict, match="creation_inheritance_invalid"):
+            memory.accept_reference_prepared(request, result)
+        with pytest.raises(OwnerConflict):
+            memory.read_source(predecessor, selected["material_key"])
+    else:
+        accepted = memory.accept_reference_prepared(request, result)
+        assert accepted["input_identity"]["consumed"] == []
+        assert memory.read_source(accepted, selected["material_key"])["content"] == b"A reports 16."
+        assert next(item for item in accepted["sources"] if item["binding"] is not None)["binding"] == selected["binding"]
+        assert [item["witness_ref"] for item in accepted["understanding"]["coverage"][0]["read_ranges"]] == [citations["b.txt"]["witness_ref"]]
+        assert memory.understanding_view(accepted)["claims_and_conditions"][0]["sources"][0]["provenance"]["kind"] == "managed_history"
+        assert memory.require_current(accepted) == inputs
+    assert memory.query(predecessor["basis_ref"], predecessor["basis_hash"])["basis_hash"] == predecessor["basis_hash"]

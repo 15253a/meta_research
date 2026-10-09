@@ -164,10 +164,56 @@ def test_material_only_append_rejects_old_save_preview_confirm_and_regenerates(t
         assert client.post(endpoint + "/confirmation-preview", headers=_write_headers(headers, "stale-preview"), json=preview).status_code == 409
         assert client.post(endpoint + "/confirmation", headers=_write_headers(headers, "stale-confirm"), json=old_confirmation).status_code == 409
         refreshed = generate(runtime, client, headers, current, key="refresh")
+        assert refreshed["creation_basis"]["applicability"]["predecessor"]["basis_hash"] == ready["creation_basis"]["basis_hash"]
+        assert len(refreshed["creation_basis"]["input_identity"]["consumed"]) == 1
+        assert refreshed["creation_basis"]["input_identity"]["consumed"][0]["reference_ref"] != ready["creation_basis"]["input_identity"]["consumed"][0]["reference_ref"]
+        original_version = next(item["binding"]["version_ref"] for item in ready["creation_basis"]["sources"] if item["binding"])
+        assert original_version in {item["binding"]["version_ref"] for item in refreshed["creation_basis"]["sources"] if item["binding"]}
         assert refreshed["creation_basis"]["input_identity_hash"] != ready["creation_basis"]["input_identity_hash"]
         assert len(refreshed["creation_basis"]["material_references"]["references"]) == 2
         confirmed = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "fresh-confirm"), json=_confirmation_payload(refreshed))
         assert confirmed.status_code == 202, confirmed.text
+        assert complete(runtime, client, endpoint)["status"] == "completed"
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_goal_change_reuses_exact_selected_version_and_snapshot_without_new_deepfetch(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text("Original16 needs a condition-specific comparison.")
+    runtime, adapter = reference_runtime(tmp_path / "runtime", selection="original")
+    client, headers = _authenticate(runtime)
+    try:
+        ready = reference_ready(runtime, client, headers, source, route="deepfetch")
+        old_basis = ready["creation_basis"]
+        old_snapshot = old_basis["literature_snapshot"]
+        old_confirmation = _confirmation_payload(ready)
+        endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        draft = {**ready["quest_draft"]["value"], "goal": "Compare calibration in the cold condition.", "route": "direct"}
+        edited = client.put(endpoint + "/draft", headers=_write_headers(headers, "goal-edit"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"], "draft": draft})
+        assert edited.status_code == 200, edited.text
+        assert client.put(endpoint + "/proposal", headers=_write_headers(headers, "old-goal-save"), json=save_payload(ready, "Old goal")).status_code == 409
+        assert client.post(endpoint + "/confirmation", headers=_write_headers(headers, "old-goal-confirm"), json=old_confirmation).status_code == 409
+        refreshed = generate(runtime, client, headers, edited.json(), key="goal-refresh")
+        basis = refreshed["creation_basis"]
+        assert basis["input_identity"]["consumed"] == []
+        assert basis["literature_snapshot"] is None
+        assert basis["inherited_literature"][0]["snapshot"] == old_snapshot
+        assert basis["inherited_literature"][0]["original_basis"] == old_basis["predecessor"]
+        memory = runtime.owners.research_memory.creation_bases
+        assert memory.query(basis["basis_ref"])["understanding"] == memory.query(old_basis["basis_ref"])["understanding"]
+        assert basis["applicability"]["decisions"][0]["disposition"] == "retain"
+        assert len(runtime.deepfetch._provider.requests) == 1
+        selected = next(item for item in basis["sources"] if item["binding"] is not None)
+        assert selected["binding"] == next(item["binding"] for item in old_basis["sources"] if item["binding"] is not None)
+        assert _retire(client, headers, runtime, selected["binding"], "inherited-pending-retire").status_code == 409
+        assert client.get(f"/api/v1/research-assets/{selected['binding']['version_ref']}/content").content == source.read_bytes()
+        assert client.put(endpoint + "/proposal", headers=_write_headers(headers, "current-goal-save"), json=save_payload(refreshed, "Cold comparison")).status_code == 200
+        current = client.get(endpoint).json()
+        accepted = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "current-goal-confirm"), json=_confirmation_payload(current))
+        assert accepted.status_code == 202, accepted.text
         assert complete(runtime, client, endpoint)["status"] == "completed"
     finally:
         client.close()

@@ -1,4 +1,6 @@
 import os
+import copy
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -8,6 +10,7 @@ from meta_research.companion import CodexCompanionAdapter
 from meta_research.creation_basis import FirstQuestionSynthesisRequest, InitializationUnderstandingRequest, empty_manifest, empty_understanding
 from meta_research.protected_creation_runtime import NativeCreationCall
 from meta_research.quest_drafting import DraftingUnavailable
+from meta_research.owners.common import OwnerConflict
 from meta_research.web import create_app
 from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
 from test_creation_material_consumption import _call, _open, _value
@@ -47,11 +50,32 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
         class Connection:
             token = arguments["mcp_token"]
         gateway = self._workspaces._creation_gateway
-        listing = _value(_call(gateway, Connection(), CREATION_MATERIAL_OPERATION_IDS[0]))
-        references = listing["references"]
+        if work.read_basis is not None and not work.read_basis_historical:
+            references = []
+        else:
+            listing = _value(_call(gateway, Connection(), CREATION_MATERIAL_OPERATION_IDS[0]))
+            references = listing["references"]
+        reassessment = None
+        if work.read_basis_historical:
+            prompt = arguments["prompt"]
+            reassessment = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])[0]["reassessment"]
+        inherited = []
+        old = None if reassessment is None else reassessment["prior_understanding"]
+        retained_refs = set()
         understanding = empty_understanding()
         for reference in references:
             ref = reference["reference_ref"]
+            eligible = [] if reassessment is None else [item["witness"] for item in reassessment["evidence_facts"]
+                if item["live_source_eligible"] and item["witness"]["reference_ref"] == ref]
+            if eligible:
+                prior_coverage = next(item for item in old["coverage"] if item["material_key"] == ref)
+                old_refs = {item["witness_ref"] for item in eligible}
+                if all(citation["witness_ref"] in old_refs for citation in prior_coverage["read_ranges"]):
+                    understanding["coverage"].append(copy.deepcopy(prior_coverage))
+                    inherited.extend({"kind": "live_source", "witness_ref": item["witness_ref"], "selected_material_key": None} for item in eligible)
+                    retained_refs.update(item["ref"] for field in ("material_composition", "work_already_done", "claims_and_conditions", "conflicts", "gaps", "unfinished_questions")
+                        for item in old[field] if all(citation["witness_ref"] in old_refs for citation in item["sources"]))
+                    continue
             entries = _value(_call(gateway, Connection(), CREATION_MATERIAL_OPERATION_IDS[0], reference_ref=ref))["entries"]
             entry = entries[0]
             path = entry["path"]
@@ -63,15 +87,41 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
             citation = {"witness_ref": page["read_witness"]["witness_ref"], "location": "original note"}
             understanding["coverage"].append({"material_key": ref, "kind": "partial" if reference["source"]["kind"] == "directory" else "read",
                 "read_ranges": [citation], "unread_description": "Large sibling was not read." if reference["source"]["kind"] == "directory" else ""})
-            understanding["claims_and_conditions"].append({"ref": ref, "text": page["text"], "kind": "reported_work",
+            statement_ref = ref if reassessment is None else ref + ":" + work.operation.operation_ref
+            understanding["claims_and_conditions"].append({"ref": statement_ref, "text": page["text"], "kind": "reported_work",
                 "conditions": ["Calibration condition recorded in the note."], "sources": [citation]})
             if self.selection in {"original", "both"}:
                 understanding["selection"].append({"source": {"kind": "original_file", "reference_ref": ref,
                     "path": path, "observation_ref": entry["observation"]["observation_ref"]}, "custody": self.original_custody, "reason": "Keep the original."})
-        if self.selection in {"result", "both"}:
+        if self.selection in {"result", "both"} and reassessment is None:
             understanding["selection"].append({"source": {"kind": "work_file", "work_ref": work.work_ref, "path": "trial.txt", "trial_ref": None},
                 "custody": "linked_local", "reason": "Keep the selected trial."})
         if arguments["operation_name"] == "initialization-understanding":
+            if reassessment is not None:
+                keys = []
+                for source in reassessment["prior_sources"]:
+                    if source["binding"] is None:
+                        continue
+                    try:
+                        self._workspaces._hc._research_memory.creation_bases.read_source(
+                            self._workspaces._hc._research_memory.creation_bases.query(work.read_basis["basis_ref"]), source["material_key"], 0, 1)
+                    except OwnerConflict:
+                        continue
+                    if not any(item["source"] == source["source"] for item in understanding["selection"]):
+                        keys.append(source["material_key"])
+                replacements = [item["ref"] for item in understanding["claims_and_conditions"]]
+                delta = {"predecessor": reassessment["predecessor"], "change_assessment": "Apply the current goal and read only changed entrances.",
+                    "decisions": [{"prior_statement_ref": item["ref"], "disposition": "retain" if item["ref"] in retained_refs else "replace",
+                        "explanation": "Original observations remain valid." if item["ref"] in retained_refs else "Changed material was read in this operation.",
+                        "applicable_conditions": item["conditions"], "affected_scope": "" if item["ref"] in retained_refs else "Changed material",
+                        "creation_limit": "none", "replacement_refs": [] if item["ref"] in retained_refs else replacements}
+                        for field in ("material_composition", "work_already_done", "claims_and_conditions", "conflicts", "gaps", "unfinished_questions") for item in old[field]],
+                    "additions": understanding, "inherited_evidence": inherited, "inherited_selection_keys": keys,
+                    "literature_decisions": [{"snapshot_ref": ref, "snapshot_hash": item["snapshot"]["snapshot_hash"],
+                        "disposition": "retain", "applicable_conditions": ["Existing condition-specific literature."],
+                        "affected_scope": "Current goal still needs a controlled comparison.", "limitations": "Existing snapshot only, no new search."}
+                        for ref, item in reassessment["prior_literature"].items()]}
+                return delta, "native-parent", ""
             return understanding, "native-parent", ""
         if arguments["operation_name"] == "companion-turn" and work.read_basis is None:
             return {"reply": "The bounded notes support an editable calibration comparison."}, "native-parent", ""
@@ -88,7 +138,6 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
         assert denied["isError"]
         revision = None
         if work.read_literature is not None:
-            import copy
             snapshot = work.read_literature["snapshot_ref"]
             summary = _value(_call(gateway, Connection(), "research_memory.content.read", source_ref=snapshot, version_ref=snapshot))
             assert summary
@@ -133,7 +182,7 @@ def test_actual_adapter_methods_share_current_protected_gateway_and_readers(tmp_
                 anchor.draft_hash, {}, "adapter-synthesis", binding.location.root_session_ref, result.companion_native_session_ref,
                 basis, context, None))
             assert synthesis.content == QUESTION
-            assert synthesis.input_identity.consumed[0].operation_ref == "adapter-synthesis"
+            assert synthesis.input_identity.consumed == ()
             assert synthesis.work.runtime.jail_root == result.work.runtime.jail_root
             assert {Path(path).name for path in adapter.calls[1][0]["invocation_runner"].read_only_inputs} >= {"sources.json", "basis.json"}
             assert len(adapter.calls[1][0]["authorized_operation_ids"]) == 6

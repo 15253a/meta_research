@@ -5100,7 +5100,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             native_ref = connection.execute(text("SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": initialization_id}).scalar_one_or_none()
         request = InitializationUnderstandingRequest(initialization_id, revision, draft_hash, draft, manifest,
             job_ref + ":understanding", current["intent_session"]["ref"], native_ref,
-            inputs=inputs if inputs.references else None)
+            inputs=inputs if inputs.references else None,
+            reassessment=memory.reassessment_context(inputs) if inputs.references else None)
         if manifest["entries"] or inputs.references:
             understand = getattr(self._proposal_drafter, "understand_initialization", None)
             if not callable(understand):
@@ -5131,6 +5132,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         if self._agent_runtime.query_deepfetch_run(request.request_ref) is not None:
             raise OwnerConflict("creation_deepfetch_basis_unbound")
         scope = {**request.scope, "creation_basis": reference,
+            "existing_work_applicability": basis.get("applicability"),
+            "inherited_literature": basis.get("inherited_literature", []),
             "existing_work_retrieval": {key: basis["understanding"][key] for key in ("claims_and_conditions", "conflicts", "gaps", "unfinished_questions")}}
         materials = [*request.accepted_material_bindings, *(source["binding"] for source in basis["sources"] if source["binding"] is not None)]
         materials = list({item["version_ref"]: item for item in materials}.values())
