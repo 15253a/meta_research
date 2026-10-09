@@ -2,6 +2,8 @@
 
 当前 scoped 工具目录决定实际可用能力，输入已有内容不要求按固定顺序再读。按需要选择以下阶段入口及共享发现／reader：
 
+工作资料按[共享资料处理合同](../../human-guidance.md#工作资料的当前处理与后继交接)处理；`materials.discover.retained_treatments` 提供已选内容与原采用关系。当前根交接未读、待验证部分及影响；需要上游重做或继续投入时，由本 Reasoning 按现有后继入口决定，不从材料反馈直接创建 Cycle。
+
 | 操作 | 用途 |
 | --- | --- |
 | `advancement_engine.reasoning_stage_run.observe` | 核验当前请求、epoch 和 AE 闭包。 |

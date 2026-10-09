@@ -4,6 +4,8 @@
 
 ## 职责
 
+工作资料的读取、独立副本、选择保管和实际影响声明按[共享资料处理合同](../../human-guidance.md#工作资料的当前处理与后继交接)。原 HumanRequest 材料归原请求根；后继使用选中内容的精确 RM reader 与用途，不把未选副本带入 Target 常规产物。
+
 AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan、Target／依赖／frontier、方法、Run／评价及领域接纳；RM 管不可变内容、AssetVersion、保管和完整性；AR 管执行、根会话、Fence、single-flight 和恢复；Harness 运行原生工具与子智能体。Bundle 管候选、范围、顺序和跨 Target 依赖，Target 根管实际实施与最终交接。
 
 子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授 Dataset／Environment 接口登记；未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
