@@ -322,6 +322,28 @@ export type CreationResearchBasis = {
   human_reviewed_draft?: { revision: number; hash: string } | null;
   input_identity?: CreationInputIdentity | null;
   input_identity_hash?: string | null;
+  predecessor?: { basis_ref: string; basis_hash: string; kind: string } | null;
+  applicability?: {
+    predecessor: { basis_ref: string; basis_hash: string; kind: string };
+    change_assessment: string;
+    decisions: Array<{
+      prior_statement_ref: string; prior_text: string;
+      disposition: "retain" | "replace" | "needs_recheck" | "out_of_scope";
+      explanation: string; applicable_conditions: string[]; affected_scope: string;
+      creation_limit: "none" | "required_first_question" | "future_research";
+      replacement_refs: string[];
+    }>;
+    literature_decisions: Array<{
+      snapshot_ref: string; snapshot_hash: string;
+      disposition: "retain" | "needs_recheck" | "out_of_scope";
+      applicable_conditions: string[]; affected_scope: string; limitations: string;
+    }>;
+  } | null;
+  inherited_literature?: Array<{
+    snapshot: { snapshot_ref: string; snapshot_hash: string; run_ref?: string };
+    original_basis: { basis_ref: string; basis_hash: string; kind: string };
+    applicability: { applicable_conditions: string[]; affected_scope: string; limitations: string };
+  }>;
   material_references?: {
     anchor: CreationAnchor;
     references: Array<{ reference_ref: string; submission_ref: string; source: ServerMaterialSelection; description: string }>;
@@ -333,6 +355,7 @@ export type CreationResearchBasis = {
   }>>;
   sources: Array<{ material_key: string; relative_path: string; selection_reason: string | null;
     source?: CreationMaterialSource;
+    inherited_from?: { basis_ref: string; basis_hash: string; kind: string };
     custody?: "managed" | "linked_local" | null;
     binding?: AssetEvidenceBinding | null;
     intake_state?: "pending" | "accepted" | "failed" | null;

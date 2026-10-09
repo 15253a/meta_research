@@ -114,7 +114,8 @@ def understanding_schema(*, references=False) -> dict[str, object]:
         "required": ["material_key", "reason"]}
     if references:
         citation = {"type": "object", "additionalProperties": False,
-            "properties": {"witness_ref": {"type": "string", "minLength": 1},
+            "properties": {"witness_ref": {"type": "string", "minLength": 1,
+                "description": "An actual current read or an explicitly accepted inherited witness, retaining its original operation identity."},
                            "location": {"type": "string", "minLength": 1}},
             "required": ["witness_ref", "location"]}
         statement["properties"]["sources"]["items"] = citation
@@ -161,8 +162,8 @@ def reassessment_schema():
             "affected_scope": {"type": "string"},
             "creation_limit": {"enum": ["none", "required_first_question", "future_research"]},
             "replacement_refs": strings})},
-        "additions": understanding_schema(references=True),
-        "inherited_evidence": {"type": "array", "items": record({
+        "additions": {**understanding_schema(references=True), "description": "Only new statements and new selections, plus complete current entrance coverage. Managed history cannot count as a current read range."},
+        "inherited_evidence": {"type": "array", "description": "Explicit prior witnesses. live_source requires unchanged observation and bytes. managed_history requires an exact inherited managed selected version and supports historical content only.", "items": record({
             "kind": {"enum": ["live_source", "managed_history"]}, "witness_ref": string,
             "selected_material_key": {"type": ["string", "null"]}})},
         "inherited_selection_keys": strings,
@@ -906,6 +907,16 @@ def creation_basis_operations(memory, runtime, collaboration):
                     except UnicodeDecodeError:
                         page["content_base64"] = base64.b64encode(content).decode()
                 return {**page, "basis_ref": basis["basis_ref"], "basis_hash": basis["basis_hash"]}
+            if arguments["view"] == "literature":
+                relation = memory.creation_bases._literature_relations(basis).get(arguments.get("snapshot_ref"))
+                if relation is None:
+                    raise OwnerConflict("creation_literature_unbound")
+                snapshot = relation["snapshot"]
+                if memory.query_literature_snapshot(snapshot["snapshot_ref"]).snapshot_hash != snapshot["snapshot_hash"]:
+                    raise OwnerConflict("creation_literature_unbound")
+                page = memory.read_literature_content_page(snapshot["snapshot_ref"],
+                    entry_path=arguments.get("entry_path"), offset=arguments.get("offset", 0), limit=arguments.get("limit", 8192))
+                return {**page, "snapshot": snapshot, "original_basis": relation["original_basis"]}
             value = {"understanding": memory.creation_bases.understanding_view(basis), "sources": memory.creation_bases.source_views(basis),
                 "corrections": basis["corrections"], "search_assessment": basis["search_assessment"],
                 "literature_snapshot": basis["literature_snapshot"], "predecessor": basis["predecessor"],
@@ -917,9 +928,10 @@ def creation_basis_operations(memory, runtime, collaboration):
         except (OwnerConflict, KeyError) as error:
             raise SemanticMcpError(getattr(error, "code", "creation_basis_unbound")) from error
     return (SemanticOperation(semantic_operation_id="research_memory.creation_basis.read", owning_module="research_memory",
-        description="Read the exact existing-work basis or a captured source. Before Quest creation only the active DeepFetch request's authorized prepared basis is visible. After creation only bases associated with this Quest are visible. Unselected workspace sources may report changed or unavailable. Imported work is external provenance, never a new Quest Run.",
+        description="Read the exact authorized existing-work basis, source or prior literature. Applicability distinguishes retained claims, changed scope and unresolved creation limits. Protected reassessment can read only its exact historical predecessor. DeepFetch can read its bound basis and exact prior snapshots with view=literature and snapshot_ref; reuse never creates a new run or snapshot binding. Unselected or linked historical bytes may be unavailable. Imported work retains external provenance.",
         input_schema={"type": "object", "additionalProperties": False, "properties": {
             "basis_ref": {"type": "string", "minLength": 1}, "expected_basis_hash": {"type": "string", "minLength": 64, "maxLength": 64},
-            "view": {"type": "string", "enum": ["understanding", "source"]}, "material_key": {"type": "string"},
+            "view": {"type": "string", "enum": ["understanding", "source", "literature"]}, "material_key": {"type": "string"},
+            "snapshot_ref": {"type": "string", "minLength": 1}, "entry_path": {"type": "string", "minLength": 1},
             "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 65536}},
             "required": ["basis_ref", "expected_basis_hash", "view"]}, output_schema={"type": "object"}, handler=read),)

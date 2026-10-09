@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from meta_research.companion import CodexCompanionAdapter
-from meta_research.creation_basis import FirstQuestionSynthesisRequest, InitializationUnderstandingRequest, empty_manifest, empty_understanding
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, InitializationUnderstandingRequest, empty_manifest, empty_understanding, first_creation_instructions
 from meta_research.protected_creation_runtime import NativeCreationCall
 from meta_research.quest_drafting import DraftingUnavailable
 from meta_research.owners.common import OwnerConflict
@@ -37,13 +37,19 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
         runner = arguments["invocation_runner"]
         work = runner.work
         self.calls.append((arguments, work))
-        guidance = runner.read_only_inputs[0]
+        guidance = runner.read_only_inputs[:3]
         assert len(runner.read_only_inputs) >= 3
         completed = work.run(NativeCreationCall(("/bin/bash", "-c",
-            f"cat \"$1\"; mkdir -p /workspace/{work.relative_directory}; printf 'trial 25\\n' > /workspace/{work.relative_directory}/trial.txt", "guidance", str(guidance)),
+            f"cat \"$@\"; mkdir -p /workspace/{work.relative_directory}; printf 'trial 25\\n' > /workspace/{work.relative_directory}/trial.txt", "guidance", *(str(path) for path in guidance)),
             arguments["prompt"], None, {}, runner.read_only_inputs, ()))
         assert completed.returncode == 0
         assert "# Understand existing work" in completed.stdout
+        for path in guidance:
+            assert path.read_text(encoding="utf-8") in completed.stdout
+        if arguments["operation_name"] == "initialization-understanding":
+            prompt = arguments["prompt"]
+            loaded = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])[0]
+            assert loaded["instruction_bundle"] == first_creation_instructions()
         assert arguments["operation_name"] in {"initialization-understanding", "first-question-synthesis", "companion-turn"}
         assert "third-party Python scientific packages" in runner.runtime_conditions
         assert "protected_creation" not in str(self._runner)
@@ -97,6 +103,7 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
             understanding["selection"].append({"source": {"kind": "work_file", "work_ref": work.work_ref, "path": "trial.txt", "trial_ref": None},
                 "custody": "linked_local", "reason": "Keep the selected trial."})
         if arguments["operation_name"] == "initialization-understanding":
+            from jsonschema import Draft202012Validator
             if reassessment is not None:
                 keys = []
                 for source in reassessment["prior_sources"]:
@@ -121,7 +128,9 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
                         "disposition": "retain", "applicable_conditions": ["Existing condition-specific literature."],
                         "affected_scope": "Current goal still needs a controlled comparison.", "limitations": "Existing snapshot only, no new search."}
                         for ref, item in reassessment["prior_literature"].items()]}
+                Draft202012Validator(arguments["schema"]).validate(delta)
                 return delta, "native-parent", ""
+            Draft202012Validator(arguments["schema"]).validate(understanding)
             return understanding, "native-parent", ""
         if arguments["operation_name"] == "companion-turn" and work.read_basis is None:
             return {"reply": "The bounded notes support an editable calibration comparison."}, "native-parent", ""
@@ -134,6 +143,10 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
                 version = source["binding"]["version_ref"]
                 page = _value(_call(gateway, Connection(), "research_memory.content.read", source_ref=version, version_ref=version))
                 assert page["text"]
+        for inherited_snapshot in work.read_inherited_literature:
+            version = inherited_snapshot["snapshot_ref"]
+            page = _value(_call(gateway, Connection(), "research_memory.content.read", source_ref=version, version_ref=version))
+            assert page["version_ref"] == version
         denied = _call(gateway, Connection(), "research_memory.content.read", source_ref="asset_version_foreign", version_ref="asset_version_foreign")
         assert denied["isError"]
         revision = None

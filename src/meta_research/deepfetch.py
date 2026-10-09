@@ -2634,6 +2634,9 @@ class CodexDeepFetchAdapter:
             creation_contract = (
                 "Before Radar read scope.creation_basis through research_memory.creation_basis.read with its exact basis_ref and expected_basis_hash. "
                 "Read relevant originals and use claim conditions, conflicts, gaps, and unfinished questions to guide search, acquisition, and independent Readers. "
+                "Inspect existing_work_applicability and inherited_literature. Reuse only their explicit applicable scope and keep unresolved limits. "
+                "Read a prior accepted snapshot through the same basis Reader with view=literature and its snapshot_ref. "
+                "Focus this requested new search on affected questions; preserve the v4 workflow and bind only this run's actual output as the new snapshot. "
                 "This initialization has no Quest. Keep imported results external. New evidence may qualify or contradict the old understanding.\n"
             )
         if request.scope.get("literature_mode") == "oa_only":

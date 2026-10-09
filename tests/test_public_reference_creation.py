@@ -24,12 +24,21 @@ class ReferenceReadingDeepFetch(DeterministicDeepFetchProvider):
         context = _context(request, "deepfetch")
         channel = _channel(self.runtime, context)
         exact = request.scope["creation_basis"]
-        prior = _accepted(_call(self.runtime, channel, "research_memory.creation_basis.read", basis_ref=exact["basis_ref"],
-            expected_basis_hash=exact["basis_hash"], view="understanding", limit=16384))
-        assert "Original16" in str(prior)
-        assert "Original16" in str(request.scope["existing_work_retrieval"])
+        pages, offset = [], 0
+        while offset is not None:
+            prior = _accepted(_call(self.runtime, channel, "research_memory.creation_basis.read", basis_ref=exact["basis_ref"],
+                expected_basis_hash=exact["basis_hash"], view="understanding", offset=offset, limit=16384))
+            pages.append(prior["text"])
+            offset = prior["next_offset"]
+        assert "original16" in "".join(pages).casefold()
+        assert "original16" in str(request.scope["existing_work_retrieval"]).casefold()
         self.input_basis = exact
         self.query_basis = request.scope["existing_work_retrieval"]
+        for inherited in request.scope.get("inherited_literature", []):
+            page = _accepted(_call(self.runtime, channel, "research_memory.creation_basis.read", basis_ref=exact["basis_ref"],
+                expected_basis_hash=exact["basis_hash"], view="literature", snapshot_ref=inherited["snapshot"]["snapshot_ref"]))
+            assert page["snapshot"] == inherited["snapshot"]
+            assert page["original_basis"] == inherited["original_basis"]
         return super().execute(request)
 
 
@@ -215,6 +224,33 @@ def test_goal_change_reuses_exact_selected_version_and_snapshot_without_new_deep
         accepted = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "current-goal-confirm"), json=_confirmation_payload(current))
         assert accepted.status_code == 202, accepted.text
         assert complete(runtime, client, endpoint)["status"] == "completed"
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_requested_new_deepfetch_keeps_inherited_snapshot_and_new_binding_distinct(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text("Original16 needs a condition-specific comparison.")
+    runtime, adapter = reference_runtime(tmp_path / "runtime", selection="original")
+    client, headers = _authenticate(runtime)
+    try:
+        ready = reference_ready(runtime, client, headers, source, route="deepfetch")
+        old = ready["creation_basis"]
+        endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        draft = {**ready["quest_draft"]["value"], "goal": "Find condition-specific counterexamples for a cold calibration."}
+        edited = client.put(endpoint + "/draft", headers=_write_headers(headers, "new-search-goal"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"], "draft": draft})
+        assert edited.status_code == 200, edited.text
+        current = generate(runtime, client, headers, edited.json(), key="new-focused-search", route="deepfetch")
+        basis = current["creation_basis"]
+        assert basis["literature_snapshot"]["snapshot_ref"] != old["literature_snapshot"]["snapshot_ref"]
+        assert basis["inherited_literature"][0]["snapshot"] == old["literature_snapshot"]
+        assert basis["inherited_literature"][0]["original_basis"] == old["predecessor"]
+        assert basis["predecessor"] == runtime.deepfetch._provider.input_basis
+        assert len(runtime.deepfetch._provider.requests) == 2
+        assert basis["input_identity"]["consumed"] == []
+        assert basis["applicability"]["decisions"][0]["disposition"] == "retain"
     finally:
         client.close()
         runtime.close()
