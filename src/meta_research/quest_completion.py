@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.quest_goals import COMPLETION_CONDITION_SOURCE_FIELDS
 from meta_research.reasoning_contract import CANDIDATE_COMPLETION_SCHEMA_REF
 
 
@@ -46,6 +47,8 @@ class QuestCompletionResearchGraph(Protocol):
     def query_current_quest_goal_revision(
         self, quest_ref: str
     ) -> dict[str, object] | None: ...
+
+    def query_runtime_conditions_revision(self, quest_ref: str) -> str: ...
 
     def query_quest_completion_acceptance(
         self, candidate_completion_ref: str
@@ -437,7 +440,10 @@ class QuestCompletionService:
             quest_is_ended=quest_ending is not None,
             source_is_current=(
                 ending is not None
-                or self._source_is_current(binding.source, binding.goal_revision)
+                or self._source_is_current(
+                    binding.source, binding.goal_revision,
+                    conditions_accepted=domain is not None,
+                )
             ),
         )
 
@@ -445,6 +451,7 @@ class QuestCompletionService:
         self,
         source: dict[str, object],
         goal_revision: dict[str, object],
+        *, conditions_accepted: bool = False,
     ) -> bool:
         quest_ref = cast(str, source["quest_ref"])
         current_goal = (
@@ -452,6 +459,12 @@ class QuestCompletionService:
         )
         if current_goal != goal_revision:
             return False
+        if not conditions_accepted:
+            revision = source.get("runtime_conditions_revision")
+            if not isinstance(revision, str) or revision != (
+                self._research_graph.query_runtime_conditions_revision(quest_ref)
+            ):
+                return False
         foreground = self._advancement_engine.query_foreground(quest_ref)
         return bool(
             isinstance(foreground, dict)
@@ -532,10 +545,12 @@ def _validated_candidate_binding(
         or candidate.get("schema_ref") != CANDIDATE_COMPLETION_SCHEMA_REF
         or candidate.get("kind") != "CandidateCompletion"
         or candidate.get("is_authoritative") is not False
-        or set(source) != _SOURCE_FIELDS
+        or set(source) not in (_SOURCE_FIELDS, _SOURCE_FIELDS | COMPLETION_CONDITION_SOURCE_FIELDS)
     ):
         raise OwnerConflict("candidate_completion_binding_invalid")
     for field in _SOURCE_FIELDS - {"foreground_epoch"}:
+        _mapping_ref(source, field, "candidate_completion_binding_invalid")
+    for field in COMPLETION_CONDITION_SOURCE_FIELDS & set(source):
         _mapping_ref(source, field, "candidate_completion_binding_invalid")
     epoch = source.get("foreground_epoch")
     basis_refs = candidate.get("completion_milestone_basis_refs")
@@ -604,6 +619,8 @@ def _validate_human_facts(
         != binding.goal_revision["goal_revision_ref"]
         or preview.get("completion_milestone_basis_refs")
         != binding.candidate["completion_milestone_basis_refs"]
+        or any(preview.get(key) != binding.source[key]
+               for key in COMPLETION_CONDITION_SOURCE_FIELDS if key in binding.source)
     ):
         raise OwnerConflict("quest_completion_preview_invalid")
     if decision is None:

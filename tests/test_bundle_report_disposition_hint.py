@@ -6,6 +6,7 @@ import pytest
 
 from meta_research.bundle_protocol import (
     AcceptedMeasurementClosure,
+    GoalWorkDisposition,
     SemanticBarrier,
     TechnicalBlocker,
 )
@@ -118,6 +119,7 @@ def test_running_target_keeps_existing_early_return_before_later_bad_notice():
         (("terminal", None), (SemanticBarrier, AcceptedMeasurementClosure), None),
         (("terminal", None), (AcceptedMeasurementClosure, AcceptedMeasurementClosure), None),
         ((None,), (AcceptedMeasurementClosure,), None),
+        (("terminal",), (GoalWorkDisposition,), "replan_required"),
         (("terminal",), (object,), None),
         ((), (), None),
     ],
@@ -130,6 +132,33 @@ def test_terminal_disposition_and_unlaunched_precedence_are_preserved(states, ki
         for index, state in enumerate(states)
         if state is not None
     ]
+
+
+def test_authoritative_nonstart_notice_closes_the_absent_frontier_for_replan():
+    worker, graph, owner, _, notices = _worker((None,))
+    notices["target-0"] = NS(
+        target_ref="target-0",
+        handoff_manifest_ref="handoff-target-0",
+    )
+    terminal = GoalWorkDisposition(
+        disposition="not_started",
+        target_ref="target-0",
+        target_run_ref="target-run-0",
+        execution_attempt_ref=None,
+        execution_fence_ref=None,
+        terminal_fact_ref="intent-0",
+        goal_work_intent_ref="intent-0",
+        goal_revision_ref="goal-revision-0",
+        goal_revision_receipt_ref="goal-receipt-0",
+        goal_revision_receipt_hash="a" * 64,
+        reason="Goal revision kept admitted Target work unstarted.",
+        retention_kind=None,
+        custody_refs=(),
+    )
+    owner.read_target_run_handoff.side_effect = None
+    owner.read_target_run_handoff.return_value = NS(terminal=terminal)
+
+    assert worker._bundle_report_disposition_hint(graph) == "replan_required"
 
 
 def test_blocker_does_not_skip_strict_validation_of_later_terminal_handoff():

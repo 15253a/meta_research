@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import cast
 
 from meta_research.feed import DurableFeed
+from meta_research.human_guidance import GuidanceRuntimeScope, StageGuidanceOperation
 from meta_research.runtime_binding_compatibility import reasoning_bindings_compatible
 from meta_research.idea_stage import _public_run
 from meta_research.owners.advancement_engine import (
@@ -16,6 +17,7 @@ from meta_research.owners.agent_runtime import (
     AttemptExecution,
     ReasoningRuntimeBinding,
     ReasoningStageRun,
+    REASONING_ATTEMPT_EXECUTION_SCHEMA,
 )
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
 from meta_research.owners.research_graph import (
@@ -86,6 +88,7 @@ class ReasoningStageWorker:
         provider: ReasoningSkillProvider,
         *,
         autonomous_creation: object | None = None,
+        human_guidance: object | None = None,
     ) -> None:
         self._feed = feed
         self._advancement_engine = advancement_engine
@@ -94,6 +97,7 @@ class ReasoningStageWorker:
         self._research_graph = research_graph
         self._provider = provider
         self._autonomous_creation = autonomous_creation
+        self._human_guidance = human_guidance
         self._transient_error: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
 
@@ -396,12 +400,26 @@ class ReasoningStageWorker:
                 if snapshot["snapshot_hash"] != facts["snapshot_hash"]:
                     raise OwnerConflict("reasoning_summary_binding_invalid")
                 summary = {"kind": "LiteratureSnapshot", "source_ref": facts["snapshot_ref"], "version_ref": facts["snapshot_ref"], "summary_ref": snapshot["summary_ref"], "summary_hash": snapshot["summary_hash"], "summary": snapshot["summary"]}
+            operation = self._freeze_completion_operation(
+                run, job_ref, "autonomous-resume", unit_ref
+            )
             decision = self._provider.decide_after_deepfetch(skill_request, checkpoint.checkpoint, facts, summary)
             if isinstance(decision.get("final_output"), dict):
                 decision = {**decision, "final_output": _assemble_provider_document(
                     skill_request, decision["final_output"],
                 )}
             validate_reasoning_deepfetch_decision(skill_request, decision, facts)
+            output = decision.get("final_output")
+            if isinstance(output, dict):
+                self._bind_completion_conditions(
+                    operation,
+                    "reasoning_submission_" + canonical_hash(output)[:32],
+                    output,
+                    checkpoint.checkpoint,
+                    {"schema_ref": "meta-research/reasoning-review/v1",
+                     "reviewed_draft_hash": checkpoint.checkpoint_hash,
+                     "final_output_hash": canonical_hash(output)},
+                )
             if self._agent_runtime.park_root_provider_session_for_human_request(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=run.native_session_ref, runtime_binding_hash=run.runtime_binding_hash):
                 self._finish_provider_job(job_ref)
                 self._transient_error = None
@@ -651,6 +669,9 @@ class ReasoningStageWorker:
         result = None
         try:
             try:
+                operation = self._freeze_completion_operation(
+                    run, job_ref, "review", unit_ref
+                )
                 result = self._provider.review_draft(skill_request, draft)
                 result = _assemble_provider_result(skill_request, result)
                 if isinstance(result, ReasoningAutonomousCheckpointResult):
@@ -813,6 +834,10 @@ class ReasoningStageWorker:
                     "review_hash": review_hash,
                 }
             )[:32]
+            self._bind_completion_conditions(
+                operation, submission_ref, result.outcome_document(),
+                result.reviewed_draft, review,
+            )
             execution = self._agent_runtime.record_reasoning_attempt_execution(
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
@@ -1037,6 +1062,9 @@ class ReasoningStageWorker:
         result = None
         try:
             try:
+                operation = self._freeze_completion_operation(
+                    run, job_ref, "autonomous-resume", unit_ref
+                )
                 result = self._provider.resume_after_autonomous_creation(
                     skill_request,
                     checkpoint,
@@ -1161,6 +1189,10 @@ class ReasoningStageWorker:
                     "review_hash": review_hash,
                 }
             )[:32]
+            self._bind_completion_conditions(
+                operation, submission_ref, result.outcome_document(),
+                result.reviewed_draft, result.review_document(),
+            )
             execution = self._agent_runtime.record_reasoning_attempt_execution(
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
@@ -1194,6 +1226,32 @@ class ReasoningStageWorker:
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
                 )
+
+    def _freeze_completion_operation(self, run, job_ref, name, unit_ref):
+        if self._human_guidance is None:
+            return None
+        operation = StageGuidanceOperation(
+            GuidanceRuntimeScope(
+                "reasoning", run.run_ref, run.attempt_ref,
+                run.root_session_ref, run.fence_ref, run.runtime_binding_hash,
+            ),
+            job_ref, name, unit_ref,
+        )
+        self._human_guidance.freeze_operation_guidance(operation)
+        return operation
+
+    def _bind_completion_conditions(
+        self, operation, submission_ref, output, reviewed_draft, review,
+    ):
+        if operation is not None and isinstance(output.get("candidate_completion"), dict):
+            self._human_guidance.bind_reasoning_completion_conditions(
+                operation=operation, submission_ref=submission_ref, output=output,
+                payload_hash=canonical_hash({
+                    "schema_ref": REASONING_ATTEMPT_EXECUTION_SCHEMA,
+                    "outcome": output, "reviewed_draft": reviewed_draft,
+                    "review": review,
+                }),
+            )
 
     def _finish_provider_job(self, job_ref: str) -> None:
         finish_job = getattr(self._provider, "finish_job", None)

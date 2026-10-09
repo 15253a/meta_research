@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { BundleTargetProjection } from "./api";
 import {
@@ -15,6 +15,7 @@ export type ExperimentLogsProps = {
   onMinimize: () => void;
   onClose: () => void;
   onShowExecution: () => void;
+  embeddedLogRef?: string;
 };
 
 const POLL_MILLISECONDS = 2000;
@@ -31,11 +32,12 @@ function friendlyError(code: string) {
   if (code === "experiment_log_not_found") return "这个日志文件暂时不可读，正在重新查找。";
   return "暂时无法读取日志，保留最后一次读取的内容，稍后自动重试。";
 }
-function targetStatus(target: BundleTargetProjection) {
-  if (target.blocker) return "等待处理";
-  return ({ running: "执行中", in_progress: "执行中", committed: "结果已接纳", failed: "执行失败",
+function targetStatus(target: BundleTargetProjection, executionStatus?: string) {
+  if (!executionStatus && target.blocker) return "等待处理";
+  return ({ admitted: "等待执行", pending: "等待执行", running: "执行中", in_progress: "执行中", committed: "结果已接纳", failed: "执行失败",
     cancelled: "已取消", blocked: "等待处理", queued: "等待执行", ready: "等待执行", succeeded: "已结束",
-    completed: "已结束", fenced: "已停止" } as Record<string, string>)[target.status] ?? target.status;
+    completed: "已结束", executed: "已结束", awaiting_acceptance: "已结束，等待接纳", accepting: "等待接纳",
+    fenced: "已停止" } as Record<string, string>)[executionStatus ?? target.status] ?? executionStatus ?? target.status;
 }
 
 async function readJson<T>(url: string, signal: AbortSignal): Promise<T> {
@@ -78,7 +80,8 @@ export function ExperimentOutputViews({ view, onChange }: {
   </nav>;
 }
 
-export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, minimized, onMinimize, onClose, onShowExecution }: ExperimentLogsProps) {
+export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, minimized, onMinimize, onClose, onShowExecution, embeddedLogRef }: ExperimentLogsProps) {
+  const embedded = embeddedLogRef !== undefined;
   const scope = `${target.target_ref}:${target.target_run_ref ?? ""}`;
   const [catalog, setCatalog] = useState<ExperimentLogList | null>(null);
   const [selectedRef, setSelectedRef] = useState<string | null>(null);
@@ -112,10 +115,11 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
   }, []);
 
   useEffect(() => {
+    if (embedded) return;
     opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     closeRef.current?.focus({ preventScroll: true });
     return () => { if (opener.current?.isConnected) opener.current.focus({ preventScroll: true }); };
-  }, []);
+  }, [embedded]);
 
   useEffect(() => {
     selected.current = null;
@@ -164,9 +168,16 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
         setConnection("connected");
         setLastRead(Date.now());
         setError(null);
-        const active = listed.logs.find(log => log.log_ref === selected.current)
+        const active = embedded ? listed.logs.find(log => log.log_ref === embeddedLogRef) : listed.logs.find(log => log.log_ref === selected.current)
           ?? listed.logs.find(log => log.log_ref === listed.default_log_ref) ?? listed.logs[0];
         if (!active) {
+          if (embedded && contentRef.current) {
+            earlierRequest.current = null;
+            forceTail.current = true;
+            setReadingEarlier(false);
+            setNotice("文件暂时未发现；保留已读取片段和阅读位置，重新出现后可继续跟随。");
+            return;
+          }
           selected.current = null;
           contentRef.current = null;
           earlierRequest.current = null;
@@ -212,6 +223,9 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
               `${base}/${encodeURIComponent(active.log_ref)}?${parameters}`, controller.signal,
             ), target.target_ref, target.target_run_ref, active.log_ref);
             if (disposed || selected.current !== active.log_ref) return;
+            // A response started while following must not land over a reader
+            // who scrolled into history while the request was in flight.
+            if (!followingRef.current && existing && !earlier) return;
             if (earlier && (page.stream_ref !== earlier.streamRef || page.next_offset !== earlier.before)) {
               throw new Error("experiment_log_reset_required");
             }
@@ -235,6 +249,13 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
         if (disposed || controller.signal.aborted) return;
         const code = errorCode(caught);
         if (code === "experiment_log_reset_required" || code === "experiment_log_not_found") {
+          if (!followingRef.current && contentRef.current) {
+            earlierRequest.current = null;
+            forceTail.current = true;
+            setReadingEarlier(false);
+            setNotice("日志文件已变化；保留已读取片段和阅读位置，继续跟随时读取当前文件末尾。");
+            return;
+          }
           contentRef.current = null;
           earlierRequest.current = null;
           setReadingEarlier(false);
@@ -263,7 +284,7 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
     };
     void poll();
     return () => { disposed = true; controller.abort(); clearTimeout(timer); };
-  }, [scope, paused, refresh, target.target_ref, target.target_run_ref]);
+  }, [scope, paused, refresh, target.target_ref, target.target_run_ref, embedded, embeddedLogRef]);
 
   useEffect(() => {
     if ((following || showEarlierBottom.current) && !paused && logRef.current) {
@@ -278,7 +299,8 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
   const file = currentCatalog?.logs.find(log => log.log_ref === selectedRef) ?? null;
   const sourceBytes = file?.source_bytes ?? current?.sourceBytes ?? 0;
   const unreadBytes = current ? Math.max(0, sourceBytes - current.nextOffset - current.pendingUtf8Bytes) : 0;
-  const taskLabel = targetStatus(target);
+  const executionStatus = currentCatalog?.target_status ?? undefined;
+  const taskLabel = targetStatus(target, executionStatus);
   const connectionLabel = paused ? "已暂停读取" : connection === "connected" ? currentCatalog?.status === "empty" ? "正在等待匹配的日志文件" : "日志读取正常"
     : connection === "error" ? "正在重连" : "正在连接日志";
 
@@ -296,28 +318,29 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
     setRefresh(value => value + 1);
   };
 
-  return createPortal(<section id="experiment-log-dialog" ref={windowRef}
-    className="experiment-log-window" role="dialog" aria-modal="false"
-    aria-label={`${target.target_key} 日志文件`} aria-hidden={blockedByHumanRequest ? true : undefined}
+  const panel = <section id={embedded ? undefined : "experiment-log-dialog"} ref={windowRef}
+    className={`experiment-log-window${embedded ? " experiment-log-inline" : ""}`} role={embedded ? "region" : "dialog"} aria-modal={embedded ? undefined : "false"}
+    aria-label={embedded ? `${target.target_key} ${file?.relative_path ?? embeddedLogRef}` : `${target.target_key} 日志文件`} aria-hidden={blockedByHumanRequest ? true : undefined}
+    data-target-run-ref={target.target_run_ref} data-log-ref={embeddedLogRef}
     inert={blockedByHumanRequest} data-hc-background data-hc-inert-owner="experiment-log"
     data-minimized={minimized ? "true" : "false"}
     onKeyDown={event => {
-      if (event.key === "Escape" && !blockedByHumanRequest) {
+      if (!embedded && event.key === "Escape" && !blockedByHumanRequest) {
         event.preventDefault(); event.stopPropagation(); onClose();
       }
     }}>
     <header className="experiment-log-header">
-      <div><small>日志文件 · 原始写入</small><b>{target.target_key}</b></div>
-      <div className="experiment-log-window-actions">
+      <div><small>{embedded ? `${target.target_key} · ${target.target_run_ref}` : "日志文件 · 原始写入"}</small><b>{embedded ? file?.relative_path ?? embeddedLogRef : target.target_key}</b></div>
+      {!embedded ? <div className="experiment-log-window-actions">
         <button type="button" onClick={onMinimize} aria-label={minimized ? "展开实验日志" : "最小化实验日志"}>{minimized ? "展开" : "最小化"}</button>
         <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭实验日志">×</button>
-      </div>
+      </div> : null}
     </header>
-    <p className="experiment-log-source-note">当前按 train/eval 文件名查找。文件名不代表训练或模型评估已经运行。此处展示文件的原始写入。</p>
+    {!embedded ? <p className="experiment-log-source-note">当前按 train/eval 文件名查找。文件名不代表训练或模型评估已经运行。此处展示文件的原始写入。</p> : null}
     {minimized ? <p className="experiment-log-minimized">{file?.name ?? "等待日志文件"} · 已暂停读取</p> : <div className="experiment-log-body">
-      <ExperimentOutputViews view="files" onChange={view => { if (view === "records") onShowExecution(); }} />
+      {!embedded ? <ExperimentOutputViews view="files" onChange={view => { if (view === "records") onShowExecution(); }} /> : null}
       <div className="experiment-log-toolbar">
-        <label className="experiment-log-select">日志文件
+        {!embedded ? <label className="experiment-log-select">日志文件
           <select aria-label="选择日志文件" value={selectedRef ?? ""} disabled={!currentCatalog?.logs.length}
             onChange={event => {
               selected.current = event.currentTarget.value;
@@ -338,12 +361,12 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
               {log.relative_path}
             </option>)}
           </select>
-        </label>
+        </label> : null}
         <label className="experiment-log-wrap"><input type="checkbox" checked={wrap} onChange={event => setWrap(event.currentTarget.checked)} />自动换行</label>
         <label className="experiment-log-wrap"><input type="checkbox" checked={rawCharacters} onChange={event => setRawCharacters(event.currentTarget.checked)} />控制字符原样</label>
       </div>
       <div className="experiment-log-states"><span data-connection={paused ? "paused" : connection}><i aria-hidden="true" />{connectionLabel}</span>
-        <span>Target 状态：{taskLabel}</span>
+        <span>{executionStatus ? "执行状态" : "Target 状态"}：{taskLabel}</span>
       </div>
       {file ? <div className="experiment-log-file-facts"><code title={file.relative_path}>{file.relative_path}</code>
         <span>{fileSize(sourceBytes)} · 最近写入 {timeLabel(file.modified_at)}</span></div> : null}
@@ -395,5 +418,85 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
         {current?.decodeReplacements ? <small>文件含无法按 UTF-8 解码的字节，已用替代字符显示；控制字符视图也使用读取后的文本。</small> : null}
       </footer>
     </div>}
-  </section>, document.body);
+  </section>;
+  return embedded ? panel : createPortal(panel, document.body);
+}
+
+function TargetLogFiles({ target, blocked, paused, onDiscovery }: {
+  target: BundleTargetProjection; blocked: boolean; paused: boolean;
+  onDiscovery: (scope: string, count: number | null) => void;
+}) {
+  const [catalog, setCatalog] = useState<ExperimentLogList | null>(null);
+  const [error, setError] = useState(false);
+  const [visible, setVisible] = useState(() => document.visibilityState !== "hidden");
+  const scope = `${target.target_ref}:${target.target_run_ref}`;
+  useEffect(() => {
+    const listener = () => setVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", listener);
+    return () => document.removeEventListener("visibilitychange", listener);
+  }, []);
+  useEffect(() => { setCatalog(null); setError(false); }, [scope]);
+  useEffect(() => {
+    if (paused || blocked || !visible || !target.target_run_ref) return;
+    const controller = new AbortController();
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const parameters = new URLSearchParams({ target_run_ref: target.target_run_ref! });
+        const listed = validateExperimentLogList(await readJson<ExperimentLogList>(
+          `/api/v1/bundle/targets/${encodeURIComponent(target.target_ref)}/experiment-logs?${parameters}`, controller.signal,
+        ), target.target_ref, target.target_run_ref);
+        if (disposed) return;
+        if (listed.status === "unavailable") setError(true);
+        else {
+          // A rotation can briefly remove a file from the directory. Keep its
+          // mounted reader so a person's history and scroll position survive.
+          setCatalog(previous => previous?.target_ref === target.target_ref && previous.target_run_ref === target.target_run_ref
+            ? { ...listed, logs: [...previous.logs.map(file => listed.logs.find(next => next.log_ref === file.log_ref) ?? file),
+              ...listed.logs.filter(file => !previous.logs.some(known => known.log_ref === file.log_ref))] }
+            : listed);
+          setError(false);
+        }
+      } catch {
+        if (!disposed) setError(true);
+      } finally {
+        if (!disposed) timer = setTimeout(() => void poll(), POLL_MILLISECONDS);
+      }
+    };
+    void poll();
+    return () => { disposed = true; controller.abort(); clearTimeout(timer); };
+  }, [scope, paused, blocked, visible, target.target_ref, target.target_run_ref]);
+  const current = catalog?.target_ref === target.target_ref && catalog.target_run_ref === target.target_run_ref ? catalog : null;
+  useEffect(() => { onDiscovery(scope, current?.logs.length ?? null); }, [scope, current?.logs.length, onDiscovery]);
+  return <>
+    {error && !current?.logs.length ? <p className="parallel-log-read-status" role="status">{target.target_key} 的执行日志暂不可读，正在重试。</p> : null}
+    {current?.logs.map(file => <ExperimentLogs key={`${scope}:${file.log_ref}`} target={target} embeddedLogRef={file.log_ref}
+      minimized={false} activityPaused={paused} blockedByHumanRequest={blocked}
+      onMinimize={() => {}} onClose={() => {}} onShowExecution={() => {}} />)}
+  </>;
+}
+
+export function ParallelExecutionLogs({ targets, blocked, paused }: {
+  targets: BundleTargetProjection[]; blocked: boolean; paused: boolean;
+}) {
+  const available = targets.filter(target => target.target_run_ref);
+  const [discovered, setDiscovered] = useState<Record<string, number | null>>({});
+  const onDiscovery = useCallback((scope: string, count: number | null) => {
+    setDiscovered(previous => previous[scope] === count ? previous : { ...previous, [scope]: count });
+  }, []);
+  const counts = available.map(target => discovered[`${target.target_ref}:${target.target_run_ref}`]);
+  const hasFiles = counts.some(count => count !== null && count !== undefined && count > 0);
+  const confirmed = counts.every(count => count !== null && count !== undefined);
+  return <section className="parallel-execution-logs" aria-label="当前执行日志">
+    <header><h2>当前执行日志</h2><p>各项实际文件同时展开；每条日志可以独立回看或返回最新写入。</p></header>
+    <p className="parallel-log-source-note">按 train/eval 文件名发现原始写入；文件名本身不代表训练或评估已经运行。</p>
+    <div className="parallel-execution-log-grid">
+      {available.map(target => <TargetLogFiles key={`${target.target_ref}:${target.target_run_ref}`} target={target} blocked={blocked} paused={paused} onDiscovery={onDiscovery} />)}
+    </div>
+    {!available.length ? <p className="parallel-log-read-status">当前没有实验执行日志；其他工作输出可在研究会话中查看。</p> : null}
+    {available.length > 0 && !hasFiles ? <p className="parallel-log-read-status" role="status">{confirmed
+      ? "尚未发现当前执行日志；准备工作和其他命令输出可从任务执行记录查看。"
+      : "正在查找当前执行日志…"}</p> : null}
+  </section>;
 }

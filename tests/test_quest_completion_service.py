@@ -59,6 +59,9 @@ def _source() -> dict[str, object]:
         "foreground_epoch": 7,
         "reasoning_content_acceptance_receipt_ref": "rm-content-receipt",
         "reasoning_domain_acceptance_receipt_ref": "rg-outcome-receipt",
+        "runtime_conditions_revision": "conditions-revision-test",
+        "conditions_snapshot_ref": "guidance-snapshot-test",
+        "conditions_snapshot_hash": "guidance-snapshot-hash-test",
     }
 
 
@@ -132,6 +135,9 @@ class _HumanCollaboration:
             "quest_ref": _QUEST_REF,
             "goal_revision_ref": _GOAL_REVISION_REF,
             "completion_milestone_basis_refs": ["stage-commit-idea"],
+            **{key: _source()[key] for key in (
+                "runtime_conditions_revision", "conditions_snapshot_ref", "conditions_snapshot_hash",
+            )},
         }
         context["human_confirmation"] = {
             "preview": preview,
@@ -193,6 +199,10 @@ class _ResearchGraph:
     ) -> dict[str, object] | None:
         assert quest_ref == _QUEST_REF
         return self.goal_revision
+
+    def query_runtime_conditions_revision(self, quest_ref: str) -> str:
+        assert quest_ref == _QUEST_REF
+        return "conditions-revision-test"
 
     def query_quest_completion_acceptance(
         self, candidate_completion_ref: str

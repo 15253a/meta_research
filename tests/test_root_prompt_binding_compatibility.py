@@ -22,6 +22,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "root_prompt_20260929"
 HANDOFF_PROFILES = Path(__file__).parent / "fixtures" / "root_prompt_bundle_handoff_20260929" / "profiles.json"
 WORKSPACE_PROFILES = Path(__file__).parent / "fixtures" / "root_workspace_20261007" / "profiles.json"
 COMBINED_PROFILES = Path(__file__).parent / "fixtures" / "batch_merge_20261008" / "profiles.json"
+QUEST_GOAL_PROFILES = Path(__file__).parent / "fixtures" / "quest_goal_20261009" / "profiles.json"
 
 
 def load(name):
@@ -36,14 +37,16 @@ def binding(value):
 
 
 @pytest.mark.parametrize("root_kind", root_capabilities.ROOT_AGENT_KINDS)
-def test_combined_prompt_reads_only_exact_baseline_and_accepted_pr_profiles(root_kind):
-    document = json.loads(COMBINED_PROFILES.read_text(encoding="utf-8"))
+def test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles(root_kind):
+    previous = json.loads(COMBINED_PROFILES.read_text(encoding="utf-8"))
+    document = json.loads(QUEST_GOAL_PROFILES.read_text(encoding="utf-8"))
     current = root_capabilities.root_capability_profile(root_kind)
     assert current.as_dict() == document["current_profile"]
     assert current.digest == document["current_profile_hash"] == canonical_hash(document["current_profile"])
     historical = reviewed_historical_root_profile_hashes(current.digest)
     assert historical == frozenset(document["historical_read_hashes"])
-    for item in [document["base_profile"], *document["single_pr_profiles"]]:
+    assert document["previous_profile_hash"] == previous["current_profile_hash"]
+    for item in [previous["base_profile"], *previous["single_pr_profiles"]]:
         assert canonical_hash(item["profile"]) == item["profile_hash"]
         assert item["profile_hash"] in historical
         assert {key: value for key, value in item["profile"].items() if key != "research_system_prompt_hash"} == {

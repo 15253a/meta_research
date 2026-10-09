@@ -3730,6 +3730,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             candidate = _decoded_mapping(
                 row.candidate_completion_json, "candidate_completion"
             )
+            source = _decoded_mapping(row.source_json, "quest_completion_source")
             preview_document = {
                 "candidate_completion_ref": row.candidate_completion_ref,
                 "candidate_completion_hash": row.candidate_completion_hash,
@@ -3738,6 +3739,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "completion_milestone_basis_refs": candidate[
                     "completion_milestone_basis_refs"
                 ],
+                **{key: source[key] for key in (
+                    "runtime_conditions_revision", "conditions_snapshot_ref",
+                    "conditions_snapshot_hash",
+                ) if key in source},
             }
             preview_hash = canonical_hash(preview_document)
             request_hash = canonical_hash(

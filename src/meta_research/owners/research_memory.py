@@ -192,6 +192,10 @@ ASSET_INTAKE_LEASE_SECONDS = 3600.0
 ASSET_INTAKE_MAX_ATTEMPTS = 5
 ASSET_INTAKE_RETRY_BASE_SECONDS = 1.0
 ASSET_VERIFICATION_INTERVAL_SECONDS = 300.0
+TARGET_WORKSPACE_NOTE_PROVENANCE_SCHEMA = (
+    "meta-research/target-workspace-note/v1"
+)
+TARGET_NOTE_INTAKE_EFFECT_SCHEMA = "meta-research/target-note-intake-effect/v1"
 
 
 def _next_verification_interval(byte_count: int) -> float:
@@ -924,6 +928,14 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
         effect_scope: Callable[[], None] | None = None,
     ) -> AssetIntakeResult: ...
 
+    def submit_target_note_intake(
+        self,
+        request: AssetIntakeRequest,
+        *,
+        idempotency_key: str,
+        effect_scope: Callable[[], None],
+    ) -> AssetIntakeResult: ...
+
     def linked_local_intake_mode(self, source_locator: str) -> str: ...
 
     def process_asset_intake_once(self) -> bool: ...
@@ -939,6 +951,14 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
         *,
         operation_namespace: str | None = None,
     ) -> AssetIntakeResult | None: ...
+
+    def query_asset_intake_effect_record(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None: ...
+
+    def query_target_note_intake_effect_record(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None: ...
 
     def query_asset_version(
         self, memory_ref: str
@@ -3477,6 +3497,48 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         operation_namespace: str | None = None,
         effect_scope: Callable[[], None] | None = None,
     ) -> AssetIntakeResult:
+        document = _asset_request_document(request)
+        provenance = document.get("provenance")
+        if (
+            isinstance(provenance, dict)
+            and provenance.get("schema_ref")
+            == TARGET_WORKSPACE_NOTE_PROVENANCE_SCHEMA
+        ):
+            raise OwnerConflict("target_note_provenance_reserved")
+        return self._submit_asset_intake(
+            request,
+            idempotency_key=idempotency_key,
+            operation_namespace=operation_namespace,
+            effect_scope=effect_scope,
+            target_note_binding=None,
+        )
+
+    def submit_target_note_intake(
+        self,
+        request: AssetIntakeRequest,
+        *,
+        idempotency_key: str,
+        effect_scope: Callable[[], None],
+    ) -> AssetIntakeResult:
+        document = _asset_request_document(request)
+        binding = _target_note_intake_effect_binding(document)
+        return self._submit_asset_intake(
+            request,
+            idempotency_key=idempotency_key,
+            operation_namespace=None,
+            effect_scope=effect_scope,
+            target_note_binding=binding,
+        )
+
+    def _submit_asset_intake(
+        self,
+        request: AssetIntakeRequest,
+        *,
+        idempotency_key: str,
+        operation_namespace: str | None = None,
+        effect_scope: Callable[[], None] | None = None,
+        target_note_binding: dict[str, object] | None = None,
+    ) -> AssetIntakeResult:
         if not idempotency_key or len(idempotency_key) > 128:
             raise OwnerConflict("asset_intake_idempotency_key_invalid")
         request_document = _asset_request_document(request)
@@ -3496,6 +3558,16 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             idempotency_key,
             request_document,
             operation_namespace=operation_namespace,
+        )
+        target_binding_json = (
+            None
+            if target_note_binding is None
+            else canonical_json(target_note_binding)
+        )
+        target_binding_hash = (
+            None
+            if target_note_binding is None
+            else canonical_hash(target_note_binding)
         )
         requested_asset_ref = request_document.get("asset_ref")
         if requested_asset_ref is not None:
@@ -3519,7 +3591,25 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 ),
                 {"idempotency_key": idempotency_key},
             ).first()
+            target_effect = connection.execute(
+                text(
+                    "SELECT * FROM rm_target_note_intake_effects WHERE "
+                    "idempotency_key=:idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
             if existing is not None:
+                if target_note_binding is None:
+                    if target_effect is not None:
+                        raise OwnerConflict("asset_intake_idempotency_conflict")
+                elif (
+                    target_effect is None
+                    or target_effect.job_ref != existing.job_ref
+                    or target_effect.request_hash != request_hash
+                    or target_effect.binding_json != target_binding_json
+                    or target_effect.binding_hash != target_binding_hash
+                ):
+                    raise OwnerConflict("asset_intake_idempotency_conflict")
                 if bool(existing.request_payload_scrubbed):
                     _verified_scrubbed_asset_request_summary(existing)
                 else:
@@ -3547,6 +3637,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     )
                     sync_claimed = True
             else:
+                if target_effect is not None:
+                    raise OwnerConflict("asset_intake_idempotency_conflict")
                 pending = connection.execute(
                     text(
                         "SELECT COUNT(*) AS job_count, "
@@ -3599,6 +3691,23 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                         "WHERE singleton = 'owner'"
                     )
                 )
+                if target_note_binding is not None:
+                    connection.execute(
+                        text(
+                            "INSERT INTO rm_target_note_intake_effects "
+                            "(idempotency_key,job_ref,request_hash,binding_json,"
+                            "binding_hash,created_at) VALUES (:idempotency_key,"
+                            ":job_ref,:request_hash,:binding_json,:binding_hash,:now)"
+                        ),
+                        {
+                            "idempotency_key": idempotency_key,
+                            "job_ref": job_ref,
+                            "request_hash": request_hash,
+                            "binding_json": target_binding_json,
+                            "binding_hash": target_binding_hash,
+                            "now": now,
+                        },
+                    )
                 self._feed.record(
                     connection,
                     "research_memory.asset_intake_queued",
@@ -4533,6 +4642,66 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         if row.request_hash != request_hash:
             raise OwnerConflict("asset_intake_idempotency_conflict")
         return self.query_asset_intake(row.job_ref)
+
+    def query_asset_intake_effect_record(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None:
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise OwnerConflict("asset_intake_idempotency_key_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_asset_intakes WHERE "
+                    "idempotency_key=:idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if row is None:
+            return None
+        if bool(row.request_payload_scrubbed):
+            raise OwnerConflict("asset_intake_effect_payload_unavailable")
+        request = _validated_stored_asset_request(
+            row.request_json, row.request_hash
+        )
+        return {
+            "request": _asset_request_document(request),
+            "result": self.query_asset_intake(row.job_ref).as_public_dict(),
+        }
+
+    def query_target_note_intake_effect_record(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None:
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise OwnerConflict("asset_intake_idempotency_key_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT e.*,i.idempotency_key AS intake_key,"
+                    "i.request_hash AS intake_request_hash FROM "
+                    "rm_target_note_intake_effects e JOIN rm_asset_intakes i "
+                    "ON i.job_ref=e.job_ref WHERE e.idempotency_key=:key"
+                ),
+                {"key": idempotency_key},
+            ).first()
+        if row is None:
+            return None
+        try:
+            binding = decoded_object(row.binding_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("target_note_effect_invalid") from error
+        if (
+            not isinstance(binding, dict)
+            or canonical_json(binding) != row.binding_json
+            or canonical_hash(binding) != row.binding_hash
+            or binding.get("schema_ref") != TARGET_NOTE_INTAKE_EFFECT_SCHEMA
+            or row.intake_key != idempotency_key
+            or row.request_hash != row.intake_request_hash
+        ):
+            raise OwnerConflict("target_note_effect_invalid")
+        return {
+            "binding": binding,
+            "result": self.query_asset_intake(row.job_ref).as_public_dict(),
+        }
 
     def query_asset_version(self, memory_ref: str) -> AcceptedAssetVersion | None:
         with self._database.read() as connection:
@@ -10807,6 +10976,107 @@ def _asset_intake_error_details(error: Exception | None, phase: str | None) -> d
             break
         current = current.__cause__ or current.__context__
     return details
+
+
+def _target_note_intake_effect_binding(
+    request: dict[str, object],
+) -> dict[str, object]:
+    provenance = request.get("provenance")
+    required_provenance = {
+        "schema_ref",
+        "producer_kind",
+        "target_ref",
+        "target_run_ref",
+        "workspace_ref",
+        "relative_path",
+        "source_content_hash",
+        "source_locator",
+    }
+    if (
+        set(request)
+        != {
+            "source_kind",
+            "custody_mode",
+            "display_name",
+            "media_type",
+            "content_base64",
+            "source_locator",
+            "provenance",
+            "asset_ref",
+            "asynchronous",
+            "origin_quest_ref",
+            "effect_scope_required",
+        }
+        or request.get("source_kind") not in {"text", "file"}
+        or request.get("custody_mode") != "managed"
+        or request.get("source_locator") is not None
+        or request.get("asset_ref") is not None
+        or request.get("asynchronous") is not False
+        or request.get("effect_scope_required") is not True
+        or not isinstance(request.get("origin_quest_ref"), str)
+        or not request["origin_quest_ref"]
+        or not isinstance(provenance, dict)
+        or set(provenance) != required_provenance
+        or provenance.get("schema_ref")
+        != TARGET_WORKSPACE_NOTE_PROVENANCE_SCHEMA
+        or provenance.get("producer_kind") != "target_workspace"
+        or provenance.get("relative_path")
+        not in {
+            "outputs/analysis/research-note.md",
+            "handoff/final-message.md",
+        }
+        or any(
+            not isinstance(provenance.get(name), str) or not provenance[name]
+            for name in (
+                "target_ref",
+                "target_run_ref",
+                "workspace_ref",
+                "source_content_hash",
+            )
+        )
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(provenance.get("source_content_hash", ""))
+        )
+        is None
+        or provenance.get("source_locator")
+        != "target-workspace://"
+        + str(provenance.get("workspace_ref", ""))
+        + "/"
+        + str(provenance.get("relative_path", ""))
+    ):
+        raise OwnerConflict("target_note_provenance_invalid")
+    try:
+        content = base64.b64decode(request.get("content_base64"), validate=True)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("target_note_provenance_invalid") from error
+    if hashlib.sha256(content).hexdigest() != provenance["source_content_hash"]:
+        raise OwnerConflict("target_note_provenance_invalid")
+    selector = {
+        "target_ref": provenance["target_ref"],
+        "target_run_ref": provenance["target_run_ref"],
+        "workspace_ref": provenance["workspace_ref"],
+        "relative_path": provenance["relative_path"],
+        "expected_content_hash": provenance["source_content_hash"],
+    }
+    return {
+        "schema_ref": TARGET_NOTE_INTAKE_EFFECT_SCHEMA,
+        "quest_ref": request["origin_quest_ref"],
+        "selector": selector,
+        "intake": {
+            name: request[name]
+            for name in (
+                "source_kind",
+                "custody_mode",
+                "display_name",
+                "media_type",
+                "provenance",
+                "asset_ref",
+                "asynchronous",
+                "origin_quest_ref",
+                "effect_scope_required",
+            )
+        },
+    }
 
 
 def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:

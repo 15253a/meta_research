@@ -18,10 +18,23 @@ from test_bundle_skill_adapter import (
 )
 from test_target_root_finalizer import _current_bundle_runtime
 from test_target_launch_admission import _ready_launch
+from test_bundle_runtime_conditions_compatibility import _SignedDispatchRunner
 
 
-def _adapter(tmp_path, output):
-    runner = _SequenceRunner([output])
+class _SignedDriftRunner(_SignedDispatchRunner):
+    native_session_ref = None
+
+    def __call__(self, *args, **kwargs):
+        result = super().__call__(*args, **kwargs)
+        return (result if self.native_session_ref is None
+                else replace_completed_stdout(result, self.native_session_ref))
+
+
+def _adapter(tmp_path, output, *, durable=False, native_session_ref=None):
+    runner_type = _SignedDriftRunner if durable else _SequenceRunner
+    runner = runner_type([output, output])
+    if durable:
+        runner.native_session_ref = native_session_ref
     adapter = CodexBundleSkillAdapter(
         tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")),
         process_runner=runner,
@@ -51,6 +64,7 @@ def _request(adapter, kind):
     target_plan = _target_plan(plan, "7" * 64)
     target_plan["completion_contract"]["experiments"][0]["brief"]["required_measurement_unit_keys"] = ["cell:structure-primary"]
     spec = target_plan["initial_strategy_update"]["candidates"][0]
+    spec["candidate"].pop("reuse_trace")
     return BundleTargetBatchRequest(
         **scope, formal_plan_ref="formal-plan:bundle-1", context_pack_ref="context-pack:bundle-1",
         context_pack_hash="7" * 64, plan_document=plan, initial_target_plan=target_plan,
@@ -77,14 +91,18 @@ def _changed(request, kind):
 
 
 @pytest.mark.parametrize("kind", ("dispatch", "batch"))
-def test_completed_input_drift_retains_result_and_requests_owner_correction(tmp_path, kind):
-    adapter, runner = _adapter(tmp_path, _output(kind))
+@pytest.mark.parametrize("durable", (False, True))
+def test_completed_input_drift_retains_result_and_requests_owner_correction(tmp_path, kind, durable):
+    adapter, runner = _adapter(tmp_path, _output(kind), durable=durable)
     request = _request(adapter, kind)
     invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
     original = invoke(request)
     assert invoke(request) == original
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
-    original_files = {name: (operation / name).read_bytes() for name in ("invocation.json", "prompt.txt", "last-message.json", "completed.json")}
+    original_files = {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()}
+    if durable:
+        assert json.loads(original_files["invocation.json"])["payload"]["transport_mode"] == "durable_supervisor"
+        assert "supervisor-exit.json" in original_files
     with pytest.raises(IdeaSkillUnavailable) as failure:
         invoke(_changed(request, kind))
     assert failure.value.code == "bundle_review_result_contract_invalid"
@@ -96,15 +114,16 @@ def test_completed_input_drift_retains_result_and_requests_owner_correction(tmp_
 
 
 @pytest.mark.parametrize("kind", ("dispatch", "batch"))
-def test_pending_changed_input_only_reconciles_original_operation(tmp_path, kind):
-    adapter, runner = _adapter(tmp_path, _output(kind))
+@pytest.mark.parametrize("durable", (False, True))
+def test_pending_changed_input_only_reconciles_original_operation(tmp_path, kind, durable):
+    adapter, runner = _adapter(tmp_path, _output(kind), durable=durable)
     request = _request(adapter, kind)
     invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
     invoke(request)
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
     # Model a process whose output exists but has no authenticated terminal seal.
     for name in ("exit.json", "completed.json", "supervisor-exit.json"):
-        (operation / name).unlink()
+        (operation / name).unlink(missing_ok=True)
     with pytest.raises(IdeaSkillUnavailable) as failure:
         invoke(_changed(request, kind))
     assert failure.value.code == "codex_operation_reconciliation_pending"
@@ -113,8 +132,9 @@ def test_pending_changed_input_only_reconciles_original_operation(tmp_path, kind
 
 
 @pytest.mark.parametrize("kind", ("dispatch", "batch"))
-def test_foreign_root_and_damaged_seals_cannot_authorize_input_correction(tmp_path, kind):
-    adapter, runner = _adapter(tmp_path, _output(kind))
+@pytest.mark.parametrize("durable", (False, True))
+def test_foreign_root_and_damaged_seals_cannot_authorize_input_correction(tmp_path, kind, durable):
+    adapter, runner = _adapter(tmp_path, _output(kind), durable=durable)
     request = _request(adapter, kind)
     invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
     invoke(request)
@@ -134,21 +154,33 @@ def test_foreign_root_and_damaged_seals_cannot_authorize_input_correction(tmp_pa
     assert len(runner.calls) == 1
 
 
+def test_damaged_durable_exit_cannot_authorize_input_correction(tmp_path):
+    adapter, runner = _adapter(tmp_path, _output("dispatch"), durable=True)
+    request = _request(adapter, "dispatch")
+    adapter.schedule_target(request)
+    operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
+    receipt = operation / "supervisor-exit.json"
+    envelope = json.loads(receipt.read_text())
+    envelope["seal"] = "0" * 64
+    receipt.write_text(json.dumps(envelope))
+    with pytest.raises(IdeaSkillUnavailable) as damaged:
+        adapter.schedule_target(_changed(request, "dispatch"))
+    assert damaged.value.code == "codex_operation_spool_invalid"
+    assert damaged.value.recovery_checkpoint is None
+    assert len(runner.calls) == 1
+
+
 def test_input_correction_creates_new_attempt_and_operation_with_same_native_session(tmp_path, monkeypatch):
     runtime = _current_bundle_runtime(tmp_path / "owner")
     try:
         _graph, _target, original, _dispatch, _launch = _ready_launch(runtime)
         provider_path = tmp_path / "adapter"
         provider_path.mkdir()
-        adapter, runner = _adapter(provider_path, _output("dispatch"))
+        adapter, runner = _adapter(provider_path, _output("dispatch"), durable=True,
+            native_session_ref=original.native_session_ref)
         # Use actual admitted Owner identities while retaining deterministic
         # provider output and the production durable invocation/correction path.
         monkeypatch.setattr(adapter, "runtime_binding", lambda: original.runtime_binding)
-        original_call = runner.__call__
-        def run_job(job_ref, argv, prompt, timeout, environment=None):
-            result = original_call(argv, prompt, timeout, environment)
-            return replace_completed_stdout(result, original.native_session_ref)
-        monkeypatch.setattr(runner, "run_job", run_job)
         def invoke(**arguments):
             return adapter._invoke(**{
                 key: arguments[key] for key in (
@@ -164,6 +196,8 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
             inbox_checkpoint=_inbox_checkpoint(run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref),
         )
         adapter.schedule_target(request)
+        original_operation = next((provider_path / "provider/provider-operations").glob("*/*"))
+        original_files = {path.name: path.read_bytes() for path in original_operation.iterdir() if path.is_file()}
         with pytest.raises(IdeaSkillUnavailable) as failed:
             adapter.schedule_target(_changed(request, "dispatch"))
         owner = runtime.owners.agent_runtime
@@ -190,6 +224,20 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         assert feedback["detail_code"] == "bundle_operation_inputs_changed"
         assert feedback["provider_unit_ref"] == unit_ref
         assert len(runner.calls) == 1
+        next_request = replace(_changed(request, "dispatch"),
+            attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref,
+            job_ref=successor.review_invocation.operation_ref,
+            inbox_checkpoint=_inbox_checkpoint(run_ref=successor.run_ref,
+                attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref))
+        assert adapter.schedule_target(next_request).action == "wait"
+        assert len(runner.calls) == 2
+        operations = list((provider_path / "provider/provider-operations").glob("*/*"))
+        assert len(operations) == 2
+        assert {name: (original_operation / name).read_bytes() for name in original_files} == original_files
+        for operation in operations:
+            invocation = json.loads((operation / "invocation.json").read_text())["payload"]
+            assert invocation["transport_mode"] == "durable_supervisor"
+            assert invocation["native_session_ref"] == original.native_session_ref
     finally:
         runtime.close()
 

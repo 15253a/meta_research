@@ -26,6 +26,7 @@ from meta_research.bundle_exhaustion import (
 from meta_research.bundle_protocol import (
     AcceptedMeasurementClosure,
     BundleReport,
+    GoalWorkDisposition,
     SemanticBarrier,
     TechnicalBlocker,
     projection_plain_value,
@@ -1022,6 +1023,19 @@ class BundleStageWorker:
                         self._transient_error = "bundle_replan_waiting_for_target_terminal"
                         return False
                     continue
+                notice = self._agent_runtime.query_target_work_notice(
+                    target.target_ref
+                )
+                if notice is not None:
+                    handoff = self._agent_runtime.read_target_run_handoff(
+                        notice.handoff_manifest_ref
+                    )
+                    if (
+                        type(handoff.terminal) is GoalWorkDisposition
+                        and handoff.terminal.disposition == "not_started"
+                    ):
+                        continue
+                    raise OwnerConflict("bundle_report_handoff_invalid")
                 if self._agent_runtime.query_target_launch_ack(target.target_ref) is not None:
                     self._transient_error = "bundle_replan_waiting_for_target_terminal"
                     return False
@@ -1085,6 +1099,19 @@ class BundleStageWorker:
             notice = self._agent_runtime.query_target_work_notice(target.target_ref)
             if frontier is None:
                 if notice is not None:
+                    if notice.target_ref != target.target_ref:
+                        raise OwnerConflict("bundle_report_handoff_invalid")
+                    handoff = self._agent_runtime.read_target_run_handoff(
+                        notice.handoff_manifest_ref
+                    )
+                    if (
+                        type(handoff.terminal) is GoalWorkDisposition
+                        and handoff.terminal.disposition == "not_started"
+                    ):
+                        handoff_manifest_refs.append(
+                            notice.handoff_manifest_ref
+                        )
+                        continue
                     raise OwnerConflict("bundle_report_handoff_invalid")
                 unlaunched = True
                 continue
@@ -1113,6 +1140,8 @@ class BundleStageWorker:
         if unlaunched:
             return None
         if any(type(terminal) is SemanticBarrier for terminal in terminals):
+            return "replan_required"
+        if any(type(terminal) is GoalWorkDisposition for terminal in terminals):
             return "replan_required"
         if terminals and all(
             type(terminal) is AcceptedMeasurementClosure for terminal in terminals

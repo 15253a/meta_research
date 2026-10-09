@@ -2146,6 +2146,7 @@ class HarnessRuntime:
             prompt=prompt,
             mcp_base_url=mcp_base_url,
             operation_ref=operation_ref,
+            owner_invocation_hash=invocation_hash,
             resume=resume,
             required_capabilities=required_capabilities,
             workspace_ref=workspace_ref,
@@ -2262,6 +2263,7 @@ class HarnessRuntime:
                         mcp_base_url=mcp_base_url, operation_ref=operation_ref,
                         workspace_ref=workspace_ref, working_directory=working_directory,
                         entry_path="recovery",
+                        owner_invocation_hash=operation.invocation_hash,
                     ))
                 except HarnessAdapterUnavailable as error:
                     raise HarnessAdmissionError(error.code) from error
@@ -2299,6 +2301,7 @@ class HarnessRuntime:
             prompt=prompt,
             mcp_base_url=mcp_base_url,
             operation_ref=operation_ref,
+            owner_invocation_hash=operation.invocation_hash,
             resume=resume,
             reconciling=True,
             reconciliation_generation=reconciliation_generation,
@@ -2324,6 +2327,7 @@ class HarnessRuntime:
         entry_path: Literal["initial", "resume", "recovery"],
         operation_channel: ResidentMcpChannel | None = None,
         external_mcp_access: ExternalMcpAccess | None = None,
+        owner_invocation_hash: str | None = None,
     ) -> HarnessInvocation:
         return HarnessInvocation(
             harness_family=request.harness_family,
@@ -2349,6 +2353,7 @@ class HarnessRuntime:
             entry_path=entry_path,
             authorized_operation_ids=request.required_operation_ids,
             external_mcp_access=external_mcp_access,
+            owner_invocation_hash=owner_invocation_hash,
         )
 
     def _invoke_provider_turn(
@@ -2359,6 +2364,7 @@ class HarnessRuntime:
         prompt: str,
         mcp_base_url: str,
         operation_ref: str,
+        owner_invocation_hash: str,
         resume: bool,
         reconciling: bool = False,
         reconciliation_generation: int = 0,
@@ -2447,6 +2453,7 @@ class HarnessRuntime:
                         working_directory=working_directory, entry_path=entry_path,
                         operation_channel=operation_channel,
                         external_mcp_access=external_mcp_access,
+                        owner_invocation_hash=owner_invocation_hash,
                     ))
             finally:
                 if operation_channel is not None:

@@ -7,6 +7,8 @@
 | `advancement_engine.reasoning_stage_run.observe` | 核验当前请求、epoch 和 AE 闭包。 |
 | `research_memory.reasoning_evidence.read` | 按研究需要读取精确冻结证据与角色，包括已核验 Plan 复用来源；可用列表本身不表示实际采用。 |
 | `research_graph.reasoning_context.read` | 读取本次冻结的已接纳 Question／Quest／Goal、历史身份与领域上下文，结合正文作独立研究判断；系统使用同一冻结版本装配元信息。 |
+| `research_graph.quest_goal.read` | 读取当前 Quest Goal、持续条件、本逻辑操作冻结工作切面和指导对齐。 |
+| `research_graph.quest_goal.evolve` / `.reconcile` | 在实质新指导或证据要求改向时提交完整、有原因的新 Goal revision；未知效果仅对账原 effect。 |
 | `research_graph.target_formal_results.read` | 按精确 target_ref 展开 VariantRun、适用评价和 MetricResult，包括已交接但尚未评价的 Run；resource_candidates 提供已接纳 Dataset／Environment 候选、精确 RM binding、当前生产归属和 TargetCommit／manifest 身份，按主 Skill 整理步骤使用。 |
 
 共享六入口及分页 reader 用于发现同 Quest 历史，不把首批目录当作全集。人类输入沿 `human_request.read` 读真实原话及材料，意见、授权、HumanRequest satisfied 与 Quest 完成确认分别核对。
@@ -23,4 +25,4 @@ AE 管阶段请求、epoch、StageCommit、后继 Cycle 和 Quest 结束；AR �
 
 provider 正常交接后，daemon 沿公开接口保存 AR 执行、RM 内容和 RG 决策，再由 AE 验证 current request／epoch 与完整 receipts 推进。各边界独立幂等；响应丢失先查询原身份，从首个未完成步骤继续。仅经公开接口核实，不读取数据库、spool、seal key 或私有状态机伪造接纳或恢复。
 
-CandidateCompletion 还需当前 Web preview、用户明确确认、RG Goal／完成接纳和 AE 结束转换。拒绝、stale、未知或未响应都保持实际状态，不结束 Quest。
+CandidateCompletion 还需当前 Web preview、用户明确确认、RG Goal／完成接纳和 AE 结束转换。尚未被当前 Goal 因果演化吸收的有效力度5指导会阻止完成；旧 CandidateCompletion 在 Goal 演化后仅作历史可读，AE 以更高 epoch 签发新 Reasoning 请求重新综合当前 Goal。拒绝、stale、未知或未响应都保持实际状态，不结束 Quest。

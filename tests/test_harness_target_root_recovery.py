@@ -617,6 +617,7 @@ def test_target_provider_return_checkpoints_session_then_resumes_once(
         startup_harness_diagnostics=False,
     )
     runner.runtime = runtime
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
     prompt = "Continue the exact Target root task through completion."
     first_flow_completed = False
     try:
@@ -702,6 +703,7 @@ def test_target_provider_return_checkpoints_session_then_resumes_once(
         else runtime
     )
     runner.runtime = restarted
+    restarted.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
     try:
         completed = restarted.harnesses.run_or_resume_target_root(
             request_ref,

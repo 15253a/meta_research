@@ -37,6 +37,7 @@ import {
   submitHumanGuidance,
   type GuidanceStrength,
   type GuidanceDelivery,
+  type GoalGuidanceAlignment,
   type CompanionAgentProposal,
   type CompanionMessage,
   type CompanionSoftConstraint,
@@ -295,6 +296,7 @@ export function QuestCompanion({
   questionContext = null,
   onChanged,
   onOpenRequest,
+  goalAlignment = [],
 }: {
   state: CompanionShellState;
   collaboration?: HumanCollaborationProjection;
@@ -303,6 +305,7 @@ export function QuestCompanion({
   questionContext?: QuestionTreeItem | null;
   onChanged: () => void;
   onOpenRequest: (requestRef: string) => void;
+  goalAlignment?: GoalGuidanceAlignment[];
 }) {
   const companion = collaboration?.companion;
   const ready = companion?.status === "ready";
@@ -567,6 +570,12 @@ export function QuestCompanion({
             key={constraint.constraint_ref ?? `constraint-${index}`}
             constraint={constraint}
             onChanged={onChanged}
+            alignment={goalAlignment.find((item) =>
+              item.guide_ref.constraint_ref === constraint.constraint_ref
+              && item.guide_ref.revision === constraint.revision
+              && (!constraint.guidance_hash
+                || item.guide_ref.guidance_hash === constraint.guidance_hash)
+            ) ?? null}
           />
         )) : null}
         {ready ? agentProposals.map((proposal, index) => (
@@ -1862,7 +1871,7 @@ function GuidanceDeliveryCard({ delivery }: { delivery: GuidanceDelivery }) {
           <dt>理由</dt><dd>{treatment.reasons}</dd>
         </dl>
       ) : null}
-      {treatment?.goal_update_pending ? <p>目标更新待对齐</p> : null}
+      {treatment?.goal_update_pending ? <p>反馈当时：目标更新待对齐</p> : null}
       <details><summary>操作与回执</summary>
         <p>工作 · {delivery.run_ref}</p><p>操作 · {delivery.operation_ref}</p>
         {treatment ? <p>回执 · {treatment.receipt.receipt_ref}</p> : null}
@@ -1874,9 +1883,11 @@ function GuidanceDeliveryCard({ delivery }: { delivery: GuidanceDelivery }) {
 function SoftConstraintCard({
   constraint,
   onChanged,
+  alignment,
 }: {
   constraint: CompanionSoftConstraint;
   onChanged: () => void;
+  alignment: GoalGuidanceAlignment | null;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1898,7 +1909,11 @@ function SoftConstraintCard({
       <p>{constraint.text ?? constraint.content ?? documentText(constraint.guidance, "text")}</p>
       <WorkMaterialReferences receipts={constraint.work_materials ?? []} />
       <span>力度 {constraint.strength ?? 3} · {guidanceStrengthLabels[constraint.strength ?? 3]}</span>
-      {constraint.strength === 5 ? <p>目标更新待对齐</p> : null}
+      {constraint.strength === 5 ? (
+        alignment?.status === "aligned"
+          ? <p>Quest 已在 {alignment.aligned_revision} 对齐；当前版本 {alignment.current_revision}。</p>
+          : <p>Quest 全局目标更新待对齐。</p>
+      ) : null}
       {constraint.deliveries?.length ? (
         <ul>{constraint.deliveries.map((delivery) => <GuidanceDeliveryCard key={delivery.delivery_ref} delivery={delivery} />)}</ul>
       ) : <p>等待下一研究操作读取。</p>}

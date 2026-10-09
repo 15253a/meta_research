@@ -31,6 +31,7 @@ import {
   fetchCurrentManualQuestionCreation,
   fetchLiteratureSnapshot,
   fetchManualQuestionCreation,
+  fetchQuestGoalHistory,
   fetchSnapshot,
   fetchStageRawOutput,
   fetchTargetRawOutput,
@@ -54,6 +55,7 @@ import {
   type HumanRequestItem,
   type PlanStageProjection,
   type PublicSnapshot,
+  type QuestGoalHistory,
   type QuestionTreeItem,
   type QuestCompletionView,
   type ReasoningStageProjection,
@@ -84,7 +86,7 @@ import "./shell.css";
 import { ResearchOverview, ResearchBrief, ResearchTimeline, StageHistoryStrip, cycleOrdinalLabel, overviewQuestRef, useResearchOverview } from "./ResearchOverview";
 import { MetaTrace } from "./MetaTrace";
 import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
-import { ExperimentLogs, ExperimentOutputViews } from "./ExperimentLogs";
+import { ExperimentLogs, ExperimentOutputViews, ParallelExecutionLogs } from "./ExperimentLogs";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
 import { RootConversations, StageRootSessions, useRootConversations } from "./RootConversations";
 import { RuntimeConditions } from "./RuntimeConditions";
@@ -989,6 +991,55 @@ function nextStepSummary(snapshot: PublicSnapshot): string {
   return `等待 ${stage.kind} 当前步骤形成可确认结果`;
 }
 
+function GoalHistory({ questRef, initial }: { questRef: string; initial: QuestGoalHistory }) {
+  const [page, setPage] = useState(initial);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function load(offset: number) {
+    setLoading(true);
+    setError(null);
+    try {
+      setPage(await fetchQuestGoalHistory(questRef, offset));
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "目标历史读取失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+  return <>
+    <ol start={page.offset + 1}>{page.items.map((revision) => (
+      <li key={revision.goal_revision_ref}>
+        <b>版本 {revision.sequence ?? 0} · {revision.goal.goal}</b>
+        <p>完成标准：{revision.goal.completion_criteria}</p>
+        {revision.judgment ? <p>调整理由：{revision.judgment}</p> : null}
+        {revision.criteria_review ? <p>标准评审：{revision.criteria_review}</p> : null}
+        {revision.conditions ? <>
+          <p>当时运行条件：{revision.conditions.runtime_conditions.text}</p>
+          <ul>{revision.conditions.enduring.map((condition) => (
+            <li key={condition.condition_ref}>
+              {condition.source_text} · {condition.meaning}
+              <span> · {condition.status === "human_superseded" ? "后续人类指导取代" : "继续保留"}</span>
+              {typeof condition.source.delivery_ref === "string" ? <span> · 来源 {condition.source.delivery_ref}</span> : null}
+              {typeof condition.superseding_source?.delivery_ref === "string" ? <span> · 取代来源 {condition.superseding_source.delivery_ref}</span> : null}
+            </li>
+          ))}</ul>
+          <ul>{revision.conditions_review?.assessments.map((assessment) => (
+            <li key={assessment.condition_ref}>
+              {assessment.disposition === "preserved" ? "继续保留" : "后续人类指导取代"} · {assessment.explanation}
+              {assessment.superseding_delivery_ref ? <span> · 来源 {assessment.superseding_delivery_ref}</span> : null}
+            </li>
+          ))}</ul>
+        </> : <p>初始化版本未记录条件快照。</p>}
+      </li>
+    ))}</ol>
+    {error ? <p role="alert">{error}</p> : null}
+    <nav aria-label="目标历史分页">
+      <button type="button" disabled={loading || page.offset === 0} onClick={() => void load(Math.max(0, page.offset - 20))}>上一页</button>
+      <button type="button" disabled={loading || page.next_offset === null} onClick={() => page.next_offset !== null && void load(page.next_offset)}>下一页</button>
+    </nav>
+  </>;
+}
+
 function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
   const quest = snapshot.research_space.current_quest ?? {
     status: "unavailable" as const,
@@ -999,31 +1050,51 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
   };
   return (
     <section
-      className="lumen-return-summary"
-      aria-label="低密度返场摘要"
+      className="lumen-card research-goal-summary"
+      aria-label="当前目标与完成标准"
       data-testid="return-summary"
     >
       <article>
-        <small>Goal 对齐 · RG</small>
+        <h2>当前目标</h2>
         <b>{quest.status === "ready" ? quest.goal : quest.reason?.code ?? "unavailable"}</b>
         <span>{quest.status === "ready"
-          ? `完成标准：${quest.completion_criteria} · ${quest.goal_revision_ref}`
-          : "不会从浏览器草案推断 Goal"}</span>
-      </article>
-      <article>
-        <small>关键变化 · accepted state</small>
-        <b>{acceptedChangeSummary(snapshot)}</b>
-        <span>只报告已经确认的当前事实</span>
-      </article>
-      <article>
-        <small>当前阻塞</small>
-        <b>{currentBlockerSummary(snapshot)}</b>
-        <span>局部等待与 Quest-wide wait 不合并</span>
-      </article>
-      <article>
-        <small>下一步</small>
-        <b>{nextStepSummary(snapshot)}</b>
-        <span>页面只解释已经确认的状态，不替研究流程作决定</span>
+          ? `完成标准：${quest.completion_criteria} · 版本 ${quest.sequence ?? 0}`
+          : "当前目标暂不可用"}</span>
+        {quest.status === "ready" && quest.guidance_alignment?.length ? (
+          <p role="status">人类指导：{quest.guidance_alignment.some((item) => item.status === "pending") ? "待对齐" : "已对齐"}</p>
+        ) : null}
+        {quest.status === "ready" && quest.judgment ? <span>调整理由：{quest.judgment}</span> : null}
+        {quest.status === "ready" && quest.conditions?.enduring.length ? (
+          <details><summary>持续条件 · {quest.conditions.enduring.length}</summary>
+            <ul>{quest.conditions.enduring.map((condition) => (
+              <li key={condition.condition_ref}>{condition.source_text} · {condition.meaning}</li>
+            ))}</ul>
+          </details>
+        ) : null}
+        {quest.status === "ready" && quest.work?.intents.length ? (
+          <details><summary>工作安排 · {quest.work.intents.length}</summary>
+            <ul>{quest.work.intents.map((intent) => (
+              <li key={intent.intent_ref}>
+                {intent.decision.kind} · {intent.actual_status} · {intent.decision.reason}
+                {intent.decision.retention ? (
+                  <>
+                    {` · 保留 ${intent.decision.retention.kind}`}
+                    {intent.decision.retention.kind === "selected" ? (
+                      <ul>{intent.decision.retention.assets.map((asset) => (
+                        <li key={asset.version_ref}>{asset.version_ref} · {asset.meaning}</li>
+                      ))}</ul>
+                    ) : null}
+                  </>
+                ) : null}
+              </li>
+            ))}</ul>
+          </details>
+        ) : null}
+        {quest.status === "ready" && quest.quest_ref && quest.history ? (
+          <BoundedDetails summary="目标与条件历史">
+            {() => <GoalHistory key={quest.goal_revision_ref} questRef={quest.quest_ref!} initial={quest.history!} />}
+          </BoundedDetails>
+        ) : null}
       </article>
     </section>
   );
@@ -4113,6 +4184,7 @@ function WorkspaceMain({
         ) : null}
       </section>
 
+      {snapshot?.research_space.current_quest.status === "ready" ? <ReturnSummary snapshot={snapshot} /> : null}
       {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchBrief snapshot={snapshot} overview={overview.data} error={overview.error} rootConversations={rootConversations} /> : null}
       {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchTimeline snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} rootConversations={rootConversations} /> : null}
       {snapshot && foreground && !showingLiveOverview ? <>
@@ -4123,6 +4195,8 @@ function WorkspaceMain({
           <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} observationPointers={targetRootObservationPointers} rootConversations={rootConversations} />
           <div><button onClick={onBrowseAssets}>研究资料 ↗</button><button onClick={onBrowseQuestions}>问题树 ↗</button></div>
         </div>
+        <ParallelExecutionLogs targets={allStageSurfaces(snapshot).flatMap(surface => surface.kind === "Bundle" ? surface.projection.target_graph.targets : [])}
+          blocked={humanRequestModalOpen} paused={hidden} />
         {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{requests[0].obligation}</span></span><b>查看并回应 ↗</b></button> : null}
         {rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
           <header><h2>{displayedTarget.target_key}</h2><p>{displayedTargetFacts.summary}</p></header>
@@ -5309,6 +5383,7 @@ function DetailedApp() {
         <QuestCompanion
           state={state}
           collaboration={snapshot?.human_collaboration}
+          goalAlignment={snapshot?.research_space.current_quest.guidance_alignment ?? []}
           researchControl={manualPanel ? undefined : snapshot?.research_control}
           questions={questionTreeItems}
           questionContext={questionTreeOpen && manualPanel === null

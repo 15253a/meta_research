@@ -847,6 +847,7 @@ def create_app(
         "reasoning_stage_worker": _process_reasoning_stage,
         "autonomous_creation_worker": _process_autonomous_creation,
         "quest_completion_worker": _process_quest_completion,
+        "goal_work_reconciler": _process_goal_work,
         "target_run_worker": _process_target_runs,
         "writing_worker": _process_writing,
         "research_asset_intake_worker": _process_research_assets,
@@ -985,6 +986,7 @@ def create_app(
                 "reasoning_stage_worker",
                 "autonomous_creation_worker",
                 "quest_completion_worker",
+                "goal_work_reconciler",
                 "target_run_worker",
                 "writing_worker",
                 "research_asset_intake_worker",
@@ -2350,6 +2352,32 @@ def create_app(
     def get_runtime_conditions(quest_ref: str) -> dict[str, str]:
         from meta_research.runtime_conditions import read_runtime_conditions
         return read_runtime_conditions(runtime.data_root.root, quest_ref)
+
+    @app.get("/api/v1/quests/{quest_ref}/goal")
+    def query_quest_goal(quest_ref: str) -> dict[str, object]:
+        return runtime.owners.research_graph.query_quest_goal_view(quest_ref)
+
+    @app.get("/api/v1/quests/{quest_ref}/goal/history")
+    def query_quest_goal_history(
+        quest_ref: str, offset: int = 0, limit: int = 50
+    ) -> dict[str, object]:
+        return runtime.owners.research_graph.query_quest_goal_history(
+            quest_ref, offset=offset, limit=limit
+        )
+
+    @app.get("/api/v1/quests/{quest_ref}/goal/revisions/{revision_ref}")
+    def query_quest_goal_revision(
+        quest_ref: str, revision_ref: str
+    ) -> dict[str, object]:
+        revision = runtime.owners.research_graph.query_quest_goal_revision_detail(
+            revision_ref
+        )
+        if revision is None or revision.get("quest_ref") != quest_ref:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "quest_goal_revision_not_found"},
+            )
+        return revision
 
     @app.put("/api/v1/quests/{quest_ref}/runtime-conditions")
     def put_runtime_conditions(quest_ref: str, conditions: RuntimeConditionsRequest) -> dict[str, str]:
@@ -4277,6 +4305,21 @@ async def _process_quest_completion(
         worker_label='quest completion',
         timeout_code='quest_completion_operation_timeout',
         timeout_seconds=REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+    )
+
+
+async def _process_goal_work(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    await _process_background_operation(
+        runtime.goal_work_reconciler.process_once,
+        health=health,
+        worker_label="goal work",
+        timeout_code="goal_work_operation_timeout",
+        timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
     )
 

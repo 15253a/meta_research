@@ -8,6 +8,8 @@ AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan�
 
 子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授 Dataset／Environment 接口登记；未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
 
+Quest 方向变化时，先用 `research_graph.quest_goal.read` 取得本操作冻结的 Goal／条件／工作切面，按共享指导合同作完整演化判断，再用 `research_graph.quest_goal.evolve` 提交；不确定效果仅用 `.reconcile` 对账原 effect。新工作使冻结切面 stale 时，交还并由新逻辑根操作取得新切面；不改写已接纳 FormalPlan 或旧调用。
+
 ## 正常流程
 
 1. 观察当前 Bundle 请求及运行绑定，读取精确 FormalPlan、内容 hash 和直接绑定它的 current receipt。
@@ -35,5 +37,7 @@ AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan�
 | `already_accepted` | 验证同 payload／hash 后复用原接纳事实。 |
 
 反馈指向已接纳 FormalPlan／ContextPack 时，沿精确 reader 读回原件并核对绑定。若确认是冻结输入与系统校验不兼容、修订当前候选无法解决，保留原件、候选和审阅结果，携带错误码、字段、绑定及已核对事实提出 `system_operation_help`，说明所需系统修复和恢复条件；不截断或重写已接纳 Plan，也不把技术故障改称科学上的 `replan_required`。同一阻塞复用已打开请求，按 Owner 等待状态交接，不重复原样提交或新建求助；Owner satisfied 后沿保留的根会话及正式恢复身份重新核验并继续。普通候选错误仍自主修订，已授权的独立工作可继续。
+
+外部 MCP 的发现或调用失败按本回合外部 MCP 上下文中的[故障协作与恢复](../../external-mcp-recovery.md)处理。Bundle 判断自身工作和各 Target 的实际依赖，仅受影响 Target 由其原根求助与核验；安排其余 ready 工作。人的修复或替代选择经正式答复交回原根，新逻辑操作取得当前配置，旧操作沿原快照对账。
 
 认证 Web 展示有界事件、当前／历史身份和连接状态；断线、重连、日志缺口或重复不改变研究事实。正式结果仅来自 Owner 验证的接纳链。

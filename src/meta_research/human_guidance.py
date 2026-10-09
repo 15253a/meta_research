@@ -106,11 +106,13 @@ class FrozenGuidanceCut:
     binding: FrozenGuidanceBinding
     provenance_ref: str
     deliveries: tuple[FrozenGuidanceDelivery, ...]
+    direction_cut: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
             "binding": self.binding.as_dict(), "provenance_ref": self.provenance_ref,
             "deliveries": [item.as_dict() for item in self.deliveries],
+            **({} if self.direction_cut is None else {"direction_cut": self.direction_cut}),
         }
 
 
