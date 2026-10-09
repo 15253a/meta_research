@@ -298,6 +298,17 @@ class QuestGoalOwnerMixin:
             self.verify_quest_goal_revision(binding)
         return binding
 
+    def query_quest_goal_revision_detail(
+        self, revision_ref: str
+    ) -> dict[str, object] | None:
+        binding = self.query_quest_goal_revision(revision_ref)
+        if binding is None:
+            return None
+        with self._database.read() as connection:
+            return self._quest_goal_revision_detail_in_transaction(
+                connection, binding
+            )
+
     def verify_quest_goal_revision(self, binding: dict[str, object]) -> None:
         if not isinstance(binding, dict) or binding.get("kind") != "QuestGoalRevision":
             raise OwnerConflict("quest_goal_revision_invalid")
@@ -670,7 +681,11 @@ class QuestGoalOwnerMixin:
                 return {"items": [], "offset": offset, "next_offset": None}
             items: list[dict[str, object]] = []
             if offset == 0:
-                items.append(initial_goal_binding(quest))
+                items.append(
+                    self._quest_goal_revision_detail_in_transaction(
+                        connection, initial_goal_binding(quest)
+                    )
+                )
                 remaining = limit - 1
                 evolved_offset = 0
             else:
@@ -694,12 +709,52 @@ class QuestGoalOwnerMixin:
                 if value is None:
                     raise OwnerConflict("quest_goal_revision_invalid")
                 verify_goal_revision_ancestry_in_transaction(connection, value)
-                items.append(value)
+                items.append(
+                    self._quest_goal_revision_detail_in_transaction(
+                        connection, value
+                    )
+                )
             has_more = len(evolved) > remaining
         return {
             "items": items,
             "offset": offset,
             "next_offset": offset + len(items) if has_more else None,
+        }
+
+    def _quest_goal_revision_detail_in_transaction(
+        self, connection, binding: dict[str, object]
+    ) -> dict[str, object]:
+        if binding.get("origin") != "evolution":
+            return {**binding, "conditions": None, "conditions_review": None}
+        row = connection.execute(
+            text(
+                "SELECT decision_json FROM rg_quest_goal_revisions "
+                "WHERE revision_ref=:revision_ref"
+            ),
+            {"revision_ref": binding["goal_revision_ref"]},
+        ).one()
+        review = parse_evolution_decision(
+            decoded_object(row.decision_json)
+        ).conditions
+        runtime = read_runtime_conditions_in_transaction(
+            connection,
+            str(binding["quest_ref"]),
+            revision=str(review["runtime_conditions_ref"]),
+        )
+        rows = connection.execute(
+            text(
+                "SELECT * FROM rg_goal_revision_conditions WHERE "
+                "revision_ref=:revision_ref ORDER BY condition_ref"
+            ),
+            {"revision_ref": binding["goal_revision_ref"]},
+        ).all()
+        return {
+            **binding,
+            "conditions": {
+                "runtime_conditions": runtime,
+                "enduring": [_condition_public(condition) for condition in rows],
+            },
+            "conditions_review": review,
         }
 
     def query_quest_goal_view(

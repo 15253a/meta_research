@@ -274,7 +274,20 @@ def _read(
         return _stored_value(quest_ref, row["value_json"], row["revision"])
 
 
-def read_runtime_conditions_in_transaction(connection, quest_ref: str) -> dict[str, str]:
+def read_runtime_conditions_in_transaction(
+    connection, quest_ref: str, *, revision: str | None = None
+) -> dict[str, str]:
+    if revision is not None:
+        row = connection.execute(
+            sql_text(
+                "SELECT value_json,revision FROM hc_runtime_condition_versions "
+                "WHERE scope_ref=:scope_ref AND revision=:revision"
+            ),
+            {"scope_ref": quest_ref, "revision": revision},
+        ).first()
+        if row is None:
+            raise OwnerConflict("runtime_conditions_revision_not_found")
+        return _stored_value(quest_ref, row.value_json, row.revision)
     row = connection.execute(
         sql_text(
             "SELECT v.value_json,v.revision FROM hc_runtime_condition_heads h "

@@ -2363,7 +2363,7 @@ def create_app(
     def query_quest_goal_revision(
         quest_ref: str, revision_ref: str
     ) -> dict[str, object]:
-        revision = runtime.owners.research_graph.query_quest_goal_revision(
+        revision = runtime.owners.research_graph.query_quest_goal_revision_detail(
             revision_ref
         )
         if revision is None or revision.get("quest_ref") != quest_ref:
