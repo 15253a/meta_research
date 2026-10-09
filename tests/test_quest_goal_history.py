@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
 from meta_research.runtime_conditions import (
     read_runtime_conditions,
     save_runtime_conditions,
 )
-from test_corrected_quest_initialization import _authenticated_client
+from meta_research.web import create_app
 from test_human_guidance_providers import _submit, _tool
 from test_target_root_finalizer import (
     _admit_independent_target_root,
@@ -18,7 +20,7 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
     tmp_path: Path,
 ) -> None:
     runtime = _current_bundle_runtime(tmp_path / "history")
-    runtime.configure_resident_mcp_endpoint("http://testserver")
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
     try:
         target, _, _, admission, _ = _admit_independent_target_root(runtime)
         launch = runtime.owners.agent_runtime.query_admitted_target_launch(
@@ -126,7 +128,7 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
         first = runtime.harnesses.run_or_resume_target_root(
             admission.run.request_ref,
             prompt="Apply the device audit direction to the Quest.",
-            mcp_base_url="http://testserver",
+            mcp_base_url="http://127.0.0.1:8999",
         )
         assert first.status == "executed"
         initial_runtime = observed[0]["cut"]["conditions"]["runtime_conditions"]
@@ -147,7 +149,7 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
         second = runtime.harnesses.run_or_resume_target_root(
             admission.run.request_ref,
             prompt="Review the newer direction and its condition change.",
-            mcp_base_url="http://testserver",
+            mcp_base_url="http://127.0.0.1:8999",
         )
         assert second.status == "executed"
         latest_runtime = save_runtime_conditions(
@@ -156,7 +158,19 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
             text="A later edit must not alter either accepted historical snapshot.",
             expected_revision=updated_runtime["revision"],
         )
-        client, _ = _authenticated_client(runtime)
+        base_url = "http://127.0.0.1:8999"
+        client = TestClient(
+            create_app(runtime, base_url=base_url, control_key="control-secret"),
+            base_url=base_url,
+        )
+        bootstrap = runtime.authentication.issue_bootstrap_token()
+        authenticated = client.post(
+            "/auth/bootstrap", headers={"Origin": base_url}, json={"token": bootstrap}
+        )
+        assert authenticated.status_code == 200, authenticated.text
+        client.headers.update(
+            {"Origin": base_url, "X-CSRF-Token": authenticated.json()["csrf_token"]}
+        )
         history_url = f"/api/v1/quests/{quest_ref}/goal/history"
         response = client.get(history_url)
         assert response.status_code == 200, response.text
