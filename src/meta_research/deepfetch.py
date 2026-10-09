@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import ExitStack
 from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpRuntime, compose_external_mcp_prompt
 from meta_research.external_mcp_client import ExternalMcpClientError
+from meta_research.deepfetch_sources import SOURCE_LEDGER_SCHEMA, verify_ledger_origins
+from meta_research.search_sources import SearchSourceError, SearchSourceRegistry, parse_basis
 
 import base64
 import hashlib
@@ -451,6 +453,12 @@ class DeepFetchProviderRequest:
     # admitted under a persisted predecessor binding.  Providers must not start
     # or resume an external effect while this flag is set.
     reconcile_only: bool = False
+    creation_context_kind: Literal[
+        "quest_initialization", "manual_question_creation", "autonomous_question_creation"
+    ] = "quest_initialization"
+    creation_context_ref: str | None = None
+    quest_ref: str | None = None
+    literature_access_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -767,6 +775,35 @@ class CodexDeepFetchAdapter:
         ) = None
         self._root_resident_mcp = RootResidentMcpChannels("deepfetch")
         self._external_mcp: ExternalMcpRuntime | None = None
+        self._search_sources: SearchSourceRegistry | None = None
+
+    def bind_search_sources(self, registry: SearchSourceRegistry) -> None:
+        self._search_sources = registry
+
+    def _source_manifest(self, request: DeepFetchProviderRequest, *, recovery: bool = False) -> dict | None:
+        raw_basis = request.scope.get("search_source_basis")
+        if (raw_basis is None or request.literature_access_mode == "provided_only"
+                or request.scope.get("literature_mode") == "provided_only"):
+            return None
+        if self._search_sources is None:
+            raise DeepFetchUnavailable("deepfetch_search_source_runtime_missing")
+        try:
+            basis = parse_basis(raw_basis)
+            scope = basis.as_dict()["scope"]
+            expected_scope = (
+                {"kind": "initialization", "initialization_id": request.initialization_id}
+                if request.creation_context_kind == "quest_initialization"
+                else {"kind": "quest", "quest_ref": request.quest_ref}
+            )
+            if scope != expected_scope:
+                raise DeepFetchUnavailable("deepfetch_search_source_scope_mismatch")
+            return self._search_sources.admit_run(
+                run_ref=request.run_ref, basis=basis,
+                runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
+                recovery=recovery,
+            )
+        except SearchSourceError as error:
+            raise DeepFetchUnavailable(error.code) from error
 
     def bind_external_mcp(self, runtime: ExternalMcpRuntime) -> None:
         self._external_mcp = runtime
@@ -1458,6 +1495,7 @@ class CodexDeepFetchAdapter:
                 durable_outcome="pending",
                 native_session_ref=request.native_session_ref,
             )
+        self._source_manifest(request, recovery=request.reconcile_only)
         if request.reconcile_only:
             return self._reconcile_existing_protocol(
                 request,
@@ -2479,6 +2517,8 @@ class CodexDeepFetchAdapter:
             checkpoint.final_envelope,
             acquisition_request_ids=checkpoint.acquisition_request_ids,
             acquisition_item_proofs=authoritative_acquisition_proofs,
+            search_sources=self._search_sources,
+            source_manifest=self._source_manifest(request),
         )
         web_evidence = {**web_evidence, "prototype": imported[6]}
         result = DeepFetchResult(
@@ -2821,6 +2861,7 @@ class CodexDeepFetchAdapter:
     ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
         with ExitStack() as external_channels:
             external_mcp_access = None
+            external_mcp_binding = None
             if self._external_mcp is not None:
                 identity = canonical_json({"workspace": str(self._workspace.resolve()), "job_ref": request.job_ref,
                     "runtime_binding_hash": canonical_hash(request.runtime_binding.as_dict()),
@@ -2841,12 +2882,26 @@ class CodexDeepFetchAdapter:
                 try:
                     snapshot = self._external_mcp.operation_snapshot(operation_identity=identity,
                         root_kind="deepfetch", task_prompt=prompt, binding=binding, legacy_empty=legacy)
+                    external_mcp_binding = snapshot.binding()
                     if not legacy:
                         prompt = compose_external_mcp_prompt(prompt, snapshot)
                         external_mcp_access = external_channels.enter_context(self._external_mcp.channel(
                             snapshot, resident_token=None if access is None else access.token))
                 except (ExternalMcpError, ExternalMcpClientError) as error:
                     raise DeepFetchUnavailable(error.code) from error
+            manifest = self._source_manifest(request)
+            if manifest is not None:
+                assert self._search_sources is not None
+                try:
+                    self._search_sources.bind_job(
+                        manifest=manifest,
+                        job_ref=request.job_ref or f"{request.run_ref}:direct",
+                        external_mcp_snapshot=external_mcp_binding,
+                    )
+                except SearchSourceError as error:
+                    raise DeepFetchUnavailable(error.code) from error
+                prompt += "\nDeepFetch supplemental source manifest=" + canonical_json(manifest)
+                prompt += "\nUse deepfetch_source_action for selected sources when useful. Preserve returned receipt_ref with the exact returned identity and paper_version. Configuration and tests are not research-use evidence."
             schema = output_schema or _deepfetch_output_schema()
             if request.job_ref is not None and callable(
                 getattr(self._runner, "run_durable_job", None)
@@ -4290,6 +4345,8 @@ def _import_v4_public_artifacts(
     *,
     acquisition_request_ids: tuple[str, ...],
     acquisition_item_proofs: tuple[dict[str, object], ...],
+    search_sources: SearchSourceRegistry | None = None,
+    source_manifest: dict | None = None,
 ) -> tuple[
     Literal["complete", "limited", "honest_empty"],
     str,
@@ -4345,7 +4402,7 @@ def _import_v4_public_artifacts(
     }
     if not isinstance(ledger, dict) or set(ledger) != top_keys:
         raise DeepFetchUnavailable("deepfetch_papers_v4_invalid")
-    if ledger.get("schema_version") != "deepfetch.papers.v4":
+    if ledger.get("schema_version") not in {"deepfetch.papers.v4", SOURCE_LEDGER_SCHEMA}:
         raise DeepFetchUnavailable("deepfetch_papers_v4_invalid")
     paper_order = ledger.get("paper_order")
     paper_records = ledger.get("papers")
@@ -4475,6 +4532,8 @@ def _import_v4_public_artifacts(
         "fulltext_path",
         "reading",
     }
+    if ledger["schema_version"] == SOURCE_LEDGER_SCHEMA:
+        record_keys |= {"paper_version", "discovery_origins"}
     identity_keys = {"paper_id", "title", "doi", "arxiv_id", "openalex_id"}
     metadata_keys = {
         "authors",
@@ -4655,6 +4714,10 @@ def _import_v4_public_artifacts(
                 "retrieved_at": cast(str, finalized_at),
             }
         )
+    try:
+        verify_ledger_origins(ledger, search_sources, source_manifest)
+    except (ValueError, SearchSourceError) as error:
+        raise DeepFetchUnavailable("deepfetch_source_provenance_invalid") from error
     if calculated_missing != missing_fulltexts:
         raise DeepFetchUnavailable("deepfetch_papers_v4_invalid")
     try:
@@ -4736,7 +4799,7 @@ def _validated_result_ledger(
     papers = value.get("papers")
     if (
         set(value) != required
-        or value.get("schema_version") != "deepfetch.papers.v4"
+        or value.get("schema_version") not in {"deepfetch.papers.v4", SOURCE_LEDGER_SCHEMA}
         or not isinstance(paper_order, list)
         or any(not isinstance(item, str) or not item for item in paper_order)
         or len(set(paper_order)) != len(paper_order)

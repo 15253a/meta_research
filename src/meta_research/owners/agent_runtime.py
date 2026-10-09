@@ -9558,7 +9558,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             source_query = (
                 "SELECT runs.runtime_binding_hash, runs.current_attempt_ref AS "
                 "attempt_ref, sessions.root_session_ref, attempts.fence_ref, "
-                "attempts.generation, runs.request_ref FROM ar_deepfetch_runs "
+                "attempts.generation, runs.request_ref, runs.provider_operation_ref FROM ar_deepfetch_runs "
                 "AS runs JOIN "
                 "ar_deepfetch_sessions AS sessions ON sessions.run_ref = "
                 "runs.run_ref JOIN ar_deepfetch_attempts AS attempts ON "
@@ -9624,11 +9624,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             "waiter_ref": f"root_run:{run_ref}",
             "waiter_generation": int(source.generation),
         }
-        if run_kind == "deepfetch" and not quest_ref:
+        if run_kind == "deepfetch":
+            verified_scope["provider_operation_ref"] = source.provider_operation_ref
             verifier = self._deepfetch_request_verifier
             if verifier is None:
                 raise OwnerConflict("deepfetch_acquisition_binding_invalid")
-            binding = verifier.query_initialization_acquisition_binding(
+            binding = verifier.query_deepfetch_acquisition_binding(
                 str(source.request_ref)
             )
             if binding is None:
@@ -9642,9 +9643,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or session.config_hash != binding["acquisition_config_hash"]
                 or session.runtime_binding_hash
                 != binding["acquisition_runtime_binding_hash"]
+                or (quest_ref and session.quest_ref != quest_ref)
             ):
                 raise OwnerConflict("deepfetch_acquisition_binding_invalid")
             verified_scope["acquisition_session_ref"] = session.session_ref
+            verified_scope["literature_access_mode"] = session.mode
         return verified_scope
 
     def _yield_operation_for_human_request(
@@ -17044,7 +17047,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
         ):
             raise OwnerConflict("deepfetch_run_request_invalid")
-        self._verify_deepfetch_acquisition_binding(request, require_ready=False)
+        verified_acquisition_session = self._verify_deepfetch_acquisition_binding(request, require_ready=False)
         try:
             provider_runtime_binding = provider.runtime_binding()
             provider_runtime_binding_hash = validate_runtime_binding(
@@ -17221,6 +17224,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             job_ref=job_ref,
             human_request_resume=human_request_resume,
             reconcile_only=reconcile_only,
+            creation_context_kind=request.creation_context_kind,
+            creation_context_ref=request.creation_context_ref,
+            quest_ref=request.quest_ref,
+            literature_access_mode=verified_acquisition_session.mode,
         )
         try:
             self.begin_provider_unit(

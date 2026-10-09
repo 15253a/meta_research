@@ -1,6 +1,6 @@
 # `papers.json` 台账契约
 
-创建或修改公开台账前读取本文件；它定义 `deepfetch.papers.v4` 的内容与分工。
+创建或修改公开台账前读取本文件；新运行使用 `deepfetch.papers.v4.1`。历史 `deepfetch.papers.v4` 保持原字段和解释，不补造来源回执。
 
 ## 顶层
 
@@ -8,7 +8,7 @@
 
 ```json
 {
-  "schema_version": "deepfetch.papers.v4",
+  "schema_version": "deepfetch.papers.v4.1",
   "topic": {
     "input": "原始任务",
     "interpretation": "简洁检索解释",
@@ -33,9 +33,9 @@
 
 ## 论文身份与元数据
 
-每个 `papers[paper_id]` 恰含 `identity`、`metadata`、`pre_understanding`、`fulltext_path`、`reading`。
+每个新 `papers[paper_id]` 恰含 `identity`、`metadata`、`pre_understanding`、`fulltext_path`、`reading`、`paper_version`、`discovery_origins`。`paper_version` 是已核实的明确版本，如 `published`、`v2`；未知时为 `unverified`。`discovery_origins` 输入为宿主回执引用数组；宿主验证实际返回身份与版本后在 RM 中保留安全来源证明。
 
-创建时用最强已核实标识形成稳定 `paper_id`：依次优先 DOI、arXiv、OpenAlex、确定性标题指纹。后来取得更强标识也保留原 ID；合并需明确身份依据。DOI 不带 URL 前缀，OpenAlex token 为 `W...`，标题保持已核实原文。OpenAlex 记录不是必要条件。
+新记录由工具按最强已核实 DOI、arXiv 或 OpenAlex 标识及版本生成 `paper_id`，后续补全更强标识保留原 ID。跨源只按相同稳定身份与相同确认版本合并，并保留全部回执。相似标题不合并；标题级或网页线索在论文身份核实前保留在研究笔记。arXiv 标识保存基础 ID，vN 保存在 `paper_version`；与正式版分开。版本未知不能自动合并，再次更新须明确指定现有 `paper_id`。DOI 不带 URL 前缀，OpenAlex token 为 `W...`，标题保持已核实原文。
 
 `metadata` 只保存书目事实。`authors`、`institutions` 为名称数组；`citation_count_observed_at` 与 `cited_by_count` 配对，使用 RFC 3339 时间，缺时间的计数视为未知。`source_urls` 是元数据位置，不证明已取得全文。
 

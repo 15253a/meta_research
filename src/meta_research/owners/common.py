@@ -588,7 +588,7 @@ class StageRunRequestVerifier(Protocol):
 
 
 class DeepFetchRunRequestVerifier(Protocol):
-    def query_initialization_acquisition_binding(
+    def query_deepfetch_acquisition_binding(
         self, request_ref: str
     ) -> dict[str, str] | None: ...
 

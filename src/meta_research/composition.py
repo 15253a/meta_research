@@ -173,14 +173,25 @@ class _DeepFetchRequestVerifierRouter:
     ) -> None:
         self._advancement_engine = advancement_engine
 
-    def query_initialization_acquisition_binding(
+    def query_deepfetch_acquisition_binding(
         self, request_ref: str
     ) -> dict[str, str] | None:
         query = getattr(
             self._human_verifier,
-            "query_initialization_acquisition_binding",
+            "query_deepfetch_acquisition_binding",
         )
-        return cast(dict[str, str] | None, query(request_ref))
+        binding = query(request_ref)
+        if binding is not None or self._advancement_engine is None:
+            return cast(dict[str, str] | None, binding)
+        request = self._advancement_engine.query_autonomous_deepfetch_request_by_ref(request_ref)
+        if request is None:
+            return None
+        return {
+            "initialization_id": request.initialization_id,
+            "acquisition_session_ref": request.acquisition_session_ref,
+            "acquisition_config_hash": request.acquisition_config_hash,
+            "acquisition_runtime_binding_hash": request.acquisition_runtime_binding_hash,
+        }
 
     def query_autonomous_deepfetch_request_by_ref(self, request_ref: str):
         if self._advancement_engine is None:
@@ -996,6 +1007,7 @@ def build_production_runtime(
         research_memory=owners.research_memory,
         agent_runtime=owners.agent_runtime,
         acquisition_provider=acquisition_provider,
+        search_sources=search_sources,
         human_collaboration_snapshot=owners.human_collaboration.query_snapshot,
         human_collaboration=owners.human_collaboration,
         target_run_agent=target_run_agent,
