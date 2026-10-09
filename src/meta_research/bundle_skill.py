@@ -1597,9 +1597,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 job_ref=request.job_ref,
             )
         except BundleSkillUnavailable as error:
-            if error.code == "codex_operation_identity_conflict":
+            if error.code in {
+                "codex_operation_identity_conflict", "codex_operation_spool_invalid",
+            }:
                 from meta_research.bundle_dispatch_recovery import recover_rejected_dispatch
 
+                # Changed rolling inputs can fail the sealed prompt comparison
+                # before invocation identity. Recovery verifies the old seal.
                 recover_rejected_dispatch(self, request, operation_name)
             raise
         action = output.get("action")
@@ -1724,7 +1728,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 job_ref=request.job_ref,
             )
         except BundleSkillUnavailable as error:
-            if error.code == "codex_operation_identity_conflict":
+            if error.code in {
+                "codex_operation_identity_conflict", "codex_operation_spool_invalid",
+            }:
                 from meta_research.bundle_dispatch_recovery import recover_rejected_target_batch
 
                 recover_rejected_target_batch(self, request, operation_name)
