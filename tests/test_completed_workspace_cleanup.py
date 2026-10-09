@@ -192,6 +192,28 @@ def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_r
         runtime.close()
 
 
+def test_cycle_cleanup_and_native_rotation_keep_the_companion_workspace(tmp_path):
+    runtime, _, _, cycle_workspace, _, _, _ = _complete(tmp_path)
+    try:
+        human = runtime.owners.human_collaboration
+        quest_ref = runtime.owners.research_graph.query_question_tree()[0].quest_ref
+        scope_ref = "quest:" + quest_ref
+        session = human.query_companion(scope_ref)
+        binding = runtime.root_workspaces.bind_companion_session(scope_ref, session["session_ref"])
+        (binding.directory / "retained-investigation.txt").write_text("Still useful across Cycles.", encoding="utf-8")
+        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        assert {item["root_kind"] for item in report if item["action"] == "removed"} == {
+            "target", "idea", "plan", "bundle", "reasoning"}
+        assert not cycle_workspace.exists()
+        assert all(item["path"] != str(binding.directory) for item in report)
+        human.start_new_companion_session(scope_ref, "after-cycle-cleanup")
+        assert human.query_companion(scope_ref)["workspace_ref"] == session["workspace_ref"]
+        assert runtime.root_workspaces.read_companion_session(scope_ref, session["session_ref"],
+            workspace_ref=session["workspace_ref"], path="retained-investigation.txt")["content"] == b"Still useful across Cycles."
+    finally:
+        runtime.close()
+
+
 def test_pending_stage_asset_intake_survives_cleanup_and_releases_after_public_readback(tmp_path):
     runtime, _, _, _, _, _, _ = _complete(tmp_path)
     try:

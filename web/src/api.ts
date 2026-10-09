@@ -2342,6 +2342,18 @@ export type CompanionMessage = {
   created_at?: number;
   reason?: { code?: string } | null;
   view_context?: CompanionViewContext | null;
+  native_session_generation?: number;
+  native_session_ref?: string | null;
+};
+
+export type CompanionSessionSwitch = {
+  scope_ref: string;
+  session_ref: string;
+  status: "switched";
+  native_session_generation: number;
+  native_session_ref: null;
+  previous_native_session_ref: string | null;
+  switch_ref: string;
 };
 
 export type GuidanceStrength = 1 | 2 | 3 | 4 | 5;
@@ -2738,6 +2750,13 @@ export type HumanCollaborationProjection = {
     status: "ready" | "unavailable";
     scope_ref?: string | null;
     session_ref: string | null;
+    native_session_generation?: number;
+    native_session_ref?: string | null;
+    can_start_new_session?: boolean;
+    switch_block_reason?: string | null;
+    workspace_ref?: string | null;
+    workspace_path?: string | null;
+    native_sessions?: Array<{ generation: number; native_session_ref: string | null; created_at: number }>;
     messages: CompanionMessage[];
     soft_constraints: CompanionSoftConstraint[];
     agent_proposals: CompanionAgentProposal[];
@@ -3499,6 +3518,10 @@ export function sendCompanionMessage(
     message,
     ...(viewContext ? { view_context: viewContext } : {}),
   });
+}
+
+export function startNewCompanionSession(scopeRef: string): Promise<CompanionSessionSwitch> {
+  return writeJson("/api/v1/companion/sessions/new", "POST", { scope_ref: scopeRef });
 }
 
 export function readHumanRequestHandoff(

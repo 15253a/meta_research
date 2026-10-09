@@ -192,13 +192,37 @@ class WorkMaterialsMixin:
     def query_work_material(self, reference_ref):
         return material_reference(self._database, reference_ref)
 
+    def _material_visible_workspaces(self, context):
+        locations = self._root_workspaces._visible(context)
+        visible = {location.workspace_ref for location in locations}
+        if context.root_kind != "companion":
+            return visible
+        companion = self.query_companion_work_context(context.root_session_ref)
+        if companion is None or not companion.get("quest_ref"):
+            return visible
+        quest_ref = companion["quest_ref"]
+        if not any(location.quest_ref == quest_ref for location in locations):
+            return visible
+        # Only registered inputs gain visibility. Their frozen receiver stays the
+        # original research root; generic workspace access is unchanged.
+        with self._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT DISTINCT w.workspace_ref FROM hc_work_material_roots w "
+                "JOIN hc_work_material_submissions s USING(submission_ref), "
+                "json_each(s.receiver_json, '$.roots') root "
+                "WHERE s.state='ready' AND json_extract(root.value, '$.workspace_ref')=w.workspace_ref "
+                "AND json_extract(root.value, '$.quest_ref')=:quest"
+            ), {"quest": quest_ref}).all()
+        visible.update(row.workspace_ref for row in rows)
+        return visible
+
     def _authorize_material(self, reference, context):
         if context is None:
             return
         if context.phase == "creation_materials":
             self._creation_material_operation(context).authorize(context, reference["reference_ref"])
             return
-        visible = {location.workspace_ref for location in self._root_workspaces._visible(context)}
+        visible = self._material_visible_workspaces(context)
         receiver = reference["receiver"]
         if not visible.intersection(root["workspace_ref"] for root in receiver.get("roots", [])):
             raise OwnerConflict("material_not_visible")
@@ -219,7 +243,7 @@ class WorkMaterialsMixin:
                 return {"references": [operation.reference_view(item["reference_ref"]) for item in refs],
                         "next_offset": offset + limit if len(operation.inputs.references) > offset + limit else None,
                         "material_set_hash": operation.inputs.set_hash}
-            visible = None if context is None else [location.workspace_ref for location in self._root_workspaces._visible(context)]
+            visible = None if context is None else sorted(self._material_visible_workspaces(context))
             with self._database.read() as connection:
                 query = "SELECT r.reference_ref FROM hc_work_material_references r JOIN hc_work_material_submissions s USING(submission_ref) WHERE s.state='ready'"
                 params = {"offset": offset, "limit": limit + 1}
@@ -376,7 +400,7 @@ def material_operations(human):
             raise SemanticMcpError(error.code) from error
     properties = {"reference_ref": {"type": "string", "maxLength": 96}, "path": {"type": "string", "maxLength": 4096}}
     return (SemanticOperation(WORK_MATERIAL_OPERATION_IDS[0], "human_collaboration",
-        "Discover saved work material references visible to this actual root and eligible earlier work. Expand one original server directory at a time without preloading, hashing, copying or formal RM intake. Entries and unexpanded scope do not prove reading or understanding. Use observation_ref from an entry for a bounded read.", call,
+        "Discover saved work material references visible to this actual root and eligible earlier work. A registered Quest Companion can read submitted inputs for the same Quest while their original receiver remains unchanged. Expand one original server directory at a time without preloading, hashing, copying or formal RM intake. Entries and unexpanded scope do not prove reading or understanding. Use observation_ref from an entry for a bounded read.", call,
         {"type": "object", "properties": {**properties, "cursor": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": False}, {"type": "object"}),
         SemanticOperation(WORK_MATERIAL_OPERATION_IDS[1], "human_collaboration",
         "Read at most 65536 requested bytes from a saved server material reference with its discovered observation_ref. Recheck original source identity and current root visibility. Returns UTF-8 or base64, exact byte interval and EOF; records successful ranges and failures without claiming comprehension. Changed originals require fresh discovery. No RM binding is required.", call,

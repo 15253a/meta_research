@@ -306,6 +306,33 @@ class RootWorkspaces:
     def bind_companion_session(self, scope_ref: str, root_session_ref: str) -> WorkspaceBinding:
         return self._companion_session_binding(scope_ref, root_session_ref, require_open=True)
 
+    def save_companion_conversation(self, scope_ref: str, root_session_ref: str,
+                                    generation: int, document: dict[str, object]) -> dict[str, object]:
+        """Publish an exact old conversation for optional reading in a fresh native Session."""
+        binding = self.bind_companion_session(scope_ref, root_session_ref)
+        root = binding.directory
+        filename = f"native-session-{generation}.json"
+        path = "companion-history/" + filename
+        content = canonical_json(document).encode("utf-8")
+        temporary = ".conversation-" + secrets.token_hex(16)
+        with _directory_fd(root) as root_fd, _child_directory(root_fd, "companion-history", create=True) as history_fd:
+            try:
+                _write_delivery_file(history_fd, (temporary,), content)
+                _check_directory_identity(root, root_fd)
+                _check_directory_identity(root / "companion-history", history_fd)
+                try:
+                    os.link(temporary, filename, src_dir_fd=history_fd, dst_dir_fd=history_fd, follow_symlinks=False)
+                except FileExistsError:
+                    pass
+                os.fsync(history_fd)
+            finally:
+                os.unlink(temporary, dir_fd=history_fd)
+        if _read_bytes(root, path) != content:
+            raise SemanticMcpError("workspace_conversation_conflict")
+        return {"generation": generation, "native_session_ref": document["native_session_ref"],
+            "workspace_ref": binding.location.workspace_ref, "path": path,
+            "sha256": hashlib.sha256(content).hexdigest()}
+
     def _companion_session_binding(self, scope_ref: str, root_session_ref: str,
                                    *, require_open: bool) -> WorkspaceBinding:
         if (not isinstance(scope_ref, str) or not scope_ref

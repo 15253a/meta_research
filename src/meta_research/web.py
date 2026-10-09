@@ -523,6 +523,11 @@ class CompanionMessageRequest(BaseModel):
     ) = None
 
 
+class CompanionNewSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope_ref: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class HumanReplyUploadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["upload"]
@@ -1503,6 +1508,11 @@ def create_app(
                 else message.view_context.model_dump()
             ),
         )
+
+    @app.post("/api/v1/companion/sessions/new")
+    def start_new_companion_session(request: Request, message: CompanionNewSessionRequest) -> dict[str, object]:
+        scope_ref = require_current_collaboration_scope(message.scope_ref, conflict_code="companion_scope_stale")
+        return runtime.owners.human_collaboration.start_new_companion_session(scope_ref, _idempotency_key(request))
 
     async def conversation_stream(
         request: Request, query: Callable[[], dict[str, object]]

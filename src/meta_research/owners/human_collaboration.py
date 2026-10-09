@@ -270,6 +270,8 @@ class HumanCollaborationInterface(Protocol):
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
 
+    def start_new_companion_session(self, scope_ref: str, idempotency_key: str) -> dict[str, object]: ...
+
     def query_companion_work_context(self, session_ref: str) -> dict[str, object] | None: ...
 
     def query_companion_reply(
@@ -2075,13 +2077,22 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         )
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
-        return self._collaboration_ladder.query_companion(scope_ref)
+        session = self._collaboration_ladder.query_companion(scope_ref)
+        if self._root_workspaces is not None and session["session_ref"] is not None:
+            location = self._root_workspaces.bind_companion_session(scope_ref, session["session_ref"]).location
+            session.update(workspace_ref=location.workspace_ref, workspace_path=str(location.directory))
+        return session
+
+    def start_new_companion_session(self, scope_ref: str, idempotency_key: str) -> dict[str, object]:
+        switched = self._collaboration_ladder.start_new_companion_session(scope_ref, idempotency_key)
+        self._export_companion_histories(scope_ref)
+        return switched
 
     def query_companion_work_context(self, session_ref: str) -> dict[str, object] | None:
         session = self._collaboration_ladder.query_companion_session(session_ref)
         if session is None:
             return None
-        context = self._resolve_companion_context(session["scope_ref"])
+        context = self._resolve_companion_context_without_history(session["scope_ref"])
         return {name: session[name] for name in ("scope_ref", "session_ref", "status")} | {
             "quest_ref": context.get("quest_ref")}
 
@@ -2212,6 +2223,32 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         }
 
     def _resolve_companion_context(
+        self, scope_ref: str, view_context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        context = self._resolve_companion_context_without_history(scope_ref, view_context)
+        history = self._export_companion_histories(scope_ref)
+        return context if not history else {**context, "prior_conversations": history}
+
+    def _export_companion_histories(self, scope_ref: str) -> list[dict[str, object]]:
+        # The database switch is authoritative. A lost export is reconstructed
+        # on /new retry or the next context load, without another switch.
+        if getattr(self, "_root_workspaces", None) is None:
+            return []
+        session = self._collaboration_ladder.query_companion(scope_ref)
+        history = []
+        for native in session["native_sessions"]:
+            generation = native["generation"]
+            if generation >= session["native_session_generation"]:
+                continue
+            document = {"schema_ref": "meta-research/companion-conversation/v1",
+                "scope_ref": scope_ref, "session_ref": session["session_ref"],
+                "native_session_generation": generation, "native_session_ref": native["native_session_ref"],
+                "turns": [turn for turn in session["turns"] if turn["native_session_generation"] == generation]}
+            history.append(self._root_workspaces.save_companion_conversation(
+                scope_ref, session["session_ref"], generation, document))
+        return history
+
+    def _resolve_companion_context_without_history(
         self,
         scope_ref: str,
         view_context: dict[str, object] | None = None,

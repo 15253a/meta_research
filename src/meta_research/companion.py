@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, cast
 
@@ -17,6 +18,7 @@ from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
     IdeaSkillUnavailable,
     _read_operation_invocation,
+    _file_sha256,
 )
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.provider_supervisor import (
@@ -52,7 +54,8 @@ class CodexCompanionAdapter(
 ):
     """One complete, persistent Companion Root and its short-lived proposal forks.
 
-    Companion turns resume the same native Root Session.  A Proposal generation
+    Companion turns resume their generation's native Root Session; `/new`
+    starts a fresh generation in the same workspace. A Proposal generation
     is not another narrow provider: the Companion must spawn exactly one fresh
     child with inherited context, wait for it, and return its schema-constrained
     draft.  A short child message points to the exact current materials already
@@ -92,6 +95,23 @@ class CodexCompanionAdapter(
 
     def capability_profile(self) -> RootCapabilityProfile:
         return root_capability_profile("companion")
+
+    def runtime_binding(self):
+        binding = super().runtime_binding()
+        guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
+        source_hash = _file_sha256(Path(__file__).resolve())
+        return replace(binding,
+            packaged_skill_bundle_hash=canonical_hash({
+                "inherited": binding.packaged_skill_bundle_hash, "companion-work.md": guidance,
+            }),
+            instruction_set_hash=canonical_hash({
+                "inherited": binding.instruction_set_hash,
+                "companion-work.md": guidance, "companion_source": source_hash,
+            }),
+            resource_bindings=(*binding.resource_bindings,
+                "package:meta_research.skills/companion-work.md@sha256:" + canonical_hash(guidance),
+                "adapter-source:meta_research.companion@sha256:" + source_hash),
+        )
 
     def cancel_job(self, job_ref: str) -> bool:
         with self._creation_call_lock:
@@ -426,8 +446,9 @@ class CodexCompanionAdapter(
             )
         elif companion:
             role_instruction = (
-                "你是长期存在的全局 Companion 根智能体。依据 current_draft 中已投影"
-                "的事实解释研究、总结状态并提出可撤回建议；不得把聊天推断成人类授权。"
+                "你是当前研究范围内独立的 Companion 根智能体。依据人的要求和已有授权，"
+                "分步调查、执行和核验工作，说明实际结果、读取范围与局限。"
+                "当前研究事实提供定位，必要材料按需读取。正式答复由人审阅选择并明确提交。"
             )
             context_identity = f"scope_ref={request.initialization_id}\n"
         else:
@@ -446,6 +467,9 @@ class CodexCompanionAdapter(
             f"current_draft={_canonical_json(request.draft)}\n"
             f"user_message={request.message}"
         )
+        if companion:
+            guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
+            prompt += "\n\n<!-- bundled resource: companion-work.md -->\n" + guidance
         if request.job_ref is not None:
             prompt = preserve_existing_reply_prompt(
                 prompt,
