@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import mimetypes
@@ -35,6 +36,7 @@ class InitializationUnderstandingRequest:
     creation_context_ref: str | None = None
     context_generation: int | None = None
     inputs: object | None = None
+    reassessment: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class InitializationUnderstandingResult:
     companion_native_session_ref: str | None = None
     input_identity: object | None = None
     work: object | None = None
+    reassessment: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,34 @@ def understanding_schema(*, references=False) -> dict[str, object]:
         "required": [*UNDERSTANDING_FIELDS, "coverage", "selection"]}
 
 
+def reassessment_schema():
+    def record(properties):
+        return {"type": "object", "additionalProperties": False, "properties": properties, "required": list(properties)}
+
+    string = {"type": "string", "minLength": 1}
+    strings = {"type": "array", "items": string}
+    return record({
+        "predecessor": record({"basis_ref": string, "basis_hash": string, "kind": string}),
+        "change_assessment": string,
+        "decisions": {"type": "array", "items": record({
+            "prior_statement_ref": string,
+            "disposition": {"enum": ["retain", "replace", "needs_recheck", "out_of_scope"]},
+            "explanation": string, "applicable_conditions": strings,
+            "affected_scope": {"type": "string"},
+            "creation_limit": {"enum": ["none", "required_first_question", "future_research"]},
+            "replacement_refs": strings})},
+        "additions": understanding_schema(references=True),
+        "inherited_evidence": {"type": "array", "items": record({
+            "kind": {"enum": ["live_source", "managed_history"]}, "witness_ref": string,
+            "selected_material_key": {"type": ["string", "null"]}})},
+        "inherited_selection_keys": strings,
+        "literature_decisions": {"type": "array", "items": record({
+            "snapshot_ref": string, "snapshot_hash": string,
+            "disposition": {"enum": ["retain", "needs_recheck", "out_of_scope"]},
+            "applicable_conditions": strings, "affected_scope": {"type": "string"},
+            "limitations": string})}})
+
+
 def revision_schema(*, references=False) -> dict[str, object]:
     return {"type": "object", "additionalProperties": False, "properties": {
         "understanding": understanding_schema(references=references),
@@ -218,12 +249,13 @@ def validate_understanding(value, manifest, read_witness) -> dict[str, object]:
     return value
 
 
-def validate_reference_understanding(value, inputs, identity, server_files):
+def validate_reference_understanding(value, inputs, identity, server_files, historical=()):
     from jsonschema import Draft202012Validator
     try:
         Draft202012Validator(understanding_schema(references=True)).validate(value)
         references = {item["reference_ref"]: item for item in inputs.references}
         witnesses = {item.witness_ref: item for item in identity.consumed}
+        historical = {item.witness_ref: item for item in historical}
         coverage = {item["material_key"]: item for item in value["coverage"]}
         if len(coverage) != len(value["coverage"]) or set(coverage) != set(references):
             raise ValueError("coverage")
@@ -264,6 +296,8 @@ def validate_reference_understanding(value, inputs, identity, server_files):
                 if field not in {"material_composition", "gaps", "unfinished_questions"} and not statement["sources"]:
                     raise ValueError("unsupported content")
                 for citation in statement["sources"]:
+                    if citation["witness_ref"] in historical:
+                        continue
                     if coverage[witness(citation).reference_ref]["kind"] == "unread":
                         raise ValueError("unread claim")
         selected = set()
@@ -319,10 +353,152 @@ class CreationBasisMemory:
             return basis
         return None
 
+    def reassessment_context(self, inputs):
+        with self._database.read() as connection:
+            rows = connection.execute(text("SELECT basis_ref FROM rm_creation_bases WHERE initialization_id=:id "
+                "AND input_identity_hash IS NOT NULL ORDER BY rowid DESC"), {"id": inputs.anchor.ref}).all()
+        predecessor = next((basis for row in rows if (basis := self.query(row.basis_ref))["input_identity"]["anchor"]["kind"] == inputs.anchor.kind), None)
+        if predecessor is None:
+            return None
+        from meta_research.creation_inputs import CreationInputIdentity, ReadWitness, require_identity
+        facts = []
+        witnesses = {item["witness_ref"]: item for item in predecessor["input_identity"]["consumed"]}
+        for inherited in predecessor.get("inherited_evidence", []):
+            witnesses[inherited["witness"]["witness_ref"]] = inherited["witness"]
+        for item in witnesses.values():
+            try:
+                require_identity(self.workspaces._hc, CreationInputIdentity(inputs.anchor, inputs.set_hash, (ReadWitness(**item),)))
+                live, live_limit = True, None
+            except OwnerConflict as error:
+                live, live_limit = False, error.code
+            historical = []
+            for source in predecessor["sources"]:
+                if source.get("binding") is None:
+                    continue
+                try:
+                    self._historical_witness(predecessor, item, source["material_key"])
+                    historical.append(source["material_key"])
+                except OwnerConflict:
+                    pass
+            facts.append({"witness": item, "live_source_eligible": live, "live_source_limit": live_limit,
+                "managed_history_keys": historical})
+        return {"predecessor": self.reference(predecessor), "prior_draft": predecessor.get("draft_context"),
+            "prior_understanding": predecessor["understanding"], "current_materials": inputs.as_dict(),
+            "evidence_facts": facts, "prior_sources": self.source_views(predecessor),
+            "prior_literature": self._literature_relations(predecessor)}
+
+    @staticmethod
+    def _literature_relations(basis):
+        relations = [copy.deepcopy(item) for item in basis.get("inherited_literature", [])]
+        if basis.get("literature_snapshot") is not None:
+            relations.append({"snapshot": basis["literature_snapshot"], "original_basis": basis["predecessor"]})
+        return {item["snapshot"]["snapshot_ref"]: item for item in relations}
+
+    def _historical_witness(self, predecessor, witness, source_key):
+        source = next((item for item in predecessor["sources"] if item["material_key"] == source_key), None)
+        if (source is None or source.get("custody") != "managed" or source.get("binding") is None
+            or source["source"].get("kind") != "original_file"
+            or source["source"]["reference_ref"] != witness["reference_ref"]
+            or source["source"]["path"] != witness["path"]
+            or source["source"]["observation_ref"] != witness["observation_ref"]):
+            raise OwnerConflict("creation_inheritance_invalid")
+        content = self.read_source(predecessor, source_key, witness["offset"], max(1, witness["length"]))["content"]
+        if len(content) != witness["length"] or hashlib.sha256(content).hexdigest() != witness["chunk_sha256"]:
+            raise OwnerConflict("creation_inheritance_invalid")
+        return source
+
+    def _compose_reassessment(self, inputs, delta):
+        from jsonschema import Draft202012Validator
+        from meta_research.creation_inputs import CreationInputIdentity, ReadWitness, require_identity
+        try:
+            Draft202012Validator(reassessment_schema()).validate(delta)
+            predecessor = self.query(delta["predecessor"]["basis_ref"], delta["predecessor"]["basis_hash"])
+            anchor = predecessor["input_identity"]["anchor"]
+            if (anchor["kind"], anchor["ref"]) != (inputs.anchor.kind, inputs.anchor.ref) or self.reference(predecessor) != delta["predecessor"]:
+                raise ValueError("predecessor context")
+            originals = {item["ref"]: (field, item) for field in UNDERSTANDING_FIELDS for item in predecessor["understanding"][field]}
+            decisions = {item["prior_statement_ref"]: item for item in delta["decisions"]}
+            if len(decisions) != len(delta["decisions"]) or set(decisions) != set(originals):
+                raise ValueError("statement decisions")
+            understanding = copy.deepcopy(delta["additions"])
+            additions = {item["ref"] for field in UNDERSTANDING_FIELDS for item in understanding[field]}
+            if additions & set(originals):
+                raise ValueError("new statement refs")
+            for ref, decision in decisions.items():
+                if decision["disposition"] == "retain":
+                    if decision["replacement_refs"]:
+                        raise ValueError("retain replacement")
+                    field, statement = originals[ref]
+                    understanding[field].append(copy.deepcopy(statement))
+                elif decision["disposition"] == "replace":
+                    if not decision["replacement_refs"] or not set(decision["replacement_refs"]).issubset(additions):
+                        raise ValueError("replacement refs")
+                elif not decision["affected_scope"].strip() or decision["creation_limit"] == "none":
+                    raise ValueError("excluded scope")
+            prior_witnesses = {item["witness_ref"]: item for item in predecessor["input_identity"]["consumed"]}
+            for inherited in predecessor.get("inherited_evidence", []):
+                prior_witnesses[inherited["witness"]["witness_ref"]] = inherited["witness"]
+            inherited = []
+            seen = set()
+            selected = {item["material_key"]: item for item in predecessor["sources"] if item.get("binding") is not None}
+            keys = delta["inherited_selection_keys"]
+            if len(set(keys)) != len(keys) or not set(keys).issubset(selected):
+                raise ValueError("inherited selection")
+            for item in delta["inherited_evidence"]:
+                witness = prior_witnesses[item["witness_ref"]]
+                if witness["witness_ref"] in seen:
+                    raise ValueError("duplicate inherited evidence")
+                seen.add(witness["witness_ref"])
+                if item["kind"] == "live_source":
+                    if item["selected_material_key"] is not None:
+                        raise ValueError("live binding")
+                    require_identity(self.workspaces._hc, CreationInputIdentity(inputs.anchor, inputs.set_hash, (ReadWitness(**witness),)))
+                    proof = {}
+                else:
+                    if item["selected_material_key"] not in keys:
+                        raise ValueError("history selection")
+                    source = self._historical_witness(predecessor, witness, item["selected_material_key"])
+                    proof = {"binding": source["binding"], "content_hash": source["sha256"]}
+                inherited.append({**item, **proof, "predecessor": self.reference(predecessor), "witness": witness})
+            inherited_sources = [copy.deepcopy(selected[key]) for key in keys]
+            for source in inherited_sources:
+                source["inherited_from"] = self.reference(predecessor)
+                self.read_source(predecessor, source["material_key"], 0, 1)
+            prior_literature = self._literature_relations(predecessor)
+            literature_decisions = {item["snapshot_ref"]: item for item in delta["literature_decisions"]}
+            if len(literature_decisions) != len(delta["literature_decisions"]) or set(literature_decisions) != set(prior_literature):
+                raise ValueError("literature decisions")
+            literature = []
+            for ref, decision in literature_decisions.items():
+                relation = prior_literature[ref]
+                if relation["snapshot"]["snapshot_hash"] != decision["snapshot_hash"]:
+                    raise ValueError("literature hash")
+                if decision["disposition"] == "retain":
+                    snapshot = self._owner.query_literature_snapshot(ref)
+                    if snapshot.snapshot_hash != decision["snapshot_hash"]:
+                        raise ValueError("literature snapshot")
+                    literature.append({**copy.deepcopy(relation), "applicability": decision})
+            applicability = {"predecessor": self.reference(predecessor), "change_assessment": delta["change_assessment"],
+                "decisions": delta["decisions"], "literature_decisions": delta["literature_decisions"]}
+            return understanding, inherited, inherited_sources, literature, applicability
+        except OwnerConflict:
+            raise
+        except Exception as error:
+            raise OwnerConflict("creation_reassessment_invalid") from error
+
     def require_current(self, basis):
         from meta_research.creation_inputs import CreationInputIdentity, require_identity
         if basis.get("input_identity") is not None:
-            return require_identity(self.workspaces._hc, CreationInputIdentity.from_dict(basis["input_identity"]))
+            identity = CreationInputIdentity.from_dict(basis["input_identity"])
+            from meta_research.creation_inputs import ReadWitness
+            live = tuple(ReadWitness(**item["witness"]) for item in basis.get("inherited_evidence", []) if item["kind"] == "live_source")
+            inputs = require_identity(self.workspaces._hc, CreationInputIdentity(identity.anchor, identity.material_set_hash, identity.consumed + live))
+            for item in basis.get("inherited_evidence", []):
+                if item["kind"] == "managed_history":
+                    source = self._historical_witness(basis, item["witness"], item["selected_material_key"])
+                    if source["binding"] != item["binding"] or source["sha256"] != item["content_hash"]:
+                        raise OwnerConflict("creation_inheritance_invalid")
+            return inputs
 
     def _accept(self, body):
         from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
@@ -375,26 +551,48 @@ class CreationBasisMemory:
 
     def accept_reference_prepared(self, request, result):
         from meta_research.owners.research_memory import AssetIntakeRequest
+        from meta_research.creation_inputs import CreationInputIdentity, ReadWitness
         inputs, identity, work = request.inputs, result.input_identity, result.work
         if (inputs is None or identity is None or work is None or work.sealed_identity != identity
             or work.operation.inputs != inputs or work.operation.operation_ref != request.job_ref
             or identity.anchor != inputs.anchor or identity.material_set_hash != inputs.set_hash):
             raise OwnerConflict("creation_input_identity_invalid")
-        validate_reference_understanding(result.understanding, inputs, identity, self.workspaces.server_files)
-        coverage = {item["material_key"]: item for item in result.understanding["coverage"]}
+        understanding = result.understanding
+        inherited, inherited_sources, literature, applicability = [], [], [], None
+        if result.reassessment is not None:
+            if request.reassessment is None or result.reassessment["predecessor"] != request.reassessment["predecessor"]:
+                raise OwnerConflict("creation_reassessment_invalid")
+            understanding, inherited, inherited_sources, literature, applicability = self._compose_reassessment(inputs, result.reassessment)
+        elif request.reassessment is not None:
+            raise OwnerConflict("creation_reassessment_required")
+        live = tuple(ReadWitness(**item["witness"]) for item in inherited if item["kind"] == "live_source")
+        historical = tuple(ReadWitness(**item["witness"]) for item in inherited if item["kind"] == "managed_history")
+        effective = CreationInputIdentity(identity.anchor, identity.material_set_hash, identity.consumed + live)
+        validate_reference_understanding(understanding, inputs, effective, self.workspaces.server_files, historical)
+        new_selection = list(understanding["selection"])
+        understanding = copy.deepcopy(understanding)
+        understanding["selection"].extend({"source": source["source"], "custody": source["custody"],
+            "reason": source["selection_reason"]} for source in inherited_sources)
+        if len({canonical_hash(item["source"]) for item in understanding["selection"]}) != len(understanding["selection"]):
+            raise OwnerConflict("creation_reassessment_invalid")
+        coverage = {item["material_key"]: item for item in understanding["coverage"]}
         body = {"schema_ref": "meta-research/creation-research-basis/v2", "kind": "prepared",
             "draft": {"initialization_id": inputs.anchor.ref, "revision": request.draft_revision, "hash": request.draft_hash},
             "root_session_ref": request.root_session_ref, "manifest": empty_manifest(),
             "manifest_hash": canonical_hash(empty_manifest()), "material_references": inputs.as_dict(),
-            "input_identity": identity.as_dict(), "understanding": result.understanding,
-            "sources": [], "predecessor": None, "literature_snapshot": None, "corrections": [], "search_assessment": None}
+            "input_identity": identity.as_dict(), "understanding": understanding, "draft_context": request.draft,
+            "sources": inherited_sources, "predecessor": None if applicability is None else applicability["predecessor"],
+            "literature_snapshot": None, "corrections": [], "search_assessment": None}
+        if applicability is not None:
+            body.update(schema_ref="meta-research/creation-research-basis/v3", applicability=applicability,
+                inherited_evidence=inherited, inherited_literature=literature)
         self.require_current(body)
         for entry in inputs.references:
             body["sources"].append({"material_key": entry["reference_ref"], "relative_path": entry["source"]["absolute_path"],
                 "reference": entry, "source": {"kind": "material_reference", "reference_ref": entry["reference_ref"]},
                 "coverage": coverage[entry["reference_ref"]], "selection_reason": None, "binding": None,
                 "custody": None, "intake_state": None})
-        for selected in result.understanding["selection"]:
+        for selected in new_selection:
             source = selected["source"]
             retained = work.retain_source(source)
             locator = (retained["original_locator"] if selected["custody"] == "linked_local"
@@ -575,15 +773,27 @@ class CreationBasisMemory:
             views.append(view)
         return views
 
-    @staticmethod
-    def citation_view(basis, citation):
-        item = next(item for item in basis["input_identity"]["consumed"] if item["witness_ref"] == citation["witness_ref"])
-        return {**item, "material_key": item["reference_ref"], "location": citation["location"]}
+    def citation_view(self, basis, citation):
+        item = next((item for item in basis["input_identity"]["consumed"] if item["witness_ref"] == citation["witness_ref"]), None)
+        provenance = {"kind": "current_operation"}
+        if item is None:
+            inherited = next((item for item in basis.get("inherited_evidence", [])
+                if item["witness"]["witness_ref"] == citation["witness_ref"]), None)
+            if inherited is None:
+                if basis.get("predecessor") is None:
+                    raise OwnerConflict("creation_inheritance_invalid")
+                predecessor = self.query(basis["predecessor"]["basis_ref"], basis["predecessor"]["basis_hash"])
+                return {**self.citation_view(predecessor, citation), "provenance": {
+                    "kind": "historical_identity", "predecessor": basis["predecessor"]}}
+            item = inherited["witness"]
+            provenance = {key: value for key, value in inherited.items() if key != "witness"}
+        return {**item, "material_key": item["reference_ref"], "location": citation["location"], "provenance": provenance}
 
     def understanding_view(self, basis):
         if basis.get("input_identity") is None:
             return basis["understanding"]
-        return {**basis["understanding"], **{field: [{**statement, "sources": [
+        return {**basis["understanding"], "applicability": basis.get("applicability"),
+            "inherited_literature": basis.get("inherited_literature", []), **{field: [{**statement, "sources": [
             self.citation_view(basis, citation) for citation in statement["sources"]]}
             for statement in basis["understanding"][field]] for field in UNDERSTANDING_FIELDS}}
 
