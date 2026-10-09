@@ -340,7 +340,7 @@ export type CreationResearchBasis = {
     }>;
   } | null;
   inherited_literature?: Array<{
-    snapshot: { snapshot_ref: string; snapshot_hash: string; run_ref?: string };
+    snapshot: { snapshot_ref: string; snapshot_hash: string; binding: { run_ref: string } };
     original_basis: { basis_ref: string; basis_hash: string; kind: string };
     applicability: { applicable_conditions: string[]; affected_scope: string; limitations: string };
   }>;

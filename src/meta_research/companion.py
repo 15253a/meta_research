@@ -265,13 +265,14 @@ class CodexCompanionAdapter(
         try:
             if request.inputs is not None:
                 prompt = ("Read registered material entrances only through the granted bounded discover/read/copy MCP tools. "
-                    "Return the reference understanding schema using actual returned opaque witness_ref citations. "
-                    "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
+                    + ("Return the reference understanding schema using actual returned opaque witness_ref citations. "
+                       if request.reassessment is None else "Return the reassessment delta using actual returned opaque witness_ref citations for new reads. ")
+                    + "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
                     "A directory is never completely read merely because one child was read.\n"
                     + _canonical_json({"instruction_bundle": instructions, "draft": request.draft,
                         "reassessment": request.reassessment}))
                 if request.reassessment is not None:
-                    prompt += ("\nReturn the reassessment delta. Judge each prior statement's applicability and conditions. "
+                    prompt += ("\nJudge each prior statement's applicability and conditions. "
                         "Read only affected content. Explicitly inherit eligible witnesses with their original operation identity. "
                         "Managed history supports historical statements, never current read coverage. Mark necessary first-Question "
                         "checks versus future research without a global waiting gate. Decide separately for every old literature snapshot. "

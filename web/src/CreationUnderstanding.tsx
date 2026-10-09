@@ -98,7 +98,7 @@ export function CreationUnderstanding({ basis }: { basis: CreationResearchBasis 
       <p>这些快照保留原检索身份，不表示本次进行了新检索。</p>
       <ul>{basis.inherited_literature.map((item) => <li key={item.snapshot.snapshot_ref}>
         <small>{item.snapshot.snapshot_ref} · {item.snapshot.snapshot_hash}</small>
-        {item.snapshot.run_ref ? <small>原检索：{item.snapshot.run_ref}</small> : null}
+        <small>原检索：{item.snapshot.binding.run_ref}</small>
         <small>原绑定依据：{item.original_basis.basis_ref}</small>
       </li>)}</ul>
     </div> : null}
