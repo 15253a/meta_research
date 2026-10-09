@@ -2736,7 +2736,10 @@ export type QuestGoalRevisionDetail = {
   criteria_review?: string;
   conditions: {
     runtime_conditions: QuestRuntimeConditions;
-    enduring: Array<{ condition_ref: string; source_text: string; meaning: string; source: Record<string, unknown> }>;
+    enduring: Array<{
+      condition_ref: string; source_text: string; meaning: string; source: Record<string, unknown>;
+      status: "active" | "human_superseded"; superseding_source?: Record<string, unknown>;
+    }>;
   } | null;
   conditions_review: {
     assessments: Array<{ condition_ref: string; disposition: string; explanation: string; superseding_delivery_ref?: string }>;

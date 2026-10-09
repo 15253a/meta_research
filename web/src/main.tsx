@@ -1017,7 +1017,9 @@ function GoalHistory({ questRef, initial }: { questRef: string; initial: QuestGo
           <ul>{revision.conditions.enduring.map((condition) => (
             <li key={condition.condition_ref}>
               {condition.source_text} · {condition.meaning}
+              <span> · {condition.status === "human_superseded" ? "后续人类指导取代" : "继续保留"}</span>
               {typeof condition.source.delivery_ref === "string" ? <span> · 来源 {condition.source.delivery_ref}</span> : null}
+              {typeof condition.superseding_source?.delivery_ref === "string" ? <span> · 取代来源 {condition.superseding_source.delivery_ref}</span> : null}
             </li>
           ))}</ul>
           <ul>{revision.conditions_review?.assessments.map((assessment) => (
