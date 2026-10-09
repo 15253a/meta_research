@@ -94,10 +94,17 @@ class ProtectedCreation:
         if self.read_literature is not None:
             metadata = memory._owner.read_literature_snapshot_metadata(self.read_literature["snapshot_ref"])
             anchor = self.operation.inputs.anchor
+            generation = metadata.get("context_generation")
+            if anchor.kind == "manual_question_creation":
+                request = self.owner._hc.query_deepfetch_request(metadata["request_ref"])
+                if (request is None or request.creation_context_kind != anchor.kind
+                    or request.creation_context_ref != anchor.ref or request.quest_ref != metadata["quest_ref"]):
+                    raise OwnerConflict("creation_literature_unbound")
+                generation = request.context_generation
             if (metadata["snapshot_hash"] != self.read_literature["snapshot_hash"]
                 or metadata.get("creation_context_kind", "quest_initialization") != anchor.kind
                 or (metadata.get("creation_context_ref") or metadata["initialization_id"]) != anchor.ref
-                or metadata.get("context_generation") != anchor.generation):
+                or generation != anchor.generation):
                 raise OwnerConflict("creation_literature_unbound")
         self.execution_binding["context_readers"] = {"basis": self.read_basis, "literature": self.read_literature}
 

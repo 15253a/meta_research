@@ -461,9 +461,14 @@ class CodexCompanionAdapter(
         try:
             identity, work = None, None
             if request.inputs is not None:
+                reply_schema = _reply_schema(include_agent_proposal=companion)
+                if request.literature_snapshot is not None:
+                    reply_schema["properties"]["revision"] = revision_schema(references=True)
+                    reply_schema["required"].append("revision")
+                    prompt += "\nRead the accepted literature through the exact scoped Reader. Return a complete understanding revision and honest source-backed corrections; keep the Seed and source selection immutable."
                 raw, native_session_ref, _stdout, identity, work = self._protected_creation_invoke(request,
                     operation_name="companion-turn", prompt=prompt,
-                    schema=_reply_schema(include_agent_proposal=companion), native_session_ref=request.native_session_ref,
+                    schema=reply_schema, native_session_ref=request.native_session_ref,
                     inputs=request.inputs)
             else:
                 raw, native_session_ref, _stdout = (
@@ -486,6 +491,8 @@ class CodexCompanionAdapter(
             ) from error
         reply = raw.get("reply")
         expected_keys = {"reply", "agent_proposal"} if companion else {"reply"}
+        if request.inputs is not None and request.literature_snapshot is not None:
+            expected_keys.add("revision")
         if (
             set(raw) != expected_keys
             or not isinstance(reply, str)
@@ -515,6 +522,7 @@ class CodexCompanionAdapter(
             agent_proposal=agent_proposal,
             input_identity=identity,
             work=work,
+            revision=raw.get("revision"),
         )
 
 

@@ -612,6 +612,8 @@ class HumanCollaborationInterface(Protocol):
         idempotency_key: str,
     ) -> dict[str, object]: ...
 
+    def prepare_manual_creation_understanding(self, context_ref: str, *, idempotency_key: str) -> dict[str, object]: ...
+
     def save_manual_question_proposal(
         self,
         context_ref: str,
@@ -621,6 +623,7 @@ class HumanCollaborationInterface(Protocol):
         idempotency_key: str,
         expected_proposal_ref: str | None = None,
         expected_proposal_hash: str | None = None,
+        expected_input_identity_hash: str | None = None,
     ) -> dict[str, object]: ...
 
     def confirm_manual_question_proposal(
@@ -9155,6 +9158,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 ) from error
             raise
 
+    def prepare_manual_creation_understanding(self, context_ref: str, *, idempotency_key: str) -> dict[str, object]:
+        self._manual_creation.prepare_material_basis(context_ref, idempotency_key=idempotency_key)
+        return self._manual_creation.query(context_ref)
+
     def save_manual_question_proposal(
         self,
         context_ref: str,
@@ -9164,11 +9171,13 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         idempotency_key: str,
         expected_proposal_ref: str | None = None,
         expected_proposal_hash: str | None = None,
+        expected_input_identity_hash: str | None = None,
     ) -> dict[str, object]:
         return self._manual_creation.save_proposal(
             context_ref,
             content=content,
             expected_basis_hash=expected_basis_hash,
+            expected_input_identity_hash=expected_input_identity_hash,
             expected_proposal_ref=expected_proposal_ref,
             expected_proposal_hash=expected_proposal_hash,
             idempotency_key=idempotency_key,

@@ -73,7 +73,7 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
                 "custody": "linked_local", "reason": "Keep the selected trial."})
         if arguments["operation_name"] == "initialization-understanding":
             return understanding, "native-parent", ""
-        if arguments["operation_name"] == "companion-turn":
+        if arguments["operation_name"] == "companion-turn" and work.read_basis is None:
             return {"reply": "The bounded notes support an editable calibration comparison."}, "native-parent", ""
         basis = self._workspaces._hc._research_memory.creation_bases.query(work.read_basis["basis_ref"], work.read_basis["basis_hash"])
         value = _value(_call(gateway, Connection(), "research_memory.creation_basis.read", basis_ref=basis["basis_ref"],
@@ -93,7 +93,17 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
             summary = _value(_call(gateway, Connection(), "research_memory.content.read", source_ref=snapshot, version_ref=snapshot))
             assert summary
             revised = copy.deepcopy(basis["understanding"])
-            revision = {"understanding": revised, "corrections": [], "search_assessment": "The accepted literature was read within its recorded limits."}
+            claim = revised["claims_and_conditions"][0]
+            claim["text"] = "The literature counterproof qualifies the original16 claim: a condition-specific comparison remains necessary."
+            claim["conditions"].append("The accepted paper does not establish transfer to the cold condition.")
+            original_ref = next(item["reference_ref"] for item in basis["material_references"]["references"])
+            revision = {"understanding": revised, "corrections": [{"prior_statement_ref": claim["ref"],
+                "disposition": "qualified", "explanation": "The accepted paper supplies a counterexample to unrestricted transfer.",
+                "original_sources": [original_ref], "literature_sources": [{"paper_id": "doi:10.1000/example.one", "locator": "loc-1"}]}],
+                "search_assessment": "One accepted paper qualifies transfer; the second has no accepted full text."}
+        if arguments["operation_name"] == "companion-turn":
+            return {"reply": "The bounded notes and accepted evidence support an editable calibration comparison.",
+                **({} if revision is None else {"revision": revision})}, "native-parent", ""
         return {"proposal_fork_native_session_ref": "native-child", "result": {"content": QUESTION, "revision": revision}}, "native-parent", ""
 
 

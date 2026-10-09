@@ -122,7 +122,7 @@ def accept_root_question(runtime) -> tuple[str, str, str]:
         preview_hash=previewed["confirmation_preview"]["hash"],
         idempotency_key="manual-prerequisite-confirm",
     )
-    for _attempt in range(5):
+    for _attempt in range(20):
         if not human.reconcile_once():
             break
     completed = human.query_quest_creation(opened["initialization_id"])

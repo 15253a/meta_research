@@ -168,6 +168,7 @@ class IntentTurnResult:
     agent_proposal: dict[str, object] | None = None
     input_identity: object | None = None
     work: object | None = None
+    revision: dict[str, object] | None = None
 
 
 class ProposalDrafter(Protocol):

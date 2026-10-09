@@ -13,16 +13,33 @@ from test_public_first_question_deepfetch import (
 )
 from test_public_quest_initialization import _confirmation_payload
 from test_public_work_materials import _source
+from test_root_workspace import _context, _channel, _call, _accepted
 
 
 pytestmark = pytest.mark.skipif(os.name != "posix" or os.geteuid() != 0, reason="requires actual protected creation runtime")
 
 
+class ReferenceReadingDeepFetch(DeterministicDeepFetchProvider):
+    def execute(self, request):
+        context = _context(request, "deepfetch")
+        channel = _channel(self.runtime, context)
+        exact = request.scope["creation_basis"]
+        prior = _accepted(_call(self.runtime, channel, "research_memory.creation_basis.read", basis_ref=exact["basis_ref"],
+            expected_basis_hash=exact["basis_hash"], view="understanding", limit=16384))
+        assert "Original16" in str(prior)
+        assert "Original16" in str(request.scope["existing_work_retrieval"])
+        self.input_basis = exact
+        self.query_basis = request.scope["existing_work_retrieval"]
+        return super().execute(request)
+
+
 def reference_runtime(path, *, selection="both", original_custody="managed"):
     adapter = ProtectedCreationFixture(path / "adapter", selection=selection, original_custody=original_custody)
+    provider = ReferenceReadingDeepFetch()
     runtime = build_production_runtime(prepare_data_root(path / "data"), proposal_drafter=adapter,
         intent_drafting_provider=adapter, host_compute_probe=DeterministicProbe(),
-        deepfetch_provider=DeterministicDeepFetchProvider(), acquisition_provider=RecordingAcquisitionProvider())
+        deepfetch_provider=provider, acquisition_provider=RecordingAcquisitionProvider())
+    provider.runtime = runtime
     runtime.root_workspaces.configure_creation_runtime(executable="/bin/bash", credentials_home=path / "credentials")
     return runtime, adapter
 
@@ -166,6 +183,8 @@ def test_reference_deepfetch_consumes_scoped_literature_before_confirmation(tmp_
         ready = reference_ready(runtime, client, headers, source, route="deepfetch")
         assert ready["creation_basis"]["kind"] == "literature_revised"
         assert ready["creation_basis"]["predecessor"]
+        assert ready["creation_basis"]["corrections"][0]["disposition"] == "qualified"
+        assert "counterproof" in ready["creation_basis"]["understanding"]["claims_and_conditions"][0]["text"]
         assert adapter.calls[-1][1].read_literature
         endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
         confirmed = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "confirm"), json=_confirmation_payload(ready))

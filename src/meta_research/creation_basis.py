@@ -376,7 +376,7 @@ class CreationBasisMemory:
         validate_reference_understanding(result.understanding, inputs, identity, self.workspaces.server_files)
         coverage = {item["material_key"]: item for item in result.understanding["coverage"]}
         body = {"schema_ref": "meta-research/creation-research-basis/v2", "kind": "prepared",
-            "draft": {"initialization_id": request.initialization_id, "revision": request.draft_revision, "hash": request.draft_hash},
+            "draft": {"initialization_id": inputs.anchor.ref, "revision": request.draft_revision, "hash": request.draft_hash},
             "root_session_ref": request.root_session_ref, "manifest": empty_manifest(),
             "manifest_hash": canonical_hash(empty_manifest()), "material_references": inputs.as_dict(),
             "input_identity": identity.as_dict(), "understanding": result.understanding,
