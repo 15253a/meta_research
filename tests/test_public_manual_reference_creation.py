@@ -114,6 +114,13 @@ def test_manual_reference_seed_drafting_append_explicit_save_confirm_and_success
         saved = client.put(endpoint + "/proposal", headers=_write_headers(headers, "manual-fresh-save"), json=manual_save_payload(view))
         assert saved.status_code == 200, saved.text
         view = saved.json()
+        final_selected = [item for item in view["creation_basis"]["sources"] if item["binding"] is not None]
+        for item in final_selected:
+            version_ref = item["binding"]["version_ref"]
+            pending_read = client.get("/api/v1/research-content", params={
+                "quest_ref": anchor[1], "source_ref": version_ref, "version_ref": version_ref})
+            assert pending_read.status_code == 409, pending_read.text
+            assert pending_read.json()["detail"]["code"] == "asset_quest_scope_invalid"
         confirmed = client.post(endpoint + "/proposal-confirmation", headers=_write_headers(headers, "manual-confirm"), json={
             "proposal_ref": view["proposal"]["ref"], "proposal_hash": view["proposal"]["hash"]})
         assert confirmed.status_code == 202, confirmed.text
@@ -126,7 +133,11 @@ def test_manual_reference_seed_drafting_append_explicit_save_confirm_and_success
         basis = runtime.owners.research_memory.creation_bases.for_question(view["question_anchor"]["question_ref"], anchor[1])
         for item in basis["sources"]:
             if item["binding"] is not None:
-                assert client.get(f"/api/v1/research-assets/{item['binding']['version_ref']}/content").status_code == 200
+                version_ref = item["binding"]["version_ref"]
+                successor_read = client.get("/api/v1/research-content", params={
+                    "quest_ref": view["question_anchor"]["quest_ref"],
+                    "source_ref": version_ref, "version_ref": version_ref})
+                assert successor_read.status_code == 200, successor_read.text
         assert source.read_text() == "Original16 is observed only under room conditions."
         assert view["seed"] == seed
     finally:

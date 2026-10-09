@@ -3271,11 +3271,28 @@ class ManualQuestionCreation:
         quest, parent = self._require_row_target_current(row)
         basis = self._material_basis(row, require_current=False)
         if basis is not None:
+            accepted_version_refs = {
+                role.version_ref
+                for role in self._research_graph.query_asset_roles(
+                    quest_ref=quest.quest_ref, role="quest_source_material"
+                )
+            }
             for source in basis["sources"]:
                 if source["binding"] is not None:
                     binding = self._research_memory.query_asset_version(source["binding"]["version_ref"]).as_binding()
                     self._research_memory.verify_asset_binding(asset_ref=binding.asset_ref, version_ref=binding.version_ref,
                         content_hash=binding.content_hash, manifest_hash=binding.manifest_hash, receipt=binding.receipt)
+                    if binding.version_ref not in accepted_version_refs:
+                        self._research_graph.accept_asset_role(
+                            binding=binding,
+                            role="quest_source_material",
+                            quest_ref=quest.quest_ref,
+                            idempotency_key="manual-source-material:" + canonical_hash({
+                                "context_ref": context_ref,
+                                "version_ref": binding.version_ref,
+                            }),
+                        )
+                        return
         content = _validate_question_content(
             _decoded_dict(row.proposal_json, "manual_proposal_invalid")
         )
