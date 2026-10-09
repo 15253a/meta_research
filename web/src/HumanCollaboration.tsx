@@ -2817,7 +2817,7 @@ function IntentDraftingSession({
             {message.role === "assistant" && message.status === "completed" && message.message_ref && messageText(message).trim() ? <label className="hc-select-reply">
               <input type="checkbox" checked={selectedReplyRefs.includes(message.message_ref)} disabled={request.status !== "open"}
                 onChange={event => onSelectReply(message.message_ref!, event.target.checked)} />
-              选入正式回应 <span>{selectedReplyRefs.includes(message.message_ref) ? "已选 · 尚未提交" : "助手已完成 · 尚未选择"}</span>
+              选入正式回应 <span>{selectedReplyRefs.includes(message.message_ref) ? "已选入正式回应" : "助手已完成 · 尚未选择"}</span>
             </label> : null}
           </article>
         ))}

@@ -127,6 +127,7 @@ test("a request selects completed assistant work and server artifacts before exp
   }
   await formal.getByRole("button", { name: "提交", exact: true }).click();
   await expect(formal).toContainText("回应已提交");
+  await expect(assistant.getByText("已选入正式回应", { exact: true })).toBeVisible();
   const delivered = state.writes.filter(write => write.path.endsWith("/responses"));
   expect(delivered).toHaveLength(1);
   expect(delivered[0].path).toBe("/api/v1/human-requests/HR-first%3Ar1/responses");
