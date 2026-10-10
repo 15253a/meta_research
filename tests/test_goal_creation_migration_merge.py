@@ -10,7 +10,7 @@ from meta_research.migration import upgrade_database
 from test_quest_goal_evolution_migration import _migration_config, _upgrade_to_revision
 
 
-MERGED_REVISION = "0069_merge_goal_creation"
+LATEST_REVISION = "0072_merge_material_companion"
 
 
 def _seed_existing_creation(database: Path) -> dict[str, tuple]:
@@ -73,11 +73,11 @@ def test_goal_creation_merge_preserves_existing_data_from_each_head(
     upgrade_database(database)
     upgrade_database(database)
 
-    assert ScriptDirectory.from_config(_migration_config()).get_heads() == [MERGED_REVISION]
+    assert ScriptDirectory.from_config(_migration_config()).get_heads() == [LATEST_REVISION]
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
         assert connection.execute("SELECT version_num FROM alembic_version").fetchall() == [
-            (MERGED_REVISION,),
+            (LATEST_REVISION,),
         ]
         for table, original in original_rows.items():
             actual = connection.execute(f"SELECT * FROM {table}").fetchone()

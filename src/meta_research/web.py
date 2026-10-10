@@ -523,6 +523,11 @@ class CompanionMessageRequest(BaseModel):
     ) = None
 
 
+class CompanionNewSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope_ref: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class HumanReplyUploadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["upload"]
@@ -1504,6 +1509,11 @@ def create_app(
             ),
         )
 
+    @app.post("/api/v1/companion/sessions/new")
+    def start_new_companion_session(request: Request, message: CompanionNewSessionRequest) -> dict[str, object]:
+        scope_ref = require_current_collaboration_scope(message.scope_ref, conflict_code="companion_scope_stale")
+        return runtime.owners.human_collaboration.start_new_companion_session(scope_ref, _idempotency_key(request))
+
     async def conversation_stream(
         request: Request, query: Callable[[], dict[str, object]]
     ) -> StreamingResponse:
@@ -2101,6 +2111,10 @@ def create_app(
             message=message.message,
             idempotency_key=_idempotency_key(request),
         )
+
+    @app.post("/api/v1/quest-initializations/{initialization_id}/intent-session/new")
+    def start_new_intent_session(initialization_id: str, request: Request) -> dict[str, object]:
+        return runtime.owners.human_collaboration.start_new_intent_session(initialization_id, _idempotency_key(request))
 
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/confirmation-preview",

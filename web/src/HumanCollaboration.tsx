@@ -33,6 +33,7 @@ import {
   retryHumanRequest,
   reviseHumanCommand,
   sendCompanionMessage,
+  startNewCompanionSession,
   withdrawSoftConstraint,
   submitHumanGuidance,
   type GuidanceStrength,
@@ -40,6 +41,7 @@ import {
   type GoalGuidanceAlignment,
   type CompanionAgentProposal,
   type CompanionMessage,
+  type CompanionSessionSwitch,
   type CompanionSoftConstraint,
   type HumanCollaborationProjection,
   type HumanCapabilityAuthorization,
@@ -127,12 +129,61 @@ const fallbackCompanionCopy: Record<CompanionShellState, {
   },
   "ready-active": {
     label: "跟随当前研究",
-    message: "我会在这里解释研究状态；普通聊天不会直接写入领域事实。",
+    message: "可以让我按你的要求调查、执行并核验已授权工作。工作空间持续保留；正式回应由你选择并提交。",
   },
 };
 
 function messageText(message: CompanionMessage): string {
   return message.content ?? message.message ?? message.text ?? "";
+}
+
+type CompanionSessionProjection = HumanCollaborationProjection["companion"];
+
+function useCompanionSessionSwitch(companion: CompanionSessionProjection | undefined, onChanged: () => void) {
+  const [switching, setSwitching] = useState(false);
+  const [switched, setSwitched] = useState<CompanionSessionSwitch | null>(null);
+  const switchingRef = useRef(false);
+  const session: CompanionSessionProjection | undefined = switched && companion && switched.scope_ref === companion.scope_ref
+    && switched.native_session_generation > (companion?.native_session_generation ?? -1)
+    ? { ...companion, native_session_generation: switched.native_session_generation, native_session_ref: null } : companion;
+  const busy = companion?.can_start_new_session === false
+    || companion?.messages.some(message => ["queued", "processing", "running"].includes(message.status ?? ""));
+  const start = async (scopeRef: string) => {
+    if (switchingRef.current) return;
+    if (busy) throw new ProductError("companion_session_busy");
+    switchingRef.current = true;
+    setSwitching(true);
+    try {
+      setSwitched(await startNewCompanionSession(scopeRef));
+      onChanged();
+    } finally {
+      switchingRef.current = false;
+      setSwitching(false);
+    }
+  };
+  return { session, switching, busy, start };
+}
+
+function CompanionSessionState({ companion, switching = false, busy = false }: {
+  companion?: CompanionSessionProjection;
+  switching?: boolean;
+  busy?: boolean;
+}) {
+  if (!companion || companion.status !== "ready") return null;
+  return <details className="companion-session-state" data-testid="companion-session-state">
+    <summary>{switching ? "正在准备新会话…" : `会话 ${companion.native_session_generation ?? 1} · ${companion.native_session_ref ? "已启动" : "等待首条消息启动"}`}</summary>
+    <p>同一研究工作空间持续保留；输入 /new 更换原生会话，旧对话可回看并按需读取。</p>
+    <code>{companion.workspace_path ?? companion.workspace_ref ?? companion.session_ref}</code>
+    {companion.native_session_ref ? <p>当前原生会话 <code>{companion.native_session_ref}</code></p> : null}
+    {busy ? <p role="status">还有消息在执行或排队，请等它们结束后输入 /new。</p> : null}
+    {companion.native_sessions?.length ? <ul>{companion.native_sessions.map(item => <li key={item.generation}>会话 {item.generation} · <code>{item.native_session_ref ?? "尚未启动"}</code></li>)}</ul> : null}
+  </details>;
+}
+
+function companionError(error: unknown): string {
+  return reasonCode(error) === "companion_session_busy"
+    ? "还有消息在执行或排队；等待结束后再输入 /new。"
+    : reasonCode(error);
 }
 
 function documentText(
@@ -308,6 +359,7 @@ export function QuestCompanion({
   goalAlignment?: GoalGuidanceAlignment[];
 }) {
   const companion = collaboration?.companion;
+  const sessionSwitch = useCompanionSessionSwitch(companion, onChanged);
   const ready = companion?.status === "ready";
   const canSend = ready && Boolean(companion.scope_ref);
   const [draft, setDraft] = useState("");
@@ -403,6 +455,16 @@ export function QuestCompanion({
     event.preventDefault();
     const message = draft.trim();
     if (!canSend || !scopeRef || !message || sendingRef.current) return;
+    if (message === "/new") {
+      sendingRef.current = true;
+      setError(null);
+      try {
+        await sessionSwitch.start(scopeRef);
+        setDraft("");
+      } catch (caught) { setError(companionError(caught)); }
+      finally { sendingRef.current = false; }
+      return;
+    }
     sendingRef.current = true;
     const localRef = optimisticSequence.current + 1;
     optimisticSequence.current = localRef;
@@ -476,6 +538,7 @@ export function QuestCompanion({
         </div>
         <code>{ready ? "可交流" : "暂不可用"}</code>
       </header>
+      <CompanionSessionState companion={sessionSwitch.session} switching={sessionSwitch.switching} busy={sessionSwitch.busy} />
       <div ref={chatRef} className="lumen-chat" aria-live="polite">
         {questionContext ? (
           <article
@@ -523,8 +586,9 @@ export function QuestCompanion({
                   ? "YOU · CONVERSATION"
                   : message.role === "system"
                     ? "SYSTEM · STATUS"
-                    : "COMPANION · READ-ONLY EXPLANATION"}
+                    : "COMPANION · INDEPENDENT WORK"}
               </small>
+              {message.native_session_generation !== undefined ? <small>会话 {message.native_session_generation}</small> : null}
               {message.role === "assistant" ? (
                 <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
               ) : messageText(message)}
@@ -560,7 +624,7 @@ export function QuestCompanion({
             className="lumen-message lumen-companion-thinking"
             data-message-status="processing"
           >
-            <small>COMPANION · READ-ONLY EXPLANATION</small>
+            <small>COMPANION · INDEPENDENT WORK</small>
             <PendingCompanionReply message={message} onChanged={onChanged} />
           </article>
         ))}
@@ -623,10 +687,10 @@ export function QuestCompanion({
         <div>
           <textarea
             aria-label="给研究助手发消息"
-            disabled={!canSend || sending}
+            disabled={!canSend || sending || sessionSwitch.switching}
             rows={1}
             placeholder={canSend
-              ? "询问研究情况，或讨论建议……"
+              ? "调查、执行或核验已授权工作；/new 开启新会话"
               : ready
                 ? "创建 Quest 后开始对话"
                 : "研究助手尚未启用"}
@@ -636,13 +700,13 @@ export function QuestCompanion({
           />
           <button
             type="submit"
-            disabled={!canSend || sending || !draft.trim()}
+            disabled={!canSend || sending || sessionSwitch.switching || !draft.trim()}
             aria-label="发送消息"
           >
             ↑
           </button>
         </div>
-        <small>{error ? `发送失败 · ${error}` : "Enter 发送 · Shift+Enter 换行"}</small>
+        <small>{error ? `发送失败 · ${error}` : "Enter 发送 · Shift+Enter 换行 · /new 保留工作空间并更换会话"}</small>
       </form>
     </aside>
   );
@@ -2222,7 +2286,7 @@ export function HumanRequestSurface({
       >
         {selected ? (
           <HumanRequestView
-            key={selected.request_ref}
+            key={`${selected.request_ref}:${selected.revision}`}
             request={selected}
             collaboration={collaboration}
             onBack={() => onSelect(null)}
@@ -2336,6 +2400,14 @@ function HumanRequestView({
   hasNext: boolean;
 }) {
   const waiting = collaboration?.human_requests.waiting;
+  const [selectedReplyRefs, setSelectedReplyRefs] = useState<string[]>([]);
+  const selectedReplies = (collaboration?.companion.messages ?? []).filter(message =>
+    message.role === "assistant" && message.status === "completed" && !!message.message_ref
+    && selectedReplyRefs.includes(message.message_ref)
+    && message.view_context?.kind === "human_request"
+    && message.view_context.request_ref === request.request_ref
+    && message.view_context.revision === request.revision
+    && message.view_context.quest_ref === request.quest_ref);
 
   return (
     <>
@@ -2381,23 +2453,31 @@ function HumanRequestView({
         )}
       </header>
       <div className="hc-request-workspace">
+        <IntentDraftingSession
+          key={`${request.request_ref}:${request.revision}`}
+          request={request}
+          scopeRef={collaboration?.companion.scope_ref ?? null}
+          companion={collaboration?.companion}
+          messages={collaboration?.companion.messages ?? []}
+          selectedReplyRefs={selectedReplyRefs}
+          onSelectReply={(ref, selected) => setSelectedReplyRefs(current => selected
+            ? [...current.filter(item => item !== ref), ref] : current.filter(item => item !== ref))}
+          onChanged={onChanged}
+        />
         <main className="hc-request-core">
+          <header className="hc-formal-head"><small>请求任务与正式回应</small><b>审阅后明确提交</b><p>助手完成、选入回应、正式提交与原根接纳分别记录。</p></header>
           <RequestHandoff key={`${request.request_ref}:${request.revision}`} request={request} onChanged={onChanged} />
           <RequestForm
+            key={`${request.request_ref}:${request.revision}`}
             request={request}
+            selectedReplies={selectedReplies}
+            workspacePath={collaboration?.companion.workspace_path ?? undefined}
             commands={collaboration?.commands.items ?? []}
             authorizations={collaboration?.commands.authorizations ?? []}
             onChanged={onChanged}
           />
           <RequestDetails request={request} otherBlockers={waiting?.other_blockers ?? []} />
         </main>
-        <IntentDraftingSession
-          key={`${request.request_ref}:${request.revision}`}
-          request={request}
-          scopeRef={collaboration?.companion.scope_ref ?? null}
-          messages={collaboration?.companion.messages ?? []}
-          onChanged={onChanged}
-        />
       </div>
     </>
   );
@@ -2621,11 +2701,17 @@ function IntentDraftingSession({
   request,
   scopeRef,
   messages,
+  companion,
+  selectedReplyRefs,
+  onSelectReply,
   onChanged,
 }: {
   request: HumanRequestItem;
   scopeRef: string | null;
   messages: CompanionMessage[];
+  companion?: CompanionSessionProjection;
+  selectedReplyRefs: string[];
+  onSelectReply: (messageRef: string, selected: boolean) => void;
   onChanged: () => void;
 }) {
   const [draft, setDraft] = useState("");
@@ -2635,6 +2721,7 @@ function IntentDraftingSession({
   const optimisticSequence = useRef(0);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const sessionSwitch = useCompanionSessionSwitch(companion, onChanged);
   const questRef = typeof request.quest_ref === "string" && request.quest_ref
     ? request.quest_ref
     : null;
@@ -2668,6 +2755,14 @@ function IntentDraftingSession({
     event.preventDefault();
     const message = draft.trim();
     if (!message || sendingRef.current || !scopeRef || !questRef) return;
+    if (message === "/new") {
+      sendingRef.current = true;
+      setError(null);
+      try { await sessionSwitch.start(scopeRef); setDraft(""); }
+      catch (caught) { setError(companionError(caught)); }
+      finally { sendingRef.current = false; }
+      return;
+    }
     sendingRef.current = true;
     const localRef = ++optimisticSequence.current;
     setOptimisticMessages((current) => [...current, {
@@ -2702,21 +2797,28 @@ function IntentDraftingSession({
   return (
     <aside className="hc-request-draft" aria-label={`${requestCopy[request.kind].list}相关交流`}>
       <header>
-        <span className="hc-draft-orb" aria-hidden="true" />
-        <div><small>询问与协商</small><b>和研究助手聊一聊</b><span>只讨论当前事项</span></div>
+        <span className="hc-draft-orb" aria-hidden="true"><MetaTrace variant="assistant" /></span>
+        <div><small>独立研究助手</small><b>调查、执行与核验</b><span>按你的要求工作；结果与限制供你审阅</span></div>
       </header>
+      <CompanionSessionState companion={sessionSwitch.session} switching={sessionSwitch.switching} busy={sessionSwitch.busy} />
       <div className="hc-draft-transcript" aria-live="polite" ref={transcriptRef}>
         {!scoped.length && !optimisticMessages.length ? (
           <article>
             <small>当前事项</small>
-            <p>你可以询问当前状态，或讨论替代路线。</p>
+            <p>请说明希望调查、执行或核验的工作。助手可按需读取材料、委派子智能体，产物保留在当前研究工作空间。</p>
           </article>
         ) : scoped.map((message, index) => (
           <article className={message.role === "user" ? "me" : ""} key={message.message_ref ?? index}>
             <small>{message.role === "user" ? "你" : "研究助手"}</small>
+            {message.native_session_generation !== undefined ? <small>会话 {message.native_session_generation}</small> : null}
             <p>{message.role === "assistant"
               ? <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
               : messageText(message)}</p>
+            {message.role === "assistant" && message.status === "completed" && message.message_ref && messageText(message).trim() ? <label className="hc-select-reply">
+              <input type="checkbox" checked={selectedReplyRefs.includes(message.message_ref)} disabled={request.status !== "open"}
+                onChange={event => onSelectReply(message.message_ref!, event.target.checked)} />
+              选入正式回应 <span>{selectedReplyRefs.includes(message.message_ref) ? "已选入正式回应" : "助手已完成 · 尚未选择"}</span>
+            </label> : null}
           </article>
         ))}
         {visibleOptimisticMessages.map((message) => <article className="me" key={`user-${message.localRef}`}>
@@ -2737,19 +2839,19 @@ function IntentDraftingSession({
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={submitTextareaOnEnter}
-              disabled={sending || !scopeRef || !questRef}
+              disabled={sending || sessionSwitch.switching || !scopeRef || !questRef}
             />
             <button
               type="submit"
-              disabled={sending || !scopeRef || !questRef || !draft.trim()}
+              disabled={sending || sessionSwitch.switching || !scopeRef || !questRef || !draft.trim()}
               aria-label="发送消息"
             >↑</button>
           </span>
         </label>
-        <small>{error ? `发送失败 · ${error}` : `${draft.length} 字 · Enter 发送 · Shift+Enter 换行`}</small>
+        <small>{error ? `发送失败 · ${error}` : `${draft.length} 字 · Enter 发送 · /new 保留工作空间并更换会话`}</small>
       </form>
       <div className="hc-draft-status">这里的交流不会提交回应，也不会改变当前事项的处理状态。</div>
-      <div className="hc-draft-boundary">聊天可以帮助理解情况；只有左侧明确提交，才会记录你的回应。</div>
+      <div className="hc-draft-boundary">选择助手说明或工作空间中的产物后，在正式回应区明确提交，才会交回本请求原根。</div>
     </aside>
   );
 }
@@ -2768,17 +2870,20 @@ async function humanReplyMaterials(material: HumanRequestMaterial): Promise<Huma
   return material.selection ? [{ kind: "server_reference", selection: material.selection }] : [];
 }
 
-function MaterialPicker({ selection, setSelection, disabled }: {
+function MaterialPicker({ selection, setSelection, disabled, initialPath }: {
   selection: ServerMaterialSelection | null; setSelection: (value: ServerMaterialSelection | null) => void; disabled: boolean;
+  initialPath?: string;
 }) {
-  return <ServerMaterialPicker value={selection} onSelect={setSelection} disabled={disabled} />;
+  return <ServerMaterialPicker value={selection} onSelect={setSelection} disabled={disabled} initialPath={initialPath} />;
 }
 
-function RequestForm({ request, commands, authorizations, onChanged }: {
+function RequestForm({ request, commands, authorizations, onChanged, selectedReplies, workspacePath }: {
   request: HumanRequestItem;
   commands: HumanCommand[];
   authorizations: HumanCapabilityAuthorization[];
   onChanged: () => void;
+  selectedReplies: CompanionMessage[];
+  workspacePath?: string;
 }) {
   const [note, setNote] = useState("");
   const [sealedResponse, setSealedResponse] = useState<HumanRequestResponseBody | null>(null);
@@ -2836,8 +2941,9 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
       const response: HumanRequestResponseBody = {
         decision,
         facts,
-        note,
+        note: [note, ...selectedReplies.map(message => messageText(message))].filter(value => value.trim()).join("\n\n"),
       };
+      if (selectedReplies.length) response.facts = { ...facts, companion_selections: selectedReplies.map(message => ({ message_ref: message.message_ref, native_session_generation: message.native_session_generation, native_session_ref: message.native_session_ref })) };
       const pendingResponse = pendingHumanRequestResponse(request.request_ref);
       if (pendingResponse) {
         if (pendingResponse.request_ref !== request.request_ref) {
@@ -2934,6 +3040,11 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
 
   return (
     <>
+      {selectedReplies.length ? <section className="hc-selected-replies" aria-label="已选助手说明">
+        <b>已选助手说明 · 尚未提交</b>
+        {selectedReplies.map(message => <p key={message.message_ref}>{messageText(message)}</p>)}
+        <small>正式提交包含以上说明。文件产物需在下方明确选择。</small>
+      </section> : null}
       {sealedResponse && <section className="server-material-picker__candidate" role="status">
         <b>原求助回应有待重试的封存提交</b><code>{request.request_ref}</code>
         <p>{sealedResponse.note}</p>
@@ -2943,7 +3054,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
       </section>}
       {hasLegacyHumanRequestMaterial(request.request_ref) ? <p role="status">检测到旧版材料恢复记录。原入库回执保留；请重新选择文件或原路径后提交，旧记录不会自动重放。</p> : null}
       {request.kind === "library_reconnect" ? (
-        <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending || !!sealedResponse} />
+        <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending || !!sealedResponse} workspacePath={workspacePath} />
       ) : null}
       {request.kind === "external_material_api_access" ? (
         <NaturalLanguageMaterialForm
@@ -2952,6 +3063,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           setNote={setNote}
           submit={submit}
           disabled={pending || !!sealedResponse}
+          workspacePath={workspacePath}
         />
       ) : null}
       {request.kind === "offline_action" ? (
@@ -2961,6 +3073,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           setNote={setNote}
           submit={submit}
           disabled={pending || !!sealedResponse}
+          workspacePath={workspacePath}
         />
       ) : null}
       {request.kind === "capability_authorization" ? (
@@ -2998,7 +3111,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         {error ? (
           <><b>{request.kind === "system_operation_help" ? "重试未成功" : "回应没有记录"}</b><br />{error}</>
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
-          <><b>提交只表示人的回应已接纳</b><br />这不代表材料充分、实验成功或研究结论为真；负责当前请求的 Agent 会解释回应并决定下一步。</>
+          <><b>正式提交将回应交回请求原根</b><br />负责当前请求的 Agent 会解释回应、核验材料并决定下一步。</>
         ) : request.kind === "system_operation_help" ? (
           <><b>只重试当前绑定的失败操作</b><br />成功后只恢复它的精确依赖；失败会保留同一操作链并显示新修订。</>
         ) : (
@@ -3038,12 +3151,14 @@ function LibraryForm({
   setNote,
   submit,
   disabled,
+  workspacePath,
 }: {
   request: HumanRequestItem;
   note: string;
   setNote: (value: string) => void;
   submit: SubmitResponse;
   disabled: boolean;
+  workspacePath?: string;
 }) {
   const [mode, setMode] = useState<"none" | "oa" | "material">("none");
   const [selection, setSelection] = useState<ServerMaterialSelection | null>(null);
@@ -3079,7 +3194,7 @@ function LibraryForm({
       ) : null}
       {mode === "material" ? (
         <section className="hc-choice-panel">
-          <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} />
+          <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} initialPath={workspacePath} />
           <p>提交仅将原始来源引用交给请求原根。材料留在原服务器路径，原根可按需读取；本次提交不自动入库。</p>
           <button type="button" disabled={disabled} onClick={() => void submit(
             { route: "provided_material", ...(acquisitionPaperId ? { acquisition_paper_id: acquisitionPaperId } : {}) },
@@ -3115,12 +3230,14 @@ function NaturalLanguageMaterialForm({
   setNote,
   submit,
   disabled,
+  workspacePath,
 }: {
   request: HumanRequestItem;
   note: string;
   setNote: (value: string) => void;
   submit: SubmitResponse;
   disabled: boolean;
+  workspacePath?: string;
 }) {
   const [selection, setSelection] = useState<ServerMaterialSelection | null>(null);
   const condition = isRecord(request.target_assertion?.condition)
@@ -3154,7 +3271,7 @@ function NaturalLanguageMaterialForm({
               placeholder="写下结果、拒绝、限制或建议的替代路线。"
             />
           </label>
-          <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} />
+          <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} initialPath={workspacePath} />
         </div>
         <p className="hc-asset-boundary">提交将回应和原始来源引用交给请求原根。材料留在原服务器路径，可由原根按需读取；提交本身不自动入库。</p>
       </section>

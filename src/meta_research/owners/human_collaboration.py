@@ -270,6 +270,8 @@ class HumanCollaborationInterface(Protocol):
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
 
+    def start_new_companion_session(self, scope_ref: str, idempotency_key: str) -> dict[str, object]: ...
+
     def query_companion_work_context(self, session_ref: str) -> dict[str, object] | None: ...
 
     def query_companion_reply(
@@ -536,6 +538,8 @@ class HumanCollaborationInterface(Protocol):
         message: str,
         idempotency_key: str,
     ) -> dict[str, object]: ...
+
+    def start_new_intent_session(self, initialization_id: str, idempotency_key: str) -> dict[str, object]: ...
 
     def preview_confirmation(
         self,
@@ -2075,13 +2079,22 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         )
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
-        return self._collaboration_ladder.query_companion(scope_ref)
+        session = self._collaboration_ladder.query_companion(scope_ref)
+        if self._root_workspaces is not None and session["session_ref"] is not None:
+            location = self._root_workspaces.bind_companion_session(scope_ref, session["session_ref"]).location
+            session.update(workspace_ref=location.workspace_ref, workspace_path=str(location.directory))
+        return session
+
+    def start_new_companion_session(self, scope_ref: str, idempotency_key: str) -> dict[str, object]:
+        switched = self._collaboration_ladder.start_new_companion_session(scope_ref, idempotency_key)
+        self._export_companion_histories(scope_ref)
+        return switched
 
     def query_companion_work_context(self, session_ref: str) -> dict[str, object] | None:
         session = self._collaboration_ladder.query_companion_session(session_ref)
         if session is None:
             return None
-        context = self._resolve_companion_context(session["scope_ref"])
+        context = self._resolve_companion_context_without_history(session["scope_ref"])
         return {name: session[name] for name in ("scope_ref", "session_ref", "status")} | {
             "quest_ref": context.get("quest_ref")}
 
@@ -2212,6 +2225,32 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         }
 
     def _resolve_companion_context(
+        self, scope_ref: str, view_context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        context = self._resolve_companion_context_without_history(scope_ref, view_context)
+        history = self._export_companion_histories(scope_ref)
+        return context if not history else {**context, "prior_conversations": history}
+
+    def _export_companion_histories(self, scope_ref: str) -> list[dict[str, object]]:
+        # The database switch is authoritative. A lost export is reconstructed
+        # on /new retry or the next context load, without another switch.
+        if getattr(self, "_root_workspaces", None) is None:
+            return []
+        session = self._collaboration_ladder.query_companion(scope_ref)
+        history = []
+        for native in session["native_sessions"]:
+            generation = native["generation"]
+            if generation >= session["native_session_generation"]:
+                continue
+            document = {"schema_ref": "meta-research/companion-conversation/v1",
+                "scope_ref": scope_ref, "session_ref": session["session_ref"],
+                "native_session_generation": generation, "native_session_ref": native["native_session_ref"],
+                "turns": [turn for turn in session["turns"] if turn["native_session_generation"] == generation]}
+            history.append(self._root_workspaces.save_companion_conversation(
+                scope_ref, session["session_ref"], generation, document))
+        return history
+
+    def _resolve_companion_context_without_history(
         self,
         scope_ref: str,
         view_context: dict[str, object] | None = None,
@@ -5080,7 +5119,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         except SemanticMcpError as error:
             raise OwnerConflict(error.code) from error
 
-    def prepare_creation_basis(self, initialization_id, revision, draft_hash, draft, job_ref):
+    def prepare_creation_basis(self, initialization_id, revision, draft_hash, draft, job_ref, *, expected_native_generation=None):
         from meta_research.creation_basis import (
             InitializationUnderstandingRequest, empty_manifest, empty_understanding,
         )
@@ -5097,7 +5136,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         if any(not submission["complete"] for submission in manifest["submissions"]):
             raise OwnerConflict("creation_material_submission_incomplete")
         with self._database.read() as connection:
-            native_ref = connection.execute(text("SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": initialization_id}).scalar_one_or_none()
+            native = connection.execute(text("SELECT native_session_ref,native_session_generation FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": initialization_id}).first()
+        if native is None or expected_native_generation is not None and int(native.native_session_generation) != expected_native_generation:
+            raise OwnerConflict("companion_native_session_stale")
+        native_ref = native.native_session_ref
+        native_generation = int(native.native_session_generation)
         request = InitializationUnderstandingRequest(initialization_id, revision, draft_hash, draft, manifest,
             job_ref + ":understanding", current["intent_session"]["ref"], native_ref,
             inputs=inputs if inputs.references else None)
@@ -5108,11 +5151,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             result = understand(request)
             understanding = result.understanding
             if result.companion_native_session_ref is not None:
-                with self._database.write() as connection:
-                    changed = connection.execute(text("UPDATE hc_intent_drafting_sessions SET native_session_ref=:native WHERE initialization_id=:id AND status='open' AND (native_session_ref IS NULL OR native_session_ref=:native)"),
-                        {"id": initialization_id, "native": result.companion_native_session_ref})
-                    if not changed.rowcount:
-                        raise OwnerConflict("companion_native_session_stale")
+                with self._database.fenced_write() as connection:
+                    self._checkpoint_intent_native(connection, initialization_id, native_generation, result.companion_native_session_ref)
         else:
             understanding = empty_understanding()
         if inputs.references:
@@ -5999,6 +6039,97 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 )
         return self.query_quest_creation(initialization_id)
 
+    @staticmethod
+    def _intent_session_busy(connection, initialization_id: str, session_ref: str) -> bool:
+        return bool(connection.execute(text(
+            "SELECT EXISTS(SELECT 1 FROM hc_intent_drafting_turns WHERE session_ref=:session_ref "
+            "AND assistant_status IN ('queued','running')) OR EXISTS(SELECT 1 FROM hc_proposal_generation_attempts "
+            "WHERE initialization_id=:initialization_id AND status IN ('queued','running')) OR "
+            "EXISTS(SELECT 1 FROM hc_deepfetch_requests WHERE initialization_id=:initialization_id AND status='queued') OR "
+            "EXISTS(SELECT 1 FROM hc_creation_material_operations WHERE root_session_ref=:session_ref "
+            "AND state IN ('active','unknown_outcome'))"),
+            {"initialization_id": initialization_id, "session_ref": session_ref}).scalar_one())
+
+    @staticmethod
+    def _ensure_intent_native_history(connection, initialization_id: str):
+        session = connection.execute(text("SELECT * FROM hc_intent_drafting_sessions "
+            "WHERE initialization_id=:initialization_id"), {"initialization_id": initialization_id}).one()
+        connection.execute(text("INSERT OR IGNORE INTO hc_intent_native_sessions "
+            "(session_ref,generation,native_session_ref,created_at) VALUES (:session_ref,:generation,:native,:created_at)"),
+            {"session_ref": session.session_ref, "generation": int(session.native_session_generation),
+                "native": session.native_session_ref, "created_at": float(session.created_at)})
+        return session
+
+    def _checkpoint_intent_native(self, connection, initialization_id: str, generation: int, native_session_ref: str) -> None:
+        session = self._ensure_intent_native_history(connection, initialization_id)
+        if int(session.native_session_generation) != generation:
+            raise OwnerConflict("companion_native_session_stale")
+        if connection.execute(text("SELECT 1 FROM hc_intent_native_sessions WHERE session_ref=:session_ref "
+                "AND native_session_ref=:native AND generation!=:generation"),
+                {"session_ref": session.session_ref, "native": native_session_ref, "generation": generation}).first():
+            raise OwnerConflict("companion_native_session_reused")
+        updated = connection.execute(text("UPDATE hc_intent_drafting_sessions SET native_session_ref=:native,updated_at=:now "
+            "WHERE session_ref=:session_ref AND native_session_generation=:generation AND status='open' "
+            "AND (native_session_ref IS NULL OR native_session_ref=:native)"),
+            {"session_ref": session.session_ref, "generation": generation, "native": native_session_ref, "now": time.time()})
+        if not updated.rowcount:
+            raise OwnerConflict("companion_native_session_stale")
+        connection.execute(text("UPDATE hc_intent_native_sessions SET native_session_ref=:native "
+            "WHERE session_ref=:session_ref AND generation=:generation"),
+            {"session_ref": session.session_ref, "generation": generation, "native": native_session_ref})
+
+    def start_new_intent_session(self, initialization_id: str, idempotency_key: str) -> dict[str, object]:
+        request_hash = canonical_hash({"command": "intent_session_new", "initialization_id": initialization_id})
+        with self._database.fenced_write() as connection:
+            switch_ref = self._query_command(connection, idempotency_key, "intent_session_new", request_hash)
+            if switch_ref is None:
+                row = self._require_initialization(connection, initialization_id)
+                if row.status in {"confirmed", "completed", "cancelled"}:
+                    raise OwnerConflict("intent_session_closed")
+                session = self._ensure_intent_native_history(connection, initialization_id)
+                if session.status != "open":
+                    raise OwnerConflict("intent_session_closed")
+                if self._intent_session_busy(connection, initialization_id, session.session_ref):
+                    raise OwnerConflict("companion_session_busy")
+                generation, now = int(session.native_session_generation) + 1, time.time()
+                switch_ref = new_ref("intent_switch")
+                connection.execute(text("INSERT INTO hc_intent_native_sessions "
+                    "(session_ref,generation,created_at) VALUES (:session_ref,:generation,:now)"),
+                    {"session_ref": session.session_ref, "generation": generation, "now": now})
+                connection.execute(text("INSERT INTO hc_intent_session_switches "
+                    "(switch_ref,session_ref,generation,previous_native_session_ref,created_at) "
+                    "VALUES (:switch_ref,:session_ref,:generation,:previous,:now)"),
+                    {"switch_ref": switch_ref, "session_ref": session.session_ref, "generation": generation,
+                        "previous": session.native_session_ref, "now": now})
+                connection.execute(text("UPDATE hc_intent_drafting_sessions SET native_session_ref=NULL, "
+                    "native_session_generation=:generation,updated_at=:now WHERE session_ref=:session_ref"),
+                    {"session_ref": session.session_ref, "generation": generation, "now": now})
+                self._record_command(connection, idempotency_key, initialization_id, "intent_session_new", request_hash, switch_ref)
+                connection.execute(text("UPDATE human_collaboration_state SET revision=revision+1 WHERE singleton='owner'"))
+                self._feed.record(connection, "human_collaboration.intent_session_switched",
+                    {"initialization_id": initialization_id, "session_ref": session.session_ref,
+                        "native_session_generation": generation, "switch_ref": switch_ref})
+        self._export_intent_histories(initialization_id)
+        return self.query_quest_creation(initialization_id)
+
+    def _export_intent_histories(self, initialization_id: str) -> list[dict[str, object]]:
+        if self._root_workspaces is None:
+            return []
+        view = self.query_quest_creation(initialization_id)
+        session = view["intent_session"]
+        history = []
+        for native in session["native_sessions"]:
+            generation = native["generation"]
+            if generation >= session["native_session_generation"]:
+                continue
+            document = {"schema_ref": "meta-research/companion-conversation/v1",
+                "initialization_id": initialization_id, "session_ref": session["ref"],
+                "native_session_generation": generation, "native_session_ref": native["native_session_ref"],
+                "turns": [turn for turn in session["turns"] if turn["native_session_generation"] == generation]}
+            history.append(self._root_workspaces.save_initialization_conversation(
+                initialization_id, session["ref"], generation, document))
+        return history
+
     def send_intent_message(
         self,
         initialization_id: str,
@@ -6022,7 +6153,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "message": message,
             }
         )
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = self._query_command(
                 connection, idempotency_key, "intent_message", request_hash
             )
@@ -6063,6 +6194,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     if session.status != "open":
                         raise OwnerConflict("intent_session_closed")
                     session_ref = session.session_ref
+                native = self._ensure_intent_native_history(connection, initialization_id)
                 ordinal = int(
                     connection.execute(
                         text(
@@ -6078,10 +6210,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                         "INSERT INTO hc_intent_drafting_turns "
                         "(turn_ref, session_ref, ordinal, idempotency_key, "
                         "request_hash, basis_revision, basis_hash, user_content, "
-                        "user_content_hash, assistant_status, created_at) VALUES "
+                        "user_content_hash, assistant_status, created_at, native_session_generation) VALUES "
                         "(:turn_ref, :session_ref, :ordinal, :idempotency_key, "
                         ":request_hash, :basis_revision, :basis_hash, :user_content, "
-                        ":user_content_hash, 'queued', :now)"
+                        ":user_content_hash, 'queued', :now, :native_session_generation)"
                     ),
                     {
                         "turn_ref": turn_ref,
@@ -6093,6 +6225,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                         "basis_hash": expected_draft_hash,
                         "user_content": message,
                         "user_content_hash": canonical_hash(message),
+                        "native_session_generation": int(native.native_session_generation),
                         "now": now,
                     },
                 )
@@ -6240,9 +6373,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 text(
                     "SELECT adapter_metadata_json FROM hc_intent_drafting_turns "
                     "WHERE session_ref = :session_ref AND ordinal < :ordinal AND "
-                    "assistant_status = 'completed' ORDER BY ordinal DESC LIMIT 1"
+                    "assistant_status = 'completed' AND native_session_generation = :native_generation "
+                    "ORDER BY ordinal DESC LIMIT 1"
                 ),
-                {"session_ref": turn.session_ref, "ordinal": int(turn.ordinal)},
+                {"session_ref": turn.session_ref, "ordinal": int(turn.ordinal),
+                    "native_generation": int(turn.native_session_generation)},
             ).scalar_one_or_none()
             turn_revision = connection.execute(
                 text(
@@ -6427,14 +6562,22 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             self._finish_provider_job(provider, provider_job_ref)
 
     def _process_proposal_generation_once(self) -> bool:
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             job = connection.execute(
                 text(
                     "UPDATE hc_proposal_generation_attempts SET status = 'running', "
-                    "attempt_count = attempt_count + 1, started_at = :now WHERE "
-                    "generation_ref = (SELECT generation_ref FROM "
-                    "hc_proposal_generation_attempts WHERE status = 'queued' ORDER BY "
-                    "created_at LIMIT 1) AND status = 'queued' RETURNING *"
+                    "attempt_count = attempt_count + 1, started_at = :now, "
+                    "native_session_generation = COALESCE(native_session_generation, "
+                    "(SELECT s.native_session_generation FROM hc_intent_drafting_sessions s "
+                    "WHERE s.initialization_id=hc_proposal_generation_attempts.initialization_id)) WHERE "
+                    "generation_ref = (SELECT p.generation_ref FROM "
+                    "hc_proposal_generation_attempts p WHERE p.status = 'queued' "
+                    "AND NOT EXISTS (SELECT 1 FROM hc_intent_drafting_turns t "
+                    "JOIN hc_intent_drafting_sessions s ON s.session_ref=t.session_ref "
+                    "WHERE s.initialization_id=p.initialization_id AND t.assistant_status='running') "
+                    "AND NOT EXISTS (SELECT 1 FROM hc_proposal_generation_attempts active "
+                    "WHERE active.initialization_id=p.initialization_id AND active.status='running') "
+                    "ORDER BY p.created_at LIMIT 1) AND status = 'queued' RETURNING *"
                 ),
                 {"now": time.time()},
             ).first()
@@ -6539,13 +6682,17 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             )
             return True
         with self._database.read() as connection:
-            companion_native_session_ref = connection.execute(
+            native = connection.execute(
                 text(
-                    "SELECT native_session_ref FROM hc_intent_drafting_sessions "
+                    "SELECT native_session_ref,native_session_generation FROM hc_intent_drafting_sessions "
                     "WHERE initialization_id = :initialization_id AND status = 'open'"
                 ),
                 {"initialization_id": job.initialization_id},
-            ).scalar_one_or_none()
+            ).first()
+        if native is None or int(native.native_session_generation) != int(job.native_session_generation):
+            self._fail_proposal_job(job.generation_ref, claim_attempt, "companion_native_session_stale")
+            return True
+        companion_native_session_ref = native.native_session_ref
         literature_snapshot: dict[str, object] | None = None
         if job.route == "deepfetch":
             if job.literature_snapshot_ref is None:
@@ -6607,7 +6754,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         try:
             frozen_draft = decoded_object(revision.draft_json)
             basis = self.prepare_creation_basis(str(job.initialization_id), int(job.basis_revision),
-                str(job.basis_hash), frozen_draft, provider_job_ref)
+                str(job.basis_hash), frozen_draft, provider_job_ref,
+                expected_native_generation=int(job.native_session_generation))
             with self._database.read() as connection:
                 companion_native_session_ref = connection.execute(text("SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": job.initialization_id}).scalar_one_or_none()
             request = ProposalDraftRequest(
@@ -6756,24 +6904,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 )
             else:
                 if result.companion_native_session_ref is not None:
-                    updated_companion = connection.execute(
-                        text(
-                            "UPDATE hc_intent_drafting_sessions SET "
-                            "native_session_ref = :native_session_ref, updated_at = "
-                            ":now WHERE initialization_id = :initialization_id AND "
-                            "status = 'open' AND (native_session_ref IS NULL OR "
-                            "native_session_ref = :native_session_ref)"
-                        ),
-                        {
-                            "initialization_id": job.initialization_id,
-                            "native_session_ref": (
-                                result.companion_native_session_ref
-                            ),
-                            "now": time.time(),
-                        },
-                    )
-                    if not updated_companion.rowcount:
-                        raise OwnerConflict("companion_native_session_stale")
+                    self._checkpoint_intent_native(connection, str(job.initialization_id),
+                        int(job.native_session_generation), result.companion_native_session_ref)
                 proposal_ref, proposal_hash = self._record_proposal(
                     connection,
                     job.initialization_id,
@@ -6935,7 +7067,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 )
 
     def _process_intent_turn_once(self) -> bool:
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             turn = connection.execute(
                 text(
                     "UPDATE hc_intent_drafting_turns SET assistant_status = 'running', "
@@ -6948,7 +7080,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     "hc_quest_initializations AS initializations ON "
                     "initializations.initialization_id = sessions.initialization_id "
                     "WHERE turns.assistant_status = 'queued' AND sessions.status = "
-                    "'open' AND initializations.status NOT IN ('confirmed', "
+                    "'open' AND NOT EXISTS (SELECT 1 FROM hc_intent_drafting_turns earlier WHERE "
+                    "earlier.session_ref=turns.session_ref AND earlier.ordinal<turns.ordinal "
+                    "AND earlier.assistant_status IN ('queued','running')) AND NOT EXISTS (SELECT 1 "
+                    "FROM hc_proposal_generation_attempts p WHERE p.initialization_id=sessions.initialization_id "
+                    "AND p.status IN ('queued','running')) AND initializations.status NOT IN ('confirmed', "
                     "'completed', 'cancelled') ORDER BY turns.created_at LIMIT 1) AND "
                     "assistant_status = 'queued' RETURNING *"
                 ),
@@ -6967,9 +7103,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 text(
                     "SELECT adapter_metadata_json FROM hc_intent_drafting_turns "
                     "WHERE session_ref = :session_ref AND ordinal < :ordinal AND "
-                    "assistant_status = 'completed' ORDER BY ordinal DESC LIMIT 1"
+                    "assistant_status = 'completed' AND native_session_generation=:native_generation ORDER BY ordinal DESC LIMIT 1"
                 ),
-                {"session_ref": turn.session_ref, "ordinal": int(turn.ordinal)},
+                {"session_ref": turn.session_ref, "ordinal": int(turn.ordinal), "native_generation": int(turn.native_session_generation)},
             ).scalar_one_or_none()
             turn_revision = connection.execute(
                 text(
@@ -7122,22 +7258,26 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     )
             return True
 
-        native_session_ref: str | None = None
-        if prior_metadata is not None:
-            metadata = decoded_object(str(prior_metadata))
-            value = metadata.get("native_session_ref")
-            if isinstance(value, str):
-                native_session_ref = value
+        with self._database.read() as connection:
+            native = connection.execute(text("SELECT native_session_ref,native_session_generation FROM hc_intent_drafting_sessions "
+                "WHERE session_ref=:session_ref"), {"session_ref": turn.session_ref}).one()
+        if int(native.native_session_generation) != int(turn.native_session_generation):
+            return False
+        native_session_ref = native.native_session_ref
         try:
             from meta_research.creation_inputs import CreationAnchor
             inputs = self.creation_material_snapshot(CreationAnchor("quest_initialization", str(initialization_id), None,
                 int(turn.basis_revision), turn.basis_hash))
+            draft = decoded_object(turn_revision.draft_json)
+            if int(turn.native_session_generation) > 1:
+                draft = {**draft, "companion_context": {"native_session_generation": int(turn.native_session_generation),
+                    "prior_conversations": self._export_intent_histories(initialization_id)}}
             result = self._intent_drafting_provider.reply(
                 IntentTurnRequest(
                     initialization_id=str(initialization_id),
                     draft_revision=int(turn.basis_revision),
                     draft_hash=turn.basis_hash,
-                    draft=decoded_object(turn_revision.draft_json),
+                    draft=draft,
                     message=turn.user_content,
                     native_session_ref=native_session_ref,
                     job_ref=provider_job_ref,
@@ -7150,6 +7290,12 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             reply = result.reply.strip()
             if not reply or len(reply) > INTENT_REPLY_MAX_LENGTH:
                 raise DraftingUnavailable("intent_reply_invalid")
+            with self._database.fenced_write() as connection:
+                active = connection.execute(text("SELECT assistant_status,assistant_attempt_count FROM hc_intent_drafting_turns "
+                    "WHERE turn_ref=:turn_ref"), {"turn_ref": turn.turn_ref}).one()
+                if active.assistant_status != "running" or int(active.assistant_attempt_count) != claim_attempt:
+                    return False
+                self._checkpoint_intent_native(connection, initialization_id, int(turn.native_session_generation), result.native_session_ref)
         except DraftingUnavailable as error:
             if error.code in _DRAFTING_RECONCILIATION_CODES:
                 return False
@@ -7201,6 +7347,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                         },
                     )
             return True
+        except OwnerConflict as error:
+            self._fail_intent_turn(turn.turn_ref, claim_attempt, str(initialization_id), error.code)
+            return True
         except Exception:
             self._fail_intent_turn(
                 turn.turn_ref,
@@ -7227,7 +7376,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     "'completed', assistant_content = :assistant_content, "
                     "assistant_content_hash = :assistant_content_hash, "
                     "adapter_metadata_json = :metadata_json, adapter_metadata_hash = "
-                    ":metadata_hash, completed_at = :now WHERE turn_ref = :turn_ref "
+                    ":metadata_hash, native_session_ref=:native_session_ref, completed_at = :now WHERE turn_ref = :turn_ref "
                     "AND assistant_status = 'running' AND assistant_attempt_count = "
                     ":claim_attempt"
                 ),
@@ -7238,24 +7387,12 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     "assistant_content_hash": canonical_hash(reply),
                     "metadata_json": canonical_json(metadata),
                     "metadata_hash": canonical_hash(metadata),
+                    "native_session_ref": result.native_session_ref,
                     "now": now,
                 },
             )
             if not updated.rowcount:
                 return True
-            connection.execute(
-                text(
-                    "UPDATE hc_intent_drafting_sessions SET native_session_ref = "
-                    ":native_session_ref, updated_at = :now WHERE session_ref = "
-                    ":session_ref AND (native_session_ref IS NULL OR "
-                    "native_session_ref = :native_session_ref)"
-                ),
-                {
-                    "session_ref": turn.session_ref,
-                    "native_session_ref": result.native_session_ref,
-                    "now": now,
-                },
-            )
             connection.execute(
                 text(
                     "UPDATE human_collaboration_state SET revision = revision + 1 "
@@ -8483,7 +8620,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                         "user_content, user_content_hash, assistant_status, "
                         "assistant_content, assistant_content_hash, reason_code, "
                         "adapter_metadata_json, adapter_metadata_hash, "
-                        "created_at, completed_at FROM hc_intent_drafting_turns "
+                        "created_at, completed_at, native_session_generation, native_session_ref FROM hc_intent_drafting_turns "
                         "WHERE session_ref = :session_ref ORDER BY ordinal"
                     ),
                     {"session_ref": intent_session.session_ref},
@@ -8493,6 +8630,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             )
             for turn in intent_turns:
                 _require_intent_turn_artifact_integrity(turn)
+            intent_native_sessions = ([] if intent_session is None else connection.execute(text(
+                "SELECT generation,native_session_ref,created_at FROM hc_intent_native_sessions "
+                "WHERE session_ref=:session_ref ORDER BY generation"), {"session_ref": intent_session.session_ref}).all())
+            intent_busy = intent_session is not None and self._intent_session_busy(
+                connection, initialization_id, intent_session.session_ref)
             preview_binding = (
                 connection.execute(
                     text(
@@ -9015,10 +9157,22 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 {
                     "ref": intent_session.session_ref,
                     "status": intent_session.status,
+                    "native_session_generation": int(intent_session.native_session_generation),
+                    "native_session_ref": intent_session.native_session_ref,
+                    "native_sessions": [{"generation": int(native.generation), "native_session_ref": native.native_session_ref,
+                        "created_at": float(native.created_at)} for native in intent_native_sessions] or [
+                            {"generation": int(intent_session.native_session_generation),
+                                "native_session_ref": intent_session.native_session_ref, "created_at": float(intent_session.created_at)}],
+                    "can_start_new_session": intent_session.status == "open" and not intent_busy,
+                    "switch_block_reason": "companion_session_busy" if intent_busy else None,
+                    **({} if self._root_workspaces is None else self._root_workspaces.initialization_workspace_metadata(
+                        initialization_id, intent_session.session_ref)),
                     "turns": [
                         {
                             "ref": turn.turn_ref,
                             "ordinal": int(turn.ordinal),
+                            "native_session_generation": int(turn.native_session_generation),
+                            "native_session_ref": turn.native_session_ref,
                             "basis_revision": int(turn.basis_revision),
                             "basis_hash": turn.basis_hash,
                             "user_content": turn.user_content,

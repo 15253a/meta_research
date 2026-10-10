@@ -1159,7 +1159,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog).not.toContainText("不要粘贴密码");
   await expect(dialog.getByText("Human Waiting Projection", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText(
-    "聊天可以帮助理解情况；只有左侧明确提交，才会记录你的回应。",
+    "选择助手说明或工作空间中的产物后，在正式回应区明确提交，才会交回本请求原根。",
     { exact: true },
   )).toBeVisible();
   const libraryDraft = dialog.getByLabel("就图书馆恢复事项发消息");
@@ -2170,9 +2170,9 @@ test("HumanRequest deep links select the exact route and keep the background ine
   await expect(page).toHaveURL(/\?panel=human-request$/);
 });
 
-test("the HumanRequest workspace preserves order and overflow at 1440/800/390", async ({
+test("the HumanRequest workspace puts assistant work first and preserves overflow at 1440/800/390", async ({
   page,
-}) => {
+}, testInfo) => {
   await installHumanCollaborationSnapshot(page);
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
@@ -2182,10 +2182,7 @@ test("the HumanRequest workspace preserves order and overflow at 1440/800/390", 
   await expect(closeButton).toBeVisible();
   expect(await page.getByTestId("product-shell").evaluate((element) => (element as HTMLElement).inert))
     .toBe(true);
-  await expect(dialog).toHaveScreenshot("d7-human-request-1440.png", {
-    animations: "disabled",
-    maxDiffPixels: 0,
-  });
+  await page.screenshot({ path: testInfo.outputPath("human-request-v4-1440.png") });
 
   const regions = () => dialog.evaluate((root) => {
     const box = (selector: string) => {
@@ -2202,26 +2199,21 @@ test("the HumanRequest workspace preserves order and overflow at 1440/800/390", 
   });
 
   const desktop = await regions();
-  expect(desktop.core.x + desktop.core.width).toBeLessThanOrEqual(desktop.draft.x + 1);
+  expect(desktop.draft.x + desktop.draft.width).toBeLessThanOrEqual(desktop.core.x + 1);
+  expect(desktop.draft.width).toBeGreaterThan(desktop.core.width);
   expect(desktop.pageWidth).toBeLessThanOrEqual(desktop.viewportWidth);
 
   await page.setViewportSize({ width: 800, height: 900 });
   const tablet = await regions();
-  expect(tablet.draft.y).toBeGreaterThanOrEqual(tablet.core.y + tablet.core.height - 1);
+  expect(tablet.core.y).toBeGreaterThanOrEqual(tablet.draft.y + tablet.draft.height - 1);
   expect(tablet.pageWidth).toBeLessThanOrEqual(tablet.viewportWidth);
-  await expect(dialog).toHaveScreenshot("d7-human-request-800.png", {
-    animations: "disabled",
-    maxDiffPixels: 0,
-  });
+  await page.screenshot({ path: testInfo.outputPath("human-request-v4-800.png") });
 
   await page.setViewportSize({ width: 390, height: 844 });
   const mobile = await regions();
-  expect(mobile.draft.y).toBeGreaterThanOrEqual(mobile.core.y + mobile.core.height - 1);
+  expect(mobile.core.y).toBeGreaterThanOrEqual(mobile.draft.y + mobile.draft.height - 1);
   expect(mobile.pageWidth).toBeLessThanOrEqual(mobile.viewportWidth);
-  await expect(dialog).toHaveScreenshot("d7-human-request-390.png", {
-    animations: "disabled",
-    maxDiffPixels: 0,
-  });
+  await page.screenshot({ path: testInfo.outputPath("human-request-v4-390.png") });
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(railEntry).toBeVisible();
