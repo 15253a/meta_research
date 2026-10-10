@@ -1,5 +1,6 @@
 /* The confirmed clean typography, using installed fonts. */
 :root { -webkit-font-smoothing: antialiased; font-family:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Noto Sans CJK SC","Segoe UI",system-ui,-apple-system,sans-serif; --display:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Noto Sans CJK SC","Segoe UI",system-ui,-apple-system,sans-serif; --utility:ui-monospace,"Cascadia Code",Consolas,"SFMono-Regular",monospace; }
+.lumen-logo { background:none; box-shadow:none; border:0; }
 .lumen-companion-head .lumen-orb { display:flex; align-items:center; justify-content:center; background:#eeedff; box-shadow:none; animation:none; }
 .lumen-companion-head .lumen-orb::before, .lumen-companion-head .lumen-orb::after { display:none; }
 .lumen-companion-head .lumen-orb .meta-trace { width:28px; height:28px; }

@@ -4,6 +4,7 @@ import { fetchRootSessions, type RootSessions } from "./rootSessionsApi";
 import { canObserveActiveTarget, observedActiveTarget, TARGET_OBSERVATION_INTERVAL_MS } from "./activeTargetStatus";
 import "./status-home.css";
 import { ResearchMotionControl } from "./ResearchMotion";
+import { MetaTrace } from "./MetaTrace";
 import { HostResources } from "./HostResources";
 
 type Health = { status: string; checks: { name: string; status: string; reason?: { code: string } }[] };
@@ -148,7 +149,7 @@ export function StatusHome() {
   const unhealthy = status?.health.checks.filter(check => check.status !== "ready") ?? [];
   return <div className="status-home">
     <header className="status-home-header">
-      <a href="/" aria-label="Meta Research 首页"><span><b>Meta Research</b><small>LUMEN WORKSPACE</small></span></a>
+      <a href="/" aria-label="Meta Research 首页"><span className="lumen-logo" aria-hidden="true"><MetaTrace variant="signature" /></span><span><b>Meta Research</b><small>LUMEN WORKSPACE</small></span></a>
       <nav aria-label="工作台导航"><a className="is-active" href="/" aria-current="page">工作台</a><a href="/?workspace=1">研究现场</a><a href="/?workspace=1&companion=1">研究助手 <span>↗</span></a></nav>
       <ResearchMotionControl />
       <HostResources />
