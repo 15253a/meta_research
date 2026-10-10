@@ -42,13 +42,36 @@ export type ServerMaterialPage = {
   unexpanded: true;
 };
 
-export type MaterialReceiver = { kind: "creation" | "manual" | "current" | "request" } & Record<string, unknown>;
+export type MaterialReceiver = { kind: "creation" | "manual" | "current" | "request" | "acquired" } & Record<string, unknown>;
 export type WorkMaterialSubmission = { receiver: MaterialReceiver; selections: ServerMaterialSelection[]; description: string };
+export type MaterialTreatment = {
+  feedback_ref: string;
+  reference_ref: string;
+  receiver: MaterialReceiver;
+  processed_by: { root_kind: string; run_ref: string; root_session_ref: string; workspace_ref: string };
+  understanding: string;
+  disposition: "adopted" | "considered" | "deferred" | "not_used";
+  changes: string;
+  continuing_work: string;
+  reasons: string;
+  limitations: string;
+  selections: Array<{
+    source: { kind: "original_file" | "workspace_file" } & Record<string, unknown>;
+    custody: "managed" | "linked_local";
+    purpose: string;
+    asset_binding: { version_ref: string } & Record<string, unknown>;
+    role_ref: string;
+    reader: { version_ref?: string; source_ref?: string } & Record<string, unknown>;
+  }>;
+  declared_by_root: boolean;
+  created_at: number;
+};
 export type WorkMaterialReference = {
   reference_ref: string; submission_ref: string; receiver: MaterialReceiver;
   source: ServerMaterialSelection; description: string; availability: string;
-  read_state: "read" | "not_read"; read_ranges: Array<{ path: string; offset: number; bytes: number }>;
+  read_state: "read" | "not_read"; read_ranges: Array<{ path: string; offset: number; bytes: number; actor?: string | null }>;
   failures: Array<{ error: string; path: string }>; unexpanded: boolean;
+  treatments?: MaterialTreatment[];
 };
 export type WorkMaterialReceipt = { submission_ref: string; receiver: MaterialReceiver; references: WorkMaterialReference[] };
 export type PendingMaterialCommand = { namespace: string; scope: string; path: string; key: string; body: Record<string, unknown> };

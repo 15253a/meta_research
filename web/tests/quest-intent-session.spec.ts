@@ -29,6 +29,10 @@ async function creationDialog(page: Page, busy = false) {
     if (url.origin !== "http://127.0.0.1:18768") return route.abort();
     const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     if (url.pathname === "/api/v1/snapshot") return json(snapshot);
+    if (url.pathname === "/api/v1/search-sources" && request.method() === "GET") return json({ sources: [], templates: [] });
+    if (url.pathname === "/api/v1/quest-initializations/init-native-switch/search-sources" && request.method() === "GET") {
+      return json({ selection: { scope: { kind: "initialization", initialization_id: current.initialization_id }, revision: 0, allowed_source_ids: [], selection_hash: "empty" }, sources: [] });
+    }
     if (url.pathname === "/api/v1/quest-initializations/current" || url.pathname === "/api/v1/quest-initializations/init-native-switch") return json(current);
     if (url.pathname === "/api/v1/quest-initializations/init-native-switch/intent-session/new") {
       writes.push({ path: url.pathname, body: request.postDataJSON() });

@@ -10,7 +10,7 @@ from meta_research.human_guidance import FrozenGuidanceBinding
 from meta_research import __version__
 from meta_research.owners.common import canonical_hash, new_ref
 from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
-from meta_research.work_material_contract import WORK_MATERIAL_OPERATION_IDS
+from meta_research.work_material_contract import RUNTIME_MATERIAL_OPERATION_IDS
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -43,7 +43,7 @@ ROOT_AGENT_ENVIRONMENT_OPERATION_IDS = (
     "research_graph.environments.reference.reconcile",
 )
 ROOT_AGENT_COMMON_OPERATION_IDS = (
-    *WORK_MATERIAL_OPERATION_IDS,
+    *RUNTIME_MATERIAL_OPERATION_IDS,
     "research_workspace.discover",
     "research_workspace.read",
     "research_memory.assets.page",
