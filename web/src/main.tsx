@@ -15,7 +15,7 @@ import { StatusHome } from "./StatusHome";
 import { HostResources } from "./HostResources";
 import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
 import { observedActiveTarget } from "./activeTargetStatus";
-import { observedTargetRetry, targetResearchFacts } from "./targetResearchFacts";
+import { observedTargetRetry, selectTarget, targetIsExecuting, targetResearchFacts } from "./targetResearchFacts";
 import { BoundedDetails, PageWindow } from "./BoundedDetails";
 import { ResearchIcon, SpectrumStages, spectrumStage } from "./Spectrum";
 import { ResearchMotionProvider, ResearchMotionControl } from "./ResearchMotion";
@@ -3945,17 +3945,18 @@ function ExperimentLogLauncher({snapshot, blocked, paused, observationPointers, 
   const [minimized, setMinimized] = useState(false);
   const [view, setView] = useState<"records" | "files">("records");
   const opener = useRef<HTMLButtonElement>(null);
-  const target = available.find(item => item.target_ref === selected) ?? available.find(item => item.status === "running") ?? available[0];
   const sessionForeground = rootConversations.context.foreground;
   const sessionsConfirmed = !rootConversations.error && !rootConversations.context.stale
-    && Boolean(foreground && rootConversations.data?.quest_ref === foreground.quest_ref
+    && Boolean(foreground && rootConversations.data?.limited === false && rootConversations.data.quest_ref === foreground.quest_ref
       && sessionForeground?.quest_ref === foreground.quest_ref && sessionForeground.cycle_ref === foreground.cycle_ref
       && sessionForeground.question_ref === foreground.question_ref);
+  const target = selectTarget(available, selected, sessionsConfirmed ? rootConversations.data : null, foreground);
   const publicTargets = sessionsConfirmed ? rootConversations.data!.sessions.filter(session => session.kind === "target"
     && session.cycle_ref === foreground?.cycle_ref && session.question_ref === foreground.question_ref
     && session.target_ref && session.run_ref) : [];
   const publicTarget = !target ? publicTargets.find(item => item.session_ref === selected)
-    ?? publicTargets.find(item => item.is_executing) ?? publicTargets[0] : null;
+    ?? publicTargets.find(item => item.is_current === true && item.is_executing && item.status === "executing"
+      && rootConversations.data!.active_session_refs.includes(item.session_ref)) ?? publicTargets[0] : null;
   const recordsPending = rootConversations.error || rootConversations.context.stale
     || rootConversations.data && (!sessionsConfirmed || rootConversations.data.limited);
   useEffect(() => {setOpen(false); setSelected(null); setView("records");}, [foreground?.quest_ref, foreground?.cycle_ref, foreground?.question_ref]);
@@ -4065,13 +4066,15 @@ function WorkspaceMain({
   const bundleStage = stageSurface?.kind === "Bundle"
     ? stageSurface.projection
     : null;
-  const displayedTarget = bundleStage?.target_graph.targets.find(target => target.target_ref === rootConversations.selected?.target_ref)
-    ?? bundleStage?.target_graph.targets.find(target => target.status === "running") ?? bundleStage?.target_graph.targets.at(-1);
+  const displayedTarget = selectTarget(bundleStage?.target_graph.targets ?? [],
+    rootConversations.manualSelection ? rootConversations.selected?.target_ref : null,
+    !liveContext.stale && !showingLiveOverview && !rootConversations.error ? rootConversations.data : null, foreground);
   const displayedTargetStatus = !runtimeStatus.error && !liveContext.stale && !showingLiveOverview
     && liveContext.foreground === runtimeStatus.status?.foreground && liveContext.foreground?.stage.toLowerCase() === "bundle"
     ? runtimeStatus.status : null;
   const displayedTargetFacts = displayedTarget ? targetResearchFacts(displayedTarget,
-    bundleStage?.target_commits.find(commit => commit.target_ref === displayedTarget.target_ref), snapshot?.human_collaboration?.human_requests.items ?? [], displayedTargetStatus, targetRetry) : null;
+    bundleStage?.target_commits.find(commit => commit.target_ref === displayedTarget.target_ref), snapshot?.human_collaboration?.human_requests.items ?? [], displayedTargetStatus, targetRetry, targetIsExecuting(displayedTarget,
+      !liveContext.stale && !showingLiveOverview && !rootConversations.error ? rootConversations.data : null, foreground)) : null;
   const reasoningStage = stageSurface?.kind === "Reasoning"
     ? stageSurface.projection
     : null;

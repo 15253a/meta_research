@@ -7,6 +7,29 @@ const records = (value: unknown) => Array.isArray(value) ? value.map(record) : [
 const ref = (value: unknown): string | null => typeof value === "string" && value.length > 0 ? value : null;
 const refs = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 
+type ExecutionScope = { quest_ref: string; cycle_ref: string; question_ref: string; stage: string; status: string };
+export function exactTargetExecution(target: BundleTargetProjection) {
+  const execution = target.current_execution;
+  return execution?.target_ref === target.target_ref && execution.target_run_ref === target.target_run_ref ? execution : null;
+}
+export function targetIsExecuting(target: BundleTargetProjection, roots: RootSessions | null, foreground: ExecutionScope | null | undefined): boolean {
+  const execution = exactTargetExecution(target);
+  if (target.current_execution !== undefined && execution?.status !== "running") return false;
+  if (!foreground || foreground.stage.toLowerCase() !== "bundle" || foreground.status !== "active"
+    || !roots || roots.limited !== false || roots.quest_ref !== foreground.quest_ref) return false;
+  return roots.sessions.some(session => session.kind === "target" && session.stage === "bundle"
+    && session.target_ref === target.target_ref && session.run_ref === target.target_run_ref
+    && (!execution || session.root_session_ref === execution.root_session_ref)
+    && session.cycle_ref === foreground.cycle_ref && session.question_ref === foreground.question_ref
+    && session.is_current === true && session.is_executing === true && session.status === "executing"
+    && roots.active_session_refs.includes(session.session_ref));
+}
+export function selectTarget(targets: readonly BundleTargetProjection[], selectedRef: string | null | undefined,
+  roots: RootSessions | null, foreground: ExecutionScope | null | undefined) {
+  return targets.find(target => target.target_ref === selectedRef)
+    ?? targets.find(target => targetIsExecuting(target, roots, foreground)) ?? targets.at(-1);
+}
+
 export type TargetRetryObservation = { target_ref: string; run_ref: string; checkName: string; reasonCode?: string; summary: string };
 
 export function observedTargetRetry(status: RuntimeStatus | null, roots: RootSessions | null): TargetRetryObservation | null {
@@ -25,7 +48,7 @@ export function observedTargetRetry(status: RuntimeStatus | null, roots: RootSes
     summary: failure.reason?.code === "target_root_artifact_storage_unavailable" ? "Target 正在重试，上次入库受阻" : "Target 正在重试，上次推进受阻" };
 }
 
-export function targetResearchFacts(target: BundleTargetProjection, candidate?: BundleTargetCommitProjection, requests: readonly HumanRequestItem[] = [], runtimeStatus?: Pick<RuntimeStatus, "state" | "current_task" | "health"> | null, retry?: TargetRetryObservation | null) {
+export function targetResearchFacts(target: BundleTargetProjection, candidate?: BundleTargetCommitProjection, requests: readonly HumanRequestItem[] = [], runtimeStatus?: Pick<RuntimeStatus, "state" | "current_task" | "health"> | null, retry?: TargetRetryObservation | null, executionConfirmed?: boolean) {
   // A historical or mismatched Commit must never supply facts for the current Run.
   const commit = candidate?.target_ref === target.target_ref && candidate.target_spec_hash === target.spec_hash
     && (!target.target_run_ref || candidate.target_run_ref === target.target_run_ref) ? candidate : undefined;
@@ -62,12 +85,13 @@ export function targetResearchFacts(target: BundleTargetProjection, candidate?: 
   const runtimeFailure = exactRuntimeTarget && runtimeStatus?.state === "failed"
     && runtimeStatus.health.checks.some(check => ["target_run_worker", "target_root_lifecycle"].includes(check.name) && check.status === "unavailable");
   const retrySummary = runtimeFailure && retry?.target_ref === target.target_ref && retry.run_ref === target.target_run_ref ? retry.summary : null;
-  const technicalFailure = Boolean(runtimeFailure) || !commit && (["failed", "fenced"].includes(target.status) || Boolean(blockerCode && !coordination && !blockerCode.startsWith("target_high_risk_authorization")));
+  const execution = exactTargetExecution(target);
+  const technicalFailure = !commit && execution?.status === "failed" || Boolean(runtimeFailure) || !commit && (["failed", "fenced"].includes(target.status) || Boolean(blockerCode && !coordination && !blockerCode.startsWith("target_high_risk_authorization")));
   const dispositions: Record<string, string> = { positive: "正面结果", negative: "负面结果", uncertain: "结果不确定", rejected: "方案已否定", inconclusive: "尚无确定结论", insufficient_evidence: "证据不足" };
   const disposition = ref(commit?.result_disposition);
   const result = commit ? disposition ? dispositions[disposition] ?? disposition : null : "研究结果尚未接纳";
   const acceptance = result ? `研究记录已接纳 · ${result}` : "研究记录已接纳";
-  const summary = runtimePaused ? "研究已暂停，保留 Target 记录" : retrySummary || (runtimeFailure ? "Target 推进受阻" : openRequests.length ? "有待人类答复的求助" : technicalFailure ? "技术执行受阻" : coordination ? "等待研究调整" : commit ? acceptance : target.status === "running" ? "Target 正在开展工作" : "等待研究工作接续");
+  const summary = runtimePaused ? "研究已暂停，保留 Target 记录" : retrySummary || (runtimeFailure ? "Target 推进受阻" : openRequests.length ? "有待人类答复的求助" : technicalFailure ? "技术执行受阻" : coordination ? "等待研究调整" : commit ? acceptance : (execution?.status === "running" && executionConfirmed !== false || target.current_execution === undefined && executionConfirmed === true) ? "Target 正在开展工作" : execution?.status === "stopped" ? "Target 执行已停止，研究结果尚未接纳" : execution?.status === "completed" ? "Target 执行已结束，研究结果尚未接纳" : target.status === "running" ? "Target 执行状态待确认" : "等待研究工作接续");
   const resultAsset = record(measurement.result_asset);
   const artifactRefs = [...new Set([...refs(measurement.checkpoint_refs), ...records(manifest.entries).map(item => ref(record(item.binding).version_ref)).filter((item): item is string => Boolean(item)), ...refs([resultAsset.version_ref])])];
   const readableAssets = [...new Map([

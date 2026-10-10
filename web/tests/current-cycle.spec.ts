@@ -596,3 +596,28 @@ test("active Bundle follows its executing Target while explicit stage output kee
   await expect(timeline.getByRole("alert")).toHaveCount(0);
   expect(f.nonGetRequests).toEqual([]); expect(f.errors).toEqual([]);
 });
+
+
+test("terminal Target graph cannot displace an exact active root and historical work stays readable", async ({ page }) => {
+  const f = await openCurrentCycle(page, true);
+  const live = f.snapshot.bundle_stage.target_graph.targets[0];
+  live.current_execution = { target_ref: live.target_ref, target_run_ref: live.target_run_ref,
+    root_session_ref: f.target.root_session_ref, attempt_ref: "attempt-live", attempt_generation: 1,
+    fence_ref: "fence-live", observation_only: true, status: "running" };
+  const stopped = { ...live, target_ref: "target-stopped", target_key: "已停止的历史工作", target_run_ref: "run-stopped",
+    current_execution: { ...live.current_execution, target_ref: "target-stopped", target_run_ref: "run-stopped", root_session_ref: "root-stopped", status: "stopped" } };
+  f.snapshot.bundle_stage.target_graph.targets = [stopped, live];
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const picker = page.getByRole("combobox", { name: "选择实验任务" });
+  await expect(picker).toHaveValue(live.target_ref);
+  await expect(page.getByRole("region", { name: "当前研究工作状态" }).getByText("Target 正在开展工作", { exact: true })).toBeVisible();
+  await picker.selectOption(stopped.target_ref);
+  await expect(picker).toHaveValue(stopped.target_ref);
+  live.current_execution.status = "stopped";
+  f.target.is_executing = false; f.target.status = "completed";
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("region", { name: "当前研究工作状态" }).getByText("Target 执行已停止，研究结果尚未接纳", { exact: true })).toBeVisible();
+  await expect(page.getByText("Target 正在开展工作", { exact: true })).toHaveCount(0);
+  expect(f.nonGetRequests).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
