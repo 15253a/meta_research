@@ -198,13 +198,17 @@ test("the control stays available without a foreground and fits desktop and mobi
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 900 });
     await page.getByRole("button", { name: "修改配置", exact: true }).click();
-    await expect(dialog(page).getByRole("combobox", { name: "时间预算", exact: true })).toHaveValue("30d");
+    await expect(dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true })).toHaveValue("720");
     await expect(dialog(page).getByRole("checkbox")).toHaveCount(3);
     await expect(editor(page)).not.toBeVisible();
     const bounds = await dialog(page).boundingBox();
     expect(bounds).not.toBeNull();
     expect(bounds!.x).toBeGreaterThanOrEqual(0);
     expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+    const budgetField = dialog(page).locator(".time-budget-field");
+    await budgetField.scrollIntoViewIfNeeded();
+    await budgetField.screenshot({ path: `test-results/runtime-budget-${width}.png` });
+    expect(await dialog(page).evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
     await dialog(page).screenshot({ path: `test-results/runtime-conditions-${width}.png` });
     await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
   }
@@ -213,22 +217,22 @@ test("the control stays available without a foreground and fits desktop and mobi
 test("common choices and advanced JSON stay in sync without losing custom conditions", async ({ page }) => {
   const state = await workspace(page, structuredText());
   await page.getByRole("button", { name: "修改配置", exact: true }).click();
-  const budget = dialog(page).getByRole("combobox", { name: "时间预算", exact: true });
+  const budget = dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true });
   const literature = dialog(page).getByRole("combobox", { name: "文献搜索范围", exact: true });
-  await expect(budget).toHaveValue("30d");
+  await expect(budget).toHaveValue("720");
   await expect(literature).toHaveValue("oa_only");
   await expect(editor(page)).not.toBeVisible();
-  await budget.selectOption({ label: "7 天" });
+  await budget.fill("2.5");
   await literature.selectOption({ label: "公开全文与可选图书馆" });
   await dialog(page).getByRole("textbox", { name: "文献排除范围", exact: true }).fill("不纳入动物实验");
   await dialog(page).locator("summary").filter({ hasText: "高级" }).click();
   const first = await editor(page).inputValue();
   expect(first.startsWith(prefix)).toBe(true);
   expect(first.endsWith(suffix)).toBe(true);
-  expect(savedJson(first)).toEqual({ ...initialConditions, time_budget: "7d",
+  expect(savedJson(first)).toEqual({ ...initialConditions, time_budget: "2.5h",
     literature: { ...initialConditions.literature, mode: "oa_then_institution", scope_exclusions: "不纳入动物实验" } });
   await editor(page).fill(structuredText({ ...savedJson(first), time_budget: "90d" }));
-  await expect(budget).toHaveValue("90d");
+  await expect(budget).toHaveValue("2160");
   await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
   await expect(dialog(page).getByRole("status")).toContainText("已保存");
   expect(state.writes).toHaveLength(1);
@@ -260,12 +264,43 @@ test("deselected GPUs can be selected again after saving and reopening", async (
   expect(state.catalogReads).toBe(2);
 });
 
+test("custom hour budgets validate and survive saving and reopening", async ({ page }) => {
+  const state = await workspace(page, structuredText());
+  const opener = page.getByRole("button", { name: "修改配置", exact: true });
+  await opener.click();
+  const budget = dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true });
+  const save = dialog(page).getByRole("button", { name: "保存运行条件" });
+  for (const invalid of ["", "0", "-1", "0.001"]) {
+    await budget.fill(invalid);
+    await expect(save).toBeDisabled();
+    await expect(budget).toHaveAttribute("aria-invalid", "true");
+  }
+  expect(state.writes).toHaveLength(0);
+  await budget.fill("2.5");
+  await save.click();
+  await expect(dialog(page).getByRole("status")).toContainText("已保存");
+  expect(savedJson(state.writes[0].text)).toEqual({ ...initialConditions, time_budget: "2.5h" });
+  await dialog(page).getByRole("button", { name: "关闭", exact: true }).click();
+  await opener.click();
+  await expect(budget).toHaveValue("2.5");
+  await dialog(page).getByRole("button", { name: "不设硬截止", exact: true }).click();
+  await expect(budget).toBeDisabled();
+  await dialog(page).getByRole("button", { name: "不设硬截止", exact: true }).click();
+  await expect(budget).toHaveValue("2.5");
+  await expect(budget).toBeEnabled();
+  await dialog(page).getByRole("button", { name: "不设硬截止", exact: true }).click();
+  await save.click();
+  await expect(dialog(page).getByRole("status")).toContainText("已保存");
+  expect(savedJson(state.writes[1].text).time_budget).toBe("open");
+});
+
 test("invalid JSON stays editable and unsupported values are not silently normalized", async ({ page }) => {
   const state = await workspace(page, structuredText({ ...initialConditions, time_budget: "custom-budget",
     literature: { ...initialConditions.literature, mode: "custom-scope" } }));
   await page.getByRole("button", { name: "修改配置", exact: true }).click();
-  const budget = dialog(page).getByRole("combobox", { name: "时间预算", exact: true });
-  await expect(budget).toHaveValue("custom-budget");
+  const budget = dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true });
+  await expect(budget).toHaveValue("");
+  await expect(dialog(page).getByRole("button", { name: "保存运行条件" })).toBeDisabled();
   await expect(dialog(page).getByRole("combobox", { name: "文献搜索范围", exact: true })).toHaveValue("custom-scope");
   await dialog(page).locator("summary").filter({ hasText: "高级" }).click();
   const broken = prefix + '{"time_budget": "7d",';
@@ -275,14 +310,14 @@ test("invalid JSON stays editable and unsupported values are not silently normal
   expect(state.writes).toHaveLength(0);
   await editor(page).fill(structuredText());
   await expect(budget).toBeEnabled();
-  await expect(budget).toHaveValue("30d");
+  await expect(budget).toHaveValue("720");
 });
 
 test("catalog failures or wrong Quest metadata do not overwrite the current configuration", async ({ page }) => {
   const state = await workspace(page, structuredText());
   state.catalogFailure = true;
   await page.getByRole("button", { name: "修改配置", exact: true }).click();
-  await expect(dialog(page).getByRole("combobox", { name: "时间预算", exact: true })).toHaveValue("30d");
+  await expect(dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true })).toHaveValue("720");
   await expect(dialog(page).getByText(/完整设备清单读取失败/)).toBeVisible();
   await expect(dialog(page).getByRole("checkbox")).toHaveCount(2);
   await dialog(page).getByRole("button", { name: "取消", exact: true }).click();

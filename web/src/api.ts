@@ -264,7 +264,7 @@ export type ResearchStyle = "focus" | "balanced" | "open";
 export type QuestDraft = {
   goal: string;
   completion_criteria: string;
-  time_budget: "7d" | "30d" | "90d" | "open";
+  time_budget: string;
   research_style: ResearchStyle;
   route: "direct" | "deepfetch";
   resource_envelope_ref: string | null;

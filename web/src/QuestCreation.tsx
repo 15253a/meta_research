@@ -31,6 +31,8 @@ import {
   type QuestDraft,
 } from "./api";
 import { RESEARCH_STYLES } from "./researchStyle";
+import { TimeBudgetField } from "./TimeBudgetField";
+import { timeBudgetLabel, validTimeBudget } from "./timeBudget";
 import { CreationUnderstanding } from "./CreationUnderstanding";
 import { SearchSourcesSettings } from "./SearchSourcesSettings";
 import { MetaTrace } from "./MetaTrace";
@@ -717,6 +719,7 @@ export function QuestCreationWorkbench({
   }, [applyView, pollCreation, showError]);
 
   const persistDraft = useCallback(async function persist(): Promise<QuestCreationView | null> {
+    if (!validTimeBudget(draftRef.current.time_budget)) return null;
     if (Boolean(writeConflictRef.current)) return null;
     if (draftSavePromiseRef.current) {
       await draftSavePromiseRef.current;
@@ -1526,24 +1529,10 @@ export function QuestCreationWorkbench({
                         {RESEARCH_STYLES.find(style => style.value === draft.research_style)?.description} 这是持续研究倾向，仍须遵循你明确保留的条件。
                       </small>
                     </label>
-                    <label className="quest-field">
-                      <span>时间预算</span>
-                      <select
-                        aria-label="时间预算"
-                        value={draft.time_budget}
-                        disabled={!creation || draftInteractionLocked}
-                        onChange={(event) => updateDraft({
-                          ...draft,
-                          time_budget: event.target.value as QuestDraft["time_budget"],
-                        })}
-                        onBlur={() => void persistDraft()}
-                      >
-                        <option value="7d">7 天</option>
-                        <option value="30d">30 天</option>
-                        <option value="90d">90 天</option>
-                        <option value="open">不设硬截止</option>
-                      </select>
-                    </label>
+                    <TimeBudgetField className="quest-field" value={draft.time_budget}
+                      disabled={!creation || draftInteractionLocked}
+                      onChange={time_budget => updateDraft({ ...draft, time_budget })}
+                      onBlur={() => void persistDraft()} />
                     <section className="quest-compute" aria-labelledby="quest-compute-title">
                       <div className="quest-compute-head">
                         <div>
@@ -1942,7 +1931,7 @@ export function QuestCreationWorkbench({
 
             <aside className="quest-research-start" data-reading-position="sidebar" aria-label="研究路线与助手">
             <section className="quest-start-readings" aria-label="你的研究起点"><h3>你的研究起点</h3><dl>
-              <div><dt>时间预算</dt><dd>{{ "7d": "7 天", "30d": "30 天", "90d": "90 天", "open": "不设硬截止" }[draft.time_budget]}</dd></div>
+              <div><dt>时间预算</dt><dd>{timeBudgetLabel(draft.time_budget)}</dd></div>
               <div><dt>登记设备</dt><dd>{creation?.resource_envelope ? resourceEnvelopeCopy(creation) : "尚未检测并选择"}</dd></div>
               <div><dt>文献范围</dt><dd>{draft.literature.mode === "provided_only" ? "仅已提供材料" : draft.literature.mode === "oa_only" ? "公开获取" : "公开全文与可选图书馆"}</dd></div>
             </dl></section>
@@ -2548,6 +2537,7 @@ function meaningful(value: string): boolean {
 
 function draftIsComplete(value: QuestDraft): boolean {
   return meaningful(value.goal) && meaningful(value.completion_criteria) &&
+    validTimeBudget(value.time_budget) &&
     ["direct", "deepfetch"].includes(value.route);
 }
 
@@ -3098,10 +3088,6 @@ function resourceEnvelopeCopy(creation: QuestCreationView): string {
   return `已绑定 ${envelope.selected_device_uuids.length} 张实际检测设备。` +
     `时间预算 ${timeBudgetLabel(envelope.time_budget)} · ${ceiling} · ${devices || "未选设备"}；` +
     `状态 ${envelope.status}，不是 Run ResourceBinding。`;
-}
-
-function timeBudgetLabel(value: QuestDraft["time_budget"]): string {
-  return { "7d": "7 天", "30d": "30 天", "90d": "90 天", open: "不设硬截止" }[value];
 }
 
 function formatMemory(memoryTotalMib: number): string {

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-CODEX_MODEL_REF = "gpt-6.1-sol"
+import os
+
+SUPPORTED_CODEX_MODEL_REFS = ("gpt-6.1-sol", "gpt-5.6-sol")
+CODEX_MODEL_REF = os.environ.get("META_RESEARCH_CODEX_MODEL", "gpt-6.1-sol")
+if CODEX_MODEL_REF not in SUPPORTED_CODEX_MODEL_REFS:
+    raise ValueError(
+        "META_RESEARCH_CODEX_MODEL must be gpt-6.1-sol or gpt-5.6-sol"
+    )
 CODEX_LOCKED_VERSION = "0.159.0"
 # Model effort is distinct from the CLI preset, which also enables Ultra.
 CODEX_REASONING_EFFORT = "max"

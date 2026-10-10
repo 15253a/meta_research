@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 
-test("creating a Quest defaults to balanced and restores a saved research style with its boundaries", async ({ page }) => {
+test("creating a Quest restores saved research style, custom hours and boundaries", async ({ page }) => {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];
   let created = false;
@@ -61,6 +61,20 @@ test("creating a Quest defaults to balanced and restores a saved research style 
   })).toMatchObject({
     research_style: "focus", goal: "核对已有结果的适用范围", completion_criteria: "保留原始数据；只在获准范围内研究。",
   });
+  const budget = dialog.getByRole("spinbutton", { name: "时间预算", exact: true });
+  await expect(budget).toHaveValue("720");
+  await budget.fill("2.5");
+  await budget.blur();
+  await expect.poll(() => value.time_budget).toBe("2.5h");
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" }).getByRole("combobox", { name: "研究风格", exact: true })).toHaveValue("focus");
+  await expect(budget).toHaveValue("2.5");
+  await expect(dialog.getByRole("complementary", { name: "研究路线与助手" })).toContainText("2.5 小时");
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    const field = dialog.locator(".time-budget-field");
+    await field.scrollIntoViewIfNeeded();
+    await field.screenshot({ path: `test-results/quest-budget-${width}.png` });
+    expect(await dialog.evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+  }
 });

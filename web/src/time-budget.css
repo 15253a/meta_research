@@ -1,0 +1,9 @@
+.time-budget-field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.time-budget-field > label { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.time-budget-field > label > span { color: #66718a; font-size: 13px; }
+.time-budget-field input[type="number"] { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #cbd3e2; border-radius: 9px; color: #172033; background: #fff; font: inherit; }
+.time-budget-field input:disabled { color: #66718a; background: #f4f6fa; }
+.time-budget-field input:focus { outline: 2px solid #625fe7; outline-offset: 2px; }
+.time-budget-field > .time-budget-open { align-self: flex-start; padding: 3px 0; border: 0; background: transparent; color: #66718a; font: inherit; font-size: 12px; cursor: pointer; }
+.time-budget-field > .time-budget-open[aria-pressed="true"] { color: #625fe7; text-decoration: underline; }
+.time-budget-field > small[role="alert"] { color: #a32942; }
