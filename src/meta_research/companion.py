@@ -45,7 +45,7 @@ from meta_research.root_capabilities import RootCapabilityProfile, root_capabili
 from meta_research.creation_basis import (
     InitializationUnderstandingRequest, InitializationUnderstandingResult,
     FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult,
-    first_creation_instructions, understanding_schema, revision_schema,
+    first_creation_instructions, understanding_schema, revision_schema, reassessment_schema,
 )
 
 
@@ -152,6 +152,9 @@ class CodexCompanionAdapter(
         extra = ()
         if basis is not None:
             work.bind_context_readers(basis, getattr(request, "literature_snapshot", None))
+            extra = ("research_memory.creation_basis.read", "research_memory.content.read")
+        elif getattr(request, "reassessment", None) is not None:
+            work.bind_reassessment_readers(request.reassessment)
             extra = ("research_memory.creation_basis.read", "research_memory.content.read")
         guidance_root = Path(__file__).parent / "skills" / "first_creation"
         names = ("SKILL.md", "references/source-evidence.md", "references/literature-corrections.md")
@@ -282,16 +285,29 @@ class CodexCompanionAdapter(
         try:
             if request.inputs is not None:
                 prompt = ("Read registered material entrances only through the granted bounded discover/read/copy MCP tools. "
-                    "Return the reference understanding schema using actual returned opaque witness_ref citations. "
-                    "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
+                    + ("Return the reference understanding schema using actual returned opaque witness_ref citations. "
+                       if request.reassessment is None else "Return the reassessment delta using actual returned opaque witness_ref citations for new reads. ")
+                    + "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
                     "A directory is never completely read merely because one child was read.\n"
-                    + _canonical_json({"instruction_bundle": instructions, "draft": request.draft}))
+                    + _canonical_json({"instruction_bundle": instructions, "draft": request.draft,
+                        "reassessment": request.reassessment}))
+                if request.reassessment is not None:
+                    prompt += ("\nJudge each prior statement's applicability and conditions. "
+                        "Read only affected content. Explicitly inherit eligible witnesses with their original operation identity. "
+                        "Emit each inherited witness once, using eligible live_source for current reuse. Never emit the same witness "
+                        "as both live_source and managed_history. Retain its selected exact version separately in inherited_selection_keys; "
+                        "managed custody does not require a managed_history entry for a live witness. "
+                        "Managed history supports historical statements, never current read coverage. Mark necessary first-Question "
+                        "checks versus future research without a global waiting gate. Decide separately for every old literature snapshot. "
+                        "Reuse selected exact versions instead of selecting them for intake again.")
                 raw, native_ref, _stdout, identity, work = self._protected_creation_invoke(request,
                     operation_name="initialization-understanding", prompt=prompt,
-                    schema=understanding_schema(references=True), native_session_ref=request.companion_native_session_ref, inputs=request.inputs)
+                    schema=reassessment_schema() if request.reassessment is not None else understanding_schema(references=True),
+                    native_session_ref=request.companion_native_session_ref, inputs=request.inputs)
                 if native_ref is None:
                     raise DraftingUnavailable("companion_native_session_missing")
-                return InitializationUnderstandingResult(raw, native_ref, identity, work)
+                return InitializationUnderstandingResult({} if request.reassessment is not None else raw, native_ref, identity, work,
+                    raw if request.reassessment is not None else None)
             raw, native_ref, _stdout = self._invoke(operation_name="initialization-understanding", prompt=prompt,
                 schema=understanding_schema(), native_session_ref=request.companion_native_session_ref,
                 job_ref=request.job_ref, workspace_binding=self._creation_workspace(request))
@@ -313,6 +329,9 @@ class CodexCompanionAdapter(
             "Read the small exact context projection through its declared input paths. "
             "Use the granted scoped Readers for selected original sources and literature evidence, and bounded material tools for new original reads. "
             "Preserve the prepared basis and source selection. "
+            "Read applicability.json and inherited-literature.json when present. Reuse applicable statements and exact selected versions; "
+            "do not repeat unaffected material reads. Inherited literature retains its original snapshot, run and binding. "
+            "A direct route may use explicitly inherited literature without presenting it as a new search. "
             "Return the six proposal fields and the route-specific revision. A direct route returns revision=null. "
             "A DeepFetch route returns a complete literature revision with explicit corrections or an honest unchanged/empty assessment. "
             "No Owner writes, receipts, human confirmation, or invented Quest Run.\n"

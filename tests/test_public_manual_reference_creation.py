@@ -109,6 +109,10 @@ def test_manual_reference_seed_drafting_append_explicit_save_confirm_and_success
         refreshed = client.post(endpoint + "/understanding", headers=_write_headers(headers, "manual-refresh"), json={})
         assert refreshed.status_code == 200, refreshed.text
         view = refreshed.json()
+        assert view["creation_basis"]["applicability"]["predecessor"]["basis_hash"] == ready["creation_basis"]["basis_hash"]
+        assert len(view["creation_basis"]["input_identity"]["consumed"]) == 1
+        inherited_original = next(item["binding"] for item in ready["creation_basis"]["sources"] if item["source"]["kind"] == "original_file")
+        assert inherited_original in [item["binding"] for item in view["creation_basis"]["sources"]]
         assert view["seed"] == seed and view["generation"] == ready["generation"]
         assert client.post(endpoint + "/proposal-confirmation", headers=_write_headers(headers, "manual-old-after-refresh"), json=old_confirmation).status_code == 409
         saved = client.put(endpoint + "/proposal", headers=_write_headers(headers, "manual-fresh-save"), json=manual_save_payload(view))

@@ -24,12 +24,21 @@ class ReferenceReadingDeepFetch(DeterministicDeepFetchProvider):
         context = _context(request, "deepfetch")
         channel = _channel(self.runtime, context)
         exact = request.scope["creation_basis"]
-        prior = _accepted(_call(self.runtime, channel, "research_memory.creation_basis.read", basis_ref=exact["basis_ref"],
-            expected_basis_hash=exact["basis_hash"], view="understanding", limit=16384))
-        assert "Original16" in str(prior)
-        assert "Original16" in str(request.scope["existing_work_retrieval"])
+        pages, offset = [], 0
+        while offset is not None:
+            prior = _accepted(_call(self.runtime, channel, "research_memory.creation_basis.read", basis_ref=exact["basis_ref"],
+                expected_basis_hash=exact["basis_hash"], view="understanding", offset=offset, limit=16384))
+            pages.append(prior["text"])
+            offset = prior["next_offset"]
+        assert "original16" in "".join(pages).casefold()
+        assert "original16" in str(request.scope["existing_work_retrieval"]).casefold()
         self.input_basis = exact
         self.query_basis = request.scope["existing_work_retrieval"]
+        for inherited in request.scope.get("inherited_literature", []):
+            page = _accepted(_call(self.runtime, channel, "research_memory.creation_basis.read", basis_ref=exact["basis_ref"],
+                expected_basis_hash=exact["basis_hash"], view="literature", snapshot_ref=inherited["snapshot"]["snapshot_ref"]))
+            assert page["snapshot"] == inherited["snapshot"]
+            assert page["original_basis"] == inherited["original_basis"]
         return super().execute(request)
 
 
@@ -164,11 +173,128 @@ def test_material_only_append_rejects_old_save_preview_confirm_and_regenerates(t
         assert client.post(endpoint + "/confirmation-preview", headers=_write_headers(headers, "stale-preview"), json=preview).status_code == 409
         assert client.post(endpoint + "/confirmation", headers=_write_headers(headers, "stale-confirm"), json=old_confirmation).status_code == 409
         refreshed = generate(runtime, client, headers, current, key="refresh")
+        assert refreshed["creation_basis"]["applicability"]["predecessor"]["basis_hash"] == ready["creation_basis"]["basis_hash"]
+        assert len(refreshed["creation_basis"]["input_identity"]["consumed"]) == 1
+        assert refreshed["creation_basis"]["input_identity"]["consumed"][0]["reference_ref"] != ready["creation_basis"]["input_identity"]["consumed"][0]["reference_ref"]
+        original_version = next(item["binding"]["version_ref"] for item in ready["creation_basis"]["sources"] if item["binding"])
+        assert original_version in {item["binding"]["version_ref"] for item in refreshed["creation_basis"]["sources"] if item["binding"]}
         assert refreshed["creation_basis"]["input_identity_hash"] != ready["creation_basis"]["input_identity_hash"]
         assert len(refreshed["creation_basis"]["material_references"]["references"]) == 2
         confirmed = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "fresh-confirm"), json=_confirmation_payload(refreshed))
         assert confirmed.status_code == 202, confirmed.text
         assert complete(runtime, client, endpoint)["status"] == "completed"
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_goal_change_reuses_exact_selected_version_and_snapshot_without_new_deepfetch(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text("Original16 needs a condition-specific comparison.")
+    runtime, adapter = reference_runtime(tmp_path / "runtime", selection="original")
+    client, headers = _authenticate(runtime)
+    try:
+        ready = reference_ready(runtime, client, headers, source, route="deepfetch")
+        old_basis = ready["creation_basis"]
+        old_snapshot = old_basis["literature_snapshot"]
+        old_confirmation = _confirmation_payload(ready)
+        endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        draft = {**ready["quest_draft"]["value"], "goal": "Compare calibration in the cold condition.", "route": "direct"}
+        edited = client.put(endpoint + "/draft", headers=_write_headers(headers, "goal-edit"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"], "draft": draft})
+        assert edited.status_code == 200, edited.text
+        assert client.put(endpoint + "/proposal", headers=_write_headers(headers, "old-goal-save"), json=save_payload(ready, "Old goal")).status_code == 409
+        assert client.post(endpoint + "/confirmation", headers=_write_headers(headers, "old-goal-confirm"), json=old_confirmation).status_code == 409
+        refreshed = generate(runtime, client, headers, edited.json(), key="goal-refresh")
+        basis = refreshed["creation_basis"]
+        assert basis["input_identity"]["consumed"] == []
+        assert basis["literature_snapshot"] is None
+        assert basis["inherited_literature"][0]["snapshot"] == old_snapshot
+        assert basis["inherited_literature"][0]["original_basis"] == old_basis["predecessor"]
+        memory = runtime.owners.research_memory.creation_bases
+        assert memory.query(basis["basis_ref"])["understanding"] == memory.query(old_basis["basis_ref"])["understanding"]
+        assert basis["applicability"]["decisions"][0]["disposition"] == "retain"
+        assert len(runtime.deepfetch._provider.requests) == 1
+        selected = next(item for item in basis["sources"] if item["binding"] is not None)
+        assert selected["binding"] == next(item["binding"] for item in old_basis["sources"] if item["binding"] is not None)
+        assert _retire(client, headers, runtime, selected["binding"], "inherited-pending-retire").status_code == 409
+        assert client.get(f"/api/v1/research-assets/{selected['binding']['version_ref']}/content").content == source.read_bytes()
+        assert client.put(endpoint + "/proposal", headers=_write_headers(headers, "current-goal-save"), json=save_payload(refreshed, "Cold comparison")).status_code == 200
+        current = client.get(endpoint).json()
+        accepted = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "current-goal-confirm"), json=_confirmation_payload(current))
+        assert accepted.status_code == 202, accepted.text
+        assert complete(runtime, client, endpoint)["status"] == "completed"
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_requested_new_deepfetch_keeps_inherited_snapshot_and_new_binding_distinct(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text("Original16 needs a condition-specific comparison.")
+    runtime, adapter = reference_runtime(tmp_path / "runtime", selection="original")
+    client, headers = _authenticate(runtime)
+    try:
+        ready = reference_ready(runtime, client, headers, source, route="deepfetch")
+        old = ready["creation_basis"]
+        endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        draft = {**ready["quest_draft"]["value"], "goal": "Find condition-specific counterexamples for a cold calibration."}
+        edited = client.put(endpoint + "/draft", headers=_write_headers(headers, "new-search-goal"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"], "draft": draft})
+        assert edited.status_code == 200, edited.text
+        current = generate(runtime, client, headers, edited.json(), key="new-focused-search", route="deepfetch")
+        basis = current["creation_basis"]
+        assert basis["literature_snapshot"]["snapshot_ref"] != old["literature_snapshot"]["snapshot_ref"]
+        assert basis["inherited_literature"][0]["snapshot"] == old["literature_snapshot"]
+        assert basis["inherited_literature"][0]["original_basis"] == old["predecessor"]
+        assert basis["predecessor"] == runtime.deepfetch._provider.input_basis
+        assert len(runtime.deepfetch._provider.requests) == 2
+        assert basis["input_identity"]["consumed"] == []
+        assert basis["applicability"]["decisions"][0]["disposition"] == "retain"
+    finally:
+        client.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_literature_origin_survives_actual_consumption_then_reassessment(tmp_path, legacy):
+    from meta_research.creation_basis import InitializationUnderstandingResult
+    from test_creation_reassessment import read_materials
+
+    source = tmp_path / "original"
+    source.mkdir()
+    (source / "note.txt").write_text("Original16 needs a condition-specific comparison.")
+    (source / "additional.txt").write_text("This additional range was read only after literature acceptance.")
+    runtime, adapter = reference_runtime(tmp_path / "runtime", selection="original")
+    client, headers = _authenticate(runtime)
+    try:
+        ready = reference_ready(runtime, client, headers, source, route="deepfetch")
+        memory = runtime.owners.research_memory.creation_bases
+        revised = memory.query(ready["creation_basis"]["basis_ref"])
+        original = revised["predecessor"]
+        assert revised["literature_original_binding"] == original
+        inputs = memory.require_current(revised)
+        reference = inputs.references[0]["reference_ref"]
+        _, work, identity, _ = read_materials(runtime, adapter.calls[-1][1].operation.binding, inputs,
+            "post-literature-consumption", reference, ["additional.txt"])
+        consumed = memory.accept_consumed(revised, InitializationUnderstandingResult({}, input_identity=identity, work=work))
+        assert consumed["predecessor"] == memory.reference(revised)
+        assert consumed["literature_original_binding"] == original
+        assert any(item["operation_ref"] == "post-literature-consumption" for item in consumed["input_identity"]["consumed"])
+        if legacy:
+            consumed = memory._accept({key: value for key, value in consumed.items()
+                if key not in {"basis_ref", "basis_hash", "literature_original_binding"}})
+        assert memory._literature_relations(consumed)[revised["literature_snapshot"]["snapshot_ref"]]["original_basis"] == original
+        endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        edited = client.put(endpoint + "/draft", headers=_write_headers(headers, "origin-goal"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"],
+            "draft": {**ready["quest_draft"]["value"], "goal": "Compare only the changed cold condition.", "route": "direct"}})
+        assert edited.status_code == 200, edited.text
+        current = generate(runtime, client, headers, edited.json(), key="origin-reassessment")
+        inherited = current["creation_basis"]["inherited_literature"][0]
+        assert inherited["snapshot"] == revised["literature_snapshot"]
+        assert inherited["original_basis"] == original
+        assert inherited["snapshot"]["binding"]["run_ref"] == revised["literature_snapshot"]["binding"]["run_ref"]
     finally:
         client.close()
         runtime.close()
@@ -280,6 +406,15 @@ def test_new_reference_consumer_custody_failure_readback_and_recovery(tmp_path):
     try:
         ready = reference_ready(runtime, client, headers, source)
         endpoint = f"/api/v1/quest-initializations/{ready['initialization_id']}"
+        before = ready["creation_basis"]
+        changed = client.put(endpoint + "/draft", headers=_write_headers(headers, "failure-goal-change"), json={
+            "expected_draft_revision": ready["quest_draft"]["revision"], "expected_draft_hash": ready["quest_draft"]["hash"],
+            "draft": {**ready["quest_draft"]["value"], "goal": "Continue the preserved result under a new condition."}})
+        assert changed.status_code == 200, changed.text
+        ready = generate(runtime, client, headers, changed.json(), key="failure-inherited")
+        inherited = [item for item in ready["creation_basis"]["sources"] if item["binding"] is not None]
+        assert [item["binding"] for item in inherited] == [item["binding"] for item in before["sources"] if item["binding"] is not None]
+        assert all(item["inherited_from"]["basis_hash"] == before["basis_hash"] for item in inherited)
         confirmed = client.post(endpoint + "/confirmation", headers=_write_headers(headers, "confirm"), json=_confirmation_payload(ready))
         assert confirmed.status_code == 202, confirmed.text
         objects.rename(unavailable)

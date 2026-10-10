@@ -737,6 +737,8 @@ class ManualQuestionCreation:
         if not inputs.references:
             return None
         memory = self._research_memory.creation_bases
+        draft_context = {"creation_context_ref": context_ref, "parent_question_ref": row.parent_question_ref,
+            "confirmed_seed": None if row.seed_json is None else _decoded_dict(row.seed_json, "manual_creation_seed_invalid")}
         current_basis = self._material_basis(row, require_current=False)
         if current_basis is not None:
             try:
@@ -744,17 +746,20 @@ class ManualQuestionCreation:
             except OwnerConflict:
                 pass
             else:
-                return current_basis
+                if current_basis.get("draft_context") == draft_context:
+                    return current_basis
         basis = memory.prepared(context_ref, inputs.anchor.draft_revision, inputs.anchor.draft_hash, inputs)
+        if basis is not None and basis.get("draft_context") != draft_context:
+            basis = None
         if basis is None:
             understand = getattr(self._intent_drafting_provider, "understand_initialization", None)
             if not callable(understand):
                 raise OwnerConflict("creation_understanding_provider_unavailable")
             request = InitializationUnderstandingRequest(str(row.quest_initialization_id), inputs.anchor.draft_revision,
-                inputs.anchor.draft_hash, {"creation_context_ref": context_ref, "parent_question_ref": row.parent_question_ref,
-                    "confirmed_seed": None if row.seed_json is None else _decoded_dict(row.seed_json, "manual_creation_seed_invalid")},
+                inputs.anchor.draft_hash, draft_context,
                 empty_manifest(), "manual_understanding_" + canonical_hash({"context": context_ref, "inputs": inputs.as_dict(), "key": idempotency_key}),
-                str(session.session_ref), session.native_session_ref, "manual_question_creation", context_ref, int(row.generation), inputs)
+                str(session.session_ref), session.native_session_ref, "manual_question_creation", context_ref, int(row.generation), inputs,
+                memory.reassessment_context(inputs))
             try:
                 result = understand(request)
             except DraftingUnavailable as error:
@@ -1091,6 +1096,8 @@ class ManualQuestionCreation:
         if prepared_basis is not None:
             memory = self._research_memory.creation_bases
             scope["creation_basis"] = memory.reference(prepared_basis)
+            scope["existing_work_applicability"] = prepared_basis.get("applicability")
+            scope["inherited_literature"] = prepared_basis.get("inherited_literature", [])
             scope["existing_work_retrieval"] = {field: prepared_basis["understanding"][field]
                 for field in ("claims_and_conditions", "conflicts", "gaps", "unfinished_questions")}
             materials.extend(item["binding"] for item in prepared_basis["sources"] if item["binding"] is not None)
