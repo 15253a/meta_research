@@ -29,7 +29,7 @@ Runtime conditions retain their existing CAS revision. A separate
 `literature_configuration` in the same version stores `mode`,
 `library_entry_url` and `institution_required`. The URL is validated by the
 existing library validator and excluded from the rendered model runtime text.
-New manual DeepFetch requests read saved configuration. Queued requests and
+New manual and autonomous DeepFetch requests read saved configuration. Queued requests and
 replays retain their frozen configuration; a different configuration cannot
 replace an active acquisition session. No new retrieval provider is introduced.
 

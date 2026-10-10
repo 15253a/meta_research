@@ -442,7 +442,7 @@ test("the Quest Companion shows the user's message before its reply is ready", a
     });
     markResponseFulfilled();
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
 
   const companion = page.getByRole("complementary", { name: "研究助手" });
   const message = "先立即显示我的这条消息。";
@@ -457,6 +457,7 @@ test("the Quest Companion shows the user's message before its reply is ready", a
     await expect.poll(() => posted).toEqual({
       scope_ref: "quest_chrome_1",
       message,
+      guidance_options: { strength: 3, work_materials: null },
     });
     await expect(
       companion.locator(".lumen-message.me").filter({ hasText: message }),
@@ -660,7 +661,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
     commandsProjection.authorizations = [authorization];
     await fulfillJson(route, authorization);
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
 
   const companion = page.getByRole("complementary", { name: "研究助手" });
   await expect(companion).toBeVisible();
@@ -766,6 +767,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
   await expect.poll(() => posted).toEqual({
     scope_ref: "quest_chrome_1",
     message: "为什么这里只是局部等待？",
+    guidance_options: { strength: 3, work_materials: null },
   });
   await expect(companion).toContainText("普通聊天不会被猜成硬命令");
 });
@@ -909,13 +911,13 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
     await fulfillJson(route, revoked);
   });
 
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
-  const companion = page.getByRole("complementary", { name: "研究助手" });
-  await expect(companion).toContainText("需要你 · 只影响相关任务");
-  await expect(companion).toContainText("BROAD RESEARCH AUTHORIZATION · CURRENT GRANT");
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   await page.getByRole("dialog", { name: "需要你处理的事项" })
     .getByRole("button", { name: "关闭需要你处理的事项" }).click();
-  await companion.getByRole("button", { name: "建立 revoke Command Draft" }).click();
+  const companion = page.getByRole("complementary", { name: "研究助手" });
+  await expect(companion).toContainText("需要你 · 只影响相关任务");
+  await expect(companion).toContainText("当前研究授权");
+  await companion.getByRole("button", { name: "申请撤销授权" }).click();
   await expect.poll(() => writes.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands",
     body: {
@@ -947,7 +949,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
     },
   });
   await expect(commandCard).toContainText("Capability Authorization · revoked");
-  await expect(companion).not.toContainText("BROAD RESEARCH AUTHORIZATION · CURRENT GRANT");
+  await expect(companion).not.toContainText("当前研究授权");
 });
 
 test("the HumanRequest surface keeps five raw Agent requests and their shortest response paths", async ({
@@ -1975,7 +1977,7 @@ test("auto presentation skips requests already presented in this browser session
     revision: Number(item.revision),
   })));
 
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("处理当前 Quest 的第二个全局阻塞。");
@@ -2083,7 +2085,7 @@ test("human obligation copy keeps operation facts inside verification details", 
   for (const item of humanRequests.items as JsonRecord[]) item.status = "satisfied";
   (humanRequests.items as JsonRecord[]).at(-1)!.status = "unsatisfied";
 
-  await page.goto(product!.baseUrl, {
+  await page.goto(`${product!.baseUrl}/?workspace=1`, {
     waitUntil: "domcontentloaded",
   });
   await page.getByRole("button", { name: "需要你" }).click();
@@ -2191,7 +2193,7 @@ test("the HumanRequest workspace puts assistant work first and preserves overflo
 }, testInfo) => {
   await installHumanCollaborationSnapshot(page);
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const railEntry = page.getByRole("button", { name: "需要你" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const closeButton = dialog.getByRole("button", { name: "关闭需要你处理的事项" });
@@ -2247,7 +2249,7 @@ test("human request Draft echoes immediately while its POST is pending", async (
     await gate;
     await route.fulfill({ status: 503, json: { error: { code: "temporarily_unavailable" } } });
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const input = dialog.getByLabel("就图书馆恢复事项发消息");
   await input.fill("请立即显示本条讨论消息");
@@ -2290,7 +2292,7 @@ test("human request Draft streams before its snapshot and keeps request conversa
   });
   await page.route("**/api/v1/companion/messages", (route) =>
     route.fulfill({ json: { interaction_ref: "request-stream", status: "queued" } }));
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await dialog.getByLabel("就图书馆恢复事项发消息").fill("这个事项请分段解释");
   await dialog.getByRole("button", { name: "发送消息" }).click();

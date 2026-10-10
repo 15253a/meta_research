@@ -102,9 +102,8 @@ test("a library request keeps the original response reachable after its complete
   for (const width of [1440, 800, 390]) {
     await page.setViewportSize({ width, height: 900 });
     const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-    const main = await dialog.getByRole("main").boundingBox();
-    expect(main).not.toBeNull();
-    await page.mouse.move(main!.x + 20, main!.y + 20);
+    const readingArea = dialog.locator(width > 900 ? ".hc-request-core" : ".hc-request-workspace");
+    await readingArea.hover({ position: { x: 8, y: 8 } });
     await page.mouse.wheel(0, 5_000);
     await expect(dialog.getByRole("button", { name: "提交这条想法", exact: true })).toBeInViewport();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();

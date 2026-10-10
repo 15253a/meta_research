@@ -45,6 +45,10 @@
   .workspace-modal .hc-request-core { overflow: visible; }
   .workspace-stage-track { gap: 12px; padding: 10px 16px; font-size: 11px; flex-wrap: wrap; }
 }
+@media (min-width: 901px) and (max-height: 760px) {
+  .workspace-modal .hc-request-draft { overflow: auto; }
+  .workspace-modal .hc-draft-transcript { min-height: 160px; }
+}
 @media (prefers-reduced-motion: reduce) {
   .workspace-modal, .workspace-modal * { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
 }

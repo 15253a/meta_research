@@ -195,7 +195,7 @@ test("direct MCP works with empty generic MCP and keeps saved private connection
   await shared(page).getByLabel("MCP 连接配置", { exact: true }).fill(JSON.stringify(connection));
   await expect(shared(page).getByLabel("MCP 连接配置", { exact: true })).toHaveAttribute("type", "password");
   await shared(page).getByRole("button", { name: "测试当前配置", exact: true }).click();
-  await expect(shared(page)).toContainText("搜索、摘要和全文能力仍需实际研究调用验证");
+  await expect(shared(page).getByRole("region", { name: "当前配置测试结果", exact: true })).toContainText("2026-10-10T12:00:00Z");
   expect(state.tests[0].form).toEqual({ kind: "mcp", name: "Private MCP", instructions: "", connection: { mode: "replace", value: connection } });
   expect(state.saves).toHaveLength(0);
   await shared(page).getByRole("button", { name: "保存共享来源", exact: true }).click();
@@ -203,6 +203,7 @@ test("direct MCP works with empty generic MCP and keeps saved private connection
   await expect(shared(page).getByRole("combobox", { name: "MCP 连接操作", exact: true })).toHaveValue("keep");
   await expect(shared(page).getByLabel("MCP 连接配置", { exact: true })).toHaveCount(0);
   await shared(page).getByRole("button", { name: "重新测试当前配置", exact: true }).click();
+  await expect.poll(() => state.tests.length).toBe(2);
   await expect(shared(page).getByRole("region", { name: "当前配置测试结果", exact: true })).toBeVisible();
   expect(state.tests[1].form).toEqual({ kind: "mcp", name: "Private MCP", instructions: "", connection: { mode: "keep" } });
   await expect(selection(page)).toContainText("目前可管理共享来源");

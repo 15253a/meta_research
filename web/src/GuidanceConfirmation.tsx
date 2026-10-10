@@ -74,6 +74,7 @@ export function GuidanceConfirmation({ proposal, onChanged }: { proposal: Compan
   return <article className="lumen-proposal guidance-confirmation" aria-label="确认研究指导">
     <small>理解预览 · {confirmed ? "已确认" : "尚未交给研究"}</small>
     <b>{proposal.title ?? "确认研究指导"}</b>
+    {proposal.summary ? <p>{proposal.summary}</p> : null}
     <label>指导原文<textarea aria-label="指导原文" value={review.guidance.text} rows={3} disabled={pending || confirmed || !proposed} onChange={event => change({ text: event.target.value })} /></label>
     <label>助手理解<textarea aria-label="助手理解" value={review.guidance.assistant_understanding} rows={3} disabled={pending || confirmed || !proposed} onChange={event => change({ assistant_understanding: event.target.value })} /></label>
     <label>拟作用范围<textarea aria-label="拟作用范围" value={review.guidance.applies_to.join("\n")} rows={2} disabled={pending || confirmed || !proposed} onChange={event => change({ applies_to: lines(event.target.value) })} /></label>
