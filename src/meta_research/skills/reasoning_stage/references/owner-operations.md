@@ -27,4 +27,4 @@ AE 管阶段请求、epoch、StageCommit、后继 Cycle 和 Quest 结束；AR �
 
 provider 正常交接后，daemon 沿公开接口保存 AR 执行、RM 内容和 RG 决策，再由 AE 验证 current request／epoch 与完整 receipts 推进。各边界独立幂等；响应丢失先查询原身份，从首个未完成步骤继续。仅经公开接口核实，不读取数据库、spool、seal key 或私有状态机伪造接纳或恢复。
 
-CandidateCompletion 还需当前 Web preview、用户明确确认、RG Goal／完成接纳和 AE 结束转换。尚未被当前 Goal 因果演化吸收的有效力度5指导会阻止完成；旧 CandidateCompletion 在 Goal 演化后仅作历史可读，AE 以更高 epoch 签发新 Reasoning 请求重新综合当前 Goal。拒绝、stale、未知或未响应都保持实际状态，不结束 Quest。
+CandidateCompletion 还需当前 Web preview、用户明确确认、RG Goal／完成接纳和 AE 结束转换。整体指导尚未判断目标影响或已判确需演化时保持待对齐；局部指导不因力度5阻止整体完成。旧无范围确认的5档记录按原文及历史待对齐语义读回。真实 Goal 演化后，旧 CandidateCompletion 仅作历史可读，AE 以更高 epoch 签发新 Reasoning 请求重新综合当前 Goal。拒绝、stale、未知或未响应都保持实际状态，不结束 Quest。

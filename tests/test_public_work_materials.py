@@ -4,6 +4,7 @@ from meta_research.web import create_app
 from test_root_workspace import _make
 from test_public_human_reply_delivery import _login
 from test_public_plan_stage import _confirm_direct_quest
+from guidance_confirmation_helpers import guidance_proposal_value, prepare_guidance_submission
 
 
 def test_current_guidance_and_input_save_exact_receivers_atomically_and_replay_after_source_loss(tmp_path):
@@ -22,13 +23,30 @@ def test_current_guidance_and_input_save_exact_receivers_atomically_and_replay_a
                 selection = _source(client, source)
                 command = {"receiver": receiver, "selections": [selection], "description": "Preserve exact active receiving work."}
                 stale = {**command, "receiver": {**receiver, "epoch": receiver["epoch"] + 1}}
-                guide = {"scope_ref": "quest:" + self.quest, "text": "  Keep original text.\n", "strength": 4, "work_materials": command}
+                guide = prepare_guidance_submission(self.runtime.owners.human_collaboration,
+                    self.quest, "  Keep original text.\n", key="current-guide", strength=4)
+                revision = client.post(
+                    f"/api/v1/human-collaboration/agent-proposals/{guide['proposal_ref']}/revisions",
+                    headers={**headers, "Idempotency-Key": "current-guide-material-edit"},
+                    json={"expected_scope_ref": guide["scope_ref"],
+                        "expected_proposal_hash": guide["expected_proposal_hash"],
+                        "proposal": guidance_proposal_value(self.quest, guide["text"],
+                            strength=4, work_materials=command)})
+                assert revision.status_code == 201, revision.text
+                old_confirmation = client.post("/api/v1/human-collaboration/guidance", json=guide,
+                    headers={**headers, "Idempotency-Key": "current-guide-old-confirmation"})
+                assert old_confirmation.status_code == 409, old_confirmation.text
+                assert old_confirmation.json()["detail"]["code"] == "agent_proposal_stale"
+                guide = {**guide, "work_materials": command,
+                    "proposal_ref": revision.json()["proposal_ref"],
+                    "expected_proposal_hash": revision.json()["proposal_hash"]}
                 denied = client.post("/api/v1/human-collaboration/guidance", json={**guide, "work_materials": stale}, headers={**headers, "Idempotency-Key": "stale-guide"})
                 assert denied.status_code == 409, denied.text
                 assert self.runtime.owners.human_collaboration.query_collaboration_projection(("quest:" + self.quest,))["soft_constraints"] == []
                 accepted = client.post("/api/v1/human-collaboration/guidance", json=guide, headers={**headers, "Idempotency-Key": "current-guide"})
                 assert accepted.status_code == 201, accepted.text
-                assert accepted.json()["guidance"] == {"text": guide["text"], "strength": 4}
+                assert accepted.json()["guidance"]["text"] == guide["text"]
+                assert accepted.json()["guidance"]["work_materials"] == command
                 assert accepted.json()["work_materials"][0]["receiver"] == receiver
                 input_body = {"quest_ref": self.quest, "question_ref": request.question_ref, "text": "Original proactive input.", "work_materials": command}
                 accepted_input = client.post("/api/v1/research-inputs", json=input_body, headers={**headers, "Idempotency-Key": "current-input"})

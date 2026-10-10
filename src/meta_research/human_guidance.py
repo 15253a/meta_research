@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from meta_research.owners.common import canonical_hash, decoded_object
+from meta_research.owners.common import OwnerConflict, canonical_hash, decoded_object
 
 
 GuidanceRootKind = Literal["idea", "plan", "bundle", "reasoning", "target"]
@@ -13,6 +13,22 @@ GUIDANCE_OPERATION_IDS = (
     "human_guidance.read", "human_guidance.read.reconcile",
     "human_guidance.feedback", "human_guidance.feedback.reconcile",
 )
+
+
+def normalize_guidance_scope(scope: object, *, quest_ref: str) -> dict[str, object]:
+    fields = {
+        "quest": {"kind", "quest_ref"},
+        "question": {"kind", "quest_ref", "question_ref"},
+        "cycle": {"kind", "quest_ref", "question_ref", "cycle_ref"},
+        "target": {"kind", "quest_ref", "question_ref", "cycle_ref", "target_ref"},
+    }
+    if (not isinstance(scope, dict) or not isinstance(scope.get("kind"), str)
+            or scope["kind"] not in fields or set(scope) != fields[scope["kind"]]
+            or scope.get("quest_ref") != quest_ref
+            or any(not isinstance(value, str) or not value or len(value) > 256
+                for value in scope.values())):
+        raise OwnerConflict("guidance_scope_invalid")
+    return dict(scope)
 
 
 @dataclass(frozen=True)
@@ -90,6 +106,8 @@ class FrozenGuidanceDelivery:
     guide_json: str
     needs_treatment: bool
     prior_treatment_json: str | None
+    applies_to_work: bool = True
+    scope_confirmation: str = "legacy_unconfirmed"
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -98,6 +116,8 @@ class FrozenGuidanceDelivery:
             "needs_treatment": self.needs_treatment,
             "prior_treatment": None if self.prior_treatment_json is None
             else decoded_object(self.prior_treatment_json),
+            "applies_to_work": self.applies_to_work,
+            "scope_confirmation": self.scope_confirmation,
         }
 
 
@@ -122,6 +142,7 @@ def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True) -> str:
         "constraint_ref": decoded_object(item.guide_json)["constraint_ref"],
         "revision": decoded_object(item.guide_json)["revision"],
         "needs_treatment": item.needs_treatment,
+        "applies_to_work": item.applies_to_work,
     } for item in cut.deliveries]
     from meta_research.owners.common import canonical_json
     rendered = (
@@ -130,8 +151,10 @@ def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True) -> str:
         + "\n用 human_guidance.read 列表发现本次冻结指导，再精确完整读取各 delivery_ref。"
         "列表与此索引不证明已读原文。needs_treatment=true 的指导在本工作中尚需说明处理，"
         "完整读后用 human_guidance.feedback 说明理解、调整、继续事项及理由。"
-        "needs_treatment=false 的指导仍是持续约束，请参考既有反馈，勿重复声明处理。"
-        "本次操作之后提交的指导由下一逻辑操作接续。力度5的目标更新仍待目标演化流程，"
+        "仅 applies_to_work=true 的指导在其确认范围内适用；背景指导可读但不继承为本工作要求。"
+        "适用且 needs_treatment=false 时参考既有反馈继续履行。"
+        "本次操作之后提交的指导由下一逻辑操作接续。按实际影响判断是否涉及 Quest 目标，"
+        "局部严格要求不因力度5需要目标演化；整体变化才沿目标演化流程，"
         "收到、读取或反馈不表示目标已切换。HumanRequest 答复仍归原请求根。\n"
     )
     if not resident:

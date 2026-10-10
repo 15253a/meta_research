@@ -22,6 +22,7 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
                 for key in ("understanding", "changes", "continuing_work", "reasons")},
             "disposition": {"type": "string", "enum": [
                 "applied", "considered", "deferred", "goal_alignment_pending"]},
+            "goal_impact": {"type": "string", "enum": ["none", "requires_evolution", "undetermined"]},
         }}
 
     def read(context, arguments, reconcile=False):
@@ -32,7 +33,8 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
 
     return (
         SemanticOperation("human_guidance.read", "human_collaboration",
-            "List this operation's frozen guidance, or read an exact complete document. "
+            "List this operation's frozen guidance and applicability, or read an exact complete document. "
+            "Background-only guidance remains readable and imposes no requirement on this work. "
             "List reads do not prove receipt or reading. For an exact read use delivery_ref "
             "and a stable effect_id. Follow all pages until full_read=true before feedback.",
             read, read_schema, {"type": "object"}, "effect", "human_guidance.read.reconcile"),
@@ -42,7 +44,9 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
         SemanticOperation("human_guidance.feedback", "human_collaboration",
             "Declare your understanding, changes, continuing work and reasons after a full exact read. "
             "Use a stable effect_id. Treated guidance remains a constraint for the same work. "
-            "goal_alignment_pending is available for strength 5 and never means the goal was changed.",
+            "Assess actual goal_impact independently of strength. requires_evolution applies to "
+            "confirmed Quest scope; a wider scope needs fresh human confirmation. "
+            "goal_alignment_pending never means the goal was changed.",
             feedback, feedback_schema, {"type": "object"}, "effect", "human_guidance.feedback.reconcile"),
         SemanticOperation("human_guidance.feedback.reconcile", "human_collaboration",
             "Recover the exact feedback receipt with the original command and effect_id. "

@@ -342,14 +342,14 @@ class _CurrentBindingBundleSkill(bundle_fixtures._DeterministicBundleSkill):
         )
 
 
-def _current_bundle_runtime(path: Path, *, bundle_skill=None):
+def _current_bundle_runtime(path: Path, *, bundle_skill=None, intent_drafting_provider=None):
     """Use current operation-local Bundle and Target admission."""
 
     drafting = bundle_fixtures._DeterministicDraftingAdapter()
     runtime = bundle_fixtures.build_production_runtime(
         bundle_fixtures.prepare_data_root(path),
         proposal_drafter=drafting,
-        intent_drafting_provider=drafting,
+        intent_drafting_provider=intent_drafting_provider or drafting,
         host_compute_probe=bundle_fixtures._DeterministicProbe(),
         idea_skill_provider=bundle_fixtures._DeterministicIdeaSkill(),
         plan_skill_provider=bundle_fixtures._DeterministicPlanSkill(

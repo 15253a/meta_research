@@ -85,6 +85,8 @@ class _GuidanceRunner(_SignedRunner):
                 delivery_ref=delivery["delivery_ref"], effect_id="read-" + delivery["delivery_ref"])
             assert exact["full_read"] is True
             assert json.loads(exact["text"])["text"] == "Keep the device audit."
+            assert exact["scope_confirmation"] == "legacy_unconfirmed"
+            assert exact["semantic_scope"] is None
             if delivery["needs_treatment"]:
                 receipt = _tool(self.runtime, token, "human_guidance.feedback",
                     delivery_ref=delivery["delivery_ref"], effect_id="feedback-" + delivery["delivery_ref"],
@@ -197,6 +199,9 @@ def test_actual_idea_and_plan_transport_freeze_independent_stage_responsibility(
     try:
         quest = _confirm_direct_quest(runtime)["quest_ref"]
         _submit(runtime, quest, strength=5)
+        alignment = runtime.owners.research_graph.query_quest_goal_view(quest)["guidance_alignment"]
+        assert alignment[0]["scope_confirmation"] == "legacy_unconfirmed"
+        assert alignment[0]["status"] == "pending"
         _finish_idea_stage(runtime)
         for _ in range(8):
             current = runtime.plan_stage.query_current()

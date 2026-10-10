@@ -515,11 +515,18 @@ class CompanionHumanRequestViewContext(BaseModel):
     revision: int = Field(ge=1)
 
 
+class CompanionGuidanceOptionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    strength: int = Field(default=3, ge=1, le=5, strict=True)
+    work_materials: WorkMaterialSubmissionRequest | None = None
+
+
 class CompanionMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope_ref: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=INTENT_MESSAGE_MAX_LENGTH)
+    guidance_options: CompanionGuidanceOptionsRequest | None = None
     view_context: (
         CompanionQuestionViewContext | CompanionHumanRequestViewContext | None
     ) = None
@@ -601,6 +608,8 @@ class HumanGuidanceSubmissionRequest(BaseModel):
     text: str = Field(min_length=1, max_length=65536)
     strength: int = Field(default=3, ge=1, le=5, strict=True)
     work_materials: WorkMaterialSubmissionRequest | None = None
+    proposal_ref: str | None = Field(default=None, min_length=1, max_length=64)
+    expected_proposal_hash: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 class GuidanceProposalConversionRequest(BaseModel):
@@ -616,6 +625,10 @@ class AgentProposalConversionRequest(BaseModel):
 
     expected_scope_ref: str = Field(min_length=1, max_length=128)
     expected_proposal_hash: str = Field(min_length=64, max_length=64)
+
+
+class AgentProposalRevisionRequest(AgentProposalConversionRequest):
+    proposal: dict[str, object]
 
 
 class WithdrawSoftConstraintRequest(BaseModel):
@@ -1578,6 +1591,7 @@ def create_app(
                 if message.view_context is None
                 else message.view_context.model_dump()
             ),
+            guidance_options=None if message.guidance_options is None else message.guidance_options.model_dump(),
         )
 
     @app.post("/api/v1/companion/sessions/new")
@@ -1786,10 +1800,14 @@ def create_app(
         scope = submission.scope_ref
         if not scope.startswith("quest:") or len(scope) <= len("quest:"):
             raise OwnerConflict("guidance_quest_required")
+        if submission.proposal_ref is None or submission.expected_proposal_hash is None:
+            raise OwnerConflict("guidance_confirmation_required")
         return runtime.owners.human_collaboration.submit_human_guidance(
             quest_ref=scope.removeprefix("quest:"), original_text=submission.text,
             strength=submission.strength, idempotency_key=_idempotency_key(request),
             work_materials=submission.work_materials.model_dump() if submission.work_materials is not None else None,
+            proposal_ref=submission.proposal_ref,
+            expected_proposal_hash=submission.expected_proposal_hash,
         )
 
     @app.post("/api/v1/human-collaboration/agent-proposals", status_code=201)
@@ -1805,6 +1823,20 @@ def create_app(
             proposal.proposal,
             _idempotency_key(request),
         )
+
+    @app.post(
+        "/api/v1/human-collaboration/agent-proposals/{proposal_ref}/revisions",
+        status_code=201,
+    )
+    def revise_agent_proposal(
+        proposal_ref: str, request: Request, revision: AgentProposalRevisionRequest,
+    ) -> dict[str, object]:
+        require_current_collaboration_scope(revision.expected_scope_ref,
+            conflict_code="agent_proposal_scope_stale")
+        return runtime.owners.human_collaboration.revise_agent_proposal(
+            proposal_ref, expected_scope_ref=revision.expected_scope_ref,
+            expected_proposal_hash=revision.expected_proposal_hash,
+            proposal=revision.proposal, idempotency_key=_idempotency_key(request))
 
     @app.post(
         "/api/v1/human-collaboration/agent-proposals/{proposal_ref}/soft-constraint",

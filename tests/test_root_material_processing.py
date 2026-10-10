@@ -191,9 +191,13 @@ def test_receiving_research_root_chooses_custody_and_successor_reads_retained_us
                     reference = response.json()["delivery"]["work_materials"][0]["reference_ref"]
                 elif source_kind == "guidance":
                     receiver = client.get("/api/v1/work-materials/receiver", params={"quest_ref": observed["quest"]}).json()
+                    from guidance_confirmation_helpers import prepare_guidance_submission
+                    body = prepare_guidance_submission(self.runtime.owners.human_collaboration,
+                        observed["quest"], "Consider this current observation.", strength=2,
+                        key="current-observation-guidance", work_materials={"receiver": receiver,
+                            "selections": [selection], "description": "Human observation."})
                     response = client.post("/api/v1/human-collaboration/guidance", headers=headers,
-                        json={"scope_ref": "quest:" + observed["quest"], "text": "Consider this current observation.", "strength": 2,
-                            "work_materials": {"receiver": receiver, "selections": [selection], "description": "Human observation."}})
+                        json=body)
                     assert response.status_code == 201, response.text
                     reference = response.json()["work_materials"][0]["references"][0]["reference_ref"]
                 else:

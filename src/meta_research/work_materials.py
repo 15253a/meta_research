@@ -37,7 +37,7 @@ class MaterialSubmission:
 
 def material_reference(database, reference_ref):
     with database.read() as connection:
-        row = connection.execute(text("SELECT r.*, s.receiver_json, s.command_json, s.command_hash, s.state, s.created_at "
+        row = connection.execute(text("SELECT r.*, s.receiver_json, s.command_json, s.command_hash, s.state, s.created_at, s.anchor_kind, s.anchor_ref "
             "FROM hc_work_material_references r JOIN hc_work_material_submissions s USING (submission_ref) "
             "WHERE r.reference_ref=:ref"), {"ref": reference_ref}).first()
         if row is None or row.state != "ready":
@@ -47,6 +47,21 @@ def material_reference(database, reference_ref):
         receiver = json.loads(row.receiver_json)
         if canonical_hash(selection) != row.selection_hash or canonical_hash(command) != row.command_hash or command["receiver"] != receiver:
             raise OwnerConflict("material_receipt_invalid")
+        source_guidance = None
+        if row.anchor_kind == "guidance":
+            from meta_research.owners.human_collaboration_ladder import guidance_binding_from_row
+            guide_row = connection.execute(text("SELECT * FROM hc_soft_constraints WHERE constraint_ref=:ref"),
+                {"ref": row.anchor_ref}).first()
+            if guide_row is None:
+                raise OwnerConflict("material_receipt_invalid")
+            binding = guidance_binding_from_row(guide_row)
+            guidance = binding["guidance"]
+            source_guidance = {
+                "constraint_ref": binding["constraint_ref"], "guidance_hash": binding["guidance_hash"],
+                **{key: guidance.get(key) for key in ("text", "assistant_understanding", "applies_to", "semantic_scope", "strength")},
+                "preserve_conditions": guidance.get("preserve_conditions", []),
+                "scope_confirmation": "confirmed" if guidance.get("semantic_scope") is not None else "legacy_unconfirmed",
+            }
         accesses = connection.execute(text("SELECT result_json,actor FROM hc_work_material_accesses WHERE reference_ref=:ref ORDER BY created_at,access_ref"), {"ref": reference_ref}).all()
     facts = []
     for access in accesses:
@@ -59,7 +74,8 @@ def material_reference(database, reference_ref):
             "availability": facts[-1].get("availability", "available") if facts else "available",
             "read_state": "read" if ranges else "not_read", "read_ranges": ranges,
             "failures": [fact for fact in facts if "error" in fact], "unexpanded": selection["kind"] == "directory",
-            "reader": {"reference_ref": row.reference_ref}, "treatments": material_treatments(database, reference_ref=row.reference_ref)}
+            "reader": {"reference_ref": row.reference_ref}, "treatments": material_treatments(database, reference_ref=row.reference_ref),
+            **({"source_guidance": source_guidance} if source_guidance is not None else {})}
 
 
 def material_submission(database, submission_ref):

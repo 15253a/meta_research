@@ -21,11 +21,18 @@ def test_explicit_http_submission_preserves_original_text_and_hashed_strength(tm
         body = {"scope_ref": "quest:" + quest, "text": "  保留原文\nContinue the audit.  "}
         if strength is not None:
             body["strength"] = strength
+        proposal = runtime.owners.human_collaboration.record_agent_proposal("quest:" + quest, {
+            "proposal_kind": "soft_constraint", "text": body["text"],
+            "assistant_understanding": "保留原文要求并继续核验。", "applies_to": ["整个 Quest"],
+            "semantic_scope": {"kind": "quest", "quest_ref": quest},
+            "strength": strength or 3, "preserve_conditions": [], "work_materials": None,
+        }, "reviewed-guidance")
+        body.update(proposal_ref=proposal["proposal_ref"], expected_proposal_hash=proposal["proposal_hash"])
         headers["Idempotency-Key"] = "submit-one"
         response = client.post("/api/v1/human-collaboration/guidance", json=body, headers=headers)
         assert response.status_code == 201, response.text
         accepted = response.json()
-        assert accepted["guidance"] == {"text": body["text"], "strength": strength or 3}
+        assert accepted["guidance"] == proposal["proposal"]
         binding, = runtime.owners.human_collaboration.query_active_guidance_bindings("quest:" + quest)
         assert binding["guidance_hash"] == canonical_hash(accepted["guidance"])
         assert client.post("/api/v1/human-collaboration/guidance", json=body, headers=headers).json() == accepted

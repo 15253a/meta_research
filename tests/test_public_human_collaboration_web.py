@@ -15,6 +15,7 @@ from meta_research.quest_drafting import (
     ProposalDraftResult,
 )
 from meta_research.web import create_app
+from guidance_confirmation_helpers import guidance_proposal_value
 
 
 class _DeterministicDraftingProvider:
@@ -644,10 +645,7 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
                 headers=_write_headers(auth, "agent-proposal-web-1"),
                 json={
                     "scope_ref": scope_ref,
-                    "proposal": {
-                        "proposal_kind": "narrow_scope",
-                        "text": "Start with public literature.",
-                    },
+                    "proposal": guidance_proposal_value(completed["quest_ref"], "Start with public literature."),
                 },
             )
             assert proposal_response.status_code == 201, proposal_response.json()

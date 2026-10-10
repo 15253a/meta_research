@@ -947,10 +947,9 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             )
         elif companion:
             role_instruction = (
-                "你是当前研究上下文中的 Quest Companion。只能依据 current_draft 中的"
-                "已投影事实解释状态、验收边界和替代路线；不得把聊天推断成人类回应、"
-                "约束、确认或授权。若确有一个值得用户显式采纳的可撤回建议，可在"
-                "agent_proposal 返回结构化草案，否则必须返回 null。"
+                "你是当前研究上下文中独立的 Quest Companion。先理解人的意图，"
+                "解释或讨论只答复；希望影响研究时提出可读理解与精确范围供人确认。"
+                "正式研究输入只由人的显式确认产生。按随附 companion-work 指导完成工作。"
             )
             context_identity = f"initialization_id={request.initialization_id}\n"
         else:
@@ -969,6 +968,9 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             f"current_draft={_canonical_json(request.draft)}\n"
             f"user_message={request.message}"
         )
+        if companion:
+            context += "\n\n<!-- bundled resource: companion-work.md -->\n" + (
+                Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
         if request.job_ref is not None:
             context = preserve_existing_reply_prompt(
                 context,
@@ -2200,6 +2202,13 @@ def _reply_schema(*, include_agent_proposal: bool = False) -> dict[str, object]:
 def _validated_agent_proposal(value: object) -> dict[str, object] | None:
     if value is None:
         return None
+    if isinstance(value, dict) and value.get("proposal_kind") == "soft_constraint":
+        from jsonschema import Draft202012Validator, ValidationError
+        try:
+            Draft202012Validator(_soft_agent_proposal_schema()).validate(value)
+        except ValidationError as error:
+            raise ValueError("agent_proposal") from error
+        return dict(value)
     if not isinstance(value, dict) or set(value) not in (
         {"proposal_kind", "text", "applies_to"},
         {"proposal_kind", "text", "applies_to", "command"},
@@ -2286,11 +2295,29 @@ def _proposal_text_properties() -> dict[str, object]:
 
 
 def _soft_agent_proposal_schema() -> dict[str, object]:
+    properties = _proposal_text_properties()
+    properties["proposal_kind"] = {"type": "string", "enum": ["soft_constraint"]}
+    properties["assistant_understanding"] = {"type": "string", "minLength": 1, "maxLength": 8000}
+    properties["applies_to"] = {"type": "array", "minItems": 1, "maxItems": 20,
+        "items": {"type": "string", "minLength": 1, "maxLength": 2000}}
+    properties["strength"] = {"type": "integer", "minimum": 1, "maximum": 5}
+    properties["preserve_conditions"] = {"type": "array", "maxItems": 20,
+        "items": {"type": "string", "minLength": 1, "maxLength": 4000}}
+    scopes = []
+    for kind, references in (("quest", ("quest_ref",)),
+            ("question", ("quest_ref", "question_ref")),
+            ("cycle", ("quest_ref", "question_ref", "cycle_ref")),
+            ("target", ("quest_ref", "question_ref", "cycle_ref", "target_ref"))):
+        fields = {"kind": {"type": "string", "enum": [kind]},
+            **{name: {"type": "string", "minLength": 1, "maxLength": 128} for name in references}}
+        scopes.append({"type": "object", "additionalProperties": False,
+            "properties": fields, "required": list(fields)})
+    properties["semantic_scope"] = {"anyOf": scopes}
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": _proposal_text_properties(),
-        "required": ["proposal_kind", "text", "applies_to"],
+        "properties": properties,
+        "required": list(properties),
     }
 
 
