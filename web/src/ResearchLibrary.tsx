@@ -25,7 +25,7 @@ function text(value: unknown): string { return typeof value === "string" ? value
 function itemName(item: ResearchLibraryItem, fallback: string): string {
   return text(item.name) || text(item.title) || text(item.display_name) || text(item.version_label) || fallback;
 }
-export function ResearchLibrary({ questRef, questionRef }: { questRef: string | null; questionRef: string | null }) {
+export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: { questRef: string | null; questionRef: string | null; refreshRevision?: number }) {
   const { language } = useOutputLanguage();
   const t = (zh: string, en: string) => language === "zh" ? zh : en;
   const [entry, setEntry] = useState<ResearchLibraryEntry>("questions");
@@ -161,7 +161,7 @@ export function ResearchLibrary({ questRef, questionRef }: { questRef: string | 
             const judgments = Array.isArray(item.judgments) ? item.judgments as ResearchLibraryItem[] : [];
             return <article className="library-card" key={text(item.ref) || text(item.question_ref) || text(item.record_ref) || String(index)}>
               <h4>{name}</h4>
-              {entry === "human" && (text(item.input_ref) || (text(item.ref).startsWith("research_input:") ? text(item.ref) : "")) ? <ResearchInputMaterialReferences inputRef={text(item.input_ref) || text(item.ref)} questRef={questRef} /> : null}
+              {entry === "human" && (text(item.input_ref) || (text(item.ref).startsWith("research_input:") ? text(item.ref) : "")) ? <ResearchInputMaterialReferences inputRef={text(item.input_ref) || text(item.ref)} questRef={questRef} refreshRevision={refreshRevision} /> : null}
               {text(item.summary) ? <p>{text(item.summary)}</p> : null}
               {entry === "environments" ? <>
                 {isEnvironmentReference ? <>

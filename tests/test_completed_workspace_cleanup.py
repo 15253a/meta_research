@@ -69,8 +69,8 @@ class _WorkspaceReasoning(_WorkspaceDraft, _Reasoning):
         return draft
 
 
-def _cleanup_runtime(path):
-    skills = {'idea': _WorkspaceIdea(), 'plan': _WorkspacePlan(no_gap=False),
+def _cleanup_runtime(path, *, idea=None):
+    skills = {'idea': idea or _WorkspaceIdea(), 'plan': _WorkspacePlan(no_gap=False),
         'bundle': _WorkspaceBundle(), 'reasoning': _WorkspaceReasoning(entry_stage='idea')}
     runtime = _reasoning_runtime(path, idea_skill=skills['idea'], plan_skill=skills['plan'],
         bundle_skill=skills['bundle'], reasoning_skill=skills['reasoning'])
@@ -80,8 +80,8 @@ def _cleanup_runtime(path):
     return runtime
 
 
-def _complete(tmp_path, *, publish=True, finish_cycle=True):
-    seeded = _cleanup_runtime(tmp_path / "cleanup-root")
+def _complete(tmp_path, *, publish=True, finish_cycle=True, runtime=None):
+    seeded = runtime or _cleanup_runtime(tmp_path / "cleanup-root")
     quest = _confirm_deepfetch_quest(seeded)
     _finish_stage(seeded, 'idea')
     _finish_plan_stage(seeded)

@@ -130,6 +130,23 @@ _QUEST_GOAL_GUIDANCE_ROOT_PROFILE_TRANSITIONS = frozenset({
 
 _REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
     *_QUEST_GOAL_GUIDANCE_ROOT_PROFILE_TRANSITIONS,
+    # #183 adds current-root material processing guidance. Preserve only these
+    # exact prior historical read identities; catalogs and execution bindings
+    # remain exact. Full profiles: fixtures/material_processing_20261010/.
+    *((before, "738a9ec21427f47674d5009e3e1c7ecfa5fd4c7e08edf669182d3899821d51fd") for before in (
+        "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",
+        "187457ec5bdc0bcd5d206e770f7c8f1f53e449c569f6beec68938ea79ba9e8de",
+        "5bfe6cff4d3118caf38313803fa115bf962381ae4137984b48bc178d4aed3a85",
+        "708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d",
+        "7095b640388dd7b4c32c1aff0538454578ca7658690922e8b57ccfb7a641771b",
+        "7f70bb11a077e60d07383ca75b4686675743c63e1938af2c2ebe9587e95c4bf0",
+        "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
+        "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
+        "b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30",
+        "c1f65540670572e9ee6211c004e6ad498400ede63f0b9da125843bd720ef77b9",
+        "e31eebfad3e985d523b14ac2b49526291a0a661c3c7ed501dfa64fe982248370",
+        "e8e691b757cb608562d9766f8c9507f1f2feb9ad71b43de92296f310832bde55",
+    )),
     # 2026-10-08 PR #202-#210 integration: this exact combined prompt retains
     # the baseline's historical read identities and the separately accepted
     # research-style, cleanup, help-handoff, reply and guidance prompt profiles.
