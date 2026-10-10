@@ -92,6 +92,7 @@ import { RootConversations, StageRootSessions, useRootConversations } from "./Ro
 import { RuntimeConditions } from "./RuntimeConditions";
 import "./research-interaction.css";
 import "./spectrum-workspace.css";
+import "./workspace-modal.css";
 
 const capabilityLabels: Record<string, string> = {
   accepted_material_basis: "研究资料",

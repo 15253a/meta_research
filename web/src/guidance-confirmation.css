@@ -1,0 +1,12 @@
+.guidance-confirmation { display: grid; gap: 12px; min-width: 0; }
+.guidance-confirmation label { display: grid; gap: 6px; font-size: 12px; }
+.guidance-confirmation textarea, .guidance-confirmation select { box-sizing: border-box; width: 100%; min-width: 0; padding: 9px 10px; color: inherit; background: var(--bg, #fffdf8); border: 1px solid var(--line, #d8ded5); border-radius: 8px; font: inherit; }
+.guidance-confirmation textarea { resize: vertical; }
+.guidance-confirmation dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.guidance-confirmation code { overflow-wrap: anywhere; }
+.guidance-confirmation-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.lumen-compose .guidance-options { display: grid; gap: 8px; margin-bottom: 10px; }
+.lumen-compose .guidance-options > summary { cursor: pointer; font-size: 12px; }
+.lumen-compose .guidance-options label { display: grid; gap: 5px; font-size: 12px; }
+.lumen-compose .guidance-options select { padding: 7px; border: 1px solid var(--line, #d8ded5); background: var(--bg, #fffdf8); border-radius: 7px; color: inherit; }
+.lumen-compose .guidance-options .work-material-fields { display: block; }

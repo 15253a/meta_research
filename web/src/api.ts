@@ -2823,7 +2823,8 @@ export class ProductError extends Error {
   }
 }
 
-export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle };
+export type LiteratureConfiguration = { mode: "oa_then_institution" | "oa_only" | "provided_only"; library_entry_url: string; institution_required: boolean };
+export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle; literature_configuration?: LiteratureConfiguration };
 
 export type QuestGoalRevisionDetail = {
   goal_revision_ref: string;
@@ -2853,9 +2854,9 @@ export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSign
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
 }
 
-export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle): Promise<QuestRuntimeConditions> {
+export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle, literatureConfiguration?: LiteratureConfiguration): Promise<QuestRuntimeConditions> {
   return writeJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, "PUT", {
-    text, expected_revision: expectedRevision, research_style: researchStyle,
+    text, expected_revision: expectedRevision, research_style: researchStyle, literature_configuration: literatureConfiguration,
   });
 }
 
@@ -4407,7 +4408,7 @@ async function readJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   return (await response.json()) as T;
 }
 
-async function writeJson<T>(
+export async function writeJson<T>(
   path: string,
   method: "POST" | "PUT",
   body: object,

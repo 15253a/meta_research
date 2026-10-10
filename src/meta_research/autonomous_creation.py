@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, cast
 
-from meta_research.acquisition import AcquisitionProvider
+from meta_research.acquisition import AcquisitionProvider, effective_acquisition_config
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
+from meta_research.runtime_conditions import read_runtime_conditions
 
 
 class AutonomousHumanCollaboration(Protocol):
@@ -27,6 +29,10 @@ class AutonomousHumanCollaboration(Protocol):
     def query_autonomous_creation_contexts(
         self,
     ) -> tuple[dict[str, object], ...]: ...
+
+    def query_next_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ) -> object | None: ...
 
     def form_autonomous_question_proposal(
         self,
@@ -127,6 +133,10 @@ class AutonomousAdvancementEngine(Protocol):
 
     def query_autonomous_deepfetch_request(self, context_ref: str) -> object | None: ...
 
+    def query_next_autonomous_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ) -> object | None: ...
+
     def record_autonomous_deepfetch_succeeded(self, **values: object) -> None: ...
 
     def record_autonomous_deepfetch_failed(self, **values: object) -> None: ...
@@ -169,6 +179,8 @@ class AutonomousCreationService:
         research_memory: AutonomousResearchMemory,
         research_graph: AutonomousResearchGraph,
         acquisition_provider: AcquisitionProvider,
+        *,
+        workspace: Path | None = None,
     ) -> None:
         self._human_collaboration = human_collaboration
         self._advancement_engine = advancement_engine
@@ -176,6 +188,7 @@ class AutonomousCreationService:
         self._research_memory = research_memory
         self._research_graph = research_graph
         self._acquisition_provider = acquisition_provider
+        self._workspace = workspace
         self._scheduler_cursor: str | None = None
 
     def start(
@@ -388,8 +401,29 @@ class AutonomousCreationService:
             session = self._agent_runtime.query_acquisition_session(
                 quest_ref=quest_ref
             )
+            config = None
+            if self._workspace is not None:
+                config = read_runtime_conditions(self._workspace, quest_ref).get("literature_configuration")
+            config_hash = None if config is None else canonical_hash({
+                "schema_ref": "meta-research/acquisition-session-config/v1",
+                **effective_acquisition_config(config),
+            })
             prepared_or_bound = False
-            if session is None:
+            if session is None or config_hash is not None and _field(session, "config_hash") != config_hash:
+                if session is not None:
+                    if _field(session, "slot_held") is not False:
+                        return False
+                    # AR's session is reused, so keep every queued/in-flight
+                    # request's original config binding until it finishes.
+                    for query in (
+                        self._human_collaboration.query_next_deepfetch_request,
+                        self._advancement_engine.query_next_autonomous_deepfetch_request,
+                    ):
+                        excluded: tuple[str, ...] = ()
+                        while (pending := query(excluded)) is not None:
+                            if _field(pending, "acquisition_session_ref") == _field(session, "session_ref"):
+                                return False
+                            excluded += (cast(str, _field(pending, "request_ref")),)
                 quest = self._research_graph.query_quest_by_ref(quest_ref)
                 if quest is None:
                     raise OwnerConflict("autonomous_deepfetch_quest_unavailable")
@@ -399,7 +433,7 @@ class AutonomousCreationService:
                 literature = draft.get("literature")
                 if not isinstance(literature, dict):
                     raise OwnerConflict("autonomous_deepfetch_quest_policy_unavailable")
-                config = {
+                config = config if config is not None else {
                     "mode": literature.get("mode"),
                     "library_entry_url": literature.get("library_entry_url"),
                     "institution_required": literature.get("institution_required", False),

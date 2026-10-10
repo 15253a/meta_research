@@ -81,16 +81,16 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
   });
   await page.goto("http://127.0.0.1:18768/?workspace=1", { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("button", { name: "运行条件", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "修改配置", exact: true })).toBeEnabled();
   return state;
 }
 
-const dialog = (page: Page) => page.getByRole("dialog", { name: "运行条件", exact: true });
+const dialog = (page: Page) => page.getByRole("dialog", { name: "修改配置", exact: true });
 const editor = (page: Page) => dialog(page).getByRole("textbox", { name: "运行条件内容" });
 
-test("opening reads the current configuration and cancelling never writes", async ({ page }) => {
+test("configuration reopening retains unsaved conditions without writing", async ({ page }) => {
   const state = await workspace(page);
-  const opener = page.getByRole("button", { name: "运行条件", exact: true });
+  const opener = page.getByRole("button", { name: "修改配置", exact: true });
   expect(state.reads).toHaveLength(0);
   await opener.click();
   await expect(editor(page)).toHaveValue(state.configs[state.questRef].text);
@@ -103,14 +103,14 @@ test("opening reads the current configuration and cancelling never writes", asyn
   await expect(opener).toBeFocused();
   expect(state.writes).toHaveLength(0);
   await opener.click();
-  await expect(editor(page)).toHaveValue(state.configs[state.questRef].text);
+  await expect(editor(page)).toHaveValue("本次临时编辑，不保存");
   expect(state.reads).toHaveLength(2);
 });
 
 test("research style defaults to balanced and a saved choice preserves handwritten conditions", async ({ page }) => {
   const conditions = "只使用我提供的数据。\n未经我同意不要改变持续保留条件。";
   const state = await workspace(page, conditions);
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   const style = dialog(page).getByRole("combobox", { name: "研究风格", exact: true });
   await expect(style).toHaveValue("balanced");
   await expect(style.locator("option")).toHaveText(["聚焦攻关", "均衡探索", "开放探索"]);
@@ -122,14 +122,14 @@ test("research style defaults to balanced and a saved choice preserves handwritt
   await expect(dialog(page).getByText("当前研究风格：开放探索", { exact: true })).toBeVisible();
   expect(state.configs[state.questRef]).toMatchObject({ text: conditions, research_style: "open" });
   await dialog(page).getByRole("button", { name: "关闭", exact: true }).click();
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(dialog(page).getByRole("combobox", { name: "研究风格", exact: true })).toHaveValue("open");
   await expect(editor(page)).toHaveValue(conditions);
 });
 
 test("saving uses the displayed revision and keeps the server receipt for the next edit", async ({ page }) => {
   const state = await workspace(page);
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(editor(page)).toBeEnabled();
   await editor(page).fill("GPU：2 张获准 GPU\n时间预算：7 天\n只开展轻量验证。");
   await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
@@ -140,13 +140,13 @@ test("saving uses the displayed revision and keeps the server receipt for the ne
   await expect(dialog(page).getByRole("status")).toHaveText("已保存，将用于后续新调用。");
   expect(state.writes[1].expected_revision).toBe("r2");
   await dialog(page).getByRole("button", { name: "关闭", exact: true }).click();
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(editor(page)).toHaveValue(state.configs[state.questRef].text);
 });
 
 test("save failures retain edits and a conflict requires a fresh read", async ({ page }) => {
   const state = await workspace(page);
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(editor(page)).toBeEnabled();
   await editor(page).fill("失败时仍要保留的运行条件");
   state.failure = 503;
@@ -155,19 +155,22 @@ test("save failures retain edits and a conflict requires a fresh read", async ({
   await expect(editor(page)).toHaveValue("失败时仍要保留的运行条件");
   state.failure = 409;
   await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
-  await expect(dialog(page).getByRole("alert")).toContainText("关闭后重新打开");
+  await expect(dialog(page).getByRole("alert")).toContainText("核对最新版本");
   await expect(editor(page)).toHaveValue("失败时仍要保留的运行条件");
   await expect(dialog(page).getByRole("button", { name: "保存运行条件" })).toBeDisabled();
   state.configs[state.questRef] = { quest_ref: state.questRef, text: "另一处已更新的运行条件", revision: "r5" };
   await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
+  await expect(editor(page)).toHaveValue("失败时仍要保留的运行条件");
+  await expect(dialog(page).getByRole("button", { name: "保存运行条件" })).toBeDisabled();
+  await dialog(page).getByRole("button", { name: "读取最新运行条件并替换当前编辑" }).click();
   await expect(editor(page)).toHaveValue("另一处已更新的运行条件");
 });
 
 test("Quest changes close the editor and a late old response cannot replace the new configuration", async ({ page }) => {
   const state = await workspace(page);
   state.delayedQuest = state.questRef;
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect.poll(() => state.release !== null).toBe(true);
   const nextQuest = "quest-next";
   state.configs[nextQuest] = { quest_ref: nextQuest, text: "下一项研究：CPU，90 天", revision: "r-next" };
@@ -177,7 +180,7 @@ test("Quest changes close the editor and a late old response cannot replace the 
   state.snapshot.research_control.foreground.quest_ref = nextQuest;
   state.snapshot.revision += 1;
   await expect(dialog(page)).toHaveCount(0);
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(editor(page)).toHaveValue(state.configs[nextQuest].text);
   state.release?.();
   await expect(editor(page)).toHaveValue(state.configs[nextQuest].text);
@@ -194,7 +197,7 @@ test("the control stays available without a foreground and fits desktop and mobi
   await expect(page.locator(".lumen-connection code")).toHaveText(`状态 ${state.snapshot.revision}`);
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 900 });
-    await page.getByRole("button", { name: "运行条件", exact: true }).click();
+    await page.getByRole("button", { name: "修改配置", exact: true }).click();
     await expect(dialog(page).getByRole("combobox", { name: "时间预算", exact: true })).toHaveValue("30d");
     await expect(dialog(page).getByRole("checkbox")).toHaveCount(3);
     await expect(editor(page)).not.toBeVisible();
@@ -209,14 +212,14 @@ test("the control stays available without a foreground and fits desktop and mobi
 
 test("common choices and advanced JSON stay in sync without losing custom conditions", async ({ page }) => {
   const state = await workspace(page, structuredText());
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   const budget = dialog(page).getByRole("combobox", { name: "时间预算", exact: true });
   const literature = dialog(page).getByRole("combobox", { name: "文献搜索范围", exact: true });
   await expect(budget).toHaveValue("30d");
   await expect(literature).toHaveValue("oa_only");
   await expect(editor(page)).not.toBeVisible();
   await budget.selectOption({ label: "7 天" });
-  await literature.selectOption({ label: "全面搜索（包括图书馆）" });
+  await literature.selectOption({ label: "公开全文与可选图书馆" });
   await dialog(page).getByRole("textbox", { name: "文献排除范围", exact: true }).fill("不纳入动物实验");
   await dialog(page).locator("summary").filter({ hasText: "高级" }).click();
   const first = await editor(page).inputValue();
@@ -235,7 +238,7 @@ test("common choices and advanced JSON stay in sync without losing custom condit
 
 test("deselected GPUs can be selected again after saving and reopening", async ({ page }) => {
   const state = await workspace(page, structuredText());
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(dialog(page).getByRole("checkbox")).toHaveCount(3);
   await dialog(page).getByRole("checkbox").nth(0).uncheck();
   await dialog(page).getByRole("checkbox").nth(1).uncheck();
@@ -244,7 +247,7 @@ test("deselected GPUs can be selected again after saving and reopening", async (
   expect(savedJson(state.writes[0].text).selected_devices).toEqual([]);
   expect(savedJson(state.writes[0].text).selected_device_uuids).toEqual([]);
   await dialog(page).getByRole("button", { name: "关闭", exact: true }).click();
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(dialog(page).getByRole("checkbox")).toHaveCount(3);
   await expect(dialog(page).getByRole("checkbox").nth(0)).not.toBeChecked();
   await dialog(page).getByRole("checkbox").nth(0).check();
@@ -260,7 +263,7 @@ test("deselected GPUs can be selected again after saving and reopening", async (
 test("invalid JSON stays editable and unsupported values are not silently normalized", async ({ page }) => {
   const state = await workspace(page, structuredText({ ...initialConditions, time_budget: "custom-budget",
     literature: { ...initialConditions.literature, mode: "custom-scope" } }));
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   const budget = dialog(page).getByRole("combobox", { name: "时间预算", exact: true });
   await expect(budget).toHaveValue("custom-budget");
   await expect(dialog(page).getByRole("combobox", { name: "文献搜索范围", exact: true })).toHaveValue("custom-scope");
@@ -278,14 +281,14 @@ test("invalid JSON stays editable and unsupported values are not silently normal
 test("catalog failures or wrong Quest metadata do not overwrite the current configuration", async ({ page }) => {
   const state = await workspace(page, structuredText());
   state.catalogFailure = true;
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(dialog(page).getByRole("combobox", { name: "时间预算", exact: true })).toHaveValue("30d");
   await expect(dialog(page).getByText(/完整设备清单读取失败/)).toBeVisible();
   await expect(dialog(page).getByRole("checkbox")).toHaveCount(2);
   await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
   state.catalogFailure = false;
   state.catalogQuest = "another-quest";
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(dialog(page).getByText(/完整设备清单读取失败/)).toBeVisible();
   await expect(dialog(page).getByRole("checkbox")).toHaveCount(2);
   await expect(dialog(page).getByRole("button", { name: "保存运行条件" })).toBeDisabled();
@@ -296,7 +299,7 @@ test("catalog failures or wrong Quest metadata do not overwrite the current conf
 test("advanced GPU edits cannot revive removed metadata or silently widen inconsistent selections", async ({ page }) => {
   const state = await workspace(page, structuredText({ ...initialConditions,
     selected_devices: [{ ...devices[0], custom_device_note: "remove this" }, devices[1]] }));
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(dialog(page).getByRole("checkbox")).toHaveCount(3);
   await dialog(page).locator("summary").filter({ hasText: "高级" }).click();
   await editor(page).fill(structuredText({ ...initialConditions, selected_device_uuids: [] }));

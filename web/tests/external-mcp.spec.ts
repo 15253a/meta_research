@@ -52,13 +52,13 @@ async function workspace(page: Page, preQuest = false) {
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
   });
   await page.goto("http://127.0.0.1:18768/?workspace=1", { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("button", { name: "运行条件", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "修改配置", exact: true })).toBeEnabled();
   return state;
 }
 
 const settings = (page: Page) => page.getByRole("region", { name: "外部 MCP 服务", exact: true });
-const open = (page: Page) => page.getByRole("button", { name: "运行条件", exact: true }).click();
-const close = (page: Page) => page.getByRole("button", { name: "关闭运行条件", exact: true }).click();
+const open = (page: Page) => page.getByRole("button", { name: "修改配置", exact: true }).click();
+const close = (page: Page) => page.getByRole("button", { name: "关闭修改配置", exact: true }).click();
 
 test("pre-Quest settings default to all Roots, save blank instructions and persist explicit none", async ({ page }) => {
   const state = await workspace(page, true);
@@ -122,4 +122,16 @@ test("read retry and stale revision preserve visible edits without an overwrite"
   await expect(settings(page).getByRole("textbox", { name: "研究使用说明", exact: true })).toHaveValue("Keep this instruction.");
   await expect(settings(page).getByRole("button", { name: "保存外部 MCP", exact: true })).toBeDisabled();
   expect(state.config.services).toEqual([]);
+});
+
+test("system MCP keeps an unsaved connection when configuration is reopened", async ({ page }) => {
+  const state = await workspace(page, true);
+  await open(page);
+  await settings(page).getByRole("button", { name: "添加服务", exact: true }).click();
+  await settings(page).getByRole("textbox", { name: "服务名称", exact: true }).fill("尚未保存的系统服务");
+  await settings(page).getByRole("textbox", { name: "启动命令", exact: true }).fill("python");
+  await close(page); await open(page);
+  await expect(settings(page).getByRole("textbox", { name: "服务名称", exact: true })).toHaveValue("尚未保存的系统服务");
+  await expect(settings(page).getByRole("textbox", { name: "启动命令", exact: true })).toHaveValue("python");
+  expect(state.writes).toEqual([]);
 });

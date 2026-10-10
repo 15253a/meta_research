@@ -85,18 +85,15 @@ test("real server selection and explicit receipts cover every material consumer"
   const requestClose = page.getByRole("button", { name: "关闭需要你处理的事项", exact: true });
   if (await requestClose.isVisible()) await requestClose.click();
 
-  const guidance = page.getByRole("form", { name: "提交人类指导", exact: true });
-  await expect(guidance).toBeVisible();
-  if (await requestClose.isVisible()) await requestClose.click();
-  await guidance.getByLabel("指导原文", { exact: true }).fill("Guidance keeps its exact text and strength.");
+  const guidance = page.getByRole("complementary", { name: "研究助手", exact: true });
+  await guidance.getByText("指导力度与可选材料", { exact: true }).click();
+  await guidance.getByLabel("给研究助手发消息", { exact: true }).fill("Guidance keeps its exact text and strength.");
   await guidance.getByLabel("指导力度", { exact: true }).selectOption("4");
   await choose(page, guidance, fixture.small_file, "Exact guidance source description.");
-  const guidanceResponse = page.waitForResponse(response => response.request().method() === "POST" && response.url().endsWith("/api/v1/human-collaboration/guidance"));
-  await guidance.getByRole("button", { name: "保存指导", exact: true }).click();
-  const savedGuidance = await (await guidanceResponse).json() as { work_materials: WorkMaterialReceipt[]; guidance: { text: string; strength: number } };
-  assertSaved(savedGuidance.work_materials[0], fixture.small_file, "current");
-  expect(savedGuidance.guidance.strength).toBe(4);
-  expect(savedGuidance.guidance.text).toBe("Guidance keeps its exact text and strength.");
+  await expect(guidance.getByRole("button", { name: "保存指导", exact: true })).toHaveCount(0);
+  expect(posts.some(post => post.path === "/api/v1/human-collaboration/guidance" || post.path.endsWith("/soft-constraint"))).toBe(false);
+  // The Companion understanding and formal confirmation receipt are exercised by
+  // human-collaboration.spec.ts; selection alone creates no research input.
 
   await page.goto(`${base}/?panel=create-quest&workspace=1`);
   const creation = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题", exact: true });
@@ -243,11 +240,13 @@ test("real server selection and explicit receipts cover every material consumer"
   await choose(page, human, fixture.small_file, "HumanRequest exact original description.");
   await rejectOneStaleSource(page, "**/api/v1/human-requests/*/responses", true);
   await human.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect(human).toContainText("material_source_changed");
   await expect(human.getByRole("button", { name: "选择服务器文件或目录", exact: true })).toBeEnabled();
   await choose(page, human, fixture.small_file, "HumanRequest corrected original description.");
   const humanResponse = page.waitForResponse(response => response.request().method() === "POST" && response.url().includes("/human-requests/") && response.url().endsWith("/responses"));
   await human.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   const humanReceipt = await (await humanResponse).json() as { delivery: { work_materials: Array<{ reference_ref: string }> } };
   expect(humanReceipt.delivery.work_materials).toHaveLength(1);
   const hrReferenceResponse = await page.request.get(`${base}/api/v1/work-materials/${encodeURIComponent(humanReceipt.delivery.work_materials[0].reference_ref)}`);

@@ -162,12 +162,36 @@ def _initial_conditions(root: Path, *, quest_ref=None, run_ref=None,
     if quest_ref is not None:
         inherited = _read(root, _INIT_PREFIX + initialization_id, initial_text, style)
         initial_text, style = inherited['text'], inherited['research_style']
-    return scope, initial_text, style
+    configuration = {"mode": literature.get("mode", "oa_only"),
+                     "library_entry_url": literature.get("library_entry_url", ""),
+                     "institution_required": literature.get("institution_required", False)} if isinstance(literature, dict) else None
+    if configuration is not None:
+        try:
+            configuration = _literature_configuration(configuration)
+        except OwnerConflict:
+            # Historical conditions remain readable; invalid private connection
+            # data is never promoted to a newly editable configuration.
+            configuration = None
+    return scope, initial_text, style, configuration
 
 
-def _value(quest_ref: str, text: str, research_style: str = 'balanced') -> dict[str, str]:
+def _literature_configuration(value):
+    from meta_research.owners.human_collaboration import _validated_library_entry_url
+    if (not isinstance(value, dict) or set(value) != {"mode", "library_entry_url", "institution_required"}
+            or value["mode"] not in {"oa_then_institution", "oa_only", "provided_only"}
+            or not isinstance(value["library_entry_url"], str)
+            or len(value["library_entry_url"]) > 4000
+            or type(value["institution_required"]) is not bool
+            or value["institution_required"] and value["mode"] != "oa_then_institution"):
+        raise OwnerConflict("literature_configuration_invalid")
+    return {**value, "library_entry_url": _validated_library_entry_url(value["library_entry_url"])}
+
+
+def _value(quest_ref: str, text: str, research_style: str = 'balanced', literature_configuration=None) -> dict[str, object]:
     fields = {'quest_ref': quest_ref, 'text': text,
               'research_style': validate_research_style(research_style)}
+    if literature_configuration is not None:
+        fields["literature_configuration"] = _literature_configuration(literature_configuration)
     return {**fields, 'revision': canonical_hash(fields)}
 
 
@@ -208,7 +232,7 @@ def _stored_value(scope: str, encoded: str, revision: str) -> dict[str, str]:
     ):
         raise OwnerConflict("runtime_conditions_invalid")
     try:
-        expected = _value(scope, value["text"], value["research_style"])
+        expected = _value(scope, value["text"], value["research_style"], value.get("literature_configuration"))
     except (TypeError, ValueError) as error:
         raise OwnerConflict("runtime_conditions_invalid") from error
     if value != expected or value.get("revision") != revision:
@@ -217,8 +241,14 @@ def _stored_value(scope: str, encoded: str, revision: str) -> dict[str, str]:
 
 
 def _read(
-    root: Path, quest_ref: str, default_text: str, default_style: str = "balanced"
+    root: Path, quest_ref: str, default_text: str, default_style: str = "balanced", default_literature=None
 ) -> dict[str, str]:
+    def with_library(value):
+        # Existing stored revisions remain valid. Their fallback is the immutable
+        # accepted Quest draft; the next explicit save versions the configuration.
+        if "literature_configuration" not in value and default_literature is not None:
+            return {**value, "literature_configuration": default_literature}
+        return value
     database = root / "meta-research.sqlite3"
     with closing(sqlite3.connect(database)) as db:
         db.row_factory = sqlite3.Row
@@ -229,7 +259,7 @@ def _read(
             (quest_ref,),
         ).fetchone()
         if row is not None:
-            return _stored_value(quest_ref, row["value_json"], row["revision"])
+            return with_library(_stored_value(quest_ref, row["value_json"], row["revision"]))
     imported, source_kind = _legacy_value(
         root, quest_ref, default_text, default_style
     )
@@ -269,9 +299,9 @@ def _read(
                 (quest_ref, imported["revision"], now),
             )
             db.commit()
-            return imported
+            return with_library(imported)
         db.commit()
-        return _stored_value(quest_ref, row["value_json"], row["revision"])
+        return with_library(_stored_value(quest_ref, row["value_json"], row["revision"]))
 
 
 def read_runtime_conditions_in_transaction(
@@ -312,7 +342,8 @@ def read_runtime_conditions(workspace: Path, quest_ref: str) -> dict[str, str]:
 
 
 def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
-                            expected_revision: str, research_style: str | None = None) -> dict[str, str]:
+                            expected_revision: str, research_style: str | None = None,
+                            literature_configuration=None) -> dict[str, str]:
     if not isinstance(text, str) or not text.strip() or len(text) > _LIMIT:
         raise OwnerConflict("runtime_conditions_text_invalid")
     with _LOCK:
@@ -322,7 +353,8 @@ def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
         root = _data_root(workspace)
         assert root is not None
         scope = current["quest_ref"]
-        saved = _value(scope, text, current['research_style'] if research_style is None else research_style)
+        saved = _value(scope, text, current['research_style'] if research_style is None else research_style,
+                       current.get("literature_configuration") if literature_configuration is None else literature_configuration)
         with closing(sqlite3.connect(root / "meta-research.sqlite3", timeout=5.0)) as db:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("PRAGMA busy_timeout=5000")
@@ -373,11 +405,12 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
     if initial is None:
         return ""
     current = _read(root, *initial)
+    public = {key: value for key, value in current.items() if key != "literature_configuration"}
     return (
         "本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。"
         "同类旧运行条件以本段为准；已经接纳的研究成果、精确输入与正式授权仍按原记录核验。\n"
         + render_research_style(current['research_style']) + '\n'
-        + json.dumps(current, ensure_ascii=False, separators=(",", ":"))
+        + json.dumps(public, ensure_ascii=False, separators=(",", ":"))
     )
 
 

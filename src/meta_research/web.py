@@ -848,6 +848,7 @@ class RuntimeConditionsRequest(BaseModel):
     text: str = Field(min_length=1, max_length=24000)
     expected_revision: str = Field(min_length=64, max_length=64)
     research_style: Literal['focus', 'balanced', 'open'] | None = None
+    literature_configuration: dict[str, object] | None = None
 
 
 def create_app(
@@ -2466,7 +2467,7 @@ def create_app(
         return {"output_language":read_output_language(runtime.data_root.root)}
 
     @app.get("/api/v1/quests/{quest_ref}/runtime-conditions")
-    def get_runtime_conditions(quest_ref: str) -> dict[str, str]:
+    def get_runtime_conditions(quest_ref: str) -> dict[str, object]:
         from meta_research.runtime_conditions import read_runtime_conditions
         return read_runtime_conditions(runtime.data_root.root, quest_ref)
 
@@ -2497,7 +2498,7 @@ def create_app(
         return revision
 
     @app.put("/api/v1/quests/{quest_ref}/runtime-conditions")
-    def put_runtime_conditions(quest_ref: str, conditions: RuntimeConditionsRequest) -> dict[str, str]:
+    def put_runtime_conditions(quest_ref: str, conditions: RuntimeConditionsRequest) -> dict[str, object]:
         from meta_research.runtime_conditions import save_runtime_conditions
         return save_runtime_conditions(runtime.data_root.root, quest_ref,
                                        **conditions.model_dump())
@@ -2987,6 +2988,14 @@ def create_app(
             )
         except TimeoutError as error:
             raise HTTPException(status_code=503, detail={"code": "snapshot_query_timeout"}, headers={"Retry-After": "5"}) from error
+
+    @app.get("/api/v1/research-timeline/quests")
+    def query_timeline_quests(
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=100),
+    ) -> dict[str, object]:
+        from meta_research.timeline_history import discover_timeline_quests
+        return discover_timeline_quests(runtime.owners.research_graph, offset=offset, limit=limit)
 
     @app.get("/api/v1/research-overview")
     def query_research_overview(

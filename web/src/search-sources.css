@@ -2,15 +2,15 @@
 .search-sources-settings h3, .search-sources-settings h4, .search-sources-settings h5 { margin: 0 0 10px; }
 .search-sources-settings p { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .search-sources-selection, .search-sources-shared { padding: 16px; margin-top: 14px; border: 1px solid #d8dcd8; border-radius: 10px; }
-.search-sources-shared { background: #fafbf9; }
+.search-sources-shared { background: #f7f8fc; }
 .search-sources-settings fieldset { margin: 14px 0; border: 1px solid #d8dcd8; border-radius: 8px; min-width: 0; padding: 14px; }
 .search-sources-settings legend { font-size: 13px; padding: 0 6px; }
 .search-sources-choices > label { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0; }
 .search-sources-choices input { margin-top: 3px; }
 .search-sources-choices small { display: block; color: #626c64; font-size: 12px; margin-top: 3px; }
 .search-sources-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.search-sources-settings button { border: 1px solid #b9c4b9; border-radius: 6px; padding: 7px 11px; background: #fff; color: #344a37; font: inherit; font-size: 12px; cursor: pointer; }
-.search-sources-settings button[aria-pressed="true"] { background: #e4eee2; border-color: #779675; }
+.search-sources-settings button { border: 1px solid #dfe4ee; border-radius: 9px; padding: 8px 12px; background: #fff; color: #172033; font: inherit; font-size: 13px; cursor: pointer; }
+.search-sources-settings button[aria-pressed="true"] { background: #f1efff; border-color: #625fe7; }
 .search-sources-settings button:disabled { opacity: .5; cursor: default; }
 .search-sources-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .search-sources-fields > label { display: grid; align-content: start; gap: 6px; font-size: 12px; min-width: 0; }

@@ -203,8 +203,11 @@ async function installHumanCollaborationSnapshot(
           title: "建议复核证据边界",
           summary: "接受建议最多形成草案，不直接改变研究。",
           proposal: {
-            proposal_kind: "narrow_scope",
+            proposal_kind: "soft_constraint",
             text: "首轮只使用公开文献。",
+            assistant_understanding: "首轮在公开文献范围内核查。",
+            applies_to: ["首轮"], semantic_scope: { kind: "cycle", quest_ref: "quest_chrome_1", question_ref: "question_chrome_1", cycle_ref: "cycle_chrome_1" },
+            strength: 3, preserve_conditions: [], work_materials: null,
           },
           status: "proposed",
         }, {
@@ -439,7 +442,7 @@ test("the Quest Companion shows the user's message before its reply is ready", a
     });
     markResponseFulfilled();
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
 
   const companion = page.getByRole("complementary", { name: "研究助手" });
   const message = "先立即显示我的这条消息。";
@@ -454,6 +457,7 @@ test("the Quest Companion shows the user's message before its reply is ready", a
     await expect.poll(() => posted).toEqual({
       scope_ref: "quest_chrome_1",
       message,
+      guidance_options: { strength: 3, work_materials: null },
     });
     await expect(
       companion.locator(".lumen-message.me").filter({ hasText: message }),
@@ -657,7 +661,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
     commandsProjection.authorizations = [authorization];
     await fulfillJson(route, authorization);
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
 
   const companion = page.getByRole("complementary", { name: "研究助手" });
   await expect(companion).toBeVisible();
@@ -706,12 +710,13 @@ test("the persistent Quest Companion sends ordinary conversation without command
     },
   });
 
-  await companion.getByRole("button", { name: "明确接受为指导" }).click();
+  await companion.getByRole("button", { name: "明确确认并交给研究" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/agent-proposals/proposal-1/soft-constraint",
     body: {
       expected_scope_ref: "quest_chrome_1",
       expected_proposal_hash: "1".repeat(64),
+      strength: 3,
     },
   });
   await expect(companion.locator(".lumen-constraint").filter({ hasText: "首轮只使用公开文献" }))
@@ -762,6 +767,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
   await expect.poll(() => posted).toEqual({
     scope_ref: "quest_chrome_1",
     message: "为什么这里只是局部等待？",
+    guidance_options: { strength: 3, work_materials: null },
   });
   await expect(companion).toContainText("普通聊天不会被猜成硬命令");
 });
@@ -905,13 +911,13 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
     await fulfillJson(route, revoked);
   });
 
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
-  const companion = page.getByRole("complementary", { name: "研究助手" });
-  await expect(companion).toContainText("需要你 · 只影响相关任务");
-  await expect(companion).toContainText("BROAD RESEARCH AUTHORIZATION · CURRENT GRANT");
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   await page.getByRole("dialog", { name: "需要你处理的事项" })
     .getByRole("button", { name: "关闭需要你处理的事项" }).click();
-  await companion.getByRole("button", { name: "建立 revoke Command Draft" }).click();
+  const companion = page.getByRole("complementary", { name: "研究助手" });
+  await expect(companion).toContainText("需要你 · 只影响相关任务");
+  await expect(companion).toContainText("当前研究授权");
+  await companion.getByRole("button", { name: "申请撤销授权" }).click();
   await expect.poll(() => writes.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands",
     body: {
@@ -943,7 +949,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
     },
   });
   await expect(commandCard).toContainText("Capability Authorization · revoked");
-  await expect(companion).not.toContainText("BROAD RESEARCH AUTHORIZATION · CURRENT GRANT");
+  await expect(companion).not.toContainText("当前研究授权");
 });
 
 test("the HumanRequest surface keeps five raw Agent requests and their shortest response paths", async ({
@@ -1154,7 +1160,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog).toContainText("Resume only ACQ-17.");
   await expect(dialog.getByRole("button", { name: "我已重连" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: /跳过，之后只用 OA/ })).toBeVisible();
-  await expect(dialog.getByRole("button", { name: /手动上传该文献/ })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: /提供服务器文献来源/ })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "提交这条想法" })).toBeVisible();
   await expect(dialog).not.toContainText("不要粘贴密码");
   await expect(dialog.getByText("Human Waiting Projection", { exact: true })).toHaveCount(0);
@@ -1182,6 +1188,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     "今天先暂停，之后再处理。",
   );
   await dialog.getByRole("button", { name: "提交这条想法" }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/agent_runtime%3AHR-27%3Ar1/responses",
     body: {
@@ -1213,6 +1220,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   const approvalSource = await readSelectedServerMaterial(page, dialog, serverFile);
   await expect(dialog.getByRole("button", { name: "选择服务器文件或目录", exact: true })).toBeEnabled();
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   expect(assetIntakes).toHaveLength(0);
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/research_memory%3AHR-41%3Ar1/responses",
@@ -1235,6 +1243,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await dialog.getByLabel("自然语言回应").fill("校准完成，原始目录如下。");
   const calibrationSource = await readSelectedServerMaterial(page, dialog, serverDirectory);
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/research_graph%3AHR-52%3Ar1/responses",
     body: {
@@ -1256,6 +1265,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("button", { name: "拒绝", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "接受", exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "稍后处理", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/agent_runtime%3AHR-63%3Ar1/responses",
     body: { decision: "deferred", facts: {}, note: "" },
@@ -1266,6 +1276,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     waitUntil: "domcontentloaded",
   });
   await dialog.getByRole("button", { name: "接受", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => permissionWrites.length).toBe(4);
   expect(permissionWrites.map((item) => item.path)).toEqual([
     "/api/v1/human-collaboration/commands",
@@ -1392,6 +1403,7 @@ test("a non-asset HumanRequestResponse reloads the same sealed body and key when
     "PRIVATE GENERIC RESPONSE NOTE",
   );
   await dialog.getByRole("button", { name: "我已重连" }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(1);
   const pending = await page.evaluate(() => JSON.parse(sessionStorage.getItem(
     "meta_research_pending_human_request_response",
@@ -1419,7 +1431,7 @@ test("a non-asset HumanRequestResponse reloads the same sealed body and key when
   });
   await expect.poll(() => attempts.length).toBe(2);
   expect(attempts[1]).toEqual(attempts[0]);
-  expect(await recoveredPage.evaluate(() => sessionStorage.getItem(
+  await expect.poll(() => recoveredPage.evaluate(() => sessionStorage.getItem(
     "meta_research_pending_human_request_response",
   ))).toBeNull();
   expect(await humanRequestRecoveryDatabaseState(recoveredPage)).toEqual({
@@ -1466,6 +1478,7 @@ test("a committed non-asset HumanRequestResponse with a lost ACK replays once un
   });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await dialog.getByRole("button", { name: "我已重连" }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(1);
   await page.close();
   const recoveredPage = await context.newPage();
@@ -1476,7 +1489,7 @@ test("a committed non-asset HumanRequestResponse with a lost ACK replays once un
   expect(attempts[1]).toEqual(attempts[0]);
   expect(ownerCommitCount).toBe(1);
   expect(committed.size).toBe(1);
-  expect(await recoveredPage.evaluate(() => sessionStorage.getItem(
+  await expect.poll(() => recoveredPage.evaluate(() => sessionStorage.getItem(
     "meta_research_pending_human_request_response",
   ))).toBeNull();
 });
@@ -1552,7 +1565,9 @@ test("two tabs retain independently keyed HumanRequestResponse recovery until a 
   await expect(dialogB.getByRole("button", { name: "拒绝", exact: true })).toBeVisible();
 
   await dialogA.getByRole("button", { name: "我已重连" }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await dialogB.getByRole("button", { name: "拒绝", exact: true }).click();
+  await pageB.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.get("agent_runtime:HR-27:r1")?.length ?? 0).toBe(1);
   await expect.poll(() => attempts.get("agent_runtime:HR-63:r1")?.length ?? 0).toBe(1);
 
@@ -1648,6 +1663,7 @@ test("an aborted atomic recovery cleanup retains its manifest and payload for th
   });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await dialog.getByRole("button", { name: "我已重连" }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(1);
   await expect(dialog).toContainText("human_request_recovery_manifest_store_unavailable");
   expect(await humanRequestRecoveryDatabaseState(page)).toMatchObject({
@@ -1712,6 +1728,7 @@ test("an orphaned material delivery is discarded when its request revision is no
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await readSelectedServerMaterial(page, dialog, serverFile);
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => externalAttempt).toBe(1);
   const humanRequests = (snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord;
   humanRequests.items = (humanRequests.items as JsonRecord[]).filter(
@@ -1724,6 +1741,7 @@ test("an orphaned material delivery is discarded when its request revision is no
     "meta_research_pending_human_request_response",
   ))).toBeNull();
   await dialog.getByRole("button", { name: "我已重连" }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => responseAttempts.at(-1)?.path).toContain(
     "agent_runtime%3AHR-27%3Ar1",
   );
@@ -1959,7 +1977,7 @@ test("auto presentation skips requests already presented in this browser session
     revision: Number(item.revision),
   })));
 
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("处理当前 Quest 的第二个全局阻塞。");
@@ -2067,7 +2085,7 @@ test("human obligation copy keeps operation facts inside verification details", 
   for (const item of humanRequests.items as JsonRecord[]) item.status = "satisfied";
   (humanRequests.items as JsonRecord[]).at(-1)!.status = "unsatisfied";
 
-  await page.goto(product!.baseUrl, {
+  await page.goto(`${product!.baseUrl}/?workspace=1`, {
     waitUntil: "domcontentloaded",
   });
   await page.getByRole("button", { name: "需要你" }).click();
@@ -2175,7 +2193,7 @@ test("the HumanRequest workspace puts assistant work first and preserves overflo
 }, testInfo) => {
   await installHumanCollaborationSnapshot(page);
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const railEntry = page.getByRole("button", { name: "需要你" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const closeButton = dialog.getByRole("button", { name: "关闭需要你处理的事项" });
@@ -2231,7 +2249,7 @@ test("human request Draft echoes immediately while its POST is pending", async (
     await gate;
     await route.fulfill({ status: 503, json: { error: { code: "temporarily_unavailable" } } });
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const input = dialog.getByLabel("就图书馆恢复事项发消息");
   await input.fill("请立即显示本条讨论消息");
@@ -2274,7 +2292,7 @@ test("human request Draft streams before its snapshot and keeps request conversa
   });
   await page.route("**/api/v1/companion/messages", (route) =>
     route.fulfill({ json: { interaction_ref: "request-stream", status: "queued" } }));
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await dialog.getByLabel("就图书馆恢复事项发消息").fill("这个事项请分段解释");
   await dialog.getByRole("button", { name: "发送消息" }).click();
@@ -2318,13 +2336,14 @@ for (const kind of ["file", "directory", "library"] as const) {
     await page.goto(`${product!.baseUrl}/?panel=${kind === "library" ? "human-request" : "external-request"}`, { waitUntil: "domcontentloaded" });
     const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
     if (kind === "library") {
-      await dialog.getByRole("button", { name: "手动上传该文献" }).click();
+      await dialog.getByRole("button", { name: /提供服务器文献来源/ }).click();
       await dialog.getByPlaceholder("例如：先暂停这篇；或者改为向作者索取全文。").fill("Read these exact observations.");
     } else await dialog.getByLabel("自然语言回应").fill("Read these exact observations.");
     const source = await readSelectedServerMaterial(page, dialog, kind === "directory" ? serverDirectory : serverFile, "Original metadata description.");
     expect(posts).toEqual([]);
     await expect(dialog.locator("input[type=file]")).toHaveCount(0);
     await dialog.getByRole("button", { name: kind === "library" ? "提交全文来源回应" : "提交", exact: true }).click();
+    await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
     await expect.poll(() => posts.length).toBe(1);
     expect(posts[0].materials).toEqual([{ kind: "server_reference", selection: source }]);
     expect(posts[0].facts).toEqual(kind === "library" ? { route: "provided_material", acquisition_paper_id: "paper-ACQ-17" } : {});
@@ -2358,6 +2377,7 @@ test("legacy material recovery requires reselection and never replays intake", a
   expect(intakes).toHaveLength(0);
   const freshSource = await readSelectedServerMaterial(page, dialog, serverFile);
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => replies.length).toBe(1);
   expect(replies[0].materials).toEqual([{ kind: "server_reference", selection: freshSource }]);
   expect(intakes).toHaveLength(0);
@@ -2380,11 +2400,13 @@ test("a rejected stale server reference clears recovery so a new source uses a n
   await dialog.getByLabel("自然语言回应").fill("Keep this response while correcting its source.");
   await readSelectedServerMaterial(page, dialog, serverFile, "Rejected original file.");
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect(dialog).toContainText("material_source_changed");
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"))).toBeNull();
   await expect(dialog.getByRole("button", { name: "选择服务器文件或目录", exact: true })).toBeEnabled();
   const corrected = await readSelectedServerMaterial(page, dialog, serverDirectory, "Corrected original directory.");
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(2);
   expect(attempts[1].key).not.toBe(attempts[0].key);
   expect(attempts[1].body).toEqual({ decision: "provided", facts: {}, note: "Keep this response while correcting its source.", materials: [{ kind: "server_reference", selection: corrected }] });
@@ -2419,6 +2441,7 @@ test("sealed server reference survives lost ACK and reload with controls locked"
   await dialog.getByLabel("自然语言回应").fill("Original sealed reply.");
   const exactSource = await readSelectedServerMaterial(page, dialog, serverFile, "Exact original source.");
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(1);
   const pending = await page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"));
   expect(pending).toContain("AES-GCM");
@@ -2437,116 +2460,66 @@ test("sealed server reference survives lost ACK and reload with controls locked"
   expect(intakes).toEqual([]);
 });
 
-async function createGuidanceQuestThroughWeb(page: Page): Promise<void> {
-  await page.getByRole("button", { name: "创建研究任务" }).click();
-  const dialog = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
-  await expect(dialog).toBeVisible();
-  const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
-  await goal.fill("判断低照度显微图像去噪能否保留稀有形态");
-  await dialog.getByRole("textbox", { name: "边界", exact: true }).fill(
-    "形成带反例、证据边界和可执行 gap 的比较结论",
-  );
-  await goal.blur();
-  await expect(dialog.getByText("草案已自动保存", { exact: true })).toBeVisible();
-
-  const computeCard = dialog.getByLabel("本机计算卡");
-  await computeCard.getByRole("button", { name: "检测本机计算卡" }).click();
-  await expect(
-    dialog.getByText(
-      "capability_unavailable · deterministic_probe_unavailable",
-      { exact: true },
-    ),
-  ).toBeVisible();
-  await computeCard.getByRole("button", { name: "重新检测", exact: true }).click();
-  const device = computeCard.getByRole("button", {
-    name: /Deterministic GPU.*GPU-deterministic-1/,
-  });
-  await expect(device).toBeVisible();
-  await device.click();
-  await expect(
-    dialog.getByText("已绑定 1 张实际检测设备。", { exact: false }),
-  ).toBeVisible();
-
-  await dialog.getByRole("button", { name: "生成第一个问题" }).click();
-  await expect(dialog.getByLabel("首问题标题")).toHaveValue(
-    "低照度显微图像中的稀有形态保真",
-    { timeout: 15_000 },
-  );
-  await expect(
-    dialog.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
-  ).toBeVisible();
-
-  const confirmation = dialog.getByRole("button", {
-    name: "确认创建 Quest 与第一个问题",
-  });
-  await expect(confirmation).toBeEnabled();
-  await confirmation.click();
-  await expect.poll(async () => {
-    try {
-      const snapshot = await (await page.request.get(product!.baseUrl + "/api/v1/snapshot")).json();
-      return snapshot.question_tree.status === "ready"
-        && snapshot.question_tree.items.length > 0
-        && snapshot.research_control.foreground
-        ? "completed"
-        : "pending";
-    } catch {
-      return "snapshot_unavailable";
-    }
-  }, { timeout: 30_000 }).toBe("completed");
-  if (await dialog.isVisible()) {
-    await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
-  }
-  await page.getByRole("button", { name: "Quest 总览", exact: true }).click();
-  await expect(page.getByTestId("current-cycle-overview")).toBeVisible();
-}
-
-test("human guidance saves exact original text and all strengths in the real product", async ({ page }) => {
+test("human guidance reviews original words and local scope through real Companion and confirmation APIs", async ({ page }) => {
   test.setTimeout(120_000);
-  product = await DeterministicProduct.start({ stagePipeline: "plan-gap" });
+  product = await DeterministicProduct.start({ manualRoot: true });
   await openAuthenticatedProduct(page, product);
-  await createGuidanceQuestThroughWeb(page);
-  await product.waitForPlanProviderPhase("plan-primary", 30_000);
-  const form = page.getByRole("form", { name: "提交人类指导" });
-  await expect(form).toBeVisible();
-  await expect(form.getByRole("combobox", { name: "指导力度", exact: true })).toHaveValue("3");
-  const text = "  保留各设备的独立核验。\n再比较稀有形态。  ";
-  await form.getByRole("textbox", { name: "指导原文" }).fill(text);
-  const saved = page.waitForResponse((response) => response.url().endsWith("/human-collaboration/guidance") && response.request().method() === "POST");
-  await form.getByRole("button", { name: "保存指导" }).click();
-  const response = await saved;
-  expect(response.status()).toBe(201);
-  const first = await response.json();
-  expect(first.guidance).toEqual({ text, strength: 3 });
-  const scopeRef = first.scope_ref;
-  for (const strength of [1, 2, 3, 4, 5]) {
-    await form.getByRole("combobox", { name: "指导力度", exact: true }).selectOption(String(strength));
-    const original = "力度 " + strength + " 的原文";
-    await form.getByRole("textbox", { name: "指导原文" }).fill(original);
-    const save = page.waitForResponse((reply) => reply.url().endsWith("/human-collaboration/guidance") && reply.request().method() === "POST");
-    await form.getByRole("button", { name: "保存指导" }).click();
-    const reply = await save;
-    expect(reply.status()).toBe(201);
-    expect((await reply.json()).guidance).toEqual({ text: original, strength });
-  }
-  const omitted = await page.request.post(product.baseUrl + "/api/v1/human-collaboration/guidance", {
-    headers: { Origin: product.baseUrl, "Idempotency-Key": "browser-guidance-default" },
-    data: { scope_ref: scopeRef, text: "省略力度仍默认优先考虑。" },
+  await page.goto(`${product.baseUrl}/?workspace=1`);
+  const sidebar = page.getByRole("complementary", { name: "研究助手" });
+  const input = sidebar.getByLabel("给研究助手发消息");
+  await input.fill("解释一下学习率的作用。");
+  await sidebar.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(sidebar).toContainText("建议先固定可证伪边界：解释一下学习率的作用。");
+  const before = await (await page.request.get(product.baseUrl + "/api/v1/snapshot")).json();
+  expect(before.human_collaboration.companion.soft_constraints).toEqual([]);
+  expect(before.human_collaboration.companion.agent_proposals).toEqual([]);
+  await sidebar.getByText("指导力度与可选材料", { exact: true }).click();
+  await expect(sidebar.getByLabel("指导力度", { exact: true })).toHaveValue("3");
+  await sidebar.getByLabel("指导力度", { exact: true }).selectOption("5");
+  const original = "  GUIDANCE CONFIRMATION 本问题严格只换学习率，总目标不变。  ";
+  await input.fill(original);
+  await sidebar.getByRole("button", { name: "发送消息", exact: true }).click();
+  let review = sidebar.getByRole("article", { name: "确认研究指导" });
+  await expect(review).toBeVisible({ timeout: 20_000 });
+  await expect(review.getByLabel("指导原文", { exact: true })).toHaveValue(original);
+  await expect(review).not.toContainText("Quest 全局目标更新待对齐");
+  const preview = await (await page.request.get(product.baseUrl + "/api/v1/snapshot")).json();
+  expect(preview.human_collaboration.companion.soft_constraints).toEqual([]);
+  const previous = preview.human_collaboration.companion.agent_proposals[0];
+  const csrf = decodeURIComponent((await page.context().cookies()).find(cookie => cookie.name === "meta_research_csrf")!.value);
+  await review.getByLabel("助手理解", { exact: true }).fill("仅在本问题后续工作中变更学习率，保留总目标与其余条件。");
+  await expect(review.getByRole("button", { name: "明确确认并交给研究", exact: true })).toBeDisabled();
+  await review.getByRole("button", { name: "保存修改并重新审阅", exact: true }).click();
+  await expect.poll(async () => {
+    const state = await (await page.request.get(product!.baseUrl + "/api/v1/snapshot")).json();
+    return state.human_collaboration.companion.agent_proposals.filter((item: JsonRecord) => item.status === "proposed").length;
+  }).toBe(1);
+  const stale = await page.request.post(product.baseUrl + `/api/v1/human-collaboration/agent-proposals/${previous.proposal_ref}/soft-constraint`, {
+    headers: { Origin: product.baseUrl, "X-CSRF-Token": csrf, "Idempotency-Key": "browser-stale-guidance" },
+    data: { expected_scope_ref: previous.scope_ref, expected_proposal_hash: previous.proposal_hash, strength: 5 },
   });
-  expect(omitted.status()).toBe(201);
-  expect((await omitted.json()).guidance.strength).toBe(3);
-  for (const strength of [true, 0, 6, "3", 3.5, null]) {
-    const malformed = await page.request.post(product.baseUrl + "/api/v1/human-collaboration/guidance", {
-      headers: { Origin: product.baseUrl, "Idempotency-Key": "browser-malformed-" + String(strength) },
-      data: { scope_ref: scopeRef, text: "invalid", strength },
-    });
-    expect(malformed.status()).toBe(422);
-  }
+  expect(stale.status()).toBe(409);
+  expect((await stale.json()).detail.code).toBe("agent_proposal_stale");
+  await expect(review.getByRole("button", { name: "明确确认并交给研究", exact: true })).toBeEnabled();
+  const converted = page.waitForResponse(response => response.url().endsWith("/soft-constraint") && response.request().method() === "POST");
+  await review.getByRole("button", { name: "明确确认并交给研究", exact: true }).click();
+  const confirmed = await converted;
+  expect(confirmed.status()).toBe(201);
+  const result = await confirmed.json();
+  expect(result.soft_constraint.guidance).toMatchObject({ text: original, strength: 5,
+    assistant_understanding: "仅在本问题后续工作中变更学习率，保留总目标与其余条件。",
+    semantic_scope: { kind: "question", quest_ref: before.research_space.current_quest.quest_ref, question_ref: before.research_control.foreground.question_ref },
+    preserve_conditions: ["总目标不变"],
+  });
+  const direct = await page.request.post(product.baseUrl + "/api/v1/human-collaboration/guidance", {
+    headers: { Origin: product.baseUrl, "X-CSRF-Token": csrf, "Idempotency-Key": "browser-guidance-no-bypass" },
+    data: { scope_ref: previous.scope_ref, text: "不能直接投递", strength: 5 },
+  });
+  expect(direct.status()).toBe(409);
+  expect((await direct.json()).detail.code).toBe("guidance_confirmation_required");
   await page.reload();
-  const cards = page.locator(".lumen-constraint");
-  await expect(cards).toHaveCount(7);
-  await expect(cards.filter({ hasText: "稀有形态" }).first()).toContainText(text.trim());
-  await expect(cards.filter({ hasText: "力度 5 的原文" })).toContainText("目标更新待对齐");
-  await expect(cards.filter({ hasText: "力度 5 的原文" })).toContainText("等待下一研究操作读取");
-  const snapshot = await (await page.request.get(product.baseUrl + "/api/v1/snapshot")).json();
-  expect(snapshot.human_collaboration.companion.soft_constraints[0].deliveries).toEqual([]);
+  const card = sidebar.locator(".lumen-constraint").filter({ hasText: "GUIDANCE CONFIRMATION" });
+  await expect(card).toContainText("确认范围 · question");
+  await expect(card).not.toContainText("Quest 全局目标更新待对齐");
+  await expect(card).toContainText("待适用研究工作接续");
 });

@@ -462,6 +462,9 @@ async function openTimeline(page: Page, { runningBundle = false, secondTargetFir
   const errors: string[] = [];
   const reads = { overview: 0, summaries: 0, roots: 0, summaryQuests: [] as string[] };
   const runtime: { status: JsonRecord | null } = { status: null };
+  const history = { quests: [{ quest_ref: QUEST_REF, goal: snapshot.research_space.current_quest.goal }],
+    questions: overview.cycles.map(cycle => ({ question_ref: cycle.question_ref, name: cycle.question_ref, status: "active" })),
+    otherOverview: null as ResearchOverviewData | null, status: 200, pageSize: 100 };
   page.on("pageerror", error => errors.push(error.message));
   const webRoot = process.env.META_RESEARCH_WEB_DIST ?? resolve(import.meta.dirname, "../../src/meta_research/web_dist");
   await page.route("**/*", async route => {
@@ -473,7 +476,15 @@ async function openTimeline(page: Page, { runningBundle = false, secondTargetFir
     if (url.pathname === "/api/v1/status" && runtime.status) return json(runtime.status);
     if (url.pathname === "/api/v1/snapshot") return json(snapshot);
     if (url.pathname === "/api/v1/events") return route.fulfill({ contentType: "text/event-stream", body: "event: snapshot.required\ndata: {}\n\n" });
-    if (url.pathname === "/api/v1/research-overview") { reads.overview += 1; return json(overview); }
+    if (url.pathname === "/api/v1/research-timeline/quests" || url.pathname === "/api/v1/research-library/questions") {
+      const requestedQuest = url.searchParams.get("quest_ref");
+      const items = url.pathname.endsWith("/quests") ? history.quests : requestedQuest === QUEST_REF ? history.questions
+        : requestedQuest === overview.quest_ref ? snapshot.question_tree.items.map((item: JsonRecord) => ({ question_ref: item.question_ref, name: item.title, status: "active" })) : [];
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const size = Math.min(history.pageSize, Number(url.searchParams.get("limit") ?? 100));
+      return json({ schema_ref: "meta-research/timeline-quests/v1", items: items.slice(offset, offset + size), next_offset: offset + size < items.length ? offset + size : null }, history.status);
+    }
+    if (url.pathname === "/api/v1/research-overview") { reads.overview += 1; return json(url.searchParams.get("quest_ref") === overview.quest_ref ? overview : history.otherOverview, history.status); }
     if (/^\/api\/v1\/quests\/[^/]+\/timeline-summaries$/.test(url.pathname)) {
       reads.summaries += 1;
       reads.summaryQuests.push(decodeURIComponent(url.pathname.split("/")[4]));
@@ -488,12 +499,86 @@ async function openTimeline(page: Page, { runningBundle = false, secondTargetFir
   await page.goto("http://timeline.test/?workspace=1", { waitUntil: "domcontentloaded" });
   const timeline = page.getByRole("region", { name: "研究时间线", exact: true });
   await timeline.scrollIntoViewIfNeeded();
-  return { timeline, errors, snapshot, overview, catalog, recorder, reads, runtime };
+  return { timeline, errors, snapshot, overview, catalog, recorder, reads, runtime, history };
 }
 
 const cycleNode = (timeline: Locator, cycleRef = CYCLE_REF) => timeline.locator(`.research-timeline-cycle[data-cycle-ref="${cycleRef}"]`);
 const stageSummary = (timeline: Locator, stage: string, cycleRef = CYCLE_REF) => cycleNode(timeline, cycleRef).locator(`.research-timeline-stage[data-stage="${stage}"] .research-timeline-stage-summary .timeline-summary-text`);
 const summaryNode = (timeline: Locator, key: string) => timeline.locator(`.timeline-summary[data-summary-key="${key}"]`);
+
+test("timeline browsing includes formal Questions without Cycles and other Quests without changing foreground", async ({ page }) => {
+  const { timeline, snapshot, history } = await openTimeline(page);
+  const foreground = JSON.stringify(snapshot.research_control.foreground);
+  history.quests.push({ quest_ref: "quest-history", goal: "历史研究目标" });
+  history.questions.push({ question_ref: "question-without-cycle", name: "尚未推进的正式问题", status: "retired" });
+  history.otherOverview = { schema_ref: "meta-research/research-overview/v1", status: "idle", quest_ref: "quest-history",
+    question_ref: null, cycle_ref: null, cycle_ordinal: null, foreground: null, findings: { quest: [], question: [], cycle: [] }, reason: null,
+    cycles: [{ cycle_ref: "cycle-history", question_ref: "question-history", ordinal: 1, stages: {} }] };
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const noCycle = timeline.locator('[data-question-ref="question-without-cycle"]');
+  await expect(noCycle).toContainText("尚未推进的正式问题");
+  await expect(noCycle).toContainText("已退役");
+  await timeline.getByLabel("浏览 Quest").selectOption("quest-history");
+  await expect(timeline.locator('[data-cycle-ref="cycle-history"]')).toBeVisible();
+  await expect(timeline.locator('[data-cycle-ref="cycle-history"]')).toHaveAttribute("data-current", "false");
+  expect(JSON.stringify(snapshot.research_control.foreground)).toBe(foreground);
+  await timeline.getByRole("button", { name: "返回当前工作", exact: true }).click();
+  await expect(timeline.getByLabel("浏览 Quest")).toHaveValue(QUEST_REF);
+  await expect(cycleNode(timeline)).toBeVisible();
+});
+
+test("timeline discovery reaches Quest and formal Question pages beyond one hundred with honest retry feedback", async ({ page }) => {
+  const { timeline, history } = await openTimeline(page);
+  history.pageSize = 25;
+  for (let index = 0; index < 105; index += 1) {
+    history.quests.push({ quest_ref: `quest-page-${index}`, goal: `历史研究 ${index}` });
+    history.questions.push({ question_ref: `question-page-${index}`, name: `未进入轮次的问题 ${index}`, status: index === 104 ? "pruned" : "active" });
+  }
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(timeline.getByLabel("浏览 Quest").locator("option")).toHaveCount(106);
+  const last = timeline.locator('[data-question-ref="question-page-104"]');
+  await expect(last).toContainText("未进入轮次的问题 104");
+  await expect(last).toContainText("pruned");
+  await page.route("**/api/v1/research-timeline/quests?*", route => route.fulfill({ status: 503, contentType: "application/json", body: "{}" }));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(timeline).toContainText("Quest 列表读取失败");
+  await expect(last).toBeVisible();
+  await page.unroute("**/api/v1/research-timeline/quests?*");
+  await timeline.getByRole("button", { name: "重新读取", exact: true }).click();
+  await expect(timeline.getByLabel("浏览 Quest").locator("option")).toHaveCount(106);
+  await expect(timeline).not.toContainText("Quest 列表读取失败");
+});
+
+test("timeline keeps the reader position through a new Cycle and provides keyboard scrolling and explicit return", async ({ page }) => {
+  const { timeline, snapshot, overview } = await openTimeline(page);
+  for (let ordinal = 4; ordinal <= 38; ordinal += 1) overview.cycles.push({ cycle_ref: `cycle-scroll-${ordinal}`, question_ref: QUESTION_REF, ordinal, stages: {} });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const scroll = timeline.getByLabel("按时间排列的研究记录");
+  await expect(timeline.locator('[data-cycle-ref="cycle-scroll-38"]')).toBeVisible();
+  for (const viewport of [{ width: 1440, height: 420 }, { width: 390, height: 520 }]) {
+    await page.setViewportSize(viewport);
+    await scroll.focus();
+    await scroll.press("End");
+    await expect.poll(() => scroll.evaluate(node => node.scrollTop)).toBeGreaterThan(100);
+    await scroll.press("Home");
+    await expect.poll(() => scroll.evaluate(node => node.scrollTop)).toBe(0);
+    const metrics = await scroll.evaluate(node => ({ height: node.clientHeight, content: node.scrollHeight,
+      overflow: getComputedStyle(node).overflowY, scrollbar: getComputedStyle(node).scrollbarColor }));
+    expect(metrics.content).toBeGreaterThan(metrics.height);
+    expect(metrics.overflow).toBe("scroll");
+    expect(metrics.scrollbar).not.toBe("auto");
+  }
+  await scroll.evaluate(node => { node.scrollTop = 17; });
+  Object.assign(snapshot.research_control.foreground, { cycle_ref: "cycle-scroll-39" });
+  Object.assign(overview, { cycle_ref: "cycle-scroll-39", cycle_ordinal: 39 });
+  overview.cycles.push({ cycle_ref: "cycle-scroll-39", question_ref: QUESTION_REF, ordinal: 39, stages: {} });
+  await advanceSnapshot(page, snapshot);
+  await expect(timeline.locator('[data-cycle-ref="cycle-scroll-39"]')).toHaveAttribute("data-current", "true");
+  expect(await scroll.evaluate(node => node.scrollTop)).toBe(17);
+  await timeline.getByRole("button", { name: "返回当前工作", exact: true }).click();
+  await expect.poll(() => scroll.evaluate(node => node.scrollTop)).toBeGreaterThan(100);
+  await expect(timeline.locator('[data-cycle-ref="cycle-scroll-39"] > details')).toHaveAttribute("open", "");
+});
 
 function updateSummary(recorder: { data: TimelineSummaries }, key: string, patch: Partial<TimelineSummaryNode>) {
   const node = recorder.data.nodes.find(item => item.node_key === key);

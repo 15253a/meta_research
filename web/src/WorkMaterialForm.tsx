@@ -7,6 +7,8 @@ import {
   type WorkMaterialReceipt, type WorkMaterialSubmission, type MaterialTreatment,
 } from "./workMaterialApi";
 
+const materialSelections = new Map<string, ServerMaterialSelection>();
+
 export function useWorkMaterialDraft(scope: string, receiverPath: string) {
   const [selection, setSelection] = useState<ServerMaterialSelection | null>(null);
   const [receiver, setReceiver] = useState<MaterialReceiver | null>(null);
@@ -24,16 +26,19 @@ export function useWorkMaterialDraft(scope: string, receiverPath: string) {
   useEffect(() => {
     let active = true;
     generation.current += 1;
-    setSelection(null); setReceiver(null); setPending(null);
+    const selected = materialSelections.get(scope) ?? null;
+    setSelection(selected); setReceiver(null); setPending(null);
     setError(null); setErrorCode(null); setErrorStatus(null); setReceipts([]); setBusy(true);
     void pendingMaterialCommand(scope).then(value => { if (active) setPending(value); }).catch(caught => {
       if (active) { setError(workMaterialErrorMessage(caught)); setErrorCode(caught instanceof WorkMaterialError ? caught.code : "material_pending_invalid"); }
     }).finally(() => { if (active) setBusy(false); });
+    if (selected) void select(selected);
     return () => { active = false; };
   }, [scope]);
 
   async function select(value: ServerMaterialSelection | null) {
     const requestGeneration = ++generation.current;
+    if (value) materialSelections.set(scope, value); else materialSelections.delete(scope);
     setSelection(value); setReceiver(null); setError(null); setErrorCode(null); setErrorStatus(null);
     if (!value) return;
     setBusy(true);
@@ -59,6 +64,7 @@ export function useWorkMaterialDraft(scope: string, receiverPath: string) {
     try {
       const result = await deliverMaterialCommand(command);
       if (activeScope.current === command.scope) {
+        materialSelections.delete(command.scope);
         setPending(null); setSelection(null); setReceiver(null);
         const saved = Array.isArray(result.work_materials) ? result.work_materials as WorkMaterialReceipt[]
           : Array.isArray(result.references) ? [result as unknown as WorkMaterialReceipt] : [];
@@ -87,6 +93,7 @@ export function useWorkMaterialDraft(scope: string, receiverPath: string) {
 
   async function discard() {
     try {
+      materialSelections.delete(scope);
       await discardMaterialCommand(scope); setPending(null); setReceiver(null); setSelection(null); setError(null); setErrorCode(null); setErrorStatus(null);
     } catch (caught) { setError(workMaterialErrorMessage(caught)); }
   }

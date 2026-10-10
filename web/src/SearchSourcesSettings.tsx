@@ -18,6 +18,7 @@ type EditorDraft =
   | { kind: "mcp"; name: string; instructions: string; connectionMode: "keep" | "replace"; connectionJson: string };
 type Editor = { draft: EditorDraft; source?: SearchSourceView; report: SearchSourceTestReport | null };
 type Operation = "idle" | "testing" | "saving-source" | "saving-selection";
+const sourceDrafts = new Map<string, { selection: SearchSourceSelection | null; allowed: string[]; editor: Editor | null; probeQuery: string }>();
 const capabilityNames: Record<string, string> = {
   connection: "连接", authentication: "认证", search: "搜索", abstract: "摘要", page_read: "网页读取", fulltext: "论文全文",
 };
@@ -109,11 +110,12 @@ export function SearchSourcesSettings(props: Props) {
 function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }: Props) {
   const alive = useRef(true);
   const identity = scopeKey(scope);
+  const restored = sourceDrafts.get(identity);
   const [sources, setSources] = useState<SearchSourceView[]>([]);
   const [selection, setSelection] = useState<SearchSourceSelection | null>(null);
-  const [allowed, setAllowed] = useState<string[]>([]);
-  const [editor, setEditor] = useState<Editor | null>(null);
-  const [probeQuery, setProbeQuery] = useState("deep learning");
+  const [allowed, setAllowed] = useState<string[]>(restored?.allowed ?? []);
+  const [editor, setEditor] = useState<Editor | null>(restored?.editor ?? null);
+  const [probeQuery, setProbeQuery] = useState(restored?.probeQuery ?? "deep learning");
   const [operation, setOperation] = useState<Operation>("idle");
   const [loading, setLoading] = useState(true);
   const [readAttempt, setReadAttempt] = useState(0);
@@ -136,13 +138,26 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }
       scope.kind === "shared-only" ? Promise.resolve(null) : fetchSearchSourceSelection(scope, controller.signal),
     ]).then(([shared, scoped]) => {
       if (!current) return;
-      setSources(shared.sources); setSelection(scoped?.selection ?? null); setAllowed(scoped?.selection.allowed_source_ids ?? []);
-      setEditor(null); setConflict(null); setSharedReceipt(null); setSelectionReceipt(null);
+      const cached = sourceDrafts.get(identity);
+      const latestSelection = scoped?.selection ?? null;
+      const dirtySelection = cached && JSON.stringify([...cached.allowed].sort()) !== JSON.stringify([...(cached.selection?.allowed_source_ids ?? [])].sort());
+      const staleSelection = dirtySelection && cached.selection?.revision !== latestSelection?.revision;
+      const staleSource = cached?.editor?.source && shared.sources.find(source => source.source_id === cached.editor?.source?.source_id)?.version !== cached.editor.source.version;
+      setSources(shared.sources); setSelection(dirtySelection ? cached.selection : latestSelection);
+      setAllowed(dirtySelection ? cached.allowed : latestSelection?.allowed_source_ids ?? []);
+      setEditor(cached?.editor ?? null); setProbeQuery(cached?.probeQuery ?? "deep learning");
+      setConflict(staleSelection ? "selection" : staleSource ? "source" : null); setSharedReceipt(null); setSelectionReceipt(null);
+      if (staleSelection) setSelectionError("当前研究的允许来源已变化。勾选草稿已保留，请显式读取最新选择后核对。");
+      if (staleSource) setError("共享来源已被其他编辑更新。当前草稿已保留，请显式读取最新来源再核对。");
     }).catch(() => {
       if (current) setError("搜索源读取失败，请重试。当前编辑不会自动提交。");
     }).finally(() => { if (current) setLoading(false); });
     return () => { current = false; alive.current = false; controller.abort(); };
   }, [readAttempt, identity]);
+
+  useEffect(() => {
+    if (!loading) sourceDrafts.set(identity, { selection, allowed, editor, probeQuery });
+  }, [identity, selection, allowed, editor, probeQuery, loading]);
 
   const edit = (draft: EditorDraft) => {
     setEditor(previous => previous ? { ...previous, draft, report: null } : null);

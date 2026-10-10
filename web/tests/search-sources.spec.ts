@@ -102,7 +102,7 @@ async function workspace(page: Page, preQuest = false, withCreation = false) {
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
   });
   await page.goto("http://127.0.0.1:18768/?workspace=1", { waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(settings(page).getByRole("button", { name: "添加搜索源", exact: true })).toBeEnabled();
   return state;
 }
@@ -114,6 +114,21 @@ async function add(page: Page, kind: "website" | "api" | "mcp", name: string) {
   await shared(page).getByRole("combobox", { name: "来源类型", exact: true }).selectOption(kind);
   await shared(page).getByRole("textbox", { name: "来源名称", exact: true }).fill(name);
 }
+
+test("closing and reopening retains the Quest source draft without saving it", async ({ page }) => {
+  const state = await workspace(page);
+  await selection(page).getByRole("checkbox", { name: "允许 Saved website", exact: true }).check();
+  await add(page, "mcp", "未保存的搜索连接");
+  await shared(page).getByRole("textbox", { name: "来源使用说明", exact: true }).fill("仅供当前初始化核对");
+  const connection = shared(page).getByLabel("MCP 连接配置", { exact: true });
+  await connection.fill('{"transport":"streamable_http","url":"https://example.org/mcp","headers":{}}');
+  await page.getByRole("button", { name: "关闭修改配置", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
+  await expect(selection(page).getByRole("checkbox", { name: "允许 Saved website", exact: true })).toBeChecked();
+  await expect(shared(page).getByRole("textbox", { name: "来源名称", exact: true })).toHaveValue("未保存的搜索连接");
+  await expect(connection).toHaveValue('{"transport":"streamable_http","url":"https://example.org/mcp","headers":{}}');
+  expect(state.mutations).toEqual([]);
+});
 
 test("website draft test is separate from shared save and per-Quest selection", async ({ page }) => {
   const state = await workspace(page);
@@ -138,8 +153,8 @@ test("website draft test is separate from shared save and per-Quest selection", 
   await selection(page).getByRole("button", { name: "保存当前 Quest 允许来源", exact: true }).click();
   await expect(selection(page)).toContainText("已保存当前 Quest允许来源，修订 1");
   expect(state.selectionSaves).toEqual([{ scope: state.questRef, allowed_source_ids: ["source_1"], expected_revision: 0 }]);
-  await page.getByRole("button", { name: "关闭运行条件", exact: true }).click();
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "关闭修改配置", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(selection(page).getByRole("checkbox", { name: "允许 New website", exact: true })).toBeChecked();
   await shared(page).getByRole("button", { name: "New website", exact: true }).click();
   await expect(shared(page).getByRole("region", { name: "当前配置测试结果", exact: true })).toContainText("2026-10-10T12:00:00Z");
@@ -180,7 +195,7 @@ test("direct MCP works with empty generic MCP and keeps saved private connection
   await shared(page).getByLabel("MCP 连接配置", { exact: true }).fill(JSON.stringify(connection));
   await expect(shared(page).getByLabel("MCP 连接配置", { exact: true })).toHaveAttribute("type", "password");
   await shared(page).getByRole("button", { name: "测试当前配置", exact: true }).click();
-  await expect(shared(page)).toContainText("搜索、摘要和全文能力仍需实际研究调用验证");
+  await expect(shared(page).getByRole("region", { name: "当前配置测试结果", exact: true })).toContainText("2026-10-10T12:00:00Z");
   expect(state.tests[0].form).toEqual({ kind: "mcp", name: "Private MCP", instructions: "", connection: { mode: "replace", value: connection } });
   expect(state.saves).toHaveLength(0);
   await shared(page).getByRole("button", { name: "保存共享来源", exact: true }).click();
@@ -188,6 +203,7 @@ test("direct MCP works with empty generic MCP and keeps saved private connection
   await expect(shared(page).getByRole("combobox", { name: "MCP 连接操作", exact: true })).toHaveValue("keep");
   await expect(shared(page).getByLabel("MCP 连接配置", { exact: true })).toHaveCount(0);
   await shared(page).getByRole("button", { name: "重新测试当前配置", exact: true }).click();
+  await expect.poll(() => state.tests.length).toBe(2);
   await expect(shared(page).getByRole("region", { name: "当前配置测试结果", exact: true })).toBeVisible();
   expect(state.tests[1].form).toEqual({ kind: "mcp", name: "Private MCP", instructions: "", connection: { mode: "keep" } });
   await expect(selection(page)).toContainText("目前可管理共享来源");
@@ -219,9 +235,9 @@ test("source and selection conflicts preserve drafts until explicit latest read"
 
 test("Quest switch rejects stale selection read and clears editor ownership", async ({ page }) => {
   const state = await workspace(page);
-  await page.getByRole("button", { name: "关闭运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "关闭修改配置", exact: true }).click();
   state.delayedQuest = state.questRef;
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect.poll(() => state.release !== null).toBe(true);
   const nextQuest = "quest-next";
   state.selections[nextQuest] = { scope: { kind: "quest", quest_ref: nextQuest }, revision: 4, allowed_source_ids: ["source_fixture"], selection_hash: "next" };
@@ -231,7 +247,7 @@ test("Quest switch rejects stale selection read and clears editor ownership", as
   state.snapshot.research_control.foreground.quest_ref = nextQuest;
   state.snapshot.revision += 1;
   await expect(settings(page)).toHaveCount(0);
-  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "修改配置", exact: true }).click();
   await expect(selection(page).getByRole("checkbox", { name: "允许 Saved website", exact: true })).toBeChecked();
   state.release?.();
   await expect(selection(page).getByRole("checkbox", { name: "允许 Saved website", exact: true })).toBeChecked();
@@ -244,7 +260,7 @@ test("Quest switch rejects stale selection read and clears editor ownership", as
 
 test("creation saves initialization selection without rewriting the draft or starting research", async ({ page }) => {
   const state = await workspace(page, true, true);
-  await page.getByRole("button", { name: "关闭运行条件", exact: true }).click();
+  await page.getByRole("button", { name: "关闭修改配置", exact: true }).click();
   await page.getByRole("button", { name: "创建研究任务", exact: true }).click();
   await expect(selection(page).getByRole("button", { name: "保存创建草稿允许来源", exact: true })).toBeDisabled();
   await add(page, "api", "Creation Crossref");

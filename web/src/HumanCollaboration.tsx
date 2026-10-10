@@ -12,11 +12,13 @@ import {
 } from "react";
 import { useReplyStream } from "./chatReplyStream";
 import { MetaTrace } from "./MetaTrace";
+import { usePageDraft, usePageReadingPosition } from "./pageDraft";
+import { GuidanceConfirmation } from "./GuidanceConfirmation";
+import { sendGuidanceConversation } from "./guidanceApi";
 import {
   authorizeHumanCommand,
   confirmHumanCommand,
   convertAgentProposalToCommandDraft,
-  convertAgentProposalToSoftConstraint,
   deliverPendingHumanRequestResponse,
   createHumanCommand,
   downloadHumanRequestHandoff,
@@ -35,7 +37,6 @@ import {
   sendCompanionMessage,
   startNewCompanionSession,
   withdrawSoftConstraint,
-  submitHumanGuidance,
   type GuidanceStrength,
   type GuidanceDelivery,
   type GoalGuidanceAlignment,
@@ -339,6 +340,9 @@ function requestStatusLabel(status: HumanRequestItem["status"]): string {
   }[status];
 }
 
+type CompanionComposerDraft = { text: string; strength: GuidanceStrength; selection: ServerMaterialSelection | null };
+let companionComposerDrafts: Record<string, CompanionComposerDraft> = {};
+
 export function QuestCompanion({
   state,
   collaboration,
@@ -362,7 +366,23 @@ export function QuestCompanion({
   const sessionSwitch = useCompanionSessionSwitch(companion, onChanged);
   const ready = companion?.status === "ready";
   const canSend = ready && Boolean(companion.scope_ref);
-  const [draft, setDraft] = useState("");
+  const scopeRef = companion?.scope_ref ?? null;
+  const draftKey = `${scopeRef}:${questionContext?.question_ref ?? "quest"}`;
+  const [composerDrafts, setComposerDrafts] = useState(companionComposerDrafts);
+  const composerDraft = composerDrafts[draftKey] ?? { text: "", strength: 3 as GuidanceStrength, selection: null };
+  const updateComposer = (patch: Partial<CompanionComposerDraft>) => setComposerDrafts(current => {
+    const next = { ...current, [draftKey]: { ...(current[draftKey] ?? { text: "", strength: 3 as GuidanceStrength, selection: null }), ...patch } };
+    companionComposerDrafts = next;
+    return next;
+  });
+  const draft = composerDraft.text;
+  const strength = composerDraft.strength;
+  const setDraft = (value: string | ((current: string) => string)) => setComposerDrafts(current => {
+    const prior = current[draftKey] ?? { text: "", strength: 3 as GuidanceStrength, selection: null };
+    const next = { ...current, [draftKey]: { ...prior, text: typeof value === "string" ? value : value(prior.text) } };
+    companionComposerDrafts = next;
+    return next;
+  });
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -374,7 +394,11 @@ export function QuestCompanion({
     COMPANION_MESSAGE_PAGE_SIZE,
   );
   const chatRef = useRef<HTMLDivElement>(null);
-  const scopeRef = companion?.scope_ref ?? null;
+  const materials = useWorkMaterialDraft(`companion-guidance:${scopeRef}:${questionContext?.question_ref ?? "quest"}`, currentMaterialReceiverPath(questIdentity(scopeRef ?? ""), questionContext?.question_ref));
+  useEffect(() => { if (composerDraft.selection) void materials.select(composerDraft.selection); }, [draftKey]);
+  const materialFields = { ...materials, select: async (selection: ServerMaterialSelection | null) => {
+    updateComposer({ selection }); await materials.select(selection);
+  } };
   const requests = scopeRef
     ? openRequests(collaboration).filter((request) => Boolean(request.quest_ref)
       && questIdentity(request.quest_ref!) === questIdentity(scopeRef))
@@ -403,7 +427,7 @@ export function QuestCompanion({
     ? companion?.soft_constraints.filter((item) => item.scope_ref === scopeRef) ?? []
     : [];
   const agentProposals = scopeRef
-    ? companion?.agent_proposals.filter((item) => item.scope_ref === scopeRef) ?? []
+    ? companion?.agent_proposals.filter((item) => item.scope_ref === scopeRef && item.status !== "dismissed") ?? []
     : [];
   const commands = collaboration?.commands.items.filter((item) =>
     (item.scope_ref === scopeRef || item.scope_ref === "runtime:telemetry")
@@ -453,9 +477,10 @@ export function QuestCompanion({
   }, [messages, optimisticProjectionKey]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const message = draft.trim();
-    if (!canSend || !scopeRef || !message || sendingRef.current) return;
-    if (message === "/new") {
+    const message = draft;
+    if (!canSend || !scopeRef || !message.trim() || sendingRef.current
+      || materials.busy || materials.pending || (materials.selection && !materials.receiver)) return;
+    if (message.trim() === "/new") {
       sendingRef.current = true;
       setError(null);
       try {
@@ -485,7 +510,7 @@ export function QuestCompanion({
     setSending(true);
     setError(null);
     try {
-      const queued = await sendCompanionMessage(
+      const queued = await sendGuidanceConversation(
         message,
         scopeRef,
         questionContext && questionContext.lifecycle_revision !== null ? {
@@ -496,6 +521,8 @@ export function QuestCompanion({
           content_hash: questionContext.content_hash,
           lifecycle_revision: questionContext.lifecycle_revision,
         } : null,
+        strength,
+        materials.materialCommand(),
       );
       setOptimisticMessages((current) => current.map((item) =>
         item.localRef === localRef
@@ -628,7 +655,6 @@ export function QuestCompanion({
             <PendingCompanionReply message={message} onChanged={onChanged} />
           </article>
         ))}
-        {ready && scopeRef ? <HumanGuidanceComposer key={scopeRef} scopeRef={scopeRef} onChanged={onChanged} /> : null}
         {ready ? softConstraints.map((constraint, index) => (
           <SoftConstraintCard
             key={constraint.constraint_ref ?? `constraint-${index}`}
@@ -684,6 +710,12 @@ export function QuestCompanion({
         ) : null}
       </div>
       <form className="lumen-compose" onSubmit={(event) => void submit(event)}>
+        <details className="guidance-options">
+          <summary>指导力度与可选材料</summary>
+          <GuidanceStrengthSelect value={strength} onChange={value => updateComposer({ strength: value })} disabled={!canSend || sending} />
+          <WorkMaterialFields draft={materialFields} disabled={!canSend || sending} />
+          <small>解释与讨论直接回答；影响研究时，先核对理解与范围再明确确认。主动材料仍可独立提交。</small>
+        </details>
         <div>
           <textarea
             aria-label="给研究助手发消息"
@@ -700,7 +732,7 @@ export function QuestCompanion({
           />
           <button
             type="submit"
-            disabled={!canSend || sending || sessionSwitch.switching || !draft.trim()}
+            disabled={!canSend || sending || sessionSwitch.switching || materials.busy || !!materials.pending || (!!materials.selection && !materials.receiver) || !draft.trim()}
             aria-label="发送消息"
           >
             ↑
@@ -1868,56 +1900,9 @@ function GuidanceStrengthSelect({ value, onChange, disabled, label = "指导力�
   );
 }
 
-function HumanGuidanceComposer({ scopeRef, onChanged }: {
-  scopeRef: string; onChanged: () => void;
-}) {
-  const materials = useWorkMaterialDraft(`guidance:${scopeRef}`, currentMaterialReceiverPath(scopeRef.replace(/^quest:/, "")));
-  const [text, setText] = useState("");
-  const [strength, setStrength] = useState<GuidanceStrength>(3);
-  const [pending, setPending] = useState(false);
-  const pendingRef = useRef(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (pendingRef.current || !text.trim()) return;
-    pendingRef.current = true;
-    setPending(true);
-    setMessage(null);
-    try {
-      if (materials.selection) {
-        const result = await materials.submit("/api/v1/human-collaboration/guidance", { scope_ref: scopeRef, text, strength, work_materials: materials.materialCommand() });
-        if (!result) return;
-      } else await submitHumanGuidance(scopeRef, text, strength);
-      setText("");
-      setMessage("指导已保存。下一研究操作将读取这份原文。");
-      onChanged();
-    } catch (caught) {
-      setMessage("保存失败 · " + reasonCode(caught));
-    } finally {
-      pendingRef.current = false;
-      setPending(false);
-    }
-  };
-  return (
-    <form className="lumen-guidance-compose" aria-label="提交人类指导"
-      onSubmit={(event) => void submit(event)}>
-      <b>人类指导</b>
-      <label>指导原文
-        <textarea aria-label="指导原文" rows={3} value={text} disabled={pending}
-          onChange={(event) => setText(event.target.value)}
-          placeholder="写下希望研究工作遵循的具体指导……" />
-      </label>
-      <GuidanceStrengthSelect value={strength} onChange={setStrength} disabled={pending} />
-      {strength === 5 ? <p>目标更新待对齐。当前研究继续，目标变化由目标演化流程处理。</p> : null}
-      <WorkMaterialFields draft={materials} disabled={pending} onRetried={() => { setText(""); setMessage("指导及材料引用已保存。材料尚未表示已理解。"); onChanged(); }} />
-      <button type="submit" disabled={pending || materials.busy || !!materials.pending || (!!materials.selection && !materials.receiver) || !text.trim()}>保存指导</button>
-      {message ? <p role="status">{message}</p> : null}
-    </form>
-  );
-}
-
 function GuidanceDeliveryCard({ delivery }: { delivery: GuidanceDelivery }) {
   const treatment = delivery.treatment;
+  const scopeFeedback = delivery as GuidanceDelivery & { background_only?: boolean; scope_confirmation?: string };
   return (
     <li className="lumen-guidance-delivery">
       <b>{delivery.root_kind.toUpperCase()} · {treatment
@@ -1926,6 +1911,8 @@ function GuidanceDeliveryCard({ delivery }: { delivery: GuidanceDelivery }) {
         : delivery.received_at ? "已确认收到" : "已准备送达"}</b>
       <p>已准备送达{delivery.received_at ? " · 已确认收到" : ""}
         {delivery.read_at ? " · 已完整读取" : ""}</p>
+      {scopeFeedback.background_only ? <p>这项工作仅将指导作为背景阅读，未在确认范围内应用。</p> : null}
+      {scopeFeedback.scope_confirmation === "legacy_unconfirmed" ? <p>历史指导缺少范围确认记录。</p> : null}
       {!delivery.needs_treatment ? <p>本工作继续履行既有指导。</p> : null}
       {treatment ? (
         <dl>
@@ -1971,16 +1958,18 @@ function SoftConstraintCard({
     <article className={`lumen-constraint ${constraint.status}`}>
       <small>人类指导 · {constraint.status === "active" ? "生效中" : "已撤回"}</small>
       <p>{constraint.text ?? constraint.content ?? documentText(constraint.guidance, "text")}</p>
+      {documentText(constraint.guidance, "assistant_understanding") ? <p>确认时的理解 · {documentText(constraint.guidance, "assistant_understanding")}</p> : null}
+      {isRecord(constraint.guidance?.semantic_scope) ? <p>确认范围 · {Object.values(constraint.guidance.semantic_scope).join(" · ")}</p> : <p>历史指导 · 未记录范围确认</p>}
       <WorkMaterialReferences receipts={constraint.work_materials ?? []} />
       <span>力度 {constraint.strength ?? 3} · {guidanceStrengthLabels[constraint.strength ?? 3]}</span>
-      {constraint.strength === 5 ? (
+      {alignment ? (
         alignment?.status === "aligned"
           ? <p>Quest 已在 {alignment.aligned_revision} 对齐；当前版本 {alignment.current_revision}。</p>
           : <p>Quest 全局目标更新待对齐。</p>
       ) : null}
       {constraint.deliveries?.length ? (
         <ul>{constraint.deliveries.map((delivery) => <GuidanceDeliveryCard key={delivery.delivery_ref} delivery={delivery} />)}</ul>
-      ) : <p>等待下一研究操作读取。</p>}
+      ) : <p>已保存，待适用研究工作接续；尚无读取或处理回执。</p>}
       {constraint.source_proposal_ref ? (
         <code className="lumen-source-proposal">source · {constraint.source_proposal_ref}</code>
       ) : null}
@@ -2004,23 +1993,7 @@ function AgentProposalCard({
   const [convertedTo, setConvertedTo] = useState<"soft_constraint" | "command_draft" | null>(null);
   const proposalKind = proposal.kind
     ?? documentText(proposal.proposal, "proposal_kind", "kind");
-  const proposedGuidance = documentText(proposal.proposal, "text");
-  const [strength, setStrength] = useState<GuidanceStrength>(3);
   const proposedCommand = commandDraftFromProposal(proposal.proposal);
-  const acceptGuidance = async () => {
-    if (!proposal.scope_ref || !proposal.proposal_ref || !proposal.proposal_hash || !proposedGuidance) return;
-    setPending(true);
-    setError(null);
-    try {
-      await convertAgentProposalToSoftConstraint(proposal, strength);
-      setConvertedTo("soft_constraint");
-      onChanged();
-    } catch (caught) {
-      setError(reasonCode(caught));
-    } finally {
-      setPending(false);
-    }
-  };
   const createCommandDraft = async () => {
     if (!proposal.scope_ref || !proposal.proposal_ref || !proposal.proposal_hash || !proposedCommand) return;
     setPending(true);
@@ -2035,6 +2008,7 @@ function AgentProposalCard({
       setPending(false);
     }
   };
+  if (proposalKind !== "command_draft") return <GuidanceConfirmation proposal={proposal} onChanged={onChanged} />;
   return (
     <article className="lumen-proposal">
       <small>{proposalKind === "command_draft" ? "COMMAND DRAFT · NO AUTHORITY" : "AGENT PROPOSAL"}</small>
@@ -2050,12 +2024,6 @@ function AgentProposalCard({
         <button type="button" disabled={pending} onClick={() => void createCommandDraft()}>
           建立精确 Command Draft
         </button>
-      ) : null}
-      {!convertedTo && proposal.status === "proposed" && proposalKind !== "command_draft" && proposal.scope_ref && proposal.proposal_ref && proposal.proposal_hash && proposedGuidance ? (
-        <>
-          <GuidanceStrengthSelect label="建议转指导的力度" value={strength} onChange={setStrength} disabled={pending} />
-          <button type="button" disabled={pending} onClick={() => void acceptGuidance()}>明确接受为指导</button>
-        </>
       ) : null}
       {proposal.status === "proposed" && !proposal.proposal_hash ? (
         <em role="status">当前 Proposal 缺少 exact hash，已停止转换。</em>
@@ -2203,6 +2171,7 @@ export function HumanRequestSurface({
     document.body.style.overflow = "hidden";
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (dialogRef.current?.querySelector("dialog[open]")) return;
       event.preventDefault();
       onCloseRef.current();
     };
@@ -2235,6 +2204,7 @@ export function HumanRequestSurface({
     if (event.key !== "Tab") return;
     const dialog = dialogRef.current;
     if (!dialog) return;
+    if (dialog.querySelector("dialog[open]")) return;
     const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
       "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), "
       + "select:not([disabled]), summary, a[href], [tabindex]:not([tabindex='-1'])",
@@ -2264,7 +2234,7 @@ export function HumanRequestSurface({
   return (
     <dialog
       ref={dialogRef}
-      className="hc-backdrop"
+      className="hc-backdrop workspace-modal"
       data-open="true"
       data-blocking={blocking ? "true" : "false"}
       aria-label="需要你处理的事项"
@@ -2288,6 +2258,8 @@ export function HumanRequestSurface({
           <HumanRequestView
             key={`${selected.request_ref}:${selected.revision}`}
             request={selected}
+            requests={items}
+            onSelectRequest={onSelect}
             collaboration={collaboration}
             onBack={() => onSelect(null)}
             onClose={onClose}
@@ -2332,7 +2304,7 @@ function HumanRequestList({
   return (
     <>
       <header className="hc-head">
-        <span className="hc-symbol" aria-hidden="true">!</span>
+        <span className="hc-symbol" aria-hidden="true"><MetaTrace variant="signature" /></span>
         <div>
           <small>{blocking ? "当前需要你处理" : "处理记录"}</small>
           <h2>需要你处理的事项</h2>
@@ -2374,6 +2346,8 @@ function HumanRequestList({
 
 function HumanRequestView({
   request,
+  requests,
+  onSelectRequest,
   collaboration,
   onBack,
   onClose,
@@ -2387,6 +2361,8 @@ function HumanRequestView({
   hasNext,
 }: {
   request: HumanRequestItem;
+  requests: HumanRequestItem[];
+  onSelectRequest: (requestRef: string) => void;
   collaboration?: HumanCollaborationProjection;
   onBack: () => void;
   onClose: () => void;
@@ -2400,7 +2376,10 @@ function HumanRequestView({
   hasNext: boolean;
 }) {
   const waiting = collaboration?.human_requests.waiting;
-  const [selectedReplyRefs, setSelectedReplyRefs] = useState<string[]>([]);
+  const workspace = useRef<HTMLDivElement>(null);
+  usePageReadingPosition(`${request.request_ref}:${request.revision}`, workspace);
+  const [reviewing, setReviewing] = useState(false);
+  const [selectedReplyRefs, setSelectedReplyRefs] = usePageDraft<string[]>(`hr-replies:${request.request_ref}:${request.revision}`, []);
   const selectedReplies = (collaboration?.companion.messages ?? []).filter(message =>
     message.role === "assistant" && message.status === "completed" && !!message.message_ref
     && selectedReplyRefs.includes(message.message_ref)
@@ -2412,7 +2391,7 @@ function HumanRequestView({
   return (
     <>
       <header className="hc-head">
-        <span className="hc-symbol" aria-hidden="true">↻</span>
+        <span className="hc-symbol" aria-hidden="true"><MetaTrace variant="signature" /></span>
         <div>
           <small>
             {blocking
@@ -2452,7 +2431,23 @@ function HumanRequestView({
           </div>
         )}
       </header>
-      <div className="hc-request-workspace">
+      <nav className="hc-kind-navigation" aria-label="求助类别">
+        {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助"] as const).map((label, index) => {
+          const kind = (Object.keys(requestCopy) as HumanRequestItem["kind"][])[index];
+          const sameKind = requests.filter(item => item.kind === kind);
+          const next = sameKind.find(item => item.status === "open") ?? sameKind[0];
+          return <button key={kind} type="button" disabled={!next} aria-current={kind === request.kind ? "page" : undefined}
+            onClick={() => { if (next) onSelectRequest(next.request_ref); }}>
+            <span>{index + 1}. {label}</span><small>{sameKind.length ? `${sameKind.length} 项真实请求` : "当前无请求"}</small>
+          </button>;
+        })}
+      </nav>
+      <nav className="workspace-stage-track" aria-label="求助处理阶段">
+        <span aria-current={request.responses?.length || reviewing ? undefined : "step"}>协作处理</span>
+        <span aria-current={reviewing ? "step" : undefined}>审阅回应</span>
+        <span aria-current={request.responses?.length ? "step" : undefined}>{request.responses?.length ? "已交回 · 原根核验" : "交回核对"}</span>
+      </nav>
+      <div className="hc-request-workspace" ref={workspace}>
         <IntentDraftingSession
           key={`${request.request_ref}:${request.revision}`}
           request={request}
@@ -2472,6 +2467,7 @@ function HumanRequestView({
             request={request}
             selectedReplies={selectedReplies}
             workspacePath={collaboration?.companion.workspace_path ?? undefined}
+            onReviewChange={setReviewing}
             commands={collaboration?.commands.items ?? []}
             authorizations={collaboration?.commands.authorizations ?? []}
             onChanged={onChanged}
@@ -2714,7 +2710,7 @@ function IntentDraftingSession({
   onSelectReply: (messageRef: string, selected: boolean) => void;
   onChanged: () => void;
 }) {
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = usePageDraft(`hr-chat:${request.request_ref}`, "");
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
   const [optimisticMessages, setOptimisticMessages] = useState<OptimisticCompanionMessage[]>([]);
@@ -2805,6 +2801,8 @@ function IntentDraftingSession({
         {!scoped.length && !optimisticMessages.length ? (
           <article>
             <small>当前事项</small>
+            <p className="hc-draft-obligation">{request.obligation}</p>
+            <p>{request.business_purpose}</p>
             <p>请说明希望调查、执行或核验的工作。助手可按需读取材料、委派子智能体，产物保留在当前研究工作空间。</p>
           </article>
         ) : scoped.map((message, index) => (
@@ -2860,6 +2858,7 @@ type SubmitResponse = (
   facts?: Record<string, unknown>,
   decision?: "provided" | "declined" | "deferred",
   material?: HumanRequestMaterial,
+  alreadyReviewed?: boolean,
 ) => Promise<void>;
 
 type HumanRequestMaterial = {
@@ -2877,17 +2876,22 @@ function MaterialPicker({ selection, setSelection, disabled, initialPath }: {
   return <ServerMaterialPicker value={selection} onSelect={setSelection} disabled={disabled} initialPath={initialPath} />;
 }
 
-function RequestForm({ request, commands, authorizations, onChanged, selectedReplies, workspacePath }: {
+function RequestForm({ request, commands, authorizations, onChanged, selectedReplies, workspacePath, onReviewChange }: {
   request: HumanRequestItem;
   commands: HumanCommand[];
   authorizations: HumanCapabilityAuthorization[];
   onChanged: () => void;
   selectedReplies: CompanionMessage[];
   workspacePath?: string;
+  onReviewChange: (reviewing: boolean) => void;
 }) {
-  const [note, setNote] = useState("");
+  const [note, setNote] = usePageDraft(`hr-note:${request.request_ref}`, "");
   const [sealedResponse, setSealedResponse] = useState<HumanRequestResponseBody | null>(null);
   const [pending, setPending] = useState(false);
+  const [review, setReview] = useState<HumanRequestResponseBody | null>(null);
+  const reviewAction = useRef<(() => Promise<void>) | null>(null);
+  const delivering = useRef(false);
+  useEffect(() => { onReviewChange(review !== null); return () => onReviewChange(false); }, [review, onReviewChange]);
   const [recorded, setRecorded] = useState(false);
   const [retryStatus, setRetryStatus] = useState<"processing" | "succeeded" | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -2905,7 +2909,6 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   }, [request.request_ref]);
 
   useEffect(() => {
-    setNote("");
     setPending(false);
     setRecorded(false);
     setRetryStatus(null);
@@ -2917,6 +2920,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   const markResponseRecorded = () => {
     if (currentRequestRef.current !== request.request_ref) return;
     setRecorded(true);
+    setNote("");
     onChanged();
   };
 
@@ -2928,22 +2932,31 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     return () => window.cancelAnimationFrame(frame);
   }, [recorded]);
 
-  const submit: SubmitResponse = async (
-    facts = {},
-    decision = "provided",
-    material,
-  ) => {
-    if (pending || recorded) return;
+  const submit: SubmitResponse = async (facts = {}, decision = "provided", material, alreadyReviewed = false) => {
+    if ((pending && !alreadyReviewed) || recorded) return;
+    const response: HumanRequestResponseBody = {
+      decision, facts,
+      note: [note, ...selectedReplies.map(message => messageText(message))].filter(value => value.trim()).join("\n\n"),
+    };
+    if (selectedReplies.length) response.facts = { ...facts, companion_selections: selectedReplies.map(message => ({ message_ref: message.message_ref, native_session_generation: message.native_session_generation, native_session_ref: message.native_session_ref })) };
+    if (decision === "provided" && material) response.materials = await humanReplyMaterials(material);
+    if (!sealedResponse && decision === "provided" && hasLegacyHumanRequestMaterial(request.request_ref)
+      && !response.materials?.length) {
+      setError("human_response_material_reselection_required");
+      return;
+    }
+    // A sealed retry already contains the exact reviewed bytes and identity.
+    if (sealedResponse || alreadyReviewed) { await deliverResponse(sealedResponse ?? response); return; }
+    setReview(response);
+  };
+
+  const deliverResponse = async (response: HumanRequestResponseBody) => {
+    if (delivering.current || recorded) return;
+    delivering.current = true;
     setPending(true);
     setError(null);
     try {
       await hydratePendingHumanRequestRecovery();
-      const response: HumanRequestResponseBody = {
-        decision,
-        facts,
-        note: [note, ...selectedReplies.map(message => messageText(message))].filter(value => value.trim()).join("\n\n"),
-      };
-      if (selectedReplies.length) response.facts = { ...facts, companion_selections: selectedReplies.map(message => ({ message_ref: message.message_ref, native_session_generation: message.native_session_generation, native_session_ref: message.native_session_ref })) };
       const pendingResponse = pendingHumanRequestResponse(request.request_ref);
       if (pendingResponse) {
         if (pendingResponse.request_ref !== request.request_ref) {
@@ -2954,11 +2967,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         markResponseRecorded();
         return;
       }
-      if (material) {
-        const materials = await humanReplyMaterials(material);
-        if (materials.length) response.materials = materials;
-      }
-      if (decision === "provided" && hasLegacyHumanRequestMaterial(request.request_ref)
+      if (response.decision === "provided" && hasLegacyHumanRequestMaterial(request.request_ref)
           && !response.materials?.length) {
         throw new ProductError("human_response_material_reselection_required");
       }
@@ -2973,7 +2982,9 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         : code);
       if (humanRequestScopeStale(code)) onChanged();
     } finally {
+      delivering.current = false;
       setPending(false);
+      setReview(null);
     }
   };
 
@@ -3040,6 +3051,15 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
 
   return (
     <>
+      {review ? <HumanResponseReview request={request} response={review} pending={pending}
+        onClose={() => { if (!pending) { reviewAction.current = null; setReview(null); } }}
+        onConfirm={() => {
+          const action = reviewAction.current;
+          if (!action) { void deliverResponse(review); return; }
+          reviewAction.current = null;
+          setPending(true);
+          void action().finally(() => { setPending(false); setReview(null); });
+        }} /> : null}
       {selectedReplies.length ? <section className="hc-selected-replies" aria-label="已选助手说明">
         <b>已选助手说明 · 尚未提交</b>
         {selectedReplies.map(message => <p key={message.message_ref}>{messageText(message)}</p>)}
@@ -3086,6 +3106,11 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
           submit={submit}
           disabled={pending || !!sealedResponse}
           onChanged={onChanged}
+          reviewAuthorization={action => {
+            reviewAction.current = action;
+            setReview({ decision: "provided", facts: { authorization: request.required_authorization },
+              note: [note, ...selectedReplies.map(message => messageText(message))].filter(Boolean).join("\n\n") });
+          }}
         />
       ) : null}
       {request.kind === "system_operation_help" ? (
@@ -3121,6 +3146,33 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
       ) : null}
     </>
   );
+}
+
+function HumanResponseReview({ request, response, pending, onClose, onConfirm }: {
+  request: HumanRequestItem; response: HumanRequestResponseBody; pending: boolean;
+  onClose: () => void; onConfirm: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const element = dialog.current;
+    element?.showModal();
+    return () => { element?.close(); opener?.focus({ preventScroll: true }); };
+  }, []);
+  return <dialog ref={dialog} className="hc-response-review workspace-modal" aria-label="审阅正式回应"
+    onCancel={event => { event.preventDefault(); event.stopPropagation(); onClose(); }}
+    onKeyDown={event => { if (event.key === "Escape") event.stopPropagation(); }}>
+    <header><h3>审阅正式回应</h3><button type="button" disabled={pending} onClick={onClose}>返回编辑</button></header>
+    <p>{request.obligation}</p><small>{request.request_ref} · 修订 {request.revision}</small>
+    <dl><dt>回应决定</dt><dd>{response.decision === "provided" ? "提供回应" : response.decision === "declined" ? "拒绝" : "暂缓"}</dd>
+      <dt>实际反馈与已选助手说明</dt><dd>{response.note || "未提供文字"}</dd></dl>
+    {response.facts?.authorization ? <section><b>本次精确授权</b><pre>{JSON.stringify(response.facts.authorization, null, 2)}</pre></section> : null}
+    {response.materials?.map((material, index) => material.kind === "server_reference" ? <p key={index}>
+      {material.selection.server.hostname} · {material.selection.absolute_path}<br />{material.selection.description}
+    </p> : null)}
+    <p>确认后交回本请求原 Session。送达、原根核验、材料接纳分别记录。</p>
+    <button type="button" className="hc-submit" disabled={pending} onClick={onConfirm}>{pending ? "正在提交…" : "确认提交回应"}</button>
+  </dialog>;
 }
 
 function RequestIntro({ children }: { children: ReactNode }) {
@@ -3160,8 +3212,8 @@ function LibraryForm({
   disabled: boolean;
   workspacePath?: string;
 }) {
-  const [mode, setMode] = useState<"none" | "oa" | "material">("none");
-  const [selection, setSelection] = useState<ServerMaterialSelection | null>(null);
+  const [mode, setMode] = usePageDraft<"none" | "oa" | "material">(`hr-library-mode:${request.request_ref}`, "none");
+  const [selection, setSelection] = usePageDraft<ServerMaterialSelection | null>(`hr-material:${request.request_ref}`, null);
   const acquisitionPaperId = typeof request.target_assertion?.acquisition_paper_id === "string"
     ? request.target_assertion.acquisition_paper_id
     : null;
@@ -3239,7 +3291,7 @@ function NaturalLanguageMaterialForm({
   disabled: boolean;
   workspacePath?: string;
 }) {
-  const [selection, setSelection] = useState<ServerMaterialSelection | null>(null);
+  const [selection, setSelection] = usePageDraft<ServerMaterialSelection | null>(`hr-material:${request.request_ref}`, null);
   const condition = isRecord(request.target_assertion?.condition)
     ? request.target_assertion.condition
     : {};
@@ -3295,6 +3347,7 @@ function PermissionForm({
   submit,
   disabled,
   onChanged,
+  reviewAuthorization,
 }: {
   request: HumanRequestItem;
   commands: HumanCommand[];
@@ -3304,6 +3357,7 @@ function PermissionForm({
   submit: SubmitResponse;
   disabled: boolean;
   onChanged: () => void;
+  reviewAuthorization: (action: () => Promise<void>) => void;
 }) {
   const [recordedCommand, setRecordedCommand] = useState<HumanCommand | null>(null);
   const [recordedAuthorization, setRecordedAuthorization] = useState<HumanCapabilityAuthorization | null>(null);
@@ -3399,7 +3453,7 @@ function PermissionForm({
       // Retain the issued receipt if response delivery fails; a retry only
       // delivers that same response through the existing idempotent recovery.
       setRecordedAuthorization(receipt);
-      await submit({ authorization_receipt_ref: receipt.receipt_ref }, "provided");
+      await submit({ authorization_receipt_ref: receipt.receipt_ref }, "provided", undefined, true);
     } catch (caught) {
       const code = reasonCode(caught);
       setAuthorizationError(humanRequestScopeStale(code)
@@ -3414,9 +3468,9 @@ function PermissionForm({
 
   return (
     <>
-      <p className="hc-permission-summary">点击“接受”即提交本次授权，系统核对后继续对应任务。</p>
+      <p className="hc-permission-summary">选择“接受”后先审阅精确授权；明确确认才签发授权并交回本请求。</p>
       <div className="hc-permission-actions" aria-busy={authorizationPending || disabled}>
-        <button type="button" className="allow" disabled={disabled || authorizationPending || !capability} onClick={() => void accept()}>
+        <button type="button" className="allow" disabled={disabled || authorizationPending || !capability} onClick={() => reviewAuthorization(accept)}>
           {authorizationPending ? "正在提交…" : "接受"}
         </button>
         <button type="button" disabled={disabled || authorizationPending} onClick={() => void submit({}, "declined")}>拒绝</button>
