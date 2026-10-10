@@ -1197,7 +1197,14 @@ export type PlanStageProjection = {
   [key: string]: unknown;
 };
 
+export type BundleTargetExecution = {
+  target_ref: string; target_run_ref: string; root_session_ref: string;
+  attempt_ref: string; attempt_generation: number | null; fence_ref: string; observation_only: true;
+  status: "running" | "completed" | "failed" | "pending" | "stopped" | "unavailable";
+};
+
 export type BundleTargetProjection = {
+  current_execution?: BundleTargetExecution | null;
   target_ref: string;
   target_key: string;
   spec_hash: string;

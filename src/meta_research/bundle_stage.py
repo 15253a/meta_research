@@ -29,6 +29,7 @@ from meta_research.bundle_protocol import (
     GoalWorkDisposition,
     SemanticBarrier,
     TechnicalBlocker,
+    TargetFrontierEntry,
     projection_plain_value,
 )
 from meta_research.bundle_skill import (
@@ -1843,6 +1844,51 @@ class BundleStageWorker:
             idempotency_key=_operation_key("target-evidence-role", commit.commit_ref),
         )
 
+    def _current_target_execution(
+        self, frontier: TargetFrontierEntry | None,
+    ) -> dict[str, object] | None:
+        """Observe the exact current root independently of research acceptance.
+
+        A launched Target can still await a scientific result after its native
+        turn or mechanical lifecycle has ended. Neither fact changes the graph.
+        """
+        if frontier is None:
+            return None
+        handle = frontier.current_handle
+        execution: dict[str, object] = {
+            "target_ref": handle.target_ref,
+            "target_run_ref": handle.target_run_ref,
+            "root_session_ref": handle.root_session_ref,
+            "attempt_ref": handle.execution_attempt_ref,
+            "attempt_generation": None,
+            "fence_ref": handle.execution_fence_ref,
+            "status": "stopped" if frontier.state == "terminal" else "unavailable",
+            "observation_only": True,
+        }
+        if frontier.state == "terminal" or self._harnesses is None:
+            return execution
+        try:
+            observed = self._harnesses.query_target_root_observations(
+                handle.target_ref, limit=1,
+            )
+        except HarnessAdmissionError:
+            return execution
+        if (
+            observed.target_ref, observed.target_run_ref, observed.root_session_ref,
+            observed.attempt_ref, observed.fence_ref,
+        ) != (
+            handle.target_ref, handle.target_run_ref, handle.root_session_ref,
+            handle.execution_attempt_ref, handle.execution_fence_ref,
+        ):
+            return execution
+        execution["attempt_generation"] = observed.attempt_generation
+        execution["status"] = {
+            "connecting": "pending", "live": "running",
+            "turn_complete": "completed", "terminal": "failed",
+            "replaced": "stopped",
+        }.get(observed.status, "unavailable")
+        return execution
+
     def query_current(self) -> dict[str, object]:
         current = self._discover_current_cycle()
         if current is None:
@@ -2103,6 +2149,7 @@ class BundleStageWorker:
                             )
                         ),
                         "status": status,
+                        "current_execution": self._current_target_execution(target_frontier),
                         "blocker": blocker,
                         "receipt": target.receipt.as_public_dict(),
                     }

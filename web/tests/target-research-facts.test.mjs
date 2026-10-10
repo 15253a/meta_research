@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { observedTargetRetry, targetResearchFacts } from "../src/targetResearchFacts.ts";
+import { observedTargetRetry, selectTarget, targetIsExecuting, targetResearchFacts } from "../src/targetResearchFacts.ts";
 
 const target = { target_ref: "target:1", target_key: "trial", target_run_ref: "work:1", spec_hash: "hash:1", dependency_refs: [], status: "committed" };
 const commit = (measurement, disposition = "uncertain") => ({ target_ref: "target:1", target_run_ref: "work:1", target_spec_hash: "hash:1", commit_ref: "commit:1", result_disposition: disposition,
@@ -119,7 +119,7 @@ test("runtime failures never leak into another Target, another Run, or accepted 
     null,
   ]) {
     const facts = targetResearchFacts({ ...target, status: "running" }, undefined, [], observation);
-    assert.equal(facts.summary, "Target 正在开展工作");
+    assert.equal(facts.summary, "Target 执行状态待确认");
     assert.equal(facts.technicalFailure, false);
   }
   const accepted = targetResearchFacts(target, commit({ formal_entities: [] }), [], workerFailure);
@@ -134,7 +134,7 @@ test("a paused current Target keeps its records and never pauses another Run or 
   assert.equal(facts.technicalFailure, false);
   assert.equal(facts.sources.target_run_ref, "work:1");
   assert.deepEqual(facts.artifactRefs, []);
-  assert.equal(targetResearchFacts({ ...target, target_run_ref: "work:other", status: "running" }, undefined, [], paused).summary, "Target 正在开展工作");
+  assert.equal(targetResearchFacts({ ...target, target_run_ref: "work:other", status: "running" }, undefined, [], paused).summary, "Target 执行状态待确认");
   assert.match(targetResearchFacts(target, commit({}), [], paused).summary, /研究记录已接纳/);
 });
 
@@ -153,7 +153,7 @@ test("an exact active retry retains the previous error without presenting the Ta
   const otherFailure = { ...retryStatus, health: { checks: [{ ...workerFailure.health.checks[0], reason: { code: "provider_transport_unavailable" } }] } };
   assert.equal(observedTargetRetry(otherFailure, retryRoots).summary, "Target 正在重试，上次推进受阻");
   assert.match(targetResearchFacts(target, commit({}), [], retryStatus, retry).summary, /已接纳/);
-  assert.equal(targetResearchFacts({ ...target, target_run_ref: "work:other", status: "running" }, undefined, [], retryStatus, retry).summary, "Target 正在开展工作");
+  assert.equal(targetResearchFacts({ ...target, target_run_ref: "work:other", status: "running" }, undefined, [], retryStatus, retry).summary, "Target 执行状态待确认");
 });
 
 test("finalizing, uncertain or mismatched sessions cannot claim an active retry", () => {
@@ -166,4 +166,27 @@ test("finalizing, uncertain or mismatched sessions cannot claim an active retry"
     ].map(change => ({ ...retryRoots, sessions: [{ ...retryRoots.sessions[0], ...change }] }))]) {
     assert.equal(observedTargetRetry(retryStatus, roots), null);
   }
+});
+
+const execution = { target_ref: "target:1", target_run_ref: "work:1", root_session_ref: "root:1", attempt_ref: "attempt:1", attempt_generation: 1, fence_ref: "fence:1", status: "running" };
+const liveTarget = { ...target, status: "running", current_execution: execution };
+const exactRoots = { ...retryRoots, sessions: [{ ...retryRoots.sessions[0], root_session_ref: "root:1" }] };
+test("precise execution wins over stale graph state while explicit historical selection remains readable", () => {
+  const stopped = { ...liveTarget, target_ref: "old", current_execution: { ...execution, target_ref: "old", status: "stopped" } };
+  assert.equal(selectTarget([stopped, liveTarget], null, exactRoots, retryStatus.foreground), liveTarget);
+  assert.equal(selectTarget([stopped, liveTarget], "old", exactRoots, retryStatus.foreground), stopped);
+  assert.match(targetResearchFacts(stopped).summary, /执行已停止.*尚未接纳/);
+  assert.equal(targetResearchFacts(liveTarget).summary, "Target 正在开展工作");
+  assert.match(targetResearchFacts({ ...liveTarget, current_execution: { ...execution, status: "completed" } }).summary, /执行已结束.*尚未接纳/);
+  assert.match(targetResearchFacts(liveTarget, commit({})).summary, /已接纳/);
+});
+test("default execution requires the exact current root and foreground scope, including legacy evidence", () => {
+  assert.equal(targetIsExecuting(liveTarget, exactRoots, retryStatus.foreground), true);
+  assert.equal(targetIsExecuting({ ...target, status: "running" }, exactRoots, retryStatus.foreground), true);
+  for (const roots of [null, { ...exactRoots, limited: true }, { ...exactRoots, quest_ref: "other" }, { ...exactRoots, active_session_refs: [] },
+    ...[{ root_session_ref: "old" }, { run_ref: "old" }, { cycle_ref: "old" }, { question_ref: "old" }, { is_current: false }, { is_executing: false }, { status: "completed" }]
+      .map(change => ({ ...exactRoots, sessions: [{ ...exactRoots.sessions[0], ...change }] }))]) {
+    assert.equal(targetIsExecuting(liveTarget, roots, retryStatus.foreground), false);
+  }
+  for (const status of ["completed", "stopped", "pending", "failed", "unavailable"]) assert.equal(targetIsExecuting({ ...liveTarget, current_execution: { ...execution, status } }, exactRoots, retryStatus.foreground), false);
 });
