@@ -101,6 +101,8 @@ class MaterialProcessingMixin:
         location = self._root_workspaces.bind_runtime(context).location
         validated = [self._selected_material_source(context, reference, selected) for selected in selections]
         self._reserve_material_effect(context, key, "feedback", command, reference_ref)
+        guidance_context = ({"source_guidance": reference["source_guidance"]}
+            if "source_guidance" in reference else {})
         retained = []
         for ordinal, (selected, locator, expected_hash) in enumerate(validated):
             from meta_research.owners.research_memory import AssetIntakeRequest
@@ -116,7 +118,7 @@ class MaterialProcessingMixin:
                 source_locator=locator, media_type=mimetypes.guess_type(locator)[0] or "application/octet-stream",
                 provenance={"kind": "work_material_selection", "reference_ref": reference_ref,
                     "receiver": reference["receiver"], "source": selected["source"], "purpose": selected["purpose"],
-                    "processed_by": location.source(), "feedback_ref": key},
+                    "processed_by": location.source(), "feedback_ref": key, **guidance_context},
                 origin_quest_ref=location.quest_ref, asynchronous=True, effect_scope_required=True),
                 idempotency_key=intake_key, effect_scope=effect_scope)
             if accepted.status == "queued":
@@ -134,7 +136,7 @@ class MaterialProcessingMixin:
                 "reader": {"source_ref": binding.version_ref, "version_ref": binding.version_ref}})
         result = {**command, "feedback_ref": key, "receiver": reference["receiver"],
             "processed_by": {**location.source(), "run_ref": context.run_ref}, "declared_by_root": True,
-            "selections": retained, "created_at": time.time()}
+            "selections": retained, "created_at": time.time(), **guidance_context}
         return self._complete_material_effect(context, key, result, "human_collaboration.work_material_treated")
 
     def _selected_material_source(self, context, reference, selected):

@@ -1032,6 +1032,9 @@ class QuestGoalOwnerMixin:
             binding = direction_cut.get("guidance_binding")
             if binding is not None and binding != delivery["binding"]:
                 raise OwnerConflict("goal_guidance_cause_unbound")
+            scope = delivery.get("semantic_scope")
+            if scope is not None and scope.get("kind") != "quest":
+                raise OwnerConflict("guidance_goal_scope_confirmation_required")
             return cause
         evidence = cause.get("evidence")
         assert isinstance(evidence, list)
@@ -1117,6 +1120,9 @@ class QuestGoalOwnerMixin:
             source = _guidance_delivery_source(connection, clause["delivery_ref"])
             if source["quest_ref"] != quest_ref or source["read_at"] is None:
                 raise OwnerConflict("goal_condition_source_invalid")
+            scope = source.get("semantic_scope")
+            if scope is not None and scope.get("kind") != "quest":
+                raise OwnerConflict("guidance_goal_scope_confirmation_required")
             original = source["original_text"]
             start, end = int(clause["start"]), int(clause["end"])
             if end > len(original) or original[start:end] != clause["text"]:
@@ -1292,9 +1298,8 @@ class QuestGoalOwnerMixin:
     ) -> list[dict[str, object]]:
         guides = connection.execute(
             text(
-                "SELECT constraint_ref,revision,guidance_hash,receipt_ref,receipt_hash "
+                "SELECT constraint_ref,revision,guidance_hash,receipt_ref,receipt_hash,guidance_json "
                 "FROM hc_soft_constraints WHERE scope_ref=:scope_ref AND status='active' "
-                "AND json_extract(guidance_json,'$.strength')=5 "
                 "ORDER BY constraint_ref,revision"
             ),
             {"scope_ref": "quest:" + quest_ref},
@@ -1313,6 +1318,12 @@ class QuestGoalOwnerMixin:
             cursor = "" if row is None else row.parent_ref
         values = []
         for guide in guides:
+            guidance = decoded_object(guide.guidance_json)
+            scope = guidance.get("semantic_scope")
+            if scope is not None and scope.get("kind") != "quest":
+                continue
+            if scope is None and guidance.get("strength", 3) != 5:
+                continue
             guide_ref = {
                 "constraint_ref": guide.constraint_ref,
                 "revision": int(guide.revision),
@@ -1336,11 +1347,21 @@ class QuestGoalOwnerMixin:
                 ),
                 None,
             )
+            from meta_research.owners.human_guidance import current_guidance_assessments
+            treatments = current_guidance_assessments(connection, constraint_ref=guide.constraint_ref,
+                revision=guide.revision, guidance_hash=guide.guidance_hash)
+            impacts = [item.get("goal_impact", "undetermined") for item in treatments]
+            if match is None and "none" in impacts and not any(
+                    impact in {"requires_evolution", "undetermined"} for impact in impacts):
+                continue
             values.append(
                 {
                     "guide_ref": guide_ref,
                     "status": "pending" if match is None else "aligned",
-                    "reason": "awaiting_goal_evolution" if match is None else None,
+                    "reason": ("awaiting_goal_impact_assessment" if scope is not None
+                        and (not impacts or "undetermined" in impacts) and "requires_evolution" not in impacts
+                        else "awaiting_goal_evolution") if match is None else None,
+                    "scope_confirmation": "legacy_unconfirmed" if scope is None else "confirmed",
                     "aligned_revision": None if match is None else match.revision_ref,
                     "current_revision": current_ref,
                     "authored_by": None if match is None else decoded_object(match.author_json),
@@ -1483,6 +1504,7 @@ def _guidance_delivery_source(connection, delivery_ref: str) -> dict[str, object
         "binding": binding,
         "guide_ref": guide_ref,
         "original_text": original,
+        "semantic_scope": guidance.get("semantic_scope"),
         "read_at": row.read_at,
         "created_at": row.created_at,
     }

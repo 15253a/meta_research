@@ -271,6 +271,7 @@ class HumanCollaborationInterface(Protocol):
         idempotency_key: str,
         *,
         view_context: dict[str, object] | None = None,
+        guidance_options: dict[str, object] | None = None,
     ) -> dict[str, object]: ...
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
@@ -299,6 +300,11 @@ class HumanCollaborationInterface(Protocol):
         self, scope_ref: str, proposal: dict[str, object], idempotency_key: str
     ) -> dict[str, object]: ...
 
+    def revise_agent_proposal(
+        self, proposal_ref: str, *, expected_scope_ref: str,
+        expected_proposal_hash: str, proposal: dict[str, object], idempotency_key: str,
+    ) -> dict[str, object]: ...
+
     def convert_agent_proposal_to_soft_constraint(
         self,
         proposal_ref: str,
@@ -306,6 +312,7 @@ class HumanCollaborationInterface(Protocol):
         expected_scope_ref: str,
         expected_proposal_hash: str,
         idempotency_key: str,
+        strength: int = 3,
     ) -> dict[str, object]: ...
 
     def convert_agent_proposal_to_command_draft(
@@ -2094,12 +2101,14 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         idempotency_key: str,
         *,
         view_context: dict[str, object] | None = None,
+        guidance_options: dict[str, object] | None = None,
     ) -> dict[str, object]:
         return self._collaboration_ladder.send_companion_message(
             scope_ref,
             message,
             idempotency_key,
             view_context=view_context,
+            guidance_options=guidance_options,
         )
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
@@ -2166,8 +2175,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
     ) -> dict[str, list[dict[str, object]]]:
         projection = self._collaboration_ladder.query_projection(scope_refs)
         for guide in projection["soft_constraints"]:
-            guide["deliveries"] = self.query_guidance_deliveries(guide["constraint_ref"])
-            guide["strength"] = guide["guidance"].get("strength", 3)
+            self._decorate_guidance_projection(guide)
         authorizations: list[dict[str, object]] = []
         for authorization in projection["authorizations"]:
             if (
@@ -2185,6 +2193,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             else:
                 authorizations.append(authorization)
         return {**projection, "authorizations": authorizations}
+
+    def _decorate_guidance_projection(self, guide: dict[str, object]) -> None:
+        guide["deliveries"] = self.query_guidance_deliveries(guide["constraint_ref"])
+        guide["strength"] = guide["guidance"].get("strength", 3)
 
     def _companion_quest_context(
         self,
@@ -2222,6 +2234,26 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     "title": content.get("title"),
                     "unknown_statement": content.get("unknown_statement"),
                 }
+        research_targets: list[dict[str, object]] = []
+        cycle_ref = foreground.get("cycle_ref") if isinstance(foreground, dict) else None
+        if isinstance(cycle_ref, str) and cycle_ref:
+            bundle_request = self._advancement_engine.query_bundle_stage_request(cycle_ref)
+            graph = (
+                self._research_graph.query_target_graph(bundle_request.request_ref)
+                if bundle_request is not None
+                else None
+            )
+            if graph is not None:
+                research_targets = [
+                    {
+                        "quest_ref": graph.quest_ref,
+                        "question_ref": bundle_request.accepted_question.question_ref,
+                        "cycle_ref": graph.cycle_ref,
+                        "target_ref": target.target_ref,
+                        "target_key": target.target_key,
+                    }
+                    for target in graph.targets[:20]
+                ]
         return {
             "schema_ref": "meta-research/companion-context/v1",
             "scope_ref": scope_ref,
@@ -2242,6 +2274,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             "current_question": current_question,
             "activity": {
                 "foreground": foreground,
+                "research_targets": research_targets,
                 "managed_runs": list(
                     self._agent_runtime.query_managed_runs(quest_ref)[:20]
                 ),
@@ -2444,6 +2477,16 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             scope_ref, proposal, idempotency_key
         )
 
+    def revise_agent_proposal(
+        self, proposal_ref: str, *, expected_scope_ref: str,
+        expected_proposal_hash: str, proposal: dict[str, object], idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.revise_agent_proposal(
+            proposal_ref, expected_scope_ref=expected_scope_ref,
+            expected_proposal_hash=expected_proposal_hash, proposal=proposal,
+            idempotency_key=idempotency_key,
+        )
+
     def convert_agent_proposal_to_soft_constraint(
         self,
         proposal_ref: str,
@@ -2453,13 +2496,20 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         idempotency_key: str,
         strength: int = 3,
     ) -> dict[str, object]:
-        return self._collaboration_ladder.convert_agent_proposal_to_soft_constraint(
+        proposal = self._collaboration_ladder._query_agent_proposal(proposal_ref)
+        work_materials = proposal["proposal"].get("work_materials")
+        commit = self._guidance_material_committer(
+            expected_scope_ref.removeprefix("quest:"), work_materials, idempotency_key)
+        converted = self._collaboration_ladder.convert_agent_proposal_to_soft_constraint(
             proposal_ref,
             expected_scope_ref=expected_scope_ref,
             expected_proposal_hash=expected_proposal_hash,
             idempotency_key=idempotency_key,
             strength=strength,
+            material_committer=commit,
         )
+        self._decorate_guidance_projection(converted["soft_constraint"])
+        return converted
 
     def convert_agent_proposal_to_command_draft(
         self,

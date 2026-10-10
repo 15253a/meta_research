@@ -22,6 +22,9 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
                 for key in ("understanding", "changes", "continuing_work", "reasons")},
             "disposition": {"type": "string", "enum": [
                 "applied", "considered", "deferred", "goal_alignment_pending"]},
+            "goal_impact": {"type": "string", "enum": ["none", "requires_evolution", "undetermined"]},
+            "resolves_receipts": {"type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 96}},
         }}
 
     def read(context, arguments, reconcile=False):
@@ -32,9 +35,12 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
 
     return (
         SemanticOperation("human_guidance.read", "human_collaboration",
-            "List this operation's frozen guidance, or read an exact complete document. "
+            "List this operation's frozen guidance and applicability, or read an exact complete document. "
+            "Background-only guidance remains readable and imposes no requirement on this work. "
             "List reads do not prove receipt or reading. For an exact read use delivery_ref "
-            "and a stable effect_id. Follow all pages until full_read=true before feedback.",
+            "and a stable effect_id. Follow all pages until full_read=true before feedback. "
+            "The full read also observes current goal_assessments; use a new read effect_id "
+            "before explicitly resolving an undetermined assessment.",
             read, read_schema, {"type": "object"}, "effect", "human_guidance.read.reconcile"),
         SemanticOperation("human_guidance.read.reconcile", "human_collaboration",
             "Recover the exact committed read receipt using the original arguments and effect_id.",
@@ -42,7 +48,12 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
         SemanticOperation("human_guidance.feedback", "human_collaboration",
             "Declare your understanding, changes, continuing work and reasons after a full exact read. "
             "Use a stable effect_id. Treated guidance remains a constraint for the same work. "
-            "goal_alignment_pending is available for strength 5 and never means the goal was changed.",
+            "Assess actual goal_impact independently of strength. requires_evolution applies to "
+            "confirmed Quest scope; a wider scope needs fresh human confirmation. "
+            "Omitted impact remains undetermined for Quest guidance and legacy strength 5. "
+            "After a fresh full read, use resolves_receipts to name current undetermined assessment "
+            "receipts and explicitly conclude none or requires_evolution. Real evolution obligations cannot be erased. "
+            "goal_alignment_pending never means the goal was changed.",
             feedback, feedback_schema, {"type": "object"}, "effect", "human_guidance.feedback.reconcile"),
         SemanticOperation("human_guidance.feedback.reconcile", "human_collaboration",
             "Recover the exact feedback receipt with the original command and effect_id. "

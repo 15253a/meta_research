@@ -33,6 +33,7 @@ from meta_research.runtime_protection import (
     RuntimeProtectionUnavailable,
 )
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from guidance_confirmation_helpers import guidance_proposal_value
 
 
 _QUESTION = {
@@ -427,13 +428,13 @@ def test_companion_post_invoke_validation_preserves_native_session(
     )
 
 
-def _confirm_direct_quest(runtime) -> dict[str, object]:
+def _confirm_direct_quest(runtime, key_prefix="hc-ladder") -> dict[str, object]:
     human = runtime.owners.human_collaboration
-    opened = human.create_quest({}, "hc-ladder-quest-open")
+    opened = human.create_quest({}, key_prefix + "-quest-open")
     probed = human.observe_host_compute(
         opened["initialization_id"],
         ["GPU-hc-test"],
-        "hc-ladder-compute-probe",
+        key_prefix + "-compute-probe",
     )
     draft = dict(probed["quest_draft"]["value"])
     draft.update(
@@ -455,13 +456,13 @@ def _confirm_direct_quest(runtime) -> dict[str, object]:
         opened["initialization_id"],
         draft,
         probed["quest_draft"]["hash"],
-        "hc-ladder-quest-draft",
+        key_prefix + "-quest-draft",
         probed["quest_draft"]["revision"],
     )
     human.generate_question_proposal(
         opened["initialization_id"],
         revised["quest_draft"]["hash"],
-        "hc-ladder-question-proposal",
+        key_prefix + "-question-proposal",
         revised["quest_draft"]["revision"],
     )
     assert human.process_drafting_once()
@@ -472,7 +473,7 @@ def _confirm_direct_quest(runtime) -> dict[str, object]:
         quest_draft_hash=proposed["quest_draft"]["hash"],
         proposal_ref=proposed["proposal"]["ref"],
         proposal_hash=proposed["proposal"]["hash"],
-        idempotency_key="hc-ladder-quest-preview",
+        idempotency_key=key_prefix + "-quest-preview",
     )
     confirmed = human.confirm_quest(
         opened["initialization_id"],
@@ -482,7 +483,7 @@ def _confirm_direct_quest(runtime) -> dict[str, object]:
         proposal_hash=proposed["proposal"]["hash"],
         preview_ref=previewed["confirmation_preview"]["ref"],
         preview_hash=previewed["confirmation_preview"]["hash"],
-        idempotency_key="hc-ladder-quest-confirm",
+        idempotency_key=key_prefix + "-quest-confirm",
     )
     assert confirmed["receipts"]["human_confirmation"]["status"] == "accepted"
     return confirmed
@@ -588,10 +589,7 @@ def test_conversation_proposal_constraint_and_authorization_are_distinct(
 
         proposal = human.record_agent_proposal(
             scope_ref,
-            {
-                "proposal_kind": "narrow_scope",
-                "text": "Restrict the first pass to public literature.",
-            },
+            guidance_proposal_value(creation["quest_ref"], "Restrict the first pass to public literature."),
             "agent-proposal-1",
         )
         assert proposal["status"] == "proposed"
@@ -1212,9 +1210,18 @@ def test_collaboration_projection_isolates_every_artifact_by_exact_scope(
     provider = _DeterministicDraftingProvider()
     runtime = _runtime(tmp_path / "projection-scope-isolation", provider)
     human = runtime.owners.human_collaboration
-    scope_a = "quest:quest_projection_scope_a"
-    scope_b = "human_request:human_request_projection_scope_b"
     try:
+        scopes = []
+        for suffix in ("a", "b"):
+            confirmed = _confirm_direct_quest(runtime, key_prefix="projection-" + suffix)
+            for _ in range(16):
+                if human.query_quest_creation(confirmed["initialization_id"])["status"] == "completed":
+                    break
+                human.reconcile_once()
+            creation = human.query_quest_creation(confirmed["initialization_id"])
+            assert creation["status"] == "completed"
+            scopes.append("quest:" + creation["quest_ref"])
+        scope_a, scope_b = scopes
         for suffix, scope_ref in (("a", scope_a), ("b", scope_b)):
             human.send_companion_message(
                 scope_ref,
@@ -1224,11 +1231,8 @@ def test_collaboration_projection_isolates_every_artifact_by_exact_scope(
             assert human.process_drafting_once()
             proposal = human.record_agent_proposal(
                 scope_ref,
-                {
-                    "proposal_kind": "scope_probe",
-                    "scope": suffix,
-                    "text": f"Only apply guidance {suffix} in its exact scope.",
-                },
+                guidance_proposal_value(scope_ref.removeprefix("quest:"),
+                    f"Only apply guidance {suffix} in its exact scope."),
                 f"scope-{suffix}-proposal",
             )
             human.convert_agent_proposal_to_soft_constraint(
@@ -2060,13 +2064,14 @@ def test_owner_atomically_converts_exact_proposal_to_soft_constraint(
     provider = _DeterministicDraftingProvider()
     runtime = _runtime(tmp_path / "proposal-to-soft-constraint", provider)
     human = runtime.owners.human_collaboration
-    scope_ref = "quest:quest_proposal_to_soft_constraint"
-    proposal_value = {
-        "proposal_kind": "narrow_scope",
-        "text": "Restrict the first pass to public literature.",
-        "applies_to": ["idea"],
-    }
     try:
+        confirmed = _confirm_direct_quest(runtime)
+        for _ in range(5):
+            if not human.reconcile_once():
+                break
+        quest_ref = human.query_quest_creation(confirmed["initialization_id"])["quest_ref"]
+        scope_ref = "quest:" + quest_ref
+        proposal_value = guidance_proposal_value(quest_ref, "Restrict the first pass to public literature.")
         proposal = human.record_agent_proposal(
             scope_ref,
             proposal_value,

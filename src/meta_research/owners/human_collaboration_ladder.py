@@ -471,11 +471,13 @@ class SQLiteHumanCollaborationLadder:
         idempotency_key: str,
         *,
         view_context: dict[str, object] | None = None,
+        guidance_options: dict[str, object] | None = None,
     ) -> dict[str, object]:
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")
-        message = _text(message, "companion_message_required", INTENT_MESSAGE_MAX_LENGTH)
+        _text(message, "companion_message_required", INTENT_MESSAGE_MAX_LENGTH)
         _reject_secret_content(message)
         _idempotency_key(idempotency_key)
+        guidance_options = _guidance_options(guidance_options)
         if view_context is not None:
             view_context = _document(
                 view_context,
@@ -487,6 +489,7 @@ class SQLiteHumanCollaborationLadder:
                 "command": "send_companion_message",
                 "scope_ref": scope_ref,
                 "message": message,
+                **({} if guidance_options is None else {"guidance_options": guidance_options}),
                 **(
                     {}
                     if view_context is None
@@ -560,11 +563,11 @@ class SQLiteHumanCollaborationLadder:
                     text(
                         "INSERT INTO hc_companion_turns (interaction_ref, session_ref, "
                         "ordinal, message, message_hash, view_context_json, "
-                        "view_context_hash, assistant_status, "
+                        "view_context_hash, guidance_options_json, guidance_options_hash, assistant_status, "
                         "attempt_count, idempotency_key, command_hash, created_at, "
                         "updated_at, native_session_generation, native_session_ref) VALUES (:interaction_ref, :session_ref, :ordinal, "
                         ":message, :message_hash, :view_context_json, "
-                        ":view_context_hash, 'queued', 0, :idempotency_key, "
+                        ":view_context_hash, :guidance_options_json, :guidance_options_hash, 'queued', 0, :idempotency_key, "
                         ":command_hash, :now, :now, :native_session_generation, :native_session_ref)"
                     ),
                     {
@@ -575,6 +578,8 @@ class SQLiteHumanCollaborationLadder:
                         "ordinal": ordinal,
                         "message": message,
                         "message_hash": canonical_hash(message),
+                        "guidance_options_json": None if guidance_options is None else canonical_json(guidance_options),
+                        "guidance_options_hash": None if guidance_options is None else canonical_hash(guidance_options),
                         "view_context_json": (
                             None
                             if view_context is None
@@ -764,6 +769,7 @@ class SQLiteHumanCollaborationLadder:
                 "authoritative_effect": False,
                 "current_context": context,
                 "native_session_generation": int(row.native_session_generation),
+                "selected_guidance": _turn_guidance_options(row) or {"strength": 3, "work_materials": None},
             }
             if continuation_control_revision is not None:
                 draft["human_request_resume"] = {
@@ -814,6 +820,9 @@ class SQLiteHumanCollaborationLadder:
                 agent_proposal = _document(
                     agent_proposal, "agent_proposal_invalid"
                 )
+                if agent_proposal.get("proposal_kind") == "soft_constraint":
+                    selected = _turn_guidance_options(row) or {"strength": 3, "work_materials": None}
+                    agent_proposal = {**agent_proposal, "text": row.message, **selected}
                 _reject_secret_content(agent_proposal)
             with self._database.fenced_write() as connection:
                 self._checkpoint_companion_native(connection, row, native_session_ref)
@@ -1530,6 +1539,48 @@ class SQLiteHumanCollaborationLadder:
             "created_at": float(row.created_at),
         }
 
+    def revise_agent_proposal(
+        self, proposal_ref: str, *, expected_scope_ref: str,
+        expected_proposal_hash: str, proposal: dict[str, object], idempotency_key: str,
+    ) -> dict[str, object]:
+        """Keep each reviewed version immutable and retire its previous confirmation."""
+        proposal_ref = _text(proposal_ref, "agent_proposal_stale", 64)
+        expected_scope_ref = _scope_ref(expected_scope_ref, "agent_proposal_stale")
+        expected_proposal_hash = _expected_proposal_hash(expected_proposal_hash)
+        proposal = _document(proposal, "agent_proposal_invalid")
+        _reject_secret_content(proposal)
+        _idempotency_key(idempotency_key)
+        command_hash = canonical_hash({"command": "revise_agent_proposal",
+            "proposal_ref": proposal_ref, "expected_scope_ref": expected_scope_ref,
+            "expected_proposal_hash": expected_proposal_hash, "proposal": proposal})
+        with self._database.fenced_write() as connection:
+            revised_ref = _collaboration_command(connection, idempotency_key,
+                "agent_proposal_revision", command_hash)
+            if revised_ref is None:
+                row, _ = _proposal_for_conversion(connection, proposal_ref=proposal_ref,
+                    expected_scope_ref=expected_scope_ref,
+                    expected_proposal_hash=expected_proposal_hash)
+                revised_ref = new_ref("agent_proposal")
+                connection.execute(text(
+                    "INSERT INTO hc_agent_proposals (proposal_ref,scope_ref,proposal_json,"
+                    "proposal_hash,status,idempotency_key,command_hash,created_at) "
+                    "VALUES (:ref,:scope,:proposal,:hash,'proposed',:key,:command,:now)"),
+                    {"ref": revised_ref, "scope": expected_scope_ref,
+                     "proposal": canonical_json(proposal), "hash": canonical_hash(proposal),
+                     "key": idempotency_key, "command": command_hash, "now": time.time()})
+                updated = connection.execute(text(
+                    "UPDATE hc_agent_proposals SET status='dismissed' WHERE proposal_ref=:ref "
+                    "AND status='proposed' AND proposal_hash=:hash"),
+                    {"ref": row.proposal_ref, "hash": expected_proposal_hash})
+                if updated.rowcount != 1:
+                    raise OwnerConflict("agent_proposal_stale")
+                _record_collaboration_command(connection, idempotency_key,
+                    "agent_proposal_revision", command_hash, revised_ref)
+                _advance_hc(connection, self._feed, "human_collaboration.agent_proposal_revised",
+                    {"proposal_ref": revised_ref, "previous_proposal_ref": proposal_ref,
+                     "scope_ref": expected_scope_ref})
+        return self._query_agent_proposal(revised_ref)
+
     def submit_human_guidance(
         self, *, quest_ref: str, original_text: str, strength: int = 3,
         idempotency_key: str, work_materials=None, material_committer=None,
@@ -1577,6 +1628,7 @@ class SQLiteHumanCollaborationLadder:
         expected_proposal_hash: str,
         idempotency_key: str,
         strength: int = 3,
+        material_committer=None,
     ) -> dict[str, object]:
         _guidance_strength(strength)
         proposal_ref = _text(proposal_ref, "agent_proposal_stale", 64)
@@ -1610,6 +1662,9 @@ class SQLiteHumanCollaborationLadder:
                     expected_scope_ref=expected_scope_ref,
                     expected_proposal_hash=expected_proposal_hash,
                 )
+                _confirmed_guidance(connection, expected_scope_ref, guidance, strength)
+                if guidance.get("work_materials") is not None and material_committer is None:
+                    raise OwnerConflict("guidance_material_confirmation_required")
                 constraint_ref = _create_formal_guidance(
                     connection, scope_ref=expected_scope_ref, guidance=guidance,
                     strength=strength, source_proposal_ref=proposal_ref,
@@ -1641,6 +1696,8 @@ class SQLiteHumanCollaborationLadder:
                 )
             else:
                 constraint_ref = replay
+            if material_committer is not None:
+                material_committer(connection, constraint_ref)
         proposal = self._query_agent_proposal(proposal_ref)
         constraint = self._query_soft_constraint(constraint_ref)
         if constraint.get("source_proposal_ref") != proposal_ref:
@@ -3421,6 +3478,33 @@ def _turn_view_context(row) -> dict[str, object] | None:
     return context
 
 
+def _guidance_options(value) -> dict[str, object] | None:
+    if value is None:
+        return None
+    value = _document(value, "guidance_options_invalid")
+    if set(value) != {"strength", "work_materials"}:
+        raise OwnerConflict("guidance_options_invalid")
+    _guidance_strength(value["strength"])
+    if value["work_materials"] is not None:
+        from meta_research.work_materials import MaterialSubmission
+        MaterialSubmission.parse(value["work_materials"])
+    _reject_secret_content(value)
+    return value
+
+
+def _turn_guidance_options(row) -> dict[str, object] | None:
+    encoded = getattr(row, "guidance_options_json", None)
+    digest = getattr(row, "guidance_options_hash", None)
+    if encoded is None and digest is None:
+        return None
+    if not isinstance(encoded, str) or not isinstance(digest, str):
+        raise OwnerConflict("companion_interaction_invalid")
+    value = _guidance_options(decoded_object(encoded))
+    if canonical_hash(value) != digest:
+        raise OwnerConflict("companion_interaction_invalid")
+    return value
+
+
 def _public_turn(row) -> dict[str, object]:
     if canonical_hash(row.message) != row.message_hash:
         raise OwnerConflict("companion_interaction_invalid")
@@ -3429,6 +3513,7 @@ def _public_turn(row) -> dict[str, object]:
     ):
         raise OwnerConflict("companion_interaction_invalid")
     view_context = _turn_view_context(row)
+    guidance_options = _turn_guidance_options(row)
     return {
         "interaction_ref": row.interaction_ref,
         "interaction_kind": "conversation",
@@ -3437,6 +3522,7 @@ def _public_turn(row) -> dict[str, object]:
         "native_session_generation": int(row.native_session_generation),
         "native_session_ref": row.native_session_ref,
         "message": row.message,
+        **({} if guidance_options is None else {"guidance_options": guidance_options}),
         **(
             {}
             if view_context is None
@@ -3734,6 +3820,38 @@ def _formal_guidance(guidance: dict[str, object], strength: int) -> dict[str, ob
         raise OwnerConflict("guidance_document_too_large")
     _reject_secret_content(document)
     return document
+
+
+def _confirmed_guidance(connection, scope_ref, guidance, strength) -> None:
+    required = {"text", "assistant_understanding", "applies_to", "semantic_scope",
+                "strength", "preserve_conditions", "work_materials"}
+    if not required.issubset(guidance) or guidance.get("proposal_kind") != "soft_constraint":
+        raise OwnerConflict("guidance_confirmation_required")
+    if guidance["strength"] != strength:
+        raise OwnerConflict("guidance_confirmation_stale")
+    _guidance_strength(guidance["strength"])
+    _text(guidance["assistant_understanding"], "guidance_understanding_required", 8000)
+    for field, maximum in (("applies_to", 2000), ("preserve_conditions", 4000)):
+        values = guidance[field]
+        if (not isinstance(values, list) or len(values) > 20
+                or (field == "applies_to" and not values)):
+            raise OwnerConflict("guidance_confirmation_required")
+        for value in values:
+            _text(value, "guidance_confirmation_required", maximum)
+    if not scope_ref.startswith("quest:"):
+        raise OwnerConflict("guidance_quest_required")
+    quest_ref = scope_ref.removeprefix("quest:")
+    from meta_research.owners.human_guidance import validate_guidance_scope
+    scope = validate_guidance_scope(connection, quest_ref, guidance["semantic_scope"])
+    materials = guidance["work_materials"]
+    if materials is not None:
+        from meta_research.work_materials import MaterialSubmission
+        receiver = MaterialSubmission.parse(materials).receiver
+        if (receiver.get("kind") != "current" or receiver.get("quest_ref") != quest_ref
+                or (scope.get("question_ref") is not None
+                    and receiver.get("question_ref") != scope["question_ref"])):
+            raise OwnerConflict("material_receiver_invalid")
+    _formal_guidance(guidance, strength)
 
 
 def _create_formal_guidance(

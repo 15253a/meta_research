@@ -9,6 +9,7 @@ from meta_research.human_guidance import (
     FrozenGuidanceBinding, FrozenGuidanceCut, FrozenGuidanceDelivery,
     GuidanceOperationIdentity, GuidanceRuntimeScope, StageGuidanceOperation,
     TargetGuidanceOperation, GUIDANCE_DOCUMENT_MAX_BYTES,
+    normalize_guidance_scope,
 )
 from meta_research.owners.common import (
     OwnerConflict, canonical_hash, canonical_json, decoded_object, new_ref,
@@ -56,8 +57,30 @@ class HumanGuidanceMixin:
 
     def submit_human_guidance(
         self, *, quest_ref: str, original_text: str, strength: int = 3,
-        idempotency_key: str, work_materials=None,
+        idempotency_key: str, work_materials=None, proposal_ref: str | None = None,
+        expected_proposal_hash: str | None = None,
     ) -> dict[str, object]:
+        if proposal_ref is not None or expected_proposal_hash is not None:
+            if proposal_ref is None or expected_proposal_hash is None:
+                raise OwnerConflict("guidance_confirmation_required")
+            proposal = self._collaboration_ladder._query_agent_proposal(proposal_ref)
+            document = proposal["proposal"]
+            if (document.get("text") != original_text
+                    or document.get("strength") != strength
+                    or document.get("work_materials") != work_materials):
+                raise OwnerConflict("guidance_confirmation_stale")
+            converted = self.convert_agent_proposal_to_soft_constraint(
+                proposal_ref, expected_scope_ref="quest:" + quest_ref,
+                expected_proposal_hash=expected_proposal_hash,
+                idempotency_key=idempotency_key, strength=strength)
+            return converted["soft_constraint"]
+        commit = self._guidance_material_committer(quest_ref, work_materials, idempotency_key)
+        return self._collaboration_ladder.submit_human_guidance(
+            quest_ref=quest_ref, original_text=original_text, strength=strength,
+            idempotency_key=idempotency_key, work_materials=work_materials, material_committer=commit,
+        )
+
+    def _guidance_material_committer(self, quest_ref, work_materials, idempotency_key):
         commit = None
         if work_materials is not None:
             from meta_research.work_materials import MaterialSubmission
@@ -71,10 +94,7 @@ class HumanGuidanceMixin:
             def commit(connection, constraint_ref):
                 self._insert_material_submission(connection, command=work_materials, key=idempotency_key,
                     anchor_kind="guidance", anchor_ref=constraint_ref)
-        return self._collaboration_ladder.submit_human_guidance(
-            quest_ref=quest_ref, original_text=original_text, strength=strength,
-            idempotency_key=idempotency_key, work_materials=work_materials, material_committer=commit,
-        )
+        return commit
 
     def freeze_operation_guidance(
         self, operation: StageGuidanceOperation | TargetGuidanceOperation,
@@ -121,6 +141,8 @@ class HumanGuidanceMixin:
             deliveries = []
             for guide_row in rows:
                 guide = guidance_binding_from_row(guide_row)
+                scope_value = guide["guidance"].get("semantic_scope")
+                applies = scope_value is None or guidance_applies_to_work(connection, scope_value, work)
                 prior = connection.execute(text(
                     "SELECT feedback_json FROM hc_guidance_treatments WHERE "
                     "root_kind=:root_kind AND run_ref=:run_ref AND "
@@ -131,8 +153,9 @@ class HumanGuidanceMixin:
                     "revision": guide_row.revision, "guidance_hash": guide_row.guidance_hash,
                 }).first()
                 deliveries.append(FrozenGuidanceDelivery(
-                    new_ref("guidance_delivery"), canonical_json(guide), prior is None,
+                    new_ref("guidance_delivery"), canonical_json(guide), applies and prior is None,
                     None if prior is None else prior.feedback_json,
+                    applies, "legacy_unconfirmed" if scope_value is None else "confirmed",
                 ))
             snapshot_ref = new_ref("guidance_snapshot")
             payload = {
@@ -254,6 +277,12 @@ class HumanGuidanceMixin:
                 "original_text": guide["guidance"].get("text") if offset == 0
                     and end == len(document) else None,
                 "strength": guide["guidance"].get("strength", 3),
+                "assistant_understanding": guide["guidance"].get("assistant_understanding"),
+                "semantic_scope": guide["guidance"].get("semantic_scope"),
+                "preserve_conditions": guide["guidance"].get("preserve_conditions", []),
+                "scope_confirmation": delivery.scope_confirmation,
+                "applies_to_work": delivery.applies_to_work,
+                "background_only": not delivery.applies_to_work,
                 "text": document[offset:end].decode("utf-8"), "offset": offset,
                 "next_offset": None if end == len(document) else end,
                 "complete": offset == 0 and end == len(document),
@@ -261,6 +290,9 @@ class HumanGuidanceMixin:
                 "needs_treatment": delivery.needs_treatment,
                 "prior_treatment": None if delivery.prior_treatment_json is None
                     else decoded_object(delivery.prior_treatment_json),
+                "goal_assessments": [_assessment_summary(item) for item in current_guidance_assessments(
+                    connection, constraint_ref=guide["constraint_ref"], revision=guide["revision"],
+                    guidance_hash=guide["guidance_hash"])] if full_read else [],
                 "received": True,
             }
             receipt = _record_effect(connection, key, "read", command, payload)
@@ -282,16 +314,28 @@ class HumanGuidanceMixin:
         self, *, scope: GuidanceRuntimeScope, binding: FrozenGuidanceBinding,
         delivery_ref: str, effect_id: str, understanding: str, changes: str,
         continuing_work: str, reasons: str, disposition: str,
+        goal_impact: str | None = None,
+        resolves_receipts: list[str] | None = None,
         reconcile: bool = False,
     ) -> dict[str, object]:
         command = {"delivery_ref": delivery_ref, "understanding": understanding,
             "changes": changes, "continuing_work": continuing_work, "reasons": reasons,
-            "disposition": disposition}
+            "disposition": disposition,
+            **({} if goal_impact is None else {"goal_impact": goal_impact}),
+            **({} if resolves_receipts is None else {"resolves_receipts": resolves_receipts})}
         if (any(not isinstance(command[key], str) or not command[key].strip()
                     or len(command[key]) > 8192
                 for key in ("understanding", "changes", "continuing_work", "reasons"))
-                or disposition not in {"applied", "considered", "deferred", "goal_alignment_pending"}):
+                or disposition not in {"applied", "considered", "deferred", "goal_alignment_pending"}
+                or goal_impact not in {None, "none", "requires_evolution", "undetermined"}
+                or disposition == "goal_alignment_pending" and goal_impact == "none"):
             raise OwnerConflict("guidance_feedback_invalid")
+        if resolves_receipts is not None and (
+                not isinstance(resolves_receipts, list) or not 1 <= len(resolves_receipts) <= 100
+                or any(not isinstance(ref, str) or not 1 <= len(ref) <= 96 for ref in resolves_receipts)
+                or len(set(resolves_receipts)) != len(resolves_receipts)
+                or goal_impact not in {"none", "requires_evolution"}):
+            raise OwnerConflict("guidance_resolution_invalid")
         key = _effect_key(binding, "feedback", effect_id)
         with self._database.fenced_write() as connection:
             cut = self._authorize_guidance(scope, binding, reconcile=reconcile)
@@ -302,14 +346,38 @@ class HumanGuidanceMixin:
             if reconcile:
                 raise OwnerConflict("guidance_effect_not_found")
             guide = decoded_object(delivery.guide_json)
-            if (disposition == "goal_alignment_pending"
-                    and guide["guidance"].get("strength", 3) != 5):
-                raise OwnerConflict("guidance_goal_alignment_strength_invalid")
+            if not delivery.applies_to_work:
+                raise OwnerConflict("guidance_outside_confirmed_scope")
+            confirmed_scope = guide["guidance"].get("semantic_scope")
+            global_assessment = (confirmed_scope is not None and confirmed_scope["kind"] == "quest"
+                or confirmed_scope is None and guide["guidance"].get("strength", 3) == 5)
+            impact = goal_impact or ("requires_evolution" if disposition == "goal_alignment_pending"
+                else "undetermined" if global_assessment else "none")
+            if (impact == "requires_evolution" and confirmed_scope is not None
+                    and confirmed_scope["kind"] != "quest"):
+                raise OwnerConflict("guidance_goal_scope_confirmation_required")
             row = connection.execute(text(
                 "SELECT read_at FROM hc_guidance_deliveries WHERE delivery_ref=:delivery_ref"
             ), {"delivery_ref": delivery_ref}).one()
             if row.read_at is None:
                 raise OwnerConflict("guidance_exact_read_required")
+            if resolves_receipts:
+                assessments = {item["receipt"]["receipt_ref"]: item for item in current_guidance_assessments(
+                    connection, constraint_ref=guide["constraint_ref"], revision=guide["revision"],
+                    guidance_hash=guide["guidance_hash"])}
+                if any(ref not in assessments for ref in resolves_receipts):
+                    raise OwnerConflict("guidance_resolution_stale")
+                if any(assessments[ref].get("goal_impact") not in {None, "undetermined"}
+                        for ref in resolves_receipts):
+                    raise OwnerConflict("guidance_resolution_invalid")
+                reads = connection.execute(text(
+                    "SELECT receipt_json FROM hc_guidance_effects WHERE kind='read' AND delivery_ref=:delivery_ref"
+                ), {"delivery_ref": delivery_ref}).all()
+                observed = {item["receipt_ref"] for read in reads
+                    if (value := decoded_object(read.receipt_json)).get("full_read")
+                    for item in value.get("goal_assessments", [])}
+                if not set(resolves_receipts).issubset(observed):
+                    raise OwnerConflict("guidance_resolution_unread")
             params = {"root_kind": binding.identity.root_kind,
                 "run_ref": binding.identity.run_ref, "constraint_ref": guide["constraint_ref"],
                 "revision": guide["revision"], "guidance_hash": guide["guidance_hash"]}
@@ -318,17 +386,22 @@ class HumanGuidanceMixin:
                 "AND run_ref=:run_ref AND constraint_ref=:constraint_ref AND revision=:revision "
                 "AND guidance_hash=:guidance_hash"
             ), params).first()
-            if prior is not None:
+            if prior is not None and (not resolves_receipts
+                    or decoded_object(prior.feedback_json)["receipt"]["receipt_ref"] not in resolves_receipts):
                 raise OwnerConflict("guidance_already_treated")
             payload = {**command, "binding": binding.as_dict(), "guide_ref": {
                 key: guide[key] for key in ("constraint_ref", "revision", "guidance_hash",
                     "receipt_ref", "receipt_hash")}, "declared_by_root": True,
-                "goal_update_pending": guide["guidance"].get("strength", 3) == 5,
+                "goal_impact": impact, "goal_update_pending": impact != "none",
+                "semantic_scope": confirmed_scope,
             }
             receipt = _record_effect(connection, key, "feedback", command, payload)
             connection.execute(text(
                 "INSERT INTO hc_guidance_treatments VALUES (:root_kind,:run_ref,:constraint_ref,"
-                ":revision,:guidance_hash,:delivery_ref,:effect_key,:feedback_json,:now)"
+                ":revision,:guidance_hash,:delivery_ref,:effect_key,:feedback_json,:now) "
+                "ON CONFLICT(root_kind,run_ref,constraint_ref,revision,guidance_hash) DO UPDATE SET "
+                "delivery_ref=excluded.delivery_ref,effect_key=excluded.effect_key,"
+                "feedback_json=excluded.feedback_json,created_at=excluded.created_at"
             ), {**params, "delivery_ref": delivery_ref, "effect_key": key,
                 "feedback_json": canonical_json(receipt), "now": time.time()})
             self._feed.record(connection, "human_collaboration.guidance_treated", {
@@ -347,19 +420,79 @@ class HumanGuidanceMixin:
     def query_guidance_deliveries(self, constraint_ref: str) -> list[dict[str, object]]:
         with self._database.read() as connection:
             rows = connection.execute(text(
-                "SELECT d.*,s.root_kind,s.run_ref,s.operation_ref,t.feedback_json FROM "
+                "SELECT d.*,s.root_kind,s.run_ref,s.operation_ref,s.quest_ref,"
+                "s.snapshot_json,s.snapshot_hash,t.feedback_json FROM "
                 "hc_guidance_deliveries d JOIN hc_guidance_snapshots s USING(snapshot_ref) "
                 "LEFT JOIN hc_guidance_treatments t ON t.root_kind=s.root_kind "
                 "AND t.run_ref=s.run_ref AND t.constraint_ref=d.constraint_ref "
                 "AND t.revision=d.revision AND t.guidance_hash=d.guidance_hash "
                 "WHERE d.constraint_ref=:constraint_ref ORDER BY d.created_at,d.delivery_ref"
             ), {"constraint_ref": constraint_ref}).all()
-        return [{"delivery_ref": row.delivery_ref, "root_kind": row.root_kind,
-            "run_ref": row.run_ref, "operation_ref": row.operation_ref,
-            "prepared_at": row.created_at, "received_at": row.received_at,
-            "read_at": row.read_at, "needs_treatment": bool(row.needs_treatment),
-            "treatment": None if row.feedback_json is None else decoded_object(row.feedback_json),
-        } for row in rows]
+        result = []
+        for row in rows:
+            delivery = _delivery(_cut(row), row.delivery_ref)
+            result.append({"delivery_ref": row.delivery_ref, "root_kind": row.root_kind,
+                "run_ref": row.run_ref, "operation_ref": row.operation_ref,
+                "prepared_at": row.created_at, "received_at": row.received_at,
+                "read_at": row.read_at, "needs_treatment": bool(row.needs_treatment),
+                "applies_to_work": delivery.applies_to_work,
+                "background_only": not delivery.applies_to_work,
+                "scope_confirmation": delivery.scope_confirmation,
+                "treatment": None if row.feedback_json is None else decoded_object(row.feedback_json),
+            })
+        return result
+
+
+def validate_guidance_scope(connection, quest_ref: str, scope: object) -> dict[str, object]:
+    value = normalize_guidance_scope(scope, quest_ref=quest_ref)
+    if connection.execute(text("SELECT quest_ref FROM rg_quests WHERE quest_ref=:quest_ref"),
+            value).first() is None:
+        raise OwnerConflict("guidance_scope_unbound")
+    if value["kind"] != "quest":
+        question = connection.execute(text(
+            "SELECT question_ref FROM rg_questions WHERE quest_ref=:quest_ref AND question_ref=:question_ref "
+            "UNION ALL SELECT question_ref FROM rg_manual_questions WHERE quest_ref=:quest_ref AND question_ref=:question_ref "
+            "UNION ALL SELECT question_ref FROM rg_autonomous_questions WHERE quest_ref=:quest_ref AND question_ref=:question_ref"
+        ), value).first()
+        if question is None:
+            raise OwnerConflict("guidance_scope_unbound")
+    if value["kind"] in {"cycle", "target"}:
+        cycle = connection.execute(text(
+            "SELECT cycle_ref FROM ae_cycles WHERE quest_ref=:quest_ref "
+            "AND question_ref=:question_ref AND cycle_ref=:cycle_ref"
+        ), value).first()
+        if cycle is None:
+            raise OwnerConflict("guidance_scope_unbound")
+    if value["kind"] == "target":
+        target = connection.execute(text(
+            "SELECT t.target_ref FROM rg_targets t JOIN rg_target_graphs g USING(graph_ref) "
+            "WHERE t.target_ref=:target_ref AND g.quest_ref=:quest_ref AND g.cycle_ref=:cycle_ref"
+        ), value).first()
+        if target is None:
+            raise OwnerConflict("guidance_scope_unbound")
+    return value
+
+
+def guidance_applies_to_work(connection, scope, work) -> bool:
+    value = normalize_guidance_scope(scope, quest_ref=work.quest_ref)
+    if value["kind"] == "quest":
+        return True
+    if work.root_kind == "target":
+        row = connection.execute(text(
+            "SELECT g.cycle_ref,q.question_ref,t.target_ref FROM rg_targets t "
+            "JOIN rg_target_graphs g USING(graph_ref) JOIN ae_stage_run_requests q "
+            "ON q.request_ref=g.request_ref WHERE t.target_ref=:ref AND g.quest_ref=:quest_ref"
+        ), {"ref": work.provenance_ref, "quest_ref": work.quest_ref}).first()
+    else:
+        row = connection.execute(text(
+            "SELECT cycle_ref,question_ref,NULL AS target_ref FROM ae_stage_run_requests "
+            "WHERE request_ref=:ref AND quest_ref=:quest_ref"
+        ), {"ref": work.provenance_ref, "quest_ref": work.quest_ref}).first()
+    if row is None:
+        raise OwnerConflict("guidance_scope_work_unbound")
+    return (value["question_ref"] == row.question_ref
+        and (value["kind"] == "question" or value["cycle_ref"] == row.cycle_ref)
+        and (value["kind"] != "target" or value["target_ref"] == row.target_ref))
 
 
 def _cut(row) -> FrozenGuidanceCut:
@@ -376,6 +509,7 @@ def _cut(row) -> FrozenGuidanceCut:
     ), payload["provenance_ref"], tuple(FrozenGuidanceDelivery(
         item["delivery_ref"], canonical_json(item["guide"]), item["needs_treatment"],
         None if item["prior_treatment"] is None else canonical_json(item["prior_treatment"]),
+        item.get("applies_to_work", True), item.get("scope_confirmation", "legacy_unconfirmed"),
     ) for item in payload["deliveries"]), direction_cut)
 
 
@@ -391,10 +525,40 @@ def _summary(delivery):
     return {"delivery_ref": delivery.delivery_ref, "constraint_ref": guide["constraint_ref"],
         "revision": guide["revision"], "guidance_hash": guide["guidance_hash"],
         "strength": guide["guidance"].get("strength", 3),
+        "semantic_scope": guide["guidance"].get("semantic_scope"),
+        "scope_confirmation": delivery.scope_confirmation,
+        "applies_to_work": delivery.applies_to_work,
+        "background_only": not delivery.applies_to_work,
         "needs_treatment": delivery.needs_treatment,
         "reader": {"operation": "human_guidance.read", "delivery_ref": delivery.delivery_ref},
         "prior_treatment": None if delivery.prior_treatment_json is None
             else decoded_object(delivery.prior_treatment_json)}
+
+
+def current_guidance_assessments(connection, *, constraint_ref, revision, guidance_hash):
+    rows = connection.execute(text(
+        "SELECT e.receipt_json,e.receipt_hash FROM hc_guidance_effects e "
+        "JOIN hc_guidance_deliveries d USING(delivery_ref) WHERE e.kind='feedback' "
+        "AND d.constraint_ref=:ref AND d.revision=:revision AND d.guidance_hash=:hash "
+        "ORDER BY e.created_at,e.effect_key"
+    ), {"ref": constraint_ref, "revision": revision, "hash": guidance_hash}).all()
+    receipts = []
+    for row in rows:
+        receipt = decoded_object(row.receipt_json)
+        if canonical_hash(receipt) != row.receipt_hash:
+            raise OwnerConflict("guidance_receipt_invalid")
+        receipts.append(receipt)
+    resolved = {ref for receipt in receipts for ref in receipt.get("resolves_receipts", [])}
+    return [receipt for receipt in receipts if receipt["receipt"]["receipt_ref"] not in resolved]
+
+
+def _assessment_summary(receipt):
+    identity = receipt["binding"]["identity"]
+    return {"receipt_ref": receipt["receipt"]["receipt_ref"],
+        "goal_impact": receipt.get("goal_impact", "undetermined"),
+        "root_kind": identity["root_kind"], "run_ref": identity["run_ref"],
+        "delivery_ref": receipt["delivery_ref"], "understanding": receipt["understanding"],
+        "reasons": receipt["reasons"]}
 
 
 def _effect_key(binding, kind, effect_id):
