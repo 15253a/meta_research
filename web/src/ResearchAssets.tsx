@@ -894,7 +894,7 @@ export function ResearchAssetsWorkbench({
           </button>
         </header>
 
-        <ResearchLibrary questRef={currentQuestRef} questionRef={currentQuestionRef} />
+        <ResearchLibrary questRef={currentQuestRef} questionRef={currentQuestionRef} refreshRevision={initial.revision} />
         <details className="asset-storage-details">
           <summary>{t("保存文件与保管设置", "Save files and manage storage")}</summary>
         <div className="asset-body">

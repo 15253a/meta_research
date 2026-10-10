@@ -49,7 +49,31 @@ export function CreationUnderstanding({ basis }: { basis: CreationResearchBasis 
       <b id={titleId}>已有课题的理解</b>
       <small>{basis.kind === "literature_revised" ? "结合文献修正后" : "根据已有资料"}</small>
     </div>
-    {basis.freshness === "stale" ? <p role="status">创建依据已经变化。下面保留生成时的理解；请重新生成以阅读当前资料。</p> : null}
+    {basis.freshness === "stale" ? <p role="status">创建依据已经变化。下面保留当时的理解；新依据需要判断仍适用的认识并补查受影响部分，旧确认已失效。</p> : null}
+    {basis.applicability ? <div>
+      <h3>本次变化与适用范围</h3>
+      <p>{basis.applicability.change_assessment}</p>
+      <small>前驱依据：{basis.applicability.predecessor.basis_ref} · {basis.applicability.predecessor.basis_hash}</small>
+      <ul>{basis.applicability.decisions.map((decision) => <li key={decision.prior_statement_ref}>
+        <b>{{ retain: "仍适用", replace: "已替换认识", needs_recheck: "待补查", out_of_scope: "不在当前范围" }[decision.disposition]}</b>
+        <p>{decision.prior_text}</p>
+        <p>{decision.explanation}</p>
+        {decision.applicable_conditions.length ? <small>适用条件：{decision.applicable_conditions.join("；")}</small> : null}
+        {decision.affected_scope ? <p>受影响范围：{decision.affected_scope}</p> : null}
+        {decision.creation_limit !== "none" ? <p>{decision.creation_limit === "required_first_question"
+          ? "形成首题所需的依据仍需核对。" : "该范围保留为后续研究，尚未得到验证。"}</p> : null}
+      </li>)}</ul>
+      {basis.applicability.literature_decisions.length ? <div>
+        <h3>已有文献的适用性</h3>
+        <ul>{basis.applicability.literature_decisions.map((decision) => <li key={decision.snapshot_ref}>
+          <b>{{ retain: "沿用已有快照", needs_recheck: "文献范围待补查", out_of_scope: "文献不在当前范围" }[decision.disposition]}</b>
+          <small>原快照：{decision.snapshot_ref} · {decision.snapshot_hash}</small>
+          {decision.applicable_conditions.length ? <p>适用条件：{decision.applicable_conditions.join("；")}</p> : null}
+          {decision.affected_scope ? <p>{decision.affected_scope}</p> : null}
+          <p>{decision.limitations}</p>
+        </li>)}</ul>
+      </div> : null}
+    </div> : null}
     {understandingFields.map(({ field, label }) => <div key={field}>
       <h3>{label}</h3>
       {basis.understanding[field].length ? <ul>{basis.understanding[field].map((statement) => <li key={statement.ref}>
@@ -64,10 +88,20 @@ export function CreationUnderstanding({ basis }: { basis: CreationResearchBasis 
         <b>{source.relative_path}</b> · {sourceKind(source)} · {{ read: "已读", partial: "部分已读", unread: "未读" }[source.coverage.kind]}
         {source.coverage.unread_description ? <p>{source.coverage.unread_description}</p> : null}
         <p>{custodyStatus(source)}</p>
+        {source.inherited_from ? <small>沿用原依据的精确资料版本：{source.inherited_from.basis_ref}。本次未重新接纳。</small> : null}
         {source.selection_reason ? <small>选择理由：{source.selection_reason}</small> : null}
         {source.binding?.version_ref ? <small>资料版本：{source.binding.version_ref}</small> : null}
       </li>)}</ul> : <p>当前未登记资料来源。</p>}
     </details>
+    {basis.inherited_literature?.length ? <div>
+      <h3>沿用的文献身份</h3>
+      <p>这些快照保留原检索身份，不表示本次进行了新检索。</p>
+      <ul>{basis.inherited_literature.map((item) => <li key={item.snapshot.snapshot_ref}>
+        <small>{item.snapshot.snapshot_ref} · {item.snapshot.snapshot_hash}</small>
+        <small>原检索：{item.snapshot.binding.run_ref}</small>
+        <small>原绑定依据：{item.original_basis.basis_ref}</small>
+      </li>)}</ul>
+    </div> : null}
     {basis.kind === "literature_revised" ? <div>
       <h3>文献带来的修正</h3>
       {basis.corrections.length ? <ul>{basis.corrections.map((correction, index) => <li key={`${correction.prior_statement_ref}-${index}`}>

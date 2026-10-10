@@ -323,6 +323,28 @@ export type CreationResearchBasis = {
   human_reviewed_draft?: { revision: number; hash: string } | null;
   input_identity?: CreationInputIdentity | null;
   input_identity_hash?: string | null;
+  predecessor?: { basis_ref: string; basis_hash: string; kind: string } | null;
+  applicability?: {
+    predecessor: { basis_ref: string; basis_hash: string; kind: string };
+    change_assessment: string;
+    decisions: Array<{
+      prior_statement_ref: string; prior_text: string;
+      disposition: "retain" | "replace" | "needs_recheck" | "out_of_scope";
+      explanation: string; applicable_conditions: string[]; affected_scope: string;
+      creation_limit: "none" | "required_first_question" | "future_research";
+      replacement_refs: string[];
+    }>;
+    literature_decisions: Array<{
+      snapshot_ref: string; snapshot_hash: string;
+      disposition: "retain" | "needs_recheck" | "out_of_scope";
+      applicable_conditions: string[]; affected_scope: string; limitations: string;
+    }>;
+  } | null;
+  inherited_literature?: Array<{
+    snapshot: { snapshot_ref: string; snapshot_hash: string; binding: { run_ref: string } };
+    original_basis: { basis_ref: string; basis_hash: string; kind: string };
+    applicability: { applicable_conditions: string[]; affected_scope: string; limitations: string };
+  }>;
   material_references?: {
     anchor: CreationAnchor;
     references: Array<{ reference_ref: string; submission_ref: string; source: ServerMaterialSelection; description: string }>;
@@ -334,6 +356,7 @@ export type CreationResearchBasis = {
   }>>;
   sources: Array<{ material_key: string; relative_path: string; selection_reason: string | null;
     source?: CreationMaterialSource;
+    inherited_from?: { basis_ref: string; basis_hash: string; kind: string };
     custody?: "managed" | "linked_local" | null;
     binding?: AssetEvidenceBinding | null;
     intake_state?: "pending" | "accepted" | "failed" | null;
@@ -535,6 +558,8 @@ export type IntentSessionTurn = {
   assistant_content: string | null;
   assistant_content_hash: string | null;
   reason: null | { code: string };
+  native_session_generation?: number;
+  native_session_ref?: string | null;
 };
 
 export type TargetAssertion = {
@@ -623,6 +648,13 @@ export type QuestCreationView = {
     ref: string;
     status: "open" | "closed";
     turns: IntentSessionTurn[];
+    native_session_generation?: number;
+    native_session_ref?: string | null;
+    native_sessions?: Array<{ generation: number; native_session_ref: string | null; created_at: number }>;
+    can_start_new_session?: boolean;
+    switch_block_reason?: string | null;
+    workspace_ref?: string | null;
+    workspace_path?: string | null;
   };
   acquisition_session: AcquisitionSessionProjection | null;
   deepfetch: DeepFetchProjection | null;
@@ -2343,6 +2375,18 @@ export type CompanionMessage = {
   created_at?: number;
   reason?: { code?: string } | null;
   view_context?: CompanionViewContext | null;
+  native_session_generation?: number;
+  native_session_ref?: string | null;
+};
+
+export type CompanionSessionSwitch = {
+  scope_ref: string;
+  session_ref: string;
+  status: "switched";
+  native_session_generation: number;
+  native_session_ref: null;
+  previous_native_session_ref: string | null;
+  switch_ref: string;
 };
 
 export type GuidanceStrength = 1 | 2 | 3 | 4 | 5;
@@ -2739,6 +2783,13 @@ export type HumanCollaborationProjection = {
     status: "ready" | "unavailable";
     scope_ref?: string | null;
     session_ref: string | null;
+    native_session_generation?: number;
+    native_session_ref?: string | null;
+    can_start_new_session?: boolean;
+    switch_block_reason?: string | null;
+    workspace_ref?: string | null;
+    workspace_path?: string | null;
+    native_sessions?: Array<{ generation: number; native_session_ref: string | null; created_at: number }>;
     messages: CompanionMessage[];
     soft_constraints: CompanionSoftConstraint[];
     agent_proposals: CompanionAgentProposal[];
@@ -3500,6 +3551,10 @@ export function sendCompanionMessage(
     message,
     ...(viewContext ? { view_context: viewContext } : {}),
   });
+}
+
+export function startNewCompanionSession(scopeRef: string): Promise<CompanionSessionSwitch> {
+  return writeJson("/api/v1/companion/sessions/new", "POST", { scope_ref: scopeRef });
 }
 
 export function readHumanRequestHandoff(
@@ -4282,6 +4337,14 @@ export function sendIntentMessage(
       expected_draft_hash: creation.quest_draft.hash,
       message,
     },
+  );
+}
+
+export function startNewIntentSession(initializationId: string): Promise<QuestCreationView> {
+  return writeJson(
+    `/api/v1/quest-initializations/${encodeURIComponent(initializationId)}/intent-session/new`,
+    "POST",
+    {},
   );
 }
 
@@ -5850,6 +5913,9 @@ export function followProjection(
     "human_collaboration.guidance_prepared",
     "human_collaboration.guidance_read",
     "human_collaboration.guidance_treated",
+    "human_collaboration.work_materials_submitted",
+    "human_collaboration.work_material_read",
+    "human_collaboration.work_material_treated",
     "human_collaboration.soft_constraint_withdrawn",
     "human_collaboration.agent_proposal_recorded",
     "human_collaboration.command_draft_created",

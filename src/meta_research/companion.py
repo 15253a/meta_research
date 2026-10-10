@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, cast
 
@@ -17,6 +18,7 @@ from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
     IdeaSkillUnavailable,
     _read_operation_invocation,
+    _file_sha256,
 )
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.provider_supervisor import (
@@ -43,7 +45,7 @@ from meta_research.root_capabilities import RootCapabilityProfile, root_capabili
 from meta_research.creation_basis import (
     InitializationUnderstandingRequest, InitializationUnderstandingResult,
     FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult,
-    first_creation_instructions, understanding_schema, revision_schema,
+    first_creation_instructions, understanding_schema, revision_schema, reassessment_schema,
 )
 
 
@@ -52,7 +54,8 @@ class CodexCompanionAdapter(
 ):
     """One complete, persistent Companion Root and its short-lived proposal forks.
 
-    Companion turns resume the same native Root Session.  A Proposal generation
+    Companion turns resume their generation's native Root Session; `/new`
+    starts a fresh generation in the same workspace. A Proposal generation
     is not another narrow provider: the Companion must spawn exactly one fresh
     child with inherited context, wait for it, and return its schema-constrained
     draft.  A short child message points to the exact current materials already
@@ -93,6 +96,23 @@ class CodexCompanionAdapter(
     def capability_profile(self) -> RootCapabilityProfile:
         return root_capability_profile("companion")
 
+    def runtime_binding(self):
+        binding = super().runtime_binding()
+        guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
+        source_hash = _file_sha256(Path(__file__).resolve())
+        return replace(binding,
+            packaged_skill_bundle_hash=canonical_hash({
+                "inherited": binding.packaged_skill_bundle_hash, "companion-work.md": guidance,
+            }),
+            instruction_set_hash=canonical_hash({
+                "inherited": binding.instruction_set_hash,
+                "companion-work.md": guidance, "companion_source": source_hash,
+            }),
+            resource_bindings=(*binding.resource_bindings,
+                "package:meta_research.skills/companion-work.md@sha256:" + canonical_hash(guidance),
+                "adapter-source:meta_research.companion@sha256:" + source_hash),
+        )
+
     def cancel_job(self, job_ref: str) -> bool:
         with self._creation_call_lock:
             runners = [runner for key, runner in self._creation_calls.items()
@@ -132,6 +152,9 @@ class CodexCompanionAdapter(
         extra = ()
         if basis is not None:
             work.bind_context_readers(basis, getattr(request, "literature_snapshot", None))
+            extra = ("research_memory.creation_basis.read", "research_memory.content.read")
+        elif getattr(request, "reassessment", None) is not None:
+            work.bind_reassessment_readers(request.reassessment)
             extra = ("research_memory.creation_basis.read", "research_memory.content.read")
         guidance_root = Path(__file__).parent / "skills" / "first_creation"
         names = ("SKILL.md", "references/source-evidence.md", "references/literature-corrections.md")
@@ -262,16 +285,29 @@ class CodexCompanionAdapter(
         try:
             if request.inputs is not None:
                 prompt = ("Read registered material entrances only through the granted bounded discover/read/copy MCP tools. "
-                    "Return the reference understanding schema using actual returned opaque witness_ref citations. "
-                    "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
+                    + ("Return the reference understanding schema using actual returned opaque witness_ref citations. "
+                       if request.reassessment is None else "Return the reassessment delta using actual returned opaque witness_ref citations for new reads. ")
+                    + "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
                     "A directory is never completely read merely because one child was read.\n"
-                    + _canonical_json({"instruction_bundle": instructions, "draft": request.draft}))
+                    + _canonical_json({"instruction_bundle": instructions, "draft": request.draft,
+                        "reassessment": request.reassessment}))
+                if request.reassessment is not None:
+                    prompt += ("\nJudge each prior statement's applicability and conditions. "
+                        "Read only affected content. Explicitly inherit eligible witnesses with their original operation identity. "
+                        "Emit each inherited witness once, using eligible live_source for current reuse. Never emit the same witness "
+                        "as both live_source and managed_history. Retain its selected exact version separately in inherited_selection_keys; "
+                        "managed custody does not require a managed_history entry for a live witness. "
+                        "Managed history supports historical statements, never current read coverage. Mark necessary first-Question "
+                        "checks versus future research without a global waiting gate. Decide separately for every old literature snapshot. "
+                        "Reuse selected exact versions instead of selecting them for intake again.")
                 raw, native_ref, _stdout, identity, work = self._protected_creation_invoke(request,
                     operation_name="initialization-understanding", prompt=prompt,
-                    schema=understanding_schema(references=True), native_session_ref=request.companion_native_session_ref, inputs=request.inputs)
+                    schema=reassessment_schema() if request.reassessment is not None else understanding_schema(references=True),
+                    native_session_ref=request.companion_native_session_ref, inputs=request.inputs)
                 if native_ref is None:
                     raise DraftingUnavailable("companion_native_session_missing")
-                return InitializationUnderstandingResult(raw, native_ref, identity, work)
+                return InitializationUnderstandingResult({} if request.reassessment is not None else raw, native_ref, identity, work,
+                    raw if request.reassessment is not None else None)
             raw, native_ref, _stdout = self._invoke(operation_name="initialization-understanding", prompt=prompt,
                 schema=understanding_schema(), native_session_ref=request.companion_native_session_ref,
                 job_ref=request.job_ref, workspace_binding=self._creation_workspace(request))
@@ -293,6 +329,9 @@ class CodexCompanionAdapter(
             "Read the small exact context projection through its declared input paths. "
             "Use the granted scoped Readers for selected original sources and literature evidence, and bounded material tools for new original reads. "
             "Preserve the prepared basis and source selection. "
+            "Read applicability.json and inherited-literature.json when present. Reuse applicable statements and exact selected versions; "
+            "do not repeat unaffected material reads. Inherited literature retains its original snapshot, run and binding. "
+            "A direct route may use explicitly inherited literature without presenting it as a new search. "
             "Return the six proposal fields and the route-specific revision. A direct route returns revision=null. "
             "A DeepFetch route returns a complete literature revision with explicit corrections or an honest unchanged/empty assessment. "
             "No Owner writes, receipts, human confirmation, or invented Quest Run.\n"
@@ -426,8 +465,9 @@ class CodexCompanionAdapter(
             )
         elif companion:
             role_instruction = (
-                "你是长期存在的全局 Companion 根智能体。依据 current_draft 中已投影"
-                "的事实解释研究、总结状态并提出可撤回建议；不得把聊天推断成人类授权。"
+                "你是当前研究范围内独立的 Companion 根智能体。依据人的要求和已有授权，"
+                "分步调查、执行和核验工作，说明实际结果、读取范围与局限。"
+                "当前研究事实提供定位，必要材料按需读取。正式答复由人审阅选择并明确提交。"
             )
             context_identity = f"scope_ref={request.initialization_id}\n"
         else:
@@ -436,6 +476,11 @@ class CodexCompanionAdapter(
                 "意图，但只能回复建议；不得修改草稿、确认 bundle 或签发 receipt。"
             )
             context_identity = f"initialization_id={request.initialization_id}\n"
+            if request.draft.get("companion_context"):
+                role_instruction += (
+                    "旧对话可沿 companion_context.prior_conversations 中的工作区路径按需读取；"
+                    "新会话不自动导入旧对话全文。"
+                )
         prompt = (
             role_instruction
             + CHAT_REPLY_PROGRESS_INSTRUCTION
@@ -446,6 +491,9 @@ class CodexCompanionAdapter(
             f"current_draft={_canonical_json(request.draft)}\n"
             f"user_message={request.message}"
         )
+        if companion:
+            guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
+            prompt += "\n\n<!-- bundled resource: companion-work.md -->\n" + guidance
         if request.job_ref is not None:
             prompt = preserve_existing_reply_prompt(
                 prompt,

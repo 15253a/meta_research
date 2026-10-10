@@ -69,8 +69,8 @@ class _WorkspaceReasoning(_WorkspaceDraft, _Reasoning):
         return draft
 
 
-def _cleanup_runtime(path):
-    skills = {'idea': _WorkspaceIdea(), 'plan': _WorkspacePlan(no_gap=False),
+def _cleanup_runtime(path, *, idea=None):
+    skills = {'idea': idea or _WorkspaceIdea(), 'plan': _WorkspacePlan(no_gap=False),
         'bundle': _WorkspaceBundle(), 'reasoning': _WorkspaceReasoning(entry_stage='idea')}
     runtime = _reasoning_runtime(path, idea_skill=skills['idea'], plan_skill=skills['plan'],
         bundle_skill=skills['bundle'], reasoning_skill=skills['reasoning'])
@@ -80,8 +80,8 @@ def _cleanup_runtime(path):
     return runtime
 
 
-def _complete(tmp_path, *, publish=True, finish_cycle=True):
-    seeded = _cleanup_runtime(tmp_path / "cleanup-root")
+def _complete(tmp_path, *, publish=True, finish_cycle=True, runtime=None):
+    seeded = runtime or _cleanup_runtime(tmp_path / "cleanup-root")
     quest = _confirm_deepfetch_quest(seeded)
     _finish_stage(seeded, 'idea')
     _finish_plan_stage(seeded)
@@ -188,6 +188,28 @@ def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_r
         print('CYCLE_CLEANUP ' + json.dumps({'cycle_ref': cycle, 'report': result,
             'rm_readback': '36\n', 'reasoning_outcome_readable': True,
             'successor_discovery': discovery, 'external_original_readable': True}, sort_keys=True))
+    finally:
+        runtime.close()
+
+
+def test_cycle_cleanup_and_native_rotation_keep_the_companion_workspace(tmp_path):
+    runtime, _, _, cycle_workspace, _, _, _ = _complete(tmp_path)
+    try:
+        human = runtime.owners.human_collaboration
+        quest_ref = runtime.owners.research_graph.query_question_tree()[0].quest_ref
+        scope_ref = "quest:" + quest_ref
+        session = human.query_companion(scope_ref)
+        binding = runtime.root_workspaces.bind_companion_session(scope_ref, session["session_ref"])
+        (binding.directory / "retained-investigation.txt").write_text("Still useful across Cycles.", encoding="utf-8")
+        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        assert {item["root_kind"] for item in report if item["action"] == "removed"} == {
+            "target", "idea", "plan", "bundle", "reasoning"}
+        assert not cycle_workspace.exists()
+        assert all(item["path"] != str(binding.directory) for item in report)
+        human.start_new_companion_session(scope_ref, "after-cycle-cleanup")
+        assert human.query_companion(scope_ref)["workspace_ref"] == session["workspace_ref"]
+        assert runtime.root_workspaces.read_companion_session(scope_ref, session["session_ref"],
+            workspace_ref=session["workspace_ref"], path="retained-investigation.txt")["content"] == b"Still useful across Cycles."
     finally:
         runtime.close()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import subprocess
 import threading
 import time
@@ -1442,7 +1443,23 @@ sys.stdout.flush()
 def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifacts(
     tmp_path: Path,
 ) -> None:
-    runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
+    class GuidanceRunner(SequencedPrototypeRunner):
+        def __call__(self, argv, prompt, timeout):
+            roots = [line.removeprefix("deepfetch_skill_root=") for line in prompt.splitlines()
+                if line.startswith("deepfetch_skill_root=")]
+            if roots:
+                root = Path(roots[0])
+                skill = root / "SKILL.md"
+                references = re.findall(r"\]\((references/[^)]+)\)", skill.read_text(encoding="utf-8"))
+                self.loaded_files = [skill, *(root / path for path in dict.fromkeys(references))]
+                loaded = subprocess.run(["/bin/cat", *(str(path) for path in self.loaded_files)], capture_output=True, check=True)
+                assert loaded.stdout == b"".join(path.read_bytes() for path in self.loaded_files)
+                scopes = [line.removeprefix("scope=") for line in prompt.splitlines() if line.startswith("scope=")]
+                if scopes:
+                    self.loaded_scope = json.loads(scopes[0])
+            return super().__call__(argv, prompt, timeout)
+
+    runner = GuidanceRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
     adapter = _bind_acquisition(
         CodexDeepFetchAdapter(
@@ -1453,7 +1470,13 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
         acquisition,
     )
 
-    result = _execute(adapter)
+    scope = {"goal": "Check only cold-condition transfer.",
+        "creation_basis": {"basis_ref": "creation_basis_current", "basis_hash": "d" * 64, "kind": "prepared"},
+        "existing_work_applicability": {"change_assessment": "Only cold-condition transfer changed."},
+        "inherited_literature": [{"snapshot": {"snapshot_ref": "literature_snapshot_prior", "snapshot_hash": "e" * 64,
+            "binding": {"run_ref": "deepfetch_run_prior"}},
+            "original_basis": {"basis_ref": "creation_basis_prior", "basis_hash": "f" * 64, "kind": "prepared"}}]}
+    result = _execute(adapter, replace(_request(), scope=scope, scope_hash=canonical_hash(scope)))
 
     assert result.completion == "complete"
     assert result.summary.startswith("# 范围")
@@ -1494,6 +1517,8 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
     assert len(acquisition.calls) == 1
     assert set((tmp_path / "provider").glob("runs/*/public/*"))
     assert result.web_evidence is not None
+    assert runner.loaded_scope == scope
+    assert {path.name for path in runner.loaded_files} >= {"SKILL.md", "creation-basis.md", "agents.md", "ledger-tools.md"}
 
 
 def test_deepfetch_turns_use_and_revoke_exact_operation_tree_channels(

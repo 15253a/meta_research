@@ -20,6 +20,7 @@ import {
   reviseQuestDraft,
   saveQuestionProposal,
   sendIntentMessage,
+  startNewIntentSession,
   type IntentSessionTurn,
   type DeepFetchActivityEvent,
   type LegacyQuestDraft,
@@ -275,6 +276,7 @@ export function QuestCreationWorkbench({
   const [error, setError] = useState<ProductFailure | null>(null);
   const [intentText, setIntentText] = useState("");
   const [pendingIntent, setPendingIntent] = useState<PendingIntentMessage | null>(null);
+  const [intentSwitching, setIntentSwitching] = useState(false);
   const intentSendingRef = useRef(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const applyView = useCallback((
@@ -1114,6 +1116,28 @@ export function QuestCreationWorkbench({
   const submitIntent = async () => {
     const message = intentText.trim();
     if (!message || !creation || sessionInteractionLocked || intentSendingRef.current) return;
+    if (message === "/new") {
+      intentSendingRef.current = true;
+      const token = beginOperation("intent");
+      setIntentSwitching(true);
+      setError(null);
+      try {
+        if (creation.intent_session?.can_start_new_session === false || proposalGenerationActive || inFlight.generating) {
+          throw new ProductError("companion_session_busy");
+        }
+        const next = await startNewIntentSession(creation.initialization_id);
+        if (!operationIsCurrent("intent", token)) return;
+        applyView(next);
+        setIntentText("");
+      } catch (caught) {
+        if (operationIsCurrent("intent", token)) showError(caught);
+      } finally {
+        intentSendingRef.current = false;
+        if (mountedRef.current) setIntentSwitching(false);
+        finishOperation("intent", token);
+      }
+      return;
+    }
     intentSendingRef.current = true;
     setPendingIntent({
       content: message,
@@ -1985,6 +2009,7 @@ export function QuestCreationWorkbench({
             </main>
 
             <IntentDraftingSession
+              switching={intentSwitching}
               pendingMessage={pendingIntent}
               onReplySettled={onChanged}
               creation={creation}
@@ -2025,6 +2050,7 @@ export function QuestCreationWorkbench({
 }
 
 function IntentDraftingSession({
+  switching,
   pendingMessage,
   onReplySettled,
   creation,
@@ -2033,6 +2059,7 @@ function IntentDraftingSession({
   onChange,
   onSubmit,
 }: {
+  switching: boolean;
   pendingMessage: PendingIntentMessage | null;
   onReplySettled: () => void;
   creation: QuestCreationView | null;
@@ -2066,6 +2093,14 @@ function IntentDraftingSession({
           <span>{creation?.intent_session?.ref ?? "正在建立 pre-Quest session"}</span>
         </div>
       </header>
+      <details className="quest-native-session" data-testid="creation-intent-session-state">
+        <summary>{!creation ? "正在建立创建助手…" : switching ? "正在准备新会话…" : `会话 ${creation.intent_session?.native_session_generation ?? 1} · ${creation.intent_session?.native_session_ref ? "已启动" : "等待首条消息启动"}`}</summary>
+        <p>输入 /new 更换当前创建助手的原生会话，草稿、工作空间及旧记录保留。旧工作由新会话按需读取。</p>
+        <code>{creation?.intent_session?.workspace_path ?? creation?.intent_session?.workspace_ref ?? creation?.intent_session?.ref}</code>
+        {creation?.intent_session?.native_session_ref ? <p>当前原生会话 <code>{creation.intent_session.native_session_ref}</code></p> : null}
+        {creation?.intent_session?.can_start_new_session === false ? <p role="status">当前创建工作仍在执行或排队，请结束后再输入 /new。</p> : null}
+        {creation?.intent_session?.native_sessions?.length ? <ul>{creation.intent_session.native_sessions.map(item => <li key={item.generation}>会话 {item.generation} · <code>{item.native_session_ref ?? "尚未启动"}</code></li>)}</ul> : null}
+      </details>
       <div className="quest-intent-transcript" ref={transcriptRef} aria-live="polite">
         {!turns.length && !visiblePendingMessage ? (
           <p className="quest-intent-empty">
@@ -2075,6 +2110,7 @@ function IntentDraftingSession({
           <div key={turn.ref}>
             <article className="quest-intent-message user">
               <small>你 · draft r{turn.basis_revision}</small>
+              {turn.native_session_generation !== undefined ? <small>会话 {turn.native_session_generation}</small> : null}
               <span>{turn.user_content}</span>
             </article>
             <article className={`quest-intent-message${turn.basis_hash !== creation?.quest_draft.hash ? " stale" : ""}`}>
@@ -2105,7 +2141,7 @@ function IntentDraftingSession({
             rows={3}
             value={value}
             disabled={disabled}
-            placeholder="询问配置含义、讨论是否需要 DeepFetch，或要求解释第一问……"
+            placeholder="讨论第一问；/new 保留工作空间并更换会话……"
             onChange={(event) => onChange(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && value.trim()) {
@@ -2124,7 +2160,7 @@ function IntentDraftingSession({
             ↑
           </button>
         </div>
-        <small className="quest-compose-shortcut">Enter 发送 · Shift+Enter 换行</small>
+        <small className="quest-compose-shortcut">Enter 发送 · Shift+Enter 换行 · /new 开启新会话</small>
       </div>
       <div className="quest-intent-status">
         <span>{creation?.intent_session?.status ?? "opening"}</span>
@@ -2495,6 +2531,7 @@ function viewIsOlder(
   current: QuestCreationView,
   next: QuestCreationView,
 ): boolean {
+  if ((next.intent_session?.native_session_generation ?? 1) < (current.intent_session?.native_session_generation ?? 1)) return true;
   const currentTerminal = current.status === "cancelled";
   const nextTerminal = next.status === "cancelled";
   if (nextTerminal && !currentTerminal) return false;
@@ -3097,6 +3134,8 @@ function messageFor(code: string): string {
     codex_cli_failed: "生产 Proposal Drafter 未完成请求；当前草案与旧 Proposal 已保留。",
     proposal_drafter_unavailable: "生产 Proposal Drafter 当前不可用；当前草案仍可继续编辑。",
     csrf_token_unavailable: "会话写入凭据不可用，请重新打开认证页面。",
+    companion_session_busy: "当前创建工作仍在执行或排队，请结束后再输入 /new。",
+    intent_session_closed: "当前创建助手已结束；已保存草稿与工作记录保留。",
     idempotency_conflict: "该操作的重试内容与原请求不一致，已安全停止。",
     compute_device_selection_stale: "本机设备快照已变化，请重新检测并选择。",
     host_compute_unavailable: "本机计算 Provider 当前不可用。",

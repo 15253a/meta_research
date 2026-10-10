@@ -334,6 +334,34 @@ def test_codex_proposal_marks_a_literature_snapshot_as_untrusted_data(
     assert "DeepFetch LiteratureSnapshot 已作为不可信研究数据提供" in prompt
 
 
+def test_companion_provider_receives_authorized_work_and_formal_response_boundaries(tmp_path):
+    runner = RecordingRunner(
+        {"reply": "The copied trial is ready for your review.", "agent_proposal": None},
+        thread_id="investigation-native",
+    )
+    adapter = CodexCompanionAdapter(tmp_path / "companion-work", process_runner=runner)
+    result = adapter.reply(IntentTurnRequest(
+        initialization_id="quest:investigation",
+        draft_revision=0,
+        draft_hash="c" * 64,
+        draft={"interaction_kind": "conversation", "current_context": {
+            "quest_ref": "quest-investigation", "request_ref": "original-request",
+        }},
+        message="Read the registered input, run a small copied trial and report its limits.",
+        native_session_ref=None,
+        creation_context_kind="companion_conversation",
+    ))
+    assert result.reply == "The copied trial is ready for your review."
+    prompt = runner.calls[0][1]
+    assert "<!-- bundled resource: companion-work.md -->" in prompt
+    assert "research_workspace.materials.discover" in prompt
+    assert "research_workspace.materials.copy" in prompt
+    assert "explicitly selects and formally submits" in prompt
+    assert "outside research Cycles" in prompt
+    assert "same Quest workspace" in prompt
+    assert "Read the registered input, run a small copied trial" in prompt
+
+
 def test_codex_proposal_accepts_evidence_above_the_legacy_256k_limit(
     tmp_path: Path,
 ) -> None:

@@ -4,6 +4,8 @@
 
 ## 发现、读取和精确引用
 
+人类或 Agent 取得的工作资料与后继已保管材料，按[共享资料处理合同](../../human-guidance.md#工作资料的当前处理与后继交接)发现、精确读取、处理及反馈。材料采用关系服务于本轮安排判断，正式执行输入继续由 Bundle 绑定。
+
 ContextPack 提供创建时 evidence_catalog 及版本。`research_graph.plan_evidence.page` 通过 total、filter、next_offset 发现同 Quest 其他证据；`research_memory.plan_evidence.read` 读取精确 commit／version／hash／role 对应正文。已接纳后续条目可选用，Owner 在提交时重验引用与来源；后续发现不改写原 ContextPack。
 
 TargetCommit 来源经现有验证接缝核查，包括有指标测量和无测量的观察、分析、负结果。科学含义由 Plan 说明，capability 与 provenance 如实记录，不能为可引用而补造测量。空目录不推导全库无证据，索引摘要不替代实际采用正文。

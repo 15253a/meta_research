@@ -408,7 +408,61 @@ class SQLiteHumanCollaborationLadder:
                 "now": now,
             },
         )
+        connection.execute(text(
+            "INSERT INTO hc_companion_native_sessions "
+            "(session_ref,generation,native_session_ref,created_at) "
+            "VALUES (:session_ref,1,:native_session_ref,:now)"),
+            {"session_ref": session_ref, "native_session_ref": native_session_ref, "now": now})
         return session_ref, True
+
+    def start_new_companion_session(self, scope_ref: str, idempotency_key: str) -> dict[str, object]:
+        """Switch only at an idle boundary; retries return the original switch."""
+        scope_ref = _scope_ref(scope_ref, "companion_scope_required")
+        _idempotency_key(idempotency_key)
+        command_hash = canonical_hash({"command": "start_new_companion_session", "scope_ref": scope_ref})
+        with self._database.fenced_write() as connection:
+            switch_ref = _collaboration_command(connection, idempotency_key, "companion_session_new", command_hash)
+            if switch_ref is None:
+                session_ref, created = self._ensure_companion_session_row(connection, scope_ref)
+                session = connection.execute(text(
+                    "SELECT * FROM hc_companion_sessions WHERE session_ref=:session_ref"),
+                    {"session_ref": session_ref}).one()
+                pending = connection.execute(text(
+                    "SELECT COUNT(*) FROM hc_companion_turns WHERE session_ref=:session_ref "
+                    "AND assistant_status IN ('queued','processing')"), {"session_ref": session_ref}).scalar_one()
+                if pending:
+                    raise OwnerConflict("companion_session_busy")
+                generation = int(session.native_session_generation) + 1
+                now = time.time()
+                switch_ref = new_ref("companion_switch")
+                connection.execute(text(
+                    "INSERT INTO hc_companion_native_sessions (session_ref,generation,created_at) "
+                    "VALUES (:session_ref,:generation,:now)"),
+                    {"session_ref": session_ref, "generation": generation, "now": now})
+                connection.execute(text(
+                    "INSERT INTO hc_companion_session_switches "
+                    "(switch_ref,scope_ref,session_ref,generation,previous_native_session_ref,created_at) "
+                    "VALUES (:switch_ref,:scope_ref,:session_ref,:generation,:previous,:now)"),
+                    {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
+                        "generation": generation, "previous": session.native_session_ref, "now": now})
+                connection.execute(text(
+                    "UPDATE hc_companion_sessions SET native_session_ref=NULL, "
+                    "native_session_generation=:generation,updated_at=:now WHERE session_ref=:session_ref"),
+                    {"session_ref": session_ref, "generation": generation, "now": now})
+                _record_collaboration_command(connection, idempotency_key, "companion_session_new", command_hash, switch_ref)
+                connection.execute(text(
+                    "UPDATE human_collaboration_state SET revision=revision+1, "
+                    "companion_session_count=companion_session_count+:created WHERE singleton='owner'"),
+                    {"created": int(created)})
+                self._feed.record(connection, "human_collaboration.companion_session_switched",
+                    {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
+                        "native_session_generation": generation})
+            switch = connection.execute(text(
+                "SELECT * FROM hc_companion_session_switches WHERE switch_ref=:switch_ref"),
+                {"switch_ref": switch_ref}).one()
+        return {"scope_ref": switch.scope_ref, "session_ref": switch.session_ref, "status": "switched",
+            "switch_ref": switch.switch_ref, "native_session_generation": int(switch.generation),
+            "native_session_ref": None, "previous_native_session_ref": switch.previous_native_session_ref}
 
     def send_companion_message(
         self,
@@ -461,7 +515,7 @@ class SQLiteHumanCollaborationLadder:
             _reject_secret_content(
                 _document(resolved, "companion_context_invalid")
             )
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
                     "SELECT * FROM hc_companion_turns WHERE idempotency_key = "
@@ -489,6 +543,9 @@ class SQLiteHumanCollaborationLadder:
                     connection,
                     scope_ref,
                 )
+                native = connection.execute(text(
+                    "SELECT native_session_generation,native_session_ref FROM hc_companion_sessions "
+                    "WHERE session_ref=:session_ref"), {"session_ref": session_ref}).one()
                 ordinal = int(
                     connection.execute(
                         text(
@@ -505,14 +562,16 @@ class SQLiteHumanCollaborationLadder:
                         "ordinal, message, message_hash, view_context_json, "
                         "view_context_hash, assistant_status, "
                         "attempt_count, idempotency_key, command_hash, created_at, "
-                        "updated_at) VALUES (:interaction_ref, :session_ref, :ordinal, "
+                        "updated_at, native_session_generation, native_session_ref) VALUES (:interaction_ref, :session_ref, :ordinal, "
                         ":message, :message_hash, :view_context_json, "
                         ":view_context_hash, 'queued', 0, :idempotency_key, "
-                        ":command_hash, :now, :now)"
+                        ":command_hash, :now, :now, :native_session_generation, :native_session_ref)"
                     ),
                     {
                         "interaction_ref": interaction_ref,
                         "session_ref": session_ref,
+                        "native_session_generation": int(native.native_session_generation),
+                        "native_session_ref": native.native_session_ref,
                         "ordinal": ordinal,
                         "message": message,
                         "message_hash": canonical_hash(message),
@@ -554,13 +613,16 @@ class SQLiteHumanCollaborationLadder:
     def process_drafting_once(self) -> bool:
         if self._recover_completed_companion_root_scope():
             return True
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             row = connection.execute(
                 text(
-                    "SELECT turns.*, sessions.scope_ref, sessions.native_session_ref "
+                    "SELECT turns.*, sessions.scope_ref, native.native_session_ref AS generation_native_session_ref "
                     "FROM hc_companion_turns AS turns JOIN hc_companion_sessions AS "
-                    "sessions ON sessions.session_ref = turns.session_ref WHERE "
-                    "turns.assistant_status = 'queued' OR (turns.assistant_status "
+                    "sessions ON sessions.session_ref = turns.session_ref JOIN hc_companion_native_sessions AS native "
+                    "ON native.session_ref=turns.session_ref AND native.generation=turns.native_session_generation WHERE "
+                    "(turns.assistant_status = 'queued' AND NOT EXISTS (SELECT 1 FROM hc_companion_turns earlier "
+                    "WHERE earlier.session_ref=turns.session_ref AND earlier.ordinal<turns.ordinal "
+                    "AND earlier.assistant_status IN ('queued','processing'))) OR (turns.assistant_status "
                     "= 'processing' AND EXISTS (SELECT 1 FROM ar_run_controls AS "
                     "controls WHERE controls.run_ref = turns.interaction_ref AND "
                     "controls.run_kind = 'companion' AND controls.status IN "
@@ -574,11 +636,12 @@ class SQLiteHumanCollaborationLadder:
                 text(
                     "UPDATE hc_companion_turns SET assistant_status = 'processing', "
                     "attempt_count = attempt_count + :attempt_increment, reason_code "
-                    "= NULL, updated_at = :now WHERE interaction_ref = "
+                    "= NULL, native_session_ref=COALESCE(native_session_ref,:native_session_ref), updated_at = :now WHERE interaction_ref = "
                     ":interaction_ref AND assistant_status = :prior_status"
                 ),
                 {
                     "interaction_ref": row.interaction_ref,
+                    "native_session_ref": row.generation_native_session_ref,
                     "attempt_increment": (
                         1 if row.assistant_status == "queued" else 0
                     ),
@@ -685,7 +748,7 @@ class SQLiteHumanCollaborationLadder:
                 control_revision = registered.get("control_revision")
                 if (
                     row.assistant_status == "processing"
-                    and row.native_session_ref is not None
+                    and (row.native_session_ref or row.generation_native_session_ref) is not None
                     and registered.get("status") == "running"
                     and isinstance(control_revision, int)
                     and not isinstance(control_revision, bool)
@@ -700,6 +763,7 @@ class SQLiteHumanCollaborationLadder:
                 "scope_ref": row.scope_ref,
                 "authoritative_effect": False,
                 "current_context": context,
+                "native_session_generation": int(row.native_session_generation),
             }
             if continuation_control_revision is not None:
                 draft["human_request_resume"] = {
@@ -717,7 +781,7 @@ class SQLiteHumanCollaborationLadder:
                 draft_hash=canonical_hash(draft),
                 draft=draft,
                 message=row.message,
-                native_session_ref=row.native_session_ref,
+                native_session_ref=row.native_session_ref or row.generation_native_session_ref,
                 job_ref=provider_job_ref,
                 root_runtime_scope=root_runtime_scope,
                 creation_context_kind="companion_conversation",
@@ -751,24 +815,10 @@ class SQLiteHumanCollaborationLadder:
                     agent_proposal, "agent_proposal_invalid"
                 )
                 _reject_secret_content(agent_proposal)
+            with self._database.fenced_write() as connection:
+                self._checkpoint_companion_native(connection, row, native_session_ref)
             if root_runtime_scope is not None:
                 assert self._agent_runtime is not None
-                with self._database.write() as connection:
-                    checkpointed = connection.execute(
-                        text(
-                            "UPDATE hc_companion_sessions SET native_session_ref = "
-                            ":native_session_ref, updated_at = :now WHERE "
-                            "session_ref = :session_ref AND (native_session_ref IS "
-                            "NULL OR native_session_ref = :native_session_ref)"
-                        ),
-                        {
-                            "native_session_ref": native_session_ref,
-                            "now": time.time(),
-                            "session_ref": row.session_ref,
-                        },
-                    )
-                    if not checkpointed.rowcount:
-                        raise OwnerConflict("companion_native_session_stale")
                 registered = self._agent_runtime.register_external_root_task_scope(
                     root_kind="companion",
                     root_runtime_scope=root_runtime_scope,
@@ -805,24 +855,7 @@ class SQLiteHumanCollaborationLadder:
                     )
                     _reject_secret_content(native_session_ref)
                     with self._database.write() as connection:
-                        checkpointed = connection.execute(
-                            text(
-                                "UPDATE hc_companion_sessions SET "
-                                "native_session_ref = :native_session_ref, "
-                                "updated_at = :now WHERE session_ref = "
-                                ":session_ref AND (native_session_ref IS NULL OR "
-                                "native_session_ref = :native_session_ref)"
-                            ),
-                            {
-                                "native_session_ref": native_session_ref,
-                                "now": time.time(),
-                                "session_ref": row.session_ref,
-                            },
-                        )
-                        if not checkpointed.rowcount:
-                            raise OwnerConflict(
-                                "companion_native_session_stale"
-                            )
+                        self._checkpoint_companion_native(connection, row, native_session_ref)
                     finish_job = getattr(
                         self._drafting_provider, "finish_job", None
                     )
@@ -900,7 +933,15 @@ class SQLiteHumanCollaborationLadder:
             if callable(finish_job) and not outcome_unknown:
                 finish_job(provider_job_ref)
             return True
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
+            current = connection.execute(text(
+                "SELECT turns.assistant_status,sessions.native_session_generation FROM hc_companion_turns turns "
+                "JOIN hc_companion_sessions sessions USING(session_ref) WHERE interaction_ref=:interaction_ref"),
+                {"interaction_ref": row.interaction_ref}).one()
+            if (current.assistant_status != "processing"
+                    or int(current.native_session_generation) != int(row.native_session_generation)):
+                return False
+            self._checkpoint_companion_native(connection, row, native_session_ref)
             updated = connection.execute(
                 text(
                     "UPDATE hc_companion_turns SET assistant_status = 'completed', "
@@ -919,18 +960,6 @@ class SQLiteHumanCollaborationLadder:
             )
             if not updated.rowcount:
                 return False
-            connection.execute(
-                text(
-                    "UPDATE hc_companion_sessions SET native_session_ref = "
-                    ":native_session_ref, updated_at = :now WHERE session_ref = "
-                    ":session_ref"
-                ),
-                {
-                    "native_session_ref": native_session_ref,
-                    "now": time.time(),
-                    "session_ref": row.session_ref,
-                },
-            )
             self._finish_companion_turn(
                 connection,
                 row.interaction_ref,
@@ -1008,6 +1037,31 @@ class SQLiteHumanCollaborationLadder:
         if callable(finish_job):
             finish_job(provider_job_ref)
         return True
+
+    def _checkpoint_companion_native(self, connection, turn, native_session_ref: str) -> None:
+        """A replay may retain its own native identity, never replace a newer generation."""
+        parameters = {"session_ref": turn.session_ref,
+            "generation": int(turn.native_session_generation), "native_session_ref": native_session_ref,
+            "interaction_ref": turn.interaction_ref, "now": time.time()}
+        reused = connection.execute(text(
+            "SELECT generation FROM hc_companion_native_sessions WHERE session_ref=:session_ref "
+            "AND native_session_ref=:native_session_ref AND generation!=:generation"), parameters).first()
+        if reused is not None:
+            raise OwnerConflict("companion_native_session_reused")
+        updated = connection.execute(text(
+            "UPDATE hc_companion_sessions SET native_session_ref=:native_session_ref, updated_at=:now "
+            "WHERE session_ref=:session_ref AND native_session_generation=:generation "
+            "AND (native_session_ref IS NULL OR native_session_ref=:native_session_ref) "
+            "AND EXISTS (SELECT 1 FROM hc_companion_turns WHERE interaction_ref=:interaction_ref "
+            "AND assistant_status='processing' AND native_session_generation=:generation)"), parameters)
+        if not updated.rowcount:
+            raise OwnerConflict("companion_native_session_stale")
+        connection.execute(text(
+            "UPDATE hc_companion_native_sessions SET native_session_ref=:native_session_ref "
+            "WHERE session_ref=:session_ref AND generation=:generation"), parameters)
+        connection.execute(text(
+            "UPDATE hc_companion_turns SET native_session_ref=:native_session_ref "
+            "WHERE interaction_ref=:interaction_ref AND native_session_generation=:generation"), parameters)
 
     def _recover_completed_companion_root_scope(self) -> bool:
         if self._agent_runtime is None:
@@ -1221,10 +1275,20 @@ class SQLiteHumanCollaborationLadder:
                     {"session_ref": session.session_ref},
                 ).all()
             )
+            native_sessions = ([] if session is None else connection.execute(text(
+                "SELECT generation,native_session_ref,created_at FROM hc_companion_native_sessions "
+                "WHERE session_ref=:session_ref ORDER BY generation"), {"session_ref": session.session_ref}).all())
+        busy = any(turn.assistant_status in {"queued", "processing"} for turn in turns)
         return {
             "scope_ref": scope_ref,
             "session_ref": None if session is None else session.session_ref,
             "status": "ready" if session is None else session.status,
+            "native_session_generation": 1 if session is None else int(session.native_session_generation),
+            "native_session_ref": None if session is None else session.native_session_ref,
+            "can_start_new_session": not busy,
+            "switch_block_reason": "companion_session_busy" if busy else None,
+            "native_sessions": [{"generation": int(item.generation), "native_session_ref": item.native_session_ref,
+                "created_at": float(item.created_at)} for item in native_sessions],
             "turns": [_public_turn(item) for item in turns],
         }
 
@@ -1332,6 +1396,7 @@ class SQLiteHumanCollaborationLadder:
                     if "view_context" not in turn
                     else {"view_context": turn["view_context"]}
                 )
+                native_projection = {name: turn[name] for name in ("native_session_generation", "native_session_ref")}
                 messages.append(
                     {
                         "message_ref": f"{interaction_ref}:user",
@@ -1341,6 +1406,7 @@ class SQLiteHumanCollaborationLadder:
                         "status": "completed",
                         "created_at": turn["created_at"],
                         **context_projection,
+                        **native_projection,
                     }
                 )
                 assistant_status = cast(str, turn["assistant_status"])
@@ -1354,6 +1420,7 @@ class SQLiteHumanCollaborationLadder:
                         "created_at": turn["updated_at"],
                         "reason": turn["reason"],
                         **context_projection,
+                        **native_projection,
                     }
                 )
         return {
@@ -3367,6 +3434,8 @@ def _public_turn(row) -> dict[str, object]:
         "interaction_kind": "conversation",
         "scope_ref": getattr(row, "scope_ref", None),
         "ordinal": int(row.ordinal),
+        "native_session_generation": int(row.native_session_generation),
+        "native_session_ref": row.native_session_ref,
         "message": row.message,
         **(
             {}

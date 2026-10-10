@@ -1444,7 +1444,7 @@
 
 .quest-intent-session {
   display: grid;
-  grid-template-rows: auto minmax(140px, 1fr) auto auto auto;
+  grid-template-rows: auto auto minmax(140px, 1fr) auto auto auto;
   min-width: 0;
   min-height: 0;
   padding: 20px;
@@ -1580,6 +1580,10 @@
   color: var(--quest-muted);
   font-size: 8.5px;
 }
+.quest-native-session { padding: 10px 16px; border-bottom: 1px solid #deddf1; color: #707b90; font-size: 10px; overflow-wrap: anywhere; }
+.quest-native-session summary { color: var(--quest-violet); cursor: pointer; font-weight: 750; }
+.quest-native-session p { margin: 8px 0; line-height: 1.5; }
+.quest-native-session code { font-size: 9px; }
 
 .quest-intent-boundary {
   padding: 10px 11px;

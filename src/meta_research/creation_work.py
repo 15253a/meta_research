@@ -70,6 +70,8 @@ class ProtectedCreation:
         self.sealed_identity = None
         self.read_basis = None
         self.read_literature = None
+        self.read_basis_historical = False
+        self.read_inherited_literature = ()
         self.execution_binding = {"operation_ref": operation_ref, "fence_ref": self.operation.fence_ref,
             "binding_hash": self.operation.binding_hash, "work_ref": self.work_ref,
             "work_directory": "/workspace/" + self.relative_directory,
@@ -104,6 +106,7 @@ class ProtectedCreation:
             or identity["material_set_hash"] != self.operation.inputs.set_hash):
             raise OwnerConflict("creation_basis_unbound")
         self.read_basis = memory.reference(exact)
+        self.read_inherited_literature = tuple(item["snapshot"] for item in exact.get("inherited_literature", []))
         self.read_literature = None if literature is None else dict(literature["source_snapshot"])
         if self.read_literature is not None:
             metadata = memory._owner.read_literature_snapshot_metadata(self.read_literature["snapshot_ref"])
@@ -121,6 +124,18 @@ class ProtectedCreation:
                 or generation != anchor.generation):
                 raise OwnerConflict("creation_literature_unbound")
         self.execution_binding["context_readers"] = {"basis": self.read_basis, "literature": self.read_literature}
+
+    def bind_reassessment_readers(self, reassessment):
+        memory = self.owner._hc._research_memory.creation_bases
+        predecessor = memory.query(reassessment["predecessor"]["basis_ref"], reassessment["predecessor"]["basis_hash"])
+        anchor = predecessor["input_identity"]["anchor"]
+        if (anchor["kind"], anchor["ref"]) != (self.operation.inputs.anchor.kind, self.operation.inputs.anchor.ref):
+            raise OwnerConflict("creation_basis_unbound")
+        self.read_basis = memory.reference(predecessor)
+        self.read_basis_historical = True
+        self.read_inherited_literature = tuple(item["snapshot"] for item in memory._literature_relations(predecessor).values())
+        self.execution_binding["context_readers"] = {"basis": self.read_basis,
+            "historical": True, "inherited_literature": self.read_inherited_literature}
 
     def completed_handoff(self):
         outcome = self.runtime.request_stop()
