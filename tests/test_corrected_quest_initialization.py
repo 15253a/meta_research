@@ -2607,6 +2607,47 @@ def test_restart_finishes_intent_responsibility_from_terminal_owner_fact(
         original.close()
 
 
+def test_custom_hour_budget_round_trips_and_rebinds_the_gpu_envelope(tmp_path: Path) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "custom-hours"),
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    with client:
+        opened = client.post(
+            "/api/v1/quest-initializations", json={},
+            headers={**write_headers, "Idempotency-Key": "open-hours"},
+        ).json()
+        path = f"/api/v1/quest-initializations/{opened['initialization_id']}"
+        basis = client.post(
+            path + "/compute-probe", json={"selected_device_uuids": ["GPU-test-1"]},
+            headers={**write_headers, "Idempotency-Key": "probe-hours"},
+        ).json()
+        for budget, seconds in [("2.5h", 9000), ("0.01h", 36)]:
+            response = client.put(path + "/draft", json={
+                "expected_draft_revision": basis["quest_draft"]["revision"],
+                "expected_draft_hash": basis["quest_draft"]["hash"],
+                "draft": {**basis["quest_draft"]["value"], "time_budget": budget},
+            }, headers={**write_headers, "Idempotency-Key": f"budget-{budget}"})
+            assert response.status_code == 200, response.text
+            saved = response.json()
+            assert saved["quest_draft"]["value"]["time_budget"] == budget
+            assert saved["resource_envelope"]["ref"] != basis["resource_envelope"]["ref"]
+            assert saved["resource_envelope"]["status"] == "current"
+            assert saved["resource_envelope"]["time_budget"] == budget
+            assert saved["resource_envelope"]["hard_ceiling"] == {"kind": "wall_clock", "seconds": seconds}
+            assert client.get(path).json()["quest_draft"]["value"]["time_budget"] == budget
+            basis = saved
+        for invalid in ["0h", "-1h", "NaNh", "0.001h"]:
+            response = client.put(path + "/draft", json={
+                "expected_draft_revision": basis["quest_draft"]["revision"],
+                "expected_draft_hash": basis["quest_draft"]["hash"],
+                "draft": {**basis["quest_draft"]["value"], "time_budget": invalid},
+            }, headers={**write_headers, "Idempotency-Key": f"invalid-{invalid}"})
+            assert response.status_code == 422, response.text
+        assert client.get(path).json()["quest_draft"]["hash"] == basis["quest_draft"]["hash"]
+
+
 def test_corrected_blank_draft_gpu_envelope_async_proposal_and_intent_are_durable(
     tmp_path: Path,
 ) -> None:

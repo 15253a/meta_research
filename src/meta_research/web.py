@@ -32,6 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from meta_research.auth import AuthSession
 from meta_research.asset_download import AssetDownloadResponse
 from meta_research.codex_runtime import CODEX_MODEL_REF
+from meta_research.time_budget import time_budget_seconds
 from meta_research.composition import ProductionRuntime
 from meta_research.human_reply import ProvidedReply
 from meta_research.harness import (
@@ -165,7 +166,7 @@ class BootstrapExchange(BaseModel):
 class StartHarnessConformanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    codex_model_ref: Literal["gpt-6.1-sol"] = CODEX_MODEL_REF
+    codex_model_ref: str = Field(default=CODEX_MODEL_REF, min_length=1, max_length=160)
     codex_auth_profile_ref: str = Field(min_length=1, max_length=160)
     # Accepted only so an older diagnostic client does not fail at the HTTP
     # decoder boundary.  Production selection is Codex-only and ignores them.
@@ -175,6 +176,13 @@ class StartHarnessConformanceRequest(BaseModel):
     claude_auth_profile_ref: str | None = Field(
         default=None, min_length=1, max_length=160
     )
+
+    @field_validator("codex_model_ref")
+    @classmethod
+    def configured_codex_model(cls, value: str) -> str:
+        if value != CODEX_MODEL_REF:
+            raise ValueError("codex_model_not_allowed")
+        return value
 
 
 class OpenQuestRequest(BaseModel):
@@ -200,7 +208,7 @@ class QuestDraftV2Request(BaseModel):
 
     goal: str = Field(max_length=4000)
     completion_criteria: str = Field(max_length=4000)
-    time_budget: Literal["7d", "30d", "90d", "open"] = "open"
+    time_budget: str = Field(default="open", max_length=24)
     research_style: Literal['focus', 'balanced', 'open'] = 'balanced'
     route: Literal["direct", "deepfetch"] = "direct"
     resource_envelope_ref: str | None = Field(default=None, max_length=64)
@@ -210,6 +218,12 @@ class QuestDraftV2Request(BaseModel):
     )
     background_and_initial_direction: str = Field(default="", max_length=12000)
     material_manifest: dict[str, object] | None = None
+
+    @field_validator("time_budget")
+    @classmethod
+    def validate_time_budget(cls, value: str) -> str:
+        time_budget_seconds(value)
+        return value
 
 
 class ServerSelectionRequest(BaseModel):

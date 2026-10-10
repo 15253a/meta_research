@@ -4,6 +4,8 @@ import { RESEARCH_STYLES, researchStyleLabel } from "./researchStyle";
 import { ExternalMcpSettings } from "./ExternalMcpSettings";
 import { SearchSourcesSettings } from "./SearchSourcesSettings";
 import { MetaTrace } from "./MetaTrace";
+import { TimeBudgetField } from "./TimeBudgetField";
+import { validTimeBudget } from "./timeBudget";
 import {
   isConditionsObject, mergeRuntimeConditionDevices, parseRuntimeConditions, replaceRuntimeConditionsJson,
   runtimeConditionDeviceIds, runtimeConditionDevices, updateRuntimeConditionDevices,
@@ -11,7 +13,6 @@ import {
 } from "./runtime-conditions-form";
 import "./runtime-conditions.css";
 
-const TIME_BUDGETS = [["7d", "7 天"], ["30d", "30 天"], ["90d", "90 天"], ["open", "不设硬截止"]];
 const LITERATURE_MODES = [["oa_then_institution", "公开全文与可选图书馆"], ["oa_only", "只搜索开放获取资源"], ["provided_only", "只使用我提供的材料"]];
 const MAX_CONDITIONS_LENGTH = 24000;
 // Unsaved edits belong to this page and Quest, never to another Quest or a server receipt.
@@ -66,6 +67,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
     if (!choices.some(device => device.uuid === uuid)) choices.push({ uuid });
   }
   const controlsDisabled = loading || !basis || saving || parsed.kind !== "structured";
+  const invalidBudget = parsed.kind === "structured" && typeof data.time_budget === "string" && !validTimeBudget(data.time_budget);
   const stringField = (value: unknown) => value === undefined || typeof value === "string";
   const unusualFields = !stringField(data.time_budget) || !literatureEditable
     || !stringField(literature.mode) || !stringField(literature.scope_exclusions) || selectedIds === null;
@@ -165,7 +167,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   }, [questRef, questionRef, attempt]);
 
   const save = async () => {
-    if (!questRef || !basis || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH) return;
+    if (!questRef || !basis || saving || conflict || invalidBudget || !text.trim() || text.length > MAX_CONDITIONS_LENGTH) return;
     setSaving(true);
     setSaved(false);
     setError(null);
@@ -209,11 +211,9 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
         <p id="runtime-research-style-help" className="runtime-conditions-exclusions">
           {RESEARCH_STYLES.find(style => style.value === researchStyle)?.description} 这是持续研究倾向，仍须遵循你明确保留的条件。
         </p>
-        <label><span>时间预算</span><select aria-label="时间预算" value={typeof data.time_budget === "string" ? data.time_budget : ""}
+        <TimeBudgetField value={typeof data.time_budget === "string" ? data.time_budget : "open"}
           disabled={controlsDisabled || !stringField(data.time_budget)}
-          onChange={event => editFields({ ...data, time_budget: event.currentTarget.value })}>
-          <ConditionOptions value={data.time_budget} options={TIME_BUDGETS} />
-        </select></label>
+          onChange={time_budget => editFields({ ...data, time_budget })} />
       </div>
       <section className="runtime-deepfetch" aria-label="DeepFetch 配置"><h3>DeepFetch 配置</h3>
         <SearchSourcesSettings scope={{ kind: "quest", questRef }} />
@@ -277,7 +277,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
       {saved ? <p role="status" className="runtime-conditions-saved">已保存，将用于后续新调用。</p> : null}
       <footer><button type="button" onClick={onClose}>{saved || saving ? "关闭" : "取消"}</button>
         {!basis && !loading ? <button type="button" onClick={() => setAttempt(value => value + 1)}>重新读取</button> : null}
-        <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || (text === basis.text && researchStyle === (basis.research_style ?? "balanced") && JSON.stringify(library) === JSON.stringify(basis.literature_configuration))}>
+        <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || invalidBudget || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || (text === basis.text && researchStyle === (basis.research_style ?? "balanced") && JSON.stringify(library) === JSON.stringify(basis.literature_configuration))}>
           {saving ? "正在保存…" : "保存运行条件"}</button></footer>
     </form> : <><header className="runtime-conditions-pre-quest"><MetaTrace variant="brief" /><h2 id="runtime-conditions-title">修改配置</h2><button type="button" aria-label="关闭修改配置" onClick={onClose}>×</button></header><p className="runtime-pre-quest-note">尚无当前 Quest。可管理共享搜索源和系统通用 MCP；图书馆与全文获取在新建研究任务的初始化草稿中配置。</p><section className="runtime-deepfetch" aria-label="DeepFetch 配置"><h3>DeepFetch 配置</h3><SearchSourcesSettings scope={{ kind: "shared-only" }} /></section></>}
     <section className="runtime-system" aria-label="系统配置"><h3>系统配置</h3><p>通用 MCP 服务于整个系统的研究 Agent，按已选根类型授权；视频理解等通用能力无需登记为搜索源。</p>

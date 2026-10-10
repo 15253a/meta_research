@@ -24,6 +24,7 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
+from meta_research.time_budget import time_budget_seconds, valid_time_budget
 from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload, ServerReference
 from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
@@ -11751,16 +11752,8 @@ def _authorization_basis_resource_envelope(
     return envelope_value
 
 
-_TIME_BUDGET_SECONDS: dict[str, int | None] = {
-    "7d": 7 * 24 * 60 * 60,
-    "30d": 30 * 24 * 60 * 60,
-    "90d": 90 * 24 * 60 * 60,
-    "open": None,
-}
-
-
 def _resource_hard_ceiling(time_budget: str) -> dict[str, object]:
-    seconds = _TIME_BUDGET_SECONDS[time_budget]
+    seconds = time_budget_seconds(time_budget)
     return {
         "kind": "open_ended" if seconds is None else "wall_clock",
         "seconds": seconds,
@@ -11788,7 +11781,7 @@ def _resource_envelope_matches_draft(
     time_budget = draft.get("time_budget")
     return (
         isinstance(time_budget, str)
-        and time_budget in _TIME_BUDGET_SECONDS
+        and valid_time_budget(time_budget)
         and envelope.get("time_budget") == time_budget
         and envelope.get("hard_ceiling") == _resource_hard_ceiling(time_budget)
     )
@@ -11807,7 +11800,7 @@ def _resource_envelope_integrity_is_valid(
     if (
         envelope.get("schema_ref") != RESOURCE_ENVELOPE_SCHEMA
         or not isinstance(time_budget, str)
-        or time_budget not in _TIME_BUDGET_SECONDS
+        or not valid_time_budget(time_budget)
         or envelope.get("hard_ceiling") != _resource_hard_ceiling(time_budget)
         or not isinstance(selected_device_uuids, list)
         or not selected_device_uuids
@@ -12064,7 +12057,7 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
                 raise OwnerConflict(f"{field}_invalid")
             normalized[field] = value.strip()
         time_budget = draft["time_budget"]
-        if time_budget not in {"7d", "30d", "90d", "open"}:
+        if not valid_time_budget(time_budget):
             raise OwnerConflict("time_budget_invalid")
         route = draft["route"]
         if route not in {"direct", "deepfetch"}:

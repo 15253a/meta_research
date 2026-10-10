@@ -2051,7 +2051,7 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   await expect(dialog.getByRole("button", { name: "取消" })).toBeEnabled();
 
   const timeBudget = dialog.getByLabel("时间预算");
-  await timeBudget.selectOption("7d");
+  await timeBudget.fill("2.5");
   await timeBudget.blur();
   await expect(dialog.getByText("proposal_stale", { exact: true })).toBeVisible({
     timeout: 12_000,
@@ -2073,12 +2073,12 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   await expect(reopenedIntent).toBeEnabled();
   await expect.poll(async () => {
     return (await publicCurrent(page))?.quest_draft.value.time_budget;
-  }).toBe("7d");
+  }).toBe("2.5h");
   const afterBudgetChange = await publicCurrent(page);
   expect(afterBudgetChange?.resource_envelope).toMatchObject({
     status: "current",
-    time_budget: "7d",
-    hard_ceiling: { kind: "wall_clock", seconds: 604_800 },
+    time_budget: "2.5h",
+    hard_ceiling: { kind: "wall_clock", seconds: 9_000 },
   });
   expect(afterBudgetChange?.resource_envelope?.ref).not.toBe(
     beforeBudgetChange?.resource_envelope?.ref,

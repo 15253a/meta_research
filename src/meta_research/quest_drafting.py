@@ -59,12 +59,20 @@ DRAFTING_EXECUTION_CONTRACT_SCHEMA = (
     "meta-research/codex-drafting-execution-contract/v2"
 )
 _DRAFTING_MODEL_REF = CODEX_MODEL_REF
-_DRAFTING_MODEL_CATALOG_PATH = Path(__file__).with_name(
-    "codex_drafting_model_catalog.json"
+_DRAFTING_MODEL_CATALOG_SPECS = {
+    "gpt-6.1-sol": (
+        "codex_drafting_model_catalog.json",
+        "591c4d314dec8c8f2ff0102ba193ae42478f7bf7f0e6e07f4e5180f49ba6af77",
+    ),
+    "gpt-5.6-sol": (
+        "codex_drafting_model_catalog_gpt_5_6_sol.json",
+        "9d9b4936f927a6a855625bbbe0f52241d044d0d271c8fe2def611a7188cd5c9b",
+    ),
+}
+_drafting_catalog_name, _DRAFTING_MODEL_CATALOG_SHA256 = (
+    _DRAFTING_MODEL_CATALOG_SPECS[_DRAFTING_MODEL_REF]
 )
-_DRAFTING_MODEL_CATALOG_SHA256 = (
-    "591c4d314dec8c8f2ff0102ba193ae42478f7bf7f0e6e07f4e5180f49ba6af77"
-)
+_DRAFTING_MODEL_CATALOG_PATH = Path(__file__).with_name(_drafting_catalog_name)
 _DRAFTING_MODEL_CATALOG_MAX_BYTES = 64 * 1024
 _DISABLED_DRAFTING_CODEX_FEATURES = (
     "apps",
