@@ -100,7 +100,7 @@ CODEX_ROOT_FEATURE_INVENTORY_NAMES = (
 )
 
 ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
-    "deepfetch": (),
+    "deepfetch": ("deepfetch_source_action",),
     "acquisition": (),
     "companion": (),
     "idea": (*GUIDANCE_OPERATION_IDS, *GOAL_OPERATION_IDS, "research_memory.research_notes.read", "research_memory.stage_context.read"),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from meta_research.external_mcp import ExternalMcpError, parse_connection, parse_services
+from meta_research.search_sources import InitializationScope, QuestScope, SearchSourceError
 
 from meta_research.snapshot_queries import SnapshotQueryCoordinator
 
@@ -187,6 +188,7 @@ class LiteratureConfigurationRequest(BaseModel):
         "oa_then_institution"
     )
     library_entry_url: str = Field(default="", max_length=4000)
+    institution_required: bool = False
     scope_exclusions: str = Field(default="", max_length=8000)
     accepted_material_bindings: list[dict[str, object]] = Field(
         default_factory=list, max_length=100
@@ -1365,6 +1367,75 @@ def create_app(
     @app.get("/api/v1/external-mcp")
     def get_external_mcp():
         return runtime.external_mcp.read_config().as_dict()
+
+    @app.exception_handler(SearchSourceError)
+    async def source_error(_request: Request, error: SearchSourceError) -> JSONResponse:
+        status = 404 if error.code.endswith("not_found") else 409 if any(
+            term in error.code for term in ("stale", "conflict")) else 422
+        return _error(status, error.code)
+
+    @app.get("/api/v1/search-sources")
+    def get_search_sources():
+        return {"sources": runtime.search_sources.list(), "templates": runtime.search_sources.templates()}
+
+    @app.post("/api/v1/search-sources/test")
+    async def test_search_source(request: Request):
+        value = await source_payload(request, {"form", "source_id", "expected_version", "probe_query"}, {"form"})
+        return await asyncio.to_thread(runtime.search_sources.test, value["form"],
+            source_id=value.get("source_id"), expected_version=value.get("expected_version"),
+            probe_query=value.get("probe_query", "deep learning"))
+
+    @app.post("/api/v1/search-sources", status_code=201)
+    async def add_search_source(request: Request):
+        value = await source_payload(request, {"form", "matching_test_ref"}, {"form"})
+        source = await asyncio.to_thread(runtime.search_sources.save, value["form"],
+            matching_test_ref=value.get("matching_test_ref"))
+        return {"source": source, "receipt": {"scope": "shared", "source_id": source["source_id"], "version": source["version"]}}
+
+    @app.put("/api/v1/search-sources/{source_id}")
+    async def update_search_source(source_id: str, request: Request):
+        value = await source_payload(request, {"form", "matching_test_ref", "expected_version"}, {"form", "expected_version"})
+        source = await asyncio.to_thread(runtime.search_sources.save, value["form"], source_id=source_id,
+            expected_version=value["expected_version"], matching_test_ref=value.get("matching_test_ref"))
+        return {"source": source, "receipt": {"scope": "shared", "source_id": source["source_id"], "version": source["version"]}}
+
+    async def source_payload(request: Request, allowed: set[str], required: set[str]):
+        try:
+            value = await request.json()
+        except (ValueError, UnicodeDecodeError) as error:
+            raise SearchSourceError("search_source_request_invalid") from error
+        if not isinstance(value, dict) or set(value) - allowed or required - set(value):
+            raise SearchSourceError("search_source_request_invalid")
+        return value
+
+    @app.get("/api/v1/quest-initializations/{initialization_id}/search-sources")
+    def get_initialization_sources(initialization_id: str):
+        runtime.owners.human_collaboration.query_quest_creation(initialization_id)
+        return {"selection": runtime.search_sources.selection(InitializationScope(initialization_id)),
+            "sources": runtime.search_sources.list()}
+
+    @app.put("/api/v1/quest-initializations/{initialization_id}/search-sources")
+    async def select_initialization_sources(initialization_id: str, request: Request):
+        value = await source_payload(request, {"allowed_source_ids", "expected_revision"}, {"allowed_source_ids", "expected_revision"})
+        selection = await asyncio.to_thread(runtime.owners.human_collaboration.save_search_source_selection,
+            initialization_id, allowed_source_ids=value["allowed_source_ids"], expected_revision=value["expected_revision"])
+        return {"selection": selection, "receipt": {"scope": selection["scope"], "revision": selection["revision"]}}
+
+    @app.get("/api/v1/quests/{quest_ref}/search-sources")
+    def get_quest_sources(quest_ref: str):
+        if runtime.owners.research_graph.query_quest_by_ref(quest_ref) is None:
+            raise SearchSourceError("search_source_scope_not_found")
+        return {"selection": runtime.search_sources.selection(QuestScope(quest_ref)), "sources": runtime.search_sources.list()}
+
+    @app.put("/api/v1/quests/{quest_ref}/search-sources")
+    async def select_quest_sources(quest_ref: str, request: Request):
+        if runtime.owners.research_graph.query_quest_by_ref(quest_ref) is None:
+            raise SearchSourceError("search_source_scope_not_found")
+        value = await source_payload(request, {"allowed_source_ids", "expected_revision"}, {"allowed_source_ids", "expected_revision"})
+        selection = await asyncio.to_thread(runtime.search_sources.select, QuestScope(quest_ref),
+            allowed_source_ids=tuple(value["allowed_source_ids"]) if isinstance(value["allowed_source_ids"], list) else value["allowed_source_ids"],
+            expected_revision=value["expected_revision"])
+        return {"selection": selection, "receipt": {"scope": selection["scope"], "revision": selection["revision"]}}
 
     @app.put("/api/v1/external-mcp")
     async def put_external_mcp(request: Request):

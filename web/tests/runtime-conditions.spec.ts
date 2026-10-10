@@ -59,6 +59,8 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
       return json(next);
     }
     if (request.method() !== "GET") return route.abort();
+    if (url.pathname === "/api/v1/search-sources") return json({ sources: [], templates: [] });
+    if (url.pathname.endsWith("/search-sources")) return json({ sources: [], selection: { scope: { kind: "quest", quest_ref: state.questRef }, revision: 0, allowed_source_ids: [], selection_hash: "empty" } });
     if (/^\/api\/v1\/questions\/[^/]+\/history$/.test(url.pathname)) return json({
       status: "ready", question_ref: state.snapshot.research_space.current_question.question_ref,
       question: { question_ref: state.snapshot.research_space.current_question.question_ref, quest_ref: state.catalogQuest, initialization_id: "init-runtime-conditions" },

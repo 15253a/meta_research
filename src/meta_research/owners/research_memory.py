@@ -10495,7 +10495,7 @@ def _validated_v4_ledger(value: object, *, expected_count: int) -> int:
     papers = value.get("papers")
     if (
         set(value) != required
-        or value.get("schema_version") != "deepfetch.papers.v4"
+        or value.get("schema_version") not in {"deepfetch.papers.v4", "deepfetch.papers.v4.1"}
         or not isinstance(paper_order, list)
         or any(not isinstance(item, str) or not item for item in paper_order)
         or len(set(paper_order)) != len(paper_order)

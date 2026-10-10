@@ -1,0 +1,103 @@
+{
+  "schema": "meta_research.issue215.units.v1",
+  "kind": "safe_receipt_projection",
+  "baseline_commit": "4bd3796cbb3fbb5f88e7c88ba411695b79dd9695",
+  "environment": "isolated_linux",
+  "count_scope": "Each count belongs to its own frozen source tree. These are not one combined full-suite result.",
+  "units": [
+    {
+      "name": "direct_mcp",
+      "source_commit": "58feb87c02d0f31ec29be6f3bd065aedfc4cfb21",
+      "source_tree": "7be2835626b985441d7d9fceb3e4b1910db8bb85",
+      "selectors": [
+        "tests/test_external_mcp.py"
+      ],
+      "collected": 20,
+      "completed": 20,
+      "completed_equals_collected": true,
+      "exit_code": 0,
+      "counts": {
+        "passed": 20,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "source_seal_intact": true,
+      "dependency_lock": {
+        "uv_lock_sha256": "432c79a65e3752a364b5cc72c1b36ce963e7edf2c4a9ca02d74f3178117d773d",
+        "distribution_count": 59,
+        "exact_distribution_set_matches": true,
+        "dependency_check_passed": true
+      },
+      "receipt": {
+        "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/environment/linux/7be2835626b985441d7d9fceb3e4b1910db8bb85/run-20261009T163913.316921Z-9b040436/results/execution.json",
+        "sha256": "d9a2bd2bb2b4e622f1955a75a7d1f54948cd2de7ab66605472774da1653dac33"
+      }
+    },
+    {
+      "name": "source_configuration",
+      "source_commit": "a15fac591421a19771b519e4c90a6572609b564a",
+      "source_tree": "780db2031c808eea73b2e04cb68b37828afc2851",
+      "selectors": [
+        "tests/test_search_sources.py",
+        "tests/test_search_sources_web.py",
+        "tests/test_public_acquisition_session.py::test_explicit_root_library_reconnect_repreflights_quest_session"
+      ],
+      "collected": 40,
+      "completed": 40,
+      "completed_equals_collected": true,
+      "exit_code": 0,
+      "counts": {
+        "passed": 40,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "source_seal_intact": true,
+      "dependency_lock": {
+        "uv_lock_sha256": "432c79a65e3752a364b5cc72c1b36ce963e7edf2c4a9ca02d74f3178117d773d",
+        "distribution_count": 59,
+        "exact_distribution_set_matches": true,
+        "dependency_check_passed": true
+      },
+      "receipt": {
+        "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/environment/linux/780db2031c808eea73b2e04cb68b37828afc2851/run-20261009T171237.699716Z-3759ea98/results/execution.json",
+        "sha256": "60a2511429a98b049089359d176518a201c668ede99a95a130e90ecf6965af04"
+      }
+    },
+    {
+      "name": "runtime_provenance",
+      "source_commit": "f1c3c43328931dd35246190605d6f8da9adf0c0f",
+      "source_tree": "cdb744b09c438192ddeb6193f8e3cdc2e27e7416",
+      "selectors": [
+        "tests/test_deepfetch_search_sources.py",
+        "tests/test_deepfetch_source_authority.py",
+        "tests/test_search_source_lifecycle.py",
+        "tests/test_deepfetch_adapter.py",
+        "tests/test_public_semantic_mcp_gateway.py",
+        "tests/test_root_capability_floor.py"
+      ],
+      "collected": 222,
+      "completed": 222,
+      "completed_equals_collected": true,
+      "exit_code": 0,
+      "counts": {
+        "passed": 222,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "source_seal_intact": true,
+      "dependency_lock": {
+        "uv_lock_sha256": "432c79a65e3752a364b5cc72c1b36ce963e7edf2c4a9ca02d74f3178117d773d",
+        "distribution_count": 59,
+        "exact_distribution_set_matches": true,
+        "dependency_check_passed": true
+      },
+      "receipt": {
+        "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/environment/linux/cdb744b09c438192ddeb6193f8e3cdc2e27e7416/run-20261009T173606.784726Z-ed81e954/results/execution.json",
+        "sha256": "4facb77efcebcb7c912372f3e88493abb0b3b15380c24f65e2771fb3d7d8981c"
+      }
+    }
+  ]
+}

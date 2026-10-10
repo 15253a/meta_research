@@ -35,8 +35,8 @@ python3 "$DEEPFETCH_ROOT/scripts/openalex.py" citations \
 ## 接纳一条 Web 线索
 
 1. 核实精确学术标题及至少一项身份来源，例如 DOI、arXiv、OpenAlex、PubMed、会议录、仓储或出版商论文页。
-2. 可行时用 OpenAlex 规范元数据；没有记录仍可保留已核实 DOI、arXiv 或标题身份的论文。
-3. 优先按 DOI，再按 arXiv、OpenAlex 或明确的标题／作者证据去重。
+2. 可行时用 OpenAlex 规范元数据；没有记录仍可保留已核实 DOI 或 arXiv 身份的论文。只有标题的线索先留在研究笔记。
+3. 按 DOI、arXiv 或 OpenAlex 的已核实身份及同一确认版本去重；相似标题不合并，预印本与正式版、arXiv 不同版本分开。
 4. 仅填写标题、摘要、引文上下文或元数据实际支持的预理解。
 5. 入选正文交给 Acquisition 和 Reader，不在主上下文展开全文科学阅读。
 

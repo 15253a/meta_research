@@ -3378,13 +3378,13 @@ def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
         if value == "--enable"
     }
     assert {"multi_agent", "plugins", "remote_plugin", "hooks"} <= enabled
-    assert argv[argv.index("--model") + 1] == "gpt-6-sol"
+    assert argv[argv.index("--model") + 1] == "gpt-6.1-sol"
     assert gate_argv[-1] == "-"
     assert gate_timeout is None
     assert "web_evidence_gate=v1" in gate_prompt
     assert "Codex 默认工具能力保持可用" in gate_prompt
     assert "禁止使用 shell" not in gate_prompt
-    assert gate_argv[gate_argv.index("--model") + 1] == "gpt-6-sol"
+    assert gate_argv[gate_argv.index("--model") + 1] == "gpt-6.1-sol"
     gate_config_values = [
         gate_argv[index + 1]
         for index, value in enumerate(gate_argv)
@@ -3820,7 +3820,7 @@ else:
         if value == "--config"
     ]
     assert 'model_reasoning_effort="ultra"' in durable_config_values
-    assert durable_argv[durable_argv.index("--model") + 1] == "gpt-6-sol"
+    assert durable_argv[durable_argv.index("--model") + 1] == "gpt-6.1-sol"
 
 
 def test_durable_stop_before_thread_start_allows_a_new_provider_operation(

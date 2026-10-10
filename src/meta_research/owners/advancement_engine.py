@@ -37,6 +37,7 @@ from meta_research.control_contract import (
 )
 from meta_research.database import Database
 from meta_research.deepfetch import DeepFetchRunRequest
+from meta_research.search_sources import QuestScope, SearchSourceRegistry
 from meta_research.feed import DurableFeed
 from meta_research.read_snapshot_cache import snapshot_cached
 from meta_research.idea_contract import (
@@ -333,6 +334,8 @@ def _bundle_stage_report_closure(
 
 class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for Cycle, Stage, and Foreground authority."""
+
+    def bind_search_sources(self, registry: SearchSourceRegistry) -> None: ...
 
     def query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest: ...
 
@@ -899,6 +902,17 @@ class _SQLiteAutonomousAdvancementLifecycle:
             ],
             "question_blueprint": blueprint,
         }
+        with self._database.read() as connection:
+            pinned = connection.execute(
+                text("SELECT * FROM ae_autonomous_deepfetch_requests WHERE context_ref = :ref"),
+                {"ref": context_ref},
+            ).first()
+        if pinned is not None:
+            pinned_scope = self._validated_autonomous_deepfetch_request(pinned).scope
+            if "search_source_basis" in pinned_scope:
+                deepfetch_scope["search_source_basis"] = pinned_scope["search_source_basis"]
+        elif self._search_sources is not None:
+            deepfetch_scope["search_source_basis"] = self._search_sources.capture(QuestScope(quest_ref)).as_dict()
         resource_envelope = {
             "schema_ref": "meta-research/autonomous-resource-envelope/v1",
             "quest_ref": quest_ref,
@@ -2158,6 +2172,7 @@ class SQLiteAdvancementEngine(
         self._database = database
         self._feed = feed
         self._quest_verifier = quest_verifier
+        self._search_sources: SearchSourceRegistry | None = None
         self._question_verifier = question_verifier
         self._accepted_question_verifier = accepted_question_verifier
         self._evidence_verifier = evidence_verifier
@@ -2187,6 +2202,9 @@ class SQLiteAdvancementEngine(
         )
         self._stage_request_verifier = SQLiteAdvancementEngineReceiptVerifier(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
+
+    def bind_search_sources(self, registry: SearchSourceRegistry) -> None:
+        self._search_sources = registry
 
     def bind_bundle_exhaustion_evidence_verifier(
         self, verifier: BundleExhaustionEvidenceVerifier

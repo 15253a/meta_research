@@ -6,7 +6,7 @@
 
 ## 预检与 Acquisition
 
-Quest 级 Acquisition Root 负责当前访问模式、合法路线、浏览器状态和私有存储。沿当前配置预检：`oa_only` 无需机构浏览器，`provided_only` 仅核实已提供材料，`oa_then_institution` 核实所需机构路线。每次请求使用当前明确模式，不继承上回合的临时判断。
+Quest 级 Acquisition Root 负责当前访问模式、合法路线、浏览器状态和私有存储。沿宿主固定的有效配置预检：`oa_only` 无需机构浏览器，`provided_only` 仅核实已提供材料，`oa_then_institution` 核实所需机构路线。未配置机构且访问可选时，宿主使用 `oa_only`；明确要求机构访问时保留求助。每次请求使用该 Session 固定模式，不继承上回合的临时判断。
 
 通过共用 `agent_runtime.acquisition.request` effect 提交 1–10 个目标的有界批次；请求结果不明时以同一 `effect_id` 对账，再判断是否重试。当前适配器的 `action=acquire` 请求体形状为：
 

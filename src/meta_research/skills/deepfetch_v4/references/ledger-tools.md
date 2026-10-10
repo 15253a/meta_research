@@ -12,7 +12,7 @@ python3 "$DEEPFETCH_ROOT/scripts/papers.py" init \
   --intensity medium
 ```
 
-`upsert` 接受一项发现记录、数组、`{"papers": [...], "limitations": [...]}` 或完整 `deepfetch.openalex.v4` search／get 信封。工具移除雷达专属字段并写入元数据；主智能体仍须筛选实际保留条目，按[台账契约](papers-json.md)填写 `summary`、`evidence_level`、`basis`、`why_included`、`uncertainty`。`update-run` 保存单调递增的主动检索秒数、实际维度和停止理由。
+`upsert` 接受一项发现记录、数组、`{"papers": [...], "limitations": [...]}` 或完整 `deepfetch.openalex.v4` search／get 信封。新台账保留 `paper_version` 与 `discovery_origins`，相同已核实标识与确认版本跨源合并时累积所有回执。版本未知不能自动合并，更新时指定返回的现有 `paper_id`；完整 ID 由工具生成，不手写版本后缀。工具移除雷达专属字段并写入元数据；主智能体仍须筛选实际保留条目，按[台账契约](papers-json.md)填写 `summary`、`evidence_level`、`basis`、`why_included`、`uncertainty`。`update-run` 保存单调递增的主动检索秒数、实际维度和停止理由。
 
 ## 全文与 Reader
 

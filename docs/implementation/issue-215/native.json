@@ -1,0 +1,192 @@
+{
+  "schema": "meta_research.issue215.native.v1",
+  "kind": "safe_public_and_receipt_projection",
+  "source_commit": "f1c3c43328931dd35246190605d6f8da9adf0c0f",
+  "source_tree": "cdb744b09c438192ddeb6193f8e3cdc2e27e7416",
+  "result": {
+    "snapshot_status": "accepted",
+    "completion": "limited",
+    "paper_count": 1,
+    "fulltext_count": 1,
+    "reader_status": "complete",
+    "native_web_search_events": 4,
+    "native_web_fetch_events": 6
+  },
+  "execution": {
+    "status": "completed",
+    "returncode": 0,
+    "output_schema_valid": true,
+    "actual_completion_imported": true,
+    "imported_public_file_count": 3,
+    "result_bytes_rewritten": false,
+    "reader_spawn_recorded": true,
+    "reader_protocol": "native response_item function_call and function_call_output",
+    "reader_native_parent_sha256": "f18fe7f56eb2d2abab294b5632dc630a1829e704ec3954015d918a287b098fc6",
+    "driver_spawn_attempt_count": 0,
+    "driver_spawn_counter_limitation": "The driver counter does not parse this native protocol. The exact-parent reader-spawn proof records the successful Reader spawn."
+  },
+  "platform": {
+    "actual_cli": "codex-cli 0.162.0-alpha.2",
+    "captured_linux_cli": "codex-cli 0.159.0",
+    "overlays": [
+      "Windows platform and safe system environment",
+      "MCP SSH bridge",
+      "explicit path mapping",
+      "exact-hash supplemental Acquisition input transfer"
+    ],
+    "same_version_linux_execution_claimed": false,
+    "controlled_companion": "existing deterministic drafting adapter; no real Companion model claim",
+    "crossref_mcp": "controlled read-only stdio bridge over real Crossref HTTP",
+    "actual_fulltext_adapter": "NatureDownloaderAdapter",
+    "worker_setup": "manual operations with controlled host compute and power probes"
+  },
+  "acquisition": {
+    "mode": "oa_only",
+    "request_count": 1,
+    "pdf_bytes": 603123,
+    "pdf_sha256": "51b5de45eb0b558b19c3affe49503cff50cb170a32de602983d6e2ec286942a7",
+    "transferred_artifact_bytes_rewritten": false
+  },
+  "confirmation": {
+    "before_counts": {
+      "quest_count": 0,
+      "question_count": 0,
+      "foreground_cycle_count": 0
+    },
+    "after_counts": {
+      "quest_count": 1,
+      "question_count": 1,
+      "foreground_cycle_count": 1
+    },
+    "formal_receipts": {
+      "human_confirmation": "accepted",
+      "quest_goal": "accepted",
+      "broad_research_authorization": "accepted",
+      "question_content": "accepted",
+      "question_identity": "accepted",
+      "cycle_activation": "accepted"
+    },
+    "first_helper_result": "The immediate cached projection count assertion failed after all six receipts were accepted.",
+    "recovery": "Read-only resume observed the settled counts. Confirmation was not repeated.",
+    "inherited_selection_revision": 1,
+    "inherited_source_kinds": [
+      "api",
+      "mcp"
+    ],
+    "other_initialization_source_kinds": [
+      "website"
+    ],
+    "other_initialization_was_cancelled": true
+  },
+  "final_readback": {
+    "quest_selection_revision": 2,
+    "quest_allowance_source_kinds": [
+      "api"
+    ],
+    "shared_source_count": 3,
+    "shared_versions": [
+      1,
+      1,
+      1
+    ],
+    "other_selection_unchanged": true,
+    "accepted_snapshot_unchanged": true,
+    "actual_runtime_ui": "API selected and MCP unchecked after the explicit API-only selection save; observed read-only"
+  },
+  "limits": [
+    "Accepted completion is limited, not an unrestricted research success.",
+    "OpenAlex returned HTTP 429 and remains limited.",
+    "Opaque MCP metadata has no confirmed paper version; its actual call is retained as a clue.",
+    "Appendix and supplementary-material coverage remains limited; no claim that all such materials were obtained or independently read.",
+    "Controlled Companion drafting is not a real Companion model execution."
+  ],
+  "cleanup": {
+    "native_providers": [
+      {
+        "operation": "t1",
+        "pid": 37596,
+        "alive": false
+      },
+      {
+        "operation": "t2",
+        "pid": 54628,
+        "alive": false
+      },
+      {
+        "operation": "t3",
+        "pid": 34332,
+        "alive": false
+      }
+    ],
+    "owned_api_pid": 4026419,
+    "owned_api_process_alive": false,
+    "tunnel_listener_count": 0,
+    "browser_tab_closed": true,
+    "primary_identity_unchanged": true,
+    "primary_identity_equal_fields": {
+      "pid": true,
+      "alive": true,
+      "start_ticks": true,
+      "argv": true,
+      "release_manifest_sha256": true,
+      "source_commit": true,
+      "wheel_sha256": true
+    },
+    "primary_service_controls": 0,
+    "retired_service_controls": 0
+  },
+  "pending": [
+    "Required different-model-family trail review: Claude HTTP403 quota failure remains unresolved; no waiver recorded"
+  ],
+  "sources": [
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/run-20261009T175109.333247Z/confirmation-acceptance-20261009T181637.631510Z.json",
+      "sha256": "3a84659afceef7d8511b043cdb9a124078872f50a0b4f8e0f721029cbb353c52"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/run-20261009T175109.333247Z/final-public-readback-summary.json",
+      "sha256": "1f08444c6d2441a1723cf5cf2fa4bc00b3455cec2442afd2c25c61decf115c7d"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/s/operations/t3/execution.json",
+      "sha256": "2ce2590f9ec9219ed964996eb0b898e3afb1de56412e40cc4d67b97cb51774e7"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/s/operations/t3/reader-spawn-proof.json",
+      "sha256": "2ceeb11898bd4fc74bad68121fa4c6d753dbe03496047c87ac35a2c69e68fd8e"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/run-20261009T175109.333247Z/imported-native/17123e2dd92c225b507f-1791568765735182437/import-proof.json",
+      "sha256": "db251b4a475a86a26c65937eec0e26b7b506816d8c015e64256f4dbe9cca0a64"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/s/operations/t3/acquisition-input-transfer.json",
+      "sha256": "057f57415a602ea8257a3dd65aad16a279763b6c1279d0d0276c619ccc336d50"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/environment/primary-identity-20261009T181815.599043Z.json",
+      "sha256": "4a8ead385e980869489c5b28785919ada5d03178d5676ba7532c707847c5ecde"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/cleanup-final.json",
+      "sha256": "aa614c29fd0c7db4d83a196492cbaea2dd6ceb4d1b46124ebd9f00cb2180280c"
+    },
+    {
+      "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/native/run-20261009T175109.333247Z/process-20261009T181815.068543Z.json",
+      "sha256": "21cb54601d1824107305cddb749833f6df553c50d63bd1e6d51c062b3e3700f1"
+    }
+  ],
+  "decision_trail_self_audit": {
+    "status": "completed",
+    "scope": "Root self-audit through native acceptance only; not the required different-family review",
+    "row_count": 49,
+    "superseding_rows": [
+      16,
+      24,
+      38
+    ],
+    "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/trail-audit/accepted-native-before-publication/root-truth-audit.json",
+    "sha256": "f2e1445cad96cc98bb6a84501520049673b5ca72d286a334dacc4df278fbe9b4"
+  },
+  "publication_status": "Track actual commit, PR and tracker publication in the GitHub issue conclusion and local delivery record. This evidence projection does not anticipate publication."
+}

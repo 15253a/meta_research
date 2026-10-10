@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 
-LEDGER_SCHEMA = "deepfetch.papers.v4"
+LEDGER_SCHEMA = "deepfetch.papers.v4.1"
+HISTORICAL_LEDGER_SCHEMA = "deepfetch.papers.v4"
 READER_JOB_SCHEMA = "deepfetch.reader.job.v4"
 READER_PATCH_SCHEMA = "deepfetch.reader.patch.v4"
 STATE_SCHEMA = "deepfetch.private.v4"
@@ -310,8 +311,8 @@ def empty_reading() -> Dict[str, Any]:
     }
 
 
-def new_paper(paper_id: str, title: str) -> Dict[str, Any]:
-    return {
+def new_paper(paper_id: str, title: str, *, source_schema: bool = True) -> Dict[str, Any]:
+    paper = {
         "identity": {
             "paper_id": paper_id,
             "title": title,
@@ -340,6 +341,9 @@ def new_paper(paper_id: str, title: str) -> Dict[str, Any]:
         "fulltext_path": None,
         "reading": empty_reading(),
     }
+    if source_schema:
+        paper.update(paper_version="unverified", discovery_origins=[])
+    return paper
 
 
 def normalize_basis(value: Any) -> Dict[str, Any]:
@@ -354,6 +358,7 @@ def normalize_basis(value: Any) -> Dict[str, Any]:
 
 
 INTAKE_FLAT_KEYS = {
+    "paper_version", "discovery_origins",
     "paper_id", "title", "doi", "arxiv_id", "openalex_id", "authors",
     "institutions", "year", "venue", "publisher", "abstract", "cited_by_count",
     "citation_count_observed_at", "source_urls", "summary", "pre_understanding_summary",
@@ -393,6 +398,19 @@ def normalized_intake(raw: Any) -> Dict[str, Any]:
         return block.get(name)
 
     title = normalize_title(pick("title", identity))
+    version = nullable_string(raw.get("paper_version"), "paper_version") or "unverified"
+    if len(version) > 128:
+        raise PapersError("paper_version is too long")
+    arxiv_raw = pick("arxiv_id", identity)
+    embedded_version = re.search(r"(v\d+)(?:\.pdf)?$", arxiv_raw or "", flags=re.I)
+    if embedded_version:
+        if version != "unverified" and version != embedded_version.group(1).lower():
+            raise PapersError("arxiv version conflicts with paper_version")
+        version = embedded_version.group(1).lower()
+    origins = raw.get("discovery_origins", [])
+    if not isinstance(origins, list):
+        raise PapersError("discovery_origins must be an array")
+    origins = [{"receipt_ref": nonempty_string(exact_object(origin, ("receipt_ref",), "discovery origin")["receipt_ref"], "receipt_ref")} for origin in origins]
     evidence_level = pick("evidence_level", pre) or "title_only"
     if evidence_level not in PRE_EVIDENCE_LEVELS:
         raise PapersError("invalid pre-understanding evidence_level")
@@ -410,6 +428,8 @@ def normalized_intake(raw: Any) -> Dict[str, Any]:
     if (cited_by_count is None) != (citation_count_observed_at is None):
         raise PapersError("cited_by_count and citation_count_observed_at must be supplied together")
     return {
+        "paper_version": version,
+        "discovery_origins": origins,
         "paper_id": nullable_string(pick("paper_id", identity), "paper_id"),
         "title": title,
         "doi": normalize_doi(pick("doi", identity)),
@@ -438,7 +458,15 @@ def normalized_intake(raw: Any) -> Dict[str, Any]:
     }
 
 
-def generated_paper_id(item: Dict[str, Any]) -> str:
+def generated_paper_id(item: Dict[str, Any], *, source_schema: bool = False) -> str:
+    if source_schema:
+        base = next(("%s:%s" % (prefix, item[field]) for prefix, field in
+                     (("doi", "doi"), ("arxiv", "arxiv_id"), ("openalex", "openalex_id")) if item[field]), None)
+        if base is None:
+            raise PapersError("new paper records require a verified scholarly identifier; keep title-only or web leads outside the paper ledger")
+        version = item["paper_version"]
+        suffix = hashlib.sha256(version.encode("utf-8")).hexdigest()[:12]
+        return "%s@%s" % (base, suffix)
     if item["doi"]:
         return "doi:%s" % item["doi"]
     if item["arxiv_id"]:
@@ -451,19 +479,22 @@ def generated_paper_id(item: Dict[str, Any]) -> str:
 
 def find_existing_id(ledger: Dict[str, Any], item: Dict[str, Any]) -> Optional[str]:
     matches = set()
+    source_schema = ledger["schema_version"] == LEDGER_SCHEMA
     if item["paper_id"] is not None:
         if item["paper_id"] not in ledger["papers"]:
             raise PapersError("paper_id may select an existing record but cannot create one")
         matches.add(item["paper_id"])
     for paper_id, paper in ledger["papers"].items():
         identity = paper["identity"]
+        if source_schema and (item["paper_version"] == "unverified" or paper["paper_version"] != item["paper_version"]):
+            continue
         if item["doi"] and identity["doi"] == item["doi"]:
             matches.add(paper_id)
         if item["arxiv_id"] and identity["arxiv_id"] == item["arxiv_id"]:
             matches.add(paper_id)
         if item["openalex_id"] and identity["openalex_id"] == item["openalex_id"]:
             matches.add(paper_id)
-        if title_key(identity["title"]) == title_key(item["title"]):
+        if not source_schema and title_key(identity["title"]) == title_key(item["title"]):
             matches.add(paper_id)
     if len(matches) > 1:
         raise PapersError("paper identifiers resolve to multiple existing records")
@@ -471,7 +502,9 @@ def find_existing_id(ledger: Dict[str, Any], item: Dict[str, Any]) -> Optional[s
         return None
     paper_id = next(iter(matches))
     existing = ledger["papers"][paper_id]["identity"]
-    if title_key(existing["title"]) != title_key(item["title"]):
+    if source_schema and ledger["papers"][paper_id]["paper_version"] != item["paper_version"]:
+        raise PapersError("paper_version conflicts with the selected existing paper")
+    if not source_schema and title_key(existing["title"]) != title_key(item["title"]):
         raise PapersError("title conflicts with the selected existing paper")
     for field, label in (("doi", "DOI"), ("arxiv_id", "arXiv ID"), ("openalex_id", "OpenAlex ID")):
         if item[field] and existing[field] and item[field] != existing[field]:
@@ -483,6 +516,9 @@ def merge_intake(paper: Dict[str, Any], item: Dict[str, Any]) -> None:
     identity = paper["identity"]
     metadata = paper["metadata"]
     pre = paper["pre_understanding"]
+    if "paper_version" in paper:
+        paper["paper_version"] = item["paper_version"]
+        paper["discovery_origins"] = merge_unique(paper["discovery_origins"], item["discovery_origins"])
     for field in ("doi", "arxiv_id", "openalex_id"):
         if item[field] is not None:
             identity[field] = item[field]
@@ -579,7 +615,7 @@ def save_state(out_dir: Path, state: Dict[str, Any]) -> None:
 
 def load_ledger(out_dir: Path) -> Dict[str, Any]:
     value = read_json(out_dir / "papers.json")
-    if not isinstance(value, dict) or value.get("schema_version") != LEDGER_SCHEMA:
+    if not isinstance(value, dict) or value.get("schema_version") not in {LEDGER_SCHEMA, HISTORICAL_LEDGER_SCHEMA}:
         raise PapersError("papers.json schema_version must be %s" % LEDGER_SCHEMA)
     return value
 
@@ -830,10 +866,10 @@ def command_upsert(args: argparse.Namespace) -> None:
             item = normalized_intake(raw)
             paper_id = find_existing_id(ledger, item)
             if paper_id is None:
-                paper_id = generated_paper_id(item)
+                paper_id = generated_paper_id(item, source_schema=ledger["schema_version"] == LEDGER_SCHEMA)
                 if paper_id in ledger["papers"]:
                     raise PapersError("paper_id collision")
-                ledger["papers"][paper_id] = new_paper(paper_id, item["title"])
+                ledger["papers"][paper_id] = new_paper(paper_id, item["title"], source_schema=ledger["schema_version"] == LEDGER_SCHEMA)
                 ledger["paper_order"].append(paper_id)
             merge_intake(ledger["papers"][paper_id], item)
             if paper_id not in changed:
@@ -1294,7 +1330,7 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
             errors.append("%s: %s" % (prefix, exc))
 
     check(lambda: exact_object(ledger, TOP_KEYS, "papers.json"), "schema")
-    if ledger.get("schema_version") != LEDGER_SCHEMA:
+    if ledger.get("schema_version") not in {LEDGER_SCHEMA, HISTORICAL_LEDGER_SCHEMA}:
         errors.append("schema: schema_version must be %s" % LEDGER_SCHEMA)
 
     topic = ledger.get("topic")
@@ -1381,7 +1417,9 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
 
     for paper_id, paper in papers.items():
         prefix = "paper %s" % paper_id
-        check(lambda paper=paper: exact_object(paper, PAPER_KEYS, "paper"), prefix)
+        source_schema = ledger["schema_version"] == LEDGER_SCHEMA
+        paper_keys = (*PAPER_KEYS, "paper_version", "discovery_origins") if source_schema else PAPER_KEYS
+        check(lambda paper=paper: exact_object(paper, paper_keys, "paper"), prefix)
         if not isinstance(paper, dict) or any(key not in paper for key in PAPER_KEYS):
             continue
         identity = paper["identity"]
@@ -1406,7 +1444,14 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
                 ):
                     if identity[field] != canonical:
                         errors.append("%s: identity.%s is not canonical" % (prefix, field))
-                if paper_id.startswith("doi:"):
+                if source_schema:
+                    item = normalized_intake({"identity": identity, "paper_version": paper.get("paper_version"), "discovery_origins": paper.get("discovery_origins")})
+                    identity_prefix = paper_id.partition(":")[0]
+                    identity_field = {"doi": "doi", "arxiv": "arxiv_id", "openalex": "openalex_id"}.get(identity_prefix)
+                    version_hash = hashlib.sha256(item["paper_version"].encode("utf-8")).hexdigest()[:12]
+                    if identity_field is None or not item[identity_field] or paper_id != "%s:%s@%s" % (identity_prefix, item[identity_field], version_hash):
+                        errors.append("%s: versioned paper_id disagrees with identity or paper_version" % prefix)
+                elif paper_id.startswith("doi:"):
                     if canonical_doi is None or paper_id != "doi:%s" % canonical_doi:
                         errors.append("%s: DOI paper_id disagrees with identity.doi" % prefix)
                 elif paper_id.startswith("arxiv:"):

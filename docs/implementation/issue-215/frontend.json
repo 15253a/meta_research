@@ -1,0 +1,85 @@
+{
+  "schema": "meta_research.issue215.frontend.v1",
+  "source_commit": "71a06608fa64729e595eb966b2957cd724476d26",
+  "source_tree": "e45314c1e1336745238bd7b3958ea8feafda502b",
+  "tree_proof": {
+    "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/ui-tree-proof.json",
+    "sha256": "723f473ee2f5bd6252a10cc4dd7ff2b6b121a2bbc990b094cd4d814d7a853eaf"
+  },
+  "results": [
+    {
+      "name": "node_tests",
+      "command": "npm test",
+      "observed_counts": {
+        "tests": 32,
+        "passed": 32,
+        "failed": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      },
+      "evidence": {
+        "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/ui-node-tests.log",
+        "sha256": "9c0fa8a67e77fc67b38c7966acec036567ce87ff688334ed83fcd7be4174881c"
+      }
+    },
+    {
+      "name": "source_browser",
+      "command": "node node_modules/@playwright/test/cli.js test tests/search-sources.spec.ts --project=functional",
+      "observed_counts": {
+        "tests": 6,
+        "passed": 6,
+        "failed": 0
+      },
+      "served_assets": "tracked default src/meta_research/web_dist",
+      "http_boundary": "intercepted fixtures",
+      "evidence": {
+        "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/ui-default-source-browser.log",
+        "sha256": "c28de113a37ca02672c84a832baaf7b0a772a2732ad2eb0b342c1a77fd4975f8"
+      }
+    },
+    {
+      "name": "existing_browser_cases",
+      "selectors": [
+        "tests/external-mcp.spec.ts",
+        "tests/runtime-conditions.spec.ts"
+      ],
+      "scoped_counts": {
+        "tests": 14,
+        "passed": 14,
+        "failed": 0
+      },
+      "http_boundary": "intercepted fixtures",
+      "containing_run": {
+        "tests": 20,
+        "passed": 19,
+        "failed": 1,
+        "failed_case": "source creation fixture lacked ready worker capability",
+        "whole_run_status": "failed",
+        "resolution": "Corrected source fixture passed in the final six-source run. Do not claim this containing run passed."
+      },
+      "evidence": {
+        "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/ui-browser-final.log",
+        "sha256": "2c58c620e29216c47dfd0c244473a6543a1c03a800b6c1dc6b27610269159e35"
+      }
+    },
+    {
+      "name": "typecheck_and_production_build",
+      "command": "npm run build -- --emptyOutDir false",
+      "observed_steps": [
+        "typecheck:app",
+        "typecheck:e2e",
+        "vite build"
+      ],
+      "status": "passed",
+      "output_directory": "src/meta_research/web_dist",
+      "warning": "Existing Vite chunk-size warning remains.",
+      "evidence": {
+        "local_path": "D:/10-7优化实现8768/.scratch/implementation-215-20261010/ui-default-build.log",
+        "sha256": "c28918d6fc4b001d6be852e32fdd8bd8c89b193641ef72ba30ff37f3bd8da1c1"
+      }
+    }
+  ],
+  "actual_external_provider_availability_proven_by_browser_fixtures": false,
+  "final_native_research_and_quest_confirmation_status": "pending"
+}

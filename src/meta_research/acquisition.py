@@ -33,6 +33,31 @@ class AcquisitionUnavailable(RuntimeError):
         self.code = code
 
 
+def effective_acquisition_config(config: dict[str, object]) -> dict[str, object]:
+    if (
+        not {"mode", "library_entry_url"} <= set(config)
+        or set(config) - {"mode", "library_entry_url", "institution_required"}
+        or config.get("mode")
+        not in {"oa_then_institution", "oa_only", "provided_only"}
+        or not isinstance(config.get("library_entry_url"), str)
+        or type(config.get("institution_required", False)) is not bool
+        or (
+            config.get("institution_required", False)
+            and config.get("mode") != "oa_then_institution"
+        )
+    ):
+        raise AcquisitionUnavailable("acquisition_preflight_request_invalid")
+    mode = str(config["mode"])
+    library_entry_url = str(config["library_entry_url"]).strip()
+    if (
+        mode == "oa_then_institution"
+        and not library_entry_url
+        and not config.get("institution_required", False)
+    ):
+        mode = "oa_only"
+    return {"mode": mode, "library_entry_url": library_entry_url}
+
+
 @dataclass(frozen=True)
 class AcquisitionRuntimeBinding:
     provider_ref: str

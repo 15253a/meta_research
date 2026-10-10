@@ -255,10 +255,17 @@ class ExternalMcpRuntime:
             return config
 
     def test_connection(self, connection: dict[str, Any]) -> dict[str, Any]:
+        result = self.test_direct_connection(connection)
+        if result["status"] == "ready":
+            return {key: value for key, value in result.items() if key != "tools"}
+        return result
+
+    def test_direct_connection(self, connection: dict[str, Any]) -> dict[str, Any]:
         try:
             discovered = self._client.discover(connection)
             self._validate_catalog(discovered["tools"])
-            return {"status": "ready", "server_name": discovered["server_name"], "protocol_version": discovered["protocol_version"], "tool_count": len(discovered["tools"])}
+            return {"status": "ready", "server_name": discovered["server_name"], "protocol_version": discovered["protocol_version"],
+                "tool_count": len(discovered["tools"]), "tools": discovered["tools"]}
         except ExternalMcpClientError as error:
             messages = {"timeout": "Connection initialization or discovery timed out.", "unreachable": "The MCP service could not be reached.",
                 "authentication_failed": "The MCP service rejected authentication.", "process_start_failed": "The MCP command could not be started.",
@@ -268,6 +275,23 @@ class ExternalMcpRuntime:
 
     def operation_snapshot(self, *, operation_identity: str, root_kind: RootAgentKind, task_prompt: str,
         binding: dict[str, str] | None = None, recovery: bool = False, legacy_empty: bool = False) -> ExternalMcpOperationSnapshot:
+        def configuration() -> ExternalMcpConfiguration:
+            config = self.read_config()
+            return ExternalMcpConfiguration(config.revision, () if legacy_empty else tuple(
+                service for service in config.services if root_kind in service.allowed_root_kinds))
+        return self._operation_snapshot(operation_identity=operation_identity, root_kind=root_kind,
+            task_prompt=task_prompt, binding=binding, recovery=recovery, configuration=configuration)
+
+    def direct_service_snapshot(self, *, operation_identity: str, services: tuple[ExternalMcpServiceConfig, ...],
+        configuration_revision: str, task_prompt: str, binding: dict[str, str] | None = None,
+        recovery: bool = False) -> ExternalMcpOperationSnapshot:
+        configuration = ExternalMcpConfiguration(configuration_revision, services)
+        return self._operation_snapshot(operation_identity="search-source:" + operation_identity, root_kind="deepfetch",
+            task_prompt=task_prompt, binding=binding, recovery=recovery, configuration=lambda: configuration)
+
+    def _operation_snapshot(self, *, operation_identity: str, root_kind: RootAgentKind, task_prompt: str,
+        binding: dict[str, str] | None, recovery: bool,
+        configuration: Callable[[], ExternalMcpConfiguration]) -> ExternalMcpOperationSnapshot:
         operation_key = canonical_hash({"identity": operation_identity, "root_kind": root_kind})
         path = self._operations / (operation_key + ".json")
         with self._lock:
@@ -280,21 +304,18 @@ class ExternalMcpRuntime:
                 return snapshot
             if recovery or binding is not None:
                 raise ExternalMcpError("external_mcp_snapshot_missing")
-            config = self.read_config()
+            config = configuration()
             frozen = []
-            if not legacy_empty:
-                for service in config.services:
-                    if root_kind not in service.allowed_root_kinds:
-                        continue
-                    try:
-                        discovered = self._client.discover(json.loads(service.connection_json))
-                        self._validate_catalog(discovered["tools"])
-                    except ExternalMcpClientError as error:
-                        failure = {"stage": "tools/list" if error.code == "invalid_catalog" else error.stage,
-                            "reason_code": error.code, "outcome": "tools_unavailable", "business_action_attempted": False}
-                        frozen.append(FrozenExternalService(service, "", "[]", canonical_json(failure)))
-                    else:
-                        frozen.append(FrozenExternalService(service, discovered["server_instructions"], canonical_json(discovered["tools"])))
+            for service in config.services:
+                try:
+                    discovered = self._client.discover(json.loads(service.connection_json))
+                    self._validate_catalog(discovered["tools"])
+                except ExternalMcpClientError as error:
+                    failure = {"stage": "tools/list" if error.code == "invalid_catalog" else error.stage,
+                        "reason_code": error.code, "outcome": "tools_unavailable", "business_action_attempted": False}
+                    frozen.append(FrozenExternalService(service, "", "[]", canonical_json(failure)))
+                else:
+                    frozen.append(FrozenExternalService(service, discovered["server_instructions"], canonical_json(discovered["tools"])))
             payload = {"operation_key": operation_key, "root_kind": root_kind, "configuration_revision": config.revision,
                 "task_prompt": task_prompt, "services": [service.as_dict() for service in frozen],
                 "recovery_guidance": _TOOL_GUIDANCE + ("\n\n" + (files("meta_research.skills") / "external-mcp-recovery.md").read_text(encoding="utf-8") if frozen else "")}
@@ -303,6 +324,26 @@ class ExternalMcpRuntime:
             if snapshot.task_prompt != task_prompt:
                 raise ExternalMcpError("external_mcp_snapshot_conflict")
             return snapshot
+
+    def call_direct(self, *, binding: dict[str, str], service_id: str, tool_name: str,
+        arguments: dict[str, Any]) -> dict[str, Any]:
+        snapshot = self.restore_snapshot(binding, root_kind="deepfetch")
+        tools = {exposed_tool_name(frozen.service.service_id, tool["name"]): (frozen, tool)
+            for frozen in snapshot.services for tool in json.loads(frozen.catalog_json)}
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._grants[token] = _ExternalGrant(snapshot, tools, lambda: True)
+        try:
+            _, response, _ = self.dispatch_http(token, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": exposed_tool_name(service_id, tool_name), "arguments": arguments}})
+            if response is None:
+                raise ExternalMcpError("external_mcp_result_invalid")
+            if "error" in response:
+                raise ExternalMcpError(response["error"]["message"])
+            return response["result"]
+        finally:
+            with self._lock:
+                self._grants.pop(token, None)
 
     def _read_snapshot(self, path: Path) -> ExternalMcpOperationSnapshot:
         try:

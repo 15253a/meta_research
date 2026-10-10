@@ -10,7 +10,7 @@ from meta_research.migration import upgrade_database
 from test_quest_goal_evolution_migration import _migration_config, _upgrade_to_revision
 
 
-LATEST_REVISION = "0072_merge_material_companion"
+LATEST_REVISION = "0073_merge_search_source"
 
 
 def _seed_existing_creation(database: Path) -> dict[str, tuple]:

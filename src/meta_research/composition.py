@@ -142,6 +142,7 @@ from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillPr
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 from meta_research.root_workspace import RootWorkspaces
 from meta_research.external_mcp import ExternalMcpRuntime
+from meta_research.search_sources import SearchSourceRegistry
 
 
 @dataclass(frozen=True)
@@ -172,14 +173,25 @@ class _DeepFetchRequestVerifierRouter:
     ) -> None:
         self._advancement_engine = advancement_engine
 
-    def query_initialization_acquisition_binding(
+    def query_deepfetch_acquisition_binding(
         self, request_ref: str
     ) -> dict[str, str] | None:
         query = getattr(
             self._human_verifier,
-            "query_initialization_acquisition_binding",
+            "query_deepfetch_acquisition_binding",
         )
-        return cast(dict[str, str] | None, query(request_ref))
+        binding = query(request_ref)
+        if binding is not None or self._advancement_engine is None:
+            return cast(dict[str, str] | None, binding)
+        request = self._advancement_engine.query_autonomous_deepfetch_request_by_ref(request_ref)
+        if request is None:
+            return None
+        return {
+            "initialization_id": request.initialization_id,
+            "acquisition_session_ref": request.acquisition_session_ref,
+            "acquisition_config_hash": request.acquisition_config_hash,
+            "acquisition_runtime_binding_hash": request.acquisition_runtime_binding_hash,
+        }
 
     def query_autonomous_deepfetch_request_by_ref(self, request_ref: str):
         if self._advancement_engine is None:
@@ -279,6 +291,7 @@ class ProductionRuntime:
     writing: WritingReportService
     harnesses: HarnessRuntime
     external_mcp: ExternalMcpRuntime
+    search_sources: SearchSourceRegistry
     root_workspaces: RootWorkspaces
     target_run_authorities: TargetRunAuthorities
     target_run_runtime: TargetRunRuntime
@@ -980,6 +993,13 @@ def build_production_runtime(
             bind_workspaces(root_workspaces)
     human_collaboration._creation_workspaces = root_workspaces
     research_memory.creation_bases.workspaces = root_workspaces
+    external_mcp = ExternalMcpRuntime(data_root.root)
+    search_sources = SearchSourceRegistry(data_root.root, external_mcp=external_mcp)
+    human_collaboration.bind_search_sources(search_sources)
+    advancement_engine.bind_search_sources(search_sources)
+    bind_sources = getattr(deepfetch_provider, "bind_search_sources", None)
+    if callable(bind_sources):
+        bind_sources(search_sources)
     semantic_gateway = create_semantic_owner_gateway(
         root_workspaces=root_workspaces,
         research_graph=owners.research_graph,
@@ -987,6 +1007,7 @@ def build_production_runtime(
         research_memory=owners.research_memory,
         agent_runtime=owners.agent_runtime,
         acquisition_provider=acquisition_provider,
+        search_sources=search_sources,
         human_collaboration_snapshot=owners.human_collaboration.query_snapshot,
         human_collaboration=owners.human_collaboration,
         target_run_agent=target_run_agent,
@@ -1194,7 +1215,6 @@ def build_production_runtime(
             provider is lifecycle for lifecycle in provider_lifecycles
         ):
             provider_lifecycles.append(provider)
-    external_mcp = ExternalMcpRuntime(data_root.root)
     external_mcp.bind_scope_authority(harnesses)
     for provider in (intent_drafting_provider, idea_skill_provider, plan_skill_provider,
         bundle_skill_provider, reasoning_skill_provider, deepfetch_provider, acquisition_provider, writing_skill_provider):
@@ -1204,6 +1224,7 @@ def build_production_runtime(
     harnesses.bind_external_mcp(external_mcp)
     runtime = ProductionRuntime(
         external_mcp=external_mcp,
+        search_sources=search_sources,
         data_root=data_root,
         owners=owners,
         authentication=Authentication(database),

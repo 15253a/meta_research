@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.deepfetch_sources import source_operations
+
 from meta_research.stage_context_access import stage_context_operations
 from meta_research.root_workspace import workspace_operations
 from meta_research.work_materials import material_operations
@@ -243,6 +245,7 @@ def create_semantic_owner_gateway(
     human_collaboration=None,
     target_run_agent: SQLiteTargetRunAgentAuthority | None = None,
     root_workspaces=None,
+    search_sources=None,
 ) -> SemanticMcpGateway:
     """Bind semantic operations to public Owner interfaces only.
 
@@ -266,6 +269,7 @@ def create_semantic_owner_gateway(
         raise ValueError("semantic owner snapshot interface unavailable")
 
     operations = [
+        *source_operations(agent_runtime, search_sources),
         *workspace_operations(root_workspaces),
         *(material_operations(human_collaboration) if human_collaboration is not None else ()),
         *(
