@@ -557,6 +557,8 @@ export type IntentSessionTurn = {
   assistant_content: string | null;
   assistant_content_hash: string | null;
   reason: null | { code: string };
+  native_session_generation?: number;
+  native_session_ref?: string | null;
 };
 
 export type TargetAssertion = {
@@ -645,6 +647,13 @@ export type QuestCreationView = {
     ref: string;
     status: "open" | "closed";
     turns: IntentSessionTurn[];
+    native_session_generation?: number;
+    native_session_ref?: string | null;
+    native_sessions?: Array<{ generation: number; native_session_ref: string | null; created_at: number }>;
+    can_start_new_session?: boolean;
+    switch_block_reason?: string | null;
+    workspace_ref?: string | null;
+    workspace_path?: string | null;
   };
   acquisition_session: AcquisitionSessionProjection | null;
   deepfetch: DeepFetchProjection | null;
@@ -2365,6 +2374,18 @@ export type CompanionMessage = {
   created_at?: number;
   reason?: { code?: string } | null;
   view_context?: CompanionViewContext | null;
+  native_session_generation?: number;
+  native_session_ref?: string | null;
+};
+
+export type CompanionSessionSwitch = {
+  scope_ref: string;
+  session_ref: string;
+  status: "switched";
+  native_session_generation: number;
+  native_session_ref: null;
+  previous_native_session_ref: string | null;
+  switch_ref: string;
 };
 
 export type GuidanceStrength = 1 | 2 | 3 | 4 | 5;
@@ -2761,6 +2782,13 @@ export type HumanCollaborationProjection = {
     status: "ready" | "unavailable";
     scope_ref?: string | null;
     session_ref: string | null;
+    native_session_generation?: number;
+    native_session_ref?: string | null;
+    can_start_new_session?: boolean;
+    switch_block_reason?: string | null;
+    workspace_ref?: string | null;
+    workspace_path?: string | null;
+    native_sessions?: Array<{ generation: number; native_session_ref: string | null; created_at: number }>;
     messages: CompanionMessage[];
     soft_constraints: CompanionSoftConstraint[];
     agent_proposals: CompanionAgentProposal[];
@@ -3522,6 +3550,10 @@ export function sendCompanionMessage(
     message,
     ...(viewContext ? { view_context: viewContext } : {}),
   });
+}
+
+export function startNewCompanionSession(scopeRef: string): Promise<CompanionSessionSwitch> {
+  return writeJson("/api/v1/companion/sessions/new", "POST", { scope_ref: scopeRef });
 }
 
 export function readHumanRequestHandoff(
@@ -4304,6 +4336,14 @@ export function sendIntentMessage(
       expected_draft_hash: creation.quest_draft.hash,
       message,
     },
+  );
+}
+
+export function startNewIntentSession(initializationId: string): Promise<QuestCreationView> {
+  return writeJson(
+    `/api/v1/quest-initializations/${encodeURIComponent(initializationId)}/intent-session/new`,
+    "POST",
+    {},
   );
 }
 
@@ -5872,6 +5912,9 @@ export function followProjection(
     "human_collaboration.guidance_prepared",
     "human_collaboration.guidance_read",
     "human_collaboration.guidance_treated",
+    "human_collaboration.work_materials_submitted",
+    "human_collaboration.work_material_read",
+    "human_collaboration.work_material_treated",
     "human_collaboration.soft_constraint_withdrawn",
     "human_collaboration.agent_proposal_recorded",
     "human_collaboration.command_draft_created",

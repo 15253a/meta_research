@@ -11,6 +11,7 @@ from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json, new_ref
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from meta_research.work_material_contract import WORK_MATERIAL_OPERATION_IDS, CREATION_MATERIAL_OPERATION_IDS
+from meta_research.material_processing import MaterialProcessingMixin, material_treatments, material_processing_operations
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,7 @@ class MaterialSubmission:
         if not isinstance(value, dict) or set(value) != {"receiver", "selections", "description"}:
             raise OwnerConflict("material_submission_invalid")
         receiver, selections, description = value["receiver"], value["selections"], value["description"]
-        if (not isinstance(receiver, dict) or receiver.get("kind") not in {"creation", "manual", "current", "request"}
+        if (not isinstance(receiver, dict) or receiver.get("kind") not in {"creation", "manual", "current", "request", "acquired"}
             or not isinstance(selections, list) or not 1 <= len(selections) <= 100
             or not isinstance(description, str) or len(description) > 4000):
             raise OwnerConflict("material_submission_invalid")
@@ -46,15 +47,19 @@ def material_reference(database, reference_ref):
         receiver = json.loads(row.receiver_json)
         if canonical_hash(selection) != row.selection_hash or canonical_hash(command) != row.command_hash or command["receiver"] != receiver:
             raise OwnerConflict("material_receipt_invalid")
-        accesses = connection.execute(text("SELECT result_json FROM hc_work_material_accesses WHERE reference_ref=:ref ORDER BY created_at,access_ref"), {"ref": reference_ref}).all()
-    facts = [json.loads(access.result_json) for access in accesses]
+        accesses = connection.execute(text("SELECT result_json,actor FROM hc_work_material_accesses WHERE reference_ref=:ref ORDER BY created_at,access_ref"), {"ref": reference_ref}).all()
+    facts = []
+    for access in accesses:
+        value = json.loads(access.result_json)
+        actor = access.actor if value.get("reader_kind") == "root" else "browser" if value.get("reader_kind") == "browser" else None
+        facts.append({**value, "actor": actor})
     ranges = [fact for fact in facts if fact["operation"] == "read" and "error" not in fact]
     return {"reference_ref": row.reference_ref, "submission_ref": row.submission_ref, "receiver": receiver,
             "source": selection, "description": command["description"], "registered_at": row.created_at,
             "availability": facts[-1].get("availability", "available") if facts else "available",
             "read_state": "read" if ranges else "not_read", "read_ranges": ranges,
             "failures": [fact for fact in facts if "error" in fact], "unexpanded": selection["kind"] == "directory",
-            "reader": {"reference_ref": row.reference_ref}}
+            "reader": {"reference_ref": row.reference_ref}, "treatments": material_treatments(database, reference_ref=row.reference_ref)}
 
 
 def material_submission(database, submission_ref):
@@ -74,7 +79,7 @@ def material_submissions_for(database, anchor_kind, anchor_ref):
     return [material_submission(database, row.submission_ref) for row in rows]
 
 
-class WorkMaterialsMixin:
+class WorkMaterialsMixin(MaterialProcessingMixin):
     def creation_material_snapshot(self, anchor):
         from meta_research.creation_inputs import material_snapshot
         return material_snapshot(self, anchor)
@@ -192,13 +197,37 @@ class WorkMaterialsMixin:
     def query_work_material(self, reference_ref):
         return material_reference(self._database, reference_ref)
 
+    def _material_visible_workspaces(self, context):
+        locations = self._root_workspaces._visible(context)
+        visible = {location.workspace_ref for location in locations}
+        if context.root_kind != "companion":
+            return visible
+        companion = self.query_companion_work_context(context.root_session_ref)
+        if companion is None or not companion.get("quest_ref"):
+            return visible
+        quest_ref = companion["quest_ref"]
+        if not any(location.quest_ref == quest_ref for location in locations):
+            return visible
+        # Only registered inputs gain visibility. Their frozen receiver stays the
+        # original research root; generic workspace access is unchanged.
+        with self._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT DISTINCT w.workspace_ref FROM hc_work_material_roots w "
+                "JOIN hc_work_material_submissions s USING(submission_ref), "
+                "json_each(s.receiver_json, '$.roots') root "
+                "WHERE s.state='ready' AND json_extract(root.value, '$.workspace_ref')=w.workspace_ref "
+                "AND json_extract(root.value, '$.quest_ref')=:quest"
+            ), {"quest": quest_ref}).all()
+        visible.update(row.workspace_ref for row in rows)
+        return visible
+
     def _authorize_material(self, reference, context):
         if context is None:
             return
         if context.phase == "creation_materials":
             self._creation_material_operation(context).authorize(context, reference["reference_ref"])
             return
-        visible = {location.workspace_ref for location in self._root_workspaces._visible(context)}
+        visible = self._material_visible_workspaces(context)
         receiver = reference["receiver"]
         if not visible.intersection(root["workspace_ref"] for root in receiver.get("roots", [])):
             raise OwnerConflict("material_not_visible")
@@ -208,6 +237,9 @@ class WorkMaterialsMixin:
             connection.execute(text("INSERT INTO hc_work_material_accesses (access_ref,reference_ref,path,actor,result_json,created_at) VALUES (:ref,:reference,:path,:actor,:result,:now)"),
                 {"ref": new_ref("material_access"), "reference": reference_ref, "path": path, "actor": actor,
                  "result": canonical_json(value), "now": time.time()})
+            if value.get("operation") == "read" and "error" not in value:
+                self._feed.record(connection, "human_collaboration.work_material_read", {"reference_ref": reference_ref,
+                    "actor": actor if value.get("reader_kind") == "root" else "browser"})
 
     def discover_work_materials(self, *, reference_ref=None, path="", cursor=None, limit=50, context=None, actor="browser", offset=0):
         if reference_ref is None:
@@ -219,7 +251,7 @@ class WorkMaterialsMixin:
                 return {"references": [operation.reference_view(item["reference_ref"]) for item in refs],
                         "next_offset": offset + limit if len(operation.inputs.references) > offset + limit else None,
                         "material_set_hash": operation.inputs.set_hash}
-            visible = None if context is None else [location.workspace_ref for location in self._root_workspaces._visible(context)]
+            visible = None if context is None else sorted(self._material_visible_workspaces(context))
             with self._database.read() as connection:
                 query = "SELECT r.reference_ref FROM hc_work_material_references r JOIN hc_work_material_submissions s USING(submission_ref) WHERE s.state='ready'"
                 params = {"offset": offset, "limit": limit + 1}
@@ -227,8 +259,14 @@ class WorkMaterialsMixin:
                     query += " AND EXISTS (SELECT 1 FROM hc_work_material_roots w WHERE w.submission_ref=s.submission_ref AND w.workspace_ref IN (SELECT value FROM json_each(:visible)))"
                     params["visible"] = json.dumps(visible)
                 rows = connection.execute(text(query + " ORDER BY s.created_at,r.reference_ref LIMIT :limit OFFSET :offset"), params).all()
+            retained = []
+            if context is not None:
+                quest = self._material_scope(context).get("quest_ref")
+                if quest:
+                    retained = material_treatments(self._database, quest_ref=quest, offset=offset, limit=limit + 1, selected_only=True)
             return {"references": [self.query_work_material(row.reference_ref) for row in rows[:limit]],
-                    "next_offset": offset + limit if len(rows) > limit else None}
+                    "next_offset": offset + limit if len(rows) > limit or len(retained) > limit else None,
+                    "retained_treatments": retained[:limit]}
         reference = self.query_work_material(reference_ref)
         self._authorize_material(reference, context)
         if context is not None and context.phase == "creation_materials":
@@ -256,6 +294,7 @@ class WorkMaterialsMixin:
             operation = self._creation_material_operation(context)
             witness = operation.witness(reference_ref, path, value)
         self._record_material_access(reference_ref, actor, path, {"operation": "read", "path": path,
+            "reader_kind": "root" if context is not None else "browser",
             "observation_ref": value["observation"]["observation_ref"], "offset": offset, "bytes": value["bytes"],
             "eof": value["eof"], "availability": "available",
             **({"witness": witness.as_dict(), "fence_ref": operation.fence_ref} if witness else {})})
@@ -283,18 +322,22 @@ class WorkMaterialsMixin:
 
     def copy_creation_material(self, *, context, effect_id, reference_ref, path, observation_ref, max_bytes=1048576):
         from meta_research.creation_inputs import material_bytes
-        operation = self._creation_material_operation(context)
+        from meta_research.material_processing import RuntimeMaterialOperation
+        creation = context.phase == "creation_materials"
+        operation = self._creation_material_operation(context) if creation else RuntimeMaterialOperation(self, context)
         operation.authorize(context, reference_ref)
         if type(max_bytes) is not int or not 1 <= max_bytes <= 8 * 1024**2:
             raise OwnerConflict("creation_copy_limit_invalid")
         request = {"reference_ref": reference_ref, "path": path,
                    "observation_ref": observation_ref, "max_bytes": max_bytes}
-        key, request_hash = context.effect_key(effect_id), canonical_hash(request)
+        key = context.effect_key(effect_id) if creation else self._material_effect_key(context, effect_id, "copy")
+        request_hash = canonical_hash(request)
         with self._database.fenced_write() as connection:
-            active = connection.execute(text("SELECT state,fence_ref FROM hc_creation_material_operations WHERE operation_ref=:ref"),
-                {"ref": operation.operation_ref}).one()
-            if active.state != "active" or active.fence_ref != operation.fence_ref:
-                raise OwnerConflict("creation_material_scope_invalid")
+            if creation:
+                active = connection.execute(text("SELECT state,fence_ref FROM hc_creation_material_operations WHERE operation_ref=:ref"),
+                    {"ref": operation.operation_ref}).one()
+                if active.state != "active" or active.fence_ref != operation.fence_ref:
+                    raise OwnerConflict("creation_material_scope_invalid")
             row = connection.execute(text("SELECT * FROM hc_creation_material_copies WHERE effect_key=:key"), {"key": key}).first()
             if row is not None:
                 if row.request_hash != request_hash:
@@ -324,7 +367,8 @@ class WorkMaterialsMixin:
                         raise OwnerConflict("creation_copy_too_large")
                     stream.write(content)
                     digest.update(content)
-                    witnesses.append(page["read_witness"])
+                    witnesses.append(page.get("read_witness") or {"reference_ref": reference_ref, "path": path,
+                        "observation_ref": observation_ref, "offset": page["offset"], "length": len(content), "actor": context.run_ref})
                     if page["eof"]:
                         break
                     if not content:
@@ -332,7 +376,8 @@ class WorkMaterialsMixin:
                 details = os.fstat(stream.fileno())
                 receipt = {"state": "ready", "effect_key": key,
                     "work_file": {"kind": "work_file", "work_ref": operation.work.work_ref, "path": name, "trial_ref": key},
-                    "working_path": "/workspace/" + operation.work.relative_directory + "/" + name,
+                    "working_path": ("/workspace/" + operation.work.relative_directory + "/" + name if creation
+                        else str(operation.work.location.directory / name)),
                     "source": {"kind": "original_file", "reference_ref": reference_ref, "path": path, "observation_ref": observation_ref},
                     "bytes": offset, "sha256": digest.hexdigest(), "read_witnesses": witnesses,
                     "device": details.st_dev, "inode": details.st_ino}
@@ -347,8 +392,10 @@ class WorkMaterialsMixin:
             raise
 
     def reconcile_creation_copy(self, *, context, effect_id):
-        operation = self._creation_material_operation(context)
-        key = context.effect_key(effect_id)
+        from meta_research.material_processing import RuntimeMaterialOperation
+        creation = context.phase == "creation_materials"
+        operation = self._creation_material_operation(context) if creation else RuntimeMaterialOperation(self, context)
+        key = context.effect_key(effect_id) if creation else self._material_effect_key(context, effect_id, "copy")
         with self._database.read() as connection:
             row = connection.execute(text("SELECT * FROM hc_creation_material_copies WHERE effect_key=:key"), {"key": key}).first()
         if row is None:
@@ -375,14 +422,14 @@ def material_operations(human):
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
     properties = {"reference_ref": {"type": "string", "maxLength": 96}, "path": {"type": "string", "maxLength": 4096}}
-    return (SemanticOperation(WORK_MATERIAL_OPERATION_IDS[0], "human_collaboration",
-        "Discover saved work material references visible to this actual root and eligible earlier work. Expand one original server directory at a time without preloading, hashing, copying or formal RM intake. Entries and unexpanded scope do not prove reading or understanding. Use observation_ref from an entry for a bounded read.", call,
+    return (*material_processing_operations(human), SemanticOperation(WORK_MATERIAL_OPERATION_IDS[0], "human_collaboration",
+        "Discover saved work material references visible to this actual root and eligible earlier work. A registered Quest Companion can read submitted inputs for the same Quest while their original receiver remains unchanged. Expand one original server directory at a time without preloading, hashing, copying or formal RM intake. Entries and unexpanded scope do not prove reading or understanding. Use observation_ref from an entry for a bounded read.", call,
         {"type": "object", "properties": {**properties, "cursor": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": False}, {"type": "object"}),
         SemanticOperation(WORK_MATERIAL_OPERATION_IDS[1], "human_collaboration",
         "Read at most 65536 requested bytes from a saved server material reference with its discovered observation_ref. Recheck original source identity and current root visibility. Returns UTF-8 or base64, exact byte interval and EOF; records successful ranges and failures without claiming comprehension. Changed originals require fresh discovery. No RM binding is required.", call,
         {"type": "object", "properties": {**properties, "observation_ref": {"type": "string", "minLength": 1}, "offset": {"type": "integer", "minimum": 0}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536}}, "required": ["reference_ref", "path", "observation_ref"], "additionalProperties": False}, {"type": "object"}),
         SemanticOperation(CREATION_MATERIAL_OPERATION_IDS[2], "human_collaboration",
-        "Copy only one explicitly requested observed original file into this creation operation's isolated work. Reads bounded original ranges and returns their witnesses plus an independent editable WorkFile. Default 1MiB, maximum8MiB per requested copy; no directory recursion. Retry the same effect_id unchanged or reconcile it; an edited copy is never overwritten by replay.", call,
+        "Copy one explicitly requested observed original file into independent editable work using the shared observed-file copier. Research roots write under .work-materials, outside Target's automatic output custody. Creation operations keep their isolated work. Reads bounded original ranges; default 1MiB, maximum8MiB; no directory recursion. Retry unchanged effect_id or reconcile; edited copies are never overwritten. Neither copies nor new outputs are automatically retained.", call,
         {"type": "object", "properties": {**properties, "observation_ref": {"type": "string", "minLength": 1}, "effect_id": {"type": "string", "minLength": 1, "maxLength": 128}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608}},
          "required": ["reference_ref", "path", "observation_ref", "effect_id"], "additionalProperties": False}, {"type": "object"}, "effect", CREATION_MATERIAL_OPERATION_IDS[3]),
         SemanticOperation(CREATION_MATERIAL_OPERATION_IDS[3], "human_collaboration",

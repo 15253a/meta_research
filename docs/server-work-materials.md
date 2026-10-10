@@ -34,4 +34,16 @@
 
 创建消费者可用 HC 的 `discover_creation_materials` / `read_creation_material`，传精确 `initialization_id` 或 `context_ref` 及其所属 reference。它们不要求 Seed 或 RM binding。原件使用 no-follow 描述符访问，拒绝符号链接逃逸与特殊文件，读取前后核验来源及字节观察。原件变化需重新发现；缺失或权限失败如实保存。
 
-[#213](https://github.com/15253a/meta_research/issues/213) 接通 Quest／手动 Question 的材料解释与共同工作副本，[#183](https://github.com/15253a/meta_research/issues/183) 接通研究中的消费。此合同交付运输、持久接收身份和可调用 reader，不宣称这些消费者已完成。新引用不得自动适配为全量 RM intake。
+[#213](https://github.com/15253a/meta_research/issues/213) 接通 Quest／手动 Question 的材料解释与共同工作副本；[#183](https://github.com/15253a/meta_research/issues/183) 在此能力上接通研究中的消费，合同如下。新引用不自动适配为全量 RM intake。
+
+## 运行根处理与选择保管
+
+真实根及其继承通道可用共同 `research_workspace.materials.copy`／`.copy.reconcile` 对一个观察到的原文件取得独立可写副本，沿 receipt 的 `working_path` 处理。请求字段与创建消费者相同；运行根副本放 `.work-materials/`，不属于 Target 常规自动产物目录。同一 effect_id 重试读回既有 receipt，保留已编辑内容。现有单文件小副本限额继续适用，大原件仍可按范围读及通过既有 RM custody 选择保管。
+
+Agent 自行取得资料可调用 `research_workspace.materials.acquire`，传 `effect_id`、真实取得 `description` 及互斥的 `absolute_path` 或原样 `selection`。绝对路径由现有服务器安全 inspector 生成轻量选择，Agent 不构造观察值。receiver.kind 为 `acquired`，roots 取实际认证工作，不重选当前前台，不制造 HumanRequest，不提前入库；`.acquire.reconcile` 只传原 effect_id 读回接受结果。
+
+`research_workspace.materials.feedback` 参数为 `effect_id`、`reference_ref`、`understanding`、`disposition`（adopted／considered／deferred／not_used）、`changes`、`continuing_work`、`reasons`、`limitations`、`selections`。disposition 是根的实际声明；adopted 要求该根有实际成功读取范围，浏览器读取不代替。每项 selection 为 `{source,custody,purpose}`，custody 是 managed 或 linked_local；source 使用原件 `{kind:"original_file",path,observation_ref}` 或工作结果 `{kind:"workspace_file",workspace_ref,path,expected_sha256}`。可选原件、结果、两者或空数组，所选项经既有 RM intake 与 RG quest_source_material 接纳，返回精确 `asset_binding`、`role_ref`、`reader`。正常 Target 实施与评价仍通过正式结果交接，反馈不制造科学结果、证据资格或资源身份。
+
+引用 GET 返回 `treatments`，保留原 receiver、processed_by 实际根／run、真实用途、声明的影响与局限；成功 read_ranges 的 reader_kind／actor 区分根与浏览器，旧记录无类型时不推定根已读。`.feedback.reconcile` 只传 effect_id 查询原接受结果。反馈 replay 先按原命令核验，不因来源、页面或前台后来变化重新投递。
+
+后继同 Quest 根通过 `materials.discover.retained_treatments` 及 next_offset 检索真正选中的内容和原采用关系，再将 selection.reader 交给 `research_memory.content.read`。它不获得原投递工作区的额外可见性；linked_local 漂移如实从精确 reader 返回。未选副本、输出与原件不因反馈自动入库；引用位置沿现有 Cycle 清理的 pending intake／linked custody 依赖保护。

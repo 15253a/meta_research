@@ -4,7 +4,7 @@ import {
   deliverMaterialCommand, discardMaterialCommand, fetchMaterialReceiver, pendingMaterialCommand,
   stageMaterialCommand, workMaterialErrorMessage, WorkMaterialError, fetchWorkMaterialReference, fetchResearchInputMaterialReceipts,
   type MaterialReceiver, type PendingMaterialCommand, type ServerMaterialSelection,
-  type WorkMaterialReceipt, type WorkMaterialSubmission,
+  type WorkMaterialReceipt, type WorkMaterialSubmission, type MaterialTreatment,
 } from "./workMaterialApi";
 
 export function useWorkMaterialDraft(scope: string, receiverPath: string) {
@@ -97,7 +97,31 @@ export function useWorkMaterialDraft(scope: string, receiverPath: string) {
 export type WorkMaterialDraft = ReturnType<typeof useWorkMaterialDraft>;
 
 export function ReceivingIdentity({ receiver }: { receiver: MaterialReceiver }) {
-  return <details className="work-material-receiver"><summary>材料接收位置 · {receiver.kind === "creation" ? "Quest 创建草稿" : receiver.kind === "manual" ? "手动创建上下文" : receiver.kind === "request" ? "求助原始工作" : "当前研究工作"}</summary><pre>{JSON.stringify(receiver, null, 2)}</pre></details>;
+  return <details className="work-material-receiver"><summary>材料接收位置 · {receiver.kind === "creation" ? "Quest 创建草稿" : receiver.kind === "manual" ? "手动创建上下文" : receiver.kind === "request" ? "求助原始工作" : receiver.kind === "acquired" ? "Agent 自行取得资料的工作" : "当前研究工作"}</summary><pre>{JSON.stringify(receiver, null, 2)}</pre></details>;
+}
+
+function MaterialTreatmentFeedback({ treatments }: { treatments: readonly MaterialTreatment[] }) {
+  const dispositions = { adopted: "已采用", considered: "已考虑", deferred: "待处理", not_used: "未采用" };
+  return <section className="work-material-treatment" aria-label="材料处理反馈">
+    {!treatments.length ? <p>尚无研究根的材料处理反馈。</p> : treatments.map(treatment => <div key={treatment.feedback_ref}>
+      <b>{treatment.processed_by.root_kind} · 根声明：{dispositions[treatment.disposition]}</b>
+      <dl>
+        <dt>理解</dt><dd>{treatment.understanding}</dd>
+        <dt>对研究安排或判断的影响</dt><dd>{treatment.changes}</dd>
+        <dt>后续工作</dt><dd>{treatment.continuing_work}</dd>
+        <dt>取舍理由</dt><dd>{treatment.reasons}</dd>
+        <dt>依据与限制</dt><dd>{treatment.limitations}</dd>
+      </dl>
+      <b>本次保管选择</b>
+      {!treatment.selections.length ? <p>本次未选择正式保管内容。</p> : <ul>{treatment.selections.map((selection, index) => <li key={index}>
+        <span>{selection.source.kind === "original_file" ? "原件" : "处理结果"} · {selection.custody === "managed" ? "独立保管" : "原位链接"}</span>
+        <p>{selection.purpose}</p>
+        <a href={`/api/v1/research-assets/${encodeURIComponent(selection.asset_binding.version_ref)}/content`} target="_blank" rel="noreferrer">查看保管内容</a>
+      </li>)}</ul>}
+      <small>反馈是研究根的声明；采用不表示已独立验证或目标完成。</small>
+      <details><summary>处理工作与精确引用</summary><pre>{JSON.stringify(treatment, null, 2)}</pre></details>
+    </div>)}
+  </section>;
 }
 
 export function WorkMaterialReferences({ receipts }: { receipts: readonly WorkMaterialReceipt[] }) {
@@ -109,18 +133,27 @@ export function WorkMaterialReferences({ receipts }: { receipts: readonly WorkMa
     <ReceivingIdentity receiver={reference.receiver} />
     <small>{reference.unexpanded ? "目录未整体展开。" : ""}读取记录不代表理解或研究采用。</small>
     {reference.availability !== "available" && <p role="status">{workMaterialErrorMessage(new WorkMaterialError(reference.availability))}</p>}
-    {reference.read_ranges.length > 0 && <details><summary>成功读取范围</summary><ul>{reference.read_ranges.map((range, index) => <li key={index}>{range.path || reference.source.absolute_path} · 从字节 {range.offset} 起读取 {range.bytes} 字节</li>)}</ul></details>}
+    {reference.read_ranges.length > 0 && <details><summary>成功读取范围</summary><ul>{reference.read_ranges.map((range, index) => <li key={index}>{range.path || reference.source.absolute_path} · 从字节 {range.offset} 起读取 {range.bytes} 字节{range.actor === "browser" ? " · 浏览器读取" : range.actor ? " · 研究工具读取" : " · 未注明读取者"}</li>)}</ul></details>}
     {reference.failures.length > 0 && <details><summary>来源访问失败记录</summary><ul>{reference.failures.map((failure, index) => <li key={index}>{failure.path} · {workMaterialErrorMessage(new WorkMaterialError(failure.error))}</li>)}</ul></details>}
+    <MaterialTreatmentFeedback treatments={reference.treatments ?? []} />
   </article>)}</div>;
 }
 
-export function ResearchInputMaterialReferences({ inputRef, questRef }: { inputRef: string; questRef: string }) {
-  const [receipts, setReceipts] = useState<WorkMaterialReceipt[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  return <details onToggle={event => {
-    if (!event.currentTarget.open) return;
-    void fetchResearchInputMaterialReceipts(inputRef, questRef).then(setReceipts).catch(caught => setError(workMaterialErrorMessage(caught)));
-  }}><summary>已保存的工作材料引用</summary><WorkMaterialReferences receipts={receipts} />{error && <p role="alert">{error}</p>}</details>;
+export function ResearchInputMaterialReferences({ inputRef, questRef, refreshRevision = 0 }: { inputRef: string; questRef: string; refreshRevision?: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const identity = `${questRef}:${inputRef}`;
+  const [result, setResult] = useState<{ identity: string; receipts: WorkMaterialReceipt[]; error: string | null }>({ identity: "", receipts: [], error: null });
+  useEffect(() => {
+    if (!expanded) return;
+    let active = true;
+    void fetchResearchInputMaterialReceipts(inputRef, questRef).then(receipts => {
+      if (active) setResult({ identity, receipts, error: null });
+    }).catch(caught => {
+      if (active) setResult(current => ({ identity, receipts: current.identity === identity ? current.receipts : [], error: workMaterialErrorMessage(caught) }));
+    });
+    return () => { active = false; };
+  }, [expanded, inputRef, questRef, identity, refreshRevision]);
+  return <details onToggle={event => setExpanded(event.currentTarget.open)}><summary>已保存的工作材料引用</summary><WorkMaterialReferences receipts={result.identity === identity ? result.receipts : []} />{result.identity === identity && result.error && <p role="alert">{result.error}</p>}</details>;
 }
 
 export function HumanRequestMaterialReferences({ responses }: { responses: readonly Record<string, unknown>[] }) {
@@ -138,7 +171,7 @@ export function HumanRequestMaterialReferences({ responses }: { responses: reado
       if (active) setReceipts(references.map(reference => ({ submission_ref: reference.submission_ref, receiver: reference.receiver, references: [reference] })));
     }).catch(caught => { if (active) setError(workMaterialErrorMessage(caught)); });
     return () => { active = false; };
-  }, [identity]);
+  }, [identity, responses]);
   return <><WorkMaterialReferences receipts={receipts} />{error && <p role="alert">{error}</p>}</>;
 }
 

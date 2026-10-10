@@ -1556,6 +1556,9 @@ def _human_collaboration_projection(
             "status": "ready",
             "scope_ref": scope_ref,
             "session_ref": companion_session.get("session_ref"),
+            **{name: companion_session.get(name) for name in (
+                "native_session_generation", "native_session_ref", "native_sessions",
+                "can_start_new_session", "switch_block_reason", "workspace_ref", "workspace_path")},
             "messages": collaboration["messages"],
             "soft_constraints": collaboration["soft_constraints"],
             "agent_proposals": collaboration["agent_proposals"],

@@ -179,6 +179,9 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
     target_root = Path(target_root)
     journal_root = target_root.parent / 'workspace-cleanup'
     offset = getattr(runtime, '_workspace_cleanup_offset', 0)
+    # Only Cycle-owned Target/stage work is eligible. Stable Companion HC
+    # workspaces (including after /new) and independent Writing never enter
+    # this candidate set and must not be added as finished provider scratch.
     with database.read() as connection:
         candidates = connection.execute(text("SELECT w.workspace_ref,w.root_name,w.target_ref, "
             "w.target_run_ref AS work_ref, 'target' AS root_kind, r.cycle_ref, l.status AS lifecycle_status, "
