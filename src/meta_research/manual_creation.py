@@ -13,6 +13,7 @@ from meta_research.database import Database
 from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.search_sources import QuestScope, SearchSourceRegistry
+from meta_research.runtime_conditions import read_runtime_conditions
 from meta_research.feed import DurableFeed
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.common import (
@@ -1012,6 +1013,9 @@ class ManualQuestionCreation:
         _validate_idempotency_key(idempotency_key)
         with self._database.read() as connection:
             initial = self._require_context(connection, context_ref)
+            previous_request = connection.execute(text(
+                "SELECT scope_json FROM hc_manual_deepfetch_requests WHERE context_ref=:ref ORDER BY created_at DESC LIMIT 1"
+            ), {"ref": context_ref}).first()
             replay = self._query_command(
                 connection,
                 idempotency_key,
@@ -1044,10 +1048,24 @@ class ManualQuestionCreation:
             "library_entry_url": literature.get("library_entry_url"),
             "institution_required": literature.get("institution_required", False),
         }
+        current_conditions = read_runtime_conditions(self._database.path.parent, quest.quest_ref)
+        config = current_conditions.get("literature_configuration", config)
+        frozen_scope = json.loads(previous_request.scope_json) if previous_request is not None else None
+        if frozen_scope is not None:
+            config = {"mode": frozen_scope["literature_mode"], "library_entry_url": frozen_scope["library_entry_url"], "institution_required": frozen_scope.get("institution_required", literature.get("institution_required", False))}
+        config_hash = canonical_hash({"schema_ref": "meta-research/acquisition-session-config/v1", **effective_acquisition_config(config)})
         session = self._agent_runtime.query_acquisition_session(
             quest_ref=quest.quest_ref
         )
-        if session is None:
+        if session is None or session.config_hash != config_hash and not session.slot_held:
+            if session is not None:
+                with self._database.read() as connection:
+                    active = connection.execute(text(
+                        "SELECT request_ref FROM hc_manual_deepfetch_requests WHERE quest_ref=:quest AND context_ref!=:context "
+                        "AND status NOT IN ('succeeded','failed','cancelled') LIMIT 1"
+                    ), {"quest": quest.quest_ref, "context": context_ref}).first()
+                if active is not None:
+                    raise OwnerConflict("manual_deepfetch_acquisition_session_not_ready")
             session = self._agent_runtime.prepare_acquisition_session(
                 initialization_id=quest.initialization_id,
                 draft_revision=quest.draft_revision,
@@ -1094,13 +1112,17 @@ class ManualQuestionCreation:
             "seed_fields": seed["fields"],
             "quest_goal": draft.get("goal"),
             "quest_completion_criteria": draft.get("completion_criteria"),
-            "literature_mode": literature.get("mode"),
-            "library_entry_url": literature.get("library_entry_url"),
+            "literature_mode": config["mode"],
+            "library_entry_url": config["library_entry_url"],
             "scope_exclusions": literature.get("scope_exclusions"),
         }
+        if frozen_scope is None or "institution_required" in frozen_scope:
+            scope["institution_required"] = config.get("institution_required", False)
         scope_hash = canonical_hash(scope)
         if self._search_sources is not None:
             scope["search_source_basis"] = self._search_sources.capture(QuestScope(quest.quest_ref)).as_dict()
+            if frozen_scope is not None and "search_source_basis" in frozen_scope:
+                scope["search_source_basis"] = frozen_scope["search_source_basis"]
             scope_hash = canonical_hash(scope)
         if prepared_basis is not None:
             memory = self._research_memory.creation_bases

@@ -6,6 +6,7 @@ type ServiceDraft = Omit<ExternalMcpService, "connection"> & {
   transport: ExternalMcpConnection["transport"]; command: string; arguments: string;
   environment: string; workingDirectory: string; url: string; headers: string;
 };
+let systemPageDraft: { basis: ExternalMcpConfiguration; services: ServiceDraft[]; testResult: { index: number; text: string } | null } | null = null;
 
 function draft(service: ExternalMcpService): ServiceDraft {
   const connection = service.connection;
@@ -44,7 +45,7 @@ const failureReasons: Record<string, string> = {
 export function ExternalMcpSettings() {
   const alive = useRef(false);
   const [basis, setBasis] = useState<ExternalMcpConfiguration | null>(null);
-  const [services, setServices] = useState<ServiceDraft[]>([]);
+  const [services, setServices] = useState<ServiceDraft[]>(systemPageDraft?.services ?? []);
   const [attempt, setAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -63,12 +64,20 @@ export function ExternalMcpSettings() {
     setError(null);
     void fetchExternalMcp(controller.signal).then(value => {
       if (!current) return;
-      setBasis(value); setServices(value.services.map(draft)); setConflict(false); setSaved(false);
+      const cached = attempt === 0 ? systemPageDraft : null;
+      const dirty = cached && JSON.stringify(cached.services) !== JSON.stringify(cached.basis.services.map(draft));
+      const stale = Boolean(dirty && cached.basis.revision !== value.revision);
+      setBasis(dirty ? cached.basis : value); setServices(dirty ? cached.services : value.services.map(draft)); setConflict(stale); setSaved(false);
+      setTestResult(dirty ? cached.testResult : null);
+      if (stale) setError("外部 MCP 配置已变化。当前编辑已保留，请核对最新版本后继续。");
     }).catch(() => {
       if (current) setError("外部 MCP 配置读取失败，请重试。");
     }).finally(() => { if (current) setLoading(false); });
     return () => { alive.current = false; current = false; controller.abort(); };
   }, [attempt]);
+  useEffect(() => {
+    if (basis && !loading) systemPageDraft = { basis, services, testResult };
+  }, [basis, services, testResult, loading]);
 
   const edit = (index: number, change: Partial<ServiceDraft>) => {
     setServices(previous => previous.map((service, selected) => selected === index ? { ...service, ...change } : service));
@@ -95,7 +104,7 @@ export function ExternalMcpSettings() {
       if (!alive.current) return;
       const stale = caught instanceof ProductError && caught.code === "external_mcp_config_stale";
       setConflict(stale);
-      setError(stale ? "外部 MCP 配置已变化。当前编辑已保留，请关闭后重新打开，核对最新内容再保存。"
+      setError(stale ? "外部 MCP 配置已变化。当前编辑已保留，请核对最新版本后继续。"
         : caught instanceof SyntaxError ? "JSON 配置无法解析，当前编辑已保留。"
         : caught instanceof ProductError ? "保存失败，请检查服务标识、名称和连接配置；当前编辑已保留。"
         : caught instanceof Error ? caught.message : "保存失败，当前编辑已保留。");
@@ -158,6 +167,7 @@ export function ExternalMcpSettings() {
       </fieldset>)}
       {!loading && basis && !services.length ? <p>尚未配置外部 MCP 服务。</p> : null}
       {error ? <p role="alert" className="runtime-conditions-error">{error}</p> : null}
+      {conflict ? <button type="button" disabled={busy} onClick={() => { setConflict(false); setAttempt(value => value + 1); }}>读取最新外部 MCP 并替换当前编辑</button> : null}
       {saved ? <p role="status" className="runtime-conditions-saved">外部 MCP 配置已保存，将用于后续新操作。</p> : null}
       <footer>{!loading && !basis ? <button type="button" onClick={() => setAttempt(value => value + 1)}>重新读取外部 MCP</button> : null}
         <button type="button" disabled={disabled || services.length >= 32} onClick={add}>添加服务</button>

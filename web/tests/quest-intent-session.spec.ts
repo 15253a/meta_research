@@ -19,6 +19,7 @@ async function creationDialog(page: Page, busy = false) {
     capabilities: { direct: { status: "ready" }, first_question_deepfetch: { status: "ready" }, accepted_material_basis: { status: "ready" } }, receipts: {},
   };
   snapshot.quest_creation.current = current;
+  snapshot.readiness.checks = [{ name: "fixture_creation", status: "ready" }];
   const writes: Array<{ path: string; body: Record<string, unknown> }> = [];
   let releaseSwitch: (() => void) | null = null;
   const switchGate = new Promise<void>(done => { releaseSwitch = done; });
@@ -80,6 +81,29 @@ test("creation /new rotates its actual initialization session without sending ch
   expect(state.current.quest_draft.value.goal).toBe("保留这个创建目标");
   expect(state.current.quest_draft.revision).toBe(1);
   expect(state.current.intent_session.native_session_ref).toBeNull();
+});
+
+test("creation keeps its unsent assistant text and real preparation stage when reopened", async ({ page }, testInfo) => {
+  const state = await creationDialog(page);
+  const dialog = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
+  const input = dialog.getByLabel("在 Quest Drafting Session 中发消息");
+  await input.fill("还未发送：先核对第一问的范围。");
+  await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole("button", { name: "创建研究任务", exact: true }).click();
+  await expect(input).toHaveValue("还未发送：先核对第一问的范围。");
+  await expect(dialog.getByRole("navigation", { name: "创建准备阶段" })).toContainText("研究简报");
+  await expect(dialog.getByRole("navigation", { name: "创建准备阶段" }).getByText("研究简报")).toHaveAttribute("aria-current", "step");
+  expect(state.writes).toEqual([]);
+  for (const [width, height] of [[1440, 900], [390, 720], [1100, 580]]) {
+    await page.setViewportSize({ width, height });
+    const bounds = await dialog.boundingBox();
+    expect(bounds?.x).toBeGreaterThanOrEqual(0);
+    expect((bounds?.x ?? width) + (bounds?.width ?? width)).toBeLessThanOrEqual(width);
+    await dialog.screenshot({ path: testInfo.outputPath(`quest-fixture-${width}-${height}.png`) });
+    await input.scrollIntoViewIfNeeded();
+    await expect(input).toBeVisible();
+  }
 });
 
 test("creation /new explains busy work and keeps the command for retry without sending it as chat", async ({ page }) => {

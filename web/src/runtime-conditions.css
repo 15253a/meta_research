@@ -1,5 +1,23 @@
 .runtime-conditions-entry { padding: 9px 13px; border: 1px solid #d8deea; border-radius: 10px; background: #fff; color: #35405b; font: inherit; font-size: 13px; white-space: nowrap; cursor: pointer; }
 .runtime-conditions-entry:disabled { opacity: .5; cursor: default; }
+.runtime-conditions-dialog.workspace-modal { width: min(1160px, calc(100vw - 32px)); font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif; }
+.runtime-conditions-dialog.workspace-modal header { min-width: 0; justify-content: flex-start; padding-bottom: 18px; border-bottom: 1px solid #dfe4ee; }
+.runtime-conditions-dialog.workspace-modal header > div { min-width: 0; overflow-wrap: anywhere; }
+.runtime-conditions-dialog.workspace-modal header button { flex-shrink: 0; margin-left: auto; }
+.runtime-conditions-dialog.workspace-modal header .meta-trace { flex-shrink: 0; width: 36px; height: 36px; color: #625fe7; }
+.runtime-conditions-dialog.workspace-modal h2 { font-size: 20px; font-weight: 500; }
+.runtime-conditions-dialog.workspace-modal h3 { margin: 0 0 14px; font-size: 20px; font-weight: 500; }
+.runtime-deepfetch, .runtime-system { padding-top: 22px; border-top: 1px solid #dfe4ee; }
+.runtime-system { margin: 0 24px 24px; }
+.runtime-fulltext { padding: 18px; border: 1px solid #dfe4ee; border-radius: 13px; background: #f8f9fd; }
+.runtime-fulltext h4 { margin: 0 0 10px; font-size: 16px; font-weight: 500; }
+.runtime-fulltext .runtime-conditions-fields { margin-top: 16px; }
+.runtime-conditions-dialog .runtime-library-required { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; }
+.runtime-conditions-fields input[type="url"] { box-sizing: border-box; min-width: 0; width: 100%; padding: 10px 12px; font: inherit; border: 1px solid #cbd3e2; border-radius: 9px; background: white; }
+.runtime-pre-quest-note { padding: 20px 24px; }
+.runtime-conditions-dialog > .runtime-deepfetch { margin: 0 24px 24px; }
+.runtime-system .external-mcp-settings { margin: 20px 0 0; padding: 0; border: 0; }
+.runtime-conditions-dialog.workspace-modal .runtime-conditions-save { background: #172033; border-color: #172033; }
 .runtime-conditions-dialog { box-sizing: border-box; width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; overscroll-behavior: contain; padding: 0; border: 1px solid #d8deea; border-radius: 18px; color: #172033; background: #fff; box-shadow: 0 24px 90px #15213c40; }
 .runtime-conditions-dialog::backdrop { background: #17203366; }
 .runtime-conditions-dialog form { display: grid; gap: 18px; padding: 24px; }

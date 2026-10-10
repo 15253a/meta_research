@@ -9,6 +9,54 @@
   --quest-paper: #ffffff;
 }
 
+.quest-dialog.workspace-modal { font-family: var(--workspace-font, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif); font-size: 14px; line-height: 1.8; }
+.quest-dialog.workspace-modal .quest-modal-symbol { color: #625fe7; background: transparent; box-shadow: none; }
+.quest-dialog.workspace-modal .quest-modal-title h2 { font-family: inherit; font-size: 20px; font-weight: 500; letter-spacing: 0; }
+.quest-dialog.workspace-modal .quest-modal-header { background: #f5f3ff; }
+.quest-dialog.workspace-modal .quest-modal-title small { display: none; }
+.quest-dialog.workspace-modal .quest-modal-chip { font: inherit; font-size: 12px; border: 0; background: transparent; }
+.quest-dialog.workspace-modal .quest-close { width: 38px; height: 38px; flex-basis: 38px; border-radius: 9px; }
+.quest-dialog.workspace-modal .quest-basis-card { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 0; background: #fff; border: 0; }
+.quest-dialog.workspace-modal .quest-basis-card > label:nth-child(2) { grid-column: 1 / -1; grid-row: 1; }
+.quest-dialog.workspace-modal .quest-basis-card .quest-field > span { color: #66718a; }
+.quest-dialog.workspace-modal .quest-basis-card .quest-field em { padding: 0; color: #66718a; background: transparent; }
+.quest-dialog.workspace-modal .quest-journey-section + .quest-journey-section { margin-top: 28px; padding-top: 24px; border-top: 1px solid #dfe4ee; }
+.quest-dialog.workspace-modal .quest-section-heading { display: block; }
+.quest-dialog.workspace-modal .quest-section-heading b { font-size: 21px; font-weight: 600; }
+.quest-dialog.workspace-modal .quest-section-heading small { margin-top: 5px; font: inherit; font-size: 13px; text-align: left; letter-spacing: 0; }
+.quest-dialog.workspace-modal .quest-field > span, .quest-dialog.workspace-modal .quest-session-compose > label { font-size: 13px; font-weight: 400; }
+.quest-dialog.workspace-modal .quest-field input, .quest-dialog.workspace-modal .quest-field textarea, .quest-dialog.workspace-modal .quest-field select, .quest-dialog.workspace-modal .quest-session-compose textarea { font: inherit; border-radius: 9px; }
+.quest-dialog.workspace-modal .quest-config-card, .quest-dialog.workspace-modal .quest-literature-card, .quest-dialog.workspace-modal .quest-material-card { padding: 0; border: 0; border-radius: 0; }
+.quest-stage-track { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
+.quest-stage-track > span { display: flex; align-items: center; gap: 8px; padding: 0 0 12px; border-bottom: 2px solid #dfe4ee; color: #7d8493; font-size: 12px; }
+.quest-stage-track small { display: grid; place-items: center; width: 20px; height: 20px; border: 1px solid #e4e6ed; border-radius: 50%; font-size: 11px; }
+.quest-stage-track [data-state="current"] { color: #172033; border-color: #625fe7; }
+.quest-stage-track [data-state="current"] small { color: white; background: #625fe7; border-color: #625fe7; }
+.quest-stage-track [data-state="complete"] { color: #172033; border-color: #172033; }
+.quest-research-start { min-height: 0; overflow: auto; scrollbar-gutter: stable; padding: 24px 22px; background: #f4f6fb; }
+.quest-start-readings h3 { font-size: 17px; font-weight: 500; }
+.quest-start-readings dl { margin: 14px 0 24px; padding-top: 12px; border-top: 1px solid #dfe4ee; }
+.quest-start-readings dl > div { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 10px; margin: 12px 0; font-size: 12px; }
+.quest-start-readings dt { color: #6d788e; }
+.quest-start-readings dd { margin: 0; overflow-wrap: anywhere; }
+.quest-dialog.workspace-modal .quest-research-start .quest-section-heading b { font-size: 16px; }
+.quest-dialog.workspace-modal .quest-research-start .quest-section-heading small { display: none; }
+.quest-dialog.workspace-modal .quest-research-start .quest-route-options { grid-template-columns: 1fr; }
+.quest-dialog.workspace-modal .quest-research-start .quest-intent-session { height: auto; margin-top: 24px; padding: 18px; border: 1px solid #e1dff1; border-radius: 20px; background: linear-gradient(#f3f0ff, #fff); }
+.quest-dialog.workspace-modal .quest-intent-header { align-items: center; }
+.quest-dialog.workspace-modal .quest-intent-header .meta-trace { flex: 0 0 44px; width: 44px; height: 44px; padding: 5px; background: #efecf7; border: 1px solid #e2def0; border-radius: 14px; }
+.quest-dialog.workspace-modal .quest-intent-header span:not(.meta-trace) { display: none; }
+.quest-dialog.workspace-modal .quest-intent-transcript { min-height: 150px; max-height: 38dvh; }
+.quest-dialog.workspace-modal .quest-session-send { width: 35px; height: 35px; flex-basis: 35px; border-radius: 10px; background: #172033; color: white; }
+.quest-dialog.workspace-modal .quest-intent-empty, .quest-dialog.workspace-modal .quest-intent-boundary { font: inherit; font-size: 13px; }
+.quest-dialog.workspace-modal .quest-footer .confirm { background: #172033; border-color: #172033; }
+@media (max-width: 760px) {
+  .quest-dialog.workspace-modal .quest-research-start { overflow: visible; padding: 20px; }
+  .quest-dialog.workspace-modal .quest-basis-card { grid-template-columns: 1fr; }
+  .quest-stage-track { gap: 8px; }
+  .quest-stage-track > span { gap: 5px; font-size: 11px; }
+}
+
 .quest-dialog {
   width: calc(100vw - 2 * clamp(16px, 3.4vw, 54px));
   height: calc(100dvh - 2 * clamp(16px, 3.4vw, 54px));

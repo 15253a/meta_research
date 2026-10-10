@@ -204,9 +204,10 @@ export function ServerMaterialPicker({ value, onSelect, selectKind = "both", dis
         {page.next_cursor && <button type="button" onClick={() => void browse(page.absolute_path, true)} disabled={busy}>加载更多条目</button>}
         {!page.next_cursor && <small>当前目录条目已全部列出。</small>}
       </section>}
-      <label className="server-material-dialog__description" htmlFor={`${id}-description`}>原始材料说明
+      <div className="server-material-dialog__description">
+        <label htmlFor={`${id}-description`}>原始材料说明</label>
         <textarea id={`${id}-description`} value={description} onChange={event => setDescription(event.target.value)} maxLength={4000} disabled={inspection === "loading"} rows={3} placeholder="说明材料的内容、用途或背景，提交时保留原文。" />
-      </label>
+      </div>
       {candidate && <p className="server-material-dialog__chosen">当前候选 <code>{candidate}</code></p>}
       <div className="server-material-dialog__footer">
         <button type="button" onClick={close}>取消</button>

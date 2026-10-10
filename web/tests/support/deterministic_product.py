@@ -336,6 +336,25 @@ class DeterministicDraftingAdapter:
         time.sleep(1.2 if "并行" in request.message else 0.25)
         if "typed unavailable" in request.message:
             raise DraftingUnavailable("deterministic_intent_unavailable")
+        if (request.creation_context_kind == "companion_conversation"
+                and "GUIDANCE CONFIRMATION" in request.message):
+            context = request.draft["current_context"]
+            assert isinstance(context, dict)
+            question = context.get("question") or context.get("current_question")
+            assert isinstance(question, dict)
+            return IntentTurnResult(
+                reply="请确认本问题范围内的理解、力度与保留条件。",
+                native_session_ref=request.native_session_ref or "chrome-companion-session",
+                adapter_kind="chrome_deterministic",
+                agent_proposal={
+                    "proposal_kind": "soft_constraint", "text": request.message,
+                    "assistant_understanding": "仅在本问题中调整学习率，保留总目标。",
+                    "applies_to": ["本问题及其后续研究工作"],
+                    "semantic_scope": {"kind": "question", "quest_ref": context["quest_ref"],
+                        "question_ref": question["question_ref"]},
+                    "strength": 3, "preserve_conditions": ["总目标不变"],
+                },
+            )
         return IntentTurnResult(
             reply=f"建议先固定可证伪边界：{request.message}",
             native_session_ref=request.native_session_ref or "chrome-intent-session",
