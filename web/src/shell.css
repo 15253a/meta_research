@@ -114,6 +114,20 @@ a:focus-visible,
   gap: 10px;
 }
 
+.lumen-logo {
+  position: relative;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 13px;
+  color: #fff;
+  background: var(--ink);
+  font: 800 11px/1 var(--utility);
+}
+
+
 .lumen-brand b {
   display: block;
   font-size: 13px;
@@ -3646,7 +3660,7 @@ a:focus-visible,
 @media (max-width: 600px) {
   .lumen-shell { display: block; padding: 8px; }
   .lumen-header { height: 64px; }
-  .lumen-brand small { display: none; }
+  .lumen-brand > div { display: none; }
   .lumen-brand { min-width: 38px; }
   .lumen-quest-context b { max-width: 180px; }
   .lumen-research-power > button { min-width: 40px; width: 40px; padding: 0; }

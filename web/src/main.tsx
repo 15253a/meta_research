@@ -84,6 +84,7 @@ import {
 } from "./HumanCollaboration";
 import "./shell.css";
 import { ResearchOverview, ResearchBrief, ResearchTimeline, StageHistoryStrip, cycleOrdinalLabel, overviewQuestRef, useResearchOverview } from "./ResearchOverview";
+import { MetaTrace } from "./MetaTrace";
 import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
 import { ExperimentLogs, ExperimentOutputViews, ParallelExecutionLogs } from "./ExperimentLogs";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
@@ -5287,6 +5288,7 @@ function DetailedApp() {
       <div className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-companion-open={showCompanion} data-hc-background>
         <header className="lumen-header" data-shell-region="header">
           <a className="lumen-brand" aria-label="Meta-research 首页" href="/" style={{ color: "inherit", textDecoration: "none" }}>
+            <span className="lumen-logo" aria-hidden="true"><MetaTrace variant="signature" /></span>
             <div><b>Meta Research</b><small>Lumen workspace</small></div>
           </a>
           <div className="lumen-quest-context">
