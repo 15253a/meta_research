@@ -2175,8 +2175,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
     ) -> dict[str, list[dict[str, object]]]:
         projection = self._collaboration_ladder.query_projection(scope_refs)
         for guide in projection["soft_constraints"]:
-            guide["deliveries"] = self.query_guidance_deliveries(guide["constraint_ref"])
-            guide["strength"] = guide["guidance"].get("strength", 3)
+            self._decorate_guidance_projection(guide)
         authorizations: list[dict[str, object]] = []
         for authorization in projection["authorizations"]:
             if (
@@ -2194,6 +2193,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             else:
                 authorizations.append(authorization)
         return {**projection, "authorizations": authorizations}
+
+    def _decorate_guidance_projection(self, guide: dict[str, object]) -> None:
+        guide["deliveries"] = self.query_guidance_deliveries(guide["constraint_ref"])
+        guide["strength"] = guide["guidance"].get("strength", 3)
 
     def _companion_quest_context(
         self,
@@ -2497,7 +2500,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         work_materials = proposal["proposal"].get("work_materials")
         commit = self._guidance_material_committer(
             expected_scope_ref.removeprefix("quest:"), work_materials, idempotency_key)
-        return self._collaboration_ladder.convert_agent_proposal_to_soft_constraint(
+        converted = self._collaboration_ladder.convert_agent_proposal_to_soft_constraint(
             proposal_ref,
             expected_scope_ref=expected_scope_ref,
             expected_proposal_hash=expected_proposal_hash,
@@ -2505,6 +2508,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             strength=strength,
             material_committer=commit,
         )
+        self._decorate_guidance_projection(converted["soft_constraint"])
+        return converted
 
     def convert_agent_proposal_to_command_draft(
         self,

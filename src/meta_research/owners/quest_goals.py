@@ -1347,12 +1347,10 @@ class QuestGoalOwnerMixin:
                 ),
                 None,
             )
-            treatments = connection.execute(text(
-                "SELECT feedback_json FROM hc_guidance_treatments WHERE constraint_ref=:ref "
-                "AND revision=:revision AND guidance_hash=:hash"
-            ), {"ref": guide.constraint_ref, "revision": guide.revision,
-                "hash": guide.guidance_hash}).all()
-            impacts = [decoded_object(item.feedback_json).get("goal_impact") for item in treatments]
+            from meta_research.owners.human_guidance import current_guidance_assessments
+            treatments = current_guidance_assessments(connection, constraint_ref=guide.constraint_ref,
+                revision=guide.revision, guidance_hash=guide.guidance_hash)
+            impacts = [item.get("goal_impact", "undetermined") for item in treatments]
             if match is None and "none" in impacts and not any(
                     impact in {"requires_evolution", "undetermined"} for impact in impacts):
                 continue
@@ -1360,7 +1358,8 @@ class QuestGoalOwnerMixin:
                 {
                     "guide_ref": guide_ref,
                     "status": "pending" if match is None else "aligned",
-                    "reason": ("awaiting_goal_impact_assessment" if scope is not None and not impacts
+                    "reason": ("awaiting_goal_impact_assessment" if scope is not None
+                        and (not impacts or "undetermined" in impacts) and "requires_evolution" not in impacts
                         else "awaiting_goal_evolution") if match is None else None,
                     "scope_confirmation": "legacy_unconfirmed" if scope is None else "confirmed",
                     "aligned_revision": None if match is None else match.revision_ref,

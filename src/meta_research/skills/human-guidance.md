@@ -24,6 +24,8 @@ selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保
 
 适用且 needs_treatment=true 时，完整读取后由根 Session 用 human_guidance.feedback 声明 understanding、changes、continuing_work、reasons、disposition 和实际 goal_impact。goal_impact=none 表示整体目标及完成标准保持；requires_evolution 表示确需整体演化，可选 goal_alignment_pending；undetermined 保留待判断事项。各档力度均可影响目标判断。写明实际安排与判断依据，保留未解决冲突；反馈是根的声明，不是已落实的独立证明。局部严格指导无需空目标版本，也不因此阻止整体完成。超出局部确认范围的整体要求应先重新供人确认；研究 Session 可以在范围内细化安排。已确认 Quest 范围指导尚未判断或确需演化时仍待目标对齐，读取、反馈或 pending 本身不表示目标已切换。
 
+省略 goal_impact 不代表判断为整体目标不变：已确认 Quest 范围及历史5档指导保持 undetermined，goal_alignment_pending 仍表示 requires_evolution。原根或后继适用根完成实际判断后，可用新 read effect_id 完整读取原指导及当前 goal_assessments，再以新 feedback effect_id、显式 goal_impact=none 或 requires_evolution 和 resolves_receipts 列出需要解决的精确未决 receipt_ref。只能解决本指导版本中完整读回且当前未决的判断；旧回执与冻结读取不改写，过时、其他来源或未读回的引用会拒绝。并行工作已提出的 requires_evolution 仍须真实演化，不能用 none 消除；不创建空目标版本来消除已经解决的疑问。
+
 ## Quest 目标演化
 
 调用 `research_graph.quest_goal.read` 读取当前整个 Quest 的目标、完整完成标准、持续条件、指导对齐状态，以及本次已认证逻辑操作冻结的实际工作切面。该切面在同一操作内不可更改；新 Target、生命周期或运行条件使它过期时，保留 stale 结果，由新签发的根操作获得新切面，不刷新旧调用。
@@ -34,6 +36,6 @@ selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保
 
 effect 不确定时，用相同 `effect_id` 和字节等价判断调用 `research_graph.quest_goal.evolve.reconcile`；不改动 effect_id 重做。成功演化之后，系统以实际 AR 结果异步执行停止或阻止；Agent 不把意图当作已完成。
 
-applies_to_work=true 且 needs_treatment=false 时，读取原文与 prior_treatment 后继续履行该范围内约束，勿重复反馈。独立阶段工作与并行根各自处理，native Session 的沿用不合并责任。同一逻辑操作恢复沿原冻结快照继续；后来提交的指导由下一操作接续。工具只接收本次 delivery_ref 和 effect_id，Quest、根、job、operation 和快照由认证通道绑定，不能由工具参数选择。
+applies_to_work=true 且 needs_treatment=false 时，读取原文与 prior_treatment 后继续履行该范围内约束，勿重复反馈；完成未决影响判断时按上述具名解决合同补充新反馈。独立阶段工作与并行根各自处理，native Session 的沿用不合并责任。同一逻辑操作恢复沿原冻结快照继续；后来提交的指导由下一操作接续。工具只接收本次 delivery_ref 和 effect_id，Quest、根、job、operation 和快照由认证通道绑定，不能由工具参数选择。
 
 HumanRequest 的回复仍归属于原请求根及原等待事项。普通聊天、历史研究说明、Agent 建议和 HumanRequest 回复不自行转成正式指导。独立 review 子智能体可以提供自由格式建议，由根亲自读取指导并声明处理；review-only 通道不授予指导效果权限。

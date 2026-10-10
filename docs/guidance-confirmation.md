@@ -91,8 +91,20 @@ reasons. `goal_impact` distinguishes `none`, `requires_evolution` and
 whether the Quest target changes. A local strength-5 instruction therefore needs
 no empty goal revision and creates no global target-alignment obligation.
 
-A confirmed Quest-wide instruction remains subject to target-impact assessment;
-an actual or unresolved target change stays pending until handled. Actual target
+A confirmed Quest-wide instruction remains subject to target-impact assessment.
+Omitting `goal_impact` is not a negative assessment: Quest-wide and legacy
+strength-5 feedback remains `undetermined` unless it explicitly reports the
+impact (or declares `goal_alignment_pending`). Local scope does not create a
+Quest-wide obligation merely because its strength is 5.
+
+Feedback may explicitly name `resolves_receipts` to resolve earlier uncertain
+assessments of the exact guidance version. Use `goal_assessments[].receipt_ref` exposed by a fresh complete guidance read. The original effect receipts remain immutable; a new
+effect records the resolution. Stale, foreign or unread resolutions are rejected.
+An explicit `none` conclusion cannot erase an existing `requires_evolution`
+assessment. This allows uncertainty to be resolved without an empty goal version
+or last-writer-wins treatment of parallel research.
+
+An actual or unresolved target change stays pending until handled. Actual target
 evolution continues to update completion criteria, preserve explicit conditions,
 invalidate stale completion candidates and assess running work. A local
 instruction cannot authorize a Quest-wide change by itself. Research agents may

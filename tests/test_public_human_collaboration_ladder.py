@@ -1214,10 +1214,13 @@ def test_collaboration_projection_isolates_every_artifact_by_exact_scope(
         scopes = []
         for suffix in ("a", "b"):
             confirmed = _confirm_direct_quest(runtime, key_prefix="projection-" + suffix)
-            for _ in range(5):
-                if not human.reconcile_once():
+            for _ in range(16):
+                if human.query_quest_creation(confirmed["initialization_id"])["status"] == "completed":
                     break
-            scopes.append("quest:" + human.query_quest_creation(confirmed["initialization_id"])["quest_ref"])
+                human.reconcile_once()
+            creation = human.query_quest_creation(confirmed["initialization_id"])
+            assert creation["status"] == "completed"
+            scopes.append("quest:" + creation["quest_ref"])
         scope_a, scope_b = scopes
         for suffix, scope_ref in (("a", scope_a), ("b", scope_b)):
             human.send_companion_message(

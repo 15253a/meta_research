@@ -290,6 +290,9 @@ class HumanGuidanceMixin:
                 "needs_treatment": delivery.needs_treatment,
                 "prior_treatment": None if delivery.prior_treatment_json is None
                     else decoded_object(delivery.prior_treatment_json),
+                "goal_assessments": [_assessment_summary(item) for item in current_guidance_assessments(
+                    connection, constraint_ref=guide["constraint_ref"], revision=guide["revision"],
+                    guidance_hash=guide["guidance_hash"])] if full_read else [],
                 "received": True,
             }
             receipt = _record_effect(connection, key, "read", command, payload)
@@ -312,12 +315,14 @@ class HumanGuidanceMixin:
         delivery_ref: str, effect_id: str, understanding: str, changes: str,
         continuing_work: str, reasons: str, disposition: str,
         goal_impact: str | None = None,
+        resolves_receipts: list[str] | None = None,
         reconcile: bool = False,
     ) -> dict[str, object]:
         command = {"delivery_ref": delivery_ref, "understanding": understanding,
             "changes": changes, "continuing_work": continuing_work, "reasons": reasons,
             "disposition": disposition,
-            **({} if goal_impact is None else {"goal_impact": goal_impact})}
+            **({} if goal_impact is None else {"goal_impact": goal_impact}),
+            **({} if resolves_receipts is None else {"resolves_receipts": resolves_receipts})}
         if (any(not isinstance(command[key], str) or not command[key].strip()
                     or len(command[key]) > 8192
                 for key in ("understanding", "changes", "continuing_work", "reasons"))
@@ -325,6 +330,12 @@ class HumanGuidanceMixin:
                 or goal_impact not in {None, "none", "requires_evolution", "undetermined"}
                 or disposition == "goal_alignment_pending" and goal_impact == "none"):
             raise OwnerConflict("guidance_feedback_invalid")
+        if resolves_receipts is not None and (
+                not isinstance(resolves_receipts, list) or not 1 <= len(resolves_receipts) <= 100
+                or any(not isinstance(ref, str) or not 1 <= len(ref) <= 96 for ref in resolves_receipts)
+                or len(set(resolves_receipts)) != len(resolves_receipts)
+                or goal_impact not in {"none", "requires_evolution"}):
+            raise OwnerConflict("guidance_resolution_invalid")
         key = _effect_key(binding, "feedback", effect_id)
         with self._database.fenced_write() as connection:
             cut = self._authorize_guidance(scope, binding, reconcile=reconcile)
@@ -337,8 +348,11 @@ class HumanGuidanceMixin:
             guide = decoded_object(delivery.guide_json)
             if not delivery.applies_to_work:
                 raise OwnerConflict("guidance_outside_confirmed_scope")
-            impact = goal_impact or ("requires_evolution" if disposition == "goal_alignment_pending" else "none")
             confirmed_scope = guide["guidance"].get("semantic_scope")
+            global_assessment = (confirmed_scope is not None and confirmed_scope["kind"] == "quest"
+                or confirmed_scope is None and guide["guidance"].get("strength", 3) == 5)
+            impact = goal_impact or ("requires_evolution" if disposition == "goal_alignment_pending"
+                else "undetermined" if global_assessment else "none")
             if (impact == "requires_evolution" and confirmed_scope is not None
                     and confirmed_scope["kind"] != "quest"):
                 raise OwnerConflict("guidance_goal_scope_confirmation_required")
@@ -347,6 +361,23 @@ class HumanGuidanceMixin:
             ), {"delivery_ref": delivery_ref}).one()
             if row.read_at is None:
                 raise OwnerConflict("guidance_exact_read_required")
+            if resolves_receipts:
+                assessments = {item["receipt"]["receipt_ref"]: item for item in current_guidance_assessments(
+                    connection, constraint_ref=guide["constraint_ref"], revision=guide["revision"],
+                    guidance_hash=guide["guidance_hash"])}
+                if any(ref not in assessments for ref in resolves_receipts):
+                    raise OwnerConflict("guidance_resolution_stale")
+                if any(assessments[ref].get("goal_impact") not in {None, "undetermined"}
+                        for ref in resolves_receipts):
+                    raise OwnerConflict("guidance_resolution_invalid")
+                reads = connection.execute(text(
+                    "SELECT receipt_json FROM hc_guidance_effects WHERE kind='read' AND delivery_ref=:delivery_ref"
+                ), {"delivery_ref": delivery_ref}).all()
+                observed = {item["receipt_ref"] for read in reads
+                    if (value := decoded_object(read.receipt_json)).get("full_read")
+                    for item in value.get("goal_assessments", [])}
+                if not set(resolves_receipts).issubset(observed):
+                    raise OwnerConflict("guidance_resolution_unread")
             params = {"root_kind": binding.identity.root_kind,
                 "run_ref": binding.identity.run_ref, "constraint_ref": guide["constraint_ref"],
                 "revision": guide["revision"], "guidance_hash": guide["guidance_hash"]}
@@ -355,7 +386,8 @@ class HumanGuidanceMixin:
                 "AND run_ref=:run_ref AND constraint_ref=:constraint_ref AND revision=:revision "
                 "AND guidance_hash=:guidance_hash"
             ), params).first()
-            if prior is not None:
+            if prior is not None and (not resolves_receipts
+                    or decoded_object(prior.feedback_json)["receipt"]["receipt_ref"] not in resolves_receipts):
                 raise OwnerConflict("guidance_already_treated")
             payload = {**command, "binding": binding.as_dict(), "guide_ref": {
                 key: guide[key] for key in ("constraint_ref", "revision", "guidance_hash",
@@ -366,7 +398,10 @@ class HumanGuidanceMixin:
             receipt = _record_effect(connection, key, "feedback", command, payload)
             connection.execute(text(
                 "INSERT INTO hc_guidance_treatments VALUES (:root_kind,:run_ref,:constraint_ref,"
-                ":revision,:guidance_hash,:delivery_ref,:effect_key,:feedback_json,:now)"
+                ":revision,:guidance_hash,:delivery_ref,:effect_key,:feedback_json,:now) "
+                "ON CONFLICT(root_kind,run_ref,constraint_ref,revision,guidance_hash) DO UPDATE SET "
+                "delivery_ref=excluded.delivery_ref,effect_key=excluded.effect_key,"
+                "feedback_json=excluded.feedback_json,created_at=excluded.created_at"
             ), {**params, "delivery_ref": delivery_ref, "effect_key": key,
                 "feedback_json": canonical_json(receipt), "now": time.time()})
             self._feed.record(connection, "human_collaboration.guidance_treated", {
@@ -498,6 +533,32 @@ def _summary(delivery):
         "reader": {"operation": "human_guidance.read", "delivery_ref": delivery.delivery_ref},
         "prior_treatment": None if delivery.prior_treatment_json is None
             else decoded_object(delivery.prior_treatment_json)}
+
+
+def current_guidance_assessments(connection, *, constraint_ref, revision, guidance_hash):
+    rows = connection.execute(text(
+        "SELECT e.receipt_json,e.receipt_hash FROM hc_guidance_effects e "
+        "JOIN hc_guidance_deliveries d USING(delivery_ref) WHERE e.kind='feedback' "
+        "AND d.constraint_ref=:ref AND d.revision=:revision AND d.guidance_hash=:hash "
+        "ORDER BY e.created_at,e.effect_key"
+    ), {"ref": constraint_ref, "revision": revision, "hash": guidance_hash}).all()
+    receipts = []
+    for row in rows:
+        receipt = decoded_object(row.receipt_json)
+        if canonical_hash(receipt) != row.receipt_hash:
+            raise OwnerConflict("guidance_receipt_invalid")
+        receipts.append(receipt)
+    resolved = {ref for receipt in receipts for ref in receipt.get("resolves_receipts", [])}
+    return [receipt for receipt in receipts if receipt["receipt"]["receipt_ref"] not in resolved]
+
+
+def _assessment_summary(receipt):
+    identity = receipt["binding"]["identity"]
+    return {"receipt_ref": receipt["receipt"]["receipt_ref"],
+        "goal_impact": receipt.get("goal_impact", "undetermined"),
+        "root_kind": identity["root_kind"], "run_ref": identity["run_ref"],
+        "delivery_ref": receipt["delivery_ref"], "understanding": receipt["understanding"],
+        "reasons": receipt["reasons"]}
 
 
 def _effect_key(binding, kind, effect_id):

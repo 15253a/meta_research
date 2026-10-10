@@ -2,6 +2,8 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 
+import pytest
+
 from test_human_guidance_providers import _tool, _tool_error
 from test_quest_goal_concurrent_roots import _ParallelBundle, _two_admitted_roots
 from test_target_root_finalizer import _current_bundle_runtime
@@ -145,6 +147,129 @@ def test_low_strength_quest_guidance_keeps_real_goal_alignment_then_evolves_crit
         assert current["current"]["goal"]["goal"] == "Audit devices with calibration controls."
         assert current["current"]["goal"]["completion_criteria"] == "Report the reproducible device audit and calibration comparison."
         assert current["guidance_alignment"][0]["status"] == "aligned"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_missing_global_goal_impact_remains_unresolved_instead_of_assuming_no_change(tmp_path, legacy):
+    runtime = _current_bundle_runtime(tmp_path / "unassessed-global", bundle_skill=_ParallelBundle())
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
+    try:
+        quest_ref, admissions, _ = _two_admitted_roots(runtime)
+        human = runtime.owners.human_collaboration
+        if legacy:
+            human.submit_human_guidance(quest_ref=quest_ref, original_text="重审整体目标。",
+                strength=5, idempotency_key="legacy-unassessed")
+        else:
+            _confirm_guidance(runtime, quest_ref, {"kind": "quest", "quest_ref": quest_ref},
+                strength=2, text="可把 Quest 重心转向设备校准，同时重审整体完成标准。")
+        graph = runtime.owners.research_graph
+        original_goal = graph.query_current_quest_goal_revision(quest_ref)
+        adapter = runtime.harnesses._adapters["codex"]
+        original_invoke = adapter.invoke
+        observed = {}
+
+        def invoke(invocation):
+            if invocation.root_kind == "target":
+                delivery, = _tool(runtime, invocation.mcp_token, "human_guidance.read")["deliveries"]
+                _tool(runtime, invocation.mcp_token, "human_guidance.read",
+                    delivery_ref=delivery["delivery_ref"], effect_id="read-unassessed")
+                command = dict(delivery_ref=delivery["delivery_ref"], effect_id="defer-unassessed",
+                    understanding="整体影响尚需判断。", changes="保留当前安排。",
+                    continuing_work="继续有价值比较。", reasons="目前没有实际目标影响结论。", disposition="deferred")
+                receipt = _tool(runtime, invocation.mcp_token, "human_guidance.feedback", **command)
+                assert receipt["goal_impact"] == "undetermined"
+                assert receipt["goal_update_pending"] is True
+                assert _tool(runtime, invocation.mcp_token, "human_guidance.feedback", **command) == receipt
+                observed.update(receipt)
+            return original_invoke(invocation)
+
+        adapter.invoke = invoke
+        runtime.harnesses.run_or_resume_target_root(admissions[0].run.request_ref,
+            prompt="如实保留未判断的整体影响。", mcp_base_url="http://127.0.0.1:8999")
+        assert observed
+        assert graph.query_quest_goal_view(quest_ref)["guidance_alignment"][0]["status"] == "pending"
+        assert graph.query_current_quest_goal_revision(quest_ref) == original_goal
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("same_root", [True, False])
+def test_named_actual_assessment_resolves_uncertainty_without_an_empty_goal_revision(tmp_path, same_root):
+    runtime = _current_bundle_runtime(tmp_path / "resolved-global", bundle_skill=_ParallelBundle())
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
+    try:
+        quest_ref, admissions, _ = _two_admitted_roots(runtime)
+        _confirm_guidance(runtime, quest_ref, {"kind": "quest", "quest_ref": quest_ref},
+            strength=2, text="参考校准建议，先判断是否影响整体目标。")
+        graph = runtime.owners.research_graph
+        original_goal = graph.query_current_quest_goal_revision(quest_ref)
+        adapter = runtime.harnesses._adapters["codex"]
+        original_invoke = adapter.invoke
+        observed = {}
+
+        def invoke(invocation):
+            if invocation.root_kind != "target":
+                return original_invoke(invocation)
+            token = invocation.mcp_token
+            delivery, = _tool(runtime, token, "human_guidance.read")["deliveries"]
+            read_command = dict(delivery_ref=delivery["delivery_ref"], effect_id="read-before-assessment")
+            first_read = _tool(runtime, token, "human_guidance.read", **read_command)
+            feedback = dict(delivery_ref=delivery["delivery_ref"],
+                understanding="判断整体目标影响。", changes="比较当前指导与完成标准。",
+                continuing_work="继续有价值比较。", reasons="尚待完成实际判断。", disposition="considered")
+            is_first = invocation.run_ref == admissions[0].run.run_ref
+            if same_root and not is_first:
+                observed["requires_evolution"] = _tool(runtime, token, "human_guidance.feedback",
+                    **{**feedback, "effect_id": "parallel-actual-change", "goal_impact": "requires_evolution"})
+                return original_invoke(invocation)
+            if is_first:
+                uncertain_command = {**feedback, "effect_id": "uncertain-impact", "goal_impact": "undetermined"}
+                observed["uncertain"] = _tool(runtime, token, "human_guidance.feedback", **uncertain_command)
+                assert graph.query_quest_goal_view(quest_ref)["guidance_alignment"][0]["status"] == "pending"
+            if is_first == same_root:
+                receipt_ref = observed["uncertain"]["receipt"]["receipt_ref"]
+                resolved_command = {**feedback, "effect_id": "resolve-impact", "goal_impact": "none",
+                    "reasons": "实际比较后确认现有整体目标及完成标准保持。", "resolves_receipts": [receipt_ref]}
+                if same_root:
+                    _tool_error(runtime, token, "human_guidance.feedback", "guidance_resolution_unread", **resolved_command)
+                    runtime.harnesses.run_or_resume_target_root(admissions[1].run.request_ref,
+                        prompt="独立保留并行工作发现的真实演化义务。", mcp_base_url="http://127.0.0.1:8999")
+                assessed_read = _tool(runtime, token, "human_guidance.read",
+                    delivery_ref=delivery["delivery_ref"], effect_id="read-current-assessments")
+                assessment = next(item for item in assessed_read["goal_assessments"] if item["receipt_ref"] == receipt_ref)
+                assert assessment["receipt_ref"] == receipt_ref
+                assert assessment["goal_impact"] == "undetermined"
+                if same_root:
+                    required_ref = observed["requires_evolution"]["receipt"]["receipt_ref"]
+                    _tool_error(runtime, token, "human_guidance.feedback", "guidance_resolution_invalid",
+                        **{**resolved_command, "resolves_receipts": [required_ref]})
+                    _tool_error(runtime, token, "human_guidance.feedback", "guidance_resolution_stale",
+                        **{**resolved_command, "resolves_receipts": [first_read["guide_ref"]["receipt_ref"]]})
+                resolved = _tool(runtime, token, "human_guidance.feedback", **resolved_command)
+                assert resolved["goal_update_pending"] is False
+                assert _tool(runtime, token, "human_guidance.feedback", **resolved_command) == resolved
+                _tool_error(runtime, token, "human_guidance.feedback", "guidance_resolution_stale",
+                    **{**resolved_command, "effect_id": "stale-resolution"})
+                assert _tool(runtime, token, "human_guidance.read", **read_command) == first_read
+                if same_root:
+                    assert _tool(runtime, token, "human_guidance.feedback", **uncertain_command) == observed["uncertain"]
+                observed["resolved"] = resolved
+            return original_invoke(invocation)
+
+        adapter.invoke = invoke
+        for admission in admissions[:1] if same_root else admissions:
+            runtime.harnesses.run_or_resume_target_root(admission.run.request_ref,
+                prompt="以具名实际判断解决未决指导影响。", mcp_base_url="http://127.0.0.1:8999")
+        assert observed["resolved"]["goal_impact"] == "none"
+        alignment = graph.query_quest_goal_view(quest_ref)["guidance_alignment"]
+        if same_root:
+            assert alignment[0]["status"] == "pending"
+            assert alignment[0]["reason"] == "awaiting_goal_evolution"
+        else:
+            assert alignment == []
+        assert graph.query_current_quest_goal_revision(quest_ref) == original_goal
     finally:
         runtime.close()
 
