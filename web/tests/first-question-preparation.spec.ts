@@ -35,13 +35,16 @@ test("DeepFetch streams material understanding before generation, then changes p
     receipts: { human_confirmation: { status: "not_attempted" }, quest_goal: { status: "not_attempted" }, broad_research_authorization: { status: "not_attempted" },
       question_content: { status: "not_attempted" }, question_identity: { status: "not_attempted" }, cycle_activation: { status: "not_attempted" } },
   };
+  const preparation = { ref: requestRef, started_at: startedAt, completed_at: null as number | null,
+    operation_state: "active" as string | null, retry_permitted: false };
+  Object.assign(creation.deepfetch!, { preparation });
   const understandingMessage = "正在阅读已选材料中的研究范围与未完成问题。";
   const appendMessage = "已核对材料引用，继续整理可以检索的证据缺口。";
   const draftingMessage = "正在结合本轮文献整理可验证的第一问。";
   const publicMessage = (id: string, text: string) => JSON.stringify({ type: "item.completed", item: { id, type: "agent_message", phase: "commentary", text } }) + "\n";
   let preparationOutput = publicMessage("understanding-1", understandingMessage);
   const synthesisOutput = publicMessage("drafting-1", draftingMessage);
-  const preparationRequests: Array<{ requestRef: string | null; generationRef: string | null; after: number }> = [];
+  const preparationRequests: Array<{ requestRef: string | null; preparationRef: string | null; generationRef: string | null; after: number }> = [];
   const generationRequests: Array<{ generationRef: string | null; after: number }> = [];
   const webRoot = process.env.META_RESEARCH_WEB_DIST ?? resolve(import.meta.dirname, "../../src/meta_research/web_dist");
   const outputPage = (ref: string, text: string, after: number, phase: string, status = "running") => {
@@ -57,8 +60,8 @@ test("DeepFetch streams material understanding before generation, then changes p
     if (url.pathname === "/api/v1/quest-initializations/init-preparation") return json(creation);
     if (url.pathname.endsWith("/preparation-output")) {
       const after = Number(url.searchParams.get("after"));
-      preparationRequests.push({ requestRef: url.searchParams.get("request_ref"), generationRef: url.searchParams.get("generation_ref"), after });
-      return json(outputPage(requestRef, preparationOutput, after, "understanding"));
+      preparationRequests.push({ requestRef: url.searchParams.get("request_ref"), preparationRef: url.searchParams.get("preparation_ref"), generationRef: url.searchParams.get("generation_ref"), after });
+      return json(outputPage(preparation.ref, preparationOutput, after, "understanding", creation.deepfetch?.status));
     }
     if (url.pathname.endsWith("/proposal-output")) {
       const after = Number(url.searchParams.get("after"));
@@ -83,6 +86,7 @@ test("DeepFetch streams material understanding before generation, then changes p
   await expect(progress).not.toHaveClass(/is-failed/);
   await expect(progress).not.toContainText("本次准备未完成");
   await expect(progress).not.toContainText("本轮耗时");
+  await expect(elapsed).toHaveText("已用时 01:05");
   await expect(stages.nth(0)).toHaveAttribute("data-state", "current");
   await expect(stages.nth(1)).toHaveAttribute("data-state", "pending");
   preparationOutput += publicMessage("understanding-2", appendMessage);
@@ -91,6 +95,27 @@ test("DeepFetch streams material understanding before generation, then changes p
   expect(preparationRequests.every(request => request.requestRef === requestRef && request.generationRef === null)).toBe(true);
   expect(preparationRequests.some(request => request.after > 0)).toBe(true);
   expect(generationRequests).toHaveLength(0);
+
+  const retriedMessage = "重新核对本次材料，旧运行输出不属于此次准备。";
+  preparation.ref = requestRef + ":preparation:retry-2";
+  preparation.started_at = startedAt;
+  preparationOutput = publicMessage("retry-understanding", retriedMessage);
+  await expect(activity).toContainText(retriedMessage);
+  await expect(activity).not.toContainText(understandingMessage);
+  await expect(activity).not.toContainText(appendMessage);
+  expect(preparationRequests.find(request => request.preparationRef === preparation.ref)?.after).toBe(0);
+
+  creation.deepfetch!.status = "failed";
+  creation.deepfetch!.failure = { code: "protected_creation_unknown_outcome" };
+  preparation.operation_state = "unknown_outcome";
+  preparation.completed_at = startedAt + 63;
+  await expect(progress).toContainText("运行是否结束尚未确认，请等待核对后再重试。");
+  await expect(progress).not.toContainText("本次运行已结束");
+  await expect(elapsed).toHaveText("已记录用时 01:03");
+  creation.deepfetch!.status = "queued";
+  creation.deepfetch!.failure = null;
+  preparation.operation_state = "active";
+  preparation.completed_at = null;
 
   creation.creation_basis = { basis_ref: "prepared-material-basis", basis_hash: hash, kind: "prepared", freshness: "current",
     understanding: { material_composition: [], work_already_done: [], claims_and_conditions: [], conflicts: [], gaps: [], unfinished_questions: [] },
