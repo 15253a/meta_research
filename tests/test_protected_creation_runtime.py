@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,6 +153,135 @@ def test_unsupported_platform_never_launches(monkeypatch, tmp_path):
     with pytest.raises(ProtectedCreationError, match="protected_creation_runtime_unavailable"):
         protected.run(_call("raise AssertionError('must not run')"))
     assert not protected.jail_root.exists()
+
+
+def test_protected_runner_streams_before_native_completion(runtime, tmp_path):
+    from meta_research.creation_work import ProtectedCreationRunner
+
+    release = runtime.work_directory / "release-stream-test"
+    release.unlink(missing_ok=True)
+    schema = tmp_path / "schema.json"
+    schema.write_text("{}")
+    result = tmp_path / "last-message.json"
+    stdout = tmp_path / "stdout.jsonl"
+    runner = ProtectedCreationRunner(SimpleNamespace(
+        operation=SimpleNamespace(operation_ref="stream-test"),
+        run=runtime.run, request_stop=runtime.request_stop,
+    ))
+    stream_job = getattr(runner, "run_streaming_job", None)
+    assert callable(stream_job), "protected native output must be published while the job runs"
+    argv = ["/bin/bash", "-c", 'exec /bin/python - "$@"', "creation",
+            "--output-schema", str(schema), "--output-last-message", str(result)]
+    prompt = """import json,pathlib,sys,time
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Reading supplied research'}}),flush=True)
+while not pathlib.Path('/workspace/release-stream-test').exists():time.sleep(.01)
+pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text('{}')
+"""
+    outcomes = []
+    errors = []
+    def run():
+        try:
+            outcomes.append(stream_job("stream-test", argv, prompt, 15.0, stdout,
+                                       stdout_max_bytes=4096))
+        except BaseException as error:
+            errors.append(error)
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 8
+        while (not stdout.exists() or not stdout.read_bytes()) and worker.is_alive() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert worker.is_alive(), errors
+        assert "Reading supplied research" in stdout.read_text()
+        assert not result.exists(), "output must arrive before native completion"
+    finally:
+        release.write_text("finish")
+        worker.join(15)
+        if worker.is_alive():
+            runtime.request_stop()
+            worker.join(15)
+        release.unlink(missing_ok=True)
+    assert not worker.is_alive()
+    assert not errors
+    assert outcomes[0].returncode == 0
+    assert outcomes[0].stdout == stdout.read_text()
+    assert stdout.stat().st_mode & 0o777 == 0o600
+    assert runtime.request_stop()["descendants_ended"] is True
+
+
+@pytest.mark.parametrize("name", ("stdout", "stderr"))
+def test_native_stream_limits_stop_tree_and_bound_output(runtime, name):
+    marker = runtime.work_directory / "stream-limit.pid"
+    chunks = []
+    call = replace(_call(f"""import os,pathlib,sys
+pathlib.Path('/workspace/stream-limit.pid').write_text(str(os.getpid()))
+while True:
+    sys.{name}.buffer.write(b'x'*65536)
+    sys.{name}.buffer.flush()
+"""), stdout_sink=chunks.append, stream_max_bytes=4096)
+    with pytest.raises(ProtectedCreationError, match="codex_output_too_large"):
+        runtime.run(call)
+    assert sum(map(len, chunks)) == (4096 if name == "stdout" else 0)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text()), 0)
+    assert runtime.request_stop()["descendants_ended"] is True
+
+
+def test_stream_timeout_while_native_does_not_read_prompt(runtime):
+    chunks = []
+    call = NativeCreationCall(("/bin/bash", "-c", "printf 'waiting\\n'; /bin/sleep 60"),
+                              "x" * (4 * 1024 * 1024), .4, {}, (), (), chunks.append)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as failure:
+        runtime.run(call)
+    assert time.monotonic() - started < 8
+    assert failure.value.output == "waiting\n"
+    assert b"".join(chunks) == b"waiting\n"
+    assert runtime.request_stop()["descendants_ended"] is True
+
+
+def test_stream_timeout_after_native_closes_output(runtime):
+    with pytest.raises(subprocess.TimeoutExpired):
+        runtime.run(_call("import os,time; os.close(1); os.close(2); time.sleep(60)", timeout=.4))
+    assert runtime.request_stop()["descendants_ended"] is True
+
+
+@pytest.mark.parametrize("existing", ("file", "symlink", "foreign_path"))
+def test_protected_stream_rejects_existing_or_unbound_spool(runtime, tmp_path, existing):
+    from meta_research.creation_work import ProtectedCreationRunner
+    from meta_research.idea_skill import IdeaSkillUnavailable
+
+    schema = tmp_path / "schema.json"
+    schema.write_text("{}")
+    result = tmp_path / "last-message.json"
+    stdout = tmp_path / "stdout.jsonl"
+    retained = tmp_path / "retained.txt"
+    retained.write_text("retained")
+    if existing == "file":
+        stdout.write_text("retained")
+    elif existing == "symlink":
+        stdout.symlink_to(retained)
+    else:
+        stdout = tmp_path / "foreign.jsonl"
+    runner = ProtectedCreationRunner(SimpleNamespace(
+        operation=SimpleNamespace(operation_ref="stream-test"),
+        run=lambda call: pytest.fail("unsafe stream must never launch"),
+    ))
+    argv = ["/bin/bash", "--output-schema", str(schema), "--output-last-message", str(result)]
+    with pytest.raises(IdeaSkillUnavailable, match="codex_operation_spool_invalid|creation_native_handoff_invalid"):
+        runner.run_streaming_job("stream-test", argv, "", 1, stdout)
+    assert retained.read_text() == "retained"
+    if existing == "file":
+        assert stdout.read_text() == "retained"
+
+
+def test_stream_sink_failure_stops_native_tree(runtime):
+    def failed_sink(chunk):
+        raise OSError("fixture disk unavailable")
+    with pytest.raises(OSError, match="fixture disk unavailable"):
+        runtime.run(replace(_call("import time; print('started',flush=True); time.sleep(60)"),
+                            stdout_sink=failed_sink))
+    assert runtime.request_stop()["descendants_ended"] is True
 
 
 def test_native_launch_and_inputs_with_private_daemon_umask(runtime, tmp_path):

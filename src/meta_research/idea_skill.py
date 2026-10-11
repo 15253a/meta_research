@@ -2633,17 +2633,28 @@ class CodexIdeaSkillAdapter:
                         completed = durable_job(*durable_arguments)
                     supervised = True
                 else:
-                    completed = (
-                        run_job(
-                            job_ref,
-                            argv,
-                            prompt,
-                            self._timeout_seconds,
-                            environment,
+                    streaming_job = getattr(runner, "run_streaming_job", None)
+                    if callable(streaming_job) and stdout_path is not None:
+                        # Host-owned live spool, with the existing local signed
+                        # exit receipt. This runner does not claim durability
+                        # across daemon loss or a supervisor-owned outcome.
+                        completed = streaming_job(
+                            job_ref, argv, prompt, self._timeout_seconds,
+                            stdout_path, environment,
+                            stdout_max_bytes=transport_limits.stream_max_bytes,
                         )
-                        if environment is not None
-                        else run_job(job_ref, argv, prompt, self._timeout_seconds)
-                    )
+                    else:
+                        completed = (
+                            run_job(
+                                job_ref,
+                                argv,
+                                prompt,
+                                self._timeout_seconds,
+                                environment,
+                            )
+                            if environment is not None
+                            else run_job(job_ref, argv, prompt, self._timeout_seconds)
+                        )
         except _ProcessStopped as error:
             raise IdeaSkillUnavailable("codex_cli_stopped") from error
         except FileNotFoundError as error:

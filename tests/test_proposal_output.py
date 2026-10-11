@@ -74,6 +74,26 @@ def test_bounded_pages_preserve_utf8_and_phase_boundary(tmp_path):
     assert offset == len((understanding + synthesis).encode("utf-8"))
 
 
+def test_terminal_utf8_tail_advances_cursor_but_running_tail_waits(tmp_path):
+    prefix = '{"type":"turn.started"}\n'
+    directory = operation(tmp_path, "first-question-synthesis", prefix)
+    # A byte output ceiling can stop the producer inside its final UTF-8 code
+    # point. While running, the exact same bytes may still receive a suffix.
+    with (directory / "stdout.jsonl").open("ab") as stream:
+        stream.write(b"\xe8\xb5")
+    first = read_proposal_output(tmp_path, GENERATION, 0, 65536)
+    assert first["text"] == prefix
+    assert first["next_offset"] == len(prefix.encode())
+    running_tail = read_proposal_output(tmp_path, GENERATION, first["next_offset"], 65536)
+    assert running_tail["text"] == ""
+    assert running_tail["next_offset"] == first["next_offset"]
+    assert running_tail["has_more"] is True
+    ended = read_proposal_output(tmp_path, {**GENERATION, "status": "failed"}, first["next_offset"], 65536)
+    assert ended["text"] == "\ufffd"
+    assert ended["next_offset"] == ended["source_bytes"] == len(prefix.encode()) + 2
+    assert ended["has_more"] is False
+
+
 def test_observed_understanding_phase_does_not_require_stdout_yet(tmp_path):
     operation(tmp_path, "initialization-understanding",
               job_ref=GENERATION["ref"] + ":proposal:understanding")

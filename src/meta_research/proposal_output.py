@@ -127,7 +127,14 @@ def _output_page(generation: dict, sources: list[_OutputSource], after: int, lim
         skip = 0
         if not remaining:
             break
-    text, consumed = _decode_raw_page(b"".join(chunks))
+    raw = b"".join(chunks)
+    if status not in {"queued", "running"} and after + len(raw) == size:
+        # A failed producer may have hit its byte ceiling inside a code point.
+        # At terminal EOF no suffix can arrive: consume that final fragment so
+        # clients do not repeatedly request the same incomplete UTF-8 bytes.
+        text, consumed = raw.decode("utf-8", errors="replace"), len(raw)
+    else:
+        text, consumed = _decode_raw_page(raw)
     page.update(text=text, next_offset=after + consumed, source_bytes=size,
                 has_more=after + consumed < size, availability="ready")
     return page

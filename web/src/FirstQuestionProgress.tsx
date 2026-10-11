@@ -44,8 +44,12 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
   ];
   const completed = steps.filter(step => step.done).length;
   const firstGap = steps.findIndex(step => !step.done);
-  const started = generation?.started_at ?? deepfetch?.run?.attempt_started_at ?? null;
-  const ended = active ? null : generation?.completed_at ?? deepfetch?.run?.attempt_completed_at ?? null;
+  const starts = [generation?.started_at, deepfetch?.run?.attempt_started_at]
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const completions = [generation?.completed_at, deepfetch?.run?.attempt_completed_at]
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const started = starts.length ? Math.min(...starts) : null;
+  const ended = !active && completions.length ? Math.max(...completions) : null;
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!active) return;

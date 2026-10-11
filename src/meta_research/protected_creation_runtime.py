@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import stat
@@ -16,7 +17,8 @@ import subprocess
 import sys
 import sysconfig
 import threading
-from typing import Literal
+import time
+from typing import Callable, Literal
 
 
 _UID = 65534
@@ -157,6 +159,8 @@ class NativeCreationCall:
     environment: dict[str, str]
     read_only_inputs: tuple[Path, ...]
     output_paths: tuple[Path, ...]
+    stdout_sink: Callable[[bytes], None] | None = None
+    stream_max_bytes: int = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +186,7 @@ class ProtectedCreationRuntime:
         self._control = self.jail_root.parent / ("." + self.jail_root.name + "-control")
         self._guard = threading.Lock()
         self._state = threading.Lock()
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen[bytes] | None = None
         self._receipt: Path | None = None
         self._stop_before_launch = False
         self._starting = False
@@ -222,18 +226,10 @@ class ProtectedCreationRuntime:
                         [sys.executable, "-I", "-S", "-c", _HELPER, str(launch)],
                         env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
                         cwd="/", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                        stderr=subprocess.PIPE,
                         close_fds=True, start_new_session=True)
                     self._starting = False
-                try:
-                    stdout, stderr = self._process.communicate(prompt, timeout=call.timeout_seconds)
-                except subprocess.TimeoutExpired as error:
-                    outcome = self.request_stop()
-                    if not outcome["descendants_ended"]:
-                        raise ProtectedCreationError("protected_creation_unknown_outcome") from error
-                    stdout, stderr = self._process.communicate()
-                    raise subprocess.TimeoutExpired(call.argv, call.timeout_seconds,
-                        output=stdout, stderr=stderr) from error
+                stdout, stderr = self._communicate(call, prompt)
                 outcome = self._read_receipt()
                 if not outcome.get("descendants_ended"):
                     raise ProtectedCreationError("protected_creation_unknown_outcome")
@@ -248,6 +244,78 @@ class ProtectedCreationRuntime:
                 self._stop_before_launch = False
                 self._has_run = True
                 self._guard.release()
+
+    def _communicate(self, call: NativeCreationCall, prompt: str) -> tuple[str, str]:
+        """Tee native bytes while concurrently draining both bounded pipes.
+
+        The host owns the sink; it is never handed into the native jail. The
+        existing helper remains the only authority for process-tree outcomes.
+        """
+        process = self._process
+        assert process is not None
+        assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+        streams = {"stdout": bytearray(), "stderr": bytearray()}
+        pending = memoryview(prompt.encode("utf-8"))
+        deadline = None if call.timeout_seconds is None else time.monotonic() + call.timeout_seconds
+        terminal: BaseException | None = None
+
+        def stop(error: BaseException) -> None:
+            nonlocal terminal
+            terminal = error
+            if not self.request_stop()["descendants_ended"]:
+                raise ProtectedCreationError("protected_creation_unknown_outcome") from error
+
+        with selectors.DefaultSelector() as selector:
+            for pipe, events, name in ((process.stdin, selectors.EVENT_WRITE, "stdin"),
+                                      (process.stdout, selectors.EVENT_READ, "stdout"),
+                                      (process.stderr, selectors.EVENT_READ, "stderr")):
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, events, name)
+            try:
+                while selector.get_map() or process.poll() is None:
+                    if terminal is None and deadline is not None and time.monotonic() >= deadline:
+                        stop(subprocess.TimeoutExpired(call.argv, call.timeout_seconds))
+                    for key, _events in selector.select(.05):
+                        pipe, name = key.fileobj, key.data
+                        if name == "stdin":
+                            try:
+                                written = os.write(pipe.fileno(), pending[:65536]) if pending and terminal is None else 0
+                                pending = pending[written:]
+                            except BrokenPipeError:
+                                pending = pending[:0]
+                            if not pending or terminal is not None:
+                                selector.unregister(pipe)
+                                pipe.close()
+                            continue
+                        chunk = os.read(pipe.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(pipe)
+                            pipe.close()
+                            continue
+                        if terminal is not None:
+                            continue
+                        remaining = call.stream_max_bytes - len(streams[name])
+                        accepted = chunk[:remaining]
+                        streams[name].extend(accepted)
+                        if name == "stdout" and accepted and call.stdout_sink is not None:
+                            call.stdout_sink(accepted)
+                        if len(chunk) > remaining:
+                            stop(ProtectedCreationError("codex_output_too_large"))
+                process.wait()
+            except BaseException as error:
+                if not self.request_stop()["descendants_ended"]:
+                    raise ProtectedCreationError("protected_creation_unknown_outcome") from error
+                raise
+            finally:
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    if not pipe.closed:
+                        pipe.close()
+        stdout, stderr = (streams[name].decode("utf-8", errors="replace") for name in ("stdout", "stderr"))
+        if isinstance(terminal, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(call.argv, call.timeout_seconds, output=stdout, stderr=stderr)
+        if terminal is not None:
+            raise terminal
+        return stdout, stderr
 
     def _cancelled_call(self, call: NativeCreationCall) -> subprocess.CompletedProcess[str]:
         receipt = self._control / ("cancel-" + secrets.token_hex(12) + ".receipt.json")
@@ -337,7 +405,10 @@ class ProtectedCreationRuntime:
                 and (not isinstance(call.timeout_seconds, (int, float))
                     or not math.isfinite(call.timeout_seconds) or call.timeout_seconds <= 0))
             or any(not isinstance(key, str) or not isinstance(value, str)
-                or not key or "=" in key or "\0" in key + value for key, value in call.environment.items())):
+                or not key or "=" in key or "\0" in key + value for key, value in call.environment.items())
+            or (call.stdout_sink is not None and not callable(call.stdout_sink))
+            or isinstance(call.stream_max_bytes, bool) or not isinstance(call.stream_max_bytes, int)
+            or call.stream_max_bytes < 1):
             raise ProtectedCreationError("protected_creation_call_invalid")
 
     def _prepare_runtime(self) -> None:

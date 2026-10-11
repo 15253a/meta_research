@@ -10,6 +10,7 @@ test("DeepFetch streams material understanding before generation, then changes p
   const requestRef = "deepfetch-material-preparation";
   const generationRef = "generation-after-deepfetch";
   const startedAt = 1_791_705_600;
+  await page.clock.setFixedTime(new Date((startedAt + 65) * 1000));
   const accepted = (kind: string, subject: string) => ({
     status: "accepted" as const, issuer: "fixture", kind, receipt_ref: `receipt-${kind}`, subject_ref: subject, payload_hash: hash,
   });
@@ -43,9 +44,9 @@ test("DeepFetch streams material understanding before generation, then changes p
   const preparationRequests: Array<{ requestRef: string | null; generationRef: string | null; after: number }> = [];
   const generationRequests: Array<{ generationRef: string | null; after: number }> = [];
   const webRoot = process.env.META_RESEARCH_WEB_DIST ?? resolve(import.meta.dirname, "../../src/meta_research/web_dist");
-  const outputPage = (ref: string, text: string, after: number, phase: string) => {
+  const outputPage = (ref: string, text: string, after: number, phase: string, status = "running") => {
     const bytes = Buffer.from(text);
-    return { generation_ref: ref, status: "running", availability: "ready", phase,
+    return { generation_ref: ref, status, availability: "ready", phase,
       text: bytes.subarray(after).toString("utf8"), next_offset: bytes.length, source_bytes: bytes.length, has_more: false };
   };
   await page.route("**/*", async route => {
@@ -62,7 +63,7 @@ test("DeepFetch streams material understanding before generation, then changes p
     if (url.pathname.endsWith("/proposal-output")) {
       const after = Number(url.searchParams.get("after"));
       generationRequests.push({ generationRef: url.searchParams.get("generation_ref"), after });
-      return json(outputPage(generationRef, synthesisOutput, after, "drafting"));
+      return json(outputPage(generationRef, synthesisOutput, after, "drafting", creation.proposal_generation?.status));
     }
     if (url.pathname === "/api/v1/preferences") return json({ output_language: "zh" });
     if (url.pathname === "/api/v1/events") return route.fulfill({ contentType: "text/event-stream", body: "event: snapshot.required\ndata: {}\n\n" });
@@ -73,6 +74,7 @@ test("DeepFetch streams material understanding before generation, then changes p
   });
   await page.goto("http://127.0.0.1:18768/?panel=create-quest", { waitUntil: "domcontentloaded" });
   const progress = page.getByTestId("first-question-progress");
+  const elapsed = progress.locator(":scope > header > span");
   const stages = progress.locator(".first-question-stage-meter > div");
   const activity = progress.getByRole("log", { name: "第一问最近活动" });
   await expect(activity).toBeVisible();
@@ -108,6 +110,8 @@ test("DeepFetch streams material understanding before generation, then changes p
   await expect(progress).not.toContainText("正在理解已有资料");
   await expect(stages.nth(0)).toHaveAttribute("data-state", "done");
   await expect(stages.nth(1)).toHaveAttribute("data-state", "current");
+  // Ignore the previous failed generation's timestamps from a different draft basis.
+  await expect(elapsed).toHaveText("已用时 01:05");
   const settledPreparationCount = preparationRequests.length;
   // Observe the next scheduled output-poll interval: the old producer must be stopped.
   await page.waitForTimeout(2200);
@@ -136,5 +140,16 @@ test("DeepFetch streams material understanding before generation, then changes p
   await expect(stages.nth(2)).toHaveAttribute("data-state", "current");
   await expect(stages.nth(3)).toHaveAttribute("data-state", "pending");
   await expect(progress.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "2");
+  // The later generation start must not reset the same preparation card's elapsed time.
+  await expect(elapsed).toHaveText("已用时 01:05");
   expect(preparationRequests).toHaveLength(settledPreparationCount);
+
+  await page.clock.setFixedTime(new Date((startedAt + 95) * 1000));
+  creation.proposal_generation.status = "failed";
+  creation.proposal_generation.completed_at = startedAt + 89;
+  creation.proposal_generation.failure = { code: "fixture_drafting_failed" };
+  await expect(progress.locator("h3")).toHaveText("本次准备未完成");
+  await expect(elapsed).toHaveText("本轮耗时 01:29");
+  await page.clock.setFixedTime(new Date((startedAt + 120) * 1000));
+  await expect(elapsed).toHaveText("本轮耗时 01:29");
 });

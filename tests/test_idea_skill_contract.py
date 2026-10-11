@@ -1886,6 +1886,37 @@ def test_production_adapter_rejects_a_resume_that_changes_native_session(
     assert runner.calls[1][0][-3:] == ["resume", "codex-primary:1", "-"]
 
 
+def test_provider_streaming_runner_preserves_local_signed_completion(tmp_path):
+    class StreamingRunner(_SequenceRunner):
+        def run_job(self, *args, **kwargs):
+            raise AssertionError("the streaming capability must receive the job")
+
+        def run_streaming_job(self, job_ref, argv, prompt, timeout, stdout_path,
+                              environment=None, *, stdout_max_bytes):
+            assert job_ref == "streaming-operation"
+            assert stdout_max_bytes == PROVIDER_STREAM_MAX_BYTES
+            completed = self(argv, prompt, timeout)
+            stdout_path.write_text(completed.stdout, encoding="utf-8")
+            return completed
+
+    runner = StreamingRunner([{"outcome": _idea_set()}])
+    workspace = tmp_path / "streaming-provider"
+    adapter = CodexIdeaSkillAdapter(workspace, executable=sys.executable, process_runner=runner)
+    request = _request(runtime_binding=adapter.runtime_binding(), job_ref="streaming-operation")
+    draft = adapter.generate_draft(request)
+    assert draft is not None
+    directory = next(workspace.glob("provider-operations/*/primary"))
+    invocation = read_transport_envelope(directory / "invocation.json", adapter._transport_key()[1])
+    assert invocation["transport_mode"] == "unreconciled_runner"
+    assert (directory / "exit.json").is_file()
+    receipt = read_transport_envelope(directory / "supervisor-exit.json", adapter._transport_key()[1])
+    assert receipt["returncode"] == 0
+    assert not (directory / "supervisor-request.json").exists()
+    replay = adapter.generate_draft(request)
+    assert replay == draft
+    assert len(runner.calls) == 1
+
+
 def test_production_adapter_reconciles_each_durable_provider_phase(
     tmp_path: Path,
 ) -> None:

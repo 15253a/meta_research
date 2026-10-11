@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import hashlib
 import json
@@ -401,6 +401,15 @@ class ProtectedCreationRunner:
         self._stop_requested = False
 
     def run_job(self, job_ref, argv, prompt, timeout_seconds, environment=None):
+        return self._run_job(job_ref, argv, prompt, timeout_seconds, environment)
+
+    def run_streaming_job(self, job_ref, argv, prompt, timeout_seconds, stdout_path,
+                          environment=None, *, stdout_max_bytes=64 * 1024 * 1024):
+        return self._run_job(job_ref, argv, prompt, timeout_seconds, environment,
+                             stdout_path=stdout_path, stdout_max_bytes=stdout_max_bytes)
+
+    def _run_job(self, job_ref, argv, prompt, timeout_seconds, environment=None, *,
+                 stdout_path=None, stdout_max_bytes=64 * 1024 * 1024):
         from meta_research.idea_skill import IdeaSkillUnavailable
         from meta_research.protected_creation_runtime import NativeCreationCall, ProtectedCreationError
         if job_ref != self.work.operation.operation_ref:
@@ -413,18 +422,60 @@ class ProtectedCreationRunner:
             if index + 1 == len(argv):
                 raise IdeaSkillUnavailable("creation_native_handoff_invalid")
             slots[option] = Path(argv[index + 1])
+        if stdout_path is not None and (
+            Path(stdout_path) != slots["--output-schema"].with_name("stdout.jsonl")
+            or slots["--output-schema"].parent != slots["--output-last-message"].parent
+        ):
+            raise IdeaSkillUnavailable("creation_native_handoff_invalid")
         try:
-            completed = self.work.run(NativeCreationCall(tuple(argv), prompt, timeout_seconds,
-                {**self.environment, **(environment or {})},
-                (*self.read_only_inputs, slots["--output-schema"]), (slots["--output-last-message"],)))
+            with (_private_stdout(Path(stdout_path)) if stdout_path is not None else nullcontext(None)) as stream:
+                def write_stdout(chunk):
+                    pending = memoryview(chunk)
+                    while pending:
+                        written = stream.write(pending)
+                        if not written:
+                            raise OSError("creation stdout write failed")
+                        pending = pending[written:]
+                completed = self.work.run(NativeCreationCall(tuple(argv), prompt, timeout_seconds,
+                    {**self.environment, **(environment or {})},
+                    (*self.read_only_inputs, slots["--output-schema"]), (slots["--output-last-message"],),
+                    None if stream is None else write_stdout, stdout_max_bytes))
+                if stream is not None:
+                    os.fsync(stream.fileno())
             if self._stop_requested and completed.returncode != 0:
                 raise IdeaSkillUnavailable("codex_cli_stopped")
             return completed
         except ProtectedCreationError as error:
             raise IdeaSkillUnavailable(error.code) from error
 
+        except OSError as error:
+            raise IdeaSkillUnavailable("codex_cli_io_unavailable") from error
+
     def cancel_job(self, job_ref):
         if job_ref != self.work.operation.operation_ref:
             return {"status": "not_running", "descendants_ended": False}
         self._stop_requested = True
         return self.work.request_stop()
+
+
+@contextmanager
+def _private_stdout(path):
+    from meta_research.idea_skill import IdeaSkillUnavailable
+
+    with owned_directory(path.parent) as parent:
+        try:
+            details = os.fstat(parent)
+            if details.st_uid != 0 or details.st_mode & 0o022:
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            descriptor = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=parent)
+            with os.fdopen(descriptor, "wb", buffering=0) as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                details = os.fstat(stream.fileno())
+                if not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or details.st_nlink != 1:
+                    raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+                yield stream
+        except FileExistsError as error:
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+        except OSError as error:
+            raise IdeaSkillUnavailable("codex_cli_io_unavailable") from error
