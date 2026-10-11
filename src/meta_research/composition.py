@@ -256,6 +256,8 @@ class _DeepFetchRequestAuthorityRouter:
         request_ref: str,
         failure_code: str,
         run_ref: str | None = None,
+        *,
+        expected_scope_hash: str | None = None,
     ) -> None:
         autonomous = (
             self._advancement_engine.query_autonomous_deepfetch_request_by_ref(
@@ -270,7 +272,7 @@ class _DeepFetchRequestAuthorityRouter:
             )
             return
         self._human_collaboration.record_deepfetch_failed(
-            request_ref, failure_code, run_ref
+            request_ref, failure_code, run_ref, expected_scope_hash=expected_scope_hash
         )
 
 

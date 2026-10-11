@@ -52,7 +52,8 @@ if 'web_evidence_gate=v1' in prompt:
 public = pathlib.Path(next(line.split('=', 1)[1] for line in prompt.splitlines()
                            if line.startswith('public_output_root=')))
 (public / 'fulltext').mkdir(parents=True, exist_ok=True)
-(public / 'papers.json').write_text(json.dumps(__LEDGER__, ensure_ascii=False), encoding='utf-8')
+ledger = {**__LEDGER__, 'schema_version': 'deepfetch.papers.v4.1'}
+(public / 'papers.json').write_text(json.dumps(ledger, ensure_ascii=False), encoding='utf-8')
 (public / 'summary.md').write_text('# 范围\\n\\n本轮未形成可纳入的精确论文。\\n', encoding='utf-8')
 result.write_text(json.dumps(__FINAL__), encoding='utf-8')
 """.replace("__LEDGER__", repr(PROTOTYPE_EMPTY_LEDGER)).replace(
@@ -66,11 +67,16 @@ result.write_text(json.dumps(__FINAL__), encoding='utf-8')
 
 @pytest.mark.parametrize("binding_changed", [False, True])
 @pytest.mark.parametrize("tamper_spool", [False, True])
+@pytest.mark.parametrize(
+    "failure_code",
+    ["deepfetch_workflow_evidence_invalid", "deepfetch_oa_only_limitation_invalid"],
+)
 def test_failed_finalization_reconciles_sealed_operation_without_new_effect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     binding_changed: bool,
     tamper_spool: bool,
+    failure_code: str,
 ) -> None:
     executable = _provider_executable(tmp_path / "fake-codex")
     data_root = prepare_data_root(tmp_path / "data")
@@ -93,19 +99,17 @@ def test_failed_finalization_reconciles_sealed_operation_without_new_effect(
         request_ref = queued["deepfetch"]["request_ref"]
         importer = deepfetch_module._import_v4_public_artifacts
 
-        def reject_metadata(*args, **kwargs):
-            raise DeepFetchUnavailable("deepfetch_workflow_evidence_invalid")
+        def reject_finalization(*args, **kwargs):
+            raise DeepFetchUnavailable(failure_code)
 
         monkeypatch.setattr(
-            deepfetch_module, "_import_v4_public_artifacts", reject_metadata
+            deepfetch_module, "_import_v4_public_artifacts", reject_finalization
         )
         assert runtime.deepfetch.process_once()
         failed = client.get(
             f"/api/v1/quest-initializations/{initialization_id}"
         ).json()
-        assert failed["deepfetch"]["failure"] == {
-            "code": "deepfetch_workflow_evidence_invalid"
-        }
+        assert failed["deepfetch"]["failure"] == {"code": failure_code}
         first_run = runtime.owners.agent_runtime.query_deepfetch_run(request_ref)
         assert first_run is not None
         assert first_run.provider_operation_retry_permitted
@@ -136,9 +140,12 @@ def test_failed_finalization_reconciles_sealed_operation_without_new_effect(
         }
         assert preserved and public_files
         monkeypatch.setattr(deepfetch_module, "_import_v4_public_artifacts", importer)
+
+        def reject_cleanup(*args, **kwargs):
+            pytest.fail("sealed finalization recovery must preserve provider artifacts")
+
+        monkeypatch.setattr(adapter, "prepare_retry_execution", reject_cleanup)
         if binding_changed:
-            # A deployed skill revision changes the provider binding while the
-            # old invocation, schema, native session and signed results survive.
             adapter._skill_bundle_hash = "f" * 64
             assert canonical_hash(adapter.runtime_binding().as_dict()) != old_binding_hash
         retried = client.post(

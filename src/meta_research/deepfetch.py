@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpRuntime, compose_external_mcp_prompt
+from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpRuntime, compose_external_mcp_prompt, split_external_mcp_prompt
 from meta_research.external_mcp_client import ExternalMcpClientError
 from meta_research.deepfetch_sources import SOURCE_LEDGER_SCHEMA, verify_ledger_origins
 from meta_research.search_sources import SearchSourceError, SearchSourceRegistry, parse_basis
@@ -601,13 +601,6 @@ def validate_deepfetch_result(
     )
     if len(set(limitations)) != len(limitations):
         raise DeepFetchUnavailable("deepfetch_limitations_duplicate")
-    if request.scope.get("literature_mode") == "oa_only" and (
-        _misstates_selected_oa_as_fallback(summary)
-        or any(
-            _misstates_selected_oa_as_fallback(value) for value in limitations
-        )
-    ):
-        raise DeepFetchUnavailable("deepfetch_oa_only_limitation_invalid")
     if result.completion == "honest_empty" and (papers or fulltexts):
         raise DeepFetchUnavailable("deepfetch_empty_result_not_empty")
     if result.completion == "honest_empty" and not limitations:
@@ -663,71 +656,6 @@ def validate_deepfetch_result(
         "web_evidence": web_evidence,
     }
     return payload, canonical_hash(payload)
-
-
-def _misstates_selected_oa_as_fallback(value: str) -> bool:
-    normalized = value.casefold()
-    names_oa = any(
-        marker in normalized
-        for marker in ("oa_only", "oa-only", "open access", "open-access", "开放获取")
-    ) or re.search(r"(?<![a-z0-9])oa(?![a-z0-9])", normalized) is not None
-    institution = any(
-        marker in normalized
-        for marker in ("institutional", "institution", "browser", "机构", "图书馆", "浏览器")
-    )
-    unavailable = any(
-        marker in normalized
-        for marker in ("不可用", "失败", "disabled", "unavailable", "not authorized")
-    )
-    causal = any(
-        marker in normalized
-        for marker in ("因此", "所以", "导致", "由于", "because", "therefore", "due to")
-    )
-    coercion_context = normalized
-    for correction in (
-        "并非被迫使用",
-        "并非被迫采用",
-        "并非被迫转向",
-        "不是被迫使用",
-        "不是被迫采用",
-        "不是被迫转向",
-        "没有被迫使用",
-        "没有被迫采用",
-        "没有被迫转向",
-        "没有降级到",
-        "没有降级至",
-        "并未降级到",
-        "并未降级至",
-        "not forced to use",
-        "not forced to fall back",
-        "not degraded to",
-        "never forced to use",
-        "never forced to fall back",
-        "never degraded to",
-    ):
-        coercion_context = coercion_context.replace(correction, "")
-    forced_or_degraded = any(
-        marker in coercion_context
-        for marker in (
-            "被迫使用",
-            "被迫采用",
-            "被迫转向",
-            "不得不使用",
-            "不得不采用",
-            "不得不转向",
-            "只好使用",
-            "只好采用",
-            "只好转向",
-            "降级到",
-            "降级至",
-            "forced to use",
-            "forced to fall back",
-            "degraded to",
-        )
-    )
-    return names_oa and (
-        forced_or_degraded or institution and unavailable and causal
-    )
 
 
 class CodexDeepFetchAdapter:
@@ -2009,6 +1937,7 @@ class CodexDeepFetchAdapter:
                     invocation_path, transport_key
                 )
                 prompt = prompt_path.read_text(encoding="utf-8")
+                _conditions, protocol_prompt = split_runtime_prompt(prompt)
                 schema_text = schema_path.read_text(encoding="utf-8")
                 full_schema_text = canonical_json(_deepfetch_output_schema())
                 gate_schema_text = canonical_json(
@@ -2040,6 +1969,9 @@ class CodexDeepFetchAdapter:
                     if self._external_mcp is None:
                         raise ValueError("external_mcp_runtime_missing")
                     self._external_mcp.restore_snapshot(invocation["external_mcp"], root_kind="deepfetch")
+                    external_context, protocol_prompt = split_external_mcp_prompt(protocol_prompt)
+                    if not external_context:
+                        raise ValueError("external_mcp_prompt_missing")
                 if "mcp_url" in invocation or "mcp_scope_binding_hash" in invocation:
                     expected_invocation_keys |= {"mcp_url", "mcp_scope_binding_hash"}
                     self._verify_existing_mcp_invocation(
@@ -2077,12 +2009,12 @@ class CodexDeepFetchAdapter:
                     or gate_turn != expected_web_gate
                     or (
                         gate_turn
-                        and not prompt.startswith("web_evidence_gate=v1\n")
+                        and not protocol_prompt.startswith("web_evidence_gate=v1\n")
                     )
                     or (
                         not gate_turn
                         and f"public_output_root={public_root}"
-                        not in prompt.splitlines()
+                        not in protocol_prompt.splitlines()
                     )
                 ):
                     raise ValueError("deepfetch reconciliation identity mismatch")
@@ -2683,7 +2615,8 @@ class CodexDeepFetchAdapter:
             route_contract = (
                 "本请求的 oa_only 是用户明确选择的主路线；跳过 "
                 "institution/browser preflight，不得探测或评价机构访问可用性，"
-                "不得描述为被迫、只能或降级到 OA。\n"
+                "如实说明所选 OA 路线的覆盖范围与限制，"
+                "不得虚构机构访问失败或由此被迫降级到 OA。\n"
             )
         return (
             "你是绑定 fixed commit "

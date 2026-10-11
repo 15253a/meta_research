@@ -205,6 +205,34 @@ def test_deepfetch_preparation_endpoint_streams_understanding_before_a_proposal_
     assert response.json()["text"] == extra
 
 
+def test_preparation_retry_output_uses_only_the_current_attempt_and_rejects_old_identity(preparation_client):
+    client, data_root, creation = preparation_client
+    request_ref = creation["deepfetch"]["request_ref"]
+    current_ref = request_ref + ":preparation:retry-2"
+    creation["deepfetch"]["preparation"] = {"ref": current_ref, "started_at": None,
+        "completed_at": None, "operation_state": None}
+    operation(data_root, "initialization-understanding", "old private output",
+              job_ref=request_ref + ":understanding")
+    url = "/api/v1/quest-initializations/init/preparation-output"
+    stale = client.get(url, params={"request_ref": request_ref, "preparation_ref": request_ref})
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "preparation_output_request_changed"
+    waiting = client.get(url, params={"request_ref": request_ref, "preparation_ref": current_ref})
+    assert waiting.status_code == 200
+    assert waiting.json()["text"] == ""
+    assert waiting.json()["generation_ref"] == current_ref
+    operation(data_root, "initialization-understanding", "new preparation output",
+              job_ref=current_ref + ":understanding")
+    current = client.get(url, params={"request_ref": request_ref, "preparation_ref": current_ref})
+    assert current.status_code == 200
+    assert current.json()["text"] == "new preparation output"
+    assert current.json()["generation_ref"] == current_ref
+    legacy = client.get(url, params={"request_ref": request_ref})
+    assert legacy.status_code == 200
+    assert legacy.json()["text"] == "new preparation output"
+    assert legacy.json()["generation_ref"] == request_ref
+
+
 @pytest.mark.parametrize("changed", ["request", "route", "revision", "hash", "freshness"])
 def test_deepfetch_preparation_endpoint_rejects_other_requests_or_draft_bases(preparation_client, changed):
     client, data_root, creation = preparation_client

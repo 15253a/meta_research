@@ -690,6 +690,8 @@ class HumanCollaborationInterface(Protocol):
         request_ref: str,
         failure_code: str,
         run_ref: str | None = None,
+        *,
+        expected_scope_hash: str | None = None,
     ) -> None: ...
 
 
@@ -5239,15 +5241,18 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
     def prepare_deepfetch_creation_basis(self, request):
         if request.creation_context_kind != "quest_initialization":
             return request
+        preparation = request.scope.get("preparation", {"ref": request.request_ref})
+        started_at = time.time()
         basis = self.prepare_creation_basis(request.initialization_id, request.draft_revision,
-            request.draft_hash, request.draft, request.request_ref)
+            request.draft_hash, request.draft, preparation["ref"])
         memory = self._research_memory.creation_bases
         reference = memory.reference(basis)
         if request.scope.get("creation_basis") == reference:
             return request
         if self._agent_runtime.query_deepfetch_run(request.request_ref) is not None:
             raise OwnerConflict("creation_deepfetch_basis_unbound")
-        scope = {**request.scope, "creation_basis": reference,
+        scope = {**request.scope, "preparation": {**preparation,
+            "started_at": started_at, "completed_at": time.time()}, "creation_basis": reference,
             "existing_work_applicability": basis.get("applicability"),
             "inherited_literature": basis.get("inherited_literature", []),
             "existing_work_retrieval": {key: basis["understanding"][key] for key in ("claims_and_conditions", "conflicts", "gaps", "unfinished_questions")}}
@@ -5503,6 +5508,20 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         )
         return generation_ref
 
+    def _deepfetch_preparation_basis_current(self, request: Row) -> bool:
+        reference = decoded_object(request.scope_json).get("creation_basis")
+        if reference is None:
+            return False
+        memory = self._research_memory.creation_bases
+        try:
+            basis = memory.query(reference["basis_ref"], reference["basis_hash"])
+            memory.require_current(basis)
+        except OwnerConflict:
+            return False
+        return memory.reference(basis) == reference and basis["draft"] == {
+            "initialization_id": request.initialization_id,
+            "revision": int(request.draft_revision), "hash": request.draft_hash}
+
     def _queue_deepfetch_request(
         self,
         connection: Connection,
@@ -5541,6 +5560,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             decoded_object(candidate.scope_json).get("search_source_basis") == (None if source_basis is None else source_basis.as_dict())), None)
         if existing is not None:
             if existing.status == "failed":
+                scope = decoded_object(existing.scope_json)
                 failed_run = self._agent_runtime.query_deepfetch_run(
                     str(existing.request_ref)
                 )
@@ -5549,13 +5569,33 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     and not failed_run.provider_operation_retry_permitted
                 ):
                     raise OwnerConflict("deepfetch_successor_required")
+                if failed_run is None:
+                    preparation_ref = scope.get("preparation", {}).get("ref", existing.request_ref)
+                    operation = connection.execute(text(
+                        "SELECT state FROM hc_creation_material_operations WHERE operation_ref=:ref"
+                    ), {"ref": preparation_ref + ":understanding"}).first()
+                    basis_current = (operation is not None and operation.state == "sealed"
+                                     and self._deepfetch_preparation_basis_current(existing))
+                    if not _preparation_retry_permitted(operation, existing.failure_code, basis_current):
+                        raise OwnerConflict("protected_creation_unknown_outcome")
+                    if operation is not None and operation.state == "failed":
+                        preparation_ref = existing.request_ref + ":preparation:" + new_ref("retry")
+                    if operation is None or operation.state == "failed":
+                        scope["preparation"] = {"ref": preparation_ref}
+                scope_hash = canonical_hash(scope)
+                from types import SimpleNamespace
+                receipt_values = {**dict(existing._mapping), "scope_hash": scope_hash}
+                authorization_hash = _deepfetch_request_receipt_hash(SimpleNamespace(**receipt_values))
                 connection.execute(
                     text(
                         "UPDATE hc_deepfetch_requests SET status = 'queued', "
-                        "failure_code = NULL, completed_at = NULL, updated_at = :now "
+                        "failure_code = NULL, completed_at = NULL, updated_at = :now, "
+                        "scope_json = :scope, scope_hash = :scope_hash, authorization_hash = :authorization "
                         "WHERE request_ref = :request_ref AND status = 'failed'"
                     ),
-                    {"request_ref": existing.request_ref, "now": time.time()},
+                    {"request_ref": existing.request_ref, "now": time.time(),
+                     "scope": canonical_json(scope), "scope_hash": scope_hash,
+                     "authorization": authorization_hash},
                 )
                 connection.execute(
                     text(
@@ -8538,6 +8578,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         request_ref: str,
         failure_code: str,
         run_ref: str | None = None,
+        *,
+        expected_scope_hash: str | None = None,
     ) -> None:
         manual_request = self._manual_creation.query_deepfetch_request(request_ref)
         if manual_request is not None:
@@ -8560,20 +8602,24 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 raise OwnerConflict("deepfetch_request_not_found")
             if row.status in {"succeeded", "cancelled"}:
                 return
-            connection.execute(
+            changed = connection.execute(
                 text(
                     "UPDATE hc_deepfetch_requests SET status = 'failed', "
                     "run_ref = COALESCE(:run_ref, run_ref), failure_code = "
                     ":failure_code, updated_at = :now, completed_at = :now WHERE "
-                    "request_ref = :request_ref AND status = 'queued'"
+                    "request_ref = :request_ref AND status = 'queued' AND "
+                    "(:expected_scope_hash IS NULL OR scope_hash = :expected_scope_hash)"
                 ),
                 {
                     "request_ref": request_ref,
                     "run_ref": run_ref,
                     "failure_code": failure_code,
                     "now": now,
+                    "expected_scope_hash": expected_scope_hash,
                 },
             )
+            if changed.rowcount != 1:
+                return
             connection.execute(
                 text(
                     "UPDATE human_collaboration_state SET revision = revision + 1 "
@@ -8676,6 +8722,13 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     "current_hash": row.draft_hash,
                 },
             ).first()
+            preparation_operation = None
+            if deepfetch_request is not None:
+                scope = decoded_object(deepfetch_request.scope_json)
+                preparation_ref = scope.get("preparation", {}).get("ref", deepfetch_request.request_ref)
+                preparation_operation = connection.execute(text(
+                    "SELECT state,created_at FROM hc_creation_material_operations WHERE operation_ref=:ref"
+                ), {"ref": preparation_ref + ":understanding"}).first()
             envelope = connection.execute(
                 text(
                     "SELECT * FROM hc_resource_envelopes WHERE initialization_id = "
@@ -9296,6 +9349,13 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 literature_snapshot,
                 basis_current=deepfetch_basis_current,
                 proposal_current=proposal_current,
+                preparation_operation=preparation_operation,
+                preparation_basis_current=(
+                    deepfetch_request is not None and deepfetch_request.status == "failed"
+                    and deepfetch_run is None and preparation_operation is not None
+                    and preparation_operation.state == "sealed"
+                    and self._deepfetch_preparation_basis_current(deepfetch_request)
+                ),
             ),
             "acquisition_session": (
                 None
@@ -11956,6 +12016,15 @@ def _deepfetch_request_from_row(row: Row) -> DeepFetchRunRequest:
     )
 
 
+def _preparation_retry_permitted(
+    operation: Row | None, failure_code: str | None, basis_current: bool = False,
+) -> bool:
+    if operation is not None:
+        return operation.state == "failed" or operation.state == "sealed" and basis_current
+    return (failure_code != "protected_creation_active"
+            and failure_code not in _DRAFTING_RECONCILIATION_CODES)
+
+
 def _public_deepfetch(
     request: Row | None,
     run: DeepFetchRun | None,
@@ -11963,6 +12032,8 @@ def _public_deepfetch(
     *,
     basis_current: bool,
     proposal_current: bool,
+    preparation_operation: Row | None = None,
+    preparation_basis_current: bool = False,
 ) -> dict[str, object] | None:
     if request is None:
         return None
@@ -12001,6 +12072,13 @@ def _public_deepfetch(
     failure_code = request.failure_code
     if failure_code is None and run is not None:
         failure_code = run.failure_code
+    scope = decoded_object(request.scope_json)
+    preparation = scope.get("preparation", {"ref": request.request_ref})
+    preparation_started = (float(preparation_operation.created_at)
+                           if preparation_operation is not None else preparation.get("started_at"))
+    preparation_completed = preparation.get("completed_at")
+    if preparation_completed is None and request.status in {"failed", "cancelled"}:
+        preparation_completed = request.completed_at
     return {
         "request_ref": request.request_ref,
         "correlation_ref": request.correlation_ref,
@@ -12022,6 +12100,14 @@ def _public_deepfetch(
             payload_hash=request.authorization_hash,
         ).as_public_dict(),
         "run": None if run is None else run.as_public_dict(),
+        "preparation": {
+            "ref": preparation["ref"],
+            "started_at": preparation_started,
+            "completed_at": preparation_completed,
+            "operation_state": None if preparation_operation is None else preparation_operation.state,
+            "retry_permitted": _preparation_retry_permitted(
+                preparation_operation, failure_code, preparation_basis_current),
+        },
         "literature_snapshot": (
             None if snapshot is None else snapshot.as_public_dict()
         ),

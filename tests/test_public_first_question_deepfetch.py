@@ -1230,6 +1230,7 @@ def test_failed_deepfetch_retries_the_same_run_with_a_new_fenced_attempt(
         proposal_drafter=SnapshotAwareProposalDrafter(),
         deepfetch_provider=provider,
         host_compute_probe=DeterministicProbe(),
+        acquisition_provider=RecordingAcquisitionProvider(),
     )
     client, write_headers = _authenticate(runtime)
     try:
@@ -3435,6 +3436,7 @@ def test_cancel_after_worker_reads_request_prevents_runtime_admission(
         proposal_drafter=SnapshotAwareProposalDrafter(),
         deepfetch_provider=provider,
         host_compute_probe=DeterministicProbe(),
+        acquisition_provider=RecordingAcquisitionProvider(),
     )
     client, write_headers = _authenticate(runtime)
     preflight_verified = threading.Event()
@@ -3599,6 +3601,7 @@ def test_restart_reuses_one_root_session_and_rejects_the_old_fence_result(
         proposal_drafter=SnapshotAwareProposalDrafter(),
         deepfetch_provider=blocking_provider,
         host_compute_probe=DeterministicProbe(),
+        acquisition_provider=RecordingAcquisitionProvider(),
     )
     client, write_headers = _authenticate(first_runtime)
     restarted_runtime = None
@@ -3632,6 +3635,7 @@ def test_restart_reuses_one_root_session_and_rejects_the_old_fence_result(
             proposal_drafter=SnapshotAwareProposalDrafter(),
             deepfetch_provider=restarted_provider,
             host_compute_probe=DeterministicProbe(),
+            acquisition_provider=RecordingAcquisitionProvider(),
         )
         successor_errors: list[BaseException] = []
 

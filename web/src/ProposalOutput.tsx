@@ -12,10 +12,12 @@ type Page = {
   phase?: "understanding" | "drafting" | null;
 };
 
-export function ProposalOutput({ initializationId, generationRef, status, enabled = true, onPhase, preparation = false }: {
+export function ProposalOutput({ initializationId, generationRef, status, enabled = true, onPhase, preparation = false, preparationRequestRef, preparationNeedsReview = false }: {
   initializationId: string; generationRef: string; status: string; enabled?: boolean;
   onPhase?: (phase: "understanding" | "drafting" | null) => void;
   preparation?: boolean;
+  preparationRequestRef?: string;
+  preparationNeedsReview?: boolean;
 }) {
   const [page, setPage] = useState<Page | null>(null);
   const [error, setError] = useState(false);
@@ -40,7 +42,8 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
     setError(false);
     async function poll() {
       try {
-        const params = new URLSearchParams({ [preparation ? "request_ref" : "generation_ref"]: generationRef, after: String(offset) });
+        const params = new URLSearchParams({ [preparation ? "request_ref" : "generation_ref"]: preparation ? preparationRequestRef ?? generationRef : generationRef, after: String(offset) });
+        if (preparation) params.set("preparation_ref", generationRef);
         const response = await fetch(`/api/v1/quest-initializations/${encodeURIComponent(initializationId)}/${preparation ? "preparation-output" : "proposal-output"}?${params}`, {
           credentials: "same-origin", cache: "no-store", signal: controller.signal,
         });
@@ -64,7 +67,7 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
     }
     void poll();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [initializationId, generationRef, status, enabled, visible, retry, preparation]);
+  }, [initializationId, generationRef, status, enabled, visible, retry, preparation, preparationRequestRef]);
 
   useEffect(() => {
     if (log.current && pinned.current) log.current.scrollTop = log.current.scrollHeight;
@@ -80,7 +83,7 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
     <div ref={log} className="first-question-activity-log" role="log" aria-label="第一问最近活动" aria-live="polite" aria-relevant="additions" aria-atomic="false"
       onScroll={event => { const node = event.currentTarget; pinned.current = node.scrollTop + node.clientHeight >= node.scrollHeight - 4; }}>
       {activities.map(activity => <div key={activity.key} className={`first-question-activity-row ${activity.status}`}><i aria-hidden="true" /><span>{activity.label}</span></div>)}
-      {active ? <p>{page ? "等待下一条运行活动，自动刷新中。" : "正在连接本次运行…"}</p> : !activities.length ? <p>本次生成已结束，尚无可展示的运行活动。</p> : null}
+      {active ? <p>{page ? "等待下一条运行活动，自动刷新中。" : "正在连接本次运行…"}</p> : !activities.length ? <p>{preparationNeedsReview ? "本次资料准备仍需核对，尚无可展示的运行活动。" : "本次生成已结束，尚无可展示的运行活动。"}</p> : null}
     </div>
     {page?.has_more ? <p>正在读取后续运行活动…</p> : null}
   </section>;

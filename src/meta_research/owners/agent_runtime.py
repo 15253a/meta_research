@@ -329,6 +329,9 @@ _NON_CANDIDATE_COMPLETION_DETAILS = frozenset(
     }
 )
 DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
+_DEEPFETCH_FINALIZATION_RECONCILABLE_CODES = frozenset(
+    {"deepfetch_workflow_evidence_invalid", "deepfetch_oa_only_limitation_invalid"}
+)
 _BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX = "bundle-target-"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 DEEPFETCH_RECONCILIATION_BASE_SECONDS = 0.5
@@ -17092,7 +17095,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 ).first()
             pending_result_reconciliation = (
                 prior_failure is not None
-                and prior_failure.failure_code == "deepfetch_workflow_evidence_invalid"
+                and prior_failure.failure_code in _DEEPFETCH_FINALIZATION_RECONCILABLE_CODES
                 and prior_failure.runtime_binding_hash == existing.runtime_binding_hash
             )
         if (
@@ -17100,16 +17103,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             and (
                 pending_result_reconciliation
                 or existing.status == "failed"
-                and existing.failure_code == "deepfetch_workflow_evidence_invalid"
+                and existing.failure_code in _DEEPFETCH_FINALIZATION_RECONCILABLE_CODES
                 and existing.provider_operation_retry_permitted
             )
             and bool(getattr(provider, "requires_verified_terminal_retry", False))
         ):
-            # The provider already finished; the host rejected its final
-            # workflow metadata. Revalidate the sealed operation under its
-            # original binding, preserving its artifacts and native session.
-            # The adapter's reconciliation path verifies the signed spool and
-            # cannot dispatch another provider effect.
             runtime_binding = existing.runtime_binding
             runtime_binding_hash = existing.runtime_binding_hash
             runtime_binding_json = canonical_json(runtime_binding.as_dict())
@@ -18341,7 +18339,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             },
                         ).first()
                         if (
-                            run.failure_code != "deepfetch_workflow_evidence_invalid"
+                            run.failure_code not in _DEEPFETCH_FINALIZATION_RECONCILABLE_CODES
                             or not bool(run.provider_operation_retry_permitted)
                             or terminal_attempt is None
                             or terminal_attempt.status != "failed"

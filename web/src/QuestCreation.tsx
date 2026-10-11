@@ -37,7 +37,7 @@ import { CreationUnderstanding } from "./CreationUnderstanding";
 import { SearchSourcesSettings } from "./SearchSourcesSettings";
 import { MetaTrace } from "./MetaTrace";
 import "./quest-creation.css";
-import { FirstQuestionProgress, currentDeepFetch, currentProposalGeneration } from "./FirstQuestionProgress";
+import { FirstQuestionProgress, currentDeepFetch, currentProposalGeneration, preparationRetryBlocked, preparationReconciliationCopy } from "./FirstQuestionProgress";
 import { useReplyStream } from "./chatReplyStream";
 
 type PendingIntentMessage = {
@@ -1332,7 +1332,7 @@ export function QuestCreationWorkbench({
   const acquisitionActionLocked = terminal || inFlight.acquisition || inFlight.generating ||
     proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
   const proposalActionLocked = terminal || inFlight.compute || inFlight.acquisition || inFlight.generating ||
-    proposalGenerationActive || inFlight.reviewing || terminalMutationActive || referenceDraft.busy || searchSelectionDirty;
+    proposalGenerationActive || inFlight.reviewing || terminalMutationActive || referenceDraft.busy || searchSelectionDirty || preparationRetryBlocked(deepfetch);
   const anyOperationActive = Object.values(inFlight).some(Boolean);
   const draftComplete = draftIsComplete(draft);
   const proposalComplete = questionIsComplete(proposal);
@@ -2731,6 +2731,10 @@ function deepfetchFailureCopy(
 ): string {
   const failure = deepfetch.failure;
   if (!failure) return "";
+  if (!deepfetch.run) {
+    return preparationRetryBlocked(deepfetch) ? preparationReconciliationCopy(deepfetch)
+      : `${messageFor(failure.code)} 目标和材料仍保留，可以重新点击“生成第一个问题”开始新的资料准备。`;
+  }
   if (deepfetchRequiresSuccessorBasis(deepfetch)) {
     const hardFailure = failure.code === "deepfetch_run_identity_conflict"
       ? messageFor(failure.code)
@@ -2747,6 +2751,9 @@ function deepfetchFailureCopy(
 function deepfetchStatusLabel(
   deepfetch: NonNullable<QuestCreationView["deepfetch"]>,
 ): string {
+  if (deepfetch.status === "failed" && !deepfetch.run) {
+    return preparationRetryBlocked(deepfetch) ? "资料准备待核对" : "资料准备未完成 · 可重试";
+  }
   return {
     queued: "已授权 · 排队中",
     running: "真实检索中",
@@ -2853,6 +2860,8 @@ function footerCopy(
   if (!proposal) {
     const deepfetch = currentDeepFetch(creation);
     if (deepfetch?.status === "failed") {
+      if (!deepfetch.run) return preparationRetryBlocked(deepfetch)
+        ? preparationReconciliationCopy(deepfetch) : "资料准备未完成；可以重新准备第一问";
       return deepfetchRequiresSuccessorBasis(deepfetch)
         ? "DeepFetch 未完成；修改并保存当前 Draft 形成新 DraftRevision，再准备 acquisition successor"
         : "DeepFetch 未完成；可沿同一 correlation 重试";

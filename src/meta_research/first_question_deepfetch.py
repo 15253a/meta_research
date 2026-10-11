@@ -6,6 +6,7 @@ from meta_research.deepfetch import DeepFetchProvider, DeepFetchUnavailable
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.common import OwnerConflict
 from meta_research.owners.research_memory import ResearchMemoryInterface
+from meta_research.quest_drafting import DraftingUnavailable
 
 
 class DeepFetchRequestAuthority(Protocol):
@@ -22,6 +23,8 @@ class DeepFetchRequestAuthority(Protocol):
         request_ref: str,
         failure_code: str,
         run_ref: str | None = None,
+        *,
+        expected_scope_hash: str | None = None,
     ) -> None: ...
 
 
@@ -64,6 +67,12 @@ class FirstQuestionDeepFetchWorker:
                     run.run_ref,
                     snapshot,
                 )
+            except DraftingUnavailable as error:
+                self._request_authority.record_deepfetch_failed(
+                    request.request_ref,
+                    error.code,
+                    expected_scope_hash=request.scope_hash,
+                )
             except DeepFetchUnavailable as error:
                 if error.code in {
                     "deepfetch_acquisition_waiting_user",
@@ -78,6 +87,7 @@ class FirstQuestionDeepFetchWorker:
                     request.request_ref,
                     error.code,
                     None if run is None else run.run_ref,
+                    expected_scope_hash=request.scope_hash,
                 )
             except OwnerConflict as error:
                 if error.code.startswith("power_inhibitor_"):
@@ -110,5 +120,6 @@ class FirstQuestionDeepFetchWorker:
                     request.request_ref,
                     error.code,
                     None if run is None else run.run_ref,
+                    expected_scope_hash=request.scope_hash,
                 )
             return True
