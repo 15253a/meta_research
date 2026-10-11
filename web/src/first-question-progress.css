@@ -1,0 +1,37 @@
+.first-question-progress { margin: 12px 0 18px; padding: 20px; min-width: 0; border: 1px solid #dedcf3; border-radius: 16px; background: linear-gradient(145deg, #faf9ff, #fff 68%); box-shadow: 0 5px 20px #49418b08; }
+.first-question-progress > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.first-question-progress > header small { color: #787399; font-size: 11px; letter-spacing: .08em; }
+.first-question-progress h3 { margin: 7px 0 0; color: #302d4c; font-size: 17px; line-height: 1.5; }
+.first-question-progress > header > span { flex-shrink: 0; color: #756e99; font-size: 11px; font-variant-numeric: tabular-nums; }
+.first-question-stage-meter { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 20px; }
+.first-question-stage-meter > div { min-width: 0; display: flex; flex-direction: column; gap: 6px; color: #9995ab; }
+.first-question-stage-meter i { position: relative; display: block; height: 5px; overflow: hidden; border-radius: 5px; background: #e9e7f0; }
+.first-question-stage-meter b { font-size: 11px; line-height: 1.6; }
+.first-question-stage-meter small { font-size: 10px; }
+.first-question-stage-meter [data-state="done"] { color: #53508a; }
+.first-question-stage-meter [data-state="done"] i { background: #8074ca; }
+.first-question-stage-meter [data-state="skipped"] i { background: #cec9df; }
+.first-question-stage-meter [data-state="current"] { color: #6954b8; }
+.first-question-stage-meter [data-state="current"] i { background: #a292db; }
+.first-question-stage-meter [data-state="current"] i::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, #ffffffb0, transparent); animation: first-question-scan 2s ease-in-out infinite; }
+.first-question-progress > p { margin: 16px 0 12px; color: #817b96; font-size: 11px; line-height: 1.8; }
+.first-question-progress.is-failed h3 { color: #a05d51; }
+.first-question-activity { border: 1px solid #e7e4f0; border-radius: 11px; background: #fff; overflow: hidden; min-width: 0; }
+.first-question-activity > header { display: flex; align-items: center; justify-content: space-between; padding: 11px 14px; border-bottom: 1px solid #eeebf4; color: #615a7d; font-size: 11px; }
+.first-question-activity > header span { color: #948da7; font-size: 10px; }
+.first-question-activity-log { max-height: 230px; overflow: auto; scrollbar-gutter: stable; overscroll-behavior: contain; padding: 5px 8px; }
+.first-question-activity-row { display: flex; align-items: baseline; gap: 10px; padding: 11px 8px; color: #655e79; font-size: 12px; line-height: 1.7; border-bottom: 1px solid #f3f1f7; overflow-wrap: anywhere; }
+.first-question-activity-row:last-child { border-bottom: 0; background: #f5f2ff; border-radius: 7px; color: #6850a7; }
+.first-question-activity-row i { flex-shrink: 0; height: 6px; width: 6px; border-radius: 50%; background: #b2a5d9; }
+.first-question-activity-row > span { white-space: pre-wrap; }
+.first-question-activity-row.failed { color: #a45d51; }
+.first-question-activity-log > p { color: #938aab; padding: 8px; font-size: 12px; line-height: 1.7; }
+.first-question-activity details { padding: 10px 14px; border-top: 1px solid #eeebf4; font-size: 10px; color: #958ca6; }
+.first-question-activity pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; }
+.first-question-progress .quest-deepfetch-runway { margin: 10px 0; }
+.first-question-progress .quest-deepfetch-live-log { max-height: 220px; }
+.first-question-progress .quest-deepfetch-live-event > span { font-size: 12px; line-height: 1.7; }
+.first-question-progress .quest-deepfetch-live > header { padding: 11px 14px; font-size: 11px; }
+@keyframes first-question-scan { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@media (max-width: 600px) { .first-question-progress { padding: 13px; } .first-question-progress > header { align-items: start; flex-direction: column; gap: 8px; } .first-question-progress h3 { font-size: 15px; } .first-question-stage-meter { gap: 5px; } .first-question-stage-meter b { font-size: 10px; } }
+@media (prefers-reduced-motion: reduce) { .first-question-stage-meter [data-state="current"] i::after { animation: none; } }

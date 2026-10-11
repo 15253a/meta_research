@@ -358,12 +358,14 @@ class ProtectedCreationRuntime:
                 path = self.jail_root / relative
                 if _runtime_digest(path) != digest:
                     raise ProtectedCreationError("protected_creation_runtime_changed")
+            self._restore_runtime_permissions(manifest)
             _owned_directory(self.work_directory, _UID)
             return
         if self.jail_root.exists():
             raise ProtectedCreationError("protected_creation_jail_unrecognized")
         _directory(self.jail_root, 0o755)
         staged: dict[str, str] = {}
+        file_modes: dict[str, int] = {}
 
         def copy(source: Path, target: Path, *, dependencies: bool = False) -> None:
             relative = target.relative_to(self.jail_root).as_posix()
@@ -374,8 +376,10 @@ class ProtectedCreationRuntime:
             _directory(target.parent, 0o755)
             with _regular_reader(resolved) as stream:
                 content = stream.read()
-            _write_private(target, content, 0o555 if os.access(resolved, os.X_OK) else 0o444)
+            mode = 0o555 if os.access(resolved, os.X_OK) else 0o444
+            _write_private(target, content, mode)
             staged[relative] = hashlib.sha256(content).hexdigest()
+            file_modes[relative] = mode
             if dependencies:
                 completed = subprocess.run(["/usr/bin/ldd", str(resolved)],
                     env={"PATH": "/usr/bin:/bin", "LANG": "C"}, capture_output=True,
@@ -439,6 +443,7 @@ class ProtectedCreationRuntime:
         (self.jail_root / "proc/self/exe").symlink_to("/bin/codex")
         for name, minor, mode in (("null", 3, 0o666), ("urandom", 9, 0o444), ("random", 8, 0o444)):
             os.mknod(self.jail_root / "dev" / name, stat.S_IFCHR | mode, os.makedev(1, minor))
+            _device_mode(self.jail_root / "dev" / name, minor, mode)
         for name in ("auth.json", "config.toml"):
             source = self.credentials_home / name
             if not source.exists():
@@ -450,7 +455,34 @@ class ProtectedCreationRuntime:
             destination = self.jail_root / "home/creation/.codex" / name
             _write_private(destination, content)
             os.chown(destination, _UID, _UID)
-        _write_private(marker, json.dumps({"entry": identity, "files": staged}).encode())
+        _write_private(marker, json.dumps({"entry": identity, "files": staged, "file_modes": file_modes}).encode())
+
+    def _restore_runtime_permissions(self, manifest: dict[str, object]) -> None:
+        # A private daemon umask used to seal valid bytes with root-only access.
+        # Repair only verified, root-owned runtime entries, while holding the
+        # runtime lock after the previous native process tree has been sealed.
+        directories = {self.jail_root, self.jail_root / "home", self.jail_root / "inputs"}
+        modes = manifest.get("file_modes", {})
+        for relative in manifest["files"]:
+            path = self.jail_root / relative
+            mode = modes.get(relative)
+            if mode is None:
+                # Legacy manifests do not record modes; umask 0077 preserves
+                # the owner's executable bit, distinguishing binaries/data.
+                mode = 0o555 if path.stat().st_mode & stat.S_IXUSR else 0o444
+            if mode not in {0o444, 0o555}:
+                raise ProtectedCreationError("protected_creation_jail_unrecognized")
+            _root_owned_mode(path, mode)
+            for parent in path.parents:
+                if not parent.is_relative_to(self.jail_root):
+                    break
+                directories.add(parent)
+        for directory in directories:
+            _root_owned_mode(directory, 0o755, directory=True)
+        for name in ("proc", "proc/self", "dev"):
+            _root_owned_mode(self.jail_root / name, 0o555, directory=True)
+        for name, minor, mode in (("null", 3, 0o666), ("urandom", 9, 0o444), ("random", 8, 0o444)):
+            _device_mode(self.jail_root / "dev" / name, minor, mode)
 
     def _prepare_call(self, call: NativeCreationCall) -> tuple[list[str], dict[str, str], list[tuple[Path, Path]], str]:
         mappings = {str(self.executable): self._entry_command, str(self.work_directory): "/workspace"}
@@ -578,12 +610,16 @@ def _directory(path: Path, mode: int) -> None:
     descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for index, component in enumerate(value.parts[1:]):
+            created = False
+            desired = mode if index == len(value.parts) - 2 else 0o755
             try:
-                os.mkdir(component, mode=mode if index == len(value.parts) - 2 else 0o755,
-                    dir_fd=descriptor)
+                os.mkdir(component, mode=desired, dir_fd=descriptor)
+                created = True
             except FileExistsError:
                 pass
             child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            if created:
+                os.fchmod(child, desired)
             os.close(descriptor)
             descriptor = child
     finally:
@@ -605,7 +641,33 @@ def _write_private(path: Path, content: bytes, mode: int = 0o600) -> None:
     with _parent_descriptor(path) as parent:
         descriptor = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
     with os.fdopen(descriptor, "wb") as stream:
+        os.fchmod(stream.fileno(), mode)
         stream.write(content)
+
+
+def _root_owned_mode(path: Path, mode: int, *, directory: bool = False) -> None:
+    with _parent_descriptor(path) as parent:
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if directory else 0), dir_fd=parent)
+    try:
+        details = os.fstat(descriptor)
+        valid_kind = stat.S_ISDIR(details.st_mode) if directory else stat.S_ISREG(details.st_mode)
+        if not valid_kind or details.st_uid != 0 or details.st_mode & 0o022:
+            raise ProtectedCreationError("protected_creation_jail_unrecognized")
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
+def _device_mode(path: Path, minor: int, mode: int) -> None:
+    with _parent_descriptor(path) as parent:
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISCHR(details.st_mode) or details.st_uid != 0 or details.st_rdev != os.makedev(1, minor):
+            raise ProtectedCreationError("protected_creation_jail_unrecognized")
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
 
 
 def _replace_private(path: Path, content: bytes, mode: int) -> None:

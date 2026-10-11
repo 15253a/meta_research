@@ -55,7 +55,7 @@ async function createAcceptedQuestThroughWeb(
     });
     await deepfetch.click();
     await expect(deepfetch).toHaveAttribute("aria-pressed", "true");
-    await dialog.getByLabel("文献搜索范围").selectOption("oa_only");
+    await dialog.getByLabel("文献全文获取范围").selectOption("oa_only");
     await expect(dialog.getByTestId("acquisition-session-status")).toContainText(
       "ready · current",
     );

@@ -37,7 +37,7 @@ import { CreationUnderstanding } from "./CreationUnderstanding";
 import { SearchSourcesSettings } from "./SearchSourcesSettings";
 import { MetaTrace } from "./MetaTrace";
 import "./quest-creation.css";
-import { ProposalOutput } from "./ProposalOutput";
+import { FirstQuestionProgress, currentDeepFetch, currentProposalGeneration } from "./FirstQuestionProgress";
 import { useReplyStream } from "./chatReplyStream";
 
 type PendingIntentMessage = {
@@ -1119,15 +1119,17 @@ export function QuestCreationWorkbench({
       }
       if (!operationIsCurrent("generating", token)) return;
       applyView(next, { syncProposal: Boolean(next.proposal) });
+      const nextGeneration = currentProposalGeneration(next);
+      const nextDeepFetch = currentDeepFetch(next);
       if (
-        next.proposal_generation?.status === "capability_unavailable" ||
-        next.proposal_generation?.status === "failed" ||
-        next.deepfetch?.status === "failed" ||
-        next.deepfetch?.status === "cancelled"
+        nextGeneration?.status === "capability_unavailable" ||
+        nextGeneration?.status === "failed" ||
+        nextDeepFetch?.status === "failed" ||
+        nextDeepFetch?.status === "cancelled"
       ) {
         showError(new ProductError(
-          next.deepfetch?.failure?.code ??
-          next.proposal_generation?.failure?.code ??
+          nextDeepFetch?.failure?.code ??
+          nextGeneration?.failure?.code ??
           "proposal_drafter_unavailable",
         ));
       } else {
@@ -1315,14 +1317,13 @@ export function QuestCreationWorkbench({
   };
 
   const terminal = creation ? creationIsLocked(creation) : false;
+  const generation = creation ? currentProposalGeneration(creation) : null;
   const proposalGenerationActive = Boolean(
     creation?.status === "proposal_generating" ||
-    creation?.proposal_generation && ["queued", "running"].includes(
-      creation.proposal_generation.status,
-    ),
+    generation && ["queued", "running"].includes(generation.status),
   );
   const acquisitionSession = creation?.acquisition_session ?? null;
-  const deepfetch = creation?.deepfetch ?? null;
+  const deepfetch = creation ? currentDeepFetch(creation) : null;
   const durableIntentActive = Boolean(
     creation?.intent_session?.turns.some((turn) =>
       ["queued", "running"].includes(turn.assistant_status)),
@@ -1597,9 +1598,9 @@ export function QuestCreationWorkbench({
                 </div>
                 <div className="quest-literature-card">
                   <label className="quest-field">
-                    <span>文献搜索范围</span>
+                    <span>文献全文获取范围</span>
                     <select
-                      aria-label="文献搜索范围"
+                      aria-label="文献全文获取范围"
                       value={draft.literature.mode}
                       disabled={!creation || draftInteractionLocked}
                       onChange={(event) => updateDraft({
@@ -1612,8 +1613,8 @@ export function QuestCreationWorkbench({
                       })}
                       onBlur={() => void persistDraft()}
                     >
-                      <option value="oa_then_institution">公开全文与可选图书馆</option>
-                      <option value="oa_only">只搜索开放获取资源</option>
+                      <option value="oa_then_institution">公开全文与可选图书馆下载</option>
+                      <option value="oa_only">仅获取开放全文</option>
                       <option
                         value="provided_only"
                         disabled={!draft.literature.accepted_material_bindings.length && !draft.material_manifest?.entries.length}
@@ -1692,8 +1693,8 @@ export function QuestCreationWorkbench({
                     >
                       <i aria-hidden="true">✓</i>
                       <div>
-                        <b>OA-only 是已选择的主路线</b>
-                        <small>跳过机构浏览器、图书馆入口和登录检测；未命中只报告 OA 路线穷尽，不会写成被迫降级。</small>
+                        <b>仅从公开资源获取文献全文</b>
+                        <small>下载开放获取的网页和 PDF，无需图书馆登录。搜索源在下方单独设置；无法取得全文时会说明结果。</small>
                       </div>
                       <span
                         className={`quest-unavailable-tag ${acquisitionSession?.status ?? "not-checked"}`}
@@ -1701,9 +1702,14 @@ export function QuestCreationWorkbench({
                         aria-live="polite"
                       >
                         {inFlight.acquisition
-                          ? "preparing · current · browser not_required"
+                          ? "正在检测公开全文获取…"
                           : acquisitionSessionCopy(acquisitionSession, draft)}
                       </span>
+                      <button type="button" className="quest-library-test"
+                        disabled={!creation || acquisitionActionLocked || draftSaveState === "saving"}
+                        onClick={() => void detectAcquisition()}>
+                        {inFlight.acquisition ? "正在检测…" : acquisitionSession ? "重新检测全文获取" : "检测全文获取"}
+                      </button>
                     </div>
                   ) : null}
                   {draft.literature.mode === "provided_only" ? (
@@ -1732,17 +1738,55 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="materials" aria-labelledby="quest-materials-title">
                 <div className="quest-section-heading">
                   <b id="quest-materials-title">研究材料 <em>可选</em></b>
-                  <small>先提供资料，再阅读和选择</small>
+                  <small>从已有论文、数据或研究结果开始</small>
                 </div>
                 <div className="quest-material-card">
-                  <p>保存服务器原路径及说明到本次创建草稿。提交不读取内容；材料解释由后续创建工作处理。</p>
-                  <WorkMaterialFields draft={referenceDraft} disabled={!creation || draftInteractionLocked}
+                  <p className="quest-material-intro">添加已有材料，供系统起草第一问时阅读和参考。保存后会显示读取与处理情况。</p>
+                  <WorkMaterialFields draft={referenceDraft} disabled={!creation || draftInteractionLocked} showReceipts={false}
                     onRetried={() => { void refreshMaterials(); }} />
-                  <button type="button" disabled={!creation || draftInteractionLocked || referenceDraft.busy || !!referenceDraft.pending || !referenceDraft.selection || !referenceDraft.receiver}
-                    onClick={() => { const command = referenceDraft.materialCommand(); if (command) void referenceDraft.submit(`/api/v1/quest-initializations/${encodeURIComponent(materialAnchor)}/material-references`, command).then(result => { if (result) void refreshMaterials(); }); }}>保存材料引用到创建草稿</button>
-                  <WorkMaterialReferences receipts={creation?.work_materials ?? []} />
+                  {referenceDraft.selection ? <button type="button" className="quest-material-save" disabled={!creation || draftInteractionLocked || referenceDraft.busy || !!referenceDraft.pending || !referenceDraft.receiver}
+                    onClick={() => { const command = referenceDraft.materialCommand(); if (command) void referenceDraft.submit(`/api/v1/quest-initializations/${encodeURIComponent(materialAnchor)}/material-references`, command).then(result => { if (result) void refreshMaterials(); }); }}>保存材料引用到创建草稿</button> : null}
+                  <WorkMaterialReferences receipts={[...referenceDraft.receipts, ...(creation?.work_materials ?? [])]} compact />
                   {draft.material_manifest?.entries.map(entry => <p key={entry.material_key}>既有创建材料 · {entry.relative_path}</p>)}
                   {draft.literature.accepted_material_bindings.map(binding => <p key={String(binding.version_ref)}>既有原件版本 · {String(binding.version_ref)}</p>)}
+                </div>
+              </section>
+
+              <section className="quest-journey-section" data-journey-section="route" aria-labelledby="quest-route-title">
+                <div className="quest-section-heading">
+                  <b id="quest-route-title">生成第一问之前，要不要补充检索？</b>
+                  <small>选择第一问的准备方式，生成后仍可编辑和确认</small>
+                </div>
+                <div className="quest-route-card">
+                  <div className="quest-route-options">
+                    <button
+                      className="quest-route-choice"
+                      type="button"
+                      aria-label="先运行 DeepFetch"
+                      aria-pressed={draft.route === "deepfetch"}
+                      disabled={!creation || draftInteractionLocked}
+                      onClick={() => updateDraft({ ...draft, route: "deepfetch" })}
+                    >
+                      <b>先运行 DeepFetch</b>
+                      <small>先检索相关研究、获取可用全文，再起草第一个问题。</small>
+                    </button>
+                    <button
+                      className="quest-route-choice"
+                      type="button"
+                      aria-label="直接根据目标生成"
+                      aria-pressed={draft.route === "direct"}
+                      disabled={!creation || draftInteractionLocked}
+                      onClick={() => updateDraft({ ...draft, route: "direct" })}
+                    >
+                      <b>直接根据目标生成</b>
+                      <small>根据当前目标、边界和已提供材料直接起草。</small>
+                    </button>
+                  </div>
+                  <p className="quest-route-note">
+                    {draft.route === "deepfetch"
+                      ? "将先整理检索结果，再生成第一问；你确认后才会创建研究任务。"
+                      : "将直接生成第一问，不启动补充检索；你确认后才会创建研究任务。"}
+                  </p>
                 </div>
               </section>
 
@@ -1752,16 +1796,19 @@ export function QuestCreationWorkbench({
                   <b id="quest-proposal-title">系统起草的第一个研究问题</b>
                   <small>六字段持续可编辑</small>
                 </div>
-                {creation?.proposal_generation ? <ProposalOutput
-                  key={creation.proposal_generation.ref}
-                  initializationId={creation.initialization_id}
-                  generationRef={creation.proposal_generation.ref}
-                  status={creation.proposal_generation.status}
-                /> : null}
+                {creation ? <FirstQuestionProgress creation={creation} pending={inFlight.generating} enabled={dialogOpen}>
+                  {deepfetch ? <div className={`quest-deepfetch-runway ${deepfetch.status}`} data-testid="deepfetch-runway" data-status={deepfetch.status}>
+                    <div className="quest-deepfetch-head"><b>补充检索与资料阅读</b><span role="status">{deepfetchStatusLabel(deepfetch)}</span></div>
+                    <DeepFetchLiveEvents attemptRef={deepfetch.run?.attempt_ref ?? null} events={deepfetch.recent_events ?? []} />
+                    {deepfetch.literature_snapshot ? <div className="quest-deepfetch-snapshot"><b>本轮保留 {deepfetch.literature_snapshot.paper_count} 篇论文，{deepfetch.literature_snapshot.fulltext_count} 篇有全文</b>
+                      {deepfetch.literature_snapshot.limitations.map(limit => <p key={limit}>{limit}</p>)}</div> : null}
+                    {deepfetch.failure ? <p className="quest-deepfetch-failure">{deepfetchFailureCopy(deepfetch)}</p> : null}
+                  </div> : null}
+                </FirstQuestionProgress> : null}
                 <div className="quest-proposal">
                   <div className="quest-question-sourcebar">
                     <b>可编辑 QuestionProposal</b>
-                    <span>系统已填入六字段；确认前都可修改</span>
+                    <span>{proposal ? "系统已填入六字段；确认前都可修改" : "起草后的六个字段可逐项修改"}</span>
                     <small>{proposalSourceCopy(creation)}</small>
                   </div>
 
@@ -1773,7 +1820,7 @@ export function QuestCreationWorkbench({
                           : "正在依据精确 DraftRevision 生成六字段；Quest 配置和右侧 Session 仍可使用。"}
                       </span>
                       <code>proposal_generating</code>
-                      <small>{creation.deepfetch?.activity ?? creation.proposal_generation?.status ?? "queued"}</small>
+                      <small>{deepfetch?.activity ?? generation?.status ?? "queued"}</small>
                     </div>
                   ) : null}
                   {creation?.status === "proposal_stale" || creation?.proposal?.status === "stale" ? (
@@ -1792,7 +1839,7 @@ export function QuestCreationWorkbench({
                   {!proposal ? (
                     <div className="quest-proposal-state">
                       <span>
-                        {creation?.proposal_generation?.status === "capability_unavailable"
+                        {generation?.status === "capability_unavailable"
                           ? "生产 Proposal Drafter 当前不可用；不会用字符串模板伪造首问题。"
                           : "填写必填基底并绑定 Quest Resource Envelope 后，可以原位生成完整六字段。"}
                       </span>
@@ -1933,111 +1980,8 @@ export function QuestCreationWorkbench({
             <section className="quest-start-readings" aria-label="你的研究起点"><h3>你的研究起点</h3><dl>
               <div><dt>时间预算</dt><dd>{timeBudgetLabel(draft.time_budget)}</dd></div>
               <div><dt>登记设备</dt><dd>{creation?.resource_envelope ? resourceEnvelopeCopy(creation) : "尚未检测并选择"}</dd></div>
-              <div><dt>文献范围</dt><dd>{draft.literature.mode === "provided_only" ? "仅已提供材料" : draft.literature.mode === "oa_only" ? "公开获取" : "公开全文与可选图书馆"}</dd></div>
+              <div><dt>全文获取</dt><dd>{draft.literature.mode === "provided_only" ? "仅已提供材料" : draft.literature.mode === "oa_only" ? "仅开放全文" : "公开全文与可选图书馆下载"}</dd></div>
             </dl></section>
-              <section className="quest-journey-section" data-journey-section="route" aria-labelledby="quest-route-title">
-                <div className="quest-section-heading">
-                  <b id="quest-route-title">生成第一问之前，要不要补充检索？</b>
-                  <small>direct 与 DeepFetch 均在当前 initialization 原位收敛</small>
-                </div>
-                <div className="quest-route-card">
-                  <div className="quest-route-options">
-                    <button
-                      className="quest-route-choice"
-                      type="button"
-                      aria-label="先运行 DeepFetch"
-                      aria-pressed={draft.route === "deepfetch"}
-                      disabled={!creation || draftInteractionLocked}
-                      onClick={() => updateDraft({ ...draft, route: "deepfetch" })}
-                    >
-                      <b>先运行 DeepFetch</b>
-                      <small>绑定当前 DraftRevision 做真实 Web Research，再原位起草六字段。</small>
-                    </button>
-                    <button
-                      className="quest-route-choice"
-                      type="button"
-                      aria-label="直接根据目标生成"
-                      aria-pressed={draft.route === "direct"}
-                      disabled={!creation || draftInteractionLocked}
-                      onClick={() => updateDraft({ ...draft, route: "direct" })}
-                    >
-                      <b>直接根据目标生成</b>
-                      <small>不等待检索，使用当前精确 Quest basis 起草。</small>
-                    </button>
-                  </div>
-                  <p className="quest-route-note">
-                    <b>当前边界：</b>
-                    {draft.route === "deepfetch"
-                      ? " DeepFetch 只形成 RM 接纳的精确 LiteratureSnapshot；不会创建 Quest、Question 或 Cycle，也不会替你完成最终确认。"
-                      : " direct 使用当前精确 Quest basis 起草；没有检索运行，也不会伪造 LiteratureSnapshot。"}
-                  </p>
-                  {draft.route === "deepfetch" ? (
-                    <div
-                      className={`quest-deepfetch-runway ${deepfetch?.status ?? "not-started"}`}
-                      data-testid="deepfetch-runway"
-                      data-status={deepfetch?.status ?? "not-started"}
-                    >
-                      <div className="quest-deepfetch-head">
-                        <div>
-                          <small>FIRST-QUESTION PREPARATION</small>
-                          <b>DeepFetch Web Research</b>
-                        </div>
-                        <span role="status" aria-live="polite">
-                          {deepfetch ? deepfetchStatusLabel(deepfetch) : "等待启动"}
-                        </span>
-                      </div>
-                      {deepfetch ? (
-                        <>
-                          <DeepFetchProgress deepfetch={deepfetch} />
-                          <div className="quest-deepfetch-facts">
-                            <span>
-                              <small>ACTIVITY</small>
-                              <b>{deepfetchActivityLabel(deepfetch.activity)}</b>
-                            </span>
-                            <span>
-                              <small>FRESHNESS</small>
-                              <b>{deepfetch.freshness}</b>
-                            </span>
-                            <span>
-                              <small>ATTEMPT</small>
-                              <b>{deepfetch.run?.attempt_generation ?? 0}</b>
-                            </span>
-                          </div>
-                          {deepfetch.literature_snapshot ? (
-                            <div className="quest-deepfetch-snapshot">
-                              <div>
-                                <b>
-                                  LiteratureSnapshot · {deepfetch.literature_snapshot.completion}
-                                </b>
-                                <small>
-                                  {deepfetch.literature_snapshot.paper_count} papers · {deepfetch.literature_snapshot.fulltext_count} fulltexts · RM accepted
-                                </small>
-                              </div>
-                              {deepfetch.literature_snapshot.limitations.length ? (
-                                <ul>
-                                  {deepfetch.literature_snapshot.limitations.map((limitation) => (
-                                    <li key={limitation}>{limitation}</li>
-                                  ))}
-                                </ul>
-                              ) : null}
-                            </div>
-                          ) : null}
-                          {deepfetch.failure ? (
-                            <p className="quest-deepfetch-failure">
-                              {deepfetchFailureCopy(deepfetch)}
-                            </p>
-                          ) : null}
-                        </>
-                      ) : (
-                        <p className="quest-deepfetch-awaiting">
-                          保存当前 DraftRevision 和 Resource Envelope 后，点击下方唯一生成按钮启动；阶段读取 durable Projection，运行中会持续闪动并显示真实已用时间。
-                        </p>
-                      )}
-                    </div>
-                  ) : null}
-                </div>
-              </section>
-
             <IntentDraftingSession
               switching={intentSwitching}
               pendingMessage={pendingIntent}
@@ -2619,8 +2563,8 @@ function viewIsOlder(
     return true;
   }
 
-  const currentGeneration = current.proposal_generation;
-  const nextGeneration = next.proposal_generation;
+  const currentGeneration = currentProposalGeneration(current);
+  const nextGeneration = currentProposalGeneration(next);
   if (
     currentGeneration &&
     ["queued", "running"].includes(currentGeneration.status) &&
@@ -2633,19 +2577,19 @@ function viewIsOlder(
     proposalGenerationStatusRank(nextGeneration.status) <
       proposalGenerationStatusRank(currentGeneration.status)
   ) return true;
-  const currentDeepFetch = current.deepfetch;
-  const nextDeepFetch = next.deepfetch;
+  const currentFetch = currentDeepFetch(current);
+  const nextFetch = currentDeepFetch(next);
   if (
-    currentDeepFetch &&
-    ["queued", "running", "accepting"].includes(currentDeepFetch.status) &&
+    currentFetch &&
+    ["queued", "running", "accepting"].includes(currentFetch.status) &&
     next.quest_draft.revision === current.quest_draft.revision &&
-    nextDeepFetch?.request_ref !== currentDeepFetch.request_ref
+    nextFetch?.request_ref !== currentFetch.request_ref
   ) return true;
   if (
-    currentDeepFetch &&
-    nextDeepFetch?.request_ref === currentDeepFetch.request_ref &&
-    ["queued", "running", "accepting"].includes(currentDeepFetch.status) &&
-    deepfetchStatusRank(nextDeepFetch.status) < deepfetchStatusRank(currentDeepFetch.status)
+    currentFetch &&
+    nextFetch?.request_ref === currentFetch.request_ref &&
+    ["queued", "running", "accepting"].includes(currentFetch.status) &&
+    deepfetchStatusRank(nextFetch.status) < deepfetchStatusRank(currentFetch.status)
   ) return true;
   return false;
 }
@@ -2666,108 +2610,6 @@ function previewStatusRank(
   status: NonNullable<QuestCreationView["confirmation_preview"]>["status"],
 ): number {
   return ["current", "stale", "consumed"].indexOf(status);
-}
-
-const DEEPFETCH_STAGE_LABELS = [
-  "授权",
-  "排队",
-  "Web Research",
-  "RM 接纳",
-  "Proposal",
-] as const;
-
-function DeepFetchProgress({
-  deepfetch,
-}: {
-  deepfetch: NonNullable<QuestCreationView["deepfetch"]>;
-}) {
-  const attempt = deepfetch.run;
-  const attemptStartedAt = attempt?.attempt_started_at ?? null;
-  const attemptCompletedAt = attempt?.attempt_completed_at ?? null;
-  const total = DEEPFETCH_STAGE_LABELS.length;
-  const completed = Math.max(0, Math.min(deepfetch.progress.completed, total));
-  const proposalIsActive =
-    deepfetch.status === "succeeded" &&
-    deepfetch.activity === "proposal_drafting" &&
-    completed < total;
-  const progressIsActive =
-    ["queued", "running", "accepting"].includes(deepfetch.status) ||
-    proposalIsActive;
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    setNow(Date.now());
-    if (!progressIsActive) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [
-    attempt?.attempt_ref,
-    attemptCompletedAt,
-    attemptStartedAt,
-    progressIsActive,
-  ]);
-
-  const stage = Math.min(completed + 1, total);
-  const elapsedEndAt = progressIsActive
-    ? now / 1_000
-    : attemptCompletedAt ?? now / 1_000;
-  const elapsedSeconds = attemptStartedAt === null
-    ? null
-    : Math.max(
-      0,
-      elapsedEndAt - attemptStartedAt,
-    );
-  const elapsed = elapsedSeconds === null
-    ? null
-    : formatElapsedSeconds(Math.floor(elapsedSeconds));
-  const progressCopy = deepfetch.status === "failed"
-    ? `失败于阶段 ${stage}/${total}${elapsed === null ? "" : ` · 耗时 ${elapsed}`}`
-    : `阶段 ${stage}/${total}${elapsed === null ? "" : ` · 已经过 ${elapsed}`}`;
-  const progressValueText = `阶段 ${stage}/${total} · ${DEEPFETCH_STAGE_LABELS[stage - 1]}${elapsed === null ? "" : ` · 已运行 ${elapsed}`}`;
-  const durableProgress = Math.round((completed / total) * 100);
-
-  return (
-    <>
-      <div className="quest-deepfetch-progress">
-        <div
-          className={`quest-deepfetch-meter${progressIsActive ? " is-active" : ""}${completed >= total ? " is-complete" : ""}`}
-          role="progressbar"
-          aria-label="DeepFetch 运行进度"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={durableProgress}
-          aria-valuetext={progressValueText}
-        >
-          <span
-            className="quest-deepfetch-meter-fill"
-            style={{ width: `${durableProgress}%` }}
-          >
-            <span aria-hidden="true" />
-          </span>
-        </div>
-        <code data-testid="deepfetch-elapsed" aria-live="off">
-          {progressCopy}
-        </code>
-      </div>
-      <div className="quest-deepfetch-stages" aria-label="DeepFetch 活动阶段">
-        {DEEPFETCH_STAGE_LABELS.map((label, index) => (
-          <span
-            key={label}
-            className={index < completed ? "done" : undefined}
-            aria-current={progressIsActive && index === stage - 1 ? "step" : undefined}
-          >
-            {label}
-          </span>
-        ))}
-      </div>
-      {progressIsActive ? (
-        <DeepFetchLiveEvents
-          attemptRef={attempt?.attempt_ref ?? null}
-          events={deepfetch.recent_events ?? []}
-        />
-      ) : null}
-    </>
-  );
 }
 
 function DeepFetchLiveEvents({
@@ -2807,7 +2649,7 @@ function DeepFetchLiveEvents({
       <header>
         <span>
           <i aria-hidden="true" />
-          LIVE PROVIDER TRACE
+          最近活动
         </span>
         <code>{events.length ? `最近 ${events.length} 条` : "等待事件"}</code>
       </header>
@@ -2831,7 +2673,7 @@ function DeepFetchLiveEvents({
             <code>{deepfetchEventCategory(event.category)}</code>
           </div>
         )) : (
-          <p>Provider 已启动，等待下一条结构化运行事件…</p>
+          <p>等待下一条运行活动，状态自动刷新中…</p>
         )}
       </div>
     </section>
@@ -2849,17 +2691,6 @@ function deepfetchEventCategory(
   }[category];
 }
 
-function formatElapsedSeconds(totalSeconds: number): string {
-  const seconds = totalSeconds % 60;
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  const minutes = totalMinutes % 60;
-  const hours = Math.floor(totalMinutes / 60);
-  if (hours === 0) {
-    return `${String(totalMinutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-  }
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-}
-
 function intentStatusRank(status: IntentSessionTurn["assistant_status"]): number {
   return ["queued", "running", "completed", "unavailable", "failed"].indexOf(status);
 }
@@ -2871,15 +2702,21 @@ function proposalGenerationStatusRank(
 }
 
 function proposalGenerationSettled(creation: QuestCreationView): boolean {
-  const generation = creation.proposal_generation;
-  const deepfetch = creation.deepfetch;
+  const generation = currentProposalGeneration(creation);
+  const deepfetch = currentDeepFetch(creation);
   if (deepfetch && ["failed", "cancelled"].includes(deepfetch.status)) return true;
   if (
     deepfetch &&
     deepfetch.freshness === "stale" &&
     deepfetch.status === "succeeded"
   ) return true;
-  if (!generation) return false;
+  if (!generation) {
+    // A past generation may settle after a Draft edit, but it cannot finish a
+    // newer DeepFetch request that has not created its own generation yet.
+    const historicalGeneration = creation.proposal_generation;
+    return !deepfetch && Boolean(historicalGeneration &&
+      ["succeeded", "capability_unavailable", "failed"].includes(historicalGeneration.status));
+  }
   if (["capability_unavailable", "failed"].includes(generation.status)) return true;
   if (generation.status !== "succeeded") return false;
   // A basis edit is intentionally allowed while the provider works. Its late
@@ -3027,8 +2864,9 @@ function footerCopy(
   if (!meaningful(draft.completion_criteria)) return "还需填写边界";
   if (!creation.resource_envelope) return "请检测本机计算卡，并为 Quest 形成 Resource Envelope";
   if (!proposal) {
-    if (creation.deepfetch?.status === "failed") {
-      return deepfetchRequiresSuccessorBasis(creation.deepfetch)
+    const deepfetch = currentDeepFetch(creation);
+    if (deepfetch?.status === "failed") {
+      return deepfetchRequiresSuccessorBasis(deepfetch)
         ? "DeepFetch 未完成；修改并保存当前 Draft 形成新 DraftRevision，再准备 acquisition successor"
         : "DeepFetch 未完成；可沿同一 correlation 重试";
     }
@@ -3049,7 +2887,7 @@ function proposalSourceCopy(creation: QuestCreationView | null): string {
   if (!creation) return "等待 initialization";
   if (creation.status === "proposal_generating") {
     return creation.route === "deepfetch"
-      ? `DeepFetch · ${creation.deepfetch?.activity ?? "queued"}`
+      ? `DeepFetch · ${currentDeepFetch(creation)?.activity ?? "queued"}`
       : "production drafter · generating";
   }
   if (creation.proposal?.status === "stale") return `旧 Proposal · basis r${creation.proposal.basis_revision}`;
@@ -3059,7 +2897,7 @@ function proposalSourceCopy(creation: QuestCreationView | null): string {
   if (creation.proposal) {
     return `${creation.route} · current draft r${creation.proposal.basis_revision}`;
   }
-  if (creation.proposal_generation?.status === "capability_unavailable") return "capability_unavailable";
+  if (currentProposalGeneration(creation)?.status === "capability_unavailable") return "capability_unavailable";
   return "等待生成";
 }
 
@@ -3152,7 +2990,7 @@ function messageFor(code: string): string {
     acquisition_session_not_ready: "当前 AcquisitionSession 尚未 ready；请按状态提示处理后重新检测。",
     deepfetch_acquisition_not_ready: "DeepFetch 正等待当前 AcquisitionSession 恢复 ready。",
     institutional_entry_required: "全面搜索需要填写获准的图书馆或数据库入口链接。",
-    library_entry_url_required: "全面搜索需要填写获准的图书馆或数据库入口链接，或切换为只搜索开放获取资源。",
+    library_entry_url_required: "要求机构访问时请填写图书馆或数据库入口，或切换为仅获取开放全文。",
     institutional_login_required: "请在已打开的 Google Chrome 资源页完成机构登录，然后重新检测。",
     institutional_preflight_unavailable: "机构资源预检未通过；请确认本机浏览器控制与入口可用。",
     institutional_resource_unverified: "浏览器已连接，但尚未验证到获准的数据库资源页。",

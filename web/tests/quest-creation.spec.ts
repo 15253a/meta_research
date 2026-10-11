@@ -201,8 +201,8 @@ test("create Quest is one continuous production window with fixed responsibiliti
   await expect(form.getByLabel("时间预算")).toBeVisible();
   await expect(form.getByRole("button", { name: "检测本机计算卡" })).toBeVisible();
   await expect(form.getByText("Quest Resource Envelope：", { exact: true })).toBeVisible();
-  await expect(form.getByLabel("文献搜索范围")).toHaveValue("oa_then_institution");
-  await expect(form.getByLabel("文献搜索范围").locator("option")).toHaveCount(3);
+  await expect(form.getByLabel("文献全文获取范围")).toHaveValue("oa_then_institution");
+  await expect(form.getByLabel("文献全文获取范围").locator("option")).toHaveCount(3);
   await expect(form.getByText("Google Chrome", { exact: false })).toBeVisible();
   await expect(form.getByRole("button", { name: "先运行 DeepFetch" })).toBeEnabled();
   await expect(form.getByRole("button", { name: "先运行 DeepFetch" })).toHaveAttribute(

@@ -153,6 +153,55 @@ def test_unsupported_platform_never_launches(monkeypatch, tmp_path):
     assert not protected.jail_root.exists()
 
 
+def test_native_launch_and_inputs_with_private_daemon_umask(runtime, tmp_path):
+    protected = ProtectedCreationRuntime(tmp_path / "jail", Path("/bin/bash"), runtime.credentials_home)
+    source = tmp_path / "input.txt"
+    source.write_text("private daemon input")
+    previous = os.umask(0o077)
+    try:
+        completed = protected.run(_call(
+            "import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text()); "
+            "print(pathlib.Path('/dev/null').open('w').write('discard'))",
+            arguments=(source,), inputs=(source,),
+        ))
+    finally:
+        os.umask(previous)
+    assert completed.returncode == 0
+    assert completed.stdout == "private daemon input\n7\n"
+    assert protected.request_stop()["descendants_ended"] is True
+
+
+def test_reuse_repairs_umask_restricted_trusted_runtime(runtime, tmp_path):
+    protected = ProtectedCreationRuntime(tmp_path / "jail", Path("/bin/bash"), runtime.credentials_home)
+    assert protected.run(_call("print('prepared')")).returncode == 0
+    manifest = json.loads((protected._control / "runtime.json").read_text())
+    # Older installations sealed the runtime bytes but let the daemon umask
+    # remove permissions needed by the unprivileged native process.
+    manifest.pop("file_modes", None)
+    (protected._control / "runtime.json").write_text(json.dumps(manifest))
+    for relative in manifest["files"]:
+        path = protected.jail_root / relative
+        path.chmod(path.stat().st_mode & ~0o077)
+        for parent in path.parents:
+            if not parent.is_relative_to(protected.jail_root):
+                break
+            parent.chmod(parent.stat().st_mode & ~0o077)
+    (protected.jail_root / "home").chmod(0o700)
+    (protected.jail_root / "dev/null").chmod(0o600)
+    reconstructed = ProtectedCreationRuntime(protected.jail_root, protected.executable, protected.credentials_home)
+    completed = reconstructed.run(_call("print('resumed'); open('/dev/null', 'w').write('discard')"))
+    assert completed.returncode == 0
+    assert completed.stdout == "resumed\n"
+
+
+def test_runtime_permission_repair_rejects_writable_runtime_directories(runtime, tmp_path):
+    protected = ProtectedCreationRuntime(tmp_path / "jail", Path("/bin/bash"), runtime.credentials_home)
+    assert protected.run(_call("print('prepared')")).returncode == 0
+    (protected.jail_root / "bin").chmod(0o777)
+    with pytest.raises(ProtectedCreationError, match="protected_creation_jail_unrecognized"):
+        protected.run(_call("raise AssertionError('must not launch')"))
+
+
 def test_native_boundary_inputs_and_exact_outputs(runtime, tmp_path):
     schema = tmp_path / "schema.json"
     schema.write_text('{"trusted":"schema"}', encoding="utf-8")

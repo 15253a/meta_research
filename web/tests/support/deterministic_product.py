@@ -12,6 +12,13 @@ from typing import cast
 import uvicorn
 
 import meta_research.web as web_module
+from meta_research.acquisition import (
+    AcquisitionBatchRequest,
+    AcquisitionItemResult,
+    AcquisitionPreflightRequest,
+    AcquisitionPreflightResult,
+    AcquisitionRuntimeBinding,
+)
 from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
     bundle_exhaustion_route_fingerprint,
@@ -396,6 +403,41 @@ class SequencedHostProbe:
             ),
             adapter_kind="chrome_controlled_probe",
         )
+
+
+class DeterministicAcquisitionProvider:
+    """Keep browser resource checks independent of installed CLI and network."""
+
+    def runtime_binding(self) -> AcquisitionRuntimeBinding:
+        return AcquisitionRuntimeBinding(
+            provider_ref="chrome/deterministic-acquisition",
+            provider_version="1",
+            capability_bindings=(
+                "browser-context-reuse", "lawful-fulltext-routing", "private-manifest",
+            ),
+        )
+
+    def preflight(self, request: AcquisitionPreflightRequest) -> AcquisitionPreflightResult:
+        institutional = request.mode == "oa_then_institution"
+        return AcquisitionPreflightResult(
+            status="ready",
+            browser_context_ref="chrome-fixture-browser-context" if institutional else None,
+            reason_code=None,
+            evidence={
+                "configuration_health": "ready" if institutional else "not_required",
+                "browser_control": "functional" if institutional else "not_required",
+                "authorized_resource": "verified" if institutional else request.mode,
+            },
+        )
+
+    def acquire(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:
+        return tuple(AcquisitionItemResult(
+            paper_id=paper.paper_id, status="missing", path=None, format=None,
+            failure={"code": "oa_fulltext_not_found", "detail": "No fixture fulltext for this paper."},
+        ) for paper in request.papers)
+
+    def reconcile(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:
+        return self.acquire(request)
 
 
 class DeterministicDeepFetchProvider:
@@ -1533,6 +1575,7 @@ async def serve(
         writing_skill_provider=DeterministicWritingSkill(),
         writing_delivery_provider_registry=writing_delivery_registry,
         deepfetch_provider=DeterministicDeepFetchProvider(),
+        acquisition_provider=DeterministicAcquisitionProvider(),
         power_inhibitor=power_inhibitor,
         harness_adapters=harness_adapters,
         startup_harness_diagnostics=False,

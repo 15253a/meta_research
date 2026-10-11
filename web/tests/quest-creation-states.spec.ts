@@ -179,7 +179,7 @@ test("an upgraded recovering v1 Quest remains readable through the corrected Web
   await expect(dialog.getByRole("textbox", { name: "边界", exact: true })).toHaveValue(
     "恢复期间仍可从公开 Web 检查既有 bundle。",
   );
-  await expect(dialog.getByLabel("文献搜索范围")).toHaveValue("oa_only");
+  await expect(dialog.getByLabel("文献全文获取范围")).toHaveValue("oa_only");
   await expect(
     dialog.getByText("正在从首个缺失 receipt 恢复", { exact: true }).first(),
   ).toBeVisible();
@@ -266,7 +266,7 @@ async function selectReadyCompute(dialog: Locator) {
   await expect(device).toBeVisible();
   await device.click();
   await expect(
-    dialog.getByText("已绑定 1 张实际检测设备。", { exact: false }),
+    dialog.locator(".quest-compute-boundary").getByText("已绑定 1 张实际检测设备。", { exact: false }),
   ).toBeVisible();
 }
 
@@ -606,22 +606,28 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
   const deepfetchChoice = dialog.getByRole("button", { name: "先运行 DeepFetch" });
   await deepfetchChoice.click();
   await expect(deepfetchChoice).toHaveAttribute("aria-pressed", "true");
-  await dialog.getByLabel("文献搜索范围").selectOption("oa_only");
+  await dialog.getByLabel("文献全文获取范围").selectOption("oa_only");
+  await dialog.getByRole("button", { name: /^(检测全文获取|重新检测全文获取)$/ }).click();
   await expect(dialog.getByTestId("acquisition-session-status")).toContainText(
     "ready · current",
   );
   const runway = dialog.getByTestId("deepfetch-runway");
-  await expect(runway).toHaveAttribute("data-status", "not-started");
-  await expect(runway).toContainText("阶段读取 durable Projection");
+  const preparation = dialog.getByTestId("first-question-progress");
+  await expect(runway).toHaveCount(0);
+  await expect(preparation).toHaveCount(0);
   await expect(session).toBeVisible();
 
   await dialog.getByRole("button", { name: "生成第一个问题" }).click();
-  await expect(runway).toHaveAttribute("data-status", /queued|running|succeeded/, {
+  await expect(runway).toHaveAttribute("data-status", /queued|running|accepting|succeeded/, {
     timeout: 8_000,
   });
-  await expect(runway.getByLabel("DeepFetch 运行进度")).toBeVisible();
+  const progress = preparation.getByLabel("第一问流程位置");
+  await expect(progress).toBeVisible();
+  await expect(progress).toHaveAttribute("aria-valuemax", "4");
+  await expect(dialog.getByRole("main").getByTestId("first-question-progress")).toHaveCount(1);
+  await expect(runway.getByTestId("deepfetch-live-events")).toBeVisible();
   await expect(session).toBeVisible();
-  await expect(runway).toContainText("2 papers · 1 fulltexts · RM accepted", {
+  await expect(runway).toContainText("本轮保留 2 篇论文，1 篇有全文", {
     timeout: 12_000,
   });
   await expect(runway).toContainText("第二篇论文没有可合法获取的开放全文。");
@@ -632,11 +638,11 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
     "DeepFetch 已核查两篇论文；一篇没有可合法获取的开放全文。",
   );
   await expect(runway).toHaveAttribute("data-status", "succeeded");
-  await expect(runway.getByLabel("DeepFetch 运行进度")).toHaveAttribute(
-    "aria-valuenow",
-    "100",
-  );
-  await expect(runway).toContainText("首问题已原位展开");
+  await expect(progress).toHaveAttribute("aria-valuenow", "4");
+  await expect(progress).toHaveAttribute("aria-valuetext", "四个阶段已完成");
+  await expect(preparation).not.toHaveClass(/is-active/);
+  await expect(preparation).toContainText("第一个问题准备好了");
+  await expect(runway.getByTestId("deepfetch-live-events")).toBeVisible();
   await expectAcceptedProposalContract(dialog);
 
   const current = await publicCurrent(page);
@@ -724,6 +730,7 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
       value: Record<string, unknown>;
     };
     current.status = "proposal_generating";
+    current.route = "deepfetch";
     questDraft.value = { ...questDraft.value, route: "deepfetch" };
     current.deepfetch = {
       request_ref: "deepfetch-request-elapsed",
@@ -800,15 +807,15 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
     name: "创建 Quest，并决定第一个研究问题",
   });
   let runway = dialog.getByTestId("deepfetch-runway");
-  let progress = runway.getByLabel("DeepFetch 运行进度");
-  await expect(progress).toHaveAttribute("aria-valuemax", "100");
-  await expect(progress).toHaveAttribute("aria-valuenow", "40");
-  await expect(progress).toHaveClass(/is-active/);
-  await expect(progress).toHaveAttribute(
-    "aria-valuetext",
-    /阶段 3\/5 · Web Research · 已运行 01:\d{2}/,
-  );
-  await expect(runway.getByText("Web Research", { exact: true })).toHaveAttribute(
+  let preparation = dialog.getByTestId("first-question-progress");
+  let progress = preparation.getByLabel("第一问流程位置");
+  await expect(progress).toHaveAttribute("aria-valuemax", "4");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  await expect(preparation).toHaveClass(/is-active/);
+  await expect(progress).toHaveAttribute("aria-valuetext", "补充检索");
+  await expect(progress.locator("[data-state='skipped']")).toContainText("理解已有资料");
+  await expect(progress.locator("[data-state='current']")).toContainText("补充检索");
+  await expect(progress.locator("[data-state='current']")).toHaveAttribute(
     "aria-current",
     "step",
   );
@@ -817,26 +824,24 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
   await expect(liveEvents).toContainText("DeepFetch 会话已启动");
   liveEventCount = 2;
   await expect(liveEvents).toContainText("正在执行 Web Search");
-  const elapsed = runway.getByTestId("deepfetch-elapsed");
-  await expect(elapsed).toHaveAttribute("aria-live", "off");
-  await expect(elapsed).toContainText(/阶段 3\/5 · 已经过 01:\d{2}/);
+  const elapsed = preparation.locator(":scope > header > span");
+  await expect(elapsed).toContainText(/已用时 01:\d{2}/);
 
   const beforeTick = await elapsed.textContent();
   await page.waitForTimeout(1_100);
   await expect.poll(() => elapsed.textContent()).not.toBe(beforeTick);
-  await expect(progress).toHaveAttribute("aria-valuenow", "40");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
 
   await page.reload({ waitUntil: "domcontentloaded" });
   dialog = page.getByRole("dialog", {
     name: "创建 Quest，并决定第一个研究问题",
   });
   runway = dialog.getByTestId("deepfetch-runway");
-  progress = runway.getByLabel("DeepFetch 运行进度");
-  await expect(progress).toHaveAttribute("aria-valuenow", "40");
-  await expect(runway.getByTestId("deepfetch-elapsed")).toContainText(
-    /阶段 3\/5 · 已经过 01:\d{2}/,
-  );
-  await expect(runway.getByTestId("deepfetch-elapsed")).not.toContainText("00:00");
+  preparation = dialog.getByTestId("first-question-progress");
+  progress = preparation.getByLabel("第一问流程位置");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  await expect(preparation.locator(":scope > header > span")).toContainText(/已用时 01:\d{2}/);
+  await expect(preparation.locator(":scope > header > span")).not.toContainText("00:00");
 
   attemptGeneration = 2;
   attemptStartedAt = Date.now() / 1_000;
@@ -845,12 +850,11 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
     name: "创建 Quest，并决定第一个研究问题",
   });
   runway = dialog.getByTestId("deepfetch-runway");
-  progress = runway.getByLabel("DeepFetch 运行进度");
-  await expect(progress).toHaveAttribute("aria-valuenow", "40");
-  await expect(runway.getByTestId("deepfetch-elapsed")).toContainText(
-    /阶段 3\/5 · 已经过 00:0\d/,
-  );
-  await expect(runway.locator(".quest-deepfetch-facts")).toContainText("2");
+  preparation = dialog.getByTestId("first-question-progress");
+  progress = preparation.getByLabel("第一问流程位置");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  await expect(preparation.locator(":scope > header > span")).toContainText(/已用时 00:0\d/);
+  await expect(runway.getByTestId("deepfetch-live-events")).toContainText("DeepFetch 会话已启动");
 
   attemptStartedAt = Date.now() / 1_000 - 190;
   attemptCompletedAt = Date.now() / 1_000 - 65;
@@ -862,19 +866,18 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
     name: "创建 Quest，并决定第一个研究问题",
   });
   runway = dialog.getByTestId("deepfetch-runway");
-  progress = runway.getByLabel("DeepFetch 运行进度");
-  await expect(progress).toHaveAttribute("aria-valuenow", "60");
-  await expect(runway.getByText("RM 接纳", { exact: true })).toHaveAttribute(
-    "aria-current",
-    "step",
-  );
-  const acceptingElapsed = runway.getByTestId("deepfetch-elapsed");
+  preparation = dialog.getByTestId("first-question-progress");
+  progress = preparation.getByLabel("第一问流程位置");
+  // A scalar sub-run checkpoint does not establish accepted literature or a prepared research basis.
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  await expect(preparation).toContainText("正在保留可用文献");
+  const acceptingElapsed = preparation.locator(":scope > header > span");
   const acceptingBeforeTick = await acceptingElapsed.textContent();
   await page.waitForTimeout(1_100);
   await expect.poll(() => acceptingElapsed.textContent()).not.toBe(
     acceptingBeforeTick,
   );
-  await expect(progress).toHaveAttribute("aria-valuenow", "60");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
 
   deepfetchStatus = "succeeded";
   deepfetchActivity = "proposal_drafting";
@@ -884,25 +887,24 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
     name: "创建 Quest，并决定第一个研究问题",
   });
   runway = dialog.getByTestId("deepfetch-runway");
-  progress = runway.getByLabel("DeepFetch 运行进度");
-  await expect(progress).toHaveAttribute("aria-valuenow", "80");
-  await expect(runway.getByText("Proposal", { exact: true })).toHaveAttribute(
-    "aria-current",
-    "step",
-  );
-  const proposalElapsed = runway.getByTestId("deepfetch-elapsed");
+  preparation = dialog.getByTestId("first-question-progress");
+  progress = preparation.getByLabel("第一问流程位置");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  await expect(progress).toHaveAttribute("aria-valuetext", "补充检索");
+  const proposalElapsed = preparation.locator(":scope > header > span");
   const proposalBeforeTick = await proposalElapsed.textContent();
   await page.waitForTimeout(1_100);
   await expect.poll(() => proposalElapsed.textContent()).not.toBe(
     proposalBeforeTick,
   );
-  await expect(progress).toHaveAttribute("aria-valuenow", "80");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
 
   await page.emulateMedia({ reducedMotion: "reduce" });
-  await expect(progress).toHaveAttribute("aria-valuenow", "80");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
   const reducedMotionBeforeTick = await proposalElapsed.textContent();
   await page.waitForTimeout(1_100);
-  await expect(progress).toHaveAttribute("aria-valuenow", "80");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  expect(await progress.locator("[data-state='current'] i").evaluate(element => getComputedStyle(element, "::after").animationName)).toBe("none");
   await expect.poll(() => proposalElapsed.textContent()).not.toBe(
     reducedMotionBeforeTick,
   );
@@ -915,10 +917,12 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
     name: "创建 Quest，并决定第一个研究问题",
   });
   runway = dialog.getByTestId("deepfetch-runway");
-  progress = runway.getByLabel("DeepFetch 运行进度");
-  await expect(progress).toHaveAttribute("aria-valuenow", "100");
-  await expect(progress).not.toHaveClass(/is-active/);
-  await expect(runway.getByTestId("deepfetch-live-events")).toHaveCount(0);
+  preparation = dialog.getByTestId("first-question-progress");
+  progress = preparation.getByLabel("第一问流程位置");
+  // Even 5/5 does not imply all four preparation stages finished without their accepted outputs.
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  await expect(preparation).toHaveClass(/is-active/);
+  await expect(runway.getByTestId("deepfetch-live-events")).toBeVisible();
 
   attemptGeneration = 3;
   attemptStartedAt = Date.now() / 1_000 - 3_177;
@@ -931,18 +935,19 @@ test("DeepFetch shows durable progress and live elapsed time across reload", asy
     name: "创建 Quest，并决定第一个研究问题",
   });
   runway = dialog.getByTestId("deepfetch-runway");
-  const frozenElapsed = runway.getByTestId("deepfetch-elapsed");
-  progress = runway.getByLabel("DeepFetch 运行进度");
-  await expect(progress).toHaveAttribute("aria-valuenow", "20");
-  await expect(progress).not.toHaveClass(/is-active/);
-  await expect(runway.getByTestId("deepfetch-live-events")).toHaveCount(0);
+  preparation = dialog.getByTestId("first-question-progress");
+  const frozenElapsed = preparation.locator(":scope > header > span");
+  progress = preparation.getByLabel("第一问流程位置");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
+  await expect(preparation).not.toHaveClass(/is-active/);
+  await expect(runway.getByTestId("deepfetch-live-events")).toBeVisible();
   await expect(runway).toContainText("Attempt 已失败 · 可重试");
-  await expect(runway).toContainText("等待新 Attempt");
-  await expect(frozenElapsed).toHaveText("失败于阶段 2/5 · 耗时 52:57");
-  await expect(runway.locator('[aria-current="step"]')).toHaveCount(0);
+  await expect(preparation).toContainText("本次准备未完成");
+  await expect(frozenElapsed).toHaveText("本轮耗时 52:57");
+  await expect(progress.locator('[aria-current="step"]')).toHaveCount(0);
   await page.waitForTimeout(1_100);
-  await expect(frozenElapsed).toHaveText("失败于阶段 2/5 · 耗时 52:57");
-  await expect(progress).toHaveAttribute("aria-valuenow", "20");
+  await expect(frozenElapsed).toHaveText("本轮耗时 52:57");
+  await expect(progress).toHaveAttribute("aria-valuenow", "1");
 
   await page.unroute("**/api/v1/snapshot", projectRunningDeepFetch);
   await page.unroute(exactViewPattern, projectRunningDeepFetchView);
@@ -1878,15 +1883,15 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   expect(afterUnavailableIntent).not.toHaveProperty("question_ref");
   expect(afterUnavailableIntent).not.toHaveProperty("cycle_ref");
 
-  const literature = dialog.getByLabel("文献搜索范围");
+  const literature = dialog.getByLabel("文献全文获取范围");
   await expect(literature.locator("option")).toHaveCount(3);
   await literature.selectOption("oa_only");
   await expect(literature).toHaveValue("oa_only");
   await expect(dialog.getByTestId("oa-only-primary-route")).toContainText(
-    "OA-only 是已选择的主路线",
+    "仅从公开资源获取文献全文",
   );
   await expect(dialog.getByTestId("oa-only-primary-route")).toContainText(
-    "跳过机构浏览器、图书馆入口和登录检测",
+    "下载开放获取的网页和 PDF，无需图书馆登录",
   );
   await expect(dialog.locator(".quest-library-test")).toHaveCount(0);
   await expect(dialog.locator('input[type="url"]')).toHaveCount(0);

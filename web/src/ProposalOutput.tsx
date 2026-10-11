@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { proposalActivities } from "./proposalActivity";
 
 type Page = {
   generation_ref: string;
@@ -8,17 +9,20 @@ type Page = {
   next_offset: number;
   source_bytes: number;
   has_more: boolean;
+  phase?: "understanding" | "drafting" | null;
 };
 
-export function ProposalOutput({ initializationId, generationRef, status }: {
-  initializationId: string; generationRef: string; status: string;
+export function ProposalOutput({ initializationId, generationRef, status, enabled = true, onPhase, preparation = false }: {
+  initializationId: string; generationRef: string; status: string; enabled?: boolean;
+  onPhase?: (phase: "understanding" | "drafting" | null) => void;
+  preparation?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
   const [page, setPage] = useState<Page | null>(null);
   const [error, setError] = useState(false);
   const [retry, setRetry] = useState(0);
   const [visible, setVisible] = useState(document.visibilityState !== "hidden");
-  const log = useRef<HTMLPreElement>(null);
+  const log = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
 
   useEffect(() => {
     const update = () => setVisible(document.visibilityState !== "hidden");
@@ -27,7 +31,7 @@ export function ProposalOutput({ initializationId, generationRef, status }: {
   }, []);
 
   useEffect(() => {
-    if (!open || !visible) return;
+    if (!enabled || !visible) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     let offset = 0;
@@ -36,8 +40,8 @@ export function ProposalOutput({ initializationId, generationRef, status }: {
     setError(false);
     async function poll() {
       try {
-        const params = new URLSearchParams({ generation_ref: generationRef, after: String(offset) });
-        const response = await fetch(`/api/v1/quest-initializations/${encodeURIComponent(initializationId)}/proposal-output?${params}`, {
+        const params = new URLSearchParams({ [preparation ? "request_ref" : "generation_ref"]: generationRef, after: String(offset) });
+        const response = await fetch(`/api/v1/quest-initializations/${encodeURIComponent(initializationId)}/${preparation ? "preparation-output" : "proposal-output"}?${params}`, {
           credentials: "same-origin", cache: "no-store", signal: controller.signal,
         });
         if (!response.ok) throw new Error(String(response.status));
@@ -60,18 +64,24 @@ export function ProposalOutput({ initializationId, generationRef, status }: {
     }
     void poll();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [initializationId, generationRef, status, open, visible, retry]);
+  }, [initializationId, generationRef, status, enabled, visible, retry, preparation]);
 
-  useEffect(() => { if (log.current) log.current.scrollTop = log.current.scrollHeight; }, [page]);
+  useEffect(() => {
+    if (log.current && pinned.current) log.current.scrollTop = log.current.scrollHeight;
+  }, [page?.text]);
+  useEffect(() => { onPhase?.(page?.phase ?? null); }, [page?.phase, onPhase]);
   const currentStatus = page?.status ?? status;
   const label = ({ queued: "排队中", running: "运行中", succeeded: "已完成", failed: "已失败", cancelled: "已取消" } as Record<string, string>)[currentStatus] ?? currentStatus;
-  return <details onToggle={event => setOpen(event.currentTarget.open)} data-testid="proposal-output">
-    <summary>查看提案生成日志 · {label}</summary>
-    <p>私有输出 · 当前提案的原始 JSONL；运行时自动刷新，完成后保留。</p>
+  const activities = proposalActivities(page?.text ?? "");
+  const active = ["queued", "running"].includes(currentStatus);
+  return <section className="first-question-activity" data-testid="proposal-output" aria-label="第一问运行活动">
+    <header><b>最近活动</b><span>{active && page?.phase === "understanding" ? "正在理解已有资料" : active && page?.phase === "drafting" ? "正在准备问题草稿" : label} · {active ? "自动刷新" : "保留运行记录"}</span></header>
     {error ? <p role="alert">日志连接暂时中断，正在重试。<button type="button" onClick={() => setRetry(value => value + 1)}>重试</button></p> : null}
-    {!page && !error ? <p>正在读取日志…</p> : null}
-    {page?.text ? <pre ref={log} role="log" aria-label="提案生成原始 stdout" style={{ maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{page.text}</pre> : null}
-    {page && !page.text && !error ? <p>{["queued", "running"].includes(page.status) ? "等待 Provider 输出，自动刷新中。" : "该次生成已结束，没有可读取的 stdout。"}</p> : null}
-    {page ? <small>{label} · {page.next_offset} / {page.source_bytes} bytes{page.has_more ? " · 正在读取后续输出" : " · 已同步到最新输出"}{page.next_offset > 1024 * 1024 ? " · 仅显示最近 1 MiB 文本" : ""}</small> : null}
-  </details>;
+    <div ref={log} className="first-question-activity-log" role="log" aria-label="第一问最近活动" aria-live="polite" aria-relevant="additions" aria-atomic="false"
+      onScroll={event => { const node = event.currentTarget; pinned.current = node.scrollTop + node.clientHeight >= node.scrollHeight - 4; }}>
+      {activities.map(activity => <div key={activity.key} className={`first-question-activity-row ${activity.status}`}><i aria-hidden="true" /><span>{activity.label}</span></div>)}
+      {active ? <p>{page ? "等待下一条运行活动，自动刷新中。" : "正在连接本次运行…"}</p> : !activities.length ? <p>本次生成已结束，尚无可展示的运行活动。</p> : null}
+    </div>
+    {page?.has_more ? <p>正在读取后续运行活动…</p> : null}
+  </section>;
 }

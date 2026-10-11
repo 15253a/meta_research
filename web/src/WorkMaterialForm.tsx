@@ -4,7 +4,7 @@ import {
   deliverMaterialCommand, discardMaterialCommand, fetchMaterialReceiver, pendingMaterialCommand,
   stageMaterialCommand, workMaterialErrorMessage, WorkMaterialError, fetchWorkMaterialReference, fetchResearchInputMaterialReceipts,
   type MaterialReceiver, type PendingMaterialCommand, type ServerMaterialSelection,
-  type WorkMaterialReceipt, type WorkMaterialSubmission, type MaterialTreatment,
+  type WorkMaterialReceipt, type WorkMaterialReference, type WorkMaterialSubmission, type MaterialTreatment,
 } from "./workMaterialApi";
 
 const materialSelections = new Map<string, ServerMaterialSelection>();
@@ -131,18 +131,30 @@ function MaterialTreatmentFeedback({ treatments }: { treatments: readonly Materi
   </section>;
 }
 
-export function WorkMaterialReferences({ receipts }: { receipts: readonly WorkMaterialReceipt[] }) {
-  return <div className="work-material-references">{receipts.flatMap(receipt => receipt.references).map(reference => <article className="server-material-picker__candidate" key={reference.reference_ref}>
-    <b>{reference.read_state === "read" ? "已保存，存在成功读取的字节范围" : "已保存，尚未读取"}</b>
-    <code>{reference.source.absolute_path}</code>
+function MaterialSourceDetails({ reference }: { reference: WorkMaterialReference }) {
+  return <>
     <span>{reference.source.server.hostname} · {reference.source.server.platform} · 运行账户 {reference.source.server.permission_context}</span>
-    {reference.source.description && <p>{reference.source.description}</p>}
     <ReceivingIdentity receiver={reference.receiver} />
     <small>{reference.unexpanded ? "目录未整体展开。" : ""}读取记录不代表理解或研究采用。</small>
-    {reference.availability !== "available" && <p role="status">{workMaterialErrorMessage(new WorkMaterialError(reference.availability))}</p>}
     {reference.read_ranges.length > 0 && <details><summary>成功读取范围</summary><ul>{reference.read_ranges.map((range, index) => <li key={index}>{range.path || reference.source.absolute_path} · 从字节 {range.offset} 起读取 {range.bytes} 字节{range.actor === "browser" ? " · 浏览器读取" : range.actor ? " · 研究工具读取" : " · 未注明读取者"}</li>)}</ul></details>}
     {reference.failures.length > 0 && <details><summary>来源访问失败记录</summary><ul>{reference.failures.map((failure, index) => <li key={index}>{failure.path} · {workMaterialErrorMessage(new WorkMaterialError(failure.error))}</li>)}</ul></details>}
-    <MaterialTreatmentFeedback treatments={reference.treatments ?? []} />
+  </>;
+}
+
+export function WorkMaterialReferences({ receipts, compact = false }: { receipts: readonly WorkMaterialReceipt[]; compact?: boolean }) {
+  const allReferences = receipts.flatMap(receipt => receipt.references);
+  const references = compact ? [...new Map(allReferences.map(reference => [reference.reference_ref, reference])).values()] : allReferences;
+  return <div className={`work-material-references${compact ? " work-material-references--compact" : ""}`}>{references.map(reference => <article className={`server-material-picker__candidate${compact ? " work-material-reference" : ""}`} key={reference.reference_ref}>
+    {compact ? <div className="work-material-reference__heading">
+      <span className="work-material-reference__icon" aria-hidden="true">{reference.source.kind === "directory" ? "▤" : "▧"}</span>
+      <div><b>{reference.source.absolute_path.split(/[\\/]/).filter(Boolean).at(-1) || reference.source.absolute_path}</b><small>{reference.source.kind === "directory" ? "材料目录" : "研究文件"}</small></div>
+      <span className="work-material-reference__state">{reference.read_state === "read" ? "已保存，已读取部分内容" : "已保存，尚未读取"}</span>
+    </div> : <b>{reference.read_state === "read" ? "已保存，存在成功读取的字节范围" : "已保存，尚未读取"}</b>}
+    <code>{reference.source.absolute_path}</code>
+    {reference.source.description && <p>{reference.source.description}</p>}
+    {reference.availability !== "available" && <p role="status">{workMaterialErrorMessage(new WorkMaterialError(reference.availability))}</p>}
+    {compact ? <details className="work-material-reference__details"><summary>来源与读取记录</summary><MaterialSourceDetails reference={reference} /></details> : <MaterialSourceDetails reference={reference} />}
+    {!compact || reference.treatments?.length ? <MaterialTreatmentFeedback treatments={reference.treatments ?? []} /> : <p className="work-material-reference__waiting">等待读取和整理；处理反馈会显示在这里。</p>}
   </article>)}</div>;
 }
 
@@ -182,7 +194,7 @@ export function HumanRequestMaterialReferences({ responses }: { responses: reado
   return <><WorkMaterialReferences receipts={receipts} />{error && <p role="alert">{error}</p>}</>;
 }
 
-export function WorkMaterialFields({ draft, disabled = false, onRetried }: { draft: WorkMaterialDraft; disabled?: boolean; onRetried?: (result: Record<string, unknown>) => void }) {
+export function WorkMaterialFields({ draft, disabled = false, onRetried, showReceipts = true }: { draft: WorkMaterialDraft; disabled?: boolean; onRetried?: (result: Record<string, unknown>) => void; showReceipts?: boolean }) {
   const command = draft.pending?.body.work_materials as WorkMaterialSubmission | undefined;
   const explicit = draft.pending?.body.receiver as MaterialReceiver | undefined;
   return <div className="work-material-fields">
@@ -197,6 +209,6 @@ export function WorkMaterialFields({ draft, disabled = false, onRetried }: { dra
     </div>}
     {draft.error && <p role="alert" className="server-material-picker__error">{draft.error}</p>}
     {draft.errorCode === "material_pending_invalid" && <button type="button" disabled={draft.busy} onClick={() => void draft.discard()}>明确放弃损坏的本地封存记录</button>}
-    <WorkMaterialReferences receipts={draft.receipts} />
+    {showReceipts ? <WorkMaterialReferences receipts={draft.receipts} /> : null}
   </div>;
 }

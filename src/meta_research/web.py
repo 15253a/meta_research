@@ -2323,6 +2323,32 @@ def create_app(
             return _error(409 if "cursor" in code else 503, code)
         return JSONResponse(page, headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/v1/quest-initializations/{initialization_id}/preparation-output")
+    def query_preparation_output(
+        initialization_id: str,
+        request_ref: str,
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=65536, ge=4, le=262144),
+    ) -> JSONResponse:
+        from meta_research.proposal_output import read_preparation_output
+        from meta_research.provider_supervisor import ProviderSupervisorError
+
+        creation = runtime.owners.human_collaboration.query_quest_creation(initialization_id)
+        deepfetch = creation.get("deepfetch")
+        draft = creation["quest_draft"]
+        if (creation.get("route") != "deepfetch" or not deepfetch
+                or deepfetch["request_ref"] != request_ref
+                or deepfetch["freshness"] != "current"
+                or deepfetch["basis_revision"] != draft["revision"]
+                or deepfetch["basis_hash"] != draft["hash"]):
+            return _error(409, "preparation_output_request_changed")
+        try:
+            page = read_preparation_output(runtime.data_root.root, deepfetch, after, limit)
+        except (OSError, ValueError, ProviderSupervisorError) as error:
+            code = str(error) if isinstance(error, ValueError) else "proposal_output_unavailable"
+            return _error(409 if "cursor" in code else 503, code)
+        return JSONResponse(page, headers={"Cache-Control": "no-store"})
+
     @app.get("/api/v1/quest-initializations/{initialization_id}/intent-session")
     def query_intent_session(initialization_id: str) -> dict[str, object]:
         view = runtime.owners.human_collaboration.query_quest_creation(

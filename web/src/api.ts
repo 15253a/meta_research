@@ -615,6 +615,9 @@ export type QuestCreationView = {
       | "failed";
     adapter_kind: string;
     attempt_count: number;
+    created_at?: number | null;
+    started_at?: number | null;
+    completed_at?: number | null;
     proposal_ref?: string;
     proposal_hash?: string;
     failure: null | { code: string };

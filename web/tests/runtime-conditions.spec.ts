@@ -218,12 +218,12 @@ test("common choices and advanced JSON stay in sync without losing custom condit
   const state = await workspace(page, structuredText());
   await page.getByRole("button", { name: "修改配置", exact: true }).click();
   const budget = dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true });
-  const literature = dialog(page).getByRole("combobox", { name: "文献搜索范围", exact: true });
+  const literature = dialog(page).getByRole("combobox", { name: "文献全文获取范围", exact: true });
   await expect(budget).toHaveValue("720");
   await expect(literature).toHaveValue("oa_only");
   await expect(editor(page)).not.toBeVisible();
   await budget.fill("2.5");
-  await literature.selectOption({ label: "公开全文与可选图书馆" });
+  await literature.selectOption({ label: "公开全文与可选图书馆下载" });
   await dialog(page).getByRole("textbox", { name: "文献排除范围", exact: true }).fill("不纳入动物实验");
   await dialog(page).locator("summary").filter({ hasText: "高级" }).click();
   const first = await editor(page).inputValue();
@@ -301,7 +301,7 @@ test("invalid JSON stays editable and unsupported values are not silently normal
   const budget = dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true });
   await expect(budget).toHaveValue("");
   await expect(dialog(page).getByRole("button", { name: "保存运行条件" })).toBeDisabled();
-  await expect(dialog(page).getByRole("combobox", { name: "文献搜索范围", exact: true })).toHaveValue("custom-scope");
+  await expect(dialog(page).getByRole("combobox", { name: "文献全文获取范围", exact: true })).toHaveValue("custom-scope");
   await dialog(page).locator("summary").filter({ hasText: "高级" }).click();
   const broken = prefix + '{"time_budget": "7d",';
   await editor(page).fill(broken);

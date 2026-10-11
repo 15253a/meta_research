@@ -27,6 +27,37 @@
 .quest-dialog.workspace-modal .quest-field > span, .quest-dialog.workspace-modal .quest-session-compose > label { font-size: 13px; font-weight: 400; }
 .quest-dialog.workspace-modal .quest-field input, .quest-dialog.workspace-modal .quest-field textarea, .quest-dialog.workspace-modal .quest-field select, .quest-dialog.workspace-modal .quest-session-compose textarea { font: inherit; border-radius: 9px; }
 .quest-dialog.workspace-modal .quest-config-card, .quest-dialog.workspace-modal .quest-literature-card, .quest-dialog.workspace-modal .quest-material-card { padding: 0; border: 0; border-radius: 0; }
+.quest-dialog.workspace-modal .quest-material-card { gap: 14px; background: transparent; }
+.quest-dialog.workspace-modal [data-journey-section="materials"] .quest-section-heading em { margin-left: 8px; padding: 3px 7px; vertical-align: middle; color: var(--quest-muted); background: #f0f2f8; border-radius: 6px; font-size: 11px; font-style: normal; font-weight: 500; }
+.quest-dialog.workspace-modal .quest-material-intro { margin: 0; color: var(--quest-muted); font-size: 13px; }
+.quest-dialog.workspace-modal .quest-material-card button { min-height: 40px; padding: 8px 14px; border: 1px solid #d8ddee; border-radius: 10px; color: #514da8; background: #f5f4ff; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.quest-dialog.workspace-modal .quest-material-card button:hover:not(:disabled) { background: #eceaff; border-color: #b8b4ef; }
+.quest-dialog.workspace-modal .quest-material-card button:disabled { opacity: .55; cursor: default; }
+.quest-dialog.workspace-modal .quest-material-card button:focus-visible { outline: 2px solid var(--quest-violet); outline-offset: 3px; }
+.quest-dialog.workspace-modal .quest-material-card .quest-material-save { justify-self: start; color: #fff; background: var(--quest-ink); border-color: var(--quest-ink); }
+.quest-dialog.workspace-modal .quest-material-card .quest-material-save:hover:not(:disabled) { background: #303b53; border-color: #303b53; }
+.quest-dialog.workspace-modal .quest-material-card .server-material-picker__candidate { padding: 16px; border: 1px solid #e0e3ef; border-radius: 14px; background: #fafaff; font-size: 13px; }
+.quest-dialog.workspace-modal .quest-material-card .work-material-references { display: grid; gap: 10px; }
+.quest-dialog.workspace-modal .quest-material-card .work-material-reference { margin: 0; gap: 9px; background: #fff; }
+.quest-dialog.workspace-modal .work-material-reference__heading { display: flex; align-items: center; gap: 10px; }
+.quest-dialog.workspace-modal .work-material-reference__icon { display: grid; place-items: center; flex: 0 0 36px; width: 36px; height: 40px; color: var(--quest-violet); background: #eeecff; border-radius: 9px; font-size: 21px; }
+.quest-dialog.workspace-modal .work-material-reference__heading > div { display: grid; gap: 2px; min-width: 0; }
+.quest-dialog.workspace-modal .work-material-reference__heading b { overflow-wrap: anywhere; font-size: 14px; }
+.quest-dialog.workspace-modal .work-material-reference__heading small { color: var(--quest-muted); font-size: 12px; }
+.quest-dialog.workspace-modal .work-material-reference__state { margin-left: auto; padding: 3px 8px; color: #5f6580; background: #f0f2f8; border-radius: 7px; font-size: 11px; white-space: nowrap; }
+.quest-dialog.workspace-modal .work-material-reference > code { overflow-wrap: anywhere; white-space: pre-wrap; color: #717b90; font-size: 11px; }
+.quest-dialog.workspace-modal .work-material-reference__details { padding-top: 8px; border-top: 1px solid #edf0f6; font-size: 12px; color: var(--quest-muted); }
+.quest-dialog.workspace-modal .work-material-reference__details > summary { cursor: pointer; }
+.quest-dialog.workspace-modal .work-material-reference__details[open] > summary { margin-bottom: 8px; }
+.quest-dialog.workspace-modal .work-material-reference__waiting { color: var(--quest-muted); font-size: 12px; }
+.quest-dialog.workspace-modal .quest-route-choice { padding: 16px; font: inherit; font-size: 13px; }
+.quest-dialog.workspace-modal .quest-route-choice small { font-size: 12px; }
+.quest-dialog.workspace-modal .quest-route-note { color: #69748a; background: #f7f8fc; border-left: 2px solid #c6c2f3; font-size: 12px; }
+@media (max-width: 760px) {
+  .quest-dialog.workspace-modal .work-material-reference__heading { flex-wrap: wrap; }
+  .quest-dialog.workspace-modal .work-material-reference__state { margin-left: 46px; }
+  .quest-dialog.workspace-modal .quest-material-card .server-material-picker__candidate { padding: 12px; }
+}
 .quest-stage-track { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
 .quest-stage-track > span { display: flex; align-items: center; gap: 8px; padding: 0 0 12px; border-bottom: 2px solid #dfe4ee; color: #7d8493; font-size: 12px; }
 .quest-stage-track small { display: grid; place-items: center; width: 20px; height: 20px; border: 1px solid #e4e6ed; border-radius: 50%; font-size: 11px; }

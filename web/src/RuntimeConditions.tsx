@@ -13,7 +13,7 @@ import {
 } from "./runtime-conditions-form";
 import "./runtime-conditions.css";
 
-const LITERATURE_MODES = [["oa_then_institution", "公开全文与可选图书馆"], ["oa_only", "只搜索开放获取资源"], ["provided_only", "只使用我提供的材料"]];
+const LITERATURE_MODES = [["oa_then_institution", "公开全文与可选图书馆下载"], ["oa_only", "仅获取开放全文"], ["provided_only", "只使用我提供的材料"]];
 const MAX_CONDITIONS_LENGTH = 24000;
 // Unsaved edits belong to this page and Quest, never to another Quest or a server receipt.
 const conditionDrafts = new Map<string, { basis: QuestRuntimeConditions; text: string; researchStyle: ResearchStyle; library: LiteratureConfiguration | undefined; advanced: boolean; scrollTop: number }>();
@@ -220,7 +220,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
         <section className="runtime-fulltext" aria-label="图书馆与全文获取"><h4>图书馆与全文获取</h4>
         <p>图书馆用于获取已发现文献的全文，不参与搜索源勾选。没有图书馆时沿允许范围内的公开网页、PDF 与 OA 路线获取；仅摘要和获取失败会按实际结果报告。</p>
         <div className="runtime-conditions-fields">
-        <label><span>文献搜索范围</span><select aria-label="文献搜索范围" value={library?.mode ?? (typeof literature.mode === "string" ? literature.mode : "")}
+        <label><span>文献全文获取范围</span><select aria-label="文献全文获取范围" value={library?.mode ?? (typeof literature.mode === "string" ? literature.mode : "")}
           disabled={loading || !basis || saving || (!library && (controlsDisabled || !literatureEditable || !stringField(literature.mode)))}
           onChange={event => {
             const mode = event.currentTarget.value as LiteratureConfiguration["mode"];

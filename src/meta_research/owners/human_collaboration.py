@@ -8645,7 +8645,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 text(
                     "SELECT generation_ref, basis_revision, basis_hash, status, "
                     "adapter_kind, attempt_count, proposal_ref, proposal_hash, "
-                    "failure_code, literature_snapshot_ref FROM "
+                    "failure_code, literature_snapshot_ref, created_at, started_at, completed_at FROM "
                     "hc_proposal_generation_attempts WHERE "
                     "initialization_id = :initialization_id ORDER BY created_at DESC "
                     "LIMIT 1"
@@ -9140,6 +9140,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     "status": generation.status,
                     "adapter_kind": generation.adapter_kind,
                     "attempt_count": int(generation.attempt_count),
+                    "created_at": generation.created_at,
+                    "started_at": generation.started_at,
+                    "completed_at": generation.completed_at,
                     "proposal_ref": generation.proposal_ref,
                     "proposal_hash": generation.proposal_hash,
                     "failure": (

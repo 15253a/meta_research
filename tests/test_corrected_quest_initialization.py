@@ -1147,15 +1147,21 @@ def test_proposal_generation_has_a_single_atomic_worker_claim(tmp_path: Path) ->
             "atomic-proposal-change",
             probed["quest_draft"]["revision"],
         )
-        hc.generate_question_proposal(
+        queued = hc.generate_question_proposal(
             saved["initialization_id"],
             saved["quest_draft"]["hash"],
             "atomic-proposal-generate",
             saved["quest_draft"]["revision"],
         )
+        assert isinstance(queued["proposal_generation"]["created_at"], float)
+        assert queued["proposal_generation"]["started_at"] is None
+        assert queued["proposal_generation"]["completed_at"] is None
         workers = [threading.Thread(target=hc.process_drafting_once) for _ in range(2)]
         workers[0].start()
         assert adapter.started.wait(timeout=2)
+        running = hc.query_quest_creation(saved["initialization_id"])["proposal_generation"]
+        assert running["created_at"] <= running["started_at"]
+        assert running["completed_at"] is None
         workers[1].start()
         workers[1].join(timeout=2)
         assert not workers[1].is_alive()
@@ -1166,6 +1172,8 @@ def test_proposal_generation_has_a_single_atomic_worker_claim(tmp_path: Path) ->
         settled = hc.query_quest_creation(saved["initialization_id"])
         assert adapter.draft_calls == 1
         assert settled["proposal_generation"]["status"] == "succeeded"
+        assert settled["proposal_generation"]["started_at"] == running["started_at"]
+        assert running["started_at"] <= settled["proposal_generation"]["completed_at"]
     finally:
         adapter.release.set()
         for worker in workers:
