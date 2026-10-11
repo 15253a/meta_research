@@ -1774,7 +1774,7 @@ def test_codex_deepfetch_treats_selected_oa_as_the_primary_route(
         tmp_path / "provider", process_runner=runner
     )
 
-    _execute(
+    result = _execute(
         adapter,
         replace(
             _request(),
@@ -1789,9 +1789,11 @@ def test_codex_deepfetch_treats_selected_oa_as_the_primary_route(
     prompt = runner.calls[1][1]
     assert "oa_only 是用户明确选择的主路线" in prompt
     assert "跳过 institution/browser preflight" in prompt
-    assert "不得描述为被迫、只能或降级到 OA" in prompt
+    assert "不得虚构机构访问失败或由此被迫降级到 OA" in prompt
     assert "Quest-scoped Acquisition" in prompt
     assert "只含 effect_id 和 1 至 10 个 targets 的 action=acquire" in prompt
+    assert result.completion == "honest_empty"
+    assert result.limitations == ("检索未形成可纳入的精确论文。",)
 
 
 def test_deepfetch_activity_tail_projects_live_events_without_provider_content(
@@ -1922,33 +1924,35 @@ def test_deepfetch_activity_tail_projects_live_events_without_provider_content(
         "检索路线降级到 OA-only。",
     ],
 )
-def test_codex_deepfetch_rejects_forced_fallback_language_for_selected_oa(
+def test_codex_deepfetch_preserves_prose_without_changing_selected_oa_policy(
     tmp_path: Path,
     limitation: str,
 ) -> None:
     misleading = copy.deepcopy(PROTOTYPE_EMPTY_FINAL)
     misleading["limitations"] = [limitation]
+    runner = RecordingRunner(misleading)
     adapter = CodexDeepFetchAdapter(
         tmp_path / "provider",
         model_ref="gpt-test",
-        process_runner=RecordingRunner(misleading),
+        process_runner=runner,
     )
 
-    with pytest.raises(
-        DeepFetchUnavailable,
-        match="deepfetch_oa_only_limitation_invalid",
-    ):
-        _execute(
-            adapter,
-            replace(
-                _request(),
-                scope={
-                    "goal": "核查证据边界",
-                    "literature_mode": "oa_only",
-                    "library_entry_url": "",
-                },
-            )
-        )
+    result = _execute(
+        adapter,
+        replace(
+            _request(),
+            scope={
+                "goal": "核查证据边界",
+                "literature_mode": "oa_only",
+                "library_entry_url": "",
+            },
+        ),
+    )
+
+    assert result.completion == "honest_empty"
+    assert result.limitations == ("检索未形成可纳入的精确论文。", limitation)
+    assert "oa_only 是用户明确选择的主路线" in runner.calls[1][1]
+    assert "不得探测或评价机构访问可用性" in runner.calls[1][1]
 
 
 @pytest.mark.parametrize(
@@ -2002,7 +2006,7 @@ def test_codex_deepfetch_accepts_honest_oa_only_scope_limitations(
         "检索路线降级到 OA-only。",
     ],
 )
-def test_deepfetch_rejects_forced_fallback_language_in_selected_oa_summary(
+def test_deepfetch_summary_does_not_override_request_binding(
     summary: str,
 ) -> None:
     request = replace(
@@ -2024,11 +2028,11 @@ def test_deepfetch_rejects_forced_fallback_language_in_selected_oa_summary(
         web_evidence=None,
     )
 
-    with pytest.raises(
-        DeepFetchUnavailable,
-        match="^deepfetch_oa_only_limitation_invalid$",
-    ):
-        validate_deepfetch_result(request, result)
+    payload, _result_hash = validate_deepfetch_result(request, result)
+
+    assert payload["summary"] == summary
+    assert payload["request_ref"] == "deepfetch_request_1"
+    assert payload["scope_hash"] == "b" * 64
 
 
 @pytest.mark.parametrize(
@@ -2037,6 +2041,11 @@ def test_deepfetch_rejects_forced_fallback_language_in_selected_oa_summary(
         "OA-only 是用户明确选择的主路线，本轮仅核查公开可访问的副本。",
         "OA-only 并非被迫降级，而是用户明确选择。",
         "The OA-only route was not forced; it was explicitly selected.",
+        (
+            "OA-only 是本次用户选择的主路线；本轮没有探测或评价机构访问。\n\n"
+            "本轮 4 个 Reader 均成功；没有 Reader 失败、错文或无效文件。\n\n"
+            "因此，后续实验必须同时包含强经典基线。"
+        ),
     ],
 )
 def test_deepfetch_accepts_honest_selected_oa_summary(summary: str) -> None:
