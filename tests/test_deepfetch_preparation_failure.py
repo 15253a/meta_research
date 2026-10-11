@@ -4,7 +4,9 @@ import pytest
 from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
+from meta_research.deepfetch import DeepFetchUnavailable
 from meta_research.idea_skill import IdeaSkillUnavailable
+from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import DraftingUnavailable
 from test_creation_companion_protected import ProtectedCreationFixture
@@ -149,18 +151,129 @@ def test_legacy_stuck_request_records_the_current_rejection_without_inventing_hi
     assert retry(client, headers, initialization, failed).status_code == 202
 
 
-def test_active_preparation_error_without_durable_terminal_evidence_blocks_retry(preparation, monkeypatch):
+@pytest.mark.parametrize("failure_code", [
+    "protected_creation_active", "protected_creation_unknown_outcome",
+    "codex_operation_reconciliation_pending", "codex_job_outcome_unknown",
+    "codex_job_spool_invalid", "codex_job_spool_conflict",
+])
+def test_active_preparation_error_without_durable_terminal_evidence_blocks_retry(preparation, monkeypatch, failure_code):
     runtime, client, headers, initialization, queued, drafter, provider = preparation
     def active(_request):
-        raise DraftingUnavailable("protected_creation_active")
+        raise DraftingUnavailable(failure_code)
     monkeypatch.setattr(drafter, "understand_initialization", active)
     assert runtime.deepfetch.process_once() is True
     failed = client.get(f"/api/v1/quest-initializations/{initialization}").json()
     assert failed["deepfetch"]["status"] == "failed"
-    assert failed["deepfetch"]["failure"] == {"code": "protected_creation_active"}
+    assert failed["deepfetch"]["failure"] == {"code": failure_code}
+    assert failed["deepfetch"]["preparation"]["retry_permitted"] is False
     response = retry(client, headers, initialization, failed)
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "protected_creation_unknown_outcome"
     assert runtime.deepfetch.process_once() is False
     assert drafter.calls == []
     assert provider.requests == []
+
+
+def test_sealed_current_basis_retries_runtime_admission_without_repeating_understanding(preparation, monkeypatch):
+    runtime, client, headers, initialization, queued, drafter, provider = preparation
+    monkeypatch.setattr(drafter, "_invoke", super(RejectFirstUnderstanding, drafter)._invoke)
+    execute = runtime.owners.agent_runtime.execute_deepfetch
+    def unavailable(_request, _provider):
+        raise OwnerConflict("runtime_admission_temporarily_unavailable")
+    monkeypatch.setattr(runtime.owners.agent_runtime, "execute_deepfetch", unavailable)
+    assert runtime.deepfetch.process_once() is True
+    failed = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+    assert failed["deepfetch"]["status"] == "failed"
+    assert failed["deepfetch"]["failure"] == {"code": "runtime_admission_temporarily_unavailable"}
+    assert failed["deepfetch"]["run"] is None
+    assert failed["deepfetch"]["preparation"]["operation_state"] == "sealed"
+    assert failed["deepfetch"]["preparation"]["retry_permitted"] is True
+    assert failed["creation_basis"]["freshness"] == "current"
+    with runtime._database.read() as connection:
+        operation_started = connection.execute(text(
+            "SELECT created_at FROM hc_creation_material_operations")).scalar_one()
+    response = retry(client, headers, initialization, failed)
+    assert response.status_code == 202, response.text
+    assert response.json()["deepfetch"]["preparation"]["ref"] == queued["deepfetch"]["request_ref"]
+    assert response.json()["deepfetch"]["preparation"]["started_at"] == operation_started
+    monkeypatch.setattr(runtime.owners.agent_runtime, "execute_deepfetch", execute)
+    assert runtime.deepfetch.process_once() is True
+    succeeded = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+    assert succeeded["deepfetch"]["status"] == "succeeded"
+    assert succeeded["deepfetch"]["preparation"]["started_at"] == operation_started
+    assert len(drafter.calls) == 1
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize("error_type", [OwnerConflict, DeepFetchUnavailable])
+def test_late_preparation_worker_error_cannot_fail_explicit_retry(preparation, monkeypatch, error_type):
+    runtime, client, headers, initialization, queued, drafter, provider = preparation
+    human = runtime.owners.human_collaboration
+    prepare = human.prepare_deepfetch_creation_basis
+    def finish_predecessor_after_retry(request):
+        try:
+            return prepare(request)
+        except DraftingUnavailable as error:
+            human.record_deepfetch_failed(request.request_ref, error.code,
+                                         expected_scope_hash=request.scope_hash)
+            failed = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+            response = retry(client, headers, initialization, failed)
+            assert response.status_code == 202, response.text
+            assert response.json()["deepfetch"]["preparation"]["ref"] != request.request_ref
+            raise error_type("late_preparation_failure") from error
+    monkeypatch.setattr(human, "prepare_deepfetch_creation_basis", finish_predecessor_after_retry)
+    assert runtime.deepfetch.process_once() is True
+    successor = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+    assert successor["deepfetch"]["status"] == "queued"
+    assert successor["deepfetch"]["failure"] is None
+    assert successor["deepfetch"]["run"] is None
+    assert len(drafter.calls) == 1
+    assert provider.requests == []
+    monkeypatch.setattr(human, "prepare_deepfetch_creation_basis", prepare)
+    assert runtime.deepfetch.process_once() is True
+    succeeded = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+    assert succeeded["deepfetch"]["status"] == "succeeded"
+    assert succeeded["deepfetch"]["run"]["attempt_generation"] == 1
+    assert len(provider.requests) == 1
+
+
+def test_sealed_preparation_retry_is_available_with_a_retained_stale_proposal(preparation, monkeypatch):
+    runtime, client, headers, initialization, queued, drafter, provider = preparation
+    human = runtime.owners.human_collaboration
+    monkeypatch.setattr(drafter, "_invoke", super(RejectFirstUnderstanding, drafter)._invoke)
+    assert runtime.deepfetch.process_once() is True
+    assert human.process_drafting_once() is True
+    original = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+    assert original["proposal"]["status"] == "current"
+    changed_draft = {**original["quest_draft"]["value"], "goal": "Compare calibration transfer under a revised condition."}
+    changed = client.put(f"/api/v1/quest-initializations/{initialization}/draft",
+        headers=_write_headers(headers, "revised-goal"), json={
+            "expected_draft_revision": original["quest_draft"]["revision"],
+            "expected_draft_hash": original["quest_draft"]["hash"], "draft": changed_draft})
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["proposal"]["status"] == "stale"
+    basis = {"expected_draft_revision": changed.json()["quest_draft"]["revision"],
+             "expected_draft_hash": changed.json()["quest_draft"]["hash"]}
+    acquisition = client.post(f"/api/v1/quest-initializations/{initialization}/acquisition-session",
+        headers=_write_headers(headers, "revised-acquisition"), json=basis)
+    assert acquisition.status_code == 200, acquisition.text
+    response = retry(client, headers, initialization, changed.json(), "revised-start")
+    assert response.status_code == 202, response.text
+    execute = runtime.owners.agent_runtime.execute_deepfetch
+    def unavailable(_request, _provider):
+        raise OwnerConflict("runtime_admission_temporarily_unavailable")
+    monkeypatch.setattr(runtime.owners.agent_runtime, "execute_deepfetch", unavailable)
+    assert runtime.deepfetch.process_once() is True
+    failed = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+    assert failed["proposal"]["ref"] == original["proposal"]["ref"]
+    assert failed["proposal"]["status"] == "stale"
+    assert failed["deepfetch"]["run"] is None
+    assert failed["deepfetch"]["preparation"]["operation_state"] == "sealed"
+    assert failed["deepfetch"]["preparation"]["retry_permitted"] is True
+    response = retry(client, headers, initialization, failed, "revised-retry")
+    assert response.status_code == 202, response.text
+    assert response.json()["deepfetch"]["preparation"]["ref"] == failed["deepfetch"]["preparation"]["ref"]
+    monkeypatch.setattr(runtime.owners.agent_runtime, "execute_deepfetch", execute)
+    assert runtime.deepfetch.process_once() is True
+    succeeded = client.get(f"/api/v1/quest-initializations/{initialization}").json()
+    assert succeeded["deepfetch"]["status"] == "succeeded"

@@ -15,12 +15,22 @@ export function currentProposalGeneration(creation: QuestCreationView) {
     && value.basis_hash === creation.quest_draft.hash ? value : null;
 }
 
+export function preparationRetryBlocked(deepfetch: QuestCreationView["deepfetch"]) {
+  return deepfetch?.status === "failed" && !deepfetch.run && deepfetch.preparation?.retry_permitted === false;
+}
+
+export function preparationReconciliationCopy(deepfetch: QuestCreationView["deepfetch"]) {
+  return deepfetch?.preparation?.operation_state === "sealed"
+    ? "资料理解已完成，研究依据仍需核对后再继续。"
+    : "运行是否结束尚未确认，请等待核对后再重试。";
+}
+
 export function FirstQuestionProgress({ creation, pending, enabled, children }: {
   creation: QuestCreationView; pending: boolean; enabled: boolean; children: ReactNode;
 }) {
   const generation = currentProposalGeneration(creation);
   const deepfetch = currentDeepFetch(creation);
-  const outputRef = generation?.ref ?? deepfetch?.request_ref;
+  const outputRef = generation?.ref ?? deepfetch?.preparation?.ref ?? deepfetch?.request_ref;
   const [observation, setObservation] = useState<{ ref?: string; phase: "understanding" | "drafting" | null }>({ phase: null });
   const phase = observation.ref === outputRef ? observation.phase : null;
   const observePhase = useCallback((next: "understanding" | "drafting" | null) => {
@@ -30,6 +40,7 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
   const currentBasis = basis?.freshness === "current";
   const ready = Boolean(creation.proposal?.status === "current" && generation?.status === "succeeded");
   const failed = generation?.status === "failed" || generation?.status === "capability_unavailable" || deepfetch?.status === "failed";
+  const preparationBlocked = preparationRetryBlocked(deepfetch);
   const cancelled = deepfetch?.status === "cancelled" || creation.status === "cancelled";
   const stale = creation.status === "proposal_stale" || creation.proposal?.status === "stale" || basis?.freshness === "stale" || deepfetch?.freshness === "stale";
   const active = !failed && !cancelled && !ready && !stale && (pending || creation.status === "proposal_generating" || ["queued", "running"].includes(generation?.status ?? "") || ["queued", "running", "accepting"].includes(deepfetch?.status ?? ""));
@@ -44,9 +55,9 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
   ];
   const completed = steps.filter(step => step.done).length;
   const firstGap = steps.findIndex(step => !step.done);
-  const starts = [generation?.started_at, deepfetch?.run?.attempt_started_at]
+  const starts = [generation?.started_at, deepfetch?.preparation?.started_at, deepfetch?.run?.attempt_started_at]
     .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
-  const completions = [generation?.completed_at, deepfetch?.run?.attempt_completed_at]
+  const completions = [generation?.completed_at, deepfetch?.preparation?.completed_at, deepfetch?.run?.attempt_completed_at]
     .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   const started = starts.length ? Math.min(...starts) : null;
   const ended = !active && completions.length ? Math.max(...completions) : null;
@@ -64,17 +75,18 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
   return <section className={`first-question-progress ${active ? "is-active" : ""} ${failed ? "is-failed" : ""}`}
     data-testid="first-question-progress" aria-label="第一问准备进度">
     <header><div><small>第一问 · 研究现场</small><h3 role="status">{title}</h3></div>
-      <span>{elapsed ? `${active ? "已用时" : "本轮耗时"} ${elapsed}` : active ? "状态自动更新" : "本次运行记录"}</span></header>
+      <span>{elapsed ? `${active ? "已用时" : preparationBlocked ? "已记录用时" : "本轮耗时"} ${elapsed}` : active ? "状态自动更新" : "本次运行记录"}</span></header>
     <div className="first-question-stage-meter" role="progressbar" aria-label="第一问流程位置" aria-valuemin={0} aria-valuemax={4}
       aria-valuenow={completed} aria-valuetext={failed || stale || cancelled ? title : ready ? "四个阶段已完成" : steps[firstGap]?.label}>
       {steps.map((step, index) => <div key={step.label} data-state={step.done ? step.skipped ? "skipped" : "done" : active && index === firstGap ? "current" : "pending"}
         aria-current={active && index === firstGap ? "step" : undefined}><i aria-hidden="true" /><b>{step.label}</b><small>{step.skipped ? "已跳过" : step.done ? "已就绪" : index === firstGap && active ? "进行中" : "待完成"}</small></div>)}
     </div>
-    <p>{failed ? "本次运行已结束，目标、材料和已有草稿仍保留。可以重新生成第一问。" : stale ? "保留此前的活动记录；更新依据后重新生成第一问。" : ready ? "检查下面的问题草稿，确认前仍可修改。" : "下面持续显示实际运行活动；没有新事件时会等待下一次输出。"}</p>
+    <p>{preparationBlocked ? preparationReconciliationCopy(deepfetch) : failed ? "本次运行已结束，目标、材料和已有草稿仍保留。可以重新生成第一问。" : stale ? "保留此前的活动记录；更新依据后重新生成第一问。" : ready ? "检查下面的问题草稿，确认前仍可修改。" : "下面持续显示实际运行活动；没有新事件时会等待下一次输出。"}</p>
     {children}
     {generation ? <ProposalOutput key={generation.ref} initializationId={creation.initialization_id} generationRef={generation.ref}
       status={generation.status} enabled={enabled} onPhase={observePhase} /> : null}
-    {!generation && deepfetch && !deepfetch.run ? <ProposalOutput key={deepfetch.request_ref} initializationId={creation.initialization_id}
-      generationRef={deepfetch.request_ref} status={deepfetch.status} enabled={enabled} onPhase={observePhase} preparation /> : null}
+    {!generation && deepfetch && !deepfetch.run ? <ProposalOutput key={outputRef} initializationId={creation.initialization_id}
+      generationRef={deepfetch.preparation?.ref ?? deepfetch.request_ref} preparationRequestRef={deepfetch.request_ref}
+      preparationNeedsReview={preparationBlocked} status={deepfetch.status} enabled={enabled} onPhase={observePhase} preparation /> : null}
   </section>;
 }

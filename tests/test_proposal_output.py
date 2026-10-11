@@ -227,6 +227,10 @@ def test_preparation_retry_output_uses_only_the_current_attempt_and_rejects_old_
     assert current.status_code == 200
     assert current.json()["text"] == "new preparation output"
     assert current.json()["generation_ref"] == current_ref
+    legacy = client.get(url, params={"request_ref": request_ref})
+    assert legacy.status_code == 200
+    assert legacy.json()["text"] == "new preparation output"
+    assert legacy.json()["generation_ref"] == request_ref
 
 
 @pytest.mark.parametrize("changed", ["request", "route", "revision", "hash", "freshness"])

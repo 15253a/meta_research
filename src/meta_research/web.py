@@ -2327,6 +2327,7 @@ def create_app(
     def query_preparation_output(
         initialization_id: str,
         request_ref: str,
+        preparation_ref: str | None = None,
         after: int = Query(default=0, ge=0),
         limit: int = Query(default=65536, ge=4, le=262144),
     ) -> JSONResponse:
@@ -2338,6 +2339,7 @@ def create_app(
         draft = creation["quest_draft"]
         if (creation.get("route") != "deepfetch" or not deepfetch
                 or deepfetch["request_ref"] != request_ref
+                or preparation_ref is not None and preparation_ref != deepfetch.get("preparation", {}).get("ref", request_ref)
                 or deepfetch["freshness"] != "current"
                 or deepfetch["basis_revision"] != draft["revision"]
                 or deepfetch["basis_hash"] != draft["hash"]):
@@ -2347,6 +2349,8 @@ def create_app(
         except (OSError, ValueError, ProviderSupervisorError) as error:
             code = str(error) if isinstance(error, ValueError) else "proposal_output_unavailable"
             return _error(409 if "cursor" in code else 503, code)
+        if preparation_ref is None:
+            page["generation_ref"] = request_ref
         return JSONResponse(page, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/quest-initializations/{initialization_id}/intent-session")

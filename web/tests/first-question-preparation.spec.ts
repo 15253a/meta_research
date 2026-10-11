@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import type { QuestCreationView } from "../src/api";
 
-test("DeepFetch streams material understanding before generation, then changes producers without stale activity or premature completion", async ({ page }) => {
+test("DeepFetch streams material understanding before generation, then changes producers without stale activity or premature completion", async ({ page }, testInfo) => {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];
   const hash = "b".repeat(64);
@@ -104,14 +104,29 @@ test("DeepFetch streams material understanding before generation, then changes p
   await expect(activity).not.toContainText(understandingMessage);
   await expect(activity).not.toContainText(appendMessage);
   expect(preparationRequests.find(request => request.preparationRef === preparation.ref)?.after).toBe(0);
+  await progress.screenshot({ path: testInfo.outputPath("preparation-retry-current-output.png") });
 
   creation.deepfetch!.status = "failed";
+  creation.deepfetch!.failure = { code: "creation_input_stale" };
+  preparation.operation_state = "failed";
+  preparation.retry_permitted = true;
+  preparation.completed_at = startedAt + 63;
+  await expect(progress).toContainText("本次运行已结束，目标、材料和已有草稿仍保留。可以重新生成第一问。");
+  await expect(elapsed).toHaveText("本轮耗时 01:03");
+  await progress.screenshot({ path: testInfo.outputPath("preparation-confirmed-failed.png") });
+
   creation.deepfetch!.failure = { code: "protected_creation_unknown_outcome" };
+  preparation.ref = requestRef + ":preparation:uncertain-empty";
+  preparationOutput = "";
   preparation.operation_state = "unknown_outcome";
+  preparation.retry_permitted = false;
   preparation.completed_at = startedAt + 63;
   await expect(progress).toContainText("运行是否结束尚未确认，请等待核对后再重试。");
   await expect(progress).not.toContainText("本次运行已结束");
+  await expect(progress).not.toContainText("本次生成已结束");
+  await expect(progress.getByTestId("proposal-output")).toContainText("本次资料准备仍需核对，尚无可展示的运行活动。");
   await expect(elapsed).toHaveText("已记录用时 01:03");
+  await progress.screenshot({ path: testInfo.outputPath("preparation-unknown-outcome.png") });
   creation.deepfetch!.status = "queued";
   creation.deepfetch!.failure = null;
   preparation.operation_state = "active";

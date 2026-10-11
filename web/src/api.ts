@@ -543,6 +543,13 @@ export type DeepFetchProjection = {
   freshness: "current" | "stale";
   authorization_receipt: Extract<ReceiptState, { status: "accepted" }>;
   run: DeepFetchRun | null;
+  preparation?: {
+    ref: string;
+    started_at: number | null;
+    completed_at: number | null;
+    operation_state: "active" | "failed" | "unknown_outcome" | "sealed" | null;
+    retry_permitted: boolean;
+  };
   literature_snapshot: LiteratureSnapshot | null;
   failure: null | { code: string };
 };

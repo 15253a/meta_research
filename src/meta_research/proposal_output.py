@@ -68,12 +68,12 @@ def read_preparation_output(data_root: Path, deepfetch: dict, after: int, limit:
     """Read only the authorized request's pre-DeepFetch understanding operation."""
     if after < 0 or not 4 <= limit <= 262144:
         raise ValueError("proposal_output_cursor_invalid")
-    request_ref = deepfetch["request_ref"]
+    preparation_ref = deepfetch.get("preparation", {}).get("ref", deepfetch["request_ref"])
     root = data_root / "companion-provider" / "provider-operations"
-    source = _operation_output(root, request_ref + ":understanding",
+    source = _operation_output(root, preparation_ref + ":understanding",
                                "initialization-understanding", "understanding")
     status = {"accepting": "running"}.get(deepfetch["status"], deepfetch["status"])
-    identity = {"ref": request_ref, "status": status, "failure": deepfetch.get("failure")}
+    identity = {"ref": preparation_ref, "status": status, "failure": deepfetch.get("failure")}
     return _output_page(identity, [] if source is None else [source], after, limit)
 
 
