@@ -15,7 +15,7 @@ const source: SearchSourceView = {
   source_id: "source_fixture", version: 1, form: { kind: "website", name: "Saved website", url: "https://papers.example.org/", instructions: "" },
   credential_present: false, connection_present: false, test: null, needs_retest: true,
 };
-async function workspace(page: Page, preQuest = false, withCreation = false) {
+async function workspace(page: Page, preQuest = false, withCreation = false, openManager = true) {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];
   const questRef: string = snapshot.research_space.current_quest.quest_ref;
@@ -38,12 +38,13 @@ async function workspace(page: Page, preQuest = false, withCreation = false) {
     snapshot.research_space.status = "empty"; snapshot.research_control.foreground = null; snapshot.research_control.quest_ref = null;
   }
   const state = {
-    snapshot, questRef, sources: [structuredClone(source)],
+    snapshot, creation, questRef, sources: [structuredClone(source)],
     selections: { [questRef]: { scope: { kind: "quest", quest_ref: questRef }, revision: 0, allowed_source_ids: [], selection_hash: "empty" } } as Record<string, SearchSourceSelection>,
     tests: [] as Array<{ form: SearchSourceForm; source_id?: string; expected_version?: number; probe_query: string }>,
     saves: [] as Array<{ form: SearchSourceForm; expected_version?: number; matching_test_ref?: string }>,
     selectionSaves: [] as Array<{ scope: string; allowed_source_ids: string[]; expected_revision: number }>,
-    staleSource: false, staleSelection: false, mutations: [] as string[], delayedQuest: "", release: null as (() => void) | null, creationReads: 0,
+    staleSource: false, staleSelection: false, failSourceSave: false, failSelectionSave: false,
+    mutations: [] as string[], delayedQuest: "", release: null as (() => void) | null, creationReads: 0,
   };
   state.selections[creation.initialization_id] = { scope: { kind: "initialization", initialization_id: creation.initialization_id }, revision: 0, allowed_source_ids: [], selection_hash: "empty" };
   await page.context().addCookies([{ name: "meta_research_csrf", value: "test-csrf", domain: "127.0.0.1", path: "/" }]);
@@ -62,6 +63,7 @@ async function workspace(page: Page, preQuest = false, withCreation = false) {
       expect(request.headers()["x-csrf-token"]).toBe("test-csrf");
       const body = request.postDataJSON(); state.saves.push(body);
       if (state.staleSource) return json({ detail: { code: "search_source_stale" } }, 409);
+      if (state.failSourceSave) return json({ detail: { code: "search_source_save_unavailable" } }, 503);
       const form: SearchSourceForm = body.form;
       const existing = state.sources.find(item => url.pathname.endsWith(`/${item.source_id}`));
       const saved: SearchSourceView = {
@@ -87,6 +89,7 @@ async function workspace(page: Page, preQuest = false, withCreation = false) {
       }
       const body = request.postDataJSON(); state.selectionSaves.push({ scope: selectedQuest, ...body });
       if (state.staleSelection) return json({ detail: { code: "search_source_selection_stale" } }, 409);
+      if (state.failSelectionSave) return json({ detail: { code: "search_source_selection_unavailable" } }, 503);
       state.selections[selectedQuest] = { ...selection, revision: selection.revision + 1, allowed_source_ids: body.allowed_source_ids };
       return json({ selection: state.selections[selectedQuest], receipt: { scope: selection.scope, revision: state.selections[selectedQuest].revision } });
     }
@@ -103,13 +106,25 @@ async function workspace(page: Page, preQuest = false, withCreation = false) {
   });
   await page.goto("http://127.0.0.1:18768/?workspace=1", { waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "修改配置", exact: true }).click();
-  await expect(settings(page).getByRole("button", { name: "添加搜索源", exact: true })).toBeEnabled();
+  await expect(settings(page)).toBeVisible();
+  if (openManager) await openShared(page);
   return state;
 }
 const settings = (page: Page) => page.getByRole("region", { name: "DeepFetch 搜索源", exact: true });
 const shared = (page: Page) => settings(page).getByRole("region", { name: "共享搜索源管理", exact: true });
 const selection = (page: Page) => settings(page).getByRole("region", { name: "当前研究允许来源", exact: true });
+const management = (page: Page) => settings(page).locator("details").filter({
+  has: page.getByRole("region", { name: "共享搜索源管理", exact: true, includeHidden: true }),
+});
+async function openShared(page: Page) {
+  const disclosure = management(page);
+  if (await disclosure.getAttribute("open") === null) {
+    await disclosure.locator("summary").click();
+  }
+  await expect(shared(page).getByRole("button", { name: "添加搜索源", exact: true })).toBeEnabled();
+}
 async function add(page: Page, kind: "website" | "api" | "mcp", name: string) {
+  await openShared(page);
   await shared(page).getByRole("button", { name: "添加搜索源", exact: true }).click();
   await shared(page).getByRole("combobox", { name: "来源类型", exact: true }).selectOption(kind);
   await shared(page).getByRole("textbox", { name: "来源名称", exact: true }).fill(name);
@@ -217,11 +232,11 @@ test("source and selection conflicts preserve drafts until explicit latest read"
   await shared(page).getByRole("textbox", { name: "来源名称", exact: true }).fill("Keep local source");
   state.staleSource = true;
   await shared(page).getByRole("button", { name: "保存共享来源", exact: true }).click();
-  await expect(shared(page).getByRole("alert")).toContainText("当前草稿已保留");
+  await expect(settings(page).getByRole("alert")).toContainText("当前草稿已保留");
   await expect(shared(page).getByRole("textbox", { name: "来源名称", exact: true })).toHaveValue("Keep local source");
   await expect(shared(page).getByRole("button", { name: "保存共享来源", exact: true })).toBeDisabled();
   state.sources[0] = { ...state.sources[0], version: 8, form: { ...source.form, name: "Latest website" } };
-  await shared(page).getByRole("button", { name: "读取最新来源并替换当前编辑", exact: true }).click();
+  await settings(page).getByRole("button", { name: "读取最新来源并替换当前编辑", exact: true }).click();
   await expect(shared(page).getByRole("textbox", { name: "来源名称", exact: true })).toHaveValue("Latest website");
   await selection(page).getByRole("checkbox", { name: "允许 Latest website", exact: true }).check();
   state.staleSelection = true;
@@ -229,7 +244,7 @@ test("source and selection conflicts preserve drafts until explicit latest read"
   await expect(selection(page).getByRole("alert")).toContainText("勾选草稿已保留");
   await expect(selection(page).getByRole("checkbox", { name: "允许 Latest website", exact: true })).toBeChecked();
   state.selections[state.questRef] = { ...state.selections[state.questRef], revision: 9, allowed_source_ids: [] };
-  await shared(page).getByRole("button", { name: "读取最新选择并替换当前勾选", exact: true }).click();
+  await settings(page).getByRole("button", { name: "读取最新选择并替换当前勾选", exact: true }).click();
   await expect(selection(page).getByRole("checkbox", { name: "允许 Latest website", exact: true })).not.toBeChecked();
 });
 
@@ -258,11 +273,80 @@ test("Quest switch rejects stale selection read and clears editor ownership", as
   expect(state.selectionSaves).toEqual([{ scope: nextQuest, allowed_source_ids: [], expected_revision: 4 }]);
 });
 
-test("creation saves initialization selection without rewriting the draft or starting research", async ({ page }) => {
+test("failed shared save retains its draft through folding and explicit cancel does not apply a source", async ({ page }, testInfo) => {
+  const state = await workspace(page, false, false, false);
+  await expect(management(page)).not.toHaveAttribute("open");
+  await expect(shared(page)).toBeHidden();
+  await expect(settings(page)).toContainText("OpenAlex");
+  await expect(settings(page)).toContainText("Web");
+  await add(page, "website", "待保存的网站");
+  await shared(page).getByRole("textbox", { name: "网站地址", exact: true }).fill("https://example.org/pending");
+  state.failSourceSave = true;
+  await shared(page).getByRole("button", { name: "保存共享来源", exact: true }).click();
+  await expect(settings(page).getByRole("alert")).toContainText("当前编辑已保留");
+  await expect(shared(page).getByRole("textbox", { name: "来源名称", exact: true })).toHaveValue("待保存的网站");
+  await management(page).locator("summary").click();
+  await expect(shared(page)).toBeHidden();
+  await expect(settings(page).getByRole("alert")).toBeVisible();
+  await openShared(page);
+  await expect(shared(page).getByRole("textbox", { name: "来源名称", exact: true })).toHaveValue("待保存的网站");
+  await expect(shared(page).getByRole("textbox", { name: "网站地址", exact: true })).toHaveValue("https://example.org/pending");
+  await settings(page).screenshot({ path: testInfo.outputPath("shared-save-failed-retained.png") });
+  await shared(page).getByRole("button", { name: "取消编辑", exact: true }).click();
+  await expect(shared(page).getByRole("textbox", { name: "来源名称", exact: true })).toHaveCount(0);
+  await expect(settings(page).getByRole("alert")).toHaveCount(0);
+  expect(state.sources).toEqual([source]);
+  expect(state.selectionSaves).toEqual([]);
+  expect(state.mutations).toEqual(["/api/v1/search-sources"]);
+});
+
+test("pending creation sources guide generation to explicit apply and failed apply can be discarded without losing shared edits", async ({ page }, testInfo) => {
+  const state = await workspace(page, true, true, false);
+  state.creation.resource_envelope = {
+    ref: "envelope-fixture", hash: "envelope-hash", schema_ref: "quest-resource-envelope/v1", status: "current",
+    host_snapshot_ref: "host-fixture", time_budget: "30d", hard_ceiling: { kind: "wall_clock", seconds: 30 * 24 * 3600 },
+    selected_device_uuids: [],
+  };
+  const draft = state.creation.quest_draft.value;
+  if (!("resource_envelope_ref" in draft)) throw new Error("This fixture requires a v2 Quest draft.");
+  draft.resource_envelope_ref = "envelope-fixture";
+  draft.resource_envelope_hash = "envelope-hash";
+  await page.getByRole("button", { name: "关闭修改配置", exact: true }).click();
+  await page.getByRole("button", { name: "创建研究任务", exact: true }).click();
+  const creation = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题", exact: true });
+  const proposal = creation.locator("[data-journey-section='question-proposal']");
+  const generate = proposal.getByRole("button", { name: "生成第一个问题", exact: true });
+  await expect(generate).toBeEnabled();
+  await add(page, "website", "独立保留的编辑");
+  await shared(page).getByRole("textbox", { name: "网站地址", exact: true }).fill("https://example.org/still-editing");
+  await selection(page).getByRole("checkbox", { name: "允许 Saved website", exact: true }).check();
+  await expect(proposal).toContainText("补充来源尚未保存，先保存或撤销后再生成。");
+  await expect(generate).toBeDisabled();
+  const apply = selection(page).getByRole("button", { name: "保存创建草稿允许来源", exact: true });
+  await proposal.getByRole("button", { name: "查看并保存搜索源选择", exact: true }).click();
+  await expect(apply).toBeFocused();
+  state.failSelectionSave = true;
+  await apply.click();
+  await expect(selection(page).getByRole("alert")).toContainText("当前编辑已保留");
+  await expect(selection(page).getByRole("checkbox", { name: "允许 Saved website", exact: true })).toBeChecked();
+  await expect(generate).toBeDisabled();
+  expect(state.selections[state.creation.initialization_id].allowed_source_ids).toEqual([]);
+  await proposal.screenshot({ path: testInfo.outputPath("pending-source-generation-guidance.png") });
+  await selection(page).getByRole("button", { name: "撤销选择修改", exact: true }).click();
+  await expect(selection(page).getByRole("checkbox", { name: "允许 Saved website", exact: true })).not.toBeChecked();
+  await expect(apply).toHaveCount(0);
+  await expect(generate).toBeEnabled();
+  await expect(shared(page).getByRole("textbox", { name: "来源名称", exact: true })).toHaveValue("独立保留的编辑");
+  expect(state.selectionSaves).toEqual([{ scope: state.creation.initialization_id, allowed_source_ids: ["source_fixture"], expected_revision: 0 }]);
+  expect(state.saves).toEqual([]);
+  expect(state.mutations).toEqual(["/api/v1/quest-initializations/init-source-fixture/search-sources"]);
+});
+
+test("creation saves initialization selection without rewriting the draft or starting research", async ({ page }, testInfo) => {
   const state = await workspace(page, true, true);
   await page.getByRole("button", { name: "关闭修改配置", exact: true }).click();
   await page.getByRole("button", { name: "创建研究任务", exact: true }).click();
-  await expect(selection(page).getByRole("button", { name: "保存创建草稿允许来源", exact: true })).toBeDisabled();
+  await expect(selection(page).getByRole("button", { name: "保存创建草稿允许来源", exact: true })).toHaveCount(0);
   await add(page, "api", "Creation Crossref");
   await shared(page).getByRole("button", { name: "测试当前配置", exact: true }).click();
   await expect(shared(page).getByRole("region", { name: "当前配置测试结果", exact: true })).toBeVisible();
@@ -282,6 +366,6 @@ test("creation saves initialization selection without rewriting the draft or sta
     const bounds = await settings(page).boundingBox();
     expect(bounds?.x).toBeGreaterThanOrEqual(0);
     expect((bounds?.x ?? width) + (bounds?.width ?? width)).toBeLessThanOrEqual(width);
-    await settings(page).screenshot({ path: `test-results/search-sources-creation-${width}.png` });
+    await settings(page).screenshot({ path: testInfo.outputPath(`search-sources-creation-${width}.png`) });
   }
 });

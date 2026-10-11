@@ -10,6 +10,7 @@ type Props = {
   scope: SearchSourceScope | { kind: "shared-only" };
   onEnsureInitialization?: () => Promise<string>;
   onSelectionSaved?: () => void;
+  onSelectionDirtyChange?: (dirty: boolean) => void;
 };
 type EditorDraft =
   | { kind: "website"; name: string; instructions: string; url: string }
@@ -107,7 +108,7 @@ function scopeKey(scope: Props["scope"]) {
 export function SearchSourcesSettings(props: Props) {
   return <SearchSourcesEditor key={scopeKey(props.scope)} {...props} />;
 }
-function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }: Props) {
+function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved, onSelectionDirtyChange }: Props) {
   const alive = useRef(true);
   const identity = scopeKey(scope);
   const restored = sourceDrafts.get(identity);
@@ -115,9 +116,11 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }
   const [selection, setSelection] = useState<SearchSourceSelection | null>(null);
   const [allowed, setAllowed] = useState<string[]>(restored?.allowed ?? []);
   const [editor, setEditor] = useState<Editor | null>(restored?.editor ?? null);
+  const [sharedOpen, setSharedOpen] = useState(Boolean(restored?.editor));
   const [probeQuery, setProbeQuery] = useState(restored?.probeQuery ?? "deep learning");
   const [operation, setOperation] = useState<Operation>("idle");
   const [loading, setLoading] = useState(true);
+  const [readFailed, setReadFailed] = useState(false);
   const [readAttempt, setReadAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [selectionError, setSelectionError] = useState<string | null>(null);
@@ -128,11 +131,13 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }
   const selectionTarget = scope.kind !== "shared-only" || Boolean(onEnsureInitialization);
   const selectionDirty = selection === null ? allowed.length > 0 : JSON.stringify([...allowed].sort()) !== JSON.stringify([...selection.allowed_source_ids].sort());
 
+  useEffect(() => { onSelectionDirtyChange?.(selectionDirty); }, [onSelectionDirtyChange, selectionDirty]);
+
   useEffect(() => {
     alive.current = true;
     const controller = new AbortController();
     let current = true;
-    setLoading(true); setError(null); setSelectionError(null);
+    setLoading(true); setReadFailed(false); setError(null); setSelectionError(null);
     void Promise.all([
       fetchSearchSources(controller.signal),
       scope.kind === "shared-only" ? Promise.resolve(null) : fetchSearchSourceSelection(scope, controller.signal),
@@ -150,7 +155,7 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }
       if (staleSelection) setSelectionError("当前研究的允许来源已变化。勾选草稿已保留，请显式读取最新选择后核对。");
       if (staleSource) setError("共享来源已被其他编辑更新。当前草稿已保留，请显式读取最新来源再核对。");
     }).catch(() => {
-      if (current) setError("搜索源读取失败，请重试。当前编辑不会自动提交。");
+      if (current) { setReadFailed(true); setError("搜索源读取失败，请重试。当前编辑不会自动提交。"); }
     }).finally(() => { if (current) setLoading(false); });
     return () => { current = false; alive.current = false; controller.abort(); };
   }, [readAttempt, identity]);
@@ -162,6 +167,10 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }
   const edit = (draft: EditorDraft) => {
     setEditor(previous => previous ? { ...previous, draft, report: null } : null);
     setError(null);
+  };
+  const addSource = () => {
+    setSharedOpen(true); setEditor({ draft: newDraft("website"), report: null }); setError(null);
+    setConflict(previous => previous === "source" ? null : previous);
   };
   const test = async () => {
     if (!editor || busy) return;
@@ -225,35 +234,51 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }
   };
 
   return <section className="search-sources-settings" aria-label="DeepFetch 搜索源">
-    <h3>DeepFetch 搜索源</h3>
-    <p className="search-sources-defaults">默认使用 OpenAlex 和原生 Web。补充来源按研究需要使用，勾选不要求每次全部调用。</p>
+    <div className="search-sources-heading"><h3>检索来源</h3><span>与全文下载分开配置</span></div>
+    <div className="search-sources-defaults" aria-label="始终启用的默认搜索源">
+      <span className="search-sources-default-chip"><i aria-hidden="true">✓</i> OpenAlex</span>
+      <span className="search-sources-default-chip"><i aria-hidden="true">✓</i> Web</span>
+      <small>默认始终启用</small>
+    </div>
     <section className="search-sources-selection" aria-label="当前研究允许来源">
-      <h4>{scope.kind === "quest" ? "当前 Quest 允许来源" : scope.kind === "initialization" || onEnsureInitialization ? "创建草稿允许来源" : "尚无当前研究"}</h4>
+      <div className="search-sources-selection-heading"><h4>补充来源</h4>
+        {selectionTarget && sources.length ? <span data-dirty={selectionDirty}>{selectionDirty ? "选择未保存" : `已选 ${allowed.length} 个`}</span> : null}
+      </div>
       {!selectionTarget ? <p>目前可管理共享来源。打开创建草稿或 Quest 后再保存其允许来源。</p> : <>
-        <p>只使用这里已保存的选择。未保存的勾选不用于 DeepFetch。图书馆用于获取全文，不属于搜索源。</p>
-        <fieldset disabled={loading || busy} className="search-sources-choices"><legend>补充来源</legend>
-          {sources.map(source => <label key={source.source_id}>
+        {loading ? <p role="status" className="search-sources-note">正在读取搜索源…</p> : readFailed ? <p className="search-sources-note">补充来源暂时无法读取，已保存的选择保持不变。</p> : sources.length ? <>
+          <p className="search-sources-note">勾选后保存到{scope.kind === "quest" ? "当前 Quest" : "创建草稿"}，后续检索按需使用。</p>
+          <fieldset disabled={busy} className="search-sources-choices"><legend className="search-sources-legend">可选补充来源</legend>
+          {sources.map(source => <label key={source.source_id} data-selected={allowed.includes(source.source_id)}>
             <input type="checkbox" aria-label={`允许 ${source.form.name}`} checked={allowed.includes(source.source_id)}
               onChange={event => { const checked = event.currentTarget.checked; setAllowed(previous => checked ? [...previous, source.source_id] : previous.filter(id => id !== source.source_id)); setSelectionReceipt(null); }} />
             <span>{source.form.name}<small>{sourceKindName(source.form)} · {source.needs_retest ? "需要重测" : source.test ? "已有配置测试" : "尚未测试"}</small></span>
           </label>)}
-          {!sources.length && !loading ? <p>尚无共享补充来源，可在下方添加。默认来源始终保留。</p> : null}
-        </fieldset>
-        {selectionDirty ? <p role="status">允许来源有未保存的修改，不会用于研究。</p> : null}
+          </fieldset>
+        </> : <div className="search-sources-empty">
+          <div><b>当前使用默认来源</b><p>尚无补充来源，需要时可添加。</p></div>
+          <button type="button" onClick={addSource} disabled={busy}>添加补充来源</button>
+        </div>}
+        {selectionDirty ? <div className="search-sources-pending" role="status">
+          <p>允许来源有未保存的修改，不会用于研究。</p>
+          <div className="search-sources-actions">
+            <button type="button" className="search-sources-save-selection" disabled={loading || busy || conflict === "selection"} onClick={() => void saveSelection()}>
+              {operation === "saving-selection" ? "正在保存允许来源…" : scope.kind === "quest" ? "保存当前 Quest 允许来源" : "保存创建草稿允许来源"}</button>
+            <button type="button" disabled={loading || busy} onClick={() => { setAllowed(selection?.allowed_source_ids ?? []); setSelectionReceipt(null); if (conflict !== "selection") setSelectionError(null); }}>撤销选择修改</button>
+          </div>
+        </div> : null}
         {selectionError ? <p role="alert" className="runtime-conditions-error">{selectionError}</p> : null}
         {selectionReceipt !== null ? <p role="status" className="runtime-conditions-saved">已保存{scope.kind === "quest" ? "当前 Quest" : "创建草稿"}允许来源，修订 {selectionReceipt}。后续新运行使用此选择。</p> : null}
-        <button type="button" disabled={loading || busy || conflict === "selection" || (selection !== null && !selectionDirty)} onClick={() => void saveSelection()}>
-          {operation === "saving-selection" ? "正在保存允许来源…" : scope.kind === "quest" ? "保存当前 Quest 允许来源" : "保存创建草稿允许来源"}</button>
       </>}
     </section>
-    <section className="search-sources-shared" aria-label="共享搜索源管理">
+    <details className="search-sources-management" open={sharedOpen} onToggle={event => setSharedOpen(event.currentTarget.open)}>
+      <summary><span><b>管理共享来源</b><small>新增或编辑，可供各个 Quest 选择</small></span></summary>
+      <section className="search-sources-shared" aria-label="共享搜索源管理">
       <h4>共享搜索源管理</h4>
-      <p>共享保存只更新该来源，其他 Quest 的选择独立保存。已运行研究保留原来源版本。测试不会保存、启用来源或启动研究。</p>
-      {loading ? <p role="status">正在读取搜索源…</p> : null}
+      <p className="search-sources-note">先保存共享来源，再在上方勾选并保存到当前研究。测试只检查配置，不会保存或启用来源。</p>
       <div className="search-sources-actions">
         {sources.map(source => <button type="button" key={source.source_id} disabled={loading || busy} aria-pressed={editor?.source?.source_id === source.source_id}
           onClick={() => { setEditor(editSource(source)); setError(null); setConflict(previous => previous === "source" ? null : previous); }}>{source.form.name}</button>)}
-        <button type="button" disabled={loading || busy} onClick={() => { setEditor({ draft: newDraft("website"), report: null }); setError(null); setConflict(previous => previous === "source" ? null : previous); }}>添加搜索源</button>
+        <button type="button" disabled={loading || busy} onClick={addSource}>添加搜索源</button>
       </div>
       {editor ? <div className="search-source-editor">
         <fieldset disabled={loading || busy}><legend>{editor.source ? "编辑共享来源" : "新增共享来源"}</legend>
@@ -272,15 +297,17 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved }
           {editor.draft.kind === "mcp" ? <p>MCP 测试只初始化连接并发现工具目录，搜索、摘要和全文能力仍需实际研究调用验证。</p> : editor.draft.kind === "website" ? <p>网站测试验证有界网页读取。主页可达不证明站内搜索或论文全文可用。</p> : <p>API 测试发起有界 GET 查询，并报告实际解析结果。空结果、认证失败、限流和格式不匹配分别展示。</p>}
           <div className="search-sources-actions"><button type="button" disabled={!editor.draft.name.trim() || conflict === "source"} onClick={() => void test()}>
             {editor.source ? "重新测试当前配置" : "测试当前配置"}</button>
-            <button type="button" disabled={!editor.draft.name.trim() || conflict === "source"} onClick={() => void saveShared()}>保存共享来源</button></div>
+            <button type="button" disabled={!editor.draft.name.trim() || conflict === "source"} onClick={() => void saveShared()}>保存共享来源</button>
+            <button type="button" onClick={() => { setEditor(null); setSharedReceipt(null); if (!readFailed) setError(null); setConflict(previous => previous === "source" ? null : previous); }}>取消编辑</button></div>
         </fieldset>
         {operation === "testing" ? <p role="status">正在测试当前配置…</p> : operation === "saving-source" ? <p role="status">正在保存共享来源…</p> : null}
         {editor.report ? <TestReport report={editor.report} /> : <p>当前表单没有匹配的测试结果，可保存后再测试。测试结果不代表研究已使用此来源。</p>}
       </div> : null}
+      {sharedReceipt ? <p role="status" className="runtime-conditions-saved">共享来源「{sharedReceipt.name}」已保存，版本 {sharedReceipt.version}。当前研究的允许来源未自动改变。请在上方勾选并保存到当前研究。</p> : null}
+      </section>
+    </details>
       {error ? <p role="alert" className="runtime-conditions-error">{error}</p> : null}
-      {sharedReceipt ? <p role="status" className="runtime-conditions-saved">共享来源「{sharedReceipt.name}」已保存，版本 {sharedReceipt.version}。当前研究的允许来源未自动改变。</p> : null}
       {conflict ? <button type="button" disabled={busy} onClick={() => void reloadConflict()}>读取最新{conflict === "source" ? "来源并替换当前编辑" : "选择并替换当前勾选"}</button> : !loading && error && !sources.length ? <button type="button" disabled={busy} onClick={() => setReadAttempt(value => value + 1)}>重新读取搜索源</button> : null}
-    </section>
   </section>;
 }
 function sourceKindName(form: SearchSourceSafeForm) { return form.kind === "website" ? "网站" : form.kind === "api" ? "API" : "MCP"; }

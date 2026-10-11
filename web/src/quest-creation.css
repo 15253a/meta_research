@@ -559,6 +559,54 @@
   gap: 12px;
 }
 
+.quest-dialog.workspace-modal .quest-literature-card {
+  margin-top: 14px;
+  padding: 17px;
+  border: 1px solid #dfe4ee;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.quest-fulltext-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.quest-fulltext-heading h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.quest-fulltext-save { color: #6d788e; font-size: 11px; }
+.quest-fulltext-save[data-state="unsaved"], .quest-fulltext-save[data-state="error"] { color: #9a6730; }
+.quest-dialog.workspace-modal .quest-fulltext-mode { gap: 6px; }
+.quest-dialog.workspace-modal .quest-fulltext-mode > span { font-size: 12px; color: #6d788e; }
+.quest-fulltext-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border-radius: 10px; background: #f7f8fc; min-width: 0; }
+.quest-fulltext-status-copy { display: flex; align-items: flex-start; gap: 9px; min-width: 0; }
+.quest-fulltext-status-copy > div { min-width: 0; }
+.quest-fulltext-status-copy b { display: block; color: #43506a; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.quest-fulltext-status-copy small { display: block; margin-top: 3px; color: #6d788e; font-size: 12px; line-height: 1.6; }
+.quest-fulltext-status-dot { flex: 0 0 7px; width: 7px; height: 7px; margin-top: 9px; border-radius: 50%; background: #a0a8bb; }
+.quest-fulltext-status[data-state="ready"] { background: #f1f8f6; }
+.quest-fulltext-status[data-state="ready"] .quest-fulltext-status-dot { background: #159987; }
+.quest-fulltext-status[data-state="ready"] b { color: #237c6d; }
+.quest-fulltext-status[data-state="unavailable"] { background: #fff6f1; }
+.quest-fulltext-status[data-state="unavailable"] .quest-fulltext-status-dot { background: #cc8158; }
+.quest-fulltext-status[data-state="waiting_user"] .quest-fulltext-status-dot, .quest-fulltext-status[data-state="stale"] .quest-fulltext-status-dot { background: #bd913c; }
+.quest-dialog.workspace-modal .quest-fulltext-status .quest-library-test { flex: 0 0 auto; width: auto; min-width: 116px; min-height: 40px; padding: 8px 12px; color: #514da8; border: 1px solid #d8deea; border-radius: 9px; background: #fff; font: inherit; font-size: 12px; font-weight: 600; line-height: 1.5; white-space: nowrap; }
+.quest-dialog.workspace-modal .quest-fulltext-status .quest-library-test:hover:not(:disabled) { background: #f2f0ff; border-color: #b8b4ef; }
+.quest-fulltext-status .quest-library-test:focus-visible, .quest-acquisition-details > summary:focus-visible { outline: 2px solid var(--quest-violet); outline-offset: 3px; }
+.quest-fulltext-description, .quest-fulltext-save-hint { margin: 0; color: #6d788e; font-size: 12px; line-height: 1.6; }
+.quest-fulltext-save-hint { font-size: 11px; }
+.quest-library-options { display: grid; gap: 12px; }
+.quest-library-required { display: flex; align-items: flex-start; gap: 9px; font-size: 12px; cursor: pointer; }
+.quest-library-required input { flex: 0 0 16px; width: 16px; height: 16px; margin: 3px 0 0; accent-color: var(--quest-violet); }
+.quest-library-required small { display: block; color: #6d788e; font-size: 11px; margin-top: 2px; }
+.quest-acquisition-details { color: #6d788e; font-size: 11px; }
+.quest-acquisition-details > summary { width: fit-content; cursor: pointer; }
+.quest-acquisition-details p { margin: 6px 0; }
+.quest-acquisition-details code { display: block; overflow-wrap: anywhere; color: #7a8194; font-size: 10px; }
+.quest-search-selection-pending { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; padding: 12px; border: 1px solid #e9d5ad; border-radius: 10px; background: #fffaf0; color: #805b25; font-size: 12px; }
+.quest-search-selection-pending button { min-height: 40px; padding: 8px 12px; border: 1px solid #d9c595; border-radius: 8px; color: #805b25; background: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+.quest-search-selection-pending button:focus-visible { outline: 2px solid var(--quest-violet); outline-offset: 3px; }
+@media (max-width: 600px) {
+  .quest-dialog.workspace-modal .quest-literature-card { padding: 13px; }
+  .quest-fulltext-status { align-items: flex-start; flex-wrap: wrap; gap: 10px; }
+  .quest-dialog.workspace-modal .quest-fulltext-status .quest-library-test { margin-left: 16px; }
+}
+
 .quest-library-prep {
   display: grid;
   grid-template-columns: 42px minmax(0, 1fr) auto;

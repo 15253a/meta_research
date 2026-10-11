@@ -608,9 +608,7 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
   await expect(deepfetchChoice).toHaveAttribute("aria-pressed", "true");
   await dialog.getByLabel("文献全文获取范围").selectOption("oa_only");
   await dialog.getByRole("button", { name: /^(检测全文获取|重新检测全文获取)$/ }).click();
-  await expect(dialog.getByTestId("acquisition-session-status")).toContainText(
-    "ready · current",
-  );
+  await expect(dialog.getByTestId("acquisition-session-status")).toHaveText("公开全文可用");
   const runway = dialog.getByTestId("deepfetch-runway");
   const preparation = dialog.getByTestId("first-question-progress");
   await expect(runway).toHaveCount(0);
@@ -1887,33 +1885,20 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   await expect(literature.locator("option")).toHaveCount(3);
   await literature.selectOption("oa_only");
   await expect(literature).toHaveValue("oa_only");
-  await expect(dialog.getByTestId("oa-only-primary-route")).toContainText(
-    "仅从公开资源获取文献全文",
-  );
-  await expect(dialog.getByTestId("oa-only-primary-route")).toContainText(
-    "下载开放获取的网页和 PDF，无需图书馆登录",
-  );
-  await expect(dialog.locator(".quest-library-test")).toHaveCount(0);
+  await expect(dialog.getByTestId("oa-only-primary-route")).toBeVisible();
+  await expect(dialog.locator(".quest-library-test")).toHaveCount(1);
   await expect(dialog.locator('input[type="url"]')).toHaveCount(0);
-  await expect(literature.locator('option[value="provided_only"]')).toHaveAttribute(
-    "disabled",
-    "",
-  );
+  await expect(literature.locator('option[value="provided_only"]')).toBeDisabled();
   const acquisitionStatus = dialog.getByTestId("acquisition-session-status");
-  await expect(acquisitionStatus).toContainText(
-    "ready · current · browser not_required",
-  );
+  await dialog.getByRole("button", { name: /^(检测全文获取|重新检测全文获取)$/ }).click();
+  await expect(acquisitionStatus).toHaveText("公开全文可用");
   await literature.selectOption("oa_then_institution");
   await expect(literature).toHaveValue("oa_then_institution");
-  await expect(dialog.getByText("全面搜索前准备 Google Chrome", { exact: true })).toBeVisible();
   await expect(dialog.locator(".quest-library-test")).toHaveCount(1);
   await expect(dialog.locator('input[type="url"]')).toHaveCount(1);
-  await expect(acquisitionStatus).toContainText(
-    "waiting_user · current · institutional_entry_required",
-  );
-  await expect(
-    dialog.getByRole("button", { name: "重新检测登录" }),
-  ).toBeEnabled();
+  await dialog.getByRole("button", { name: /^(检测全文获取|重新检测全文获取)$/ }).click();
+  await expect(acquisitionStatus).toHaveText("全文获取已就绪");
+  await expect(dialog.getByRole("button", { name: "重新检测全文获取" })).toBeEnabled();
   await expect(dialog.getByRole("button", { name: "先运行 DeepFetch" })).toBeEnabled();
   await expect(dialog.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
 

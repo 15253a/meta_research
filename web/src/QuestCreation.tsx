@@ -278,6 +278,8 @@ export function QuestCreationWorkbench({
     current?.proposal ? "restored" : "opening",
   );
   const [hasEditedDraft, setHasEditedDraft] = useState(false);
+  const [searchSelectionDirty, setSearchSelectionDirty] = useState(false);
+  const searchSourcesRef = useRef<HTMLDivElement>(null);
   const [inFlight, setInFlight] = useState<InFlightOperations>(idleOperations);
   const [error, setError] = useState<ProductFailure | null>(null);
   const [intentText, setIntentText] = useState(current ? creationPageDrafts.get(current.initialization_id)?.intentText ?? "" : "");
@@ -745,29 +747,9 @@ export function QuestCreationWorkbench({
       try {
         const saved = await reviseQuestDraft(basis, captured, expectedBasis);
         if (!mountedRef.current) return saved;
-        let next = saved;
-        const acquisitionChanged = literatureAcquisitionConfigChanged(
-          basis.quest_draft.value,
-          captured,
-        );
-        if (
-          acquisitionChanged ||
-          !saved.acquisition_session ||
-          saved.acquisition_session.freshness !== "current"
-        ) {
-          try {
-            next = await settleAcquisitionSession(saved);
-          } catch (caught) {
-            // The DraftRevision is already durable. Keep that truth visible
-            // even if the independent environment probe could not return.
-            applyView(saved, {
-              syncDraft: sameDraft(draftRef.current, captured),
-              syncProposal: !proposalDirtyRef.current,
-              adoptDirtyDraftBasis: true,
-            });
-            showError(caught);
-          }
-        }
+        // Saving user settings never starts the independent acquisition probe.
+        // Detection is explicit, or required by a user-started DeepFetch run.
+        const next = saved;
         if (!mountedRef.current) return next;
         const unchanged = sameDraft(draftRef.current, captured);
         const accepted = applyView(next, {
@@ -839,7 +821,7 @@ export function QuestCreationWorkbench({
       return persist();
     }
     return result;
-  }, [applyView, hasEditedDraft, settleAcquisitionSession, showError]);
+  }, [applyView, hasEditedDraft, showError]);
 
   const persistProposal = useCallback(async function persistQuestion(): Promise<QuestCreationView | null> {
     if (Boolean(writeConflictRef.current)) return null;
@@ -1054,7 +1036,14 @@ export function QuestCreationWorkbench({
     }
   };
 
+  function focusSearchSourceSelection() {
+    const action = searchSourcesRef.current?.querySelector<HTMLButtonElement>(".search-sources-save-selection");
+    action?.scrollIntoView({ block: "center" });
+    action?.focus({ preventScroll: true });
+  }
+
   const generateProposal = async (returnFocus?: HTMLButtonElement) => {
+    if (searchSelectionDirty) { focusSearchSourceSelection(); return; }
     const token = beginOperation("generating");
     let restoreTriggerFocus = false;
     setError(null);
@@ -1218,6 +1207,7 @@ export function QuestCreationWorkbench({
   };
 
   const submitConfirmation = async () => {
+    if (searchSelectionDirty) { focusSearchSourceSelection(); return; }
     const token = beginOperation("confirming");
     setError(null);
     try {
@@ -1323,6 +1313,9 @@ export function QuestCreationWorkbench({
     generation && ["queued", "running"].includes(generation.status),
   );
   const acquisitionSession = creation?.acquisition_session ?? null;
+  const acquisitionConfigPending = Boolean(creation && literatureAcquisitionConfigChanged(creation.quest_draft.value, draft));
+  const acquisitionPresentation = creation ? acquisitionStatusCopy(acquisitionSession, draft, acquisitionConfigPending)
+    : { state: "not-checked", label: "正在读取设置…", detail: "草稿就绪后可选择全文获取方式。" };
   const deepfetch = creation ? currentDeepFetch(creation) : null;
   const durableIntentActive = Boolean(
     creation?.intent_session?.turns.some((turn) =>
@@ -1339,7 +1332,7 @@ export function QuestCreationWorkbench({
   const acquisitionActionLocked = terminal || inFlight.acquisition || inFlight.generating ||
     proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
   const proposalActionLocked = terminal || inFlight.compute || inFlight.acquisition || inFlight.generating ||
-    proposalGenerationActive || inFlight.reviewing || terminalMutationActive || referenceDraft.busy;
+    proposalGenerationActive || inFlight.reviewing || terminalMutationActive || referenceDraft.busy || searchSelectionDirty;
   const anyOperationActive = Object.values(inFlight).some(Boolean);
   const draftComplete = draftIsComplete(draft);
   const proposalComplete = questionIsComplete(proposal);
@@ -1349,6 +1342,7 @@ export function QuestCreationWorkbench({
   const resourceEnvelopeCurrent = creation?.resource_envelope?.status === "current";
   const canConfirm = Boolean(
     creation &&
+    !searchSelectionDirty &&
     draftComplete &&
     resourceEnvelopeCurrent &&
     proposalComplete &&
@@ -1594,10 +1588,16 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="literature" aria-labelledby="quest-literature-title">
                 <div className="quest-section-heading">
                   <b id="quest-literature-title">DeepFetch 配置</b>
-                  <small>搜索源与图书馆全文获取分别配置</small>
+                  <small>设置文献如何下载，以及从哪里检索</small>
                 </div>
                 <div className="quest-literature-card">
-                  <label className="quest-field">
+                  <div className="quest-fulltext-heading">
+                    <h3>全文获取</h3>
+                    <span className="quest-fulltext-save" role="status" data-state={draftSaveState}>
+                      {draftSaveState === "saving" ? "草稿正在保存…" : draftSaveState === "unsaved" ? "修改待自动保存" : draftSaveState === "error" ? "草稿保存失败" : creation ? "设置已保存到草稿" : "正在读取草稿…"}
+                    </span>
+                  </div>
+                  <label className="quest-field quest-fulltext-mode">
                     <span>文献全文获取范围</span>
                     <select
                       aria-label="文献全文获取范围"
@@ -1623,43 +1623,28 @@ export function QuestCreationWorkbench({
                       </option>
                     </select>
                   </label>
-                  {draft.literature.mode === "oa_then_institution" ? (
-                    <>
-                      <div className="quest-library-prep">
-                        <i aria-hidden="true">↗</i>
+                  {draft.literature.mode !== "provided_only" ? (
+                    <div className="quest-fulltext-status" data-testid={draft.literature.mode === "oa_only" ? "oa-only-primary-route" : undefined}
+                      data-state={inFlight.acquisition ? "probing" : acquisitionPresentation.state}>
+                      <div className="quest-fulltext-status-copy">
+                        <span className="quest-fulltext-status-dot" aria-hidden="true" />
                         <div>
-                          <b>图书馆／全文获取</b>
-                          <small>检测真实 provider、浏览器控制与获准资源；凭据和 provider manifest 始终留在私有会话。</small>
+                          <b data-testid="acquisition-session-status" aria-live="polite">
+                            {inFlight.acquisition ? "正在检测…" : acquisitionPresentation.label}
+                          </b>
+                          <small>{inFlight.acquisition ? "正在确认当前全文获取方式，请稍候。" : acquisitionPresentation.detail}</small>
                         </div>
-                        <button
-                          ref={acquisitionButtonRef}
-                          className="quest-library-test"
-                          type="button"
-                          disabled={
-                            !creation ||
-                            acquisitionActionLocked ||
-                            draftSaveState === "saving"
-                          }
-                          onClick={() => void detectAcquisition()}
-                        >
-                          {inFlight.acquisition
-                            ? "正在检测…"
-                            : acquisitionSession?.status === "waiting_user"
-                              ? "重新检测登录"
-                              : acquisitionSession
-                                ? "重新检测"
-                                : "检测全文获取环境"}
-                        </button>
-                        <span
-                          className={`quest-unavailable-tag ${acquisitionSession?.status ?? "not-checked"}`}
-                          data-testid="acquisition-session-status"
-                          aria-live="polite"
-                        >
-                          {inFlight.acquisition
-                            ? "probing · current"
-                            : acquisitionSessionCopy(acquisitionSession, draft)}
-                        </span>
                       </div>
+                      <button ref={acquisitionButtonRef} type="button" className="quest-library-test"
+                        disabled={!creation || acquisitionActionLocked || draftSaveState === "saving"}
+                        onClick={() => void detectAcquisition()}>
+                        {inFlight.acquisition ? "正在检测…" : acquisitionPresentation.state === "waiting_user" ? "重新检测登录"
+                          : acquisitionSession ? "重新检测全文获取" : "检测全文获取"}
+                      </button>
+                    </div>
+                  ) : <p className="quest-fulltext-description">使用已提供的研究材料，不下载新的文献全文。</p>}
+                  {draft.literature.mode === "oa_then_institution" ? (
+                    <div className="quest-library-options">
                       <label className="quest-field">
                         <span>图书馆／数据库入口链接 <em>可选</em></span>
                         <input
@@ -1675,43 +1660,23 @@ export function QuestCreationWorkbench({
                           })}
                           onBlur={() => void persistDraft()}
                         />
+                        <small className="quest-fulltext-description">未填写时使用公开全文；机构登录按需请求。</small>
                       </label>
-                      <label className="quest-field">
-                        <span><input type="checkbox" aria-label="必须使用机构访问" checked={draft.literature.institution_required ?? false}
+                      <label className="quest-library-required">
+                        <input type="checkbox" aria-label="必须使用机构访问" checked={draft.literature.institution_required ?? false}
                           disabled={!creation || draftInteractionLocked}
                           onChange={event => updateDraft({ ...draft, literature: { ...draft.literature, institution_required: event.currentTarget.checked } })}
-                          onBlur={() => void persistDraft()} /> 必须使用机构访问</span>
+                          onBlur={() => void persistDraft()} />
+                        <span>必须使用机构访问<small>需要机构权限时保留登录求助。</small></span>
                       </label>
-                      <small className="quest-library-boundary">
-                        图书馆用于获取已发现文献的全文。未填可选入口时继续公开全文路线；明确要求机构访问时保留权限求助。不收集密码、Cookie、token、OTP 或浏览器 profile。
-                      </small>
-                    </>
-                  ) : draft.literature.mode === "oa_only" ? (
-                    <div
-                      className="quest-library-prep"
-                      data-testid="oa-only-primary-route"
-                    >
-                      <i aria-hidden="true">✓</i>
-                      <div>
-                        <b>仅从公开资源获取文献全文</b>
-                        <small>下载开放获取的网页和 PDF，无需图书馆登录。搜索源在下方单独设置；无法取得全文时会说明结果。</small>
-                      </div>
-                      <span
-                        className={`quest-unavailable-tag ${acquisitionSession?.status ?? "not-checked"}`}
-                        data-testid="acquisition-session-status"
-                        aria-live="polite"
-                      >
-                        {inFlight.acquisition
-                          ? "正在检测公开全文获取…"
-                          : acquisitionSessionCopy(acquisitionSession, draft)}
-                      </span>
-                      <button type="button" className="quest-library-test"
-                        disabled={!creation || acquisitionActionLocked || draftSaveState === "saving"}
-                        onClick={() => void detectAcquisition()}>
-                        {inFlight.acquisition ? "正在检测…" : acquisitionSession ? "重新检测全文获取" : "检测全文获取"}
-                      </button>
                     </div>
                   ) : null}
+                  <p className="quest-fulltext-save-hint">设置随草稿自动保存。全文获取与下方搜索源选择分别保存。</p>
+                  {draft.literature.mode !== "provided_only" && acquisitionSession ? <details className="quest-acquisition-details">
+                    <summary>查看检测详情</summary>
+                    <p>{acquisitionConfigPending ? "当前设置尚未保存，以下为上次检测记录。" : "检测用于确认获取环境，不表示文献已下载。"}</p>
+                    <code>{acquisitionSessionCopy(acquisitionSession, draft)}</code>
+                  </details> : null}
                   {draft.literature.mode === "provided_only" ? (
                     <small className="quest-library-boundary">
                       {draft.literature.accepted_material_bindings.length
@@ -1720,7 +1685,9 @@ export function QuestCreationWorkbench({
                     </small>
                   ) : null}
                 </div>
+                <div ref={searchSourcesRef}>
                 <SearchSourcesSettings scope={creation ? { kind: "initialization", initializationId: creation.initialization_id } : { kind: "shared-only" }}
+                  onSelectionDirtyChange={setSearchSelectionDirty}
                   onEnsureInitialization={async () => {
                     const saved = await persistDraft();
                     if (!saved) throw new Error("创建草稿尚未保存，请稍后重试。");
@@ -1733,6 +1700,7 @@ export function QuestCreationWorkbench({
                       if (mountedRef.current && creationRef.current?.initialization_id === basis.initialization_id) applyView(next, { syncProposal: !proposalDirtyRef.current });
                     }).catch(showError);
                   }} />
+                </div>
               </section>
 
               <section className="quest-journey-section" data-journey-section="materials" aria-labelledby="quest-materials-title">
@@ -1806,6 +1774,10 @@ export function QuestCreationWorkbench({
                   </div> : null}
                 </FirstQuestionProgress> : null}
                 <div className="quest-proposal">
+                  {searchSelectionDirty ? <div className="quest-search-selection-pending" role="status">
+                    <span>补充来源尚未保存，先保存或撤销后再生成。</span>
+                    <button type="button" onClick={focusSearchSourceSelection}>查看并保存搜索源选择</button>
+                  </div> : null}
                   <div className="quest-question-sourcebar">
                     <b>可编辑 QuestionProposal</b>
                     <span>{proposal ? "系统已填入六字段；确认前都可修改" : "起草后的六个字段可逐项修改"}</span>
@@ -2449,6 +2421,21 @@ function literatureAcquisitionConfigChanged(
     Boolean(left.literature.institution_required) !== Boolean(right.literature.institution_required) ||
     left.literature.library_entry_url.trim() !==
       right.literature.library_entry_url.trim();
+}
+
+function acquisitionStatusCopy(session: QuestCreationView["acquisition_session"], draft: QuestDraft, pending: boolean) {
+  if (pending) return { state: "stale", label: "设置待保存", detail: "保存后请重新检测全文获取。" };
+  if (!session) return { state: "not-checked", label: "设置已保存，待检测", detail: "检测当前下载方式是否可用，不会启动研究。" };
+  if (session.mode !== draft.literature.mode || session.freshness !== "current") {
+    return { state: "stale", label: "设置已更改，需重新检测", detail: "点击检测，确认当前全文获取方式。" };
+  }
+  if (session.status === "ready") return { state: "ready", label: draft.literature.mode === "oa_only" ? "公开全文可用" : "全文获取已就绪",
+    detail: draft.literature.mode === "oa_only" ? "下载开放网页和 PDF，无需图书馆登录。" : "优先获取公开全文，需要时使用可选图书馆入口。" };
+  if (session.status === "waiting_user") return { state: "waiting_user", label: "等待登录", detail: "请完成机构登录，再重新检测。" };
+  if (session.status === "probing") return { state: "probing", label: "正在检测…", detail: "正在确认当前全文获取方式。" };
+  if (session.status === "acquiring") return { state: "acquiring", label: "正在获取全文", detail: "正在处理已发现文献的全文下载。" };
+  if (session.status === "cancelled") return { state: "cancelled", label: "检测已取消", detail: "需要时可重新检测全文获取。" };
+  return { state: "unavailable", label: "暂不可用", detail: "上次检测未完成，可重新检测。详情中保留原因。" };
 }
 
 function acquisitionSessionCopy(
