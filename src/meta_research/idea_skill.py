@@ -2272,15 +2272,17 @@ class CodexIdeaSkillAdapter:
                 persisted_prompt = _read_spool_text(
                     directory / "prompt.txt", transport_limits.prompt_max_bytes
                 )
+                _key_path, key = self._transport_key()
+                previous = read_transport_envelope(invocation_path, key)
+                if previous.get("prompt_hash") != canonical_hash(persisted_prompt):
+                    raise IdeaSkillUnavailable("codex_operation_spool_invalid")
                 _conditions, original_prompt = split_runtime_prompt(persisted_prompt)
-            except (OSError, UnicodeDecodeError, ValueError) as error:
+            except (OSError, UnicodeDecodeError, ValueError, ProviderSupervisorError) as error:
                 raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
             if original_prompt != prompt:
                 # Rendering is not the business recovery authority. A repeated
                 # exact operation reconciles its sealed original input and view.
                 try:
-                    _key_path, key = self._transport_key()
-                    previous = read_transport_envelope(invocation_path, key)
                     business_text = _read_spool_text(directory / "business-input.json", transport_limits.prompt_max_bytes)
                     business = json.loads(business_text)
                     if (operation_input is None or not isinstance(business, dict)
