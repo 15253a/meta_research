@@ -417,6 +417,8 @@ class SemanticMcpGateway:
                     "instructions": (
                         "通过本服务的高层语义操作读取或改变 Owner 权威状态；其他研究工作按当前授予的原生工具和阶段规则进行。"
                         "以对应 Owner 验证的接纳事实与真实回执确认结果；工具可见或普通执行成功不扩大授权，也不替代领域接纳。"
+                        "工具调用失败以 isError=true 和 structuredContent.code 为准，可选 details 保留具体诊断与原操作对账信息；正常 Owner status 仍是业务状态。"
+                        "capability_unavailable 仅表示操作未注册或未获授；content_version_unbound 表示本次精确版本在当前范围未绑定，不表示全库不存在。"
                     ),
                 },
             }
@@ -670,7 +672,7 @@ def _jsonrpc_error(
 def _tool_error(code: str, details: dict[str, object] | None = None) -> dict[str, object]:
     return {
         "content": [{"type": "text", "text": code}],
-        "structuredContent": {"status": "capability_unavailable", "code": code,
+        "structuredContent": {"code": code,
                               **({"details": details} if details is not None else {})},
         "isError": True,
     }

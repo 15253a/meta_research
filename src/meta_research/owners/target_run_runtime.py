@@ -2988,7 +2988,6 @@ class SQLiteTargetRunGraphAuthority:
             result["research_notes_reader"] = {
                 "operation": "research_memory.research_notes.read", "source": "research_notes",
                 "path": [], "offset": 0, "limit": 8192, "index_offset": 0,
-                "summary_only": True,
             }
         return result
 

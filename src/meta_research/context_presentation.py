@@ -158,7 +158,7 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
             "source_context_pack_hash": context_pack_hash,
             "reader": reader([]), "sections": sections}
     view["research_notes_reader"] = {**reader([]), "operation": "research_memory.research_notes.read", "source": "research_notes",
-                                     "index_offset": 0, "summary_only": True}
+                                     "index_offset": 0}
     from meta_research.human_research_context import human_research_reader
     view["human_guidance_reader"] = human_research_reader()
     if stage in {"idea", "plan", "bundle", "reasoning"}:

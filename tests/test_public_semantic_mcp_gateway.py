@@ -483,7 +483,6 @@ def test_typed_harness_admission_scopes_a_real_mcp_owner_query(tmp_path) -> None
         forbidden_result = forbidden.json()["result"]
         assert forbidden_result["isError"] is True
         assert forbidden_result["structuredContent"] == {
-            "status": "capability_unavailable",
             "code": "capability_unavailable",
         }
         assert admission.run.native_session_ref is None
