@@ -460,6 +460,7 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
         process_runner=runner,
+        model_ref="test-model",
     )
     binding = adapter.runtime_binding()
     request = _request(runtime_binding=binding)
@@ -470,7 +471,7 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     assert result.primary_session_ref == "codex-plan-primary:1"
     assert result.review_mode == "advisory_unobserved"
     assert result.reviewer_agent_ref is None
-    assert binding.model_ref == "gpt-6-sol"
+    assert binding.model_ref == "test-model"
     assert "codex-effective:reasoning.effort=max" in binding.resource_bindings
     assert (
         "codex-config:model_reasoning_effort=ultra"

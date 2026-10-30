@@ -98,3 +98,36 @@ def test_live_guidance_rechecks_current_fence_and_rejects_a_finished_root(tmp_pa
             runtime.owners.human_collaboration.prepare_live_guidance(**observed)
     finally:
         runtime.close()
+
+
+def test_live_guidance_does_not_promote_unconfirmed_scope_to_formal_input(tmp_path):
+    observed = {}
+
+    def primary(human, operation):
+        cut = human.freeze_operation_guidance(operation)
+        assert cut.deliveries == ()
+        quest = cut.binding.quest_ref
+        unconfirmed = human.submit_human_guidance(quest_ref=quest,
+            original_text="A condition whose scope has not been confirmed.",
+            idempotency_key="unconfirmed-live-scope")
+        assert "semantic_scope" not in unconfirmed["guidance"]
+        confirmed = _confirm_guidance(provider.runtime, quest,
+            {"kind": "quest", "quest_ref": quest}, key="confirmed-live-scope",
+            text="Keep the formally confirmed calibration condition.")
+
+        messages = human.prepare_live_guidance(scope=operation.scope, binding=cut.binding)
+        assert [item["change"]["guide"]["constraint_ref"] for item in messages] == [
+            confirmed["constraint_ref"]]
+        delivery, = messages[0]["deliveries"]
+        assert delivery["scope_confirmation"] == "confirmed"
+        assert human.query_guidance_deliveries(unconfirmed["constraint_ref"]) == []
+        assert human.recover_operation_guidance(cut.binding.identity) == cut
+        observed["completed"] = True
+
+    provider = _InboxIdea(primary, lambda *_: None)
+    runtime, _ = _run_idea(tmp_path, provider)
+    try:
+        _finish(runtime)
+        assert observed["completed"] is True
+    finally:
+        runtime.close()

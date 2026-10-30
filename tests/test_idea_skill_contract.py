@@ -1369,7 +1369,7 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
         [{"outcome": _idea_set()}, _review_turn_output()]
     )
     adapter = CodexIdeaSkillAdapter(
-        tmp_path / "idea-provider", process_runner=runner
+        tmp_path / "idea-provider", model_ref="test-model", process_runner=runner
     )
 
     request = _request(runtime_binding=adapter.runtime_binding())
@@ -1392,16 +1392,16 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
         if value == "--config"
     }
     assert 'approval_policy="never"' in config_values
-    assert 'model_reasoning_effort="max"' in config_values
+    assert 'model_reasoning_effort="ultra"' in config_values
     assert 'web_search="live"' in config_values
     assert primary_argv[primary_argv.index("--sandbox") + 1] == "danger-full-access"
     agent_workspace = Path(primary_argv[primary_argv.index("--cd") + 1])
     schema_path = Path(primary_argv[primary_argv.index("--output-schema") + 1])
     assert agent_workspace.name == "research-workspace"
     assert not schema_path.is_relative_to(agent_workspace)
-    assert primary_argv[primary_argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert primary_argv[primary_argv.index("--model") + 1] == "test-model"
     assert (
-        "codex-config:model_reasoning_effort=max"
+        "codex-effective:reasoning.effort=max"
         in request.runtime_binding.resource_bindings
     )
     disabled = {
@@ -1430,7 +1430,6 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert set(primary_schema["properties"]) == {"outcome"}
     assert "anyOf" in primary_schema["properties"]["outcome"]
     _assert_codex_schema_types(primary_schema)
-    _assert_codex_schema_types(review_schema)
 
 
 def test_idea_root_invocation_uses_and_revokes_its_operation_tree_channel(

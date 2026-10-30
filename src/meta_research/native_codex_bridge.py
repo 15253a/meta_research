@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
+import stat
 import subprocess
 import sys
 import threading
@@ -452,7 +454,15 @@ def main():
             # writing the original path would be replaced by its empty temp.
             original = args.operation_directory / "last-message.json"
             allowed = {original, args.operation_directory / ".last-message.supervisor.tmp"}
-            if bridge.options.get("--output-last-message") != str(original) or args.output_last_message not in allowed:
+            valid_destination = args.output_last_message in allowed
+            pipe = re.fullmatch(r"/proc/([0-9]+)/fd/([0-9]+)", str(args.output_last_message))
+            if pipe is not None:
+                ready = read_transport_envelope(args.operation_directory / "supervisor-ready.json", key)
+                request = read_supervisor_request(args.operation_directory / "supervisor-request.json", key)
+                valid_destination = (ready.get("supervisor_process_id") == int(pipe[1])
+                    and ready.get("invocation_hash") == request.get("invocation_hash")
+                    and int(pipe[2]) >= 3 and stat.S_ISFIFO(args.output_last_message.stat().st_mode))
+            if bridge.options.get("--output-last-message") != str(original) or not valid_destination:
                 raise ValueError("native_result_path_conflict")
             bridge.options["--output-last-message"] = str(args.output_last_message)
         return (0 if bridge.read_original_turn() else 75) if args.reconcile_only else bridge.run()

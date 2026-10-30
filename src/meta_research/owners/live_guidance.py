@@ -29,8 +29,10 @@ def prepare_live_guidance(owner, *, scope, binding):
         for row in rows:
             guide = guidance_binding_from_row(row)
             semantic_scope = guide["guidance"].get("semantic_scope")
+            if semantic_scope is None:
+                continue
             prior = known.get(row.constraint_ref)
-            applies = semantic_scope is None or guidance_applies_to_work(connection, semantic_scope, work)
+            applies = guidance_applies_to_work(connection, semantic_scope, work)
             if not applies and prior is None:
                 continue
             if row.status != "active" and prior is None:
@@ -50,8 +52,7 @@ def prepare_live_guidance(owner, *, scope, binding):
                 deliveries = []
                 if change["status"] == "active":
                     deliveries = [FrozenGuidanceDelivery(new_ref("guidance_delivery"),
-                        canonical_json(guide), True, None, True,
-                        "legacy_unconfirmed" if semantic_scope is None else "confirmed")]
+                        canonical_json(guide), True, None, True, "confirmed")]
                 original_row = connection.execute(text(
                     "SELECT snapshot_json FROM hc_guidance_snapshots WHERE snapshot_ref=:ref"
                 ), {"ref": binding.snapshot_ref}).one()
