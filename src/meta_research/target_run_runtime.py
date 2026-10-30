@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Protocol
 
 from meta_research.database import Database
+from meta_research.context_presentation import STAGE_CONTEXT_DELIVERY_GUIDANCE
 from meta_research.bundle_protocol import (
     FormalPlan,
     TargetCandidate,
@@ -691,7 +692,14 @@ class TargetRunRuntime:
         research = dict(research_context or {})
         from meta_research.cycle_position import validate_cycle_position
         position = research.pop("cycle_position", None)
-        validate_cycle_position(position, cycle_ref=None if position is None else position.get("cycle_ref"))
+        try:
+            validate_cycle_position(position, cycle_ref=research["cycle_ref"])
+            if (research["graph_ref"] != launch.graph_ref
+                or research["stage_request_ref"] != launch.stage_request_ref
+                or research["target_ref"] != handle.target_ref):
+                raise ValueError("launch research binding")
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_cycle_position_invalid") from error
         # These are this Target's selected scientific obligations and handoff,
         # not a discovery catalog. Keep their complete text in the first input;
         # a Bundle workspace path is neither a delivery nor a Target grant.
@@ -742,7 +750,9 @@ class TargetRunRuntime:
         }
         return (
             "cycle_position=" + canonical_json({**position, "stage": "target"}) + "\n" +
+            STAGE_CONTEXT_DELIVERY_GUIDANCE +
             target_execution_skill_text() + "\n\n"
+            "下列 research_context 与 execution_contract 完整携带本 Target 适用的 Owner 冻结科学正文与合同。\n"
             "本回合在下列 Owner 冻结范围内实施或恢复 Target。按上述 Skill 读取实际合同和所需参考，"
             "进行研究、检查与局部修订，并在最终交接前完成独立子智能体审阅。普通检索、实施和整理"
             "按需要委派，子智能体使用当前任务授予的工具与权限，按对象划分写入；根负责整体判断、"

@@ -13,6 +13,7 @@ SOURCE_SPEC_HASH = "b" * 64
 def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
     candidate, formal_plan, handle, _preflight, request = _records()
     launch = SimpleNamespace(
+        stage_request_ref="stage-request:target",
         launch_ref="target-launch-root",
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
@@ -50,7 +51,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
     class TargetGraph:
         def query_target_reading_context(self, *, target_ref, research_note_directory):
             assert target_ref == handle.target_ref
-            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
+            return {"cycle_ref": "cycle:target", "graph_ref": launch.graph_ref, "stage_request_ref": launch.stage_request_ref, "target_ref": target_ref, "cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
 
         binding: object | None = None
 
@@ -217,6 +218,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
 def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> None:
     candidate, formal_plan, handle, _preflight, request = _records()
     launch = SimpleNamespace(
+        stage_request_ref="stage-request:target",
         launch_ref="target-launch-revision",
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
@@ -255,7 +257,7 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
     class TargetGraph:
         def query_target_reading_context(self, *, target_ref, research_note_directory):
             assert target_ref == handle.target_ref
-            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
+            return {"cycle_ref": "cycle:target", "graph_ref": launch.graph_ref, "stage_request_ref": launch.stage_request_ref, "target_ref": target_ref, "cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
 
         def query_execution_input_binding_for_attempt(self, **_values):
             return SimpleNamespace(binding_ref="target-input-revision")
@@ -376,6 +378,7 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
 def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() -> None:
     candidate, formal_plan, handle, _preflight, request = _records()
     launch = SimpleNamespace(
+        stage_request_ref="stage-request:target",
         launch_ref="target-launch-failed-root",
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
@@ -406,7 +409,7 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
     class TargetGraph:
         def query_target_reading_context(self, *, target_ref, research_note_directory):
             assert target_ref == handle.target_ref
-            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
+            return {"cycle_ref": "cycle:target", "graph_ref": launch.graph_ref, "stage_request_ref": launch.stage_request_ref, "target_ref": target_ref, "cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
 
         query_calls = 0
 

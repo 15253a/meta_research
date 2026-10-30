@@ -107,6 +107,8 @@ def test_completed_target_allows_next_batch_after_policy_refresh(tmp_path, monke
     ] = ["cell:structure-primary"]
     spec = target_plan["initial_strategy_update"]["candidates"][0]
     batch = BundleTargetBatchRequest(
+        cycle_ref="cycle:bundle-1",
+        cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Review frozen inputs", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref="stage-request:1", run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:1", fence_ref="bundle-fence:1",
         graph_ref="target-graph:1", formal_plan_ref="formal-plan:bundle-1",

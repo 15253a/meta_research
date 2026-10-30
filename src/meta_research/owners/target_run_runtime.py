@@ -2920,8 +2920,9 @@ class SQLiteTargetRunGraphAuthority:
             selected_keys = spec["candidate"]["experiment_keys"]
             from meta_research.cycle_position import validate_cycle_position
             position = context["cycle_position"]
-            validate_cycle_position(position, cycle_ref=context["cycle_ref"])
+            validate_cycle_position(position, cycle_ref=graph.cycle_ref)
             if (canonical_hash(context) != row.context_pack_hash
+                or context["cycle_ref"] != graph.cycle_ref
                 or canonical_json(context) != row.context_pack_json
                 or canonical_hash(spec) != row.spec_hash
                 or canonical_json(spec) != row.spec_json
@@ -2977,6 +2978,8 @@ class SQLiteTargetRunGraphAuthority:
                     break
         result = {
             "schema_ref": "meta-research/target-research-context/v1",
+            "cycle_ref": graph.cycle_ref, "graph_ref": graph.graph_ref,
+            "stage_request_ref": graph.request_ref,
             "cycle_position": position,
             "target_ref": target_ref, "question_ref": question_binding["question_ref"],
             "question_content_ref": question_binding["content_ref"],

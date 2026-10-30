@@ -3,7 +3,7 @@ import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 
 from meta_research.bundle_target_contract import FORMAL_STRATEGY_UPDATE_SCHEMA_REF
 from meta_research.owners.common import canonical_hash
@@ -66,10 +66,13 @@ def test_target_context_pins_real_read_cut_while_another_owner_accepts_new_gener
         later = propose(graph, [], "LATER: unrelated current strategy must stay outside this Target.",
                         True, "later-context-proposal")
         owner, database = runtime.target_run_authorities.research_graph, runtime._database
-        expected = owner.query_target_research_context(target_ref=target.target_ref)
+        reading_directory = tmp_path / "target-reading"
+        expected = owner.query_target_reading_context(target_ref=target.target_ref,
+            research_note_directory=reading_directory)
         entered, committed = threading.Event(), threading.Event()
         reader_thread = threading.get_ident()
         observed_cut = []
+        nested_reads = []
 
         def writer():
             assert entered.wait(30), "reader did not enter its first actual SELECT"
@@ -81,6 +84,13 @@ def test_target_context_pins_real_read_cut_while_another_owner_accepts_new_gener
                 committed.set()
 
         def pause_after_first_read(_connection, _cursor, statement, _parameters, _context, _many):
+            if threading.get_ident() == reader_thread and entered.is_set() and any(
+                    table in statement for table in ("rg_target_input_asset_role_proofs",
+                        "rm_target_research_notes", "rm_target_root_completion_manifests")):
+                generation = _connection.execute(text(
+                    "SELECT MAX(generation) FROM rg_target_graph_appends WHERE graph_ref=:ref"
+                ), {"ref": graph.graph_ref}).scalar_one()
+                nested_reads.append((statement, _connection, generation))
             if (threading.get_ident() == reader_thread and not entered.is_set()
                     and "SELECT t.graph_ref, t.spec_json" in statement):
                 observed_cut.append(database._read_cut.get())
@@ -92,18 +102,24 @@ def test_target_context_pins_real_read_cut_while_another_owner_accepts_new_gener
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 accepted = pool.submit(writer)
-                actual = owner.query_target_research_context(target_ref=target.target_ref)
+                actual = owner.query_target_reading_context(target_ref=target.target_ref,
+                    research_note_directory=reading_directory)
                 new_head = accepted.result(timeout=30)
         finally:
             event.remove(database._engine, "after_cursor_execute", pause_after_first_read)
         assert observed_cut and new_head.generation == 2
+        assert all(any(table in statement for statement, _, _ in nested_reads) for table in (
+            "rg_target_input_asset_role_proofs", "rm_target_research_notes", "rm_target_root_completion_manifests"))
+        assert all(connection is observed_cut[0] and generation == 1
+                   for _, connection, generation in nested_reads)
         assert rg.query_target_graph(request_ref).head_generation == 2
         assert actual == expected
         assert actual["bundle_notes"] == "ADMITTED: retain failed controls and unmeasured limits."
         assert actual["bundle_notes_source_ref"] == first.proposal_ref
         assert actual["bundle_notes_source_hash"] == canonical_hash(first.proposal)
         assert actual["bundle_notes_text_hash"] == hashlib.sha256(actual["bundle_notes"].encode()).hexdigest()
-        assert owner.query_target_research_context(target_ref=target.target_ref) == expected
+        assert owner.query_target_reading_context(target_ref=target.target_ref,
+            research_note_directory=reading_directory) == expected
         assert database._read_cut.get() is None
     finally:
         runtime.close()

@@ -4,7 +4,7 @@ from meta_research.resource_preparation import resource_preparation, prepared_re
 from meta_research.native_guidance import native_guidance_operation
 
 from meta_research.idea_skill import stage_operation_input, stage_replacement_prompt
-from meta_research.context_presentation import stage_context_view, stage_context_json, stage_position_prompt
+from meta_research.context_presentation import stage_context_json, stage_position_prompt, STAGE_CONTEXT_DELIVERY_GUIDANCE
 
 from dataclasses import dataclass, replace
 from importlib.resources import files
@@ -1216,7 +1216,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
         prompt = (
-            stage_position_prompt(request, "reasoning") + stage_replacement_prompt(request) +
+            stage_position_prompt(request, "reasoning") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{_reasoning_skill_instructions(request)}\n\n"
             f"{human_resume}"
             "在当前原根连续完成研究、自主组织独立子智能体审阅、聚合反馈并修订后，"
@@ -1264,8 +1264,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
             f"provider_context_view={stage_context_json('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}\n"
-            "Frozen evidence is available through the authenticated stage context reader; "
-            "the presentation is a preview, never a complete evidence authority. "
+            "Additional exact sources are available through the authenticated stage context reader. "
             "The literature preview is not a citation limit: use source=literature_records "
             "to page the exact frozen revision and cite any verified record in that revision; "
             "the Owner checks actual cited record IDs, not preview membership."
@@ -1297,6 +1296,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
     ) -> ReasoningSkillResult | ReasoningAutonomousCheckpointResult:
+        # Root policy organizes advisory review before returning a candidate.
+        # This retained adapter seam validates/checkpoints that candidate; it
+        # neither launches a review turn nor attests a review/approval event.
         _validate_request(request)
         if (
             not reasoning_bindings_compatible(request.runtime_binding, self.runtime_binding())

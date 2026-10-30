@@ -46,6 +46,7 @@ def _adapter(tmp_path, output, *, durable=False, native_session_ref=None):
 
 def _request(adapter, kind):
     scope = dict(
+        cycle_ref="cycle:drift",
         cycle_position={"cycle_ref": "cycle:drift", "round": 1, "cycle_focus": "Original frozen scope", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref="stage-request:drift", run_ref="bundle-run:drift",
         attempt_ref="bundle-attempt:drift", fence_ref="bundle-fence:drift",

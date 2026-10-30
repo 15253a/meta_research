@@ -43,9 +43,9 @@ def test_target_prompt_has_complete_selected_science_without_unrelated_briefs():
     prompt = TargetRunRuntime._root_prompt(
         execution_contract={'measurement_contract': {'protocol_version': {'required_metric_keys':['f1']}}},
         handle=handle, candidate=candidate, formal_plan=plan,
-        launch=SimpleNamespace(request=SimpleNamespace(target_spec_binding=request.target_spec_binding)),
+        launch=SimpleNamespace(graph_ref="graph:target", stage_request_ref="stage-request:target", request=SimpleNamespace(target_spec_binding=request.target_spec_binding)),
         frozen_input_manifest_path='/isolated/frozen/manifest.json',
-        research_context={'cycle_position': {'cycle_ref': 'cycle:target', 'round': 1,
+        research_context={'cycle_ref': 'cycle:target', 'graph_ref': 'graph:target', 'stage_request_ref': 'stage-request:target', 'target_ref': handle.target_ref, 'cycle_position': {'cycle_ref': 'cycle:target', 'round': 1,
             'cycle_focus': 'Audit patient split', 'focus_source': {'request_ref': 'fixture-start'}},
             'question':{'unknown_statement':'Is the patient split leakage-free?'},
             'obligations':[{'statement':'Audit actual patient overlap'}],
@@ -60,5 +60,5 @@ def test_target_prompt_has_complete_selected_science_without_unrelated_briefs():
     assert 'exact_context_path' not in prompt
     assert prompt.startswith('cycle_position=')
     assert '"execution_input_binding_receipt"' not in prompt
-    assert '初始 `result_schema` 是表达指导' in prompt
+    assert 'result_schema 是初始表达指导' in prompt
     assert 'Protocol 指标集合' in prompt

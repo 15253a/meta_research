@@ -128,6 +128,8 @@ def test_three_committed_targets_allow_next_batch_without_rebinding(tmp_path, mo
         "closure_hash": canonical_hash({"closure": index}),
     } for index in range(3))
     batch = BundleTargetBatchRequest(
+        cycle_ref="cycle:bundle-1",
+        cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Review frozen inputs", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref="stage-request:1", run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:1", fence_ref="bundle-fence:1",
         graph_ref="target-graph:1", formal_plan_ref="formal-plan:bundle-1",

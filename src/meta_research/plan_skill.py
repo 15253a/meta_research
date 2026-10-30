@@ -3,7 +3,7 @@ from __future__ import annotations
 from meta_research.resource_preparation import resource_preparation, prepared_resource
 
 from meta_research.idea_skill import stage_operation_input, stage_replacement_prompt
-from meta_research.context_presentation import stage_context_view, stage_context_json, stage_position_prompt
+from meta_research.context_presentation import stage_context_json, stage_position_prompt, STAGE_CONTEXT_DELIVERY_GUIDANCE
 
 from dataclasses import dataclass, replace
 from importlib.resources import files
@@ -464,7 +464,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
         primary_prompt = (
-            stage_position_prompt(request, "plan") + stage_replacement_prompt(request) +
+            stage_position_prompt(request, "plan") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{_plan_skill_instructions()}\n\n"
             f"{human_resume}"
             "Evidence catalog page metadata reports candidate totals, filtering, and next_offset. "
@@ -551,6 +551,9 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
     def review_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult:
+        # Root policy organizes advisory review before returning a candidate.
+        # This retained adapter seam validates/checkpoints that candidate; it
+        # neither launches a review turn nor attests a review/approval event.
         if request.runtime_binding != self.runtime_binding():
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:

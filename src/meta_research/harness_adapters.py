@@ -139,12 +139,14 @@ class HarnessAdapterUnavailable(RuntimeError):
         durable_outcome: Literal["terminal", "unknown"] = "terminal",
         transport_receipt: dict[str, object] | None = None,
         native_session_ref: str | None = None,
+        native_terminal_checkpoint: dict[str, object] | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.durable_outcome = durable_outcome
         self.transport_receipt = transport_receipt
         self.native_session_ref = native_session_ref
+        self.native_terminal_checkpoint = native_terminal_checkpoint
 
 
 class HarnessRunnerOutcomeUnknown(RuntimeError):
@@ -440,6 +442,12 @@ class _NativeCliHarnessAdapter:
                 "provider_io_unavailable", durable_outcome="unknown"
             ) from error
         events = _parse_jsonl(completed.stdout)
+        native_terminal = getattr(completed, "meta_research_native_terminal_checkpoint", None)
+        if isinstance(native_terminal, dict):
+            raise HarnessAdapterUnavailable("provider_native_turn_" + native_terminal["native_turn_status"],
+                durable_outcome="terminal", native_session_ref=native_terminal["native_session_ref"],
+                transport_receipt=getattr(completed, "meta_research_transport_receipt", None),
+                native_terminal_checkpoint=native_terminal)
         if completed.returncode == 75 and any(
             event.get("type") == "meta_research.native_outcome_unknown" for event in events
         ):
@@ -1359,12 +1367,15 @@ class HarnessSupervisorTransport:
                 {"type": "object"}, sort_keys=True, separators=(",", ":")
             ),
         )
-        _ensure_private(
-            provider_argv_path,
-            json.dumps(live_native_argv(argv, directory,
-                enabled=family == "codex" and isinstance(self._process_runner, _CancellableProcessRunner)),
-                ensure_ascii=False, separators=(",", ":")),
-        )
+        try:
+            _ensure_private(
+                provider_argv_path,
+                json.dumps(live_native_argv(argv, directory,
+                    enabled=family == "codex" and isinstance(self._process_runner, _CancellableProcessRunner)),
+                    ensure_ascii=False, separators=(",", ":")),
+            )
+        except (OSError, ValueError, ProviderSupervisorError) as error:
+            raise OSError("native_provider_spool_invalid") from error
         working_directory = provider_working_directory(argv, environment)
         request = self._supervisor_request(directory, invocation_hash, family, timeout, working_directory)
         bridge_argv = cast(list[str], request["argv"])
@@ -1463,11 +1474,18 @@ class HarnessSupervisorTransport:
         )
         completed = subprocess.CompletedProcess(argv, returncode, stdout, stderr)
         if returncode == 75 and (directory / "native-turn-start.json").is_file():
-            from meta_research.native_codex_bridge import reconcile_native_operation
-            reconciled = reconcile_native_operation(directory)
-            if reconciled is not None:
-                _message, _native_ref, recovered_stdout = reconciled
-                completed = subprocess.CompletedProcess(argv, 0, recovered_stdout, stderr)
+            from meta_research.native_codex_bridge import NativeTerminalTurnError, reconcile_native_operation
+            try:
+                reconciled = reconcile_native_operation(directory)
+            except NativeTerminalTurnError as error:
+                completed = subprocess.CompletedProcess(argv, 1, error.stdout, stderr)
+                completed.meta_research_native_terminal_checkpoint = error.checkpoint
+            except (OSError, ValueError, ProviderSupervisorError) as error:
+                raise OSError("native_reconciliation_spool_invalid") from error
+            else:
+                if reconciled is not None:
+                    _message, _native_ref, recovered_stdout = reconciled
+                    completed = subprocess.CompletedProcess(argv, 0, recovered_stdout, stderr)
         completed.meta_research_transport_receipt = {
             "schema_ref": "meta-research/harness-provider-transport-receipt/v1",
             "spool_ref": "provider-spool:" + invocation_hash,

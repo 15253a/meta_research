@@ -510,6 +510,7 @@ class BundleStageWorker:
                 replacement_context = self._rolling_replacement_context(request, run, graph, commits)
                 batch_request = BundleTargetBatchRequest(
                     stage_request_ref=request.request_ref,
+                    cycle_ref=request.cycle_ref,
                     run_ref=run.run_ref,
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
@@ -775,6 +776,7 @@ class BundleStageWorker:
             replacement_context = self._rolling_replacement_context(request, run, graph, commits)
             dispatch_request = BundleDispatchRequest(
                 stage_request_ref=request.request_ref,
+                cycle_ref=request.cycle_ref,
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
                 fence_ref=run.fence_ref,

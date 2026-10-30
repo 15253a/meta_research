@@ -38,7 +38,7 @@ def test_history_growth_does_not_expand_provider_view(snapshot,count):
     encoded=canonical_json(view).encode()
     assert len(encoded)<=CONTEXT_VIEW_MAX_BYTES
     assert canonical_hash(pack)==before
-    assert view['summary_only'] is True
+    assert view['section_delivery']['research_context'] == 'preview'
     assert b'outcome_000999' not in encoded
     assert b'"total_count":'+str(count).encode() in encoded
     # At most twelve outcomes plus navigation metadata regardless of total.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from meta_research.context_presentation import stage_context_json, stage_position_prompt
+from meta_research.context_presentation import (
+    STAGE_CONTEXT_DELIVERY_GUIDANCE, stage_context_json, stage_position_prompt,
+)
 from meta_research.resource_preparation import resource_preparation, prepared_resource
 from meta_research.native_guidance import native_guidance_operation
 
@@ -286,6 +288,7 @@ class BundleExhaustionSkillResult:
 @dataclass(frozen=True)
 class BundleDispatchRequest:
     stage_request_ref: str
+    cycle_ref: str
     run_ref: str
     attempt_ref: str
     fence_ref: str
@@ -315,6 +318,7 @@ class BundleDispatchResult:
 @dataclass(frozen=True)
 class BundleTargetBatchRequest:
     stage_request_ref: str
+    cycle_ref: str
     run_ref: str
     attempt_ref: str
     fence_ref: str
@@ -1386,6 +1390,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{canonical_hash(list(request.predecessor_rejections))}\n"
             "predecessor_rejections="
             f"{canonical_json(list(request.predecessor_rejections))}\n"
+            + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"provider_context_view={stage_context_json('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         )
         output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
@@ -1553,12 +1558,12 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 "inbox_checkpoint": request.inbox_checkpoint},
         }
         prompt = (
-            _rolling_position_prompt(request.cycle_position) +
+            _rolling_position_prompt(request) +
             stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续使用当前 Bundle 根 Session。先读取这次 durable frontier 与 "
-            "TargetCommit/blocker 摘要，再自主选择下一项可调度 Target。选择体现当前 "
+            "TargetCommit/blocker 状态，再自主选择下一项可调度 Target。选择体现当前 "
             "优先级、依赖、已实现结果与局部阻塞；不得把 Agent tree 当成 Target DAG，"
             "选择 frontier 内有当前启动权限且值得投入的 Target 时返回 dispatch。"
             "需要等待证据、依赖或重新评估研究优先级时可返回 wait，并在 rationale "
@@ -1694,7 +1699,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             if name not in {"run_ref", "attempt_ref", "fence_ref", "root_session_ref",
                             "runtime_binding_hash", "provider_feedback"}}
         prompt = (
-            _rolling_position_prompt(request.cycle_position) +
+            _rolling_position_prompt(request) +
             stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
@@ -1836,7 +1841,7 @@ def _bundle_skill_instructions(resources: dict[str, str] | None = None) -> str:
 def _rolling_operation_identity(request: BundleDispatchRequest | BundleTargetBatchRequest) -> dict[str, object]:
     """Business identity recorded beside, independently of, the reading layout."""
     return {**{name: getattr(request, name) for name in (
-        "stage_request_ref", "run_ref", "attempt_ref", "fence_ref",
+        "stage_request_ref", "cycle_ref", "run_ref", "attempt_ref", "fence_ref",
         "root_session_ref", "graph_ref")},
         "runtime_binding_hash": canonical_hash(request.runtime_binding.as_dict()),
         "cycle_position": request.cycle_position,
@@ -1878,9 +1883,13 @@ def _rolling_native_result_matches(request, native_session_ref) -> bool:
     return native_session_ref != request.native_replacement_context["retired_native_session_ref"]
 
 
-def _rolling_position_prompt(position: dict[str, object]) -> str:
+def _rolling_position_prompt(request: BundleDispatchRequest | BundleTargetBatchRequest) -> str:
     from meta_research.cycle_position import validate_cycle_position
-    validate_cycle_position(position, cycle_ref=position.get("cycle_ref"))
+    position = request.cycle_position
+    try:
+        validate_cycle_position(position, cycle_ref=request.cycle_ref)
+    except (TypeError, ValueError) as error:
+        raise BundleSkillUnavailable("bundle_cycle_position_invalid") from error
     return "cycle_position=" + canonical_json({**position, "stage": "bundle"}) + "\n"
 
 

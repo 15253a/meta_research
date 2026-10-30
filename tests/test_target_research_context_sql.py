@@ -68,7 +68,7 @@ def context_owner():
     owner._database = Database()
     owner._memory = SimpleNamespace(read_question_content=lambda *_: {"unknown_statement": "Is the split valid?"})
     graph = SimpleNamespace(
-        quest_ref="quest-1", submission_ref="initial-submission", target_plan_hash="b" * 64,
+        cycle_ref="cycle:target", graph_ref="graph-1", request_ref="request-1", quest_ref="quest-1", submission_ref="initial-submission", target_plan_hash="b" * 64,
         target_plan={"initial_strategy_update": {"notes": "Initial handoff"}},
     )
     source = SimpleNamespace(formal_plan_ref="plan-1", plan_document_hash=canonical_hash(plan))
@@ -139,5 +139,17 @@ def test_context_still_rejects_changed_frozen_spec(context_owner):
     owner, engine, _proposal = context_owner
     with engine.begin() as connection:
         connection.execute(text("UPDATE rg_targets SET spec_hash = :hash"), {"hash": "0" * 64})
+    with pytest.raises(OwnerConflict, match="target_research_context_invalid"):
+        owner.query_target_research_context(target_ref="target-1")
+
+
+def test_context_rejects_internally_consistent_position_from_another_graph_cycle(context_owner):
+    owner, engine, _proposal = context_owner
+    with engine.begin() as connection:
+        import json
+        context = json.loads(connection.execute(text("SELECT context_pack_json FROM ae_stage_run_requests")).scalar_one())
+        context["cycle_ref"] = context["cycle_position"]["cycle_ref"] = "cycle:foreign"
+        connection.execute(text("UPDATE ae_stage_run_requests SET context_pack_json=:json, context_pack_hash=:hash"),
+            {"json": canonical_json(context), "hash": canonical_hash(context)})
     with pytest.raises(OwnerConflict, match="target_research_context_invalid"):
         owner.query_target_research_context(target_ref="target-1")

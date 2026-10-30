@@ -126,3 +126,24 @@ def test_stage_position_prefix_uses_frozen_focus_and_rejects_foreign_cycle():
     request.context_pack["cycle_ref"] = "foreign"
     with pytest.raises(ValueError, match="cycle_position_invalid"):
         stage_position_prompt(request, "idea")
+
+
+@pytest.mark.parametrize("reason", [None, "", "   "])
+def test_formal_control_entries_reject_missing_or_blank_focus_as_owner_conflict(tmp_path, reason):
+    from test_public_bundle_stage import _bundle_runtime
+    from meta_research.owners.common import OwnerConflict
+    runtime = _bundle_runtime(tmp_path / "invalid-control-focus")
+    try:
+        engine = runtime.owners.advancement_engine
+        payload = {"action": "normal_switch", "target": {
+            "quest_ref": "quest", "question_ref": "question", "cycle_ref": "cycle",
+            "epoch": 1, "target_question_ref": "next-question"}, "reason": reason}
+        if reason is None:
+            payload.pop("reason")
+        for action in (lambda: engine.preview_foreground_control(payload),
+                       lambda: engine.prepare_foreground_control(intent_id="intent:bad-focus", payload=payload,
+                           expected_revision=0, idempotency_key="bad-focus")):
+            with pytest.raises(OwnerConflict, match="research_control_(payload|reason)_invalid"):
+                action()
+    finally:
+        runtime.close()

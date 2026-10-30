@@ -28,7 +28,7 @@ def _authority(refs, *, plan=False, existing=False):
         db.execute(text("INSERT INTO rg_targets VALUES ('target', 'graph', :json, :hash)"),
                    {"json": canonical_json(spec), "hash": canonical_hash(spec)})
     owner = object.__new__(SQLiteTargetRunGraphAuthority)
-    owner._database = SimpleNamespace(read=engine.connect)
+    owner._database = SimpleNamespace(read=engine.connect, read_snapshot=engine.connect)
     owner._memory = SimpleNamespace(query_input_asset=lambda **kw: None)
     owner.query_input_asset_projection = lambda **kw: object() if existing else None
     if not plan:

@@ -28,12 +28,16 @@ def _emit(value):
 
 
 def _settings(argv):
-    if len(argv) < 3 or argv[1] != "exec":
+    if (not isinstance(argv, list) or not all(isinstance(argument, str) and argument for argument in argv)
+            or len(argv) < 3 or argv[1] != "exec"):
         raise ValueError("native_codex_exec_arguments_invalid")
     command, options = [argv[0], "app-server"], {}
     index = 2
     while index < len(argv):
         flag = argv[index]
+        if flag in {"--config", "-c", "--enable", "--disable", "--model", "-m", "--cd", "-C",
+                    "--sandbox", "-s", "--output-schema", "--output-last-message", "resume"} and index + 1 >= len(argv):
+            raise ValueError("native_codex_exec_arguments_invalid")
         if flag in {"--config", "-c", "--enable", "--disable"}:
             command.extend(argv[index:index + 2]); index += 2
         elif flag == "--strict-config":
@@ -73,6 +77,16 @@ class NativeRpcError(ValueError):
     def __init__(self, method, error):
         super().__init__("native_request_rejected:" + method)
         self.method, self.error = method, error
+
+
+class NativeTerminalTurnError(RuntimeError):
+    """The exact original native turn has an authenticated failure outcome."""
+    def __init__(self, *, status, native_session_ref, stdout, checkpoint):
+        super().__init__("provider_native_turn_" + status)
+        self.status = status
+        self.native_session_ref = native_session_ref
+        self.stdout = stdout
+        self.checkpoint = checkpoint
 
 
 class NativeCodexBridge:
@@ -352,12 +366,9 @@ class NativeCodexBridge:
             self.request("initialize", {"clientInfo": {"name": "meta_research", "version": "1.0"},
                 "capabilities": {"experimentalApi": True}})
             self._send({"method": "initialized"})
-            # A new app-server connection does not have the thread loaded.
-            # Resume loads the exact native history; no turn/start is sent.
-            resumed = self.request("thread/resume", {"threadId": start["thread_id"],
-                "approvalPolicy": "never"})
-            if not isinstance(resumed, dict) or resumed.get("thread", {}).get("id") != start["thread_id"]:
-                return False
+            # thread/read reads persisted rollout history without activating
+            # the root or its required MCP servers. A metadata check must not
+            # revive an old capability grant just to discover a terminal turn.
             response = self.request("thread/read", {"threadId": start["thread_id"], "includeTurns": True})
             thread = response.get("thread", {}) if isinstance(response, dict) else {}
             if thread.get("id") != start["thread_id"]:
@@ -375,15 +386,15 @@ class NativeCodexBridge:
                         for item in turn.get("items", []))
                 if matches:
                     candidates.append(turn)
-            if len(candidates) != 1 or candidates[0].get("status") != "completed":
+            if len(candidates) != 1 or candidates[0].get("status") not in {"completed", "failed", "interrupted"}:
                 return False
             turn = candidates[0]
             messages = [item.get("text") for item in turn.get("items", []) if item.get("type") == "agentMessage"]
-            if not messages or not isinstance(messages[-1], str):
+            if turn["status"] == "completed" and (not messages or not isinstance(messages[-1], str)):
                 return False
             self._save_state(self.directory / "native-reconciled.json", {
                 "start_hash": canonical_hash(start), "thread_id": thread["id"],
-                "turn": turn, "last_message": messages[-1]})
+                "turn": turn, "last_message": messages[-1] if messages else None})
             return True
         finally:
             self.process.stdin.close()
@@ -396,8 +407,10 @@ class NativeCodexBridge:
 def reconcile_native_operation(directory):
     """Read the original native turn; never start/resume a business turn.
 
-    Returns exact final message, native identity and translated public native
-    item records. The original supervisor spool and exit seal stay unchanged.
+    Completed turns return the exact message, native identity and public native
+    item records. Failed/interrupted turns raise NativeTerminalTurnError with
+    their signed actual outcome. Only a still unresolved turn returns None.
+    The original supervisor spool and exit seal stay unchanged.
     """
     directory = Path(directory)
     start_path, reconciled_path = directory / "native-turn-start.json", directory / "native-reconciled.json"
@@ -405,11 +418,32 @@ def reconcile_native_operation(directory):
         return None
     _key_path, key = read_transport_key_for_operation(directory)
     start = read_transport_envelope(start_path, key)
+    parameters = start.get("parameters")
+    if (set(start) != {"thread_id", "client_user_message_id", "parameters"}
+            or not isinstance(start.get("thread_id"), str) or not start["thread_id"]
+            or not isinstance(parameters, dict) or parameters.get("threadId") != start["thread_id"]
+            or parameters.get("clientUserMessageId") != start.get("client_user_message_id")
+            or not isinstance(parameters.get("input"), list) or len(parameters["input"]) != 1
+            or not isinstance(parameters["input"][0], dict) or parameters["input"][0].get("type") != "text"
+            or not isinstance(parameters["input"][0].get("text"), str)
+            or start.get("client_user_message_id") != "native_input_" + canonical_hash({
+                "directory": str(directory), "prompt": parameters["input"][0]["text"]})):
+        raise ValueError("native_reconciliation_start_invalid")
+    original = read_transport_envelope(directory / "native-provider-argv.json", key)
+    if (set(original) != {"argv"} or not isinstance(original["argv"], list)
+            or not all(isinstance(argument, str) for argument in original["argv"])):
+        raise ValueError("native_provider_identity_invalid")
+    _settings(original["argv"])
     if not reconciled_path.exists():
         environment = dict(os.environ)
         environment_path = directory / "native-provider-environment.json"
         if environment_path.exists():
-            environment.update(read_transport_envelope(environment_path, key))
+            saved_environment = read_transport_envelope(environment_path, key)
+            allowed = {"CODEX_HOME", "CODEX_SQLITE_HOME", "HOME", "USERPROFILE", "XDG_CONFIG_HOME",
+                       "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"}
+            if set(saved_environment) - allowed or any(not isinstance(value, str) for value in saved_environment.values()):
+                raise ValueError("native_reconciliation_environment_invalid")
+            environment.update(saved_environment)
         try:
             process = subprocess.run([sys.executable, "-m", __name__, "--provider-argv",
                 str(directory / "native-provider-argv.json"), "--operation-directory", str(directory),
@@ -420,19 +454,41 @@ def reconcile_native_operation(directory):
         if process.returncode != 0 or not reconciled_path.exists():
             return None
     recovered = read_transport_envelope(reconciled_path, key)
+    turn = recovered.get("turn")
     if (recovered.get("start_hash") != canonical_hash(start)
             or recovered.get("thread_id") != start.get("thread_id")
-            or recovered.get("turn", {}).get("status") != "completed"):
+            or not isinstance(turn, dict) or turn.get("status") not in {"completed", "failed", "interrupted"}
+            or not isinstance(turn.get("id"), str) or not turn["id"]
+            or turn.get("error") is not None and not isinstance(turn["error"], dict)):
         raise ValueError("native_reconciliation_identity_invalid")
+    status = turn["status"]
+    if status == "completed" and not isinstance(recovered.get("last_message"), str):
+        raise ValueError("native_reconciliation_message_invalid")
+    known_path = directory / "native-turn-id.json"
+    if known_path.exists():
+        known = read_transport_envelope(known_path, key)
+        if known.get("thread_id") != recovered["thread_id"] or known.get("turn_id") != turn["id"]:
+            raise ValueError("native_reconciliation_identity_invalid")
     events = [{"type": "thread.started", "thread_id": recovered["thread_id"]}]
     for item in recovered["turn"].get("items", []):
         translated = _exec_item(item)
         if translated is not None:
             events.append({"type": "item.completed", "thread_id": recovered["thread_id"],
                 "turn_id": recovered["turn"]["id"], "item": translated})
-    events.append({"type": "turn.completed", "turn_id": recovered["turn"]["id"],
+    events.append({"type": "turn.completed" if status == "completed" else "turn.failed",
+        "turn_id": turn["id"], "error": turn.get("error"),
         "native_reconciliation_ref": canonical_hash(recovered)})
-    return recovered["last_message"], recovered["thread_id"], "\n".join(json.dumps(item, ensure_ascii=False) for item in events) + "\n"
+    stdout = "\n".join(json.dumps(item, ensure_ascii=False) for item in events) + "\n"
+    if status != "completed":
+        request_path = directory / "supervisor-request.json"
+        request = read_supervisor_request(request_path, key) if request_path.exists() else {}
+        raise NativeTerminalTurnError(status=status, native_session_ref=recovered["thread_id"], stdout=stdout,
+            checkpoint={"schema_ref": "meta-research/provider-native-turn-terminal/v1",
+                "supervisor_invocation_hash": request.get("invocation_hash"),
+                "native_session_ref": recovered["thread_id"], "native_turn_ref": turn["id"],
+                "native_turn_status": status, "native_error": turn.get("error"),
+                "native_start_hash": canonical_hash(start), "native_reconciliation_hash": canonical_hash(recovered)})
+    return recovered["last_message"], recovered["thread_id"], stdout
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-argv", required=True, type=Path)

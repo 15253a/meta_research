@@ -65,7 +65,7 @@ def test_stage_note_pointer_is_callable_without_stripping_display_arguments(tmp_
         view = stage_context_view("bundle", request.context_pack,
             context_pack_ref=request.context_pack_ref,
             context_pack_hash=request.context_pack_hash)
-        assert view["summary_only"] is True
+        assert view["section_delivery"]["accepted_formal_plan_binding"] == "complete"
         pointer = dict(view["research_notes_reader"])
         operation = pointer.pop("operation")
         gateway = _notes_gateway(runtime)

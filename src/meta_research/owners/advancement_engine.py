@@ -3,6 +3,7 @@ from __future__ import annotations
 from meta_research.context_presentation import literature_reference, reasoning_handoff_reference
 from meta_research.cycle_position import validate_cycle_position
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -3104,7 +3105,7 @@ class SQLiteAdvancementEngine(
             if operation.status == "aborted":
                 raise OwnerConflict("foreground_control_repreview_required")
             try:
-                control = decoded_object(operation.command_json)
+                control = validate_control_payload(decoded_object(operation.command_json))
             except (TypeError, ValueError) as error:
                 raise OwnerConflict("foreground_control_operation_invalid") from error
             target = cast(dict[str, object], control.get("target"))
@@ -3411,7 +3412,6 @@ class SQLiteAdvancementEngine(
                     {"cycle_ref": operation.target_cycle_ref},
                 ).first()
                 if target_cycle is None:
-                    control = decoded_object(operation.command_json)
                     source_position = self.query_cycle_position(operation.source_cycle_ref)
                     position = {"cycle_ref": operation.target_cycle_ref,
                                 "round": source_position["round"] + 1,
@@ -7261,6 +7261,9 @@ class SQLiteAdvancementEngine(
             if closure_output is not None:
                 notes = contract.get("notes")
                 if notes is not None and not isinstance(notes, str):
+                    raise OwnerConflict("bundle_stage_notes_invalid")
+                if (notes is not None and contract.get("notes_text_hash")
+                        != hashlib.sha256(notes.encode("utf-8")).hexdigest()):
                     raise OwnerConflict("bundle_stage_notes_invalid")
                 closure_output.update(_bundle_stage_report_closure(accepted, notes=notes))
                 if notes is not None:

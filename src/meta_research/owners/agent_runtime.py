@@ -10295,6 +10295,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             return
 
         recoverable_terminal = isinstance(provider_exit, dict) and (
+            provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1"
+            or
             (
                 provider_exit.get("schema_ref")
                 == "meta-research/provider-terminal-contract-failure/v1"
@@ -11146,8 +11148,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             row = connection.execute(text(
                 "SELECT s.*,r.context_pack_ref,r.context_pack_hash,r.request_ref,c.status AS control_status "
                 "FROM ar_stage_attempt_replacements x JOIN ar_run_controls c ON c.run_ref=x.run_ref "
-                "JOIN ar_stage_runs r ON r.run_ref=x.run_ref JOIN ar_safe_points s ON "
+                "JOIN ar_stage_runs r ON r.run_ref=x.run_ref LEFT JOIN ar_safe_points s ON "
                 "s.run_ref=x.run_ref AND s.attempt_ref=x.retired_attempt_ref "
+                "AND s.root_session_ref=c.root_session_ref "
+                "AND CASE WHEN json_valid(s.checkpoint_json) THEN "
+                "json_extract(s.checkpoint_json,'$.action') END='native_session_replacement' "
                 "WHERE x.replacement_attempt_ref=:attempt AND x.run_ref=:run "
                 "AND x.reason_code='native_session_unavailable' AND c.attempt_ref=:attempt "
                 "AND c.fence_ref=:fence ORDER BY s.created_at DESC LIMIT 1"
@@ -11156,6 +11161,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 return None
             if row.control_status != "running":
                 raise OwnerConflict("native_session_replacement_stale")
+            if row.safe_point_ref is None:
+                raise OwnerConflict("native_session_replacement_context_invalid")
             checkpoint = decoded_object(row.checkpoint_json)
             if (canonical_hash(checkpoint) != row.checkpoint_hash
                     or checkpoint.get("action") != "native_session_replacement"
@@ -11238,14 +11245,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "provider_unit_ref": checkpoint.get("provider_unit_ref"),
                 "failure_code": checkpoint.get("failure", {}).get("code"),
                 "detail_code": code,
-                "repair_hint": {
+                "repair_hint": (
+                    "The original native turn ended " + provider_exit["native_turn_status"]
+                    + "; continue the exact work in the same native session. Native error: "
+                    + canonical_json(provider_exit["native_error"])
+                    + ". Reconcile original external effects before repeating them."
+                    if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
                     "bundle_operation_inputs_changed": "旧输出针对旧 frontier/state/commit 快照；根据当前快照重新判断并保留已接纳事实。这表示决策输入已变化，不表示科学证据无效或输出格式错误。",
                     "reuse_receipt_invalid": "candidate.route.reuse_receipt: use the verified reuse-eligibility receipt for this candidate; TargetCommit acceptance is a different receipt.",
                     "candidate_measurement_cell_not_required": "candidate.measurement_contract: select a measurement cell present in the frozen NormalizedCompletionContract.",
                     "candidate_held_fixed_binding_incomplete": "candidate.held_fixed: provide the bindings for every declared controlled variable.",
                     "bundle_dispatch_target_not_in_frontier": "dispatch: select a currently authorized frontier target; use null selected_target_ref for wait/replan_required.",
-                }.get(code, "Correct the reported contract failure in the retained previous output; preserve accepted facts and current source bindings."),
+                }.get(code, "Correct the reported contract failure in the retained previous output; preserve accepted facts and current source bindings.")),
             }
 
     def _record_stage_provider_correction(
@@ -11263,6 +11275,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if not unit_ref or len(unit_ref) > 96:
             raise OwnerConflict("stage_provider_correction_invalid")
         native_replacement = provider_exit.get("schema_ref") == "meta-research/provider-native-session-unavailable/v1"
+        native_terminal = provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1"
+        bind_initial_native = False
         now = time.time()
         effect: RuntimeEffectIdentity | None = None
         with self._database.write() as connection:
@@ -11302,7 +11316,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 failure_code=failure_code,
                 provider_exit=provider_exit,
             )
-            if native_replacement:
+            if native_replacement or native_terminal:
                 session = connection.execute(text(
                     "SELECT * FROM ar_stage_sessions WHERE session_ref=:session"
                 ), {"session": stage_run.root_session_ref}).one()
@@ -11310,10 +11324,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "SELECT 1 FROM ar_provider_units WHERE run_ref=:run AND unit_ref!=:unit "
                     "AND status IN ('active','revocation_pending') LIMIT 1"
                 ), {"run": run_ref, "unit": unit_ref}).first()
-                if (session.native_session_ref != provider_exit["native_session_ref"]
+                if native_terminal and session.native_session_ref is None:
+                    bound_run, bound_attempt, _session, bound_fence = _load_stage_fence(
+                        connection, run_ref, attempt_ref, fence_ref)
+                    primary, _review = _provider_invocations(connection, bound_run, bound_attempt, bound_fence)
+                    bind_initial_native = (unit.unit_kind == stage_run.stage + "_primary"
+                        and primary.invocation_ref == unit.unit_ref and primary.operation_ref == unit.operation_ref
+                        and primary.status == "prepared" and bound_attempt.primary_draft_json is None
+                        and bound_attempt.payload_json is None)
+                if ((session.native_session_ref != provider_exit["native_session_ref"] and not bind_initial_native)
                         or session.status != "active" or other_unit is not None
                         or _managed_run_has_pending_root_human_request(connection, control)):
                     raise OwnerConflict("native_session_replacement_stale")
+                if bind_initial_native and connection.execute(text(
+                        "SELECT 1 FROM ar_stage_sessions WHERE native_session_ref=:native "
+                        "AND session_ref!=:session LIMIT 1"),
+                        {"native": provider_exit["native_session_ref"], "session": session.session_ref}).first() is not None:
+                    raise OwnerConflict("native_session_conflict")
             effect = _provider_runtime_effect(
                 unit_ref=str(unit.unit_ref),
                 operation_ref=str(unit.operation_ref),
@@ -11375,6 +11402,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "now": now,
                 },
             )
+            if bind_initial_native:
+                # This safe point is the sole accepted source for the first
+                # native identity learned from a reconciled terminal turn.
+                try:
+                    connection.execute(text("UPDATE ar_stage_sessions SET native_session_ref=:native,updated_at=:now "
+                        "WHERE session_ref=:session AND native_session_ref IS NULL AND status='active'"),
+                        {"native": provider_exit["native_session_ref"], "session": session.session_ref, "now": now})
+                except IntegrityError as error:
+                    raise OwnerConflict("native_session_conflict") from error
             connection.execute(
                 text(
                     "UPDATE ar_execution_fences SET status = 'rejected', "
@@ -32990,9 +33026,31 @@ def _validated_stage_provider_hard_ceiling(
                 or not isinstance(provider_exit.get("native_session_ref"), str)
                 or not 1 <= len(provider_exit["native_session_ref"]) <= 256
                 or any(not _is_sha256(provider_exit.get(field)) for field in hash_fields)
-                or provider_exit.get("result_file_hash") is not None):
+                or (provider_exit.get("result_file_hash") is not None
+                    and not _is_sha256(provider_exit["result_file_hash"]))):
             raise OwnerConflict("stage_provider_hard_ceiling_invalid")
         return decoded_object(canonical_json(provider_exit))
+    if schema_ref == "meta-research/provider-native-turn-terminal/v1":
+        expected_fields.update({"native_session_ref", "supervisor_invocation_hash", "native_start_hash",
+            "native_reconciliation_hash", "native_turn_ref", "native_turn_status", "native_error"})
+        hash_fields = expected_fields - {"schema_ref", "termination_reason", "result_file_hash",
+            "native_session_ref", "native_turn_ref", "native_turn_status", "native_error"}
+        if (failure_code != "codex_operation_failed" or unit_kind not in _PROVIDER_UNIT_RUN_KINDS
+                or set(provider_exit) != expected_fields
+                or provider_exit.get("termination_reason") != "completed"
+                or provider_exit.get("native_turn_status") not in {"failed", "interrupted"}
+                or (provider_exit.get("result_file_hash") is not None
+                    and not _is_sha256(provider_exit["result_file_hash"]))
+                or any(not _is_sha256(provider_exit.get(field)) for field in hash_fields)
+                or provider_exit.get("supervisor_invocation_hash") != provider_exit.get("invocation_hash")
+                or any(not isinstance(provider_exit.get(field), str) or not 1 <= len(provider_exit[field]) <= 256
+                    for field in ("native_session_ref", "native_turn_ref"))
+                or (provider_exit.get("native_error") is not None and not isinstance(provider_exit["native_error"], dict))):
+            raise OwnerConflict("stage_provider_hard_ceiling_invalid")
+        try:
+            return decoded_object(canonical_json(provider_exit))
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("stage_provider_hard_ceiling_invalid") from error
     schema_valid = False
     expected_reasons: frozenset[str] = frozenset()
     if schema_ref == "meta-research/provider-hard-ceiling/v1":

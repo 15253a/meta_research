@@ -9,7 +9,7 @@ from meta_research.external_mcp_client import ExternalMcpClientError
 
 from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, StageGuidanceOperation, GUIDANCE_ROOT_KINDS, guidance_prompt)
 
-from meta_research.context_presentation import stage_context_view, stage_context_json, stage_position_prompt
+from meta_research.context_presentation import stage_context_json, stage_position_prompt, STAGE_CONTEXT_DELIVERY_GUIDANCE
 from meta_research.root_workspace import RootWorkspaces, WorkspaceBinding
 from meta_research.semantic_mcp import SemanticCallContext, SemanticMcpError
 
@@ -1796,7 +1796,7 @@ class CodexIdeaSkillAdapter:
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
         primary_prompt = (
-            stage_position_prompt(request, "idea") + stage_replacement_prompt(request) +
+            stage_position_prompt(request, "idea") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{skill}\n\n"
             f"{human_resume}"
             "在当前原根连续完成研究、自主组织原生子智能体独立审阅、聚合反馈并修订后，"
@@ -1855,6 +1855,9 @@ class CodexIdeaSkillAdapter:
     def review_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
+        # Root policy organizes advisory review before returning a candidate.
+        # This retained adapter seam validates/checkpoints that candidate; it
+        # neither launches a review turn nor attests a review/approval event.
         if request.runtime_binding != self.runtime_binding():
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
@@ -2556,8 +2559,11 @@ class CodexIdeaSkillAdapter:
             argv.append("-")
         else:
             argv.extend(["resume", native_session_ref, "-"])
-        argv = live_native_argv(argv, directory, enabled=isinstance(runner, _CancellableProcessRunner))
         try:
+            try:
+                argv = live_native_argv(argv, directory, enabled=isinstance(runner, _CancellableProcessRunner))
+            except (OSError, ValueError, KeyError, TypeError, ProviderSupervisorError) as error:
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
             environment = (
                 {
                     _SEMANTIC_MCP_TOKEN_ENV: cast(str, mcp_token),
@@ -3462,8 +3468,23 @@ def _read_completed_operation(
     if native_failure is not None:
         raise native_failure
     if marker.get("returncode") == 75 and (directory / "native-turn-start.json").is_file():
-        from meta_research.native_codex_bridge import reconcile_native_operation
-        recovered = reconcile_native_operation(directory)
+        from meta_research.native_codex_bridge import reconcile_native_operation, NativeTerminalTurnError
+        try:
+            recovered = reconcile_native_operation(directory)
+        except NativeTerminalTurnError as error:
+            proof = error.checkpoint
+            if (proof.get("supervisor_invocation_hash") != marker.get("invocation_hash")
+                    or proof.get("native_session_ref") != error.native_session_ref
+                    or proof.get("native_turn_status") not in {"failed", "interrupted"}
+                    or native_session_ref is not None and error.native_session_ref != native_session_ref):
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+            checkpoint = {**_provider_hard_ceiling_checkpoint(marker), **proof}
+            raise IdeaSkillUnavailable("codex_operation_failed", recovery_checkpoint=checkpoint,
+                native_session_ref=error.native_session_ref) from error
+        except subprocess.TimeoutExpired as error:
+            raise IdeaSkillUnavailable("codex_operation_reconciliation_pending") from error
+        except (OSError, ValueError, KeyError, TypeError, ProviderSupervisorError) as error:
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
         if recovered is None:
             raise IdeaSkillUnavailable("codex_operation_reconciliation_pending")
         final_text, recovered_session, stdout = recovered

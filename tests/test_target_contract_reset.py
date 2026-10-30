@@ -72,13 +72,13 @@ def test_prompt_contains_complete_frozen_contract_and_scope_checks():
     from meta_research.target_execution_contract import target_execution_context
     from meta_research.target_run_runtime import TargetRunRuntime
     candidate, plan, handle, _, request = _records()
-    launch = SimpleNamespace(graph_ref="graph-a", request=request)
+    launch = SimpleNamespace(graph_ref="graph-a", stage_request_ref="stage-request:target", request=request)
     authority = _measurement_authority(handle.target_ref, launch)
     contract = target_execution_context(authority=authority, target_ref=handle.target_ref,
         graph_ref=launch.graph_ref, target_spec_hash=SOURCE_SPEC_HASH)
     prompt = TargetRunRuntime._root_prompt(execution_contract=contract, handle=handle,
         candidate=candidate, formal_plan=plan, launch=launch, frozen_input_manifest_path="/frozen/inputs.json",
-        research_context={"cycle_position": {"cycle_ref": "cycle:target", "round": 1,
+        research_context={"cycle_ref": "cycle:target", "graph_ref": launch.graph_ref, "stage_request_ref": launch.stage_request_ref, "target_ref": handle.target_ref, "cycle_position": {"cycle_ref": "cycle:target", "round": 1,
             "cycle_focus": "Evaluate frozen protocol", "focus_source": {"request_ref": "fixture-start"}}})
     context = json.loads(prompt.split("Exact Owner context:\n", 1)[1])
     frozen = context["execution_contract"]["measurement_contract"]

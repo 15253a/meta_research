@@ -1,7 +1,7 @@
 """Exact current scientific inputs with bounded optional discovery views.
 
-The source objects remain immutable. Every omitted region is explicitly a
-preview, and the authenticated stage_context reader can return its exact bytes.
+The source objects remain immutable. Optional projections distinguish previews
+and omitted regions; the authenticated reader can return their exact bytes.
 """
 from __future__ import annotations
 
@@ -16,6 +16,12 @@ HISTORY_LIMIT = 12
 LITERATURE_LIMIT = 24
 CONTEXT_VIEW_MAX_BYTES = 64 * 1024
 LOGGER = logging.getLogger(__name__)
+STAGE_CONTEXT_DELIVERY_GUIDANCE = (
+    "section_delivery=complete 的 section 与 required_material 是完整、准确的 Owner 冻结正文，"
+    "其中当前科学输入、合同与 notes 可直接用于本次研究判断。"
+    "section_delivery=preview 或 omitted 仅标注可选发现视图的裁剪或省略；"
+    "需要这些缺省部分时，按对应精确 reader 补取，不能把预览当作完整原文。\n"
+)
 _STAGE_SCIENTIFIC_INPUTS = {
     "idea": frozenset({"prior_accepted_bindings"}),
     "plan": frozenset(),  # The adapter supplies the exact IdeaSet once.
@@ -107,7 +113,13 @@ def literature_reference(binding: dict | None) -> dict | None:
 
 def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                        context_pack_hash: str, _observe: bool = True) -> dict[str, object]:
-    """Construct a bounded preview without altering any frozen authority."""
+    """Deliver exact current science and label each optional section's completeness."""
+    previewed_sections: set[str] = set()
+
+    def mark_preview(path: list[str | int]) -> None:
+        if path:
+            previewed_sections.add(str(path[0]))
+
     def reader(path: list[str | int]) -> dict:
         return {"operation": "research_memory.stage_context.read",
                 "context_pack_ref": context_pack_ref, "source": "context_pack",
@@ -116,6 +128,7 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
     def preview(value: object, path: list[str | int], depth: int = 0) -> object:
         if isinstance(value, str):
             if len(value.encode()) > 2048:
+                mark_preview(path)
                 return {**bounded_text(value, 2048), "reader": reader(path)}
             return value
         if isinstance(value, list):
@@ -129,9 +142,11 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                 return transformed
             page.update(total_count=len(value), truncated=True,
                         next_offset=page["shown_count"], next_offset_unit="items")
+            mark_preview(path)
             return page
         if isinstance(value, dict):
             if depth >= 6:
+                mark_preview(path)
                 return {"summary_only": True, "field_names": list(value)[:16],
                         "field_count": len(value), "reader": reader(path)}
             result = {}
@@ -139,11 +154,15 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                 # Proofs stay exact in the Owner object. Agents can read them
                 # on demand; repeating large receipt trees is not research.
                 if key in {"target_spec", "result_schema", "measurement_authority", "accepted_measurement_closures"}:
+                    mark_preview(path)
                     result[key] = {"summary_only": True, "reader": reader(path + [key])}
                 elif stage == "plan" and key == "idea_set":
+                    mark_preview(path)
                     result[key] = {"provided_as": "accepted_idea_set", "reader": reader(path + [key])}
                 elif "receipt" in key and isinstance(item, dict):
                     result[key] = {k: item[k] for k in ("receipt_ref", "payload_hash", "issuer", "kind") if k in item}
+                    if result[key] != item:
+                        mark_preview(path)
                 else:
                     result[key] = preview(item, path + [key], depth + 1)
             return result
@@ -161,10 +180,12 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
         else:
             sections[name] = preview(value, [name])
     view = {"schema_ref": "meta-research/stage-context-presentation/v1",
-            "stage": stage, "summary_only": True,
+            "stage": stage,
             "source_context_pack_ref": context_pack_ref,
             "source_context_pack_hash": context_pack_hash,
-            "reader": reader([]), "sections": sections}
+            "reader": reader([]), "sections": sections,
+            "section_delivery": {name: "preview" if name in previewed_sections else "complete"
+                                 for name in sections}}
     view["research_notes_reader"] = {**reader([]), "operation": "research_memory.research_notes.read", "source": "research_notes",
                                      "index_offset": 0}
     from meta_research.human_research_context import human_research_reader
@@ -248,6 +269,7 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
             raise ValueError("context_presentation_identity_too_large")
         _, key = max(candidates)
         sections[key] = {"omitted_from_preview": True, "reader": reader([key])}
+        view["section_delivery"][key] = "omitted"
     # The context budget covers optional reading views. Current contracts and
     # selected actual input manifests retain every byte even when individually
     # larger than that budget; their size depends on this task, not all Cycles.

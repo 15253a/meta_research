@@ -35,6 +35,8 @@ def adapter(tmp_path):
 
 def request(binding):
     return BundleDispatchRequest(
+        cycle_ref="cycle:bundle-1",
+        cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Review frozen inputs", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref='stage-request:1', run_ref='bundle-run:1', attempt_ref='bundle-attempt:1', fence_ref='bundle-fence:1', graph_ref='target-graph:1', generation=1,
         frontier=({'target_ref':'target:followup','target_key':'followup'},),
         state={'schema_ref':'meta-research/bundle-dispatch-state/v1','target_commit_refs':[],'running_targets':[],'blocked_targets':[]},

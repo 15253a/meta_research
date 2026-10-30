@@ -990,6 +990,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     result = adapter.execute(request)
     validate_bundle_skill_result(request, result)
     dispatch_request = BundleDispatchRequest(
+        cycle_ref="cycle:bundle-1",
         cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref=request.stage_request_ref,
         run_ref="bundle-run:1",
@@ -1016,6 +1017,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     )
     dispatch = adapter.schedule_target(dispatch_request)
     batch_request = BundleTargetBatchRequest(
+        cycle_ref="cycle:bundle-1",
         cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
             stage_request_ref=request.stage_request_ref,
             run_ref="bundle-run:1",
@@ -1971,6 +1973,7 @@ def test_bundle_large_rolling_prompt_reaches_the_public_batch_operation(
         for commit in target_commits
     )
     request = BundleTargetBatchRequest(
+        cycle_ref="cycle:bundle-1",
         cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref="stage-request:bundle-large-rolling",
         run_ref="bundle-run:large-rolling",
