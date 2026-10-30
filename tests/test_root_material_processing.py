@@ -177,7 +177,8 @@ def test_receiving_research_root_chooses_custody_and_successor_reads_retained_us
         def generate_draft(self, request):
             context = _context(request, "idea")
             channel = _channel(self.runtime, context)
-            with TestClient(create_app(self.runtime, base_url="http://testserver", control_key="control")) as client:
+            client = TestClient(create_app(self.runtime, base_url="http://testserver", control_key="control"))
+            try:
                 headers = _login(client, self.runtime)
                 selection = client.get("/api/v1/server-materials/inspect", params={"path": str(source)}).json()
                 if source_kind == "request":
@@ -235,6 +236,8 @@ def test_receiving_research_root_chooses_custody_and_successor_reads_retained_us
                 public = client.get(f"/api/v1/work-materials/{reference}").json()
                 assert public["treatments"][0] == treatment
                 observed.update(treatment=treatment, reference=reference, context=context)
+            finally:
+                client.close()
             return super().generate_draft(request)
     provider = ProcessDuringIdea()
     runtime = _make(tmp_path / "runtime", idea=provider)
