@@ -77,7 +77,9 @@ def test_prompt_contains_complete_frozen_contract_and_scope_checks():
     contract = target_execution_context(authority=authority, target_ref=handle.target_ref,
         graph_ref=launch.graph_ref, target_spec_hash=SOURCE_SPEC_HASH)
     prompt = TargetRunRuntime._root_prompt(execution_contract=contract, handle=handle,
-        candidate=candidate, formal_plan=plan, launch=launch, frozen_input_manifest_path="/frozen/inputs.json")
+        candidate=candidate, formal_plan=plan, launch=launch, frozen_input_manifest_path="/frozen/inputs.json",
+        research_context={"cycle_position": {"cycle_ref": "cycle:target", "round": 1,
+            "cycle_focus": "Evaluate frozen protocol", "focus_source": {"request_ref": "fixture-start"}}})
     context = json.loads(prompt.split("Exact Owner context:\n", 1)[1])
     frozen = context["execution_contract"]["measurement_contract"]
     assert frozen["protocol_version"]["required_metrics"][0]["metric_key"] == "effect"

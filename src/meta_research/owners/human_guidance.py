@@ -20,6 +20,10 @@ from meta_research.runtime_conditions import read_runtime_conditions
 
 
 class HumanGuidanceMixin:
+    def prepare_live_guidance(self, *, scope, binding):
+        from meta_research.owners.live_guidance import prepare_live_guidance
+        return prepare_live_guidance(self, scope=scope, binding=binding)
+
     def bind_reasoning_completion_conditions(
         self, *, operation: StageGuidanceOperation, submission_ref: str,
         output: dict[str, object], payload_hash: str,
@@ -281,6 +285,7 @@ class HumanGuidanceMixin:
                 "semantic_scope": guide["guidance"].get("semantic_scope"),
                 "preserve_conditions": guide["guidance"].get("preserve_conditions", []),
                 "scope_confirmation": delivery.scope_confirmation,
+                "guidance_status": delivery.guidance_status,
                 "applies_to_work": delivery.applies_to_work,
                 "background_only": not delivery.applies_to_work,
                 "text": document[offset:end].decode("utf-8"), "offset": offset,
@@ -356,11 +361,6 @@ class HumanGuidanceMixin:
             if (impact == "requires_evolution" and confirmed_scope is not None
                     and confirmed_scope["kind"] != "quest"):
                 raise OwnerConflict("guidance_goal_scope_confirmation_required")
-            row = connection.execute(text(
-                "SELECT read_at FROM hc_guidance_deliveries WHERE delivery_ref=:delivery_ref"
-            ), {"delivery_ref": delivery_ref}).one()
-            if row.read_at is None:
-                raise OwnerConflict("guidance_exact_read_required")
             if resolves_receipts:
                 assessments = {item["receipt"]["receipt_ref"]: item for item in current_guidance_assessments(
                     connection, constraint_ref=guide["constraint_ref"], revision=guide["revision"],
@@ -415,7 +415,8 @@ class HumanGuidanceMixin:
             raise OwnerConflict("guidance_snapshot_missing")
         self.verify_frozen_guidance_binding(binding)
         self._agent_runtime.verify_guidance_read_scope(scope, binding, reconcile=reconcile)
-        return self.recover_operation_guidance(binding.identity)
+        from meta_research.owners.live_guidance import with_live_deliveries
+        return with_live_deliveries(self, self.recover_operation_guidance(binding.identity))
 
     def query_guidance_deliveries(self, constraint_ref: str) -> list[dict[str, object]]:
         with self._database.read() as connection:
@@ -510,6 +511,7 @@ def _cut(row) -> FrozenGuidanceCut:
         item["delivery_ref"], canonical_json(item["guide"]), item["needs_treatment"],
         None if item["prior_treatment"] is None else canonical_json(item["prior_treatment"]),
         item.get("applies_to_work", True), item.get("scope_confirmation", "legacy_unconfirmed"),
+        item.get("guidance_status", "active"),
     ) for item in payload["deliveries"]), direction_cut)
 
 
@@ -527,6 +529,7 @@ def _summary(delivery):
         "strength": guide["guidance"].get("strength", 3),
         "semantic_scope": guide["guidance"].get("semantic_scope"),
         "scope_confirmation": delivery.scope_confirmation,
+        "guidance_status": delivery.guidance_status,
         "applies_to_work": delivery.applies_to_work,
         "background_only": not delivery.applies_to_work,
         "needs_treatment": delivery.needs_treatment,

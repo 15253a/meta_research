@@ -1,6 +1,7 @@
 from copy import deepcopy
 from dataclasses import replace
 import json
+import hashlib
 
 import pytest
 
@@ -244,6 +245,8 @@ def test_late_strategy_notes_are_accepted_and_reach_reasoning_prompt(tmp_path, s
         assert contract["notes"] == LATE_NOTE
         assert contract["notes_source_ref"] == proposal.proposal_ref
         assert contract["notes_source_hash"] == canonical_hash(proposal.proposal)
+        assert contract["notes_text_hash"] == hashlib.sha256(LATE_NOTE.encode("utf-8")).hexdigest()
+        assert contract["notes_text_hash"] != contract["notes_source_hash"]
         _reasoning_prompt(tmp_path / "downstream", {key: contract[key] for key in ("notes", "notes_source_ref", "notes_source_hash")})
     finally:
         runtime.close()

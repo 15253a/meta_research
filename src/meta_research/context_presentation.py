@@ -1,4 +1,4 @@
-"""Bounded reading views; never an Owner acceptance payload or evidence proof.
+"""Exact current scientific inputs with bounded optional discovery views.
 
 The source objects remain immutable. Every omitted region is explicitly a
 preview, and the authenticated stage_context reader can return its exact bytes.
@@ -16,6 +16,13 @@ HISTORY_LIMIT = 12
 LITERATURE_LIMIT = 24
 CONTEXT_VIEW_MAX_BYTES = 64 * 1024
 LOGGER = logging.getLogger(__name__)
+_STAGE_SCIENTIFIC_INPUTS = {
+    "idea": frozenset({"prior_accepted_bindings"}),
+    "plan": frozenset(),  # The adapter supplies the exact IdeaSet once.
+    "bundle": frozenset({"accepted_formal_plan_binding"}),
+    "reasoning": frozenset({"plan_evidence_input", "upstream_stage_closure",
+                            "accepted_target_commit_closures", "current_target_evidence_closure"}),
+}
 _REQUIRED_CURRENT_MATERIAL = frozenset({
     "execution_contract", "measurement_contract", "selected_input_manifest",
     "frozen_input_manifest",
@@ -99,7 +106,7 @@ def literature_reference(binding: dict | None) -> dict | None:
 
 
 def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
-                       context_pack_hash: str) -> dict[str, object]:
+                       context_pack_hash: str, _observe: bool = True) -> dict[str, object]:
     """Construct a bounded preview without altering any frozen authority."""
     def reader(path: list[str | int]) -> dict:
         return {"operation": "research_memory.stage_context.read",
@@ -144,11 +151,12 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
 
     sections = {}
     required_material = {}
+    scientific_inputs = _STAGE_SCIENTIFIC_INPUTS.get(stage, frozenset()) | {"cycle_position"}
     for name, value in context_pack.items():
         if name in _REQUIRED_CURRENT_MATERIAL:
             required_material[name] = value
             continue
-        if name in {"schema_ref", "cycle_ref", "foreground_epoch"}:
+        if name in scientific_inputs or name in {"schema_ref", "cycle_ref", "foreground_epoch"}:
             sections[name] = value
         else:
             sections[name] = preview(value, [name])
@@ -174,7 +182,7 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
     # completion/proof tree is too large for a preview page. These excerpts
     # retain the exact path into the frozen source and are not new authority.
     current_notes = []
-    if isinstance(predecessors, list):
+    if "prior_accepted_bindings" not in scientific_inputs and isinstance(predecessors, list):
         for index, binding in enumerate(predecessors[:3]):
             if not isinstance(binding, dict) or not isinstance(binding.get("commit_ref"), str):
                 continue
@@ -198,7 +206,7 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                            "source_ref": binding["commit_ref"]},
             })
     upstream = context_pack.get("upstream_stage_closure", [])
-    if isinstance(upstream, list):
+    if "upstream_stage_closure" not in scientific_inputs and isinstance(upstream, list):
         for index in range(max(0, len(upstream) - 3), len(upstream)):
             binding = upstream[index]
             if not isinstance(binding, dict) or not isinstance(binding.get("closure"), dict):
@@ -228,9 +236,14 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
     # A few large current obligations can still exceed the aggregate budget.
     # Replace the largest previews by exact read pointers, never silently trim
     # the Owner's source or pretend the preview satisfies an evidence gate.
-    while len(_json(view).encode()) > CONTEXT_VIEW_MAX_BYTES:
+    def optional_view_bytes():
+        return len(_json({**view, "sections": {key: value for key, value in sections.items()
+                                             if key not in scientific_inputs}}).encode())
+
+    while optional_view_bytes() > CONTEXT_VIEW_MAX_BYTES:
         candidates = [(len(_json(v).encode()), k) for k, v in sections.items()
-                      if not (isinstance(v, dict) and v.get("omitted_from_preview"))]
+                      if k not in scientific_inputs
+                      and not (isinstance(v, dict) and v.get("omitted_from_preview"))]
         if not candidates:
             raise ValueError("context_presentation_identity_too_large")
         _, key = max(candidates)
@@ -240,19 +253,52 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
     # larger than that budget; their size depends on this task, not all Cycles.
     if required_material:
         view["required_material"] = required_material
-    _observe_context_projection(stage, context_pack, view, context_pack_ref, context_pack_hash)
+    if _observe:
+        _observe_context_projection(stage, context_pack, view, context_pack_ref, context_pack_hash)
     return view
 
 
-def _observe_context_projection(stage, source, view, source_ref, source_hash):
+def stage_context_json(stage: str, context_pack: dict, *, context_pack_ref: str,
+                       context_pack_hash: str) -> str:
+    """Render once and reuse its actual byte representation for diagnostics."""
+    view = stage_context_view(stage, context_pack, context_pack_ref=context_pack_ref,
+                              context_pack_hash=context_pack_hash, _observe=False)
+    rendered, section_sizes, required_size = _encode_context_view(view,
+        measure=LOGGER.isEnabledFor(logging.INFO))
+    _observe_context_projection(stage, context_pack, view, context_pack_ref, context_pack_hash,
+        rendered=rendered, section_sizes=section_sizes, required_size=required_size)
+    return rendered
+
+
+def _encode_context_view(view, *, measure):
+    # Sections can contain a large complete scientific handoff. Encode each
+    # value once, then assemble canonical object spelling from those fragments.
+    # The same fragments supply per-section sizes when diagnostics are enabled.
+    sections = {name: _json(value) for name, value in view["sections"].items()}
+    fields = {name: _json(value) for name, value in view.items() if name != "sections"}
+    fields["sections"] = "{" + ",".join(_json(name) + ":" + sections[name]
+        for name in sorted(sections)) + "}"
+    rendered = "{" + ",".join(_json(name) + ":" + fields[name] for name in sorted(fields)) + "}"
+    section_sizes = {name: len(value.encode("utf-8")) for name, value in sections.items()} if measure else None
+    required_size = len(fields.get("required_material", "{}").encode("utf-8")) if measure else None
+    return rendered, section_sizes, required_size
+
+
+def _observe_context_projection(stage, source, view, source_ref, source_hash,
+                                *, rendered=None, section_sizes=None, required_size=None):
+    if not LOGGER.isEnabledFor(logging.INFO):
+        return
     sections = view["sections"]
+    if rendered is None:
+        rendered, section_sizes, required_size = _encode_context_view(view, measure=True)
+    encoded_view = rendered.encode("utf-8")
     LOGGER.info("context_projection %s", _json({
         "stage": stage, "source_ref": source_ref, "source_hash": source_hash,
-        "projection_hash": hashlib.sha256(_json(view).encode()).hexdigest(),
-        "default_input_utf8_bytes": len(_json(view).encode()),
+        "projection_hash": hashlib.sha256(encoded_view).hexdigest(),
+        "default_input_utf8_bytes": len(encoded_view),
         "optional_context_budget_utf8_bytes": CONTEXT_VIEW_MAX_BYTES,
-        "section_utf8_bytes": {name: len(_json(value).encode()) for name, value in sections.items()},
-        "required_material_utf8_bytes": len(_json(view.get("required_material", {})).encode()),
+        "section_utf8_bytes": section_sizes,
+        "required_material_utf8_bytes": required_size,
         "omitted_sections": [name for name, value in sections.items()
                              if isinstance(value, dict) and value.get("omitted_from_preview")],
         "compression_location": "stage_context_view",
@@ -297,7 +343,17 @@ def reasoning_handoff_reference(binding: dict) -> dict[str, object]:
             "closure_hash": hashlib.sha256(_json(closure).encode()).hexdigest(),
             "receipt": binding["receipt"], "outcome_receipt": binding["outcome_receipt"],
             "scientific_summary": closure.get("scientific_summary"),
-            **({"handoff_notes": bounded_text(closure["notes"], 2048)}
+            **({"handoff_notes": {"text": closure["notes"],
+                                  "source_utf8_bytes": len(closure["notes"].encode("utf-8")),
+                                  "truncated": False}}
                if isinstance(closure.get("notes"), str) and closure["notes"].strip() else {}),
             **({"research_notes": closure["research_notes"]} if closure.get("research_notes") else {}),
             "exact_reader": "research_memory.stage_context.read"}
+
+
+def stage_position_prompt(request, stage: str) -> str:
+    """Render only the immutable position bound to this exact request."""
+    from meta_research.cycle_position import validate_cycle_position
+    position = request.context_pack.get("cycle_position")
+    validate_cycle_position(position, cycle_ref=request.context_pack["cycle_ref"])
+    return "cycle_position=" + _json({**position, "stage": stage}) + "\n"

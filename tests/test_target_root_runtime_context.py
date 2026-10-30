@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from meta_research.harness import HarnessAdmissionError
@@ -49,7 +50,10 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
 
     class TargetGraph:
         def query_target_research_context(self, *, target_ref):
-            return {"target_ref": target_ref, "question": {"unknown_statement": "fixture research question"}}
+            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "target_ref": target_ref,
+                    "question": {"unknown_statement": "fixture research question" + "q" * 5000},
+                    "plan_notes": "plan failed, unmeasured, limited: " + "p" * 9000,
+                    "bundle_notes": "bundle held-fixed caveats: " + "b" * 9000}
         binding: object | None = None
 
         def query_execution_input_binding_for_attempt(self, **_values):
@@ -186,6 +190,14 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
         assert runtime.query_status(handle.target_ref).phase == expected_phase  # type: ignore[union-attr]
 
     assert len(harnesses.root_calls) == 2
+    for _request_ref, values in harnesses.root_calls:
+        material = json.loads(values["prompt"].split("Exact Owner context:\n", 1)[1])
+        research = material["research_context"]
+        assert research["question"]["unknown_statement"] == "fixture research question" + "q" * 5000
+        assert research["plan_notes"] == "plan failed, unmeasured, limited: " + "p" * 9000
+        assert research["bundle_notes"] == "bundle held-fixed caveats: " + "b" * 9000
+        assert "exact_context_path" not in research
+        assert material["execution_contract"]["measurement_contract"]["protocol_version"]["split"] == {"split": "heldout"}
     assert all(
         "进行研究、检查与局部修订" in values["prompt"]
         and "最终交接前完成独立子智能体审阅" in values["prompt"]
@@ -252,7 +264,7 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
 
     class TargetGraph:
         def query_target_research_context(self, *, target_ref):
-            return {"target_ref": target_ref, "question": {"unknown_statement": "fixture research question"}}
+            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "target_ref": target_ref, "question": {"unknown_statement": "fixture research question"}}
         def query_execution_input_binding_for_attempt(self, **_values):
             return SimpleNamespace(binding_ref="target-input-revision")
 
@@ -401,7 +413,7 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
 
     class TargetGraph:
         def query_target_research_context(self, *, target_ref):
-            return {"target_ref": target_ref, "question": {"unknown_statement": "fixture research question"}}
+            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "target_ref": target_ref, "question": {"unknown_statement": "fixture research question"}}
         query_calls = 0
 
         def query_execution_input_binding_for_attempt(self, **_values):

@@ -141,6 +141,7 @@ _REASONING_SOURCE_FIELDS = {
     "source_foreground_epoch",
 }
 _NEXT_CYCLE_PROPOSAL_FIELDS = _REASONING_SOURCE_FIELDS | {
+    "cycle_focus",
     "schema_ref",
     "kind",
     "target_question_ref",
@@ -814,6 +815,7 @@ def validate_reasoning_transition(
             or next_cycle.get("is_authoritative") is not False
         ):
             raise ReasoningContractError("next_cycle_proposal_invalid")
+        _require_text(next_cycle.get("cycle_focus"), "next_cycle_focus_invalid")
         _require_text(
             next_cycle.get("target_question_ref"), "next_cycle_proposal_invalid"
         )

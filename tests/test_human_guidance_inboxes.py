@@ -127,7 +127,7 @@ def test_empty_first_cut_survives_late_submit_and_new_operation_receives_it(tmp_
         runtime.close()
 
 
-def test_exact_read_feedback_replay_and_continuing_constraints(tmp_path):
+def test_feedback_without_mechanical_read_preserves_replay_and_continuing_constraints(tmp_path):
     observed = {}
     def primary(hc, operation):
         cut = hc.freeze_operation_guidance(operation)
@@ -136,13 +136,15 @@ def test_exact_read_feedback_replay_and_continuing_constraints(tmp_path):
             effect_id="decision", understanding="The audit must isolate drift.",
             changes="Compare each device separately.", continuing_work="Continue morphology checks.",
             reasons="Device mixing hides failures.", disposition="applied")
-        with pytest.raises(OwnerConflict, match="guidance_exact_read_required"):
-            hc.feedback_operation_guidance(**command)
+        receipt = hc.feedback_operation_guidance(**command)
+        assert receipt["changes"] == "Compare each device separately."
+        projection, = hc.query_guidance_deliveries(
+            receipt["guide_ref"]["constraint_ref"])
+        assert projection["read_at"] is None
         page = hc.read_operation_guidance(scope=operation.scope, binding=cut.binding,
             delivery_ref=delivery.delivery_ref, effect_id="page", limit=8)
         assert page["full_read"] is False
-        with pytest.raises(OwnerConflict, match="guidance_exact_read_required"):
-            hc.feedback_operation_guidance(**command)
+        assert hc.feedback_operation_guidance(**command) == receipt
         read = hc.read_operation_guidance(scope=operation.scope, binding=cut.binding,
             delivery_ref=delivery.delivery_ref, effect_id="full")
         assert read["original_text"] == "Audit each device."
@@ -152,8 +154,6 @@ def test_exact_read_feedback_replay_and_continuing_constraints(tmp_path):
         with pytest.raises(OwnerConflict, match="guidance_effect_conflict"):
             hc.read_operation_guidance(scope=operation.scope, binding=cut.binding,
                 delivery_ref=delivery.delivery_ref, effect_id="full", limit=12)
-        receipt = hc.feedback_operation_guidance(**command)
-        assert receipt["changes"] == "Compare each device separately."
         assert hc.feedback_operation_guidance(**command) == receipt
         assert hc.feedback_operation_guidance(**command, reconcile=True) == receipt
         with pytest.raises(OwnerConflict, match="guidance_effect_conflict"):

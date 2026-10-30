@@ -535,6 +535,7 @@ class QuestGoalOwnerMixin:
             conditions = self._verify_goal_conditions_in_transaction(
                 connection,
                 quest_ref=quest_ref,
+                author=author,
                 parent_ref=head.current_revision_ref,
                 cause=cause,
                 conditions=decision.conditions,
@@ -1057,6 +1058,7 @@ class QuestGoalOwnerMixin:
         connection,
         *,
         quest_ref: str,
+        author: ResearchRoot,
         parent_ref: str,
         cause: dict[str, object],
         conditions: dict[str, object],
@@ -1118,7 +1120,9 @@ class QuestGoalOwnerMixin:
             )
         for clause in conditions["newly_identified"]:
             source = _guidance_delivery_source(connection, clause["delivery_ref"])
-            if source["quest_ref"] != quest_ref or source["read_at"] is None:
+            if (source["quest_ref"] != quest_ref or source["binding"]["identity"] != {
+                    "root_kind": author.kind, "run_ref": author.run_ref,
+                    "operation_ref": author.operation_ref}):
                 raise OwnerConflict("goal_condition_source_invalid")
             scope = source.get("semantic_scope")
             if scope is not None and scope.get("kind") != "quest":
@@ -1442,7 +1446,6 @@ def _verified_guidance_delivery(
             "run_ref": author.run_ref,
             "operation_ref": author.operation_ref,
         }
-        or source["read_at"] is None
         or source["guide_ref"] != expected_guide
     ):
         raise OwnerConflict("goal_guidance_cause_unbound")
@@ -1499,6 +1502,26 @@ def _guidance_delivery_source(connection, delivery_ref: str) -> dict[str, object
         "snapshot_ref": row.snapshot_ref,
         "snapshot_hash": row.snapshot_hash,
     }
+    parent = payload.get("parent_binding")
+    if parent is not None:
+        if not isinstance(parent, dict):
+            raise OwnerConflict("goal_guidance_cause_unbound")
+        original_row = connection.execute(text(
+            "SELECT * FROM hc_guidance_snapshots WHERE snapshot_ref=:ref"
+        ), {"ref": parent.get("snapshot_ref")}).first()
+        if original_row is None:
+            raise OwnerConflict("goal_guidance_cause_unbound")
+        original_payload = decoded_object(original_row.snapshot_json)
+        expected = {"identity": {"root_kind": original_row.root_kind,
+            "run_ref": original_row.run_ref, "operation_ref": original_row.operation_ref},
+            "quest_ref": original_row.quest_ref, "snapshot_ref": original_row.snapshot_ref,
+            "snapshot_hash": original_row.snapshot_hash}
+        if (parent != expected or canonical_hash(original_payload) != original_row.snapshot_hash
+                or original_row.root_kind != row.root_kind or original_row.run_ref != row.run_ref
+                or original_row.quest_ref != row.quest_ref
+                or payload.get("operation") != original_payload.get("operation")):
+            raise OwnerConflict("goal_guidance_cause_unbound")
+        binding = parent
     return {
         "quest_ref": row.quest_ref,
         "binding": binding,

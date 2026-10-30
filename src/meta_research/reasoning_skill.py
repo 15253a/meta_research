@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from meta_research.context_presentation import stage_context_view
+from meta_research.resource_preparation import resource_preparation, prepared_resource
+from meta_research.native_guidance import native_guidance_operation
+
+from meta_research.idea_skill import stage_operation_input, stage_replacement_prompt
+from meta_research.context_presentation import stage_context_view, stage_context_json, stage_position_prompt
 
 from dataclasses import dataclass, replace
 from importlib.resources import files
@@ -199,6 +203,7 @@ class ReasoningSkillRequest:
     frozen_evidence_closure: tuple[dict[str, object], ...]
     root_session_ref: str
     runtime_binding: ReasoningRuntimeBinding
+    native_replacement_context: dict[str, object] | None = None
     historical_evidence_resolver: Callable[[str], dict[str, object] | None] | None = None
     native_session_ref: str | None = None
     predecessor_candidate_ref: str | None = None
@@ -945,6 +950,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         except HarnessAdmissionError as error:
             raise ReasoningSkillUnavailable(error.code) from error
 
+    @native_guidance_operation
     def _invoke_with_resident_mcp(
         self,
         *,
@@ -953,6 +959,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         prompt: str,
         schema: dict[str, object],
         native_session_ref: str | None,
+        operation_input: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         prompt, guidance_binding = self._prepare_stage_guidance(
             run_ref=request.run_ref, attempt_ref=request.attempt_ref,
@@ -1045,6 +1052,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 authorized_operation_ids=operation_ids,
                 run_ref=request.run_ref,
                 **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
+                operation_input=stage_operation_input(request, "reasoning") if operation_input is None else operation_input,
                 workspace_binding=self._workspace_binding(run_ref=request.run_ref,
                     attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
                     fence_ref=request.fence_ref, runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict())),
@@ -1085,6 +1093,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                     self._release_resident_channel(key)
         return reconciled
 
+    @resource_preparation
     def runtime_binding(self) -> ReasoningRuntimeBinding:
         resources = _reasoning_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
@@ -1191,6 +1200,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             )
         return bind_reasoning_runtime_to_full_conformance(binding, conformance)
 
+    @resource_preparation
     def generate_draft(
         self, request: ReasoningSkillRequest
     ) -> ReasoningSkillDraft:
@@ -1206,10 +1216,11 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
         prompt = (
+            stage_position_prompt(request, "reasoning") + stage_replacement_prompt(request) +
             f"{_reasoning_skill_instructions(request)}\n\n"
             f"{human_resume}"
-            "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
-            "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
+            "在当前原根连续完成研究、自主组织独立子智能体审阅、聚合反馈并修订后，"
+            "交回最终完整候选；根承担最终判断，不提前返回草稿等待系统再次启动审阅。"
             "你是当前 Reasoning 根 Agent，而不是 State Owner。先通过 resident "
             "Semantic MCP 按当前内容需要使用 "
             "advancement_engine.reasoning_stage_run.observe、"
@@ -1252,7 +1263,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"foreground_epoch={request.foreground_epoch}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
-            f"provider_context_view={canonical_json(stage_context_view('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}\n"
+            f"provider_context_view={stage_context_json('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}\n"
             "Frozen evidence is available through the authenticated stage context reader; "
             "the presentation is a preview, never a complete evidence authority. "
             "The literature preview is not a citation limit: use source=literature_records "
@@ -1280,6 +1291,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         )
         return draft
 
+    @resource_preparation
     def review_draft(
         self,
         request: ReasoningSkillRequest,
@@ -1295,56 +1307,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             validate_reasoning_skill_draft(request, draft)
         except ReasoningContractError as error:
             raise ReasoningSkillUnavailable(error.args[0]) from error
-        lineage = _owner_rejection_prompt(request)
-        prompt = (
-            f"{_reasoning_skill_instructions(request)}\n\n"
-            "本回合在原根 Session 中完成独立审查后的修订。使用原生子智能体审查完整草稿和必要原文，"
-            "让它独立核查来源、推理、研究边界及后继选择。根据反馈和你的判断修订；没有发现问题也可改稿。"
-            "根负责最终研究判断和交接，子智能体使用已授予的工具与当前 fence。"
-            "审查反馈保留在原生执行记录中。只返回schema_ref 和 final_output 的完整内容。"
-            f"{lineage}\n"
-            f"stage_request_ref={request.stage_request_ref}\n"
-            f"context_pack_hash={request.context_pack_hash}\n"
-            f"provider_context_view={canonical_json(stage_context_view('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}\n"
-            f"reviewed_draft={canonical_json(draft.draft)}"
-        )
-        reviewed, resumed_session, _stdout = self._invoke_with_resident_mcp(
-            request=request,
-            operation_name="review",
-            prompt=prompt,
-            schema=_reasoning_review_response_schema(
-                request,
-                (
-                    _reasoning_autonomous_checkpoint_schema(request)
-                    if draft.draft.get("schema_ref")
-                    == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
-                    else _reasoning_stage_output_schema(request)
-                ),
-            ),
-            native_session_ref=draft.primary_session_ref,
-        )
-        if (
-            resumed_session != draft.primary_session_ref
-            or set(reviewed)
-            != {
-                "schema_ref",
-                "final_output",
-            }
-            or reviewed.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-            or not isinstance(reviewed.get("final_output"), dict)
-        ):
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code="reasoning_review_result_contract_invalid",
-                detail_code="codex_reasoning_review_invalid",
-                rejected_candidate=reviewed,
-            )
-        final_output = cast(dict[str, object], reviewed["final_output"])
-        final_output = self._assemble_provider_output(
-            request, final_output, operation_name="review", native_session_ref=draft.primary_session_ref
-        )
+        final_output = draft.draft
         if (
             draft.draft.get("schema_ref")
             == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
@@ -1399,7 +1362,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "required": ["action", "final_output"]}
         prompt = (_reasoning_skill_instructions(request) + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；新建题推荐按上述 Skill 由 Bundle 统一交接。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
             + "completion_feedback=" + canonical_json(list(request.continuation_feedback)) + "\ncheckpoint=" + canonical_json(checkpoint) + "\nfacts=" + canonical_json(facts) + "\nsummary=" + canonical_json(summary))
-        decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref)
+        decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref, operation_input=stage_operation_input(request, "reasoning", extra={"checkpoint": checkpoint, "facts": facts, "summary": summary}))
         if native_session != request.native_session_ref:
             raise ReasoningSkillUnavailable("codex_primary_session_changed")
         if isinstance(decision.get("final_output"), dict):
@@ -1461,6 +1424,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 request, _reasoning_stage_output_schema(request)
             ),
             native_session_ref=request.native_session_ref,
+            operation_input=stage_operation_input(request, "reasoning", extra={"checkpoint": checkpoint, "creation_result": creation_result}),
         )
         if (
             resumed_session != request.native_session_ref
@@ -1591,6 +1555,7 @@ def _validate_reasoning_resident_channel(
             )
 
 
+@prepared_resource
 def _reasoning_skill_resources() -> dict[str, str]:
     package = files("meta_research.skills.reasoning_stage")
     resources = (
@@ -2086,6 +2051,7 @@ def _next_cycle_proposal_schema(
         "schema_ref": {"const": NEXT_CYCLE_PROPOSAL_SCHEMA_REF},
         "kind": {"const": "NextCycleProposal"},
         **_reasoning_source_properties(request),
+        "cycle_focus": {"type": "string", "minLength": 1},
         "target_question_ref": {"type": "string", "minLength": 1},
         "target_question_anchor_ref": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},

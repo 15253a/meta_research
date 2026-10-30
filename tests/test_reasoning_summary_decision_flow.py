@@ -21,6 +21,7 @@ def final_output(checkpoint, anchor=None):
     scope = checkpoint["autonomous_scope"]
     return {"schema_ref": REASONING_STAGE_OUTPUT_SCHEMA_REF, "scientific_outcome": outcome,
         "next_cycle_proposal": {"schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF, "kind": "NextCycleProposal",
+        "cycle_focus": "Reassess the next research direction using the accepted evidence",
             "source_quest_ref": outcome["quest_ref"], "source_cycle_ref": outcome["cycle_ref"], "source_reasoning_stage_run_request_ref": outcome["stage_run_request_ref"], "source_scientific_outcome_ref": outcome["outcome_ref"], "source_question_ref": outcome["question_ref"], "source_foreground_epoch": outcome["foreground_epoch"],
             "target_question_ref": outcome["question_ref"] if anchor is None else anchor["question_ref"], "target_question_anchor_ref": outcome["question_ref"] if anchor is None else anchor["ref"], "entry_stage": "reasoning" if anchor is None else "idea", "typed_skip_basis_refs_by_stage": {stage: [outcome["outcome_ref"]] for stage in ("idea", "plan", "bundle")} if anchor is None else {}, "is_authoritative": False}, "candidate_completion": None}
 

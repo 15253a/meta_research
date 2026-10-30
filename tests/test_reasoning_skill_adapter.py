@@ -42,6 +42,7 @@ from meta_research.semantic_mcp import McpConnection, ResidentMcpBinding
 
 def _request() -> ReasoningSkillRequest:
     context_pack: dict[str, object] = {
+        "cycle_position": {"cycle_ref": "cycle:1", "round": 1, "cycle_focus": "Compare evidence and limitations", "focus_source": {"draft_hash": "a" * 64}},
         "schema_ref": "meta-research/reasoning-context-pack/v1",
         "cycle_ref": "cycle:1",
         "foreground_epoch": 7,
@@ -192,6 +193,7 @@ def _stage_output() -> dict[str, object]:
         "next_cycle_proposal": {
             "schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
             "kind": "NextCycleProposal",
+        "cycle_focus": "Reassess the next research direction using the accepted evidence",
             "source_quest_ref": "quest:1",
             "source_cycle_ref": "cycle:1",
             "source_reasoning_stage_run_request_ref": (
@@ -845,11 +847,10 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
         )
         for item in binding.resource_bindings
     )
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
     assert 'model_reasoning_effort="ultra"' in runner.calls[0][0]
-    assert runner.calls[1][0][-3:] == ["resume", "provider-session:1", "-"]
-    assert len(authority.issued) == 2
-    assert len(authority.revoked) == 2
+    assert len(authority.issued) == 1
+    assert len(authority.revoked) == 1
     assert all(
         call["operation_ids"] == REASONING_ROOT_SEMANTIC_OPERATION_IDS
         for call in authority.issued
@@ -964,7 +965,7 @@ def test_completion_rejection_feedback_reaches_reasoning_primary_and_review(
     draft = adapter.generate_draft(request)
     adapter.review_draft(request, draft)
 
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
     for _argv, prompt, _schema in runner.calls:
         assert "owner_rejection_kind=completion" in prompt
         assert "reasoning-candidate:rejected" in prompt
@@ -1019,7 +1020,7 @@ def test_reasoning_result_does_not_require_internal_review_trace(
     )
 
     assert result is not None
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
 
 
 def _autonomous_checkpoint_fixture(request):
@@ -1121,8 +1122,8 @@ def test_reasoning_result_does_not_require_semantic_call_trace(
         outputs = [primary]
         traces = [()]
     elif operation_name == "review":
-        outputs = [primary, review]
-        traces = [REASONING_ROOT_SEMANTIC_OPERATION_IDS, ()]
+        outputs = [primary]
+        traces = [REASONING_ROOT_SEMANTIC_OPERATION_IDS]
     else:
         checkpoint, creation_result, review = _autonomous_resume_fixture(
             base_request

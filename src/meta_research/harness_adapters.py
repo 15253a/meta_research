@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from meta_research.external_mcp import ExternalMcpAccess
+from meta_research.native_guidance import live_native_argv
 
 import json
 import hashlib
@@ -439,6 +440,12 @@ class _NativeCliHarnessAdapter:
                 "provider_io_unavailable", durable_outcome="unknown"
             ) from error
         events = _parse_jsonl(completed.stdout)
+        if completed.returncode == 75 and any(
+            event.get("type") == "meta_research.native_outcome_unknown" for event in events
+        ):
+            raise HarnessAdapterUnavailable("provider_outcome_unknown", durable_outcome="unknown",
+                native_session_ref=_verified_failed_native_session_ref(family=self.family,
+                    events=events, expected_native_session_ref=invocation.native_session_ref))
         if completed.returncode != 0:
             receipt = getattr(completed, "meta_research_transport_receipt", None)
             reason = (
@@ -1354,7 +1361,9 @@ class HarnessSupervisorTransport:
         )
         _ensure_private(
             provider_argv_path,
-            json.dumps(argv, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(live_native_argv(argv, directory,
+                enabled=family == "codex" and isinstance(self._process_runner, _CancellableProcessRunner)),
+                ensure_ascii=False, separators=(",", ":")),
         )
         working_directory = provider_working_directory(argv, environment)
         request = self._supervisor_request(directory, invocation_hash, family, timeout, working_directory)
@@ -1453,6 +1462,12 @@ class HarnessSupervisorTransport:
             else ""
         )
         completed = subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        if returncode == 75 and (directory / "native-turn-start.json").is_file():
+            from meta_research.native_codex_bridge import reconcile_native_operation
+            reconciled = reconcile_native_operation(directory)
+            if reconciled is not None:
+                _message, _native_ref, recovered_stdout = reconciled
+                completed = subprocess.CompletedProcess(argv, 0, recovered_stdout, stderr)
         completed.meta_research_transport_receipt = {
             "schema_ref": "meta-research/harness-provider-transport-receipt/v1",
             "spool_ref": "provider-spool:" + invocation_hash,

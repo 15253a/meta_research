@@ -2889,6 +2889,12 @@ class SQLiteTargetRunGraphAuthority:
 
     def query_target_research_context(self, *, target_ref: str,
                                      research_note_directory: Path | None = None) -> dict[str, object]:
+        with self._database.read_snapshot():
+            return self._read_target_research_context(target_ref=target_ref,
+                research_note_directory=research_note_directory)
+
+    def _read_target_research_context(self, *, target_ref: str,
+                                    research_note_directory: Path | None = None) -> dict[str, object]:
         """Read the exact research purpose attached to this accepted Target.
 
         Keep currentness/proof reconstruction in Owners. Return only its selected
@@ -2912,6 +2918,9 @@ class SQLiteTargetRunGraphAuthority:
             plan = binding["plan_document"]
             question_binding = context["accepted_question_binding"]
             selected_keys = spec["candidate"]["experiment_keys"]
+            from meta_research.cycle_position import validate_cycle_position
+            position = context["cycle_position"]
+            validate_cycle_position(position, cycle_ref=context["cycle_ref"])
             if (canonical_hash(context) != row.context_pack_hash
                 or canonical_json(context) != row.context_pack_json
                 or canonical_hash(spec) != row.spec_hash
@@ -2943,19 +2952,32 @@ class SQLiteTargetRunGraphAuthority:
         notes_ref, notes_hash = graph.submission_ref, graph.target_plan_hash
         if row.append_ref is not None:
             with self._database.read() as connection:
-                appended = connection.execute(text(
-                    "SELECT p.proposal_json, a.proposal_ref FROM rg_target_graph_appends a "
-                    "JOIN ar_bundle_target_proposals p ON p.proposal_ref = a.proposal_ref "
-                    "WHERE a.append_ref = :append_ref AND a.graph_ref = :graph_ref"
+                admitted_generation = connection.execute(text(
+                    "SELECT generation FROM rg_target_graph_appends "
+                    "WHERE append_ref = :append_ref AND graph_ref = :graph_ref"
                 ), {"append_ref": row.append_ref, "graph_ref": row.graph_ref}).first()
-            if appended is None:
+                if admitted_generation is None:
+                    raise OwnerConflict("target_research_context_invalid")
+                appends = connection.execute(text(
+                    "SELECT p.proposal_json, a.proposal_ref FROM rg_target_graph_appends a "
+                    "LEFT JOIN ar_bundle_target_proposals p ON p.proposal_ref = a.proposal_ref "
+                    "WHERE a.graph_ref = :graph_ref AND a.generation <= :generation "
+                    "ORDER BY a.generation DESC"
+                ), {"graph_ref": row.graph_ref, "generation": admitted_generation.generation}).all()
+            if not appends:
                 raise OwnerConflict("target_research_context_invalid")
-            proposal = json.loads(appended.proposal_json)
-            update = proposal.get("strategy_update", {})
-            if isinstance(update, dict) and isinstance(update.get("notes"), str) and update["notes"].strip():
-                notes, notes_ref, notes_hash = update["notes"], appended.proposal_ref, canonical_hash(proposal)
+            for appended in appends:
+                try:
+                    proposal = json.loads(appended.proposal_json)
+                    update = proposal.get("strategy_update", {})
+                except (TypeError, ValueError, AttributeError) as error:
+                    raise OwnerConflict("target_research_context_invalid") from error
+                if isinstance(update, dict) and isinstance(update.get("notes"), str) and update["notes"].strip():
+                    notes, notes_ref, notes_hash = update["notes"], appended.proposal_ref, canonical_hash(proposal)
+                    break
         result = {
             "schema_ref": "meta-research/target-research-context/v1",
+            "cycle_position": position,
             "target_ref": target_ref, "question_ref": question_binding["question_ref"],
             "question_content_ref": question_binding["content_ref"],
             "question_content_hash": question_binding["content_hash"],
@@ -2964,10 +2986,15 @@ class SQLiteTargetRunGraphAuthority:
             "obligations": obligations, "experiment_briefs": selected_briefs,
             "plan_notes": plan.get("notes", ""), "bundle_notes": notes,
             "bundle_notes_source_ref": notes_ref, "bundle_notes_source_hash": notes_hash,
+            "bundle_notes_text_hash": hashlib.sha256(notes.encode("utf-8")).hexdigest(),
             "selection_boundary": "Only the listed obligations and Briefs belong to this Target; the wider Question and Quest remain research context.",
         }
         from meta_research.human_research_context import human_research_reader
         result["human_guidance_reader"] = human_research_reader()
+        result["research_notes_reader"] = {
+            "operation": "research_memory.research_notes.read", "source": "research_notes",
+            "path": [], "offset": 0, "limit": 8192, "index_offset": 0,
+        }
         if research_note_directory is not None:
             from meta_research.research_notes import materialize_note_body
             upstream_refs = [target_ref, *json.loads(row.dependency_refs_json)]
@@ -2985,10 +3012,6 @@ class SQLiteTargetRunGraphAuthority:
                         self._memory, note, research_note_directory)})
             if notes:
                 result["research_notes"] = notes
-            result["research_notes_reader"] = {
-                "operation": "research_memory.research_notes.read", "source": "research_notes",
-                "path": [], "offset": 0, "limit": 8192, "index_offset": 0,
-            }
         return result
 
     def resolve_input_asset_ref(self, *, target_ref: str, input_ref: str) -> str:

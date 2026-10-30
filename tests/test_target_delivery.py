@@ -36,7 +36,7 @@ def test_no_selected_evidence_has_no_companion_expansion():
     assert owner.selected_evidence_target_commits('target') == {}
 
 
-def test_target_prompt_has_selected_science_and_bounded_notes_without_unrelated_briefs():
+def test_target_prompt_has_complete_selected_science_without_unrelated_briefs():
     candidate, plan, handle, _preflight, request = _records()
     unrelated = ExperimentBrief('unselected-experiment', 'UNRELATED_BRIEF_SENTINEL', (), ('unit-unrelated',))
     plan = replace(plan, briefs=plan.briefs + (unrelated,))
@@ -45,7 +45,9 @@ def test_target_prompt_has_selected_science_and_bounded_notes_without_unrelated_
         handle=handle, candidate=candidate, formal_plan=plan,
         launch=SimpleNamespace(request=SimpleNamespace(target_spec_binding=request.target_spec_binding)),
         frozen_input_manifest_path='/isolated/frozen/manifest.json',
-        research_context={'question':{'unknown_statement':'Is the patient split leakage-free?'},
+        research_context={'cycle_position': {'cycle_ref': 'cycle:target', 'round': 1,
+            'cycle_focus': 'Audit patient split', 'focus_source': {'request_ref': 'fixture-start'}},
+            'question':{'unknown_statement':'Is the patient split leakage-free?'},
             'obligations':[{'statement':'Audit actual patient overlap'}],
             'experiment_briefs':[{'goal':'Get independent split evidence'}],
             'plan_notes':'diagnostic priority', 'bundle_notes':'中文'*6000})
@@ -54,8 +56,9 @@ def test_target_prompt_has_selected_science_and_bounded_notes_without_unrelated_
     assert 'Get independent split evidence' in prompt
     assert 'diagnostic priority' in prompt
     assert 'UNRELATED_BRIEF_SENTINEL' not in prompt
-    assert '"truncated":true' in prompt
-    assert '/isolated/frozen/research-context.json' in prompt
+    assert '中文'*6000 in prompt
+    assert 'exact_context_path' not in prompt
+    assert prompt.startswith('cycle_position=')
     assert '"execution_input_binding_receipt"' not in prompt
     assert '初始 `result_schema` 是表达指导' in prompt
     assert 'Protocol 指标集合' in prompt

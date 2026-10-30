@@ -134,6 +134,7 @@ _IDEA_BINDING: dict[str, object] = {
 
 def _context_pack() -> dict[str, object]:
     return {
+        "cycle_position": {"cycle_ref": "cycle:1", "round": 1, "cycle_focus": "Compare evidence and limitations", "focus_source": {"draft_hash": "a" * 64}},
         "schema_ref": "meta-research/plan-context-pack/v1",
         "cycle_ref": "cycle:1",
         "accepted_question_binding": _QUESTION_BINDING,
@@ -481,24 +482,17 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
         )
         for item in binding.resource_bindings
     )
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
-    review_argv, review_prompt, review_schema = runner.calls[1]
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert "--json" in primary_argv
     assert 'model_reasoning_effort="ultra"' in primary_argv
     from meta_research.research_guidance import shared_research_guidance
     assert shared_research_guidance() in primary_prompt
-    assert shared_research_guidance() in review_prompt
     assert "AcceptedQuestionBinding" in primary_prompt
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
-    assert "本回合仅执行 Primary draft phase" in primary_prompt
-    assert "下一次 resumed review turn" in primary_prompt
     assert primary_schema["properties"]["plan"]["properties"]["answer_contract"]
-    assert review_argv[-3:] == ["resume", "codex-plan-primary:1", "-"]
-    assert "ExperimentBrief" in review_prompt
-    assert "final_plan" in review_schema["properties"]
 
 
 def test_plan_primary_turn_uses_its_exact_resident_operation_tree(
@@ -648,17 +642,17 @@ def test_production_adapter_does_not_require_child_trace(
 
     assert result.review_mode == "advisory_unobserved"
     assert result.reviewer_agent_ref is None
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
 
 
-def test_durable_plan_review_shape_failure_is_terminal_and_not_replayed(
+def test_durable_plan_primary_shape_failure_is_terminal_and_not_replayed(
     tmp_path: Path,
 ) -> None:
     draft = _plan()
     workspace = tmp_path / "durable-plan-shape"
     runner = _SequenceRunner(
         [
-            {"plan": draft},
+            {"plan": None},
             {
                 "reviewer_agent_ref": "codex-plan-reviewer:shape",
 
@@ -679,17 +673,17 @@ def test_durable_plan_review_shape_failure_is_terminal_and_not_replayed(
     )
 
     with pytest.raises(
-        PlanSkillUnavailable, match="plan_review_result_contract_invalid"
+        PlanSkillUnavailable, match="plan_primary_result_contract_invalid"
     ) as caught:
         adapter.execute(request)
     assert caught.value.recovery_checkpoint is not None
     assert caught.value.recovery_checkpoint["contract_failure_code"] == (
-        "plan_review_result_contract_invalid"
+        "plan_primary_result_contract_invalid"
     )
     assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
-        "codex_review_invalid"
+        "codex_plan_invalid"
     )
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
 
     no_replay = _SequenceRunner([])
     restarted = CodexPlanSkillAdapter(
@@ -699,7 +693,7 @@ def test_durable_plan_review_shape_failure_is_terminal_and_not_replayed(
         process_runner=no_replay,
     )
     with pytest.raises(
-        PlanSkillUnavailable, match="plan_review_result_contract_invalid"
+        PlanSkillUnavailable, match="plan_primary_result_contract_invalid"
     ):
         restarted.execute(
             replace(request, runtime_binding=restarted.runtime_binding())
@@ -773,7 +767,7 @@ def test_owner_feedback_is_present_in_both_successor_prompts(tmp_path: Path) -> 
     result = adapter.execute(request)
 
     assert result.primary_session_ref == "codex-plan-primary:1"
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
     for _argv, prompt, _schema in runner.calls:
         assert "owner_rejection_kind=domain" in prompt
         assert "plan-submission:1" in prompt

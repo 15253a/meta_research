@@ -25,7 +25,6 @@ from meta_research.target_execution_contract import (
     target_execution_context, target_execution_skill_text,
 )
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
-from meta_research.context_presentation import bounded_text
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime_harness import (
@@ -690,15 +689,12 @@ class TargetRunRuntime:
         research_context: dict[str, object] | None = None,
     ) -> str:
         research = dict(research_context or {})
-        question = research.get("question")
-        if isinstance(question, dict):
-            research["question"] = {name: bounded_text(value, max_bytes=2048)
-                for name, value in question.items()}
-        research["exact_context_path"] = (str(Path(frozen_input_manifest_path).with_name("research-context.json"))
-            if frozen_input_manifest_path and research_context else None)
-        for name in ("plan_notes", "bundle_notes"):
-            if name in research:
-                research[name] = bounded_text(research[name], max_bytes=4096)
+        from meta_research.cycle_position import validate_cycle_position
+        position = research.pop("cycle_position", None)
+        validate_cycle_position(position, cycle_ref=None if position is None else position.get("cycle_ref"))
+        # These are this Target's selected scientific obligations and handoff,
+        # not a discovery catalog. Keep their complete text in the first input;
+        # a Bundle workspace path is neither a delivery nor a Target grant.
         material = {
             "research_context": research,
             "execution_contract": execution_contract,
@@ -745,6 +741,7 @@ class TargetRunRuntime:
             },
         }
         return (
+            "cycle_position=" + canonical_json({**position, "stage": "target"}) + "\n" +
             target_execution_skill_text() + "\n\n"
             "本回合在下列 Owner 冻结范围内实施或恢复 Target。按上述 Skill 读取实际合同和所需参考，"
             "进行研究、检查与局部修订，并在最终交接前完成独立子智能体审阅。普通检索、实施和整理"

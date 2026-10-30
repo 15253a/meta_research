@@ -352,6 +352,7 @@ class _AutonomousReasoningSkill:
         transition = {
             "schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
             "kind": "NextCycleProposal",
+        "cycle_focus": "Reassess the next research direction using the accepted evidence",
             "source_quest_ref": outcome["quest_ref"],
             "source_cycle_ref": outcome["cycle_ref"],
             "source_reasoning_stage_run_request_ref": outcome[

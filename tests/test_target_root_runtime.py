@@ -50,7 +50,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
     class TargetGraph:
         def query_target_reading_context(self, *, target_ref, research_note_directory):
             assert target_ref == handle.target_ref
-            return {"question": {"question_ref": "question-1"}}
+            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
 
         binding: object | None = None
 
@@ -255,7 +255,7 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
     class TargetGraph:
         def query_target_reading_context(self, *, target_ref, research_note_directory):
             assert target_ref == handle.target_ref
-            return {"question": {"question_ref": "question-1"}}
+            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
 
         def query_execution_input_binding_for_attempt(self, **_values):
             return SimpleNamespace(binding_ref="target-input-revision")
@@ -406,7 +406,7 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
     class TargetGraph:
         def query_target_reading_context(self, *, target_ref, research_note_directory):
             assert target_ref == handle.target_ref
-            return {"question": {"question_ref": "question-1"}}
+            return {"cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}}, "question": {"question_ref": "question-1"}}
 
         query_calls = 0
 

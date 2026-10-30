@@ -485,6 +485,8 @@ class IdeaStageWorker:
             )[:64]
         )
         skill_request = IdeaSkillRequest(
+            native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
+                run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),
             stage_request_ref=request.request_ref,
             question_ref=current.question.question_ref,
             context_pack_ref=request.context_pack_ref,
@@ -888,7 +890,8 @@ class IdeaStageWorker:
             if successor.get("cycle_ref")!=current.cycle_ref or successor.get("target_question_ref")!=current.question.question_ref or successor.get("entry_stage")!="idea" or not isinstance(frozen,dict):
                 raise OwnerConflict("reasoning_successor_context_invalid")
             return dict(frozen)
-        page,refs=self._research_graph.query_evidence_reference_page(current.question.quest_ref)
+        position = self._advancement_engine.query_cycle_position(current.cycle_ref)
+        page, refs = None, ()
         literature=self._research_memory.query_current_question_literature_revision(current.question.question_ref)
         guidance=[]
         if self._human_collaboration is not None:
@@ -898,7 +901,8 @@ class IdeaStageWorker:
             guidance.sort(key=lambda item:(str(item["scope_ref"]),str(item["constraint_ref"]),int(item["revision"])))
         return {"schema_ref":IDEA_CONTEXT_PACK_SCHEMA_V4_REF,"cycle_ref":current.cycle_ref,
             "accepted_question_binding":current.question.as_binding().as_dict(),
-            "accepted_evidence_refs":list(refs),"evidence_reference_revision":page["total_count"],
+            "cycle_position": position,
+            "accepted_evidence_refs":list(refs),"evidence_reference_revision":0,
             "evidence_page":page,"literature_binding":literature_reference(literature),
             "creation_basis": (lambda basis: None if basis is None else self._research_memory.creation_bases.reference(basis))(
                 self._research_memory.creation_bases.for_question(current.question.question_ref, current.question.quest_ref)),

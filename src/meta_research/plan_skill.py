@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from meta_research.context_presentation import stage_context_view
+from meta_research.resource_preparation import resource_preparation, prepared_resource
+
+from meta_research.idea_skill import stage_operation_input, stage_replacement_prompt
+from meta_research.context_presentation import stage_context_view, stage_context_json, stage_position_prompt
 
 from dataclasses import dataclass, replace
 from importlib.resources import files
@@ -67,6 +70,7 @@ class PlanSkillRequest:
     root_session_ref: str
     submission_revision: int
     runtime_binding: PlanRuntimeBinding
+    native_replacement_context: dict[str, object] | None = None
     native_session_ref: str | None = None
     predecessor_submission_ref: str | None = None
     owner_rejection_receipt_ref: str | None = None
@@ -355,6 +359,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             codex_home=codex_home,
         )
 
+    @resource_preparation
     def runtime_binding(self) -> PlanRuntimeBinding:
         resources = _plan_skill_resources()
         resident_mcp_facts = self._resident_mcp_runtime_facts()
@@ -446,6 +451,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             + resident_mcp_facts.resource_bindings,
         )
 
+    @resource_preparation
     def generate_draft(self, request: PlanSkillRequest) -> PlanSkillDraft:
         if request.runtime_binding != self.runtime_binding():
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
@@ -458,6 +464,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
         primary_prompt = (
+            stage_position_prompt(request, "plan") + stage_replacement_prompt(request) +
             f"{_plan_skill_instructions()}\n\n"
             f"{human_resume}"
             "Evidence catalog page metadata reports candidate totals, filtering, and next_offset. "
@@ -477,8 +484,9 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "Copy only actually reused later-page EvidenceRef objects verbatim into additional_evidence_bindings "
             "(maximum 32; [] if none). The adapter stores these in source_bindings.selected_evidence_catalog. "
             "Never invent receipt/hash fields or copy a discovery summary as an EvidenceRef. "
-            "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
-            "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
+            "在当前原根中连续完成研究、独立审阅和修订后再交回最终完整候选。"
+            "自主委派原生子智能体读取完整草稿和必要依据，聚合其独立反馈并修订；"
+            "由根负责最终判断，不为等待系统下一回合而提前交回草稿。"
             "你是 Plan 主 Agent。只返回 {\"plan\": ...}，其中 plan 是完整、"
             "自洽且可由 Owner 验证的 PlanDocument 候选。必须从 accepted Question "
             "选择本 Cycle 承担的 AnswerContract obligations，逐已选 obligation 交代实际相关的 Idea 候选，只引用经过 Owner 核验的精确 EvidenceRef；按需读取 ContextPack "
@@ -500,7 +508,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"{canonical_json(request.context_pack['accepted_question_binding'])}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"完整 IdeaSet={canonical_json(request.accepted_idea_set)}\n"
-            f"provider_context_view={canonical_json(stage_context_view('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}"
+            f"provider_context_view={stage_context_json('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         )
         primary_output, primary_session, _primary_stdout = (
             self._invoke_root_operation(
@@ -514,6 +522,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             root_session_ref=request.root_session_ref,
             fence_ref=request.fence_ref,
             runtime_binding=request.runtime_binding.as_dict(),
+            operation_input=stage_operation_input(request, "plan"),
             )
         )
         if primary_session is None:
@@ -538,6 +547,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             adapter_kind="codex_cli",
         )
 
+    @resource_preparation
     def review_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult:
@@ -545,49 +555,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
             raise PlanSkillUnavailable("codex_primary_session_changed")
-        lineage = _plan_owner_rejection_prompt(request)
-        reviewer_prompt = (
-            f"{_plan_skill_instructions()}\n\n"
-            "本回合在原根 Session 中完成独立审查后的修订。使用原生子智能体审查完整草稿和必要原文，"
-            "让它独立核查来源、推理、研究边界及后继选择。根据反馈和你的判断修订；没有发现问题也可改稿。"
-            "根负责最终研究判断和交接，子智能体使用已授予的工具与当前 fence。"
-            "审查反馈保留在原生执行记录中。只返回final_plan 的完整内容。"
-            f"{lineage}\n"
-            f"stage_request_ref={request.stage_request_ref}\n"
-            f"question_ref={request.question_ref}\n"
-            f"idea_set_ref={request.idea_set_ref}\n"
-            f"context_pack_ref={request.context_pack_ref}\n"
-            f"accepted_question={canonical_json(request.accepted_question_content)}\n"
-            f"完整 IdeaSet={canonical_json(request.accepted_idea_set)}\n"
-            f"provider_context_view={canonical_json(stage_context_view('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}\n"
-            f"reviewed_draft={canonical_json(draft.draft)}"
-        )
-        reviewed, resumed_session, _review_stdout = self._invoke_root_operation(
-            operation_name="review",
-            prompt=reviewer_prompt,
-            schema=_review_finalization_schema(request),
-            native_session_ref=draft.primary_session_ref,
-            job_ref=request.job_ref,
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding.as_dict(),
-        )
-        if resumed_session != draft.primary_session_ref:
-            raise PlanSkillUnavailable("codex_primary_session_changed")
-        final_value = reviewed.get("final_plan")
-        if (
-            not isinstance(final_value, dict)
-        ):
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code="plan_review_result_contract_invalid",
-                detail_code="codex_review_invalid",
-                rejected_candidate=reviewed,
-            )
+        final_value = draft.draft
         # The final document and substantive review contents remain validated
         # through ``validate_plan_skill_result``.
         return PlanSkillResult(
@@ -642,6 +610,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         )
 
 
+@prepared_resource
 def _plan_skill_resources() -> dict[str, str]:
     package = files("meta_research.skills.plan_stage")
     resources = (

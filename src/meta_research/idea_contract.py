@@ -197,6 +197,13 @@ def validate_idea_context_pack(
             else _IDEA_CONTEXT_PACK_V1_FIELDS
         )
     )
+    if "cycle_position" in context_pack:
+        from meta_research.cycle_position import validate_cycle_position
+        try:
+            validate_cycle_position(context_pack["cycle_position"], cycle_ref=cycle_ref)
+        except ValueError as error:
+            raise IdeaContractError("idea_context_pack_invalid") from error
+        expected_fields = expected_fields | {"cycle_position"}
     if set(context_pack) != expected_fields:
         raise IdeaContractError("idea_context_pack_invalid")
     if (
@@ -728,16 +735,25 @@ def _validate_literature_reference(value, question_ref):
 
 
 def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
-    if set(pack) not in (_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}, _IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page", "creation_basis"}):
+    if set(pack) - {"cycle_position"} not in (_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}, _IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page", "creation_basis"}):
         raise IdeaContractError("idea_context_pack_invalid")
+    if "cycle_position" in pack:
+        from meta_research.cycle_position import validate_cycle_position
+        try:
+            validate_cycle_position(pack["cycle_position"], cycle_ref=cycle_ref)
+        except ValueError as error:
+            raise IdeaContractError("idea_context_pack_invalid") from error
     creation=pack.get("creation_basis")
     if creation is not None and (not isinstance(creation,dict) or set(creation)!={"basis_ref","basis_hash","kind"} or not isinstance(creation["basis_ref"],str) or not _is_hash(creation["basis_hash"]) or creation["kind"] not in {"prepared","literature_revised"}):
         raise IdeaContractError("idea_context_pack_invalid")
-    legacy={k:v for k,v in pack.items() if k not in {"evidence_page", "creation_basis"}}
+    legacy={k:v for k,v in pack.items() if k not in {"evidence_page", "creation_basis", "cycle_position"}}
     legacy.update(schema_ref=IDEA_CONTEXT_PACK_SCHEMA_V2_REF,literature_binding=None,prior_accepted_bindings=[])
     refs=validate_idea_context_pack(legacy,cycle_ref=cycle_ref,accepted_question_binding=accepted_question_binding)
     page=pack["evidence_page"]
-    if not isinstance(page,dict) or set(page)!={"schema_ref","total_count","shown_count","offset","limit","next_offset","selection","complete","references_hash"} or page["schema_ref"]!="meta-research/evidence-reference-page/v1" or type(page["total_count"])is not int or page["total_count"]<len(refs) or page["shown_count"]!=len(refs) or page["total_count"]!=pack["evidence_reference_revision"] or page["offset"]!=0 or page["limit"]!=32 or len(refs)>32 or page["references_hash"]!=_canonical_hash(sorted(refs)) or page["complete"]!=(len(refs)==page["total_count"]) or page["next_offset"]!=(len(refs) if len(refs)<page["total_count"] else None):
+    if page is None:
+        if refs or pack["evidence_reference_revision"] != 0:
+            raise IdeaContractError("idea_context_pack_invalid")
+    elif not isinstance(page,dict) or set(page)!={"schema_ref","total_count","shown_count","offset","limit","next_offset","selection","complete","references_hash"} or page["schema_ref"]!="meta-research/evidence-reference-page/v1" or type(page["total_count"])is not int or page["total_count"]<len(refs) or page["shown_count"]!=len(refs) or page["total_count"]!=pack["evidence_reference_revision"] or page["offset"]!=0 or page["limit"]!=32 or len(refs)>32 or page["references_hash"]!=_canonical_hash(sorted(refs)) or page["complete"]!=(len(refs)==page["total_count"]) or page["next_offset"]!=(len(refs) if len(refs)<page["total_count"] else None):
         raise IdeaContractError("idea_context_pack_invalid")
     _validate_literature_reference(pack["literature_binding"],accepted_question_binding.get("question_ref"))
     prior=pack["prior_accepted_bindings"]
@@ -751,10 +767,10 @@ def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
         if "handoff_notes" in item:
             note = item["handoff_notes"]
             if (not isinstance(note, dict) or set(note) != {"text", "source_utf8_bytes", "truncated"}
-                or not isinstance(note["text"], str) or len(note["text"].encode()) > 2048
+                or not isinstance(note["text"], str)
                 or type(note["source_utf8_bytes"]) is not int
-                or note["source_utf8_bytes"] < len(note["text"].encode())
-                or note["truncated"] != (note["source_utf8_bytes"] > len(note["text"].encode()))):
+                or note["source_utf8_bytes"] != len(note["text"].encode())
+                or note["truncated"] is not False):
                 raise IdeaContractError("idea_context_pack_invalid")
         _validate_public_receipt(item["receipt"],issuer="advancement_engine",subject_ref=item["commit_ref"])
         _validate_public_receipt(item["outcome_receipt"],issuer="research_graph",subject_ref=item["outcome_ref"])

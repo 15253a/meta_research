@@ -135,6 +135,7 @@ def validate_bundle_context_pack(
     expected_keys = {
         "schema_ref",
         "cycle_ref",
+        "cycle_position",
         "accepted_question_binding",
         "accepted_formal_plan_binding",
     }
@@ -145,6 +146,11 @@ def validate_bundle_context_pack(
         expected_keys,
         "bundle_context_pack_invalid",
     )
+    from meta_research.cycle_position import validate_cycle_position
+    try:
+        validate_cycle_position(context_pack.get("cycle_position"), cycle_ref=cycle_ref)
+    except ValueError as error:
+        raise BundleContractError("bundle_cycle_position_invalid") from error
     if (
         schema_ref
         not in {

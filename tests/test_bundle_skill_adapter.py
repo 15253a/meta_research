@@ -143,6 +143,7 @@ def test_bundle_successor_request_carries_owner_rejection_feedback() -> None:
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-1",
+        "cycle_position": {"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_question_binding": question_binding,
         "accepted_formal_plan_binding": formal_plan_binding,
     }
@@ -762,6 +763,7 @@ def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-1",
+        "cycle_position": {"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_question_binding": {"question_ref": "question:bundle-1"},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
@@ -831,6 +833,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-1",
+        "cycle_position": {"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_question_binding": question_binding,
         "accepted_formal_plan_binding": formal_plan_binding,
     }
@@ -987,6 +990,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     result = adapter.execute(request)
     validate_bundle_skill_result(request, result)
     dispatch_request = BundleDispatchRequest(
+        cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref=request.stage_request_ref,
         run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:1",
@@ -1012,6 +1016,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     )
     dispatch = adapter.schedule_target(dispatch_request)
     batch_request = BundleTargetBatchRequest(
+        cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
             stage_request_ref=request.stage_request_ref,
             run_ref="bundle-run:1",
             attempt_ref="bundle-attempt:1",
@@ -1256,6 +1261,7 @@ def test_production_adapter_fails_before_provider_without_resident_mcp(
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-1",
+        "cycle_position": {"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_question_binding": {"question_ref": "question:bundle-1"},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
@@ -1341,6 +1347,7 @@ def test_production_exhaustion_acceptance_does_not_require_child_trace(
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-exhaustion",
+        "cycle_position": {"cycle_ref": "cycle:bundle-exhaustion", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_question_binding": {"question_ref": "question:bundle-1"},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
@@ -1581,6 +1588,7 @@ def test_invalid_provider_transport_is_terminal_and_never_replayed(
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-transport",
+        "cycle_position": {"cycle_ref": "cycle:bundle-transport", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_question_binding": {"question_ref": "question:bundle-1"},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
@@ -1679,6 +1687,7 @@ def test_bundle_adapter_transports_a_legal_target_plan_larger_than_one_mib(
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-large",
+        "cycle_position": {"cycle_ref": "cycle:bundle-large", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_question_binding": question_binding,
         "accepted_formal_plan_binding": formal_plan_binding,
     }
@@ -1962,6 +1971,7 @@ def test_bundle_large_rolling_prompt_reaches_the_public_batch_operation(
         for commit in target_commits
     )
     request = BundleTargetBatchRequest(
+        cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref="stage-request:bundle-large-rolling",
         run_ref="bundle-run:large-rolling",
         attempt_ref="bundle-attempt:large-rolling",

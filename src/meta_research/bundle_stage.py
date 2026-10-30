@@ -291,6 +291,7 @@ class BundleStageWorker:
                         else BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF
                     ),
                     "cycle_ref": current.cycle_ref,
+                    "cycle_position": self._advancement_engine.query_cycle_position(current.cycle_ref),
                     "accepted_question_binding": current.question.as_binding().as_dict(),
                     "accepted_formal_plan_binding": accepted_formal_plan.as_dict(),
                     **(
@@ -350,9 +351,14 @@ class BundleStageWorker:
             if accepted_exhaustion_evidence is None:
                 return self._execute_target_plan(request, run)
             return self._advance_exhaustion(request, run)
-        if run.execution is None:
-            return self._execute_target_plan(request, run)
         graph = self._research_graph.query_target_graph(request.request_ref)
+        if run.execution is None:
+            if graph is None:
+                return self._execute_target_plan(request, run)
+            if self._agent_runtime.query_stage_native_replacement_context(
+                run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+            ) is None:
+                raise OwnerConflict("bundle_native_replacement_context_missing")
         if graph is None:
             execution = run.execution
             rejection = self._research_graph.query_target_graph_rejection(
@@ -501,8 +507,7 @@ class BundleStageWorker:
                 attempt_ref=run.attempt_ref,
             )
             if pending is None:
-                if run.native_session_ref is None:
-                    raise OwnerConflict("bundle_native_session_missing")
+                replacement_context = self._rolling_replacement_context(request, run, graph, commits)
                 batch_request = BundleTargetBatchRequest(
                     stage_request_ref=request.request_ref,
                     run_ref=run.run_ref,
@@ -524,6 +529,8 @@ class BundleStageWorker:
                         BundleRuntimeBinding, run.runtime_binding
                     ),
                     inbox_checkpoint=inbox_checkpoint.as_public_dict(),
+                    cycle_position=request.context_pack["cycle_position"],
+                    native_replacement_context=replacement_context,
                     job_ref=batch_operation_ref,
                     provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                         run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
@@ -590,6 +597,8 @@ class BundleStageWorker:
                             provider_safe = False
                         self._transient_error = failure_code
                         return False
+                    self._bind_rolling_replacement(run, graph, batch_unit_ref,
+                        result.native_session_ref, replacement_context)
                     self._agent_runtime.record_bundle_target_proposal(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
@@ -763,8 +772,7 @@ class BundleStageWorker:
                 or _research_wait_recheck_due(latest, dispatch_frontier)
             )
         ):
-            if run.native_session_ref is None:
-                raise OwnerConflict("bundle_native_session_missing")
+            replacement_context = self._rolling_replacement_context(request, run, graph, commits)
             dispatch_request = BundleDispatchRequest(
                 stage_request_ref=request.request_ref,
                 run_ref=run.run_ref,
@@ -778,6 +786,8 @@ class BundleStageWorker:
                 native_session_ref=run.native_session_ref,
                 runtime_binding=cast(BundleRuntimeBinding, run.runtime_binding),
                 inbox_checkpoint=inbox_checkpoint.as_public_dict(),
+                cycle_position=request.context_pack["cycle_position"],
+                native_replacement_context=replacement_context,
                 job_ref=dispatch_operation_ref,
                 provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                     run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
@@ -851,6 +861,8 @@ class BundleStageWorker:
                         provider_safe = False
                     self._transient_error = failure_code
                     return False
+                self._bind_rolling_replacement(run, graph, dispatch_unit_ref,
+                    result.native_session_ref, replacement_context)
                 self._agent_runtime.record_bundle_dispatch_decision(
                     run_ref=run.run_ref,
                     attempt_ref=run.attempt_ref,
@@ -1768,6 +1780,34 @@ class BundleStageWorker:
                 human_request=human_request,
             )
         return value
+
+    def _rolling_replacement_context(self, request, run, graph, commits):
+        if run.native_session_ref is not None:
+            return None
+        basis = self._agent_runtime.query_stage_native_replacement_context(
+            run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref)
+        if basis is None:
+            raise OwnerConflict("bundle_native_replacement_context_missing")
+        return {**{name: basis[name] for name in (
+            "kind", "stage_request_ref", "retired_attempt_ref", "retired_native_session_ref",
+            "safe_point_ref", "provider_operation_ref")},
+            "isolation_basis": basis, "frozen_stage_input": request.context_pack,
+            "accepted_target_graph": {"graph_ref": graph.graph_ref,
+                "initial_target_plan": graph.target_plan, "generation": graph.head_generation,
+                "head_receipt": graph.head_receipt.as_public_dict(),
+                "targets": [self._target_projection(target) for target in graph.targets],
+                "target_commits": [{"commit_ref": commit.commit_ref, "target_ref": commit.target_ref,
+                    "closure_hash": commit.closure_hash, "closure": commit.closure,
+                    "receipt": commit.receipt.as_public_dict()} for commit in commits]}}
+
+    def _bind_rolling_replacement(self, run, graph, unit_ref, native_session_ref, context):
+        if context is None:
+            return
+        self._agent_runtime.bind_bundle_rolling_replacement_session(
+            unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref, graph_ref=graph.graph_ref,
+            graph_receipt=graph.receipt, native_session_ref=native_session_ref,
+            proof=context["isolation_basis"])
 
     @staticmethod
     def _target_projection(target: AcceptedTarget) -> dict[str, object]:
@@ -2714,6 +2754,8 @@ class BundleStageWorker:
             owner_feedback,
         ) = self._owner_rejection_context(request, run)
         skill_request = BundleSkillRequest(
+            native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
+                run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),
             stage_request_ref=request.request_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,

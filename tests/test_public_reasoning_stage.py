@@ -207,6 +207,7 @@ class _DeterministicReasoningSkill:
         next_cycle: dict[str, object] = {
             "schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
             "kind": "NextCycleProposal",
+        "cycle_focus": "Reassess the next research direction using the accepted evidence",
             "source_quest_ref": request.quest_ref,
             "source_cycle_ref": request.cycle_ref,
             "source_reasoning_stage_run_request_ref": request.stage_request_ref,
@@ -881,6 +882,13 @@ def test_reasoning_affirmed_next_cycle_keeps_owner_acceptance_layers_distinct(
             )
         )
         assert successor_context is not None
+        position = runtime.owners.advancement_engine.query_cycle_position(str(successor["cycle_ref"]))
+        assert position["cycle_ref"] == successor["cycle_ref"]
+        assert position["round"] == request.context_pack["cycle_position"]["round"] + 1
+        assert position["cycle_focus"] == committed["transition"]["cycle_focus"]
+        assert position["focus_source"]["stage_commit_ref"] == stored_commit.commit_ref
+        assert successor_context["idea_context_pack"]["cycle_position"] == position
+        assert successor_context["idea_context_pack"]["evidence_page"] is None
         assert successor_context["idea_context_pack"]["schema_ref"] == (
             "meta-research/idea-context-pack/v4"
         )

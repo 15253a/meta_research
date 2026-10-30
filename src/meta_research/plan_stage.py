@@ -459,6 +459,8 @@ class PlanStageWorker:
             )[:64]
         )
         skill_request = PlanSkillRequest(
+            native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
+                run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),
             stage_request_ref=request.request_ref,
             cycle_ref=request.cycle_ref,
             question_ref=request.accepted_question.question_ref,
@@ -932,6 +934,7 @@ class PlanStageWorker:
         return {
             "schema_ref": PLAN_CONTEXT_PACK_SCHEMA_REF,
             "cycle_ref": current.cycle_ref,
+            "cycle_position": self._advancement_engine.query_cycle_position(current.cycle_ref),
             "accepted_question_binding": current.question.as_binding().as_dict(),
             "accepted_idea_set_binding": eligible.accepted_idea_set.as_dict(),
             "evidence_catalog": [dict(item) for item in evidence_catalog],

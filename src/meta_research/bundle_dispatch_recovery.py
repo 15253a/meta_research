@@ -14,7 +14,7 @@ from meta_research.idea_skill import (
     _read_completed_operation, _read_operation_invocation, _read_spool_text,
     _unwrap_codex_root_output, _verified_operation_inputs,
 )
-from meta_research.owners.common import canonical_hash
+from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.root_capabilities import root_capability_profile
 
 
@@ -47,7 +47,12 @@ def _completed_operation(adapter, request, operation_name, raw_schema):
     invocation_hash = canonical_hash(invocation)
     _verified_operation_inputs(directory, invocation_hash=invocation_hash)
     limits = _operation_transport_limits(invocation)
-    prompt = _read_spool_text(directory / "prompt.txt", limits.prompt_max_bytes)
+    encoded_input = _read_spool_text(directory / "business-input.json", limits.prompt_max_bytes)
+    operation_input = json.loads(encoded_input)
+    if (not isinstance(operation_input, dict)
+            or canonical_json(operation_input) != encoded_input
+            or canonical_hash(operation_input) != invocation.get("operation_input_hash")):
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     output, session, _stdout = _read_completed_operation(
         directory, invocation_hash=invocation_hash,
         native_session_ref=request.native_session_ref, transport_limits=limits,
@@ -55,20 +60,7 @@ def _completed_operation(adapter, request, operation_name, raw_schema):
     output = _decode_codex_provider_output(
         _unwrap_codex_root_output(output, raw_schema), raw_schema,
     )
-    return prompt, output, session
-
-
-def _prompt_fields(prompt, names):
-    fields = {}
-    for line in prompt.splitlines():
-        name, separator, value = line.partition("=")
-        if separator and name in names:
-            if name in fields:
-                raise ValueError("duplicate request field")
-            fields[name] = value
-    if set(fields) != set(names):
-        raise ValueError("missing request field")
-    return fields
+    return operation_input, output, session
 
 
 def _correction(adapter, request, operation_name, detail):
@@ -85,30 +77,27 @@ def recover_rejected_dispatch(
     """Preserve a completed result; superseded inputs require a new Attempt."""
     from meta_research.bundle_skill import (
         BundleDispatchResult, BundleSkillContractError, _dispatch_schema,
-        validate_bundle_dispatch_result,
+        validate_bundle_dispatch_result, _rolling_operation_identity,
     )
     if request.job_ref is None:
         return
     try:
-        prompt, output, session = _completed_operation(
+        operation_input, output, session = _completed_operation(
             adapter, request, operation_name, _dispatch_schema(()),
         )
-        identity_names = (
-            "stage_request_ref", "run_ref", "attempt_ref", "fence_ref",
-            "root_session_ref", "graph_ref", "generation",
-        )
-        fields = _prompt_fields(prompt, (*identity_names, "runtime_binding_hash",
-                                       "inbox_checkpoint", "frontier", "state"))
-        if any(fields[name] != str(getattr(request, name)) for name in identity_names):
+        if (operation_input.get("kind") != "bundle_dispatch"
+                or operation_input.get("identity") != _rolling_operation_identity(request)):
             raise IdeaSkillUnavailable("codex_operation_identity_conflict")
-        if fields["runtime_binding_hash"] != canonical_hash(request.runtime_binding.as_dict()):
+        fields = operation_input["request"]
+        if not isinstance(fields, dict):
+            raise ValueError("invalid dispatch input")
+        if fields.get("generation") != request.generation:
             raise IdeaSkillUnavailable("codex_operation_identity_conflict")
-        frontier = json.loads(fields["frontier"])
-        if not isinstance(frontier, list):
-            raise ValueError("invalid frontier")
+        if not isinstance(fields["frontier"], list) or not isinstance(fields["state"], dict):
+            raise ValueError("invalid dispatch input")
         original = replace(
-            request, frontier=tuple(frontier), state=json.loads(fields["state"]),
-            inbox_checkpoint=json.loads(fields["inbox_checkpoint"]),
+            request, frontier=tuple(fields["frontier"]), state=fields["state"],
+            inbox_checkpoint=fields["inbox_checkpoint"],
         )
     except IdeaSkillUnavailable:
         raise
@@ -133,16 +122,18 @@ def recover_rejected_target_batch(
     """Use the original batch closure for validation before Owner correction."""
     from meta_research.bundle_skill import (
         BundleSkillContractError, BundleTargetBatchResult, _target_batch_schema,
-        validate_bundle_target_batch_result,
+        validate_bundle_target_batch_result, _rolling_operation_identity,
     )
     if request.job_ref is None:
         return
     try:
-        prompt, output, session = _completed_operation(
+        operation_input, output, session = _completed_operation(
             adapter, request, operation_name, _target_batch_schema(request),
         )
-        fields = _prompt_fields(prompt, ("canonical_batch_context",))
-        context = json.loads(fields["canonical_batch_context"])
+        if (operation_input.get("kind") != "bundle_target_batch"
+                or operation_input.get("identity") != _rolling_operation_identity(request)):
+            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+        context = operation_input["request"]
         identity_names = (
             "stage_request_ref", "run_ref", "attempt_ref", "fence_ref", "root_session_ref",
             "graph_ref", "formal_plan_ref", "context_pack_ref", "context_pack_hash",

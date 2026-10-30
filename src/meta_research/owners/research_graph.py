@@ -3891,8 +3891,8 @@ class SQLiteResearchGraphReceiptVerifier:
             raise OwnerConflict("reasoning_transition_binding_invalid")
         return {
             **({"notes": notes} if notes is not None else {}),
-            "scientific_summary": scientific_handoff(content.scientific_outcome,
-                source_ref=outcome_ref, next_action=transition),
+            "scientific_summary": {key: value for key, value in content.scientific_outcome.items()
+                                   if key != "notes"},
             "scientific_disposition": row.scientific_disposition,
             "scientific_outcome_hash": row.outcome_hash,
             "transition_kind": row.transition_kind,
@@ -5333,7 +5333,8 @@ class SQLiteResearchGraphReceiptVerifier:
                 source_ref = appended.proposal_ref
                 source_hash = canonical_hash(proposal)
         if notes is not None:
-            result.update(notes=notes, notes_source_ref=source_ref, notes_source_hash=source_hash)
+            result.update(notes=notes, notes_source_ref=source_ref, notes_source_hash=source_hash,
+                          notes_text_hash=hashlib.sha256(notes.encode("utf-8")).hexdigest())
         return graph, result
 
     def query_target_formal_plan_projection_source(

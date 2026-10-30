@@ -61,6 +61,8 @@ def _runtime_binding() -> IdeaRuntimeBinding:
 
 def _request(**changes: object) -> IdeaSkillRequest:
     context_pack: dict[str, object] = {
+        "cycle_ref": "cycle:1",
+        "cycle_position": {"cycle_ref": "cycle:1", "round": 1, "cycle_focus": "Compare evidence and limitations", "focus_source": {"draft_hash": "a" * 64}},
         "schema_ref": "meta-research/idea-context-pack/v1",
         "accepted_evidence_refs": ["asset:accepted-1"],
         "prior_accepted_outcomes": [],
@@ -1378,9 +1380,8 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert result.review_mode == "advisory_unobserved"
     assert result.reviewer_agent_ref is None
     assert result.adapter_kind == "codex_cli"
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
-    review_argv, review_prompt, review_schema = runner.calls[1]
     assert primary_argv[:2] == ["codex", "exec"]
     assert primary_argv[2:4] == ["--enable", "multi_agent"]
     assert "--ignore-user-config" not in primary_argv
@@ -1422,7 +1423,6 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert "view_image" not in disabled
     from meta_research.research_guidance import shared_research_guidance
     assert shared_research_guidance() in primary_prompt
-    assert shared_research_guidance() in review_prompt
     assert "## IdeaStageInvocation" in primary_prompt
     assert "## Accepted handoff" in primary_prompt
     assert "一个 submission identity" in primary_prompt
@@ -1430,15 +1430,6 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert set(primary_schema["properties"]) == {"outcome"}
     assert "anyOf" in primary_schema["properties"]["outcome"]
     _assert_codex_schema_types(primary_schema)
-    assert "## IdeaStageInvocation" in review_prompt
-    assert "## Accepted handoff" in review_prompt
-    assert "reviewed_draft=" in review_prompt
-    assert review_argv[-3:] == ["resume", "codex-primary:1", "-"]
-    assert set(review_schema["properties"]) == {
-        "findings",
-        "final_outcome",
-        "dispositions",
-    }
     _assert_codex_schema_types(review_schema)
 
 
@@ -1520,7 +1511,7 @@ def test_completion_rejection_feedback_reaches_both_idea_provider_turns(
     result = adapter.execute(request)
     validate_idea_skill_result(request, result)
 
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
     for _argv, prompt, _schema in runner.calls:
         assert "owner_rejection_kind=completion" in prompt
         assert "idea-candidate:rejected" in prompt
@@ -1664,7 +1655,7 @@ def test_codex_0147_lossy_stdout_does_not_gate_public_review_result(
 
     assert result.reviewer_agent_ref is None
     assert result.primary_session_ref == runner.root_session_ref
-    assert runner.job_refs == [request.job_ref]
+    assert runner.job_refs == []
 
 
 def test_production_adapter_does_not_accept_a_provider_reviewer_identity(
@@ -1796,94 +1787,26 @@ def test_durable_review_without_spawn_trace_replays_public_result(
     assert no_replay.calls == []
 
 
-def test_production_adapter_resumes_the_root_session_for_review_dispositions(
-    tmp_path: Path,
-) -> None:
-    finding = {
-        "finding_id": "finding-1",
-        "category": "falsifiability",
-        "message": "候选需要更明确的推翻条件。",
-    }
-    final = _idea_set("比较带预注册推翻阈值的结构一致性与像素重建")
-    runner = _SequenceRunner(
-        [
-            {"outcome": _idea_set()},
-            _review_turn_output(
-                findings=[finding],
-                final_outcome=final,
-                dispositions=[
-                    {
-                        "finding_id": "finding-1",
-                        "action": "revised",
-                        "rationale": "已把推翻阈值写入候选方向与 falsification hint。",
-                    }
-                ],
-            ),
-        ]
-    )
-    adapter = CodexIdeaSkillAdapter(
-        tmp_path / "idea-provider-review", process_runner=runner
-    )
-
-    request = _request(runtime_binding=adapter.runtime_binding())
+def test_production_adapter_continues_owner_revision_in_the_original_root(tmp_path: Path) -> None:
+    final = _idea_set("Revision after independent review and Owner feedback")
+    runner = _SequenceRunner([{"outcome": final}])
+    adapter = CodexIdeaSkillAdapter(tmp_path / "root-revision", process_runner=runner)
+    request = _request(runtime_binding=adapter.runtime_binding(), native_session_ref="codex-primary:1")
     result = adapter.execute(request)
     validate_idea_skill_result(request, result)
-
     assert result.final_outcome == final
-    assert result.findings == (finding,)
-    assert result.dispositions[0]["action"] == "revised"
-    assert len(runner.calls) == 2
-    review_argv, review_prompt, review_schema = runner.calls[1]
-    assert review_argv[-3:] == ["resume", "codex-primary:1", "-"]
-    assert "根 Idea Agent" in review_prompt
-    assert set(review_schema["properties"]) == {
-        "findings",
-        "final_outcome",
-        "dispositions",
-    }
+    assert result.reviewed_draft == final
+    assert len(runner.calls) == 1
+    assert runner.calls[0][0][-3:] == ["resume", "codex-primary:1", "-"]
 
 
-def test_production_adapter_rejects_a_resume_that_changes_native_session(
-    tmp_path: Path,
-) -> None:
-    finding = {
-        "finding_id": "finding-1",
-        "category": "falsifiability",
-        "message": "候选需要更明确的推翻条件。",
-    }
-    runner = _SequenceRunner(
-        [
-            {"outcome": _idea_set()},
-            _review_turn_output(
-                findings=[finding],
-                final_outcome=_idea_set("加入可反驳阈值的结构一致性"),
-                dispositions=[
-                    {
-                        "finding_id": "finding-1",
-                        "action": "revised",
-                        "rationale": "加入了推翻阈值。",
-                    }
-                ],
-            ),
-        ],
-        thread_ids=[
-            "codex-primary:1",
-            "alien-native-session",
-        ],
-    )
-    adapter = CodexIdeaSkillAdapter(
-        tmp_path / "native-session-mismatch",
-        process_runner=runner,
-    )
-    request = _request(runtime_binding=adapter.runtime_binding())
-
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_native_session_mismatch",
-    ):
+def test_production_adapter_rejects_a_resume_that_changes_native_session(tmp_path: Path) -> None:
+    runner = _SequenceRunner([{"outcome": _idea_set()}], thread_ids=["alien-native-session"])
+    adapter = CodexIdeaSkillAdapter(tmp_path / "native-session-mismatch", process_runner=runner)
+    request = _request(runtime_binding=adapter.runtime_binding(), native_session_ref="codex-primary:1")
+    with pytest.raises(IdeaSkillUnavailable, match="codex_native_session_mismatch"):
         adapter.execute(request)
-
-    assert runner.calls[1][0][-3:] == ["resume", "codex-primary:1", "-"]
+    assert len(runner.calls) == 1
 
 
 def test_provider_streaming_runner_preserves_local_signed_completion(tmp_path):
@@ -1973,9 +1896,8 @@ def test_production_adapter_reconciles_each_durable_provider_phase(
         job_ref="idea-review-operation:stable",
     )
     result = first.review_draft(review_request, draft)
-    assert result.final_outcome == revised
-    assert len(first_runner.calls) == 2
-    next(workspace.glob("provider-operations/*/review/completed.json")).unlink()
+    assert result.final_outcome == draft.draft
+    assert len(first_runner.calls) == 1
 
     recovered_result = restarted.review_draft(review_request, recovered_draft)
     assert recovered_result == result

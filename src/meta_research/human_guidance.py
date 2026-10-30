@@ -108,6 +108,7 @@ class FrozenGuidanceDelivery:
     prior_treatment_json: str | None
     applies_to_work: bool = True
     scope_confirmation: str = "legacy_unconfirmed"
+    guidance_status: str = "active"
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -118,6 +119,7 @@ class FrozenGuidanceDelivery:
             else decoded_object(self.prior_treatment_json),
             "applies_to_work": self.applies_to_work,
             "scope_confirmation": self.scope_confirmation,
+            "guidance_status": self.guidance_status,
         }
 
 
@@ -148,12 +150,14 @@ def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True) -> str:
     rendered = (
         "\n\n## 本次操作的正式人类指导\n"
         + canonical_json({"binding": cut.binding.as_dict(), "deliveries": items})
-        + "\n用 human_guidance.read 列表发现本次冻结指导，再精确完整读取各 delivery_ref。"
+        + "\n可用 human_guidance.read 发现并按需精确完整读取各 delivery_ref。"
         "列表与此索引不证明已读原文。needs_treatment=true 的指导在本工作中尚需说明处理，"
-        "完整读后用 human_guidance.feedback 说明理解、调整、继续事项及理由。"
+        "理解准确原文后用 human_guidance.feedback 说明理解、调整、继续事项及理由；"
+        "原文已由原生输入提供时无需为反馈另行调用读取。"
         "仅 applies_to_work=true 的指导在其确认范围内适用；背景指导可读但不继承为本工作要求。"
         "适用且 needs_treatment=false 时参考既有反馈继续履行。"
-        "本次操作之后提交的指导由下一逻辑操作接续。按实际影响判断是否涉及 Quest 目标，"
+        "在途新正式确认且适用本工作的指导通过当前原生输入在原根接续；"
+        "没有适用活动根时交由正确后继接续。按实际影响判断是否涉及 Quest 目标，"
         "局部严格要求不因力度5需要目标演化；整体变化才沿目标演化流程，"
         "收到、读取或反馈不表示目标已切换。HumanRequest 答复仍归原请求根。\n"
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from meta_research.context_presentation import literature_reference, reasoning_handoff_reference
+from meta_research.cycle_position import validate_cycle_position
 
 import json
 import time
@@ -336,6 +337,8 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for Cycle, Stage, and Foreground authority."""
 
     def bind_search_sources(self, registry: SearchSourceRegistry) -> None: ...
+
+    def query_cycle_position(self, cycle_ref: str) -> dict[str, object]: ...
 
     def query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest: ...
 
@@ -2399,6 +2402,21 @@ class SQLiteAdvancementEngine(
             "owner_revision": int(row.owner_revision),
         }
 
+    def query_cycle_position(self, cycle_ref: str) -> dict[str, object]:
+        """Read activation-time focus, never the mutable current Question/Goal."""
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT cycle_position_json FROM ae_cycles WHERE cycle_ref=:cycle"
+            ), {"cycle": cycle_ref}).first()
+        if row is None or row.cycle_position_json is None:
+            raise OwnerConflict("cycle_position_unavailable")
+        try:
+            position = decoded_object(row.cycle_position_json)
+            validate_cycle_position(position, cycle_ref=cycle_ref)
+        except (ValueError, TypeError) as error:
+            raise OwnerConflict("cycle_position_invalid") from error
+        return position
+
     def query_reasoning_successor_context(
         self, cycle_ref: str
     ) -> dict[str, object] | None:
@@ -2435,7 +2453,12 @@ class SQLiteAdvancementEngine(
                     {"cycle_ref": cycle.predecessor_cycle_ref},
                 ).first()
             )
-        if cycle is None or source is None:
+        if cycle is None:
+            return None
+        if source is None:
+            position = self.query_cycle_position(cycle_ref)
+            if cycle.predecessor_cycle_ref is not None and position["focus_source"].get("kind") != "confirmed_control":
+                raise OwnerConflict("reasoning_successor_context_unavailable")
             return None
 
         committed = self._stage_commit_from_row(source)
@@ -2503,6 +2526,7 @@ class SQLiteAdvancementEngine(
                 canonical_json(idea_context_pack)
                 != cycle.idea_context_pack_json
                 or canonical_hash(idea_context_pack) != idea_context_pack_hash
+                or idea_context_pack.get("cycle_position") != self.query_cycle_position(cycle_ref)
             ):
                 raise OwnerConflict("reasoning_successor_context_invalid")
         else:
@@ -3387,6 +3411,15 @@ class SQLiteAdvancementEngine(
                     {"cycle_ref": operation.target_cycle_ref},
                 ).first()
                 if target_cycle is None:
+                    control = decoded_object(operation.command_json)
+                    source_position = self.query_cycle_position(operation.source_cycle_ref)
+                    position = {"cycle_ref": operation.target_cycle_ref,
+                                "round": source_position["round"] + 1,
+                                "cycle_focus": control["reason"],
+                                "focus_source": {"kind": "confirmed_control", "operation_ref": operation.operation_ref,
+                                                 "intent_id": operation.intent_id, "command_hash": operation.command_hash,
+                                                 "target_question_ref": operation.target_question_ref}}
+                    validate_cycle_position(position, cycle_ref=operation.target_cycle_ref)
                     predecessor = connection.execute(
                         text(
                             "SELECT cycle_ref FROM ae_cycles WHERE quest_ref = "
@@ -3403,9 +3436,9 @@ class SQLiteAdvancementEngine(
                             "INSERT INTO ae_cycles (cycle_ref, quest_ref, "
                             "question_ref, question_receipt_ref, "
                             "question_receipt_hash, stage, status, "
-                            "predecessor_cycle_ref, created_at, updated_at) VALUES "
+                            "predecessor_cycle_ref, cycle_position_json, created_at, updated_at) VALUES "
                             "(:cycle_ref, :quest_ref, :question_ref, :receipt_ref, "
-                            ":receipt_hash, 'idea', 'ongoing', :predecessor, :now, "
+                            ":receipt_hash, 'idea', 'ongoing', :predecessor, :cycle_position_json, :now, "
                             ":now)"
                         ),
                         {
@@ -3415,6 +3448,7 @@ class SQLiteAdvancementEngine(
                             "receipt_ref": operation.target_question_receipt_ref,
                             "receipt_hash": operation.target_question_receipt_hash,
                             "predecessor": predecessor,
+                            "cycle_position_json": canonical_json(position),
                             "now": now,
                         },
                     )
@@ -3888,6 +3922,19 @@ class SQLiteAdvancementEngine(
             receipt_ref = new_ref("ae_cycle_receipt")
             receipt_hash = _receipt_hash(CYCLE_RECEIPT_KIND, cycle_ref, bindings)
             activated_at = time.time()
+            focus_field = "background_and_initial_direction"
+            focus = quest.draft.get(focus_field)
+            if not isinstance(focus, str) or not focus.strip():
+                focus_field = "goal"
+                focus = quest.draft.get(focus_field)
+            position = {"cycle_ref": cycle_ref, "round": 1, "cycle_focus": focus,
+                        "focus_source": {"kind": "confirmed_creation", "initialization_id": initialization_id,
+                                         "draft_hash": quest.draft_hash, "field": focus_field,
+                                         "confirmation_ref": quest.confirmation.receipt_ref}}
+            try:
+                validate_cycle_position(position, cycle_ref=cycle_ref)
+            except ValueError as error:
+                raise OwnerConflict("cycle_position_invalid") from error
             connection.execute(
                 text(
                     "INSERT INTO ae_initial_cycles (cycle_ref, initialization_id, "
@@ -3911,9 +3958,9 @@ class SQLiteAdvancementEngine(
                 text(
                     "INSERT INTO ae_cycles (cycle_ref, quest_ref, question_ref, "
                     "question_receipt_ref, question_receipt_hash, stage, status, "
-                    "created_at, updated_at) VALUES (:cycle_ref, :quest_ref, "
+                    "created_at, updated_at, cycle_position_json) VALUES (:cycle_ref, :quest_ref, "
                     ":question_ref, :question_receipt_ref, :question_receipt_hash, "
-                    "'idea', 'ongoing', :activated_at, :activated_at)"
+                    "'idea', 'ongoing', :activated_at, :activated_at, :cycle_position_json)"
                 ),
                 {
                     "cycle_ref": cycle_ref,
@@ -3921,6 +3968,7 @@ class SQLiteAdvancementEngine(
                     "question_ref": question.question_ref,
                     "question_receipt_ref": question.receipt.receipt_ref,
                     "question_receipt_hash": question.receipt.payload_hash,
+                    "cycle_position_json": canonical_json(position),
                     "activated_at": activated_at,
                 },
             )
@@ -4035,6 +4083,10 @@ class SQLiteAdvancementEngine(
         self._authorization_verifier.verify_broad_research_authorization(
             quest_ref=accepted_question.quest_ref
         )
+        position = self.query_cycle_position(cycle_ref)
+        if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
+            raise OwnerConflict("cycle_position_binding_invalid")
+        context_pack = {**context_pack, "cycle_position": position}
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
         epoch = self._current_stage_epoch(
@@ -4317,6 +4369,10 @@ class SQLiteAdvancementEngine(
         """Freeze the accepted Question, IdeaSet closure, and Evidence snapshot."""
 
         _validate_idempotency_key(idempotency_key)
+        position = self.query_cycle_position(cycle_ref)
+        if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
+            raise OwnerConflict("cycle_position_binding_invalid")
+        context_pack = {**context_pack, "cycle_position": position}
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
         epoch = self._current_stage_epoch(
@@ -4588,6 +4644,10 @@ class SQLiteAdvancementEngine(
         """Freeze the exact accepted FormalPlan closure consumed by Bundle."""
 
         _validate_idempotency_key(idempotency_key)
+        position = self.query_cycle_position(cycle_ref)
+        if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
+            raise OwnerConflict("cycle_position_binding_invalid")
+        context_pack = {**context_pack, "cycle_position": position}
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
         epoch = self._current_stage_epoch(
@@ -7204,7 +7264,7 @@ class SQLiteAdvancementEngine(
                     raise OwnerConflict("bundle_stage_notes_invalid")
                 closure_output.update(_bundle_stage_report_closure(accepted, notes=notes))
                 if notes is not None:
-                    for key in ("notes_source_ref", "notes_source_hash"):
+                    for key in ("notes_source_ref", "notes_source_hash", "notes_text_hash"):
                         if not isinstance(contract.get(key), str) or not contract[key]:
                             raise OwnerConflict("bundle_stage_notes_invalid")
                         closure_output[key] = contract[key]
@@ -8469,10 +8529,21 @@ class SQLiteAdvancementEngine(
                 "entry_stage": entry_stage,
             }
         )[:32]
+        source_position = self.query_cycle_position(request.cycle_ref)
+        position = {"cycle_ref": next_cycle_ref, "round": source_position["round"] + 1,
+                    "cycle_focus": transition.get("cycle_focus"),
+                    "focus_source": {"kind": "accepted_reasoning", "cycle_ref": request.cycle_ref,
+                                     "stage_commit_ref": source_commit.commit_ref,
+                                     "outcome_ref": outcome_ref, "transition_hash": canonical_hash(transition)}}
+        try:
+            validate_cycle_position(position, cycle_ref=next_cycle_ref)
+        except ValueError as error:
+            raise OwnerConflict("reasoning_successor_focus_invalid") from error
         idea_context_pack = self._freeze_reasoning_successor_idea_context(
             cycle_ref=next_cycle_ref,
             accepted_question=target,
             source_commit=source_commit,
+            cycle_position=position,
         )
         idea_context_pack_json = (
             None if idea_context_pack is None else canonical_json(idea_context_pack)
@@ -8485,11 +8556,11 @@ class SQLiteAdvancementEngine(
                 "INSERT INTO ae_cycles (cycle_ref, quest_ref, question_ref, "
                 "question_receipt_ref, question_receipt_hash, stage, status, "
                 "predecessor_cycle_ref, idea_context_pack_json, "
-                "idea_context_pack_hash, created_at, updated_at) VALUES "
+                "idea_context_pack_hash, cycle_position_json, created_at, updated_at) VALUES "
                 "(:cycle_ref, :quest_ref, "
                 ":question_ref, :question_receipt_ref, :question_receipt_hash, "
                 ":stage, 'ongoing', :predecessor_cycle_ref, "
-                ":idea_context_pack_json, :idea_context_pack_hash, :now, :now)"
+                ":idea_context_pack_json, :idea_context_pack_hash, :cycle_position_json, :now, :now)"
             ),
             {
                 "cycle_ref": next_cycle_ref,
@@ -8501,6 +8572,7 @@ class SQLiteAdvancementEngine(
                 "predecessor_cycle_ref": request.cycle_ref,
                 "idea_context_pack_json": idea_context_pack_json,
                 "idea_context_pack_hash": idea_context_pack_hash,
+                "cycle_position_json": canonical_json(position),
                 "now": now,
             },
         )
@@ -8600,15 +8672,14 @@ class SQLiteAdvancementEngine(
         cycle_ref: str,
         accepted_question: AcceptedQuestionBinding,
         source_commit: StageCommit,
+        cycle_position: dict[str, object],
     ) -> dict[str, object]:
-        evidence = self._evidence_verifier
         literature = self._question_literature_revision_verifier
         collaboration = self._authorization_verifier
-        if evidence is None or literature is None or collaboration is None:
+        if literature is None or collaboration is None:
             raise OwnerConflict("reasoning_successor_context_verifier_unavailable")
 
-        evidence_page, evidence_refs = evidence.query_evidence_reference_page(accepted_question.quest_ref)
-        evidence_revision = evidence_page["total_count"]
+        evidence_page, evidence_refs, evidence_revision = None, (), 0
         literature_revision = (
             literature.query_current_question_literature_revision(
                 accepted_question.question_ref
@@ -8640,6 +8711,7 @@ class SQLiteAdvancementEngine(
         context_pack: dict[str, object] = {
             "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_V4_REF,
             "cycle_ref": cycle_ref,
+            "cycle_position": cycle_position,
             "accepted_question_binding": accepted_question.as_dict(),
             "accepted_evidence_refs": list(sorted(evidence_refs)),
             "evidence_reference_revision": evidence_revision,
@@ -10927,8 +10999,13 @@ def _reasoning_context_pack_from_rows(
         ),
     }
 
+    cycle_row = connection.execute(text("SELECT cycle_position_json FROM ae_cycles WHERE cycle_ref=:cycle"),
+                                   {"cycle": cycle_ref}).one()
+    position = decoded_object(cycle_row.cycle_position_json) if cycle_row.cycle_position_json is not None else None
+    validate_cycle_position(position, cycle_ref=cycle_ref)
     context_pack: dict[str, object] = {
         "schema_ref": "meta-research/reasoning-context-pack/v1",
+        "cycle_position": position,
         "cycle_ref": cycle_ref,
         "foreground_epoch": epoch,
         "accepted_question_binding": accepted_question.as_dict(),
@@ -11020,6 +11097,7 @@ def _validate_reasoning_context_pack(
 ) -> None:
     if set(context_pack) != {
         "schema_ref",
+        "cycle_position",
         "cycle_ref",
         "foreground_epoch",
         "accepted_question_binding",

@@ -46,6 +46,7 @@ def _adapter(tmp_path, output, *, durable=False, native_session_ref=None):
 
 def _request(adapter, kind):
     scope = dict(
+        cycle_position={"cycle_ref": "cycle:drift", "round": 1, "cycle_focus": "Original frozen scope", "focus_source": {"request_ref": "fixture-start"}},
         stage_request_ref="stage-request:drift", run_ref="bundle-run:drift",
         attempt_ref="bundle-attempt:drift", fence_ref="bundle-fence:drift",
         graph_ref="target-graph:drift", root_session_ref="root-session:drift",
@@ -100,6 +101,17 @@ def test_completed_input_drift_retains_result_and_requests_owner_correction(tmp_
     assert invoke(request) == original
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
     original_files = {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()}
+    frozen = json.loads(original_files["business-input.json"])
+    invocation = json.loads(original_files["invocation.json"])["payload"]
+    assert invocation["operation_input_hash"] == canonical_hash(frozen)
+    assert frozen["identity"]["stage_request_ref"] == "stage-request:drift"
+    assert frozen["request"]["inbox_checkpoint"] == request.inbox_checkpoint
+    if kind == "dispatch":
+        assert frozen["request"]["frontier"] == list(request.frontier)
+        assert frozen["request"]["state"] == request.state
+    else:
+        assert frozen["request"]["current_targets"] == list(request.current_targets)
+        assert frozen["request"]["target_commits"] == list(request.target_commits)
     if durable:
         assert json.loads(original_files["invocation.json"])["payload"]["transport_mode"] == "durable_supervisor"
         assert "supervisor-exit.json" in original_files
@@ -170,6 +182,55 @@ def test_damaged_durable_exit_cannot_authorize_input_correction(tmp_path):
     assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize("kind", ("dispatch", "batch"))
+def test_damaged_business_input_cannot_authorize_recovery_or_rerun(tmp_path, kind):
+    adapter, runner = _adapter(tmp_path, _output(kind), durable=True)
+    request = _request(adapter, kind)
+    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke(request)
+    operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
+    source = operation / "business-input.json"
+    frozen = json.loads(source.read_text())
+    frozen["request"]["inbox_checkpoint"] = {}
+    source.write_text(json.dumps(frozen))
+    with pytest.raises(IdeaSkillUnavailable) as failure:
+        invoke(_changed(request, kind))
+    assert failure.value.code == "codex_operation_spool_invalid"
+    assert failure.value.recovery_checkpoint is None
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("kind", ("dispatch", "batch"))
+def test_reading_layout_change_reuses_same_exact_operation(tmp_path, monkeypatch, kind):
+    adapter, runner = _adapter(tmp_path, _output(kind), durable=True)
+    request = _request(adapter, kind)
+    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    result = invoke(request)
+    original = adapter._invoke_with_resident_mcp
+
+    def reordered(**arguments):
+        arguments["prompt"] += "\nReading layout annotation; exact business input is unchanged."
+        return original(**arguments)
+
+    monkeypatch.setattr(adapter, "_invoke_with_resident_mcp", reordered)
+    assert invoke(request) == result
+    assert len(runner.calls) == 1
+
+
+def test_equal_length_business_input_change_still_requires_owner_correction(tmp_path):
+    adapter, runner = _adapter(tmp_path, _output("dispatch"), durable=True)
+    request = _request(adapter, "dispatch")
+    request = replace(request, state={**request.state, "target_commit_refs": ["commit:initial"]})
+    changed = replace(request, state={**request.state, "target_commit_refs": ["commit:changed"]})
+    assert len(json.dumps(request.state)) == len(json.dumps(changed.state))
+    adapter.schedule_target(request)
+    with pytest.raises(IdeaSkillUnavailable) as failure:
+        adapter.schedule_target(changed)
+    assert failure.value.code == "bundle_review_result_contract_invalid"
+    assert failure.value.recovery_checkpoint["contract_failure_detail_code"] == "bundle_operation_inputs_changed"
+    assert len(runner.calls) == 1
+
+
 def test_input_correction_creates_new_attempt_and_operation_with_same_native_session(tmp_path, monkeypatch):
     runtime = _current_bundle_runtime(tmp_path / "owner")
     try:
@@ -184,7 +245,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         def invoke(**arguments):
             return adapter._invoke(**{
                 key: arguments[key] for key in (
-                    "operation_name", "prompt", "schema", "native_session_ref", "job_ref"
+                    "operation_name", "prompt", "schema", "native_session_ref", "job_ref", "operation_input"
                 )
             }, mcp_url="http://127.0.0.1:8767/mcp", mcp_token="test-resident-token", mcp_scope_binding_hash="9" * 64)
         monkeypatch.setattr(adapter, "_invoke_with_resident_mcp", invoke)

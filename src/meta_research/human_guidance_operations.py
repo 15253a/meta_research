@@ -38,7 +38,7 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
             "List this operation's frozen guidance and applicability, or read an exact complete document. "
             "Background-only guidance remains readable and imposes no requirement on this work. "
             "List reads do not prove receipt or reading. For an exact read use delivery_ref "
-            "and a stable effect_id. Follow all pages until full_read=true before feedback. "
+            "and a stable effect_id. Follow pages to obtain the complete original when needed. "
             "The full read also observes current goal_assessments; use a new read effect_id "
             "before explicitly resolving an undetermined assessment.",
             read, read_schema, {"type": "object"}, "effect", "human_guidance.read.reconcile"),
@@ -46,7 +46,8 @@ def human_guidance_operations(human_collaboration) -> tuple[SemanticOperation, .
             "Recover the exact committed read receipt using the original arguments and effect_id.",
             lambda context, args: read(context, args, True), read_schema, {"type": "object"}, "reconcile"),
         SemanticOperation("human_guidance.feedback", "human_collaboration",
-            "Declare your understanding, changes, continuing work and reasons after a full exact read. "
+            "Declare your understanding, changes, continuing work and reasons for the exact bound guidance. "
+            "Guidance already supplied in native input needs no ceremonial read call. "
             "Use a stable effect_id. Treated guidance remains a constraint for the same work. "
             "Assess actual goal_impact independently of strength. requires_evolution applies to "
             "confirmed Quest scope; a wider scope needs fresh human confirmation. "

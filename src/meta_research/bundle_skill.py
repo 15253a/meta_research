@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from meta_research.context_presentation import stage_context_view
+from meta_research.context_presentation import stage_context_json, stage_position_prompt
+from meta_research.resource_preparation import resource_preparation, prepared_resource
+from meta_research.native_guidance import native_guidance_operation
 
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
 
@@ -55,6 +57,7 @@ from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
 )
+from meta_research.idea_skill import stage_operation_input, stage_replacement_prompt
 from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     ProviderTransportLimits,
@@ -63,7 +66,6 @@ from meta_research.idea_skill import (
     _compile_codex_output_schema,
     _codex_harness_manifest,
     _file_sha256,
-    _read_spool_text,
     _shared_codex_adapter_source_hash,
 )
 from meta_research.harness import (
@@ -83,7 +85,6 @@ from meta_research.plan_contract import MAX_PLAN_EXPERIMENT_BRIEFS
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
 from meta_research.root_capabilities import merge_root_capability_bindings
-from meta_research.runtime_conditions import split_runtime_prompt
 BundleSkillContractError = BundleContractError
 BundleSkillUnavailable = IdeaSkillUnavailable
 
@@ -239,6 +240,7 @@ class BundleSkillRequest:
     root_session_ref: str
     runtime_binding: BundleRuntimeBinding
     inbox_checkpoint: dict[str, object]
+    native_replacement_context: dict[str, object] | None = None
     predecessor_rejections: tuple[dict[str, object], ...] = ()
     native_session_ref: str | None = None
     predecessor_candidate_ref: str | None = None
@@ -292,11 +294,13 @@ class BundleDispatchRequest:
     frontier: tuple[dict[str, object], ...]
     state: dict[str, object]
     root_session_ref: str
-    native_session_ref: str
+    native_session_ref: str | None
     runtime_binding: BundleRuntimeBinding
     inbox_checkpoint: dict[str, object]
+    cycle_position: dict[str, object]
     job_ref: str | None = None
     provider_feedback: dict[str, object] | None = None
+    native_replacement_context: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -325,11 +329,13 @@ class BundleTargetBatchRequest:
     current_targets: tuple[dict[str, object], ...]
     target_commits: tuple[dict[str, object], ...]
     root_session_ref: str
-    native_session_ref: str
+    native_session_ref: str | None
     runtime_binding: BundleRuntimeBinding
     inbox_checkpoint: dict[str, object]
+    cycle_position: dict[str, object]
     job_ref: str | None = None
     provider_feedback: dict[str, object] | None = None
+    native_replacement_context: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -383,8 +389,7 @@ def validate_bundle_dispatch_result(
         or len(request.frontier) > MAX_BUNDLE_TARGETS
         or any(not isinstance(item, dict) for item in request.frontier)
         or not isinstance(request.state, dict)
-        or not request.native_session_ref
-        or result.native_session_ref != request.native_session_ref
+        or not _rolling_native_result_matches(request, result.native_session_ref)
         or not result.adapter_kind
         or not isinstance(result.rationale, str)
         or not result.rationale.strip()
@@ -453,8 +458,7 @@ def validate_bundle_target_batch_result(
         or not request.root_session_ref
         or isinstance(request.base_generation, bool)
         or request.base_generation < 0
-        or not request.native_session_ref
-        or result.native_session_ref != request.native_session_ref
+        or not _rolling_native_result_matches(request, result.native_session_ref)
         or not result.adapter_kind
         or not isinstance(result.strategy_update, dict)
         or not isinstance(result.rationale, str)
@@ -1012,6 +1016,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         except HarnessAdmissionError as error:
             raise BundleSkillUnavailable(error.code) from error
 
+    @resource_preparation
+    @native_guidance_operation
     def _invoke_with_resident_mcp(
         self,
         *,
@@ -1025,6 +1031,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         schema: dict[str, object],
         native_session_ref: str | None,
         job_ref: str | None,
+        operation_input: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         prompt, guidance_binding = self._prepare_stage_guidance(
             run_ref=run_ref, attempt_ref=attempt_ref, root_session_ref=root_session_ref,
@@ -1055,24 +1062,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if not bundle_bindings_compatible(rebound, runtime_binding):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
-        if job_ref is not None:
-            directory = (
-                self._workspace / "provider-operations"
-                / canonical_hash({"job_ref": job_ref}) / operation_name
-            )
-            if (directory / "invocation.json").exists():
-                try:
-                    sealed_prompt = _read_spool_text(
-                        directory / "prompt.txt",
-                        self._provider_transport_limits.prompt_max_bytes,
-                    )
-                    prompt = _restore_frozen_bundle_instruction_prefix(
-                        prompt, sealed_prompt, runtime_binding
-                    )
-                except (OSError, UnicodeDecodeError, ValueError) as error:
-                    raise BundleSkillUnavailable(
-                        "codex_operation_spool_invalid"
-                    ) from error
         channel_key = (job_ref or run_ref, operation_name)
         channel = self._resident_mcp_channels.get(channel_key)
         if channel is None:
@@ -1133,6 +1122,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 workspace_binding=self._workspace_binding(run_ref=run_ref, attempt_ref=attempt_ref,
                     root_session_ref=root_session_ref, fence_ref=fence_ref,
                     runtime_binding_hash=canonical_hash(runtime_binding.as_dict())),
+                operation_input=stage_operation_input(request, "bundle") if operation_input is None else operation_input,
             )
         except BundleSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":
@@ -1190,6 +1180,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             return "bundle_review_result_contract_invalid"
         raise BundleSkillUnavailable("codex_operation_spool_invalid")
 
+    @resource_preparation
     def _base_runtime_binding(self) -> BundleRuntimeBinding:
         resources = _bundle_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
@@ -1214,7 +1205,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
-                    "skill_instructions": _bundle_skill_instructions(),
+                    "skill_instructions": _bundle_skill_instructions(resources),
                     "adapter_source_hash": adapter_source_hash,
                     "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
@@ -1276,6 +1267,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         return binding
 
+    @resource_preparation
     def runtime_binding(self) -> BundleRuntimeBinding:
         binding = self._base_runtime_binding()
         if self._full_conformance_authority is None:
@@ -1291,6 +1283,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             required_operation_ids=operation_ids,
         )
 
+    @resource_preparation
     def generate_draft(self, request: BundleSkillRequest) -> BundleSkillDraft:
         _validate_request(request)
         if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
@@ -1304,6 +1297,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
         prompt = (
+            stage_position_prompt(request, "bundle") + stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             f"{human_resume}"
@@ -1392,7 +1386,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{canonical_hash(list(request.predecessor_rejections))}\n"
             "predecessor_rejections="
             f"{canonical_json(list(request.predecessor_rejections))}\n"
-            f"provider_context_view={canonical_json(stage_context_view('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}"
+            f"provider_context_view={stage_context_json('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         )
         output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
@@ -1438,6 +1432,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             rejected_candidate=output,
         )
 
+    @resource_preparation
     def review_draft(
         self, request: BundleSkillRequest, draft: BundleSkillDraft
     ) -> BundleSkillResult | BundleExhaustionSkillResult:
@@ -1529,6 +1524,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         if not hmac.compare_digest(trace.transport_seal, expected):
             raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
 
+    @resource_preparation
     def execute(
         self, request: BundleSkillRequest
     ) -> BundleSkillResult | BundleExhaustionSkillResult:
@@ -1537,7 +1533,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             replace(request, native_session_ref=draft.primary_session_ref), draft
         )
 
+    @resource_preparation
     def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+        _validate_rolling_native_request(request)
         _validate_inbox_checkpoint_projection(
             request.inbox_checkpoint,
             run_ref=request.run_ref,
@@ -1547,7 +1545,15 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         target_refs = tuple(cast(str, item["target_ref"]) for item in request.frontier)
+        operation_input = {
+            "kind": "bundle_dispatch", "identity": _rolling_operation_identity(request),
+            "request": {"generation": request.generation,
+                "frontier": list(request.frontier), "state": request.state,
+                "inbox_checkpoint": request.inbox_checkpoint},
+        }
         prompt = (
+            _rolling_position_prompt(request.cycle_position) +
+            stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续使用当前 Bundle 根 Session。先读取这次 durable frontier 与 "
@@ -1571,11 +1577,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "validator 或 readiness 错误自行伪造 HumanRequest。"
             "返回 wait 或 replan_required 时，selected_target_ref 必须为 null。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
-            f"run_ref={request.run_ref}\n"
-            f"attempt_ref={request.attempt_ref}\n"
-            f"fence_ref={request.fence_ref}\n"
-            f"root_session_ref={request.root_session_ref}\n"
-            f"runtime_binding_hash={canonical_hash(request.runtime_binding.as_dict())}\n"
             f"graph_ref={request.graph_ref}\n"
             f"generation={request.generation}\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
@@ -1595,6 +1596,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 schema=_dispatch_schema(target_refs),
                 native_session_ref=request.native_session_ref,
                 job_ref=request.job_ref,
+                operation_input=operation_input,
             )
         except BundleSkillUnavailable as error:
             if error.code in {
@@ -1647,9 +1649,11 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             ) from error
         return result
 
+    @resource_preparation
     def propose_target_batch(
         self, request: BundleTargetBatchRequest
     ) -> BundleTargetBatchResult:
+        _validate_rolling_native_request(request)
         _validate_inbox_checkpoint_projection(
             request.inbox_checkpoint,
             run_ref=request.run_ref,
@@ -1681,7 +1685,16 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "target_commits": list(request.target_commits),
             "provider_feedback": request.provider_feedback,
         }
+        operation_input = {
+            "kind": "bundle_target_batch", "identity": _rolling_operation_identity(request),
+            "request": prompt_context,
+        }
+        reading_context = {name: value for name, value in prompt_context.items()
+            if name not in {"run_ref", "attempt_ref", "fence_ref", "root_session_ref",
+                            "runtime_binding_hash", "provider_feedback"}}
         prompt = (
+            _rolling_position_prompt(request.cycle_position) +
+            stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续使用同一个 Bundle 根 Session。当前 batch 的全部 Target 已形成正式 "
@@ -1707,7 +1720,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "不得编造 Owner ref，也不得在 TargetPlan 中选择 provider/adapter 或伪造"
             "execution operation；Target 按系统提供的冻结执行合同与现有授权，"
             "自主实现、获取材料、自检、运行并提交可核验的结果。\n"
-            f"canonical_batch_context={canonical_json(prompt_context)}"
+            f"batch_context={canonical_json(reading_context)}"
         )
         if len(prompt.encode("utf-8")) > BUNDLE_TARGET_BATCH_PROMPT_MAX_BYTES:
             raise BundleSkillUnavailable("bundle_target_batch_prompt_too_large")
@@ -1726,6 +1739,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 schema=_target_batch_schema(request),
                 native_session_ref=request.native_session_ref,
                 job_ref=request.job_ref,
+                operation_input=operation_input,
             )
         except BundleSkillUnavailable as error:
             if error.code in {
@@ -1782,6 +1796,7 @@ def _provider_correction_prompt(feedback: dict[str, object] | None) -> str:
     )
 
 
+@prepared_resource
 def _bundle_skill_resources() -> dict[str, str]:
     package = files("meta_research.skills.bundle_stage")
     resources = (
@@ -1810,63 +1825,62 @@ def _bundle_skill_instruction_resources() -> dict[str, str]:
     return _bundle_skill_resources()
 
 
-def _bundle_skill_instructions() -> str:
+def _bundle_skill_instructions(resources: dict[str, str] | None = None) -> str:
     return "\n\n".join(
         f"<!-- bundled resource: {name} -->\n{content}"
-        for name, content in _bundle_skill_instruction_resources().items()
+        for name, content in (resources if resources is not None else _bundle_skill_instruction_resources()).items()
     )
 
 
-def _restore_frozen_bundle_instruction_prefix(
-    prompt: str,
-    sealed_prompt: str,
-    runtime_binding: BundleRuntimeBinding,
-) -> str:
-    """Restore reviewed Bundle prose, leaving the exact request and seal checks intact."""
+def _rolling_operation_identity(request: BundleDispatchRequest | BundleTargetBatchRequest) -> dict[str, object]:
+    """Business identity recorded beside, independently of, the reading layout."""
+    return {**{name: getattr(request, name) for name in (
+        "stage_request_ref", "run_ref", "attempt_ref", "fence_ref",
+        "root_session_ref", "graph_ref")},
+        "runtime_binding_hash": canonical_hash(request.runtime_binding.as_dict()),
+        "cycle_position": request.cycle_position,
+        "native_replacement_context_hash": canonical_hash(request.native_replacement_context)}
 
-    current_instructions = _bundle_skill_instructions()
-    if not prompt.startswith(current_instructions):
-        return prompt
+
+def _validate_rolling_native_request(request) -> None:
+    if isinstance(request.native_session_ref, str) and request.native_session_ref:
+        if request.native_replacement_context is not None:
+            raise BundleSkillUnavailable("bundle_native_replacement_context_invalid")
+        return
+    context = request.native_replacement_context
+    if (request.native_session_ref is not None or not isinstance(context, dict)
+            or context.get("kind") != "native_session_replacement"
+            or context.get("stage_request_ref") != request.stage_request_ref
+            or context.get("retired_attempt_ref") == request.attempt_ref
+            or any(not isinstance(context.get(field), str) or not context[field] for field in (
+                "safe_point_ref", "retired_attempt_ref", "retired_native_session_ref", "provider_operation_ref"))
+            or not isinstance(context.get("frozen_stage_input"), dict)
+            or not isinstance(context.get("isolation_basis"), dict)
+            or context["isolation_basis"].get("context_pack_hash") != canonical_hash(context["frozen_stage_input"])
+            or any(context.get(field) != context["isolation_basis"].get(field) for field in (
+                "kind", "stage_request_ref", "safe_point_ref", "retired_attempt_ref",
+                "retired_native_session_ref", "provider_operation_ref"))
+            or not isinstance(context.get("accepted_target_graph"), dict)
+            or context["accepted_target_graph"].get("graph_ref") != request.graph_ref):
+        raise BundleSkillUnavailable("bundle_native_replacement_context_invalid")
+
+
+def _rolling_native_result_matches(request, native_session_ref) -> bool:
+    if not isinstance(native_session_ref, str) or not native_session_ref:
+        return False
+    if request.native_session_ref is not None:
+        return native_session_ref == request.native_session_ref
     try:
-        _conditions, original = split_runtime_prompt(sealed_prompt)
-    except ValueError as error:
-        raise BundleSkillUnavailable("codex_operation_spool_invalid") from error
-    if original.startswith(current_instructions):
-        return prompt
-    tail = prompt[len(current_instructions):]
-    offset = original.find(tail) if tail.startswith("\n\n") else -1
-    if offset < 0:
-        raise BundleSkillUnavailable("codex_operation_spool_invalid")
-    frozen_instructions = original[:offset]
-    names = tuple(_bundle_skill_instruction_resources())
-    if frozen_instructions.count("<!-- bundled resource: ") != len(names):
-        raise BundleSkillUnavailable("codex_operation_spool_invalid")
-    remaining = frozen_instructions
-    resources = {}
-    for index, name in enumerate(names):
-        marker = f"<!-- bundled resource: {name} -->\n"
-        if not remaining.startswith(marker):
-            raise BundleSkillUnavailable("codex_operation_spool_invalid")
-        remaining = remaining[len(marker):]
-        if index + 1 < len(names):
-            separator = f"\n\n<!-- bundled resource: {names[index + 1]} -->\n"
-            content, found, next_resource = remaining.partition(separator)
-            if not found:
-                raise BundleSkillUnavailable("codex_operation_spool_invalid")
-            remaining = separator[2:] + next_resource
-        else:
-            content = remaining
-        resources[name] = content
-        prefix = f"package:meta_research.skills.bundle_stage/{name}@sha256:"
-        matches = [value for value in runtime_binding.resource_bindings if value.startswith(prefix)]
-        if matches != [prefix + canonical_hash(content)]:
-            raise BundleSkillUnavailable("codex_operation_spool_invalid")
-    if canonical_hash(resources) != runtime_binding.packaged_skill_bundle_hash:
-        raise BundleSkillUnavailable("codex_operation_spool_invalid")
-    # The shared adapter still regenerates transport suffixes and verifies the
-    # entire sealed prompt, invocation HMAC, native/model/MCP identity and output.
-    # Never return the stored request tail or rewrite any persisted spool file.
-    return frozen_instructions + tail
+        _validate_rolling_native_request(request)
+    except BundleSkillUnavailable:
+        return False
+    return native_session_ref != request.native_replacement_context["retired_native_session_ref"]
+
+
+def _rolling_position_prompt(position: dict[str, object]) -> str:
+    from meta_research.cycle_position import validate_cycle_position
+    validate_cycle_position(position, cycle_ref=position.get("cycle_ref"))
+    return "cycle_position=" + canonical_json({**position, "stage": "bundle"}) + "\n"
 
 
 def _schema_template_request() -> BundleSkillRequest:
@@ -1886,6 +1900,8 @@ def _schema_template_request() -> BundleSkillRequest:
         "bundle_disposition": "experiments_required",
     }
     context = {
+        "cycle_position": {"cycle_ref": "__cycle__", "round": 1,
+            "cycle_focus": "__focus__", "focus_source": {"request_ref": "__request__"}},
         "accepted_question_binding": {"question_ref": "__question__"},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "__formal_plan__",

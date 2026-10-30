@@ -501,6 +501,7 @@ def _stage_output(
     transition = {
         "schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
         "kind": "NextCycleProposal",
+        "cycle_focus": "Reassess the next research direction using the accepted evidence",
         **source,
         "target_question_ref": "question:reasoning",
         "target_question_anchor_ref": "question-anchor:reasoning",
@@ -785,6 +786,7 @@ def _accept_real_root_next_cycle_content(
         "next_cycle_proposal": {
             "schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
             "kind": "NextCycleProposal",
+        "cycle_focus": "Reassess the next research direction using the accepted evidence",
             **source,
             "target_question_ref": question.question_ref,
             "target_question_anchor_ref": question.question_ref,

@@ -5,6 +5,7 @@ from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, Exte
 from meta_research.external_mcp_client import ExternalMcpClientError
 
 from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, GuidanceOperationIdentity, TargetGuidanceOperation, GUIDANCE_OPERATION_IDS, guidance_prompt)
+from meta_research.native_guidance import live_guidance_operation
 
 import hashlib
 import ipaddress
@@ -2447,6 +2448,13 @@ class HarnessRuntime:
                     invoke = getattr(adapter, "invoke_terminal", None) if terminal_replay_only else adapter.invoke
                     if not callable(invoke):
                         raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
+                    external_channels.enter_context(live_guidance_operation(
+                        self._human_guidance_authority,
+                        GuidanceRuntimeScope("target", admission.run.run_ref,
+                            admission.run.attempt_ref, admission.run.root_session_ref,
+                            admission.run.fence_ref, admission.run.capability_binding_hash),
+                        guidance_binding,
+                    ))
                     result = invoke(self._provider_invocation(
                         admission, request, prompt=prompt, mcp_base_url=mcp_base_url,
                         operation_ref=operation_ref, workspace_ref=workspace_ref,

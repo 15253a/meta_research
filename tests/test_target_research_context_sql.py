@@ -1,5 +1,6 @@
 """Execute the research-context SQL, including the appended Target branch."""
 from contextlib import contextmanager
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,8 @@ def context_owner():
         "notes": "Plan reasoning",
     }
     context = {
+        "cycle_ref": "cycle:target",
+        "cycle_position": {"cycle_ref": "cycle:target", "round": 1, "cycle_focus": "Target input", "focus_source": {"request_ref": "fixture-start"}},
         "accepted_formal_plan_binding": {"formal_plan_ref": "plan-1", "plan_document": plan},
         "accepted_question_binding": {
             "question_ref": "question-1", "quest_ref": "quest-1",
@@ -35,7 +38,7 @@ def context_owner():
             "CREATE TABLE rg_targets (target_ref TEXT PRIMARY KEY, graph_ref TEXT, spec_json TEXT, spec_hash TEXT, append_ref TEXT, dependency_refs_json TEXT)",
             "CREATE TABLE rg_target_graphs (graph_ref TEXT PRIMARY KEY, request_ref TEXT)",
             "CREATE TABLE ae_stage_run_requests (request_ref TEXT PRIMARY KEY, context_pack_json TEXT, context_pack_hash TEXT)",
-            "CREATE TABLE rg_target_graph_appends (append_ref TEXT PRIMARY KEY, graph_ref TEXT, proposal_ref TEXT)",
+            "CREATE TABLE rg_target_graph_appends (append_ref TEXT PRIMARY KEY, graph_ref TEXT, proposal_ref TEXT, generation INTEGER)",
             "CREATE TABLE ar_bundle_target_proposals (proposal_ref TEXT PRIMARY KEY, proposal_json TEXT)",
         ):
             connection.execute(text(statement))
@@ -44,13 +47,18 @@ def context_owner():
         connection.execute(text("INSERT INTO rg_target_graphs VALUES ('graph-1', 'request-1')"))
         connection.execute(text("INSERT INTO ae_stage_run_requests VALUES ('request-1', :context, :hash)"),
             {"context": canonical_json(context), "hash": canonical_hash(context)})
-        connection.execute(text("INSERT INTO rg_target_graph_appends VALUES ('append-1', 'graph-1', 'proposal-1')"))
+        connection.execute(text("INSERT INTO rg_target_graph_appends VALUES ('append-1', 'graph-1', 'proposal-1', 2)"))
         connection.execute(text("INSERT INTO ar_bundle_target_proposals VALUES (:ref, :proposal)"), [
             {"ref": "proposal-1", "proposal": canonical_json(proposal)},
             {"ref": "proposal-later", "proposal": canonical_json(later_proposal)},
         ])
 
     class Database:
+        @contextmanager
+        def read_snapshot(self):
+            with engine.connect() as connection:
+                yield connection
+
         @contextmanager
         def read(self):
             with engine.connect() as connection:
@@ -75,6 +83,7 @@ def test_appended_context_reads_exact_accepted_proposal_content(context_owner):
     assert result["bundle_notes"] == "Accepted audit handoff"
     assert result["bundle_notes_source_ref"] == "proposal-1"
     assert result["bundle_notes_source_hash"] == canonical_hash(proposal)
+    assert result["bundle_notes_text_hash"] == hashlib.sha256(b"Accepted audit handoff").hexdigest()
     assert result["experiment_briefs"][0]["experiment_key"] == "audit"
     assert result["obligations"] == [{"obligation_key": "split"}]
 
@@ -87,6 +96,7 @@ def test_initial_context_retains_initial_notes(context_owner):
     assert result["bundle_notes"] == "Initial handoff"
     assert result["bundle_notes_source_ref"] == "initial-submission"
     assert result["bundle_notes_source_hash"] == "b" * 64
+    assert result["bundle_notes_text_hash"] == hashlib.sha256(b"Initial handoff").hexdigest()
 
 
 def test_appended_context_without_notes_retains_initial_notes(context_owner):
@@ -96,6 +106,20 @@ def test_appended_context_without_notes_retains_initial_notes(context_owner):
     result = owner.query_target_research_context(target_ref="target-1")
     assert result["bundle_notes"] == "Initial handoff"
     assert result["bundle_notes_source_ref"] == "initial-submission"
+
+
+def test_appended_context_inherits_last_nonempty_accepted_notes_within_its_cut(context_owner):
+    owner, engine, _proposal = context_owner
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE ar_bundle_target_proposals SET proposal_json = '{}' WHERE proposal_ref = 'proposal-1'"))
+        connection.execute(text("INSERT INTO ar_bundle_target_proposals VALUES ('proposal-prior', :proposal)"),
+            {"proposal": canonical_json({"strategy_update": {"notes": "prior accepted caveat"}})})
+        connection.execute(text("INSERT INTO rg_target_graph_appends VALUES ('append-prior', 'graph-1', 'proposal-prior', 1)"))
+        connection.execute(text("INSERT INTO rg_target_graph_appends VALUES ('append-later', 'graph-1', 'proposal-later', 3)"))
+    result = owner.query_target_research_context(target_ref="target-1")
+    assert result["bundle_notes"] == "prior accepted caveat"
+    assert result["bundle_notes_source_ref"] == "proposal-prior"
+    assert result["bundle_notes_text_hash"] == hashlib.sha256(b"prior accepted caveat").hexdigest()
 
 
 @pytest.mark.parametrize("damage", [
