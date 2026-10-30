@@ -1617,11 +1617,14 @@ class CodexIdeaSkillAdapter:
             or marker.get("termination_reason") != "completed"
         ):
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
-        return _provider_terminal_contract_checkpoint(
-            marker,
-            failure_code,
-            detail_code,
+        return self._terminal_contract_checkpoint(
+            marker=marker, operation_name=operation_name, failure_code=failure_code,
+            detail_code=detail_code, verified_native_session_ref=recovered_session,
         )
+
+    def _terminal_contract_checkpoint(self, *, marker, operation_name, failure_code,
+            detail_code, verified_native_session_ref):
+        return _provider_terminal_contract_checkpoint(marker, failure_code, detail_code)
 
     def _sealed_transport_contract_failure(
         self,
@@ -1764,10 +1767,9 @@ class CodexIdeaSkillAdapter:
         except (OSError, ProviderSupervisorError) as error:
             raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
         failure_code = self._transport_contract_failure_code(operation_name)
-        checkpoint = _provider_terminal_contract_checkpoint(
-            marker,
-            failure_code,
-            detail_code,
+        checkpoint = self._terminal_contract_checkpoint(
+            marker=marker, operation_name=operation_name, failure_code=failure_code,
+            detail_code=detail_code, verified_native_session_ref=observed_session_ref,
         )
         return IdeaSkillUnavailable(
             failure_code,

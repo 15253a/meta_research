@@ -1184,6 +1184,18 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             return "bundle_review_result_contract_invalid"
         raise BundleSkillUnavailable("codex_operation_spool_invalid")
 
+    def _terminal_contract_checkpoint(self, *, marker, operation_name, failure_code,
+            detail_code, verified_native_session_ref):
+        checkpoint = super()._terminal_contract_checkpoint(marker=marker,
+            operation_name=operation_name, failure_code=failure_code, detail_code=detail_code,
+            verified_native_session_ref=verified_native_session_ref)
+        if (operation_name.startswith(("dispatch-", "target-batch-"))
+                and self._is_reconciliation_operation_name(operation_name)
+                and isinstance(verified_native_session_ref, str) and verified_native_session_ref):
+            return {**checkpoint, "schema_ref": "meta-research/provider-native-contract-failure/v1",
+                "native_session_ref": verified_native_session_ref}
+        return checkpoint
+
     @resource_preparation
     def _base_runtime_binding(self) -> BundleRuntimeBinding:
         resources = _bundle_skill_resources()

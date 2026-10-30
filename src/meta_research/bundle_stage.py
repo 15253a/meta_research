@@ -463,7 +463,12 @@ class BundleStageWorker:
                     commit=commit,
                 )
                 return True
-        report_progress = self._advance_bundle_report_closure(
+        # An unfinished strategy first initializes its proven replacement in
+        # the rolling batch/dispatch below. Report admission requires that
+        # authenticated native attachment and cannot run ahead of it.
+        initialize_batch = (run.native_session_ref is None
+            and len(commits) == len(graph.targets) and not graph.strategy_complete)
+        report_progress = None if initialize_batch else self._advance_bundle_report_closure(
             request=request,
             run=run,
             graph=graph,
@@ -565,6 +570,9 @@ class BundleStageWorker:
                             provider_safe = False
                         elif error.recovery_checkpoint is not None:
                             provider_safe = False
+                            if self._rolling_identity_unresolved(run, error.recovery_checkpoint, error.code):
+                                self._transient_error = "codex_operation_reconciliation_pending"
+                                return False
                             self._agent_runtime.record_stage_provider_hard_ceiling(
                                 unit_ref=batch_unit_ref,
                                 run_ref=run.run_ref,
@@ -832,6 +840,9 @@ class BundleStageWorker:
                         provider_safe = False
                     elif error.recovery_checkpoint is not None:
                         provider_safe = False
+                        if self._rolling_identity_unresolved(run, error.recovery_checkpoint, error.code):
+                            self._transient_error = "codex_operation_reconciliation_pending"
+                            return False
                         self._agent_runtime.record_stage_provider_hard_ceiling(
                             unit_ref=dispatch_unit_ref,
                             run_ref=run.run_ref,
@@ -1060,6 +1071,13 @@ class BundleStageWorker:
                 disposition = "replan_required"
         if disposition is None:
             return None
+        if run.native_session_ref is None:
+            # Pure Owner closure has no pending provider operation with which
+            # to authenticate an initial replacement native. Retain that
+            # recovery boundary without granting report acceptance or
+            # manufacturing a new model call.
+            self._transient_error = "bundle_native_replacement_initialization_pending"
+            return False
         try:
             candidate = self._agent_runtime.build_bundle_report_candidate(
                 run_ref=run.run_ref,
@@ -3274,6 +3292,8 @@ class BundleStageWorker:
             None,
         )
         if not callable(checkpoint_factory):
+            if run.native_session_ref is None:
+                raise BundleSkillUnavailable("codex_operation_reconciliation_pending")
             return False
         checkpoint = checkpoint_factory(
             job_ref=job_ref,
@@ -3286,6 +3306,8 @@ class BundleStageWorker:
             raise BundleSkillUnavailable(
                 "codex_contract_failure_checkpoint_invalid"
             )
+        if self._rolling_identity_unresolved(run, checkpoint, failure_code):
+            raise BundleSkillUnavailable("codex_operation_reconciliation_pending")
         self._agent_runtime.record_stage_provider_hard_ceiling(
             unit_ref=unit_ref,
             run_ref=run.run_ref,
@@ -3295,6 +3317,14 @@ class BundleStageWorker:
             provider_exit=checkpoint,
         )
         return True
+
+    @staticmethod
+    def _rolling_identity_unresolved(run, checkpoint, failure_code):
+        return (run.native_session_ref is None
+            and (checkpoint.get("schema_ref") == "meta-research/provider-terminal-contract-failure/v1"
+                or (checkpoint.get("schema_ref") == "meta-research/provider-hard-ceiling/v1"
+                    and failure_code == "codex_operation_failed"
+                    and checkpoint.get("termination_reason") in {"completed", "launch_failed"})))
 
     def _accept_exhaustion_review(
         self,

@@ -10299,7 +10299,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or
             (
                 provider_exit.get("schema_ref")
-                == "meta-research/provider-terminal-contract-failure/v1"
+                in {"meta-research/provider-terminal-contract-failure/v1",
+                    "meta-research/provider-native-contract-failure/v1"}
                 and provider_exit.get("contract_failure_detail_code")
                 not in {
                     "codex_native_session_missing",
@@ -11125,9 +11126,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 raise OwnerConflict("native_session_replacement_stale")
             checkpoint = {"action": "native_session_replacement_bound", "run_ref": run_ref,
                           "attempt_ref": attempt_ref, "fence_ref": fence_ref,
+                          "root_session_ref": session.session_ref,
                           "native_session_ref": native_session_ref, "graph_ref": graph_ref,
                           "graph_receipt": graph_receipt.as_public_dict(),
                           "replacement_proof_ref": proof["safe_point_ref"],
+                          "replacement_checkpoint_hash": proof["replacement_checkpoint_hash"],
                           "replacement_proof_hash": canonical_hash(proof)}
             if session.native_session_ref is None:
                 connection.execute(text("UPDATE ar_stage_sessions SET native_session_ref=:native,updated_at=:now WHERE session_ref=:session"),
@@ -11145,31 +11148,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     def query_stage_native_replacement_context(self, *, run_ref: str, attempt_ref: str,
                                                fence_ref: str) -> dict[str, object] | None:
         with self._database.read() as connection:
-            row = connection.execute(text(
-                "SELECT s.*,r.context_pack_ref,r.context_pack_hash,r.request_ref,c.status AS control_status "
-                "FROM ar_stage_attempt_replacements x JOIN ar_run_controls c ON c.run_ref=x.run_ref "
-                "JOIN ar_stage_runs r ON r.run_ref=x.run_ref LEFT JOIN ar_safe_points s ON "
-                "s.run_ref=x.run_ref AND s.attempt_ref=x.retired_attempt_ref "
-                "AND s.root_session_ref=c.root_session_ref "
-                "AND CASE WHEN json_valid(s.checkpoint_json) THEN "
-                "json_extract(s.checkpoint_json,'$.action') END='native_session_replacement' "
-                "WHERE x.replacement_attempt_ref=:attempt AND x.run_ref=:run "
-                "AND x.reason_code='native_session_unavailable' AND c.attempt_ref=:attempt "
-                "AND c.fence_ref=:fence ORDER BY s.created_at DESC LIMIT 1"
-            ), {"run": run_ref, "attempt": attempt_ref, "fence": fence_ref}).first()
+            row = _stage_native_replacement_row(connection, run_ref, attempt_ref, fence_ref)
             if row is None:
                 return None
-            if row.control_status != "running":
-                raise OwnerConflict("native_session_replacement_stale")
-            if row.safe_point_ref is None:
-                raise OwnerConflict("native_session_replacement_context_invalid")
             checkpoint = decoded_object(row.checkpoint_json)
-            if (canonical_hash(checkpoint) != row.checkpoint_hash
-                    or checkpoint.get("action") != "native_session_replacement"
-                    or checkpoint.get("run_ref") != run_ref
-                    or checkpoint.get("attempt_ref") != row.attempt_ref
-                    or checkpoint.get("fence_ref") != row.fence_ref):
-                raise OwnerConflict("native_session_replacement_context_invalid")
             attempts = connection.execute(text(
                 "SELECT * FROM ar_stage_attempts WHERE run_ref=:run AND "
                 "generation < (SELECT generation FROM ar_stage_attempts WHERE attempt_ref=:attempt) "
@@ -11192,7 +11174,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "retired_attempt_ref": row.attempt_ref,
                     "retired_native_session_ref": checkpoint["provider_exit"]["native_session_ref"],
                     "provider_operation_ref": checkpoint["provider_operation_ref"],
-                    "safe_point_ref": row.safe_point_ref, "saved_work": saved_work,
+                    "safe_point_ref": row.safe_point_ref, "replacement_checkpoint_hash": row.checkpoint_hash,
+                    "saved_work": saved_work,
                     "owner_feedback": [{"candidate_ref": item.candidate_ref,
                         "candidate": decoded_object(item.candidate_json), "feedback": json.loads(item.feedback_json)}
                         for item in feedback],
@@ -11276,7 +11259,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             raise OwnerConflict("stage_provider_correction_invalid")
         native_replacement = provider_exit.get("schema_ref") == "meta-research/provider-native-session-unavailable/v1"
         native_terminal = provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1"
+        native_contract = provider_exit.get("schema_ref") == "meta-research/provider-native-contract-failure/v1"
         bind_initial_native = False
+        rolling_basis = None
         now = time.time()
         effect: RuntimeEffectIdentity | None = None
         with self._database.write() as connection:
@@ -11316,7 +11301,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 failure_code=failure_code,
                 provider_exit=provider_exit,
             )
-            if native_replacement or native_terminal:
+            # The internal Stage adapter attests native identity only after
+            # checking the original signed invocation/exit and native protocol.
+            # Bind that identity in this same transaction as its correction.
+            if stage_run.stage == "bundle":
+                rolling_basis = _stage_native_replacement_row(connection, run_ref, attempt_ref, fence_ref)
+            if native_replacement or native_terminal or native_contract:
                 session = connection.execute(text(
                     "SELECT * FROM ar_stage_sessions WHERE session_ref=:session"
                 ), {"session": stage_run.root_session_ref}).one()
@@ -11324,14 +11314,22 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "SELECT 1 FROM ar_provider_units WHERE run_ref=:run AND unit_ref!=:unit "
                     "AND status IN ('active','revocation_pending') LIMIT 1"
                 ), {"run": run_ref, "unit": unit_ref}).first()
-                if native_terminal and session.native_session_ref is None:
+                if (native_terminal or native_contract) and session.native_session_ref is None:
                     bound_run, bound_attempt, _session, bound_fence = _load_stage_fence(
                         connection, run_ref, attempt_ref, fence_ref)
-                    primary, _review = _provider_invocations(connection, bound_run, bound_attempt, bound_fence)
-                    bind_initial_native = (unit.unit_kind == stage_run.stage + "_primary"
+                    _require_current_fence(bound_run, bound_attempt, bound_fence, "running", "current")
+                    primary, review = _provider_invocations(connection, bound_run, bound_attempt, bound_fence)
+                    bind_primary = (native_terminal and unit.unit_kind == stage_run.stage + "_primary"
                         and primary.invocation_ref == unit.unit_ref and primary.operation_ref == unit.operation_ref
                         and primary.status == "prepared" and bound_attempt.primary_draft_json is None
                         and bound_attempt.payload_json is None)
+                    bind_rolling = (stage_run.stage == "bundle" and rolling_basis is not None
+                        and unit.unit_kind == "bundle_review" and review.operation_ref == unit.operation_ref
+                        and review.status == "prepared" and bound_attempt.primary_draft_json is None
+                        and bound_attempt.payload_json is None
+                        and provider_exit["native_session_ref"] != decoded_object(
+                            rolling_basis.checkpoint_json)["provider_exit"]["native_session_ref"])
+                    bind_initial_native = bind_primary or bind_rolling
                 if ((session.native_session_ref != provider_exit["native_session_ref"] and not bind_initial_native)
                         or session.status != "active" or other_unit is not None
                         or _managed_run_has_pending_root_human_request(connection, control)):
@@ -11341,6 +11339,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "AND session_ref!=:session LIMIT 1"),
                         {"native": provider_exit["native_session_ref"], "session": session.session_ref}).first() is not None:
                     raise OwnerConflict("native_session_conflict")
+            elif rolling_basis is not None:
+                # An unbound rolling initialization with no authenticated
+                # observed identity cannot authorize a new operation/native.
+                session = connection.execute(text(
+                    "SELECT * FROM ar_stage_sessions WHERE session_ref=:session"
+                ), {"session": stage_run.root_session_ref}).one()
+                if session.native_session_ref is None:
+                    raise OwnerConflict("native_session_replacement_identity_missing")
             effect = _provider_runtime_effect(
                 unit_ref=str(unit.unit_ref),
                 operation_ref=str(unit.operation_ref),
@@ -11380,6 +11386,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "failure": {"code": failure_code},
                 "provider_exit": provider_exit,
             }
+            if bind_initial_native and rolling_basis is not None:
+                checkpoint["native_attachment"] = {
+                    "native_session_ref": provider_exit["native_session_ref"],
+                    "replacement_proof_ref": rolling_basis.safe_point_ref,
+                    "replacement_checkpoint_hash": rolling_basis.checkpoint_hash,
+                }
             safe_point_ref = new_ref("safe_point")
             connection.execute(
                 text(
@@ -27891,6 +27903,49 @@ def _load_stage_fence(connection, run_ref: str, attempt_ref: str, fence_ref: str
 
 
 
+_CORRECTION_ANCESTRY_SQL = (
+    "WITH RECURSIVE correction_ancestors(attempt_ref,run_ref,root_session_ref,fence_ref,generation,depth) AS ("
+    "SELECT attempt_ref,run_ref,root_session_ref,fence_ref,generation,0 FROM ar_stage_attempts "
+    "WHERE attempt_ref=:attempt AND run_ref=:run UNION ALL "
+    "SELECT p.attempt_ref,p.run_ref,p.root_session_ref,p.fence_ref,p.generation,c.depth+1 "
+    "FROM correction_ancestors c JOIN ar_stage_attempt_replacements x ON x.replacement_attempt_ref=c.attempt_ref "
+    "AND x.run_ref=c.run_ref JOIN ar_stage_attempts p ON p.attempt_ref=x.retired_attempt_ref "
+    "AND p.run_ref=c.run_ref AND p.root_session_ref=c.root_session_ref AND p.generation<c.generation "
+    "WHERE x.reason_code='provider_result_correction') "
+)
+
+
+def _stage_native_replacement_row(connection, run_ref, attempt_ref, fence_ref):
+    row = connection.execute(text(_CORRECTION_ANCESTRY_SQL +
+        "SELECT s.*,r.context_pack_ref,r.context_pack_hash,r.request_ref,c.status AS control_status "
+        "FROM correction_ancestors a JOIN ar_stage_attempt_replacements x ON x.replacement_attempt_ref=a.attempt_ref "
+        "AND x.run_ref=a.run_ref JOIN ar_run_controls c ON c.run_ref=x.run_ref AND c.root_session_ref=a.root_session_ref "
+        "JOIN ar_stage_runs r ON r.run_ref=x.run_ref JOIN ar_stage_attempts p ON p.attempt_ref=x.retired_attempt_ref "
+        "AND p.run_ref=x.run_ref AND p.root_session_ref=c.root_session_ref LEFT JOIN ar_safe_points s ON "
+        "s.run_ref=x.run_ref AND s.attempt_ref=x.retired_attempt_ref AND s.root_session_ref=c.root_session_ref "
+        "AND s.fence_ref=p.fence_ref "
+        "AND CASE WHEN json_valid(s.checkpoint_json) THEN "
+        "json_extract(s.checkpoint_json,'$.action') END='native_session_replacement' "
+        "WHERE x.reason_code='native_session_unavailable' AND c.attempt_ref=:attempt AND c.fence_ref=:fence "
+        "AND (a.depth=0 OR r.stage='bundle') ORDER BY a.depth,s.created_at DESC LIMIT 1"
+    ), {"run": run_ref, "attempt": attempt_ref, "fence": fence_ref}).first()
+    if row is None:
+        return None
+    if row.control_status != "running":
+        raise OwnerConflict("native_session_replacement_stale")
+    if row.safe_point_ref is None:
+        raise OwnerConflict("native_session_replacement_context_invalid")
+    checkpoint = decoded_object(row.checkpoint_json)
+    if (canonical_hash(checkpoint) != row.checkpoint_hash
+            or checkpoint.get("action") != "native_session_replacement"
+            or checkpoint.get("run_ref") != run_ref
+            or checkpoint.get("root_session_ref") != row.root_session_ref
+            or checkpoint.get("attempt_ref") != row.attempt_ref
+            or checkpoint.get("fence_ref") != row.fence_ref):
+        raise OwnerConflict("native_session_replacement_context_invalid")
+    return row
+
+
 def _historical_stage_execution_row(connection, row):
     if row is None:
         return row
@@ -27935,19 +27990,31 @@ def _require_bundle_rolling_fence(connection, run, attempt, fence):
         _require_current_fence(run, attempt, fence, "executed", "submitted")
         return
     _require_current_fence(run, attempt, fence, "running", "current")
-    rows = connection.execute(text(
-        "SELECT checkpoint_json,checkpoint_hash FROM ar_safe_points WHERE run_ref=:run "
-        "AND attempt_ref=:attempt AND fence_ref=:fence ORDER BY created_at DESC"
-    ), {"run": run.run_ref, "attempt": attempt.attempt_ref, "fence": fence.fence_ref}).all()
+    basis = _stage_native_replacement_row(connection, run.run_ref, attempt.attempt_ref, fence.fence_ref)
+    if run.stage != "bundle" or basis is None:
+        raise OwnerConflict("attempt_fence_stale")
+    rows = connection.execute(text(_CORRECTION_ANCESTRY_SQL +
+        "SELECT s.* FROM correction_ancestors a JOIN ar_safe_points s ON s.run_ref=a.run_ref "
+        "AND s.attempt_ref=a.attempt_ref AND s.fence_ref=a.fence_ref "
+        "AND s.root_session_ref=a.root_session_ref ORDER BY a.depth,s.created_at DESC"
+    ), {"run": run.run_ref, "attempt": attempt.attempt_ref}).all()
     native = connection.execute(text("SELECT native_session_ref FROM ar_stage_sessions WHERE session_ref=:session"),
                                 {"session": run.root_session_ref}).scalar_one()
     for row in rows:
         point = decoded_object(row.checkpoint_json)
-        if (canonical_hash(point) == row.checkpoint_hash
-                and point.get("action") == "native_session_replacement_bound"
-                and (point.get("run_ref"), point.get("attempt_ref"), point.get("fence_ref"), point.get("native_session_ref"))
-                    == (run.run_ref, attempt.attempt_ref, fence.fence_ref, native)
-                and run.stage == "bundle" and native):
+        if (canonical_hash(point) != row.checkpoint_hash
+                or (point.get("run_ref"), point.get("attempt_ref"), point.get("fence_ref"), point.get("root_session_ref"))
+                    != (run.run_ref, row.attempt_ref, row.fence_ref, run.root_session_ref)):
+            continue
+        attachment = point if point.get("action") == "native_session_replacement_bound" else (
+            point.get("native_attachment") if point.get("action") == "provider_result_correction"
+            and point.get("provider_exit", {}).get("schema_ref") in {
+                "meta-research/provider-native-contract-failure/v1",
+                "meta-research/provider-native-turn-terminal/v1"} else None)
+        if (isinstance(attachment, dict) and native
+                and attachment.get("native_session_ref") == native
+                and attachment.get("replacement_proof_ref") == basis.safe_point_ref
+                and attachment.get("replacement_checkpoint_hash") == basis.checkpoint_hash):
             return
     raise OwnerConflict("attempt_fence_stale")
 
@@ -33016,9 +33083,10 @@ def _validated_stage_provider_hard_ceiling(
     if not isinstance(provider_exit, dict):
         raise OwnerConflict("stage_provider_hard_ceiling_invalid")
     schema_ref = provider_exit.get("schema_ref")
-    terminal_contract_schema = (
-        schema_ref == "meta-research/provider-terminal-contract-failure/v1"
-    )
+    native_contract_schema = schema_ref == "meta-research/provider-native-contract-failure/v1"
+    terminal_contract_schema = schema_ref in {
+        "meta-research/provider-terminal-contract-failure/v1",
+        "meta-research/provider-native-contract-failure/v1"}
     expected_fields = {
         "schema_ref",
         "termination_reason",
@@ -33082,6 +33150,12 @@ def _validated_stage_provider_hard_ceiling(
             schema_valid = True
             expected_reasons = legacy_reasons
     elif terminal_contract_schema:
+        if native_contract_schema:
+            if (unit_kind != "bundle_review"
+                    or not isinstance(provider_exit.get("native_session_ref"), str)
+                    or not 1 <= len(provider_exit["native_session_ref"]) <= 256):
+                raise OwnerConflict("stage_provider_hard_ceiling_invalid")
+            expected_fields.add("native_session_ref")
         expected_fields.update(
             {"contract_failure_code", "contract_failure_detail_code"}
         )
@@ -33114,6 +33188,7 @@ def _validated_stage_provider_hard_ceiling(
         "result_file_hash",
         "contract_failure_code",
         "contract_failure_detail_code",
+        "native_session_ref",
     }
     result_hash = provider_exit.get("result_file_hash")
     if (

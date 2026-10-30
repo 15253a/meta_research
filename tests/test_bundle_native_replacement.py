@@ -9,6 +9,7 @@ from meta_research.owners.common import OwnerConflict, canonical_hash
 from test_bundle_input_drift_recovery import _adapter, _output, _request
 from test_target_launch_admission import _ready_launch
 from test_target_root_finalizer import _CurrentBindingBundleSkill, _current_bundle_runtime
+from test_public_bundle_stage import _accept_real_target_root_commit
 
 
 def _replacement_context(request):
@@ -67,6 +68,259 @@ class _ReplacementAwareBundle(_CurrentBindingBundleSkill):
         self.rolling_requests.append(request)
         result = super().schedule_target(request)
         return replace(result, native_session_ref="bundle-native-replacement") if request.native_session_ref is None else result
+
+    def propose_target_batch(self, request):
+        self.rolling_requests.append(request)
+        result = super().propose_target_batch(request)
+        return replace(result, native_session_ref="bundle-native-replacement") if request.native_session_ref is None else result
+
+
+def _unavailable_proof(native):
+    return {"schema_ref": "meta-research/provider-native-session-unavailable/v1",
+        "termination_reason": "completed", "result_file_hash": None,
+        **{name: canonical_hash({"verified": name}) for name in (
+            "invocation_hash", "prompt_hash", "output_schema_hash", "stdout_hash", "supervisor_receipt_hash")},
+        "native_session_ref": native, "error_code": -32600,
+        "error_response_hash": canonical_hash({"code": -32600,
+            "message": "no rollout found for thread id " + native})}
+
+
+class _FirstReplacementTurnCorrection(_ReplacementAwareBundle):
+    def __init__(self, outcome):
+        super().__init__()
+        self.outcome = outcome
+        self.failed_once = False
+
+    def terminal_contract_failure_checkpoint(self, **values):
+        proof = _unavailable_proof(values["native_session_ref"])
+        for name in ("error_code", "error_response_hash"):
+            proof.pop(name)
+        return {**proof, "schema_ref": "meta-research/provider-native-contract-failure/v1",
+            "result_file_hash": "c" * 64, "contract_failure_code": values["failure_code"],
+            "contract_failure_detail_code": values["detail_code"]}
+
+    def schedule_target(self, request):
+        result = super().schedule_target(request)
+        return self._first_turn(request, result, "dispatch")
+
+    def propose_target_batch(self, request):
+        result = super().propose_target_batch(request)
+        return self._first_turn(request, result, "batch")
+
+    def _first_turn(self, request, result, kind):
+        if request.native_session_ref is not None or self.failed_once:
+            return result
+        self.failed_once = True
+        if self.outcome == "invalid-result":
+            return replace(result, action="invalid-action") if kind == "dispatch" else replace(result, strategy_update={})
+        if self.outcome == "sealed-contract":
+            raise IdeaSkillUnavailable("bundle_review_result_contract_invalid",
+                native_session_ref=result.native_session_ref,
+                recovery_checkpoint=self.terminal_contract_failure_checkpoint(
+                    native_session_ref=result.native_session_ref,
+                    failure_code="bundle_review_result_contract_invalid", detail_code="bundle_dispatch_action_invalid"))
+        proof = _unavailable_proof(result.native_session_ref)
+        for name in ("error_code", "error_response_hash"):
+            proof.pop(name)
+        proof.update(schema_ref="meta-research/provider-native-turn-terminal/v1",
+            supervisor_invocation_hash=proof["invocation_hash"], native_start_hash="a" * 64,
+            native_reconciliation_hash="b" * 64, native_turn_ref="turn:first-replacement",
+            native_turn_status=self.outcome, native_error={"message": "Original replacement turn " + self.outcome})
+        raise IdeaSkillUnavailable("codex_operation_failed", native_session_ref=result.native_session_ref,
+            recovery_checkpoint=proof)
+
+
+@pytest.mark.parametrize("kind,outcome,correction_hops", [
+    (kind, outcome, 1) for kind in ("dispatch", "batch")
+    for outcome in ("invalid-result", "sealed-contract", "failed", "interrupted")
+] + [("dispatch", "invalid-result", 2)])
+def test_first_replacement_rolling_failure_continues_the_authenticated_native(tmp_path, outcome, kind, correction_hops):
+    provider = _FirstReplacementTurnCorrection(outcome)
+    runtime = _current_bundle_runtime(tmp_path / "replacement-correction", bundle_skill=provider)
+    try:
+        if kind == "batch":
+            target, graph_ref = _accept_real_target_root_commit(runtime)
+            request_ref = runtime.bundle_stage.query_current()["stage_run_request"]["request_ref"]
+            graph = runtime.owners.research_graph.query_target_graph(request_ref)
+            assert graph.graph_ref == graph_ref
+            old = runtime.owners.agent_runtime.query_bundle_stage_run(graph.request_ref)
+        else:
+            graph, target, old, _, _ = _ready_launch(runtime)
+        ar = runtime.owners.agent_runtime
+        ar.begin_provider_unit(unit_ref="initial-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
+            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
+        ar.record_stage_provider_hard_ceiling(unit_ref="initial-unavailable-unit", run_ref=old.run_ref,
+            attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
+            provider_exit=_unavailable_proof(old.native_session_ref))
+        replacement = ar.query_bundle_stage_run(old.request_ref)
+        retired_attempts = [old, replacement]
+        for _ in range(12):
+            runtime.bundle_stage.process_once()
+            if provider.failed_once:
+                break
+        assert provider.failed_once
+        corrected = ar.query_bundle_stage_run(old.request_ref)
+        assert corrected.attempt_ref != replacement.attempt_ref
+        assert corrected.native_session_ref == "bundle-native-replacement"
+        assert corrected.primary_draft is None and corrected.execution is None
+        basis = ar.query_stage_native_replacement_context(run_ref=corrected.run_ref,
+            attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref)
+        assert basis["retired_native_session_ref"] == old.native_session_ref
+        for hop in range(correction_hops - 1):
+            retired_attempts.append(corrected)
+            unit_ref = "another-authenticated-correction:" + str(hop)
+            ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=corrected.review_invocation.operation_ref,
+                run_ref=corrected.run_ref, attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref,
+                unit_kind="bundle_review")
+            ar.record_stage_provider_hard_ceiling(unit_ref=unit_ref, run_ref=corrected.run_ref,
+                attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref,
+                failure_code="bundle_review_result_contract_invalid",
+                provider_exit=provider.terminal_contract_failure_checkpoint(
+                    native_session_ref=corrected.native_session_ref,
+                    failure_code="bundle_review_result_contract_invalid", detail_code="bundle_dispatch_action_invalid"))
+            corrected = ar.query_bundle_stage_run(old.request_ref)
+            assert corrected.native_session_ref == "bundle-native-replacement"
+        for _ in range(12):
+            runtime.bundle_stage.process_once()
+            decisions = [decision for decision in (ar.query_bundle_dispatch_decisions(old.run_ref)
+                if kind == "dispatch" else ar.query_bundle_target_proposals(old.run_ref))
+                if decision.attempt_ref == corrected.attempt_ref]
+            if decisions:
+                break
+        assert decisions and decisions[-1].native_session_ref == "bundle-native-replacement"
+        assert provider.primary_calls == 1
+        assert sum(request.native_session_ref is None for request in provider.rolling_requests) == 1
+        assert all(request.native_session_ref == "bundle-native-replacement" for request in provider.rolling_requests
+            if request.attempt_ref == corrected.attempt_ref)
+        for retired in retired_attempts:
+            with pytest.raises(OwnerConflict):
+                ar.verify_root_agent_runtime_scope(root_kind="bundle", run_ref=retired.run_ref,
+                    attempt_ref=retired.attempt_ref, root_session_ref=retired.root_session_ref,
+                    fence_ref=retired.fence_ref, runtime_binding_hash=retired.runtime_binding_hash)
+        assert runtime.owners.research_graph.query_target_graph(old.request_ref) == graph
+        with runtime._database.read() as connection:
+            for retired in retired_attempts:
+                assert connection.execute(text("SELECT status FROM ar_execution_fences WHERE fence_ref=:ref"),
+                    {"ref": retired.fence_ref}).scalar_one() == "rejected"
+            assert connection.execute(text("SELECT COUNT(*) FROM rg_target_graphs")).scalar_one() == 1
+            assert connection.execute(text("SELECT COUNT(*) FROM rg_targets")).scalar_one() == 1
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_target_launches WHERE target_ref=:ref"),
+                {"ref": target.target_ref}).scalar_one() <= 1
+        if correction_hops > 1:
+            ar.begin_provider_unit(unit_ref="new-native-unavailable-unit",
+                operation_ref=corrected.review_invocation.operation_ref, run_ref=corrected.run_ref,
+                attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref, unit_kind="bundle_review")
+            ar.record_stage_provider_hard_ceiling(unit_ref="new-native-unavailable-unit", run_ref=corrected.run_ref,
+                attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref,
+                failure_code="codex_native_session_unavailable",
+                provider_exit=_unavailable_proof(corrected.native_session_ref))
+            next_replacement = ar.query_bundle_stage_run(old.request_ref)
+            next_basis = ar.query_stage_native_replacement_context(run_ref=next_replacement.run_ref,
+                attempt_ref=next_replacement.attempt_ref, fence_ref=next_replacement.fence_ref)
+            assert next_replacement.native_session_ref is None
+            assert next_basis["retired_native_session_ref"] == "bundle-native-replacement"
+            assert next_basis["safe_point_ref"] != basis["safe_point_ref"]
+            assert runtime.owners.research_graph.query_target_graph(old.request_ref) == graph
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("failure_kind", ["contract", "transport"])
+def test_unbound_replacement_without_authenticated_native_keeps_the_original_operation_pending(tmp_path, failure_kind):
+    class UnresolvedIdentity(_FirstReplacementTurnCorrection):
+        def terminal_contract_failure_checkpoint(self, **values):
+            proof = super().terminal_contract_failure_checkpoint(**values)
+            proof.pop("native_session_ref")
+            proof["schema_ref"] = "meta-research/provider-terminal-contract-failure/v1"
+            if failure_kind == "transport":
+                proof.pop("contract_failure_code")
+                proof.pop("contract_failure_detail_code")
+                proof["schema_ref"] = "meta-research/provider-hard-ceiling/v1"
+            return proof
+
+        def _first_turn(self, request, result, kind):
+            if failure_kind == "transport" and request.native_session_ref is None:
+                self.failed_once = True
+                raise IdeaSkillUnavailable("codex_operation_failed",
+                    recovery_checkpoint=self.terminal_contract_failure_checkpoint(
+                        native_session_ref=result.native_session_ref,
+                        failure_code="codex_operation_failed", detail_code="codex_output_invalid"))
+            return super()._first_turn(request, result, kind)
+
+    provider = UnresolvedIdentity("sealed-contract")
+    runtime = _current_bundle_runtime(tmp_path / "replacement-unresolved", bundle_skill=provider)
+    try:
+        graph, _target, old, _, _ = _ready_launch(runtime)
+        ar = runtime.owners.agent_runtime
+        ar.begin_provider_unit(unit_ref="initial-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
+            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
+        ar.record_stage_provider_hard_ceiling(unit_ref="initial-unavailable-unit", run_ref=old.run_ref,
+            attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
+            provider_exit=_unavailable_proof(old.native_session_ref))
+        pending = ar.query_bundle_stage_run(old.request_ref)
+        for _ in range(12):
+            runtime.bundle_stage.process_once()
+            if provider.failed_once:
+                break
+        assert provider.failed_once
+        assert runtime.bundle_stage.transient_error == "codex_operation_reconciliation_pending"
+        current = ar.query_bundle_stage_run(old.request_ref)
+        assert current.attempt_ref == pending.attempt_ref and current.native_session_ref is None
+        assert runtime.owners.research_graph.query_target_graph(old.request_ref) == graph
+        with runtime._database.read() as connection:
+            unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE run_ref=:run "
+                "AND attempt_ref=:attempt AND status='active'"),
+                {"run": current.run_ref, "attempt": current.attempt_ref}).one()
+        with pytest.raises(OwnerConflict, match="native_session_replacement_identity_missing"):
+            ar.record_stage_provider_hard_ceiling(unit_ref=unit.unit_ref, run_ref=current.run_ref,
+                attempt_ref=current.attempt_ref, fence_ref=current.fence_ref,
+                failure_code="bundle_review_result_contract_invalid" if failure_kind == "contract" else "codex_operation_failed",
+                provider_exit=provider.terminal_contract_failure_checkpoint(
+                    native_session_ref="untrusted-candidate-native",
+                    failure_code="bundle_review_result_contract_invalid", detail_code="bundle_dispatch_action_invalid"))
+        assert ar.query_bundle_stage_run(old.request_ref).attempt_ref == pending.attempt_ref
+        assert provider.primary_calls == 1
+    finally:
+        runtime.close()
+
+
+def test_unbound_replacement_with_only_owner_closure_left_reports_pending_without_new_native(tmp_path):
+    provider = _ReplacementAwareBundle()
+    runtime = _current_bundle_runtime(tmp_path / "replacement-owner-closure", bundle_skill=provider)
+    try:
+        _target, graph_ref = _accept_real_target_root_commit(runtime)
+        request_ref = runtime.bundle_stage.query_current()["stage_run_request"]["request_ref"]
+        ar, rg = runtime.owners.agent_runtime, runtime.owners.research_graph
+        for _ in range(12):
+            runtime.bundle_stage.process_once()
+            graph = rg.query_target_graph(request_ref)
+            if graph.strategy_complete:
+                break
+        assert graph.strategy_complete and graph.graph_ref == graph_ref
+        old = ar.query_bundle_stage_run(request_ref)
+        ar.begin_provider_unit(unit_ref="owner-closure-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
+            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
+        ar.record_stage_provider_hard_ceiling(unit_ref="owner-closure-unavailable-unit", run_ref=old.run_ref,
+            attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
+            provider_exit=_unavailable_proof(old.native_session_ref))
+        current = ar.query_bundle_stage_run(request_ref)
+        prior_calls = len(provider.rolling_requests)
+        with runtime._database.read() as connection:
+            prior_units = connection.execute(text("SELECT COUNT(*) FROM ar_provider_units WHERE run_ref=:run"),
+                {"run": old.run_ref}).scalar_one()
+        for _ in range(2):
+            assert not runtime.bundle_stage.process_once()
+            assert runtime.bundle_stage.transient_error == "bundle_native_replacement_initialization_pending"
+        assert ar.query_bundle_stage_run(request_ref).attempt_ref == current.attempt_ref
+        assert ar.query_bundle_stage_run(request_ref).native_session_ref is None
+        assert ar.query_bundle_run_report(old.run_ref) is None
+        assert len(provider.rolling_requests) == prior_calls and provider.primary_calls == 1
+        assert rg.query_target_graph(request_ref) == graph
+        with runtime._database.read() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_provider_units WHERE run_ref=:run"),
+                {"run": old.run_ref}).scalar_one() == prior_units
+    finally:
+        runtime.close()
 
 
 def test_accepted_graph_continues_same_native_after_public_provider_correction(tmp_path):
