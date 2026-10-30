@@ -13,7 +13,7 @@ from meta_research.paths import prepare_data_root
 from test_public_bundle_stage import (
     _bundle_runtime, _prepare_bundle_request, _DeterministicBundleSkill,
 )
-from test_reasoning_operator_pause_resume import _control, _provider
+from test_reasoning_operator_pause_resume import _control, _provider, _ExecWireContractRunner
 from test_bundle_skill_adapter import _provider_wire_value
 
 NATIVE = "operator-paused-native-bundle"
@@ -24,7 +24,8 @@ class _SupervisedBundle(CodexBundleSkillAdapter):
         self.fixture_root = root
         self.requests = []
         super().__init__(prepare_data_root(root).root / "bundle-skill-provider",
-                         executable=str(executable), timeout_seconds=120)
+                         executable=str(executable), timeout_seconds=120,
+                         process_runner=_ExecWireContractRunner())
 
     def generate_draft(self, request):
         self.requests.append(request)

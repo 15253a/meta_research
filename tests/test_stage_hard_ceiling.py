@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 from sqlalchemy import text
@@ -39,6 +40,7 @@ from meta_research.owners.agent_runtime import BundleRuntimeBinding
 from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.runtime_protection import InhibitorLease, RuntimeProtectionUnavailable
+from meta_research.quest_drafting import _CancellableProcessRunner
 from test_idea_stage_recovery import (
     _ComputeProbe,
     _DraftingProvider,
@@ -49,7 +51,6 @@ from test_idea_stage_recovery import (
 from test_idea_skill_contract import (
     _SequenceRunner as _IdeaSequenceRunner,
     _idea_set,
-    _review_turn_output,
 )
 from test_public_bundle_stage import (
     _DeterministicBundleSkill,
@@ -112,6 +113,23 @@ class _SequenceRunner(_IdeaSequenceRunner):
     def run_job(self, job_ref, argv, prompt, timeout, environment=None):
         del job_ref
         return self(argv, prompt, timeout, environment)
+
+
+class _ExecWireContractRunner:
+    """Keep exec-only malformed JSONL fixtures on their explicit wire seam.
+
+    The real cancellable runner and durable supervisor still launch, capture
+    and seal the provider. This injected composition does not represent an
+    app-server executable; native protocol identity is tested separately below.
+    """
+    def __init__(self):
+        self._processes = _CancellableProcessRunner()
+
+    def __call__(self, *args, **kwargs):
+        return self._processes(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._processes, name)
 
 
 def _signed_ceiling_evidence(reason: str) -> dict[str, object]:
@@ -265,6 +283,52 @@ def _transport_contract_codex(
     )
     executable.chmod(0o700)
     return executable
+
+
+@pytest.mark.parametrize(("resume", "failure_code"), [
+    (False, "native_thread_identity_missing"),
+    (True, "native_thread_identity_mismatch"),
+], ids=["start-missing", "resume-mismatch"])
+def test_native_appserver_rejects_missing_or_foreign_thread_before_starting_a_turn(
+    tmp_path: Path, resume: bool, failure_code: str,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("The native executable protocol boundary runs on Linux")
+    from meta_research.provider_supervisor import (
+        ensure_transport_key, read_transport_envelope, write_transport_envelope,
+    )
+    executable = tmp_path / "native-rpc-identity-codex"
+    executable.write_text("#!" + sys.executable + "\n" + r'''
+import json,sys
+from pathlib import Path
+requests=Path(__file__).with_suffix('.requests')
+for line in sys.stdin:
+ message=json.loads(line)
+ with requests.open('a') as stream:stream.write(json.dumps(message)+'\n')
+ method=message.get('method')
+ if method=='initialized':continue
+ result={}
+ if method=='thread/start':result={'thread':{}}
+ if method=='thread/resume':result={'thread':{'id':'foreign-native-root'}}
+ print(json.dumps({'id':message['id'],'result':result}),flush=True)
+''')
+    executable.chmod(0o700)
+    _key_path, key = ensure_transport_key(tmp_path)
+    directory = tmp_path / "provider-operations" / "ab" / ("c" * 64)
+    directory.mkdir(parents=True)
+    argv = [str(executable), "exec", "--json"]
+    argv.extend(["resume", "original-native-root", "-"] if resume else ["-"])
+    source = directory / "native-provider-argv.json"
+    write_transport_envelope(source, {"argv": argv}, key)
+    completed = subprocess.run([sys.executable, "-m", "meta_research.native_codex_bridge",
+        "--provider-argv", str(source), "--operation-directory", str(directory)],
+        input="One bounded protocol identity check.", text=True, capture_output=True, timeout=12)
+    assert completed.returncode == 70
+    assert failure_code in completed.stderr
+    calls = [json.loads(line)["method"] for line in executable.with_suffix(".requests").read_text().splitlines()]
+    assert calls == ["initialize", "initialized", "thread/resume" if resume else "thread/start"]
+    assert not (directory / "native-turn-start.json").exists()
+    assert read_transport_envelope(source, key) == {"argv": argv}
 
 
 def _current_plan_skill_request(runtime, cycle_ref: str):
@@ -1268,12 +1332,7 @@ def test_production_adapter_missing_review_trace_accepts_hash_bound_result(
         )
         assert request is not None
         outcome = _runtime_idea_outcome(request)
-        outputs.extend(
-            [
-                {"outcome": outcome},
-                _review_turn_output(final_outcome=outcome),
-            ]
-        )
+        outputs.append({"outcome": outcome})
 
         assert runtime.idea_stage.process_once()
         assert runtime.idea_stage.process_once(), runtime.idea_stage.transient_error
@@ -1281,7 +1340,7 @@ def test_production_adapter_missing_review_trace_accepts_hash_bound_result(
         assert accepted["status"] == "awaiting_acceptance"
         assert accepted["fence_status"] == "submitted"
         assert accepted["blocker"] is None
-        assert len(runner.calls) == 2
+        assert len(runner.calls) == 1
         # Native stdout remains diagnostic; currentness and acceptance still
         # come from the Owner-bound run, output hash, and current fence.
         assert accepted["native_session_ref"]
@@ -1344,7 +1403,8 @@ def test_plan_native_session_transport_failure_is_terminal_without_replay(
     runtime = _plan_runtime(
         data_path,
         idea_skill=_DeterministicIdeaSkill(),
-        plan_skill=CodexPlanSkillAdapter(workspace, executable=str(executable)),
+        plan_skill=CodexPlanSkillAdapter(workspace, executable=str(executable),
+            process_runner=_ExecWireContractRunner()),
     )
     try:
         quest = _confirm_direct_quest(runtime)
@@ -1394,7 +1454,8 @@ def test_plan_native_session_transport_failure_is_terminal_without_replay(
     restarted = _plan_runtime(
         data_path,
         idea_skill=_DeterministicIdeaSkill(),
-        plan_skill=CodexPlanSkillAdapter(workspace, executable=str(executable)),
+        plan_skill=CodexPlanSkillAdapter(workspace, executable=str(executable),
+            process_runner=_ExecWireContractRunner()),
     )
     try:
         assert not restarted.plan_stage.process_once()
@@ -1423,7 +1484,8 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
         call_counter,
         failure_detail=detail_code,
     )
-    adapter = CodexPlanSkillAdapter(workspace, executable=str(executable))
+    adapter = CodexPlanSkillAdapter(workspace, executable=str(executable),
+        process_runner=_ExecWireContractRunner())
     runtime = _plan_runtime(
         data_path,
         idea_skill=_DeterministicIdeaSkill(),
@@ -1465,7 +1527,8 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
     restarted = _plan_runtime(
         data_path,
         idea_skill=_DeterministicIdeaSkill(),
-        plan_skill=CodexPlanSkillAdapter(workspace, executable=str(executable)),
+        plan_skill=CodexPlanSkillAdapter(workspace, executable=str(executable),
+            process_runner=_ExecWireContractRunner()),
     )
     try:
         assert not restarted.plan_stage.process_once()
@@ -1589,16 +1652,7 @@ def test_plan_production_adapter_missing_review_trace_accepts_result(
             job_ref=run.primary_invocation.operation_ref,
         )
         document = _DeterministicPlanSkill(no_gap=False)._document(skill_request)
-        outputs.extend(
-            [
-                {"plan": document},
-                {
-
-                    "final_plan": document,
-
-                },
-            ]
-        )
+        outputs.append({"plan": document})
 
         assert runtime.plan_stage.process_once()
         assert runtime.plan_stage.process_once(), runtime.plan_stage.transient_error
@@ -1606,7 +1660,7 @@ def test_plan_production_adapter_missing_review_trace_accepts_result(
         assert accepted["status"] == "awaiting_acceptance"
         assert accepted["fence_status"] == "submitted"
         assert accepted["blocker"] is None
-        assert len(runner.calls) == 2
+        assert len(runner.calls) == 1
         # Native stdout remains diagnostic; currentness and acceptance still
         # come from the Owner-bound run, output hash, and current fence.
         assert accepted["native_session_ref"]
@@ -1944,17 +1998,7 @@ def test_reasoning_production_adapter_missing_review_trace_accepts_result(
             job_ref=run.primary_invocation.operation_ref,
         )
         draft = _DeterministicReasoningSkill().generate_draft(skill_request).draft
-        outputs.extend(
-            [
-                draft,
-                {
-                    "schema_ref": "meta-research/reasoning-review/v1",
-
-                    "final_output": draft,
-
-                },
-            ]
-        )
+        outputs.append(draft)
 
         assert runtime.reasoning_stage.process_once()
         assert runtime.reasoning_stage.process_once(), runtime.reasoning_stage.transient_error
@@ -1962,7 +2006,7 @@ def test_reasoning_production_adapter_missing_review_trace_accepts_result(
         assert accepted["status"] == "awaiting_acceptance"
         assert accepted["fence_status"] == "submitted"
         assert accepted["blocker"] is None
-        assert len(runner.calls) == 2
+        assert len(runner.calls) == 1
         # Native stdout remains diagnostic; currentness and acceptance still
         # come from the Owner-bound run, output hash, and current fence.
         assert accepted["native_session_ref"]
@@ -1974,7 +2018,7 @@ def test_reasoning_production_adapter_missing_review_trace_accepts_result(
     ("phase", "failure_code", "missing_semantic_call", "expected_calls"),
     [
         ("primary", "reasoning_primary_result_contract_invalid", 0, 1),
-        ("review", "reasoning_review_result_contract_invalid", 1, 2),
+        ("review", "reasoning_review_result_contract_invalid", 0, 1),
     ],
 )
 def test_reasoning_missing_semantic_trace_is_diagnostic(
@@ -2023,14 +2067,6 @@ def test_reasoning_missing_semantic_trace_is_diagnostic(
         draft = _DeterministicReasoningSkill().generate_draft(skill_request).draft
         outputs.append(draft)
         if phase == "review":
-            outputs.append(
-                {
-                    "schema_ref": "meta-research/reasoning-review/v1",
-
-                    "final_output": draft,
-
-                }
-            )
             assert runtime.reasoning_stage.process_once()
 
         assert runtime.reasoning_stage.process_once(), runtime.reasoning_stage.transient_error

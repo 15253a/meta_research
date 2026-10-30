@@ -1,13 +1,15 @@
 """The worker's two preflight readers reuse proofs, then release all effects."""
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
+import json
 
 import pytest
 from sqlalchemy import text
 
 from meta_research.bundle_stage import BundleStageWorker
 from meta_research.database import Database
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.advancement_engine import SQLiteAdvancementEngine
+from meta_research.owners.common import OwnerConflict, canonical_json
 from meta_research.read_snapshot_cache import snapshot_cached
 
 
@@ -26,9 +28,16 @@ class _ProofOwner:
 
 def _worker(tmp_path, request_exists=True):
     database = Database(tmp_path / "preflight.sqlite3")
+    position = {"cycle_ref": "cycle", "round": 1, "cycle_focus": "Compare approved interventions.",
+        "focus_source": {"kind": "confirmed_creation", "initialization_id": "initialization",
+            "draft_hash": "d" * 64, "field": "background_and_initial_direction",
+            "confirmation_ref": "confirmation"}}
     with database.write() as connection:
         connection.exec_driver_sql("CREATE TABLE proof_source (revision INTEGER)")
         connection.exec_driver_sql("INSERT INTO proof_source VALUES (1)")
+        connection.exec_driver_sql("CREATE TABLE ae_cycles (cycle_ref TEXT PRIMARY KEY, cycle_position_json TEXT)")
+        connection.execute(text("INSERT INTO ae_cycles VALUES (:cycle_ref, :position)"),
+            {"cycle_ref": position["cycle_ref"], "position": canonical_json(position)})
     proof = _ProofOwner(database)
     question_binding = NS(as_dict=lambda: {"question_ref": "question"})
     current = NS(cycle_ref="cycle", question=NS(
@@ -59,11 +68,16 @@ def _worker(tmp_path, request_exists=True):
         with database.write() as connection:
             connection.exec_driver_sql("UPDATE proof_source SET revision = revision + 1")
 
+    def read_cycle_position(cycle_ref):
+        after_preflight()
+        return SQLiteAdvancementEngine.query_cycle_position(proof, cycle_ref)
+
     engine = NS(
         query_foreground=Mock(return_value=foreground),
         query_bundle_stage_request=Mock(side_effect=read_request),
         query_bundle_stage_commit=Mock(return_value=object()),
         ensure_bundle_stage_request=Mock(side_effect=ensure),
+        query_cycle_position=Mock(side_effect=read_cycle_position),
     )
     worker = object.__new__(BundleStageWorker)
     worker._database = database
@@ -78,7 +92,7 @@ def _worker(tmp_path, request_exists=True):
 
 
 def test_worker_shares_proof_within_boundary_and_rechecks_next_tick(tmp_path):
-    worker, database, proof, _engine = _worker(tmp_path)
+    worker, database, proof, engine = _worker(tmp_path)
     try:
         assert worker._process_boundary_once() is False
         assert proof.observed_revisions == [1]
@@ -86,6 +100,7 @@ def test_worker_shares_proof_within_boundary_and_rechecks_next_tick(tmp_path):
             connection.exec_driver_sql("UPDATE proof_source SET revision = 2")
         assert worker._process_boundary_once() is False
         assert proof.observed_revisions == [1, 2]
+        engine.query_cycle_position.assert_not_called()
         assert database._read_cut.get() is None and database._read_cache.get() is None
     finally:
         database.close()
@@ -97,8 +112,11 @@ def test_missing_request_keeps_ensure_write_outside_read_snapshot(tmp_path):
         assert worker._process_boundary_once() is True
         assert proof.observed_revisions == [1]
         engine.ensure_bundle_stage_request.assert_called_once()
+        engine.query_cycle_position.assert_called_once_with("cycle")
         with database.read() as connection:
             assert connection.execute(text("SELECT revision FROM proof_source")).scalar_one() == 2
+            position = json.loads(connection.execute(text("SELECT cycle_position_json FROM ae_cycles")).scalar_one())
+        assert engine.ensure_bundle_stage_request.call_args.kwargs["context_pack"]["cycle_position"] == position
         assert database._read_cut.get() is None and database._read_cache.get() is None
     finally:
         database.close()
@@ -110,6 +128,7 @@ def test_ineligible_cycle_does_not_read_request_or_keep_snapshot(tmp_path):
     try:
         assert worker._process_boundary_once() is False
         engine.query_bundle_stage_request.assert_not_called()
+        engine.query_cycle_position.assert_not_called()
         assert database._read_cut.get() is None and database._read_cache.get() is None
     finally:
         database.close()
@@ -128,6 +147,7 @@ def test_preflight_rejection_is_preserved_and_releases_snapshot(tmp_path, failin
         with pytest.raises(OwnerConflict, match="upstream_proof_invalid"):
             worker._process_boundary_once()
         engine.ensure_bundle_stage_request.assert_not_called()
+        engine.query_cycle_position.assert_not_called()
         assert database._read_cut.get() is None and database._read_cache.get() is None
     finally:
         database.close()

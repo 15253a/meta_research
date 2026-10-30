@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -21,6 +22,7 @@ def _worker_at_inbox_boundary(monkeypatch, drain, execute):
     )
     run = SimpleNamespace(
         run_ref="run:test", status="running", execution=None, primary_draft=None,
+        native_session_ref=None,
     )
     worker = BundleStageWorker(
         feed=None,
@@ -34,7 +36,7 @@ def _worker_at_inbox_boundary(monkeypatch, drain, execute):
             query_managed_run=lambda _run: None,
         ),
         research_memory=None,
-        research_graph=None,
+        research_graph=SimpleNamespace(query_target_graph=Mock(return_value=None)),
         provider=None,
     )
     current = SimpleNamespace(
@@ -75,9 +77,11 @@ def test_checkpoint_race_yields_before_retrying_a_fresh_boundary(monkeypatch, co
     assert worker.transient_error is None
     assert reads == 1
     assert provider_calls == 0
+    worker._research_graph.query_target_graph.assert_not_called()
     assert worker.process_once() is True
     assert reads == 2
     assert provider_calls == 1
+    worker._research_graph.query_target_graph.assert_called_once_with("request:test")
 
 
 @pytest.mark.parametrize(
@@ -123,6 +127,7 @@ def test_retry_health_during_long_provider_call_preserves_real_faults(
             assert await asyncio.to_thread(provider_started.wait, 1.5)
             # The retry is still running: its completion cannot clear old errors.
             assert reads == 2
+            worker._research_graph.query_target_graph.assert_called_once_with("request:test")
             assert health.status == expected_status
             assert health.last_error == (None if expected_status == "ready" else code)
             if expected_status == "ready":
@@ -164,3 +169,4 @@ def test_checkpoint_retry_does_not_swallow_integrity_errors(monkeypatch, code):
     worker = _worker_at_inbox_boundary(monkeypatch, drain, lambda: True)
     with pytest.raises(OwnerConflict, match=code):
         worker.process_once()
+    worker._research_graph.query_target_graph.assert_not_called()

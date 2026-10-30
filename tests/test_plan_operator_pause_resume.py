@@ -1,4 +1,8 @@
-"""A stopped advisory turn must resume with the already accepted primary draft."""
+"""Owner pause of optional same-root work retains the saved primary draft.
+
+The fixture explicitly schedules post-draft work. The production Plan adapter
+still checkpoints its final candidate locally without a second review call.
+"""
 import json
 from pathlib import Path
 import threading
@@ -8,22 +12,29 @@ import pytest
 
 from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
-from meta_research.plan_skill import CodexPlanSkillAdapter
+from meta_research.plan_skill import CodexPlanSkillAdapter, _review_finalization_schema
+from meta_research.idea_skill import stage_operation_input
 from test_public_plan_stage import (
     _runtime, _confirm_direct_quest, _finish_idea_stage,
     _DeterministicIdeaSkill, _DeterministicPlanSkill,
 )
-from test_reasoning_operator_pause_resume import _control
+from test_reasoning_operator_pause_resume import _control, _ExecWireContractRunner
 
 NATIVE = 'operator-paused-native-plan'
 
 
-class _SupervisedPlan(CodexPlanSkillAdapter):
+class _SupervisedPlanWithOptionalContinuation(CodexPlanSkillAdapter):
+    """Explicit fixture workload to exercise an already saved Plan's pause.
+
+    This is an Owner continuation contract, not production forced-review
+    choreography or evidence of selected app-server review capabilities.
+    """
     def __init__(self, root, executable):
         self.root = root
         self.primary_calls = 0
         super().__init__(prepare_data_root(root).root / 'plan-skill-provider',
-                         executable=str(executable), timeout_seconds=120)
+                         executable=str(executable), timeout_seconds=120,
+                         process_runner=_ExecWireContractRunner())
 
     def generate_draft(self, request):
         self.primary_calls += 1
@@ -33,6 +44,20 @@ class _SupervisedPlan(CodexPlanSkillAdapter):
 
     def review_draft(self, request, draft):
         (self.root / 'next-output.json').write_text(json.dumps({'final_plan':draft.draft}))
+        output, native, _ = self._invoke_root_operation(
+            operation_name='review',
+            prompt='Test-only optional post-draft work. Preserve the exact saved Plan and return final_plan.',
+            schema=_review_finalization_schema(request),
+            native_session_ref=draft.primary_session_ref,
+            job_ref=request.job_ref, run_ref=request.run_ref,
+            attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
+            fence_ref=request.fence_ref,
+            runtime_binding=request.runtime_binding.as_dict(),
+            operation_input={'request': stage_operation_input(request, 'plan'),
+                             'saved_primary_draft': draft.draft},
+        )
+        assert native == draft.primary_session_ref
+        assert output['final_plan'] == draft.draft
         return super().review_draft(request, draft)
 
 
@@ -60,7 +85,7 @@ def _provider(path, root):
 
 
 def _make_runtime(root, executable):
-    adapter = _SupervisedPlan(root, executable)
+    adapter = _SupervisedPlanWithOptionalContinuation(root, executable)
     runtime = _runtime(root, idea_skill=_DeterministicIdeaSkill(), plan_skill=adapter)
     runtime.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
     adapter.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
@@ -69,6 +94,7 @@ def _make_runtime(root, executable):
 
 @pytest.mark.parametrize('tamper', [False, True], ids=['resume-review-only', 'reject-tampered-stop'])
 def test_paused_plan_review_preserves_primary_and_replaces_stopped_operation(tmp_path, tamper):
+    """Pause the fixture's optional work; never repeat its accepted primary."""
     root = tmp_path / 'data'
     root.mkdir()
     executable = _provider(tmp_path / 'codex', root)

@@ -358,6 +358,8 @@ class BundleStageWorker:
             if self._agent_runtime.query_stage_native_replacement_context(
                 run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
             ) is None:
+                if run.native_session_ref is not None:
+                    return self._execute_target_plan(request, run)
                 raise OwnerConflict("bundle_native_replacement_context_missing")
         if graph is None:
             execution = run.execution

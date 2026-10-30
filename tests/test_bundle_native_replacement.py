@@ -69,6 +69,53 @@ class _ReplacementAwareBundle(_CurrentBindingBundleSkill):
         return replace(result, native_session_ref="bundle-native-replacement") if request.native_session_ref is None else result
 
 
+def test_accepted_graph_continues_same_native_after_public_provider_correction(tmp_path):
+    provider = _ReplacementAwareBundle()
+    runtime = _current_bundle_runtime(tmp_path / "same-native-correction", bundle_skill=provider)
+    try:
+        graph, target, old, _decision, _launch = _ready_launch(runtime)
+        ar, rg = runtime.owners.agent_runtime, runtime.owners.research_graph
+        invocation = old.review_invocation
+        unit_ref = "bundle-terminal-turn-unit"
+        ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=invocation.operation_ref,
+            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
+            unit_kind="bundle_review")
+        proof = {"schema_ref": "meta-research/provider-native-turn-terminal/v1",
+            "termination_reason": "completed", "result_file_hash": None,
+            **{name: canonical_hash({"verified": name}) for name in (
+                "invocation_hash", "prompt_hash", "output_schema_hash", "stdout_hash", "supervisor_receipt_hash")},
+            "native_session_ref": old.native_session_ref,
+            "native_start_hash": "a" * 64, "native_reconciliation_hash": "b" * 64,
+            "native_turn_ref": "native-turn:failed-rolling-work", "native_turn_status": "failed",
+            "native_error": {"message": "The rolling turn failed in the original session"}}
+        proof["supervisor_invocation_hash"] = proof["invocation_hash"]
+        ar.record_stage_provider_hard_ceiling(unit_ref=unit_ref, run_ref=old.run_ref,
+            attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
+            failure_code="codex_operation_failed", provider_exit=proof)
+        successor = ar.query_bundle_stage_run(old.request_ref)
+        assert successor.execution is None
+        assert successor.native_session_ref == old.native_session_ref
+        assert successor.attempt_ref != old.attempt_ref and successor.fence_ref != old.fence_ref
+        assert ar.query_stage_native_replacement_context(run_ref=successor.run_ref,
+            attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref) is None
+        assert runtime.bundle_stage.process_once()
+        current = ar.query_bundle_stage_run(old.request_ref)
+        assert current.execution is not None
+        assert current.run_ref == old.run_ref and current.root_session_ref == old.root_session_ref
+        assert current.native_session_ref == old.native_session_ref
+        assert rg.query_target_graph(old.request_ref) == graph
+        assert provider.primary_calls == 1
+        with runtime._database.read() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM rg_target_graphs")).scalar_one() == 1
+            assert connection.execute(text("SELECT COUNT(*) FROM rg_targets")).scalar_one() == 1
+        with pytest.raises(OwnerConflict):
+            ar.verify_root_agent_runtime_scope(root_kind="bundle", run_ref=old.run_ref,
+                attempt_ref=old.attempt_ref, root_session_ref=old.root_session_ref,
+                fence_ref=old.fence_ref, runtime_binding_hash=old.runtime_binding_hash)
+    finally:
+        runtime.close()
+
+
 def test_coordinator_replaces_unavailable_rolling_session_without_readmitting_graph_or_target(tmp_path):
     provider = _ReplacementAwareBundle()
     runtime = _current_bundle_runtime(tmp_path / "rolling-replacement", bundle_skill=provider)

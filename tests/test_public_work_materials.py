@@ -14,7 +14,8 @@ def test_current_guidance_and_input_save_exact_receivers_atomically_and_replay_a
     source.write_text("Current operation notes.")
     class SubmitDuringIdea(_DeterministicIdeaSkill):
         def generate_draft(self, request):
-            with TestClient(create_app(self.runtime, base_url="http://testserver", control_key="control")) as client:
+            client = TestClient(create_app(self.runtime, base_url="http://testserver", control_key="control"))
+            try:
                 headers = _login(client, self.runtime)
                 receiver_response = client.get("/api/v1/work-materials/receiver", params={"quest_ref": self.quest, "question_ref": request.question_ref})
                 assert receiver_response.status_code == 200, receiver_response.text
@@ -60,6 +61,8 @@ def test_current_guidance_and_input_save_exact_receivers_atomically_and_replay_a
                 assert client.post("/api/v1/human-collaboration/guidance", json=guide, headers={**headers, "Idempotency-Key": "current-guide"}).json() == accepted.json()
                 assert client.post("/api/v1/research-inputs", json=input_body, headers={**headers, "Idempotency-Key": "current-input"}).json() == input_value
                 observed["receiver"] = receiver
+            finally:
+                client.close()
             return super().generate_draft(request)
     provider = SubmitDuringIdea()
     runtime = _runtime(tmp_path / "runtime", provider)

@@ -423,6 +423,12 @@ def test_cleanup_waits_for_actual_handoff_and_pending_finalizer_files(tmp_path, 
             pending = workspace / ".target-completion-intakes"
             pending.mkdir(); (pending / "unconsumed.json").write_text('{"state":"awaiting-finalizer"}')
         before = _workspace_bytes(workspace)
+        def workspace_contents():
+            return {str(path.relative_to(workspace)): (
+                path.is_symlink(), path.is_dir(),
+                None if path.is_dir() else path.read_bytes())
+                for path in workspace.rglob("*")}
+        before_contents = workspace_contents()
         result = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
         if dependency == "unpublished":
             # Completion and RM/RG receipts exist, but publication has not yet
@@ -434,8 +440,13 @@ def test_cleanup_waits_for_actual_handoff_and_pending_finalizer_files(tmp_path, 
         else:
             assert result[0]["action"] == "skipped", result
             assert result[0]["reason"] == "pending_finalizer_intake"
-        assert workspace.exists() and _workspace_bytes(workspace) == before
-        print("T16_PROTECTED " + json.dumps({"state":dependency,"report":result,"bytes_unchanged":before}))
+        assert workspace.exists() and workspace_contents() == before_contents
+        asset = next(entry for entry in manifest.entries
+            if entry.declared_relative_path == "outputs/data/run1.txt")
+        assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b"36\n"
+        print("T16_PROTECTED " + json.dumps({"state":dependency,"report":result,
+            "allocated_bytes_before":before,"allocated_bytes_after":_workspace_bytes(workspace),
+            "workspace_contents_unchanged":True}))
         if dependency == "unpublished":
             runtime.owners.agent_runtime.publish_target_root_completion(target_ref=handle.target_ref,
                 completion_ref=completed.completion_ref, target_commit_ref=completed.target_commit_ref)

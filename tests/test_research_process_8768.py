@@ -69,11 +69,21 @@ def test_prior_handoff_visible_at_any_stage_and_full_note_stays_exact(stage):
             "large_proof": {str(i): "x"*2000 for i in range(100)}}
     original = canonical_hash(pack)
     view = stage_context_view(stage, pack, context_pack_ref="context", context_pack_hash=original)
-    handoff = view["current_handoff_notes"][0]
-    assert handoff["notes"]["text"].startswith("继续原因")
-    assert handoff["notes"]["truncated"]
-    assert handoff["reader"]["source"] == "predecessor_closure"
-    assert handoff["reader"]["source_ref"] == "old-commit"
+    if stage == "idea":
+        handoff = view["sections"]["prior_accepted_bindings"][0]
+        assert handoff == pack["prior_accepted_bindings"][0]
+        assert view["section_delivery"]["prior_accepted_bindings"] == "complete"
+        assert handoff["handoff_notes"] == {
+            "text": note, "source_utf8_bytes": len(note.encode()), "truncated": False}
+        assert handoff["exact_reader"] == "research_memory.stage_context.read"
+        assert "current_handoff_notes" not in view
+        assert canonical_json(view).count(note) == 1
+    else:
+        handoff = view["current_handoff_notes"][0]
+        assert handoff["notes"]["text"].startswith("继续原因")
+        assert handoff["notes"]["truncated"]
+        assert handoff["reader"]["source"] == "predecessor_closure"
+        assert handoff["reader"]["source_ref"] == "old-commit"
     assert view["human_guidance_reader"]["operation"] == "human_request.read"
     assert len(canonical_json(view).encode()) <= CONTEXT_VIEW_MAX_BYTES
     assert canonical_hash(pack) == original

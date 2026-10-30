@@ -10,6 +10,7 @@ from meta_research.owners.common import OwnerConflict
 from pathlib import Path
 
 from meta_research.reasoning_skill import CodexReasoningSkillAdapter
+from meta_research.quest_drafting import _CancellableProcessRunner
 from meta_research.paths import prepare_data_root
 from test_public_reasoning_stage import _DeterministicReasoningSkill, _reasoning_runtime
 from test_reasoning_stage_provider_protection import _reach_reasoning_run
@@ -18,11 +19,28 @@ from test_public_advancement_runtime_control import _confirmed_control, _execute
 NATIVE = "operator-paused-native-reasoning"
 
 
+class _ExecWireContractRunner:
+    """Run this exec-only pause/stop fixture through the real supervisor.
+
+    Its stdin-until-EOF and exec JSONL contract is not an app-server protocol.
+    Native RPC identity and live guidance have separate production-bridge tests.
+    """
+    def __init__(self):
+        self._processes = _CancellableProcessRunner()
+
+    def __call__(self, *args, **kwargs):
+        return self._processes(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._processes, name)
+
+
 class _SupervisedReasoning(CodexReasoningSkillAdapter):
     def __init__(self, root: Path, executable: Path):
         self.fixture_root = root
         self.requests = []
-        super().__init__(prepare_data_root(root).root / "reasoning-skill-provider", executable=str(executable), timeout_seconds=120)
+        super().__init__(prepare_data_root(root).root / "reasoning-skill-provider", executable=str(executable), timeout_seconds=120,
+            process_runner=_ExecWireContractRunner())
 
     def generate_draft(self, request):
         self.requests.append(request)

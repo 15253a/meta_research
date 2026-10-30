@@ -23,6 +23,7 @@ class LaterPageIdea(_DeterministicIdeaSkill):
         assert request.context_pack['schema_ref'].endswith('/v4')
         assert self.selected_ref not in request.context_pack['accepted_evidence_refs']
         page,refs=self.page_reader(request.context_pack['accepted_question_binding']['quest_ref'],offset=32,limit=32)
+        assert page['total_count']==33
         assert self.selected_ref in refs and page['next_offset'] is None
         draft=super().generate_draft(request)
         value=deepcopy(draft.draft)
@@ -51,8 +52,8 @@ def test_later_page_idea_is_accepted_and_old_binding_survives_new_evidence(tmp_p
         provider.page_reader=runtime.owners.research_graph.query_evidence_reference_page
         current=_finish_idea_stage(runtime)
         request=provider.requests[0]
-        assert len(request.context_pack['accepted_evidence_refs'])==32
-        assert request.context_pack['evidence_page']['total_count']==33
+        assert request.context_pack['accepted_evidence_refs']==[]
+        assert request.context_pack['evidence_page'] is None
         assert assets[0].version_ref not in request.context_pack['accepted_evidence_refs']
         submission=current['run']['submission_ref']
         content=runtime.owners.research_memory.query_idea_outcome_content(submission)

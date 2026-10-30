@@ -2273,7 +2273,7 @@ class CodexIdeaSkillAdapter:
                     directory / "prompt.txt", transport_limits.prompt_max_bytes
                 )
                 _key_path, key = self._transport_key()
-                previous = read_transport_envelope(invocation_path, key)
+                previous = _read_sealed_operation_invocation(invocation_path, key=key)
                 if previous.get("prompt_hash") != canonical_hash(persisted_prompt):
                     raise IdeaSkillUnavailable("codex_operation_spool_invalid")
                 _conditions, original_prompt = split_runtime_prompt(persisted_prompt)
@@ -2872,12 +2872,12 @@ def _validate_provider_inputs(
         raise IdeaSkillUnavailable("codex_output_schema_too_large")
 
 
-def _read_operation_invocation(
+def _read_sealed_operation_invocation(
     path: Path,
     *,
     key: bytes,
-    expected_base: dict[str, object],
 ) -> dict[str, object]:
+    """Authenticate the stored payload without granting current execution."""
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -2896,6 +2896,27 @@ def _read_operation_invocation(
     ).hexdigest()
     transport_mode = typed_invocation.get("transport_mode")
     _operation_transport_limits(typed_invocation)
+    prompt_hash = typed_invocation.get("prompt_hash")
+    if (
+        set(envelope) != {"payload", "seal"}
+        or not hmac.compare_digest(seal, expected_seal)
+        or typed_invocation.get("schema_ref") != _CODEX_PROVIDER_OPERATION_SCHEMA
+        or transport_mode not in {"durable_supervisor", "unreconciled_runner"}
+        or not isinstance(prompt_hash, str)
+        or len(prompt_hash) != 64
+        or any(character not in "0123456789abcdef" for character in prompt_hash)
+    ):
+        raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+    return typed_invocation
+
+
+def _read_operation_invocation(
+    path: Path,
+    *,
+    key: bytes,
+    expected_base: dict[str, object],
+) -> dict[str, object]:
+    typed_invocation = _read_sealed_operation_invocation(path, key=key)
     expected_keys = {*expected_base, "transport_mode"}
     identity_fields = set(expected_base).difference(
         {
@@ -2906,17 +2927,11 @@ def _read_operation_invocation(
         }
     )
     if (
-        set(envelope) != {"payload", "seal"}
-        or not hmac.compare_digest(seal, expected_seal)
-        or set(typed_invocation) != expected_keys
-        or typed_invocation.get("schema_ref")
-        != _CODEX_PROVIDER_OPERATION_SCHEMA
+        set(typed_invocation) != expected_keys
         or any(
             typed_invocation.get(name) != expected_base[name]
             for name in identity_fields
         )
-        or transport_mode
-        not in {"durable_supervisor", "unreconciled_runner"}
     ):
         raise IdeaSkillUnavailable("codex_operation_identity_conflict")
     return typed_invocation
