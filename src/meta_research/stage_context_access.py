@@ -145,7 +145,7 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
 def stage_context_operations(*, advancement_engine, agent_runtime, research_graph, research_memory):
     return (SemanticOperation(semantic_operation_id=STAGE_CONTEXT_OPERATION_ID,
         owning_module='research_memory',
-        description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. Return <=16384 UTF-8 text bytes with exact source hash, next_offset and complete; history index_offset pages 12 outcomes/Questions or 32 evidence references.',
+        description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. Return <=16384 UTF-8 JSON bytes with exact source hash; next_offset=null ends the byte stream, while complete only means this page contains the entire source. Then follow index_page.next_offset with index_offset and reset byte offset to 0; history pages 12 outcomes/Questions or 32 evidence references.',
         input_schema={'type':'object','properties':{
             'context_pack_ref':{'type':'string','minLength':1,'maxLength':256},
             'source':{'type':'string','enum':['context_pack','question','literature_records','creation_understanding','creation_corrections','creation_sources','scientific_outcome','predecessor_closure','question_history','question_index','evidence_index']},
@@ -158,7 +158,7 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
         handler=lambda context,arguments:read_stage_context(advancement_engine,agent_runtime,research_graph,research_memory,context,arguments)),
         SemanticOperation(semantic_operation_id='research_memory.research_notes.read',
             owning_module='research_memory',
-            description='Read bounded research-note summaries or an exact immutable note version. Stage calls require context_pack_ref; optional predecessor_ref selects an accepted frozen predecessor within the same Quest. Target calls omit both and read only this Target, its frozen upstream Targets and selected note versions. index_offset pages 12 versions for Targets; source_ref selects an exact version for research_note_body. Explanations do not replace formal metrics or input bindings.',
+            description='Read bounded research-note summaries or an exact immutable note version. Stage calls require context_pack_ref; optional predecessor_ref selects an accepted frozen predecessor within the same Quest. Target calls omit both and read only this Target, its frozen upstream Targets and selected note versions. next_offset=null ends the UTF-8 JSON byte stream even if complete=false; index_page.next_offset continues the version index via index_offset with byte offset reset to 0. index_offset pages 12 versions for Targets; source_ref selects an exact version for research_note_body. summary_only is display metadata, not an argument. Explanations do not replace formal metrics or input bindings.',
             input_schema={'type':'object','properties':{
                 'context_pack_ref':{'type':'string','minLength':1,'maxLength':256},
                 'source':{'type':'string','enum':['research_notes','research_note_body']},

@@ -180,7 +180,7 @@ def test_research_notes_follow_only_authenticated_frozen_predecessor_question():
     view=stage_context_view('idea',pack,context_pack_ref='ctx',context_pack_hash=canonical_hash(pack))
     pointer=view['predecessor_research_notes_readers'][0]
     assert pointer['predecessor_ref']=='old_commit'
-    args={key:value for key,value in pointer.items() if key not in {'operation','summary_only'}}
+    args={key:value for key,value in pointer.items() if key != 'operation'}
     result=read_stage_context(ae,ar,None,memory,ctx,args)
     assert json.loads(result['text'])==page
     memory.query_question_research_notes.assert_called_once_with(
