@@ -800,7 +800,8 @@ def stage_operation_input(request, stage: str, *, extra=None) -> dict[str, objec
               "idea_set_ref", "predecessor_submission_ref", "predecessor_candidate_ref",
               "owner_rejection_receipt_ref", "owner_rejection_kind", "owner_feedback", "continuation_feedback"}
     hashes = {"accepted_question_content", "accepted_idea_set", "frozen_evidence_closure",
-              "plan_document", "inbox_checkpoint", "native_replacement_context"}
+              "plan_document", "inbox_checkpoint", "native_replacement_context",
+              "predecessor_rejections", "provider_feedback"}
     value = {field.name: getattr(request, field.name) for field in fields(request) if field.name in direct}
     value.update({field.name + "_hash": canonical_hash(getattr(request, field.name))
                   for field in fields(request) if field.name in hashes})

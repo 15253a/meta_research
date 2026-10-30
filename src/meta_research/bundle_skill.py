@@ -1122,7 +1122,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 workspace_binding=self._workspace_binding(run_ref=run_ref, attempt_ref=attempt_ref,
                     root_session_ref=root_session_ref, fence_ref=fence_ref,
                     runtime_binding_hash=canonical_hash(runtime_binding.as_dict())),
-                operation_input=stage_operation_input(request, "bundle") if operation_input is None else operation_input,
+                operation_input=operation_input,
             )
         except BundleSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":
@@ -1399,6 +1399,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             schema=_target_plan_envelope_schema(request),
             native_session_ref=request.native_session_ref,
             job_ref=request.job_ref,
+            operation_input=stage_operation_input(request, "bundle"),
         )
         if session_ref is None or type(output) is not dict:
             raise BundleSkillUnavailable("codex_bundle_primary_invalid")

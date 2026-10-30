@@ -1423,9 +1423,9 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert "view_image" not in disabled
     from meta_research.research_guidance import shared_research_guidance
     assert shared_research_guidance() in primary_prompt
-    assert "## IdeaStageInvocation" in primary_prompt
-    assert "## Accepted handoff" in primary_prompt
-    assert "一个 submission identity" in primary_prompt
+    assert primary_prompt.startswith("cycle_position=")
+    assert "accepted_question=" in primary_prompt
+    assert "context_pack_hash=" + request.context_pack_hash in primary_prompt
     assert "不得创建 Question、Plan、Run、receipt" in primary_prompt
     assert set(primary_schema["properties"]) == {"outcome"}
     assert "anyOf" in primary_schema["properties"]["outcome"]
