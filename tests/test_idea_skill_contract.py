@@ -37,6 +37,7 @@ from meta_research.semantic_owner_gateway import (
 )
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+    ProviderSupervisorError,
     read_transport_envelope,
     write_transport_envelope,
 )
@@ -2223,6 +2224,46 @@ def test_durable_provider_seal_binds_exact_invocation_inputs(
     ):
         restarted.generate_draft(request)
     assert forbidden_replay.calls == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_terminal_contract_checkpoint_maps_invalid_existing_transport_key_without_replay(
+    tmp_path: Path, damage: str,
+) -> None:
+    workspace = tmp_path / ("terminal-key-" + damage)
+    runner = _SequenceRunner([{"outcome": _idea_set()}])
+    adapter = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    request = _request(runtime_binding=adapter.runtime_binding(), job_ref="existing-signed-operation")
+    draft = adapter.generate_draft(request)
+    checkpoint_arguments = {
+        "job_ref": request.job_ref, "operation_name": "primary",
+        "native_session_ref": draft.primary_session_ref,
+        "failure_code": "idea_primary_result_contract_invalid",
+        "detail_code": "codex_outcome_invalid",
+    }
+    # Prove this actual signed operation is readable before damaging its key.
+    checkpoint = adapter.terminal_contract_failure_checkpoint(**checkpoint_arguments)
+    assert checkpoint["schema_ref"] == "meta-research/provider-terminal-contract-failure/v1"
+    key_path, _key = adapter._transport_key()
+    if damage == "missing":
+        key_path.unlink()
+        damaged_key = None
+    else:
+        damaged_key = b"invalid-key-length"
+        key_path.write_bytes(damaged_key)
+    operation = next(workspace.glob("provider-operations/*/primary"))
+    original = {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()}
+
+    with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_spool_invalid$") as refused:
+        adapter.terminal_contract_failure_checkpoint(**checkpoint_arguments)
+
+    assert isinstance(refused.value.__cause__, ProviderSupervisorError)
+    assert str(refused.value.__cause__) == (
+        "provider_transport_key_unavailable" if damage == "missing" else "provider_transport_key_invalid"
+    )
+    assert (key_path.read_bytes() if key_path.exists() else None) == damaged_key
+    assert {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()} == original
+    assert len(runner.calls) == 1
 
 
 def test_supervisor_recovers_a_child_result_after_daemon_response_loss(

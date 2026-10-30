@@ -105,13 +105,88 @@ def test_accepted_graph_continues_same_native_after_public_provider_correction(t
         assert current.native_session_ref == old.native_session_ref
         assert rg.query_target_graph(old.request_ref) == graph
         assert provider.primary_calls == 1
+        original_decisions = ar.query_bundle_dispatch_decisions(old.run_ref)
+        prior_decisions = {decision.decision_ref for decision in original_decisions}
+        for _ in range(12):
+            runtime.bundle_stage.process_once()
+            new_decisions = [decision for decision in ar.query_bundle_dispatch_decisions(old.run_ref)
+                if decision.decision_ref not in prior_decisions and decision.attempt_ref == current.attempt_ref]
+            if new_decisions:
+                break
+        assert new_decisions
+        assert new_decisions[-1].fence_ref == current.fence_ref
+        assert new_decisions[-1].native_session_ref == old.native_session_ref
+        assert new_decisions[-1].graph_ref == graph.graph_ref
+        assert new_decisions[-1].generation > max(decision.generation for decision in original_decisions)
+        assert rg.query_target_graph(old.request_ref) == graph
         with runtime._database.read() as connection:
             assert connection.execute(text("SELECT COUNT(*) FROM rg_target_graphs")).scalar_one() == 1
             assert connection.execute(text("SELECT COUNT(*) FROM rg_targets")).scalar_one() == 1
+            assert connection.execute(text("SELECT status FROM ar_stage_attempts WHERE attempt_ref=:ref"),
+                {"ref": current.attempt_ref}).scalar_one() == "executed"
+            assert connection.execute(text("SELECT status FROM ar_execution_fences WHERE fence_ref=:ref"),
+                {"ref": current.fence_ref}).scalar_one() == "submitted"
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_safe_points WHERE attempt_ref=:ref "
+                "AND json_extract(checkpoint_json,'$.action')='native_session_replacement_bound'"),
+                {"ref": current.attempt_ref}).scalar_one() == 0
         with pytest.raises(OwnerConflict):
             ar.verify_root_agent_runtime_scope(root_kind="bundle", run_ref=old.run_ref,
                 attempt_ref=old.attempt_ref, root_session_ref=old.root_session_ref,
                 fence_ref=old.fence_ref, runtime_binding_hash=old.runtime_binding_hash)
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("damage", ["missing-proof", "foreign-root"])
+def test_historical_execution_uses_only_the_same_root_native_replacement_proof(tmp_path, damage):
+    from meta_research.owners.common import canonical_json
+    runtime = _current_bundle_runtime(tmp_path / "historical-replacement")
+    try:
+        graph, _target, old, _decision, _launch = _ready_launch(runtime)
+        ar = runtime.owners.agent_runtime
+        invocation = old.review_invocation
+        unit_ref = "bundle-historical-native-missing-unit"
+        ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=invocation.operation_ref,
+            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
+        proof = {"schema_ref": "meta-research/provider-native-session-unavailable/v1",
+            "termination_reason": "completed", "result_file_hash": None,
+            **{name: canonical_hash({"verified": name}) for name in (
+                "invocation_hash", "prompt_hash", "output_schema_hash", "stdout_hash", "supervisor_receipt_hash")},
+            "native_session_ref": old.native_session_ref, "error_code": -32600,
+            "error_response_hash": canonical_hash({"code": -32600,
+                "message": "no rollout found for thread id " + old.native_session_ref})}
+        ar.record_stage_provider_hard_ceiling(unit_ref=unit_ref, run_ref=old.run_ref,
+            attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
+            failure_code="codex_native_session_unavailable", provider_exit=proof)
+        current = ar.query_bundle_stage_run(old.request_ref)
+        basis = ar.query_stage_native_replacement_context(run_ref=current.run_ref,
+            attempt_ref=current.attempt_ref, fence_ref=current.fence_ref)
+        original_execution = ar.query_bundle_attempt_execution(old.execution.submission_ref)
+        assert original_execution.native_session_ref == old.native_session_ref
+        checkpoint = {"schema_ref": "meta-research/runtime-safe-point/v1", "action": "pause",
+            "run_ref": old.run_ref, "root_session_ref": old.root_session_ref,
+            "attempt_ref": old.attempt_ref, "fence_ref": old.fence_ref}
+        with runtime._database.write() as connection:
+            connection.execute(text("INSERT INTO ar_safe_points (safe_point_ref,operation_ref,run_ref,attempt_ref,"
+                "root_session_ref,fence_ref,checkpoint_json,checkpoint_hash,created_at) VALUES "
+                "(:ref,:operation,:run,:attempt,:root,:fence,:checkpoint,:hash,:created)"),
+                {"ref": "safe-point:historical-later-pause", "operation": "operation:historical-later-pause",
+                    "run": old.run_ref, "attempt": old.attempt_ref, "root": old.root_session_ref,
+                    "fence": old.fence_ref, "checkpoint": canonical_json(checkpoint),
+                    "hash": canonical_hash(checkpoint), "created": 9999999999.0})
+        assert ar.query_bundle_attempt_execution(old.execution.submission_ref) == original_execution
+        assert runtime.owners.research_graph.query_target_graph(old.request_ref) == graph
+        with runtime._database.write() as connection:
+            if damage == "missing-proof":
+                connection.execute(text("DELETE FROM ar_safe_points WHERE safe_point_ref=:ref"),
+                    {"ref": basis["safe_point_ref"]})
+            else:
+                other_root = connection.execute(text("SELECT root_session_ref FROM ar_stage_runs "
+                    "WHERE stage='plan' LIMIT 1")).scalar_one()
+                connection.execute(text("UPDATE ar_safe_points SET root_session_ref=:root WHERE safe_point_ref=:ref"),
+                    {"root": other_root, "ref": basis["safe_point_ref"]})
+        with pytest.raises(OwnerConflict, match="native_session_replacement_context_invalid"):
+            ar.query_bundle_attempt_execution(old.execution.submission_ref)
     finally:
         runtime.close()
 

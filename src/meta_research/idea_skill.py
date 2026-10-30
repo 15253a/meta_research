@@ -1803,7 +1803,14 @@ class CodexIdeaSkillAdapter:
             "交回最终完整候选；根承担最终判断，不提前返回草稿等待系统再次启动审阅。"
             "你是 Idea 主 Agent。只返回 {\"outcome\": ...}，其中 outcome 是一个完整 "
             "IdeaSet 或 NoViableCandidate。"
-            "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。v4 的证据引用页只是发现目录；可用 stage_context.read 的 evidence_index 继续读后页，在既有 evidence_boundary 中引用实际使用的精确 asset version refs（合计最多100），RG 将独立核验同 Quest 角色与内容来源。"
+            "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。ContextPack v4 不预装证据首页；"
+            "需要发现证据时，调用 research_memory.stage_context.read（source=\"evidence_index\"，"
+            "context_pack_ref=本次冻结引用，path=[]，index_offset=0，offset=0，limit=8192）。"
+            "先沿返回的 next_offset 读完当前目录页的 JSON 字节流，再将 index_page.next_offset 用作 index_offset、"
+            "重置 offset=0 继续后页；index_page.next_offset=null 才表示目录结束。目录只作发现，"
+            "正文沿 research_memory.content.read 以该精确版本同时作为 source_ref 与 version_ref 读取。"
+            "在既有 evidence_boundary 中引用实际使用的精确 asset version refs（合计最多100），"
+            "RG 将独立核验同 Quest 角色与内容来源。"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
@@ -3233,7 +3240,7 @@ def _verified_operation_inputs(
                 raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     except IdeaSkillUnavailable:
         raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProviderSupervisorError) as error:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
     if (
         not isinstance(envelope, dict)

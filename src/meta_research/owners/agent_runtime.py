@@ -27895,18 +27895,33 @@ def _historical_stage_execution_row(connection, row):
     if row is None:
         return row
     missing = connection.execute(text(
-        "SELECT s.checkpoint_json,s.checkpoint_hash FROM ar_stage_attempt_replacements x "
-        "JOIN ar_stage_attempts a ON a.attempt_ref=x.retired_attempt_ref "
-        "JOIN ar_safe_points s ON s.run_ref=x.run_ref AND s.attempt_ref=x.retired_attempt_ref "
+        "SELECT s.checkpoint_json,s.checkpoint_hash,a.attempt_ref AS retired_attempt_ref,"
+        "a.fence_ref AS retired_fence_ref FROM ar_stage_attempt_replacements x "
+        "JOIN ar_stage_attempts a ON a.attempt_ref=x.retired_attempt_ref AND a.run_ref=x.run_ref "
+        "LEFT JOIN ar_safe_points s ON s.run_ref=x.run_ref AND s.attempt_ref=x.retired_attempt_ref "
+        "AND s.root_session_ref=a.root_session_ref AND s.fence_ref=a.fence_ref "
+        "AND CASE WHEN json_valid(s.checkpoint_json) THEN "
+        "json_extract(s.checkpoint_json,'$.action') END='native_session_replacement' "
         "WHERE x.run_ref=:run AND x.reason_code='native_session_unavailable' "
+        "AND a.root_session_ref=:root "
         "AND a.generation>=:generation ORDER BY a.generation,s.created_at DESC LIMIT 1"
-    ), {"run": row.run_ref, "generation": row.generation}).first()
+    ), {"run": row.run_ref, "root": row.root_session_ref, "generation": row.generation}).first()
     if missing is None:
         return row
-    checkpoint = decoded_object(missing.checkpoint_json)
-    if (canonical_hash(checkpoint) != missing.checkpoint_hash
+    if missing.checkpoint_json is None:
+        raise OwnerConflict("native_session_replacement_context_invalid")
+    try:
+        checkpoint = decoded_object(missing.checkpoint_json)
+        valid_hash = canonical_hash(checkpoint) == missing.checkpoint_hash
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("native_session_replacement_context_invalid") from error
+    if (not valid_hash
             or checkpoint.get("action") != "native_session_replacement"
-            or checkpoint.get("run_ref") != row.run_ref):
+            or checkpoint.get("run_ref") != row.run_ref
+            or checkpoint.get("root_session_ref") != row.root_session_ref
+            or checkpoint.get("attempt_ref") != missing.retired_attempt_ref
+            or checkpoint.get("fence_ref") != missing.retired_fence_ref
+            or not isinstance(checkpoint.get("provider_exit"), dict)):
         raise OwnerConflict("native_session_replacement_context_invalid")
     native = checkpoint["provider_exit"].get("native_session_ref")
     if not isinstance(native, str) or not native:
