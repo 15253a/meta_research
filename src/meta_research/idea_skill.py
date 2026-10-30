@@ -2274,7 +2274,14 @@ class CodexIdeaSkillAdapter:
                 )
                 _key_path, key = self._transport_key()
                 previous = _read_sealed_operation_invocation(invocation_path, key=key)
-                if previous.get("prompt_hash") != canonical_hash(persisted_prompt):
+                prompt_hash = previous.get("prompt_hash")
+                if (
+                    not isinstance(prompt_hash, str)
+                    or len(prompt_hash) != 64
+                    or any(character not in "0123456789abcdef" for character in prompt_hash)
+                ):
+                    raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+                if prompt_hash != canonical_hash(persisted_prompt):
                     raise IdeaSkillUnavailable("codex_operation_spool_invalid")
                 _conditions, original_prompt = split_runtime_prompt(persisted_prompt)
             except (OSError, UnicodeDecodeError, ValueError, ProviderSupervisorError) as error:
@@ -2896,15 +2903,11 @@ def _read_sealed_operation_invocation(
     ).hexdigest()
     transport_mode = typed_invocation.get("transport_mode")
     _operation_transport_limits(typed_invocation)
-    prompt_hash = typed_invocation.get("prompt_hash")
     if (
         set(envelope) != {"payload", "seal"}
         or not hmac.compare_digest(seal, expected_seal)
         or typed_invocation.get("schema_ref") != _CODEX_PROVIDER_OPERATION_SCHEMA
         or transport_mode not in {"durable_supervisor", "unreconciled_runner"}
-        or not isinstance(prompt_hash, str)
-        or len(prompt_hash) != 64
-        or any(character not in "0123456789abcdef" for character in prompt_hash)
     ):
         raise IdeaSkillUnavailable("codex_operation_identity_conflict")
     return typed_invocation
