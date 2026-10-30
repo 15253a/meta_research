@@ -26,14 +26,18 @@ NOTE = "现场备注：访谈样本存在缺口；下一轮先核实档案。\n�
 LATE_NOTE = "实施后备注：新发现缺失访谈记录；保留不一致案例，后续补充证据。"
 
 
-def _context_preview(prompt, context_hash):
+def _context_sections(prompt, context_hash, *, complete_sections):
     lines = [line for line in prompt.splitlines() if line.startswith("provider_context_view=")]
     assert len(lines) == 1
-    preview = json.loads(lines[0].split("=", 1)[1])
-    assert preview["summary_only"] is True
-    assert preview["source_context_pack_hash"] == context_hash
-    assert preview["reader"]["operation"] == "research_memory.stage_context.read"
-    return preview["sections"]
+    view = json.loads(lines[0].split("=", 1)[1])
+    assert "summary_only" not in view
+    assert set(view["section_delivery"]) == set(view["sections"])
+    assert set(view["section_delivery"].values()) <= {"complete", "preview", "omitted"}
+    for section in complete_sections:
+        assert view["section_delivery"][section] == "complete"
+    assert view["source_context_pack_hash"] == context_hash
+    assert view["reader"]["operation"] == "research_memory.stage_context.read"
+    return view["sections"]
 
 
 def _preview_rows(value):
@@ -130,8 +134,9 @@ def _reasoning_prompt(tmp_path, notes):
     draft = adapter.generate_draft(request)
     result = adapter.review_draft(replace(request, native_session_ref=draft.primary_session_ref), draft)
     assert result.scientific_outcome["notes"] == NOTE
-    preview = _context_preview(runner.calls[0][1], request.context_pack_hash)
-    assert _preview_rows(preview["upstream_stage_closure"])[-1]["closure"] == notes
+    sections = _context_sections(runner.calls[0][1], request.context_pack_hash,
+        complete_sections=("upstream_stage_closure",))
+    assert _preview_rows(sections["upstream_stage_closure"])[-1]["closure"] == notes
     return runner.calls[0][1]
 
 
@@ -162,8 +167,9 @@ def test_accepted_reasoning_notes_reach_next_idea_provider(tmp_path, monkeypatch
         context["prior_accepted_bindings"] = [{"closure": closure, "outcome_ref": accepted.outcome_ref}]
         request = idea_fixtures._request(runtime_binding=adapter.runtime_binding(), context_pack=context, context_pack_hash=canonical_hash(context))
         adapter.execute(request)
-        preview = _context_preview(runner.calls[0][1], request.context_pack_hash)
-        prior = _preview_rows(preview["prior_accepted_bindings"])[0]
+        sections = _context_sections(runner.calls[0][1], request.context_pack_hash,
+            complete_sections=("prior_accepted_bindings",))
+        prior = _preview_rows(sections["prior_accepted_bindings"])[0]
         assert prior["outcome_ref"] == accepted.outcome_ref
         assert prior["closure"]["notes"] == NOTE
     finally:
@@ -303,7 +309,8 @@ def test_late_notes_survive_real_stage_commit_and_reasoning_request(tmp_path, mo
         # Observe delivery at the real provider boundary; this synthetic provider
         # draft is not submitted to any Owner.
         adapter.generate_draft(request)
-        _context_preview(runner.calls[0][1], request.context_pack_hash)
+        _context_sections(runner.calls[0][1], request.context_pack_hash,
+            complete_sections=("upstream_stage_closure",))
         assert LATE_NOTE in runner.calls[0][1]
     finally:
         fixture.close()
