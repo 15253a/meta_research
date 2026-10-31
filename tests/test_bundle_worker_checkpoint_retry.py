@@ -22,7 +22,7 @@ def _worker_at_inbox_boundary(monkeypatch, drain, execute):
     )
     run = SimpleNamespace(
         run_ref="run:test", status="running", execution=None, primary_draft=None,
-        native_session_ref=None,
+        native_session_ref=None, completion=None,
     )
     worker = BundleStageWorker(
         feed=None,
