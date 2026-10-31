@@ -17,7 +17,7 @@ from meta_research.composition import build_production_runtime
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.plan_skill import _with_derived_answer_contract_hash
-from meta_research.target_commit_evidence import evidence_catalog_page_metadata
+from meta_research.target_commit_evidence import evidence_catalog_page_metadata, target_adoption_binding
 
 from test_harness_full_conformance import _FullConformanceAdapter, _full_request
 from test_public_bundle_stage import _DeterministicBundleSkill, _install_fixture_plan_evidence
@@ -68,7 +68,7 @@ class _LaterPageAuthority(_EvidenceReuseAuthority):
         if (
             expected_reference_revision != len(evidence_catalog)
             or len(refs) != len(evidence_catalog)
-            or any(known.get(str(item['evidence_ref'])) != item for item in evidence_catalog)
+            or any(known.get(str(item['evidence_ref'])) != item['source_binding'] for item in evidence_catalog)
             or selected_evidence_refs is not None and not selected_evidence_refs.issubset(refs)
         ):
             raise OwnerConflict('fixture_evidence_catalog_invalid')
@@ -88,7 +88,7 @@ class _LaterPagePlanSkill(_DeterministicPlanSkill):
     def _document(self, request):
         assert request.context_pack['evidence_catalog'] == []
         assert request.context_pack['evidence_reference_revision'] == 0
-        assert request.context_pack['evidence_catalog_page']['next_offset'] == 1
+        assert 'evidence_catalog_page' not in request.context_pack
         assert self.page_reader is not None
         page, catalog = self.page_reader(
             quest_ref=request.context_pack['accepted_question_binding']['quest_ref'],
@@ -98,12 +98,12 @@ class _LaterPagePlanSkill(_DeterministicPlanSkill):
         assert len(catalog) == 1
         # Reuse only the fixture's document construction; the actual request
         # and every source binding remain the original empty-catalog closure.
-        construction_context = {**request.context_pack, 'evidence_catalog': list(catalog)}
-        document = super()._document(replace(request, context_pack=construction_context))
-        document['additional_evidence_bindings'] = deepcopy(list(catalog))
+        self.selected_evidence_bindings = [target_adoption_binding(item) for item in catalog]
+        document = super()._document(request)
+        document['selected_evidence_bindings'] = deepcopy(self.selected_evidence_bindings)
         document = _with_derived_answer_contract_hash(document, request)
-        assert 'additional_evidence_bindings' not in document
-        assert document['source_bindings']['selected_evidence_catalog'] == list(catalog)
+        assert 'selected_evidence_bindings' not in document
+        assert document['source_bindings']['selected_evidence_bindings'] == self.selected_evidence_bindings
         assert document['source_bindings']['context_pack_hash'] == request.context_pack_hash
         return document
 
@@ -152,8 +152,8 @@ def test_later_page_evidence_survives_formal_plan_memory_history_and_reasoning(t
         bundle_request = runtime.owners.advancement_engine.query_bundle_stage_request(str(quest['cycle_ref']))
         assert bundle_request is not None and bundle_request.accepted_formal_plan is not None
         accepted = bundle_request.accepted_formal_plan
-        selected = accepted.plan_document['source_bindings']['selected_evidence_catalog']
-        assert selected == list(authority.catalog)
+        selected = accepted.plan_document['source_bindings']['selected_evidence_bindings']
+        assert [entry['source_binding'] for entry in selected] == list(authority.catalog)
         assert accepted.plan_document['source_bindings']['evidence_reference_revision'] == 0
         assert plan.requests[0].context_pack['evidence_catalog'] == []
         assert plan.requests[0].context_pack_hash == canonical_hash(plan.requests[0].context_pack)
@@ -164,14 +164,14 @@ def test_later_page_evidence_survives_formal_plan_memory_history_and_reasoning(t
         memory = runtime.owners.research_memory.query_plan_document(submission_ref)
         assert memory is not None
         assert memory.plan_document == accepted.plan_document
-        assert memory.plan_document['source_bindings']['selected_evidence_catalog'] == selected
+        assert memory.plan_document['source_bindings']['selected_evidence_bindings'] == selected
 
         leaves = runtime.owners.research_graph.resolve_plan_evidence_reuse_leaves(
             quest_ref=str(quest['quest_ref']), accepted_formal_plan=accepted,
         )
         assert leaves and {leaf.evidence_ref for leaf in leaves} == {selected[0]['evidence_ref']}
         forged = deepcopy(accepted.plan_document)
-        forged['source_bindings']['selected_evidence_catalog'][0]['content_hash'] = '0' * 64
+        forged['source_bindings']['selected_evidence_bindings'][0]['source_binding']['content_hash'] = '0' * 64
         with pytest.raises(OwnerConflict, match='bundle_formal_plan_binding_invalid'):
             runtime.owners.research_graph.resolve_plan_evidence_reuse_leaves(
                 quest_ref=str(quest['quest_ref']), accepted_formal_plan=replace(accepted, plan_document=forged),

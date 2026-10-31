@@ -2695,107 +2695,52 @@ class SQLiteTargetRunGraphAuthority:
             or authority.target_spec_hash != row.spec_hash
             or authority.accepted_formal_plan_binding_hash != canonical_hash(binding.as_dict())):
             raise OwnerConflict("target_input_reference_scope_invalid")
-        leaves = self._domain_reader.resolve_plan_evidence_reuse_leaves(
-            quest_ref=row.quest_ref, accepted_formal_plan=binding
-        )
-        commit_leaves = [leaf for leaf in leaves if leaf.role in {"MetricResult", "WorkProduct"}]
-        asset_leaves = [leaf for leaf in leaves if leaf.role == "AssetVersion"]
-        if not commit_leaves and not asset_leaves:
-            return self._resolve_remaining_quest_inputs(refs, resolved, quest_ref=row.quest_ref)
-        with self._database.read() as connection:
-            plan = connection.execute(text(
-                "SELECT r.context_pack_json, r.context_pack_hash FROM "
-                "rg_formal_plan_decisions d JOIN ae_stage_run_requests r ON "
-                "r.request_ref = d.request_ref AND r.context_pack_ref = d.context_pack_ref "
-                "WHERE d.formal_plan_ref = :formal_plan_ref AND d.decision = 'accepted'"
-            ), {"formal_plan_ref": binding.formal_plan_ref}).first()
-        try:
-            plan_context = json.loads(plan.context_pack_json)
-            from meta_research.plan_contract import selected_plan_evidence_catalog
-            catalog = selected_plan_evidence_catalog(binding.plan_document, plan_context["evidence_catalog"])
-            if (canonical_hash(plan_context) != plan.context_pack_hash
-                or canonical_json(plan_context) != plan.context_pack_json
-                or not isinstance(catalog, list)):
-                raise ValueError("Plan catalog")
-        except (AttributeError, KeyError, TypeError, ValueError) as error:
-            raise OwnerConflict("target_input_evidence_catalog_invalid") from error
+        # Consume the complete accepted adoption history, including Brief-only
+        # materials. EvidenceUse explains scientific support; it is not the
+        # execution-input allowlist and need not be recreated for reuse.
+        catalog = binding.plan_document["source_bindings"]["selected_evidence_bindings"]
         selected_assets = {item.asset.asset_ref: item.asset for item in resolved.values()}
         selected_commits: set[str] = set()
-        for leaf in asset_leaves:
-            matches = [entry for entry in catalog if isinstance(entry, dict)
-                and entry.get("evidence_ref") == leaf.evidence_ref]
-            if len(matches) != 1:
-                raise OwnerConflict("target_input_evidence_catalog_invalid")
-            entry = matches[0]
-            if (canonical_hash(entry) != leaf.evidence_catalog_entry_hash
-                or entry.get("schema_ref") != "meta-research/evidence-source-ref/v1"
-                or entry.get("source_kind") != "AssetVersion"
-                or entry.get("source_ref") != leaf.asset_version_ref
-                or leaf.evidence_item_ref != leaf.asset_version_ref):
-                raise OwnerConflict("target_input_evidence_catalog_invalid")
-            # The accepted Plan fixes the version. Recheck its existing Quest
-            # origin before the normal Target input proof path writes any role.
-            asset = self._domain_reader.verify_asset_quest_scope(
-                leaf.asset_version_ref, quest_ref=row.quest_ref
-            )
-            source = leaf.source_binding
-            if (asset.version_ref != leaf.asset_version_ref
-                or asset.asset_ref != leaf.source_subject_ref
-                or not isinstance(source, dict)
-                or source.get("kind") != "AssetVersion"
-                or source.get("ref") != asset.version_ref
-                or source.get("source_subject_ref") != asset.asset_ref
-                or source.get("owner_acceptance_receipt_ref") != asset.receipt.receipt_ref):
-                raise OwnerConflict("target_input_evidence_catalog_invalid")
-            relevant_refs = tuple(ref for ref in (leaf.evidence_ref, asset.asset_ref, asset.version_ref)
-                if ref in unresolved)
+        for adopted in catalog:
+            kind = adopted["source_kind"]
+            entry = adopted["source_binding"]
+            if kind == "AssetVersion":
+                relevant_refs = tuple(ref for ref in (adopted["evidence_ref"], entry["asset_ref"], entry["version_ref"])
+                                      if ref in unresolved)
+                if not relevant_refs:
+                    continue
+                asset = self._domain_reader.verify_asset_quest_scope(adopted["source_ref"], quest_ref=row.quest_ref)
+                if asset.as_dict() != entry:
+                    raise OwnerConflict("target_input_evidence_catalog_invalid")
+                role = None
+            elif kind == "TargetCommit":
+                commit_ref = entry["target_commit_root_ref"]
+                selected_commits.add(commit_ref)
+                relevant_refs = tuple(ref for ref in (adopted["evidence_ref"], entry["asset_ref"], entry["asset_version_ref"])
+                                      if ref in unresolved)
+                if not relevant_refs:
+                    continue
+                roles = self._domain_reader.query_asset_roles(quest_ref=row.quest_ref,
+                                                              version_refs=(entry["asset_version_ref"],))
+                matches = [role for role in roles if role.role_ref == entry["role_ref"]]
+                asset = AcceptedAssetBinding(asset_ref=entry["asset_ref"], version_ref=entry["asset_version_ref"],
+                    content_hash=entry["content_hash"], manifest_hash=entry["manifest_hash"],
+                    receipt=acceptance_receipt_from_public(entry["asset_receipt"]))
+                if (len(matches) != 1 or matches[0].asset_binding() != asset
+                        or matches[0].receipt != acceptance_receipt_from_public(entry["role_receipt"])):
+                    raise OwnerConflict("target_input_evidence_role_invalid")
+                role = matches[0]
+                if commit_sources is not None:
+                    selected = commit_sources.setdefault(commit_ref, [])
+                    selected.extend(ref for ref in relevant_refs if ref not in selected)
+            else:
+                continue
             if not relevant_refs:
                 continue
             previous_asset = selected_assets.get(asset.asset_ref)
             if previous_asset is not None and previous_asset != asset:
                 raise OwnerConflict("target_input_evidence_version_conflict")
             selected_assets[asset.asset_ref] = asset
-            for ref in relevant_refs:
-                previous = resolved.get(ref)
-                if previous is not None and previous.asset != asset:
-                    raise OwnerConflict("target_input_evidence_version_conflict")
-                resolved[ref] = _SelectedTargetInput(asset, row.quest_ref)
-        for leaf in commit_leaves:
-            matches = [entry for entry in catalog if isinstance(entry, dict)
-                and entry.get("evidence_ref") == leaf.evidence_ref]
-            if len(matches) != 1:
-                raise OwnerConflict("target_input_evidence_catalog_invalid")
-            entry = matches[0]
-            if (canonical_hash(entry) != leaf.evidence_catalog_entry_hash
-                or entry.get("target_commit_root_ref") != leaf.target_commit_ref):
-                raise OwnerConflict("target_input_evidence_catalog_invalid")
-            selected_commits.add(leaf.target_commit_ref)
-            relevant_refs = tuple(ref for ref in (leaf.evidence_ref, entry.get("asset_ref"), entry.get("asset_version_ref"))
-                if ref in unresolved)
-            if not relevant_refs:
-                continue
-            roles = self._domain_reader.query_asset_roles(
-                quest_ref=row.quest_ref, version_refs=(entry["asset_version_ref"],)
-            )
-            matching_roles = [role for role in roles if role.role_ref == entry["role_ref"]]
-            if len(matching_roles) != 1:
-                raise OwnerConflict("target_input_evidence_role_invalid")
-            role = matching_roles[0]
-            asset = AcceptedAssetBinding(
-                asset_ref=entry["asset_ref"], version_ref=entry["asset_version_ref"],
-                content_hash=entry["content_hash"], manifest_hash=entry["manifest_hash"],
-                receipt=acceptance_receipt_from_public(entry["asset_receipt"]),
-            )
-            if (role.asset_binding() != asset or role.quest_ref != row.quest_ref
-                or role.receipt != acceptance_receipt_from_public(entry["role_receipt"])):
-                raise OwnerConflict("target_input_evidence_role_invalid")
-            previous_asset = selected_assets.get(asset.asset_ref)
-            if previous_asset is not None and previous_asset != asset:
-                raise OwnerConflict("target_input_evidence_version_conflict")
-            selected_assets[asset.asset_ref] = asset
-            if commit_sources is not None:
-                selected = commit_sources.setdefault(leaf.target_commit_ref, [])
-                selected.extend(ref for ref in relevant_refs if ref not in selected)
             for ref in relevant_refs:
                 previous = resolved.get(ref)
                 if previous is not None and previous.asset != asset:

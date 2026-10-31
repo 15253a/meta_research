@@ -1459,9 +1459,11 @@ def _plan_briefs(
     if not gaps or type(briefs_value) is not list or not briefs_value:
         raise BundleTargetContractError("completion_contract_plan_has_no_work")
     result: dict[str, dict[str, object]] = {}
-    covered: set[str] = set()
     for value in briefs_value:
-        brief = _exact_dict(value, set(_PLAN_BRIEF_FIELDS), "plan_brief_invalid")
+        fields = set(_PLAN_BRIEF_FIELDS)
+        if isinstance(value, dict) and "reuse_material_refs" in value:
+            fields.add("reuse_material_refs")
+        brief = _exact_dict(value, fields, "plan_brief_invalid")
         key = _ref(brief["experiment_key"], "ExperimentKey")
         if key in result:
             raise BundleTargetContractError("plan_brief_duplicate")
@@ -1475,10 +1477,9 @@ def _plan_briefs(
             "contributing idea refs",
             allow_empty=True,
         )
+        if "reuse_material_refs" in brief:
+            _string_list(brief["reuse_material_refs"], "reuse material refs", allow_empty=True)
         result[key] = brief
-        covered.update(brief_gaps)
-    if covered != gaps:
-        raise BundleTargetContractError("plan_brief_gap_set_incomplete")
     return plan_hash, result
 
 

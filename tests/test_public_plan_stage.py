@@ -210,7 +210,7 @@ class _DeterministicPlanSkill:
         }
         evidence_reuse_set: list[dict[str, object]] = []
         if self.no_gap:
-            evidence = request.context_pack["evidence_catalog"][0]
+            evidence = self.selected_evidence_bindings[0]
             evidence_reuse_set = [
                 {
                     "obligation_key": "rare-morphology-comparison",
@@ -278,6 +278,7 @@ class _DeterministicPlanSkill:
                 "evidence_reference_revision": request.context_pack[
                     "evidence_reference_revision"
                 ],
+                "selected_evidence_bindings": getattr(self, "selected_evidence_bindings", []),
             },
         }
 

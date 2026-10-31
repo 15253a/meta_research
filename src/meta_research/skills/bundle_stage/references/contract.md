@@ -2,9 +2,9 @@
 
 ## 调用闭包与阶段范围
 
-`BundleStageRunRequest` 冻结 stage request、Cycle、epoch、Bundle Run、根 Fence、ContextPack ref／hash、已接纳 FormalPlan ref／内容 hash／receipt、EvidenceReuseSet、GapSet、全部 gap Brief，以及 Quest 授权、Harness 和资源边界。消费 current FormalPlan 的精确内容，稳定 ref 本身不替代绑定；草稿或漂移的 latest 不能启用 Target。
+`BundleStageRunRequest` 冻结 stage request、Cycle、epoch、Bundle Run、根 Fence、ContextPack ref／hash、已接纳 FormalPlan ref／内容 hash／receipt、EvidenceReuseSet、GapSet、实际 ExperimentBrief 和完整 `source_bindings.selected_evidence_bindings`，以及 Quest 授权、Harness 和资源边界。消费 current FormalPlan 的精确内容，稳定 ref 本身不替代绑定；草稿或漂移的 latest 不能启用 Target。
 
-没有 gap Brief 时由 AE 验证正式 Plan 及 receipts 并形成 `StageCommit(Skipped)`，不建立 Bundle Run 或 Target。冻结核心承诺的实质改变通过 `replan_required` 交给 Reasoning 与后继 Cycle。
+没有 ExperimentBrief 时由 AE 验证正式 Plan 及 receipts 并形成 `StageCommit(Skipped)`，不建立 Bundle Run 或 Target；gap 仍可非空，其 insufficiency 与完整 Plan 一起交 Reasoning。只按实际 Brief 派生 required cells，不能要求本轮为所有 gap 安排工作。冻结核心承诺的实质改变通过 `replan_required` 交给 Reasoning 与后继 Cycle。
 
 ## 策略、粒度与风险
 
@@ -44,7 +44,7 @@ Variant 保存具体配方；Protocol 保存评价规则和稳定划分／预处
 
 ## 历史输入与精确复用
 
-当前 FormalPlan 的已选证据给出来源 TargetCommit 及资产索引。按新 Target 实际用途读取数据、划分、预测、实现和协议；结果或 notes 的阅读不等于输入绑定。将所需 Evidence、精确 AssetVersion 或由该 Commit 冻结版本的 Asset 放入 `direct_accepted_input_asset_refs`，由系统验证来源及解析配套内容。
+当前 FormalPlan 的完整采用集合给出 TargetCommit、HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 的准确来源与 reader，包含仅供 Brief.reuse_material_refs 使用的材料；EvidenceReuseSet 只表达 CoverageDecision 的 EvidenceUse。按新 Target 实际用途读取数据、划分、预测、实现和协议，保留来源和使用限制；结果或 notes 的阅读不等于输入绑定。将所需 Evidence、精确 AssetVersion 或由该 Commit 冻结版本的 Asset 放入 `direct_accepted_input_asset_refs`，由系统验证来源及解析配套内容。
 
 资产索引不是整包照搬要求，Baseline／实现验证也不能证明历史数据已准入。缺必需输入时指出具体来源和缺口。图内依赖只指本图 Target，历史输入沿正式资产路径继承；新图 cells 只表本轮承诺，不说明全库是否有旧结果。
 

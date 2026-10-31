@@ -16,15 +16,17 @@ class _AssetGapPlan(fixtures._DeterministicPlanSkill):
 
     def _document(self, request):
         document = super()._document(request)
-        entry = {"schema_ref": "meta-research/evidence-source-ref/v1",
-            "evidence_ref": self.source_ref, "source_kind": "AssetVersion", "source_ref": self.source_ref}
+        binding = self.runtime.owners.research_memory.query_asset_version(self.source_ref).as_binding()
+        entry = {"evidence_ref": self.source_ref, "source_kind": "AssetVersion", "source_ref": self.source_ref,
+            "source_binding": binding.as_dict(), "reader": {"operation": "research_memory.content.read",
+            "args": {"source_ref": self.source_ref, "version_ref": self.source_ref}}}
         use = {"obligation_key": document["gap_set"][0], "evidence_ref": self.source_ref,
             "supported_claim": "The supplied material fixes the observed input for a new comparison.",
             "support_boundary": "Input observation only; comparative performance remains an open gap.",
             "contributing_idea_refs": [request.accepted_idea_set["candidates"][0]["candidate_key"]]}
         document["coverage"][0]["evidence_uses"] = [use]
         document["evidence_reuse_set"] = [use]
-        document["additional_evidence_bindings"] = [entry]
+        document["source_bindings"]["selected_evidence_bindings"] = [entry]
         return _with_derived_answer_contract_hash(document, request)
 
 
@@ -49,6 +51,7 @@ def _runtime(path):
         idea_skill_provider=fixtures._DeterministicIdeaSkill(), plan_skill_provider=plan,
         bundle_skill_provider=bundle, harness_adapters=(fixtures._FullConformanceAdapter("codex"),),
         power_inhibitor=fixtures._TogglePowerInhibitor())
+    plan.runtime = runtime
     return runtime, plan, bundle
 
 
@@ -109,7 +112,7 @@ def test_gap_plan_selected_asset_version_prepares_real_target_proofs_without_dri
         role = _origin(runtime, selected, quest["quest_ref"], "selected-origin")
         plan.source_ref = bundle.source_ref = selected.version_ref
         target, accepted = _accepted_target(runtime, quest)
-        assert accepted.plan_document["source_bindings"]["selected_evidence_catalog"][0]["source_ref"] == selected.version_ref
+        assert accepted.plan_document["source_bindings"]["selected_evidence_bindings"][0]["source_ref"] == selected.version_ref
         assert target.spec["candidate"]["direct_accepted_input_asset_refs"] == [selected.version_ref]
         newer = _asset(runtime, "newer-same-asset", asset_ref=selected.asset_ref)
         _origin(runtime, newer, quest["quest_ref"], "newer-origin")

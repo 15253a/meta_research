@@ -284,7 +284,20 @@ def _plan_document() -> dict[str, object]:
             "context_pack_ref": "plan_context_1",
             "context_pack_hash": "6" * 64,
             "evidence_reference_revision": 1,
+            "selected_evidence_bindings": [_selected_binding(_EVIDENCE_REF)],
         },
+    }
+
+
+def _selected_binding(evidence):
+    return {
+        "evidence_ref": evidence["evidence_ref"], "source_kind": "TargetCommit",
+        "source_ref": evidence["target_commit_root_ref"],
+        "source_binding": deepcopy(evidence),
+        "reader": {"operation": "research_memory.content.read", "args": {
+            "source_ref": evidence["target_commit_root_ref"],
+            "version_ref": evidence["asset_version_ref"],
+        }},
     }
 
 
@@ -352,13 +365,9 @@ def test_plan_rejects_trace_roles_absent_from_the_selected_idea_relationships() 
         )
 
 
-@pytest.mark.parametrize("mutation", ("covered_has_brief", "gap_has_no_brief"))
-def test_only_gaps_have_experiment_briefs(mutation: str) -> None:
+def test_only_gaps_have_experiment_briefs() -> None:
     document = _plan_document()
-    if mutation == "covered_has_brief":
-        document["experiment_briefs"][0]["gap_obligation_keys"].append("effect")
-    else:
-        document["experiment_briefs"] = []
+    document["experiment_briefs"][0]["gap_obligation_keys"].append("effect")
 
     with pytest.raises(PlanContractError, match="plan_gap_brief_closure_invalid"):
         validate_plan_document(

@@ -285,7 +285,7 @@ const proposalFields: ReadonlyArray<{
     key: "answer_shape",
     label: "合格答案的形状",
     seedLabel: "合格答案的形状，可选",
-    placeholder: "什么类型的答案才算足够？不要写实验协议或指标。",
+    placeholder: "需要回答什么、形成何种结论并说明哪些边界？题意已有的真实阈值应保留，不用报告格式或实验步骤代替。",
     rows: 3,
   },
   {
@@ -307,7 +307,7 @@ const proposalFields: ReadonlyArray<{
     key: "requirements_constraints",
     label: "会改变问题含义的约束",
     seedLabel: "会改变问题含义的约束，可选",
-    placeholder: "只写会改变 Question 含义的要求；不要写实现方案。",
+    placeholder: "按需写会改变问题含义的真实要求、约束及来源；普通实现偏好不作为题意硬约束。可留空。",
     rows: 3,
   },
 ];

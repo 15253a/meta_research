@@ -2683,7 +2683,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         ):
             raise OwnerConflict("plan_content_invalid")
         bindings = plan_document.get("source_bindings", {})
-        selected = bindings.get("selected_evidence_catalog", [])
+        selected = bindings.get("selected_evidence_bindings", [])
         if not isinstance(selected, list) or not all(isinstance(item, dict) for item in selected):
             raise OwnerConflict("plan_selected_evidence_invalid")
         return selected
@@ -13047,21 +13047,13 @@ def _verify_idea_payload(
     return outcome, reviewed_draft, review
 
 
-def _selected_plan_evidence_refs(
-    plan_document: dict[str, object],
-) -> frozenset[str]:
-    reuse_set = plan_document.get("evidence_reuse_set")
-    if not isinstance(reuse_set, list):
-        raise OwnerConflict("plan_content_invalid")
-    refs: set[str] = set()
-    for use in reuse_set:
-        if not isinstance(use, dict):
-            raise OwnerConflict("plan_content_invalid")
-        evidence_ref = use.get("evidence_ref")
-        if not isinstance(evidence_ref, str) or not evidence_ref:
-            raise OwnerConflict("plan_content_invalid")
-        refs.add(evidence_ref)
-    return frozenset(refs)
+def _selected_plan_evidence_refs(plan_document: dict[str, object]) -> frozenset[str]:
+    bindings = plan_document.get("source_bindings", {})
+    selected = bindings.get("selected_evidence_bindings") if isinstance(bindings, dict) else None
+    if not isinstance(selected, list) or any(not isinstance(item, dict)
+            or not isinstance(item.get("evidence_ref"), str) or not item["evidence_ref"] for item in selected):
+        raise OwnerConflict("plan_selected_evidence_invalid")
+    return frozenset(item["evidence_ref"] for item in selected)
 
 
 def _verify_plan_document_projection(row, plan_document: dict[str, object]) -> None:

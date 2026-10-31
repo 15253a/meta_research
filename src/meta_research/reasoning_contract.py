@@ -249,6 +249,7 @@ def plan_evidence_reuse_leaves(
     evidence_refs: list[str] = []
     item_refs: list[str] = []
     roles_by_evidence_ref: dict[str, list[str]] = {}
+    adopted_by_ref: dict[str, dict[str, object]] | None = None
     for value in leaves:
         if not isinstance(value, dict):
             raise ReasoningContractError(
@@ -279,18 +280,33 @@ def plan_evidence_reuse_leaves(
             "reasoning_plan_evidence_closure_invalid",
         )
         if "source_binding" in value:
-            from meta_research.plan_contract import EVIDENCE_SOURCE_REF_SCHEMA, GENERIC_EVIDENCE_KINDS
+            from meta_research.plan_contract import (
+                GENERIC_EVIDENCE_KINDS, PlanContractError, selected_plan_evidence_catalog,
+            )
             source = value["source_binding"]
             if not isinstance(source, dict) or role not in GENERIC_EVIDENCE_KINDS:
                 raise ReasoningContractError("reasoning_plan_evidence_closure_invalid")
             _validated_closure_leaf(source)
-            compact = {"schema_ref": EVIDENCE_SOURCE_REF_SCHEMA, "evidence_ref": item_ref,
-                       "source_kind": role, "source_ref": item_ref}
+            if adopted_by_ref is None:
+                formal = cast(dict[str, object], plan_input["formal_plan_binding"])
+                plan_document = formal.get("plan_document")
+                if not isinstance(plan_document, dict):
+                    raise ReasoningContractError("reasoning_plan_evidence_closure_invalid")
+                try:
+                    adopted_by_ref = {
+                        str(item["evidence_ref"]): item
+                        for item in selected_plan_evidence_catalog(plan_document, [])
+                    }
+                except PlanContractError as error:
+                    raise ReasoningContractError("reasoning_plan_evidence_closure_invalid") from error
+            selected = adopted_by_ref.get(evidence_ref)
             if (source.get("kind") != role or source.get("ref") != item_ref or evidence_ref != item_ref
                     or value.get("source_subject_kind") != role
                     or value.get("source_subject_ref") != source.get("source_subject_ref", item_ref)
                     or value.get("asset_version_ref") != (item_ref if role == "AssetVersion" else None)
-                    or value.get("evidence_catalog_entry_hash") != canonical_hash(compact)
+                    or selected is None or selected.get("source_kind") != role
+                    or selected.get("source_ref") != item_ref
+                    or value.get("evidence_catalog_entry_hash") != canonical_hash(selected)
                     or value.get("evidence_use_hashes") != [canonical_hash(use) for use in uses_by_ref.get(evidence_ref, [])]
                     or not uses_by_ref.get(evidence_ref)
                     or any(value.get(key) is not None for key in (
@@ -909,9 +925,12 @@ def _validate_formal_question(question: dict[str, object]) -> None:
         "autonomous_question_six_fields_incomplete",
     )
     for field in FORMAL_QUESTION_FIELDS:
-        _require_text(
-            question.get(field), "autonomous_question_six_fields_incomplete"
-        )
+        value = question.get(field)
+        if field in {"background_context", "requirements_constraints"}:
+            if not isinstance(value, str):
+                raise ReasoningContractError("autonomous_question_six_fields_incomplete")
+        else:
+            _require_text(value, "autonomous_question_six_fields_incomplete")
 
 
 def _validated_closure_leaf(value: dict[str, object]) -> str:

@@ -27,6 +27,7 @@ from meta_research.provider_supervisor import (
 )
 from meta_research.quest_drafting import (
     INTENT_REPLY_MAX_LENGTH,
+    QUESTION_CONTENT_GUIDANCE,
     DraftingUnavailable,
     IntentDraftingProvider,
     IntentTurnRequest,
@@ -333,6 +334,7 @@ class CodexCompanionAdapter(
             "do not repeat unaffected material reads. Inherited literature retains its original snapshot, run and binding. "
             "A direct route may use explicitly inherited literature without presenting it as a new search. "
             "Return the six proposal fields and the route-specific revision. A direct route returns revision=null. "
+            f"{QUESTION_CONTENT_GUIDANCE}\n"
             "A DeepFetch route returns a complete literature revision with explicit corrections or an honest unchanged/empty assessment. "
             "No Owner writes, receipts, human confirmation, or invented Quest Run.\n"
             + _canonical_json({"instruction_bundle": instructions, "draft": request.draft,

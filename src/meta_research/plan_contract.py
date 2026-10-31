@@ -20,7 +20,6 @@ GENERIC_EVIDENCE_KINDS = frozenset({"HumanInput", "ScientificOutcome", "AssetVer
 MAX_PLAN_OBLIGATIONS = 64
 MAX_PLAN_EVIDENCE_REFS = 256
 MAX_PLAN_EXPERIMENT_BRIEFS = 64
-MAX_SELECTED_PLAN_EVIDENCE_REFS = 32
 PLAN_TEXT_MAX_CHARS = 8_192
 
 _QUESTION_TRACE_FIELDS = {
@@ -168,7 +167,7 @@ def _valid_evidence_discovery_projection(projection: dict[str, object]) -> bool:
 def selected_plan_evidence_catalog(
     document: dict[str, object], frozen_catalog: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Join a discovery page with only explicitly selected exact later bindings.
+    """Return the complete adopted set, independently of discovery page sizes.
 
     This validates structure, not authority. RG validates every selected receipt,
     source, exact content and Quest eligibility before accepting the FormalPlan.
@@ -176,31 +175,54 @@ def selected_plan_evidence_catalog(
     without expanding or mutating the original Stage request.
     """
     bindings = document.get("source_bindings")
-    additions = bindings.get("selected_evidence_catalog", []) if isinstance(bindings, dict) else []
-    if not isinstance(additions, list) or len(additions) > MAX_SELECTED_PLAN_EVIDENCE_REFS:
+    selected = bindings.get("selected_evidence_bindings") if isinstance(bindings, dict) else None
+    if not isinstance(selected, list):
         raise PlanContractError("plan_selected_evidence_invalid")
-    uses = document.get("evidence_reuse_set", [])
-    if not isinstance(uses, list):
-        raise PlanContractError("plan_evidence_reuse_set_invalid")
-    used = {item.get("evidence_ref") for item in uses if isinstance(item, dict) and isinstance(item.get("evidence_ref"), str)}
-    result = {str(item["evidence_ref"]): item for item in frozen_catalog}
-    seen: set[str] = set()
-    versions = {str(item.get("asset_version_ref", item.get("source_ref"))): str(item["evidence_ref"]) for item in frozen_catalog}
-    for raw in additions:
+    frozen_by_ref = {str(item["evidence_ref"]): item for item in frozen_catalog}
+    result: dict[str, dict[str, object]] = {}
+    versions: dict[str, str] = {}
+    for raw in selected:
         entry = _object(raw, "plan_selected_evidence_invalid")
-        _validate_evidence_ref(entry)
+        _validate_selected_evidence_binding(entry)
         ref = cast(str, entry["evidence_ref"])
-        version = cast(str, entry.get("asset_version_ref", entry.get("source_ref")))
-        if ref not in used or ref in seen or (ref in result and result[ref] != entry):
+        source = cast(dict[str, object], entry["source_binding"])
+        version = cast(str, source.get("asset_version_ref", entry["source_ref"]))
+        if ref in result or (ref in frozen_by_ref and frozen_by_ref[ref] != source):
             raise PlanContractError("plan_selected_evidence_invalid")
         if version in versions and versions[version] != ref:
             raise PlanContractError("plan_selected_evidence_invalid")
-        seen.add(ref)
         versions[version] = ref
         result[ref] = entry
-    if len(result) > MAX_PLAN_EVIDENCE_REFS:
-        raise PlanContractError("plan_selected_evidence_invalid")
     return list(result.values())
+
+
+def _validate_selected_evidence_binding(entry: dict[str, object]) -> None:
+    """Check submitted identity structure; accepting Owners establish authority."""
+    code = "plan_selected_evidence_invalid"
+    _exact_keys(entry, {"evidence_ref", "source_kind", "source_ref", "source_binding", "reader"}, code)
+    for field in ("evidence_ref", "source_ref"):
+        _require_text(entry.get(field), code)
+    source = _object(entry.get("source_binding"), code)
+    kind = entry.get("source_kind")
+    if kind == "TargetCommit":
+        _validate_evidence_ref(source)
+        if (source.get("schema_ref") != EVIDENCE_REF_SCHEMA_REF
+                or source.get("evidence_ref") != entry["evidence_ref"]
+                or source.get("target_commit_root_ref") != entry["source_ref"]):
+            raise PlanContractError(code)
+    elif kind == "AssetVersion":
+        if (source.get("version_ref") != entry["source_ref"]
+                or entry["evidence_ref"] != entry["source_ref"]):
+            raise PlanContractError(code)
+    elif (kind not in GENERIC_EVIDENCE_KINDS or source.get("kind") != kind
+          or source.get("ref") != entry["source_ref"]
+          or entry["evidence_ref"] != entry["source_ref"]):
+        raise PlanContractError(code)
+    reader = _object(entry.get("reader"), code)
+    _exact_keys(reader, {"operation", "args"}, code)
+    _require_text(reader.get("operation"), code)
+    if not isinstance(reader.get("args"), dict) or not reader["args"]:
+        raise PlanContractError(code)
 
 
 def validate_plan_document(
@@ -335,21 +357,18 @@ def validate_plan_document(
     briefs = document.get("experiment_briefs")
     if not isinstance(briefs, list) or len(briefs) > MAX_PLAN_EXPERIMENT_BRIEFS:
         raise PlanContractError("plan_experiment_brief_invalid")
-    covered_by_brief: set[str] = set()
     experiment_keys: set[str] = set()
     for value in briefs:
         brief = _object(value, "plan_experiment_brief_invalid")
-        brief_gaps, experiment_key = _validate_experiment_brief(
+        _, experiment_key = _validate_experiment_brief(
             brief,
             gap_keys=gap_keys,
             candidate_refs=candidate_refs,
+            evidence_by_ref=evidence_by_ref,
         )
         if experiment_key in experiment_keys:
             raise PlanContractError("plan_experiment_brief_invalid")
         experiment_keys.add(experiment_key)
-        covered_by_brief.update(brief_gaps)
-    if covered_by_brief != gap_keys:
-        raise PlanContractError("plan_gap_brief_closure_invalid")
 
     _validate_idea_trace(
         document.get("idea_trace"),
@@ -358,7 +377,7 @@ def validate_plan_document(
     )
     expected_disposition = (
         "experiments_required"
-        if gap_keys
+        if briefs
         else "no_new_experiment_required"
     )
     if document.get("bundle_disposition") != expected_disposition:
@@ -375,10 +394,11 @@ def validate_plan_document(
             "context_pack_ref",
             "context_pack_hash",
             "evidence_reference_revision",
-        } | ({"selected_evidence_catalog"} if "selected_evidence_catalog" in source_bindings else set()),
+            "selected_evidence_bindings",
+        },
         "plan_document_source_invalid",
     )
-    if {key: value for key, value in source_bindings.items() if key != "selected_evidence_catalog"} != {
+    if {key: value for key, value in source_bindings.items() if key != "selected_evidence_bindings"} != {
         "question_ref": question_ref,
         "idea_set_ref": idea_set_ref,
         "context_pack_ref": context_pack_ref,
@@ -698,6 +718,7 @@ def _validate_experiment_brief(
     *,
     gap_keys: set[str],
     candidate_refs: tuple[str, ...],
+    evidence_by_ref: dict[str, dict[str, object]],
 ) -> tuple[set[str], str]:
     _exact_keys(
         brief,
@@ -709,7 +730,7 @@ def _validate_experiment_brief(
             "boundary_constraints",
             "semantic_delta",
             "contributing_idea_refs",
-        },
+        } | ({"reuse_material_refs"} if "reuse_material_refs" in brief else set()),
         "plan_experiment_brief_invalid",
     )
     experiment_key = brief.get("experiment_key")
@@ -730,6 +751,12 @@ def _validate_experiment_brief(
         candidate_refs=candidate_refs,
         code="plan_experiment_brief_invalid",
     )
+    reuse_refs = brief.get("reuse_material_refs", [])
+    if (not isinstance(reuse_refs, list)
+            or not all(_text(ref) for ref in reuse_refs)
+            or len(reuse_refs) != len(set(reuse_refs))
+            or not set(reuse_refs) <= set(evidence_by_ref)):
+        raise PlanContractError("plan_reuse_material_ref_invalid")
     return set(cast(list[str], values)), cast(str, experiment_key)
 
 

@@ -53,6 +53,7 @@ from meta_research.target_run_finalizer import (
     SQLiteTargetRootCompletionMemoryAuthority,
     TargetRunFinalizer,
 )
+from meta_research.target_commit_evidence import target_adoption_binding
 from meta_research.target_run_runtime_contract import (
     decode_target_completion_handoff,
 )
@@ -755,7 +756,7 @@ class _FixtureTargetCommitEvidenceAuthority:
         refs = {str(item["evidence_ref"]) for item in evidence_catalog}
         if (
             expected_reference_revision != revision
-            or tuple(evidence_catalog) != catalog
+            or tuple(item.get("source_binding", item) for item in evidence_catalog) != catalog
             or (
                 selected_evidence_refs is not None
                 and not selected_evidence_refs.issubset(refs)
@@ -1011,6 +1012,11 @@ def _install_fixture_plan_evidence(
             "role_receipt": role.receipt.as_public_dict(),
         },
     )
+    # Adoption is an explicit provider decision after the accurate source
+    # reader, independently of the optional first discovery page.
+    runtime.plan_stage._provider.selected_evidence_bindings = [
+        target_adoption_binding(authority.catalog[0])
+    ]
 
 
 def _finish_plan_stage(runtime) -> dict[str, object]:
@@ -2800,6 +2806,41 @@ def test_legacy_target_commit_is_rejected_before_receipt_or_fence_checks(
             runtime.owners.advancement_engine.query_bundle_stage_commit(request_ref)
             is None
         )
+    finally:
+        runtime.close()
+
+
+class _UnscheduledGapPlanSkill(_DeterministicPlanSkill):
+    def _document(self, request):
+        document = super()._document(request)
+        document["experiment_briefs"] = []
+        document["bundle_disposition"] = "no_new_experiment_required"
+        document["coverage"][0]["insufficiency"] = (
+            "The evidence remains insufficient. Defer new execution until the required data is available."
+        )
+        return document
+
+
+def test_unscheduled_gap_records_skipped_without_starting_bundle_or_target(tmp_path: Path) -> None:
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-unscheduled-gap", plan_skill_provider=_UnscheduledGapPlanSkill(no_gap=False),
+    )
+    try:
+        _prepare_bundle_request(runtime)
+        for _step in range(4):
+            current = runtime.bundle_stage.query_current()
+            if current["stage_commit"] is not None:
+                break
+            assert runtime.bundle_stage.process_once()
+        else:
+            raise AssertionError("Unscheduled Plan did not skip Bundle")
+        accepted_plan = current["stage_run_request"]["accepted_formal_plan_binding"]["plan_document"]
+        assert accepted_plan["gap_set"] == ["rare-morphology-comparison"]
+        assert accepted_plan["experiment_briefs"] == []
+        assert accepted_plan["coverage"][0]["insufficiency"].startswith("The evidence remains insufficient.")
+        assert current["stage_commit"]["status"] == "Skipped"
+        assert current["run"] is None
+        assert current["target_commits"] == []
     finally:
         runtime.close()
 

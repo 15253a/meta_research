@@ -13,7 +13,7 @@ description: 在已接纳 FormalPlan 内组织并启用 Target，滚动安排材
 正式人类指导按运行时加载的[共享指导合同](../human-guidance.md)读取原文、声明处理并延续约束。
 ## 1. 读取与滚动安排
 
-读取已接纳 FormalPlan、gap Brief、输入索引、权威 frontier 与反馈，选择值得现在投入的工作。局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。
+读取完整已接纳 FormalPlan、实际 ExperimentBrief、采用来源、输入索引、权威 frontier 与反馈，选择值得现在投入的工作。只为实际 Brief 组织 cells 和 Target；未安排的 gap 连同 Plan 的 insufficiency 保留给后继，不据此补造工作或计作完成。局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。
 
 本 Cycle 的 Idea、Plan、已启用 Target 暂存材料和本工作人类交付文件，用 `research_workspace.discover`／`read` 按根系统提示核对；在途观察可指导安排，正式结果与冻结执行输入继续沿原交接流程。
 
@@ -45,7 +45,7 @@ cells 表达应实施及报告的责任，允许负结果、失败原因和未�
 
 Bundle 统一保留并筛选 Target 发现的建题线索。跨 Target 合并同一未知，先判断当前或已有 Question 能否承载；值得独立追踪的候选按对研究目标的重要性、已有依据和后续研究价值比较。交给 Reasoning 的建题推荐为零或一个，只选最值得推进的一项，说明来源、与已有题的区别和联系、独立追踪理由及可开展的研究。其余有价值线索留在 notes 中并明确为保留项，不逐 Target 提交、不作为待逐个建题的队列；没有合适候选时明确写本轮不推荐建题。这里的数量约束只针对新 Question 推荐，不限制 Target、Dataset 或 Environment 的合理粒度。
 
-为保留最后一个 Target 后的汇总回合，安排和执行工作时保持 `strategy_complete=false`。全部 Target 已接纳后，读取包括最后结果在内的研究说明、完成候选取舍和独立审阅，再用不新增 Target 的 `StrategyUpdate`（`candidates=[]`、`strategy_complete=true`）提交完整 notes 并封口；科学上的建题推荐写在 notes，不放进用于启用 Target 的 `candidates`。需要继续实施时按现有滚动策略提交实际 Target，保持策略未封口。技术阻塞或语义屏障仍按真实状态交接，不能为凑候选补造工作。
+为保留最后一个 Target 后的汇总回合，安排和执行工作时保持 `strategy_complete=false`。全部 required cells 有 current accepted TargetCommit 后，读取包括最后结果在内的研究说明、完成候选取舍、资源整理和独立审阅，再用不新增 Target 的 `StrategyUpdate`（`candidates=[]`、`strategy_complete=true`）提交完整 notes 并封口；当前已提 Target 全部接纳不代表尚缺的 cells 已完成。科学上的建题推荐写在 notes，不放进用于启用 Target 的 `candidates`。需要继续实施时按现有滚动策略提交实际 Target，保持策略未封口。技术阻塞或语义屏障仍按真实状态交接，不能为凑候选补造工作。
 
 Target 正式接纳后，在同一整理核验环节从 TargetCommit 上下文取精确 `target_ref`，调用 `research_graph.target_formal_results.read`，读取 `resource_candidates`。核对其 TargetCommit／manifest 身份，再看 `dataset_candidates`、`environment_candidates` 的 `artifact_path`、含义、精确 `asset_binding` 和 `producers`；候选 purpose 表示拟议用途，生产归属以 RG 当前已纠正的 subject 为准，原接纳归属及纠错记录保留依据。implementation 候选沿已核验 Run 的 `input_binding_ref`／implementation revision 关联实际工作。按内容判断复用价值，直接沿用完整原件 binding。Dataset 用 datasets.register／register_version／reference，真实派生用 derive；Environment 用 environments.register 记录含义、真实来源和相同原件 binding，再用 reference 关联当前 Question、原 Target／Run 和用途。六入口按复用目的组织，同一原件可供多种用途引用，交接不要求填满六入口。
 

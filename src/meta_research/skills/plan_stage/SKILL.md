@@ -35,9 +35,9 @@ description: 根据当前研究重心、构想与历史证据选择本轮投入�
 
 `research_graph.baselines.page`／`read` 的 `limit` 是条目数，默认 20，范围 1–100；`read` 只传精确 `baseline_ref` 即可读取方法合同，展开关联实体时再按返回的 `next_offset`／`next_evaluation_offset` 分页。各工具的分页单位独立，正文 reader 的字符上限不适用于 Baseline 列表。遇 `baseline_query_invalid` 时按当前 schema 修正参数，再继续读取。
 
-逐 obligation 判断 `covered | gap`，写支持主张及边界。`covered` 至少有一个实际 evidence use；无测量观察、分析、负结果、人类输入等可按真实内容使用，来源类型不预设科学价值。`gap` 说明相对义务还缺什么，可有部分证据，但须由一个或多个 ExperimentBrief 覆盖。仍要消费的历史来源选入 evidence use，不能只在 notes 写“复用”。
+逐 obligation 判断 `covered | gap`，写支持主张及边界。`covered` 至少有一个实际 evidence use；无测量观察、分析、负结果、人类输入等可按真实内容使用，来源类型不预设科学价值。`gap` 的非空 insufficiency 说明实际不足；本轮未安排的 gap 同时说明不安排理由、依据与限制。按真实需要选择本轮推进哪些 gap，可部分推进，也可多份 Brief 推进同一 gap。
 
-Brief 用 goal、characteristics、boundary constraints、semantic delta 和真实 Idea 来源说明目的、可接受观察与局部限制。Target、实现和依赖由 Bundle 决定。全部 covered 且无 Brief 时为 `no_new_experiment_required`；存在 gap 且均被 Brief 覆盖时为 `experiments_required`。
+Brief 用 goal、characteristics、boundary constraints、semantic delta 和真实 Idea 来源说明目的、可接受观察与局部限制；计划复用材料按需写入 `reuse_material_refs`。Target、实现和依赖由 Bundle 决定。adapter 按 Brief 是否为空派生 `bundle_disposition`；无 Brief 时保留真实 gap 和未安排理由，交 Reasoning 综合。
 
 完成条件：每项义务有唯一覆盖判断，所有新工作对应真实缺口，复用来源与适用边界可核查。
 
@@ -45,6 +45,6 @@ Brief 用 goal、characteristics、boundary constraints、semantic delta 和真�
 
 委派原生独立子智能体审阅完整草稿和关键原文；根据自由格式反馈及自身判断修订并交接完整最终内容。同根自查不替代独立审阅，没有具体问题也可改稿。Owner 绑定草稿／最终 hash 并核验科研来源，不要求审查表单、审阅者身份证明或批准记录。
 
-输出 `answer_contract`、`coverage`、`experiment_briefs`、`notes` 等核心字段。首目录外实际读过并采用的来源放入最多 32 项 `additional_evidence_bindings`，精确格式见 Owner 操作。adapter 派生 `evidence_reuse_set`、`gap_set`、`idea_trace`、`bundle_disposition`、`source_bindings` 和合同 hash，不重复手填。拒绝时修订具体原因并保留来源；未知效果先对账原身份。
+输出 `answer_contract`、`coverage`、`experiment_briefs`、`selected_evidence_bindings` 和必要 `notes`。采用集合同时保留科学支持及 Brief 计划复用的材料，精确绑定直接复制准确 reader 的 `selected_evidence_binding`，格式见 Owner 操作。adapter 原样保存整组采用来源并派生 `evidence_reuse_set`、`gap_set`、`idea_trace`、`bundle_disposition`、其他来源绑定和合同 hash。拒绝时修订具体原因并保留来源；未知效果先对账原身份。
 
 完成条件：真实 RM／RG 接纳及 AR／AE 交接可验证。Plan 不创建 receipt、StageCommit、Bundle Run 或 Target；无新实验只提供由 AE 核验的 skip 依据。

@@ -873,6 +873,23 @@ def test_autonomous_question_proposal_binds_source_and_all_six_fields() -> None:
     assert len(proposal_hash) == 64
 
 
+def test_autonomous_question_retains_empty_optional_background_and_constraints() -> None:
+    proposal = _autonomous_question_proposal()
+    proposal["question"]["background_context"] = ""
+    proposal["question"]["requirements_constraints"] = ""
+    assert len(validate_autonomous_question_proposal(
+        proposal, source_outcome=_scientific_outcome("uncertain"),
+    )) == 64
+
+
+@pytest.mark.parametrize("field", ["title", "unknown_statement", "answer_shape", "applicability_scope"])
+def test_autonomous_question_still_requires_nonempty_core_text(field: str) -> None:
+    proposal = _autonomous_question_proposal()
+    proposal["question"][field] = ""
+    with pytest.raises(ReasoningContractError, match="autonomous_question_six_fields_incomplete"):
+        validate_autonomous_question_proposal(proposal, source_outcome=_scientific_outcome("uncertain"))
+
+
 def test_reasoning_transition_requires_exactly_one_candidate() -> None:
     outcome = _scientific_outcome()
     next_cycle = _next_cycle_proposal()

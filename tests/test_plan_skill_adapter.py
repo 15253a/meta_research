@@ -13,7 +13,7 @@ import pytest
 
 from meta_research.idea_skill import _compile_codex_output_schema
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
-from meta_research.owners.common import canonical_hash
+from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.plan_contract import material_plan_hash
 from meta_research.plan_skill import (
     CodexPlanSkillAdapter,
@@ -25,6 +25,7 @@ from meta_research.plan_skill import (
     _review_finalization_schema,
     _validate_request,
     validate_plan_skill_result,
+    _with_derived_answer_contract_hash,
 )
 from meta_research.semantic_owner_gateway import (
     ROOT_AGENT_SEMANTIC_OPERATION_IDS,
@@ -247,6 +248,7 @@ def _plan(goal: str = "比较跨设备形态召回。") -> dict[str, object]:
             "context_pack_ref": "plan-context:1",
             "context_pack_hash": canonical_hash(_context_pack()),
             "evidence_reference_revision": 0,
+            "selected_evidence_bindings": [],
         },
     }
 
@@ -287,6 +289,30 @@ def test_packaged_plan_skill_is_the_runtime_authority() -> None:
     assert "experiment_key" in contract and "Brief" in contract
     assert "TODO-IMPL" not in operations
     assert "RM 管内容保管" in operations
+
+
+def test_adapter_preserves_the_complete_adopted_set_and_derives_skip_from_empty_briefs():
+    plan = _plan()
+    for key in ("source_bindings", "evidence_reuse_set", "gap_set", "idea_trace", "bundle_disposition"):
+        plan.pop(key)
+    plan["experiment_briefs"] = []
+    selected = [{
+        "evidence_ref": f"material:{index}", "source_kind": "AssetVersion",
+        "source_ref": f"material:{index}",
+        "source_binding": {"asset_ref": f"asset:{index}", "version_ref": f"material:{index}"},
+        "reader": {"operation": "research_memory.content.read", "args": {
+            "source_ref": f"asset:{index}", "version_ref": f"material:{index}",
+        }},
+    } for index in range(34)]
+    plan["selected_evidence_bindings"] = deepcopy(selected)
+
+    normalized = _with_derived_answer_contract_hash(plan, _request())
+
+    assert normalized["source_bindings"]["selected_evidence_bindings"] == selected
+    assert "selected_evidence_bindings" not in normalized
+    assert normalized["evidence_reuse_set"] == []
+    assert normalized["gap_set"] == ["cross-device"]
+    assert normalized["bundle_disposition"] == "no_new_experiment_required"
 
 
 def test_validator_accepts_exact_plan_and_owner_feedback_requires_material_change() -> None:
@@ -611,6 +637,40 @@ def test_production_adapter_derives_answer_contract_hash_after_each_turn(
         answer_schema = plan_schema["properties"]["answer_contract"]
         assert "answer_contract_hash" not in answer_schema["properties"]
         assert "answer_contract_hash" not in answer_schema["required"]
+
+
+def test_production_adapter_decodes_the_owners_binding_without_losing_source_fields(tmp_path):
+    selected = {
+        "evidence_ref": "asset-version:retained", "source_kind": "AssetVersion",
+        "source_ref": "asset-version:retained",
+        "source_binding": {"asset_ref": "asset:retained", "version_ref": "asset-version:retained",
+                           "content_hash": "b" * 64, "manifest_hash": "c" * 64,
+                           "receipt": {"receipt_ref": "receipt:actual-owner", "owner_specific_detail": "retained"}},
+        "reader": {"operation": "research_memory.content.read", "args": {
+            "source_ref": "asset:retained", "version_ref": "asset-version:retained",
+        }},
+    }
+    output = _plan()
+    for key in ("source_bindings", "evidence_reuse_set", "gap_set", "idea_trace", "bundle_disposition"):
+        output.pop(key)
+    output["notes"] = "Use the retained material for the arranged comparison."
+    output["experiment_briefs"][0]["reuse_material_refs"] = [selected["evidence_ref"]]
+    transport = deepcopy(selected)
+    transport["source_binding"] = canonical_json(selected["source_binding"])
+    transport["reader"]["args"] = canonical_json(selected["reader"]["args"])
+    output["selected_evidence_bindings"] = [transport]
+    runner = _SequenceRunner([{"plan": output}])
+    adapter = CodexPlanSkillAdapter(
+        tmp_path / "provider-owner-binding", executable=str(_fake_codex(tmp_path / "codex-owner-binding")),
+        process_runner=runner,
+    )
+    request = _request(runtime_binding=adapter.runtime_binding())
+
+    result = adapter.execute(request)
+
+    validate_plan_skill_result(request, result)
+    assert result.final_plan["source_bindings"]["selected_evidence_bindings"] == [selected]
+    assert result.final_plan["evidence_reuse_set"] == []
 
 
 def test_production_adapter_does_not_require_child_trace(

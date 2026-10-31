@@ -211,8 +211,8 @@ def validate_bundle_context_pack(
             != idea_binding.get("outcome_ref")
         ):
             raise BundleContractError("bundle_context_pack_invalid")
-    gaps = cast(list[object], plan["gap_set"])
-    expected = "experiments_required" if gaps else "no_new_experiment_required"
+    briefs = cast(list[object], plan["experiment_briefs"])
+    expected = "experiments_required" if briefs else "no_new_experiment_required"
     if plan["bundle_disposition"] != expected:
         raise BundleContractError("bundle_formal_plan_binding_invalid")
     return plan

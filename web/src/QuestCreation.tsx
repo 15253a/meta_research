@@ -105,7 +105,7 @@ const proposalFields: Array<{
     code: "answer_shape",
     required: true,
     rows: 3,
-    placeholder: "什么类型的答案才足够？",
+    placeholder: "需要回答什么、形成何种结论并说明哪些边界？保留题意已有的真实要求。",
   },
   {
     key: "applicability_scope",
@@ -121,14 +121,14 @@ const proposalFields: Array<{
     label: "首问题背景上下文",
     code: "background_context",
     rows: 3,
-    placeholder: "理解这个问题所需的背景。",
+    placeholder: "按需补充理解问题所需的背景，可留空。",
   },
   {
     key: "requirements_constraints",
     label: "首问题含义约束",
     code: "requirements_constraints",
     rows: 3,
-    placeholder: "只写会改变问题含义的要求。",
+    placeholder: "按需写会改变题意的真实要求、约束及来源；普通实施偏好不作为硬约束。可留空。",
   },
 ];
 

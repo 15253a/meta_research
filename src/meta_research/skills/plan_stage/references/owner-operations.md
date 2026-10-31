@@ -6,22 +6,26 @@
 
 人类或 Agent 取得的工作资料与后继已保管材料，按[共享资料处理合同](../../human-guidance.md#工作资料的当前处理与后继交接)发现、精确读取、处理及反馈。材料采用关系服务于本轮安排判断，正式执行输入继续由 Bundle 绑定。
 
-ContextPack 提供创建时 evidence_catalog 及版本。`research_graph.plan_evidence.page` 通过 total、filter、next_offset 发现同 Quest 其他证据；`research_memory.plan_evidence.read` 读取精确 commit／version／hash／role 对应正文。已接纳后续条目可选用，Owner 在提交时重验引用与来源；后续发现不改写原 ContextPack。
+按实际研究需要调用 `research_graph.plan_evidence.page`，通过 total、filter、next_offset 发现同 Quest 证据；`research_memory.plan_evidence.read` 读取精确 commit／version／hash／role 对应正文并返回 `selected_evidence_binding`。ContextPack 不预查候选目录，后续发现不改写原冻结请求。目录页长不限制本轮采用来源范围。
 
 TargetCommit 来源经现有验证接缝核查，包括有指标测量和无测量的观察、分析、负结果。科学含义由 Plan 说明，capability 与 provenance 如实记录，不能为可引用而补造测量。空目录不推导全库无证据，索引摘要不替代实际采用正文。
 
-HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 按系统提示中的研究入口在当前 Quest 内发现，再沿返回 reader 读精确正文。额外来源采用：
+HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 按系统提示中的研究入口在当前 Quest 内发现，再沿返回 reader 读精确正文；目录未带完整采用绑定时，从准确 reader 返回的 `selected_evidence_binding` 取得。完整采用集合 `selected_evidence_bindings` 中每项形状为：
 
 ```json
 {
-  "schema_ref": "meta-research/evidence-source-ref/v1",
   "evidence_ref": "精确来源ref",
-  "source_kind": "HumanInput|ScientificOutcome|AssetVersion|LiteratureSnapshot",
-  "source_ref": "同一精确来源ref"
+  "source_kind": "AssetVersion",
+  "source_ref": "准确来源ref",
+  "source_binding": {"说明": "原样使用实际Owner返回的完整绑定，此示意对象不可提交"},
+  "reader": {
+    "operation": "research_memory.content.read",
+    "args": {"source_ref": "工具返回的配对引用", "version_ref": "工具返回的准确版本"}
+  }
 }
 ```
 
-`source_kind` 选实际单一类别，不写四类拼接值；coverage 的 evidence use 使用同一 ref。Target 证据使用工具返回的完整 EvidenceRef。`additional_evidence_bindings` 只提交本轮读过并实际采用的条目，最多 32 项；adapter 写入 `source_bindings.selected_evidence_catalog`，RG 重验真实接纳事实、同 Quest 范围和内容，并供后续读回。
+`source_kind` 使用真实单一类别：TargetCommit、HumanInput、ScientificOutcome、AssetVersion 或 LiteratureSnapshot；source_binding 保留该类型现有准确身份和接纳来路，reader 保留工具返回的准确操作及参数，不手拼 receipt 或引用。覆盖的 EvidenceUse 与可选 Brief.reuse_material_refs 都以 evidence_ref 引用同一集合。adapter 将整个 `selected_evidence_bindings` 原样写入 `source_bindings.selected_evidence_bindings`；RG 核验真实接纳事实、当前权限、同 Quest 范围和内容，后续按准确身份读取。只供实施的材料不必伪装成 EvidenceUse，后继按实际需要选择或修复材料时保留 Plan 原采用历史。
 
 采用文献时，`LiteratureSnapshot` 的 `source_ref` 和 `evidence_ref` 都复制已接纳文献修订返回的 `literature_snapshot_ref`（`literature_snapshot_...`）。DOI、URL 和 `citation_key` 定位快照中的具体论文，写在 `supported_claim`、`support_boundary` 或 notes 中；它们不是快照身份。同一快照的多篇论文共用一个来源 binding，各 evidence use 分别说明所读论文、主张及适用边界。提交前逐项对照工具返回的来源类型和精确 ref。
 

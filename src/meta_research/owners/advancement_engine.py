@@ -7579,7 +7579,7 @@ class SQLiteAdvancementEngine(
             or accepted is None
             or accepted.formal_plan_ref != formal_plan_ref
             or accepted.formal_plan_receipt != formal_plan_receipt
-            or accepted.plan_document.get("gap_set") != []
+            or accepted.plan_document.get("experiment_briefs") != []
             or accepted.plan_document.get("bundle_disposition")
             != "no_new_experiment_required"
         ):

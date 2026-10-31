@@ -36,6 +36,14 @@ TARGET_COMMIT_EVIDENCE_CAPABILITIES = (
 )
 
 
+def target_adoption_binding(binding):
+    return {"evidence_ref": binding.get("evidence_ref"), "source_kind": "TargetCommit",
+            "source_ref": binding.get("target_commit_root_ref"), "source_binding": binding,
+            "reader": {"operation": "research_memory.content.read", "args": {
+                "source_ref": binding.get("target_commit_root_ref"),
+                "version_ref": binding.get("asset_version_ref")}}}
+
+
 def target_commit_evidence_closure_refs(
     commit: TargetCommit,
 ) -> tuple[str, ...]:
@@ -400,31 +408,42 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             )
         ):
             raise OwnerConflict("plan_evidence_catalog_invalid")
-        if len(evidence_catalog) != expected_reference_revision or len(evidence_catalog) > 256:
+        if len(evidence_catalog) != expected_reference_revision:
             raise OwnerConflict("plan_evidence_catalog_invalid")
-        generic = [item for item in evidence_catalog if item.get("schema_ref") == EVIDENCE_SOURCE_REF_SCHEMA]
-        target_entries = [item for item in evidence_catalog if item.get("schema_ref") != EVIDENCE_SOURCE_REF_SCHEMA]
-        for item in generic:
-            self._generic_plan_source(quest_ref, item)
-        root_refs = tuple(str(item.get("target_commit_root_ref", "")) for item in target_entries)
-        current_catalog = [*self._catalog_for_refs(
-            quest_ref=quest_ref, target_commit_refs=root_refs, current_only=require_current,
-            role_refs=tuple(str(item.get("role_ref", "")) for item in target_entries),
-        ), *generic]
-        current_by_ref = {
-            cast(str, item["evidence_ref"]): item for item in current_catalog
-        }
-        supplied_refs: list[str] = []
+        generic = [item for item in evidence_catalog if item.get("source_kind") in GENERIC_EVIDENCE_KINDS]
+        target_entries = []
+        for item in evidence_catalog:
+            if item.get("source_kind") in GENERIC_EVIDENCE_KINDS:
+                self._generic_plan_source(quest_ref, item)
+                continue
+            if "source_kind" in item:
+                binding = item.get("source_binding")
+                if (not isinstance(binding, dict) or item != target_adoption_binding(binding)):
+                    raise OwnerConflict("plan_evidence_source_invalid")
+            else:
+                # This is the existing frozen discovery-page protocol, rather
+                # than a second Plan adoption format.
+                binding = item
+            target_entries.append(binding)
+        current_catalog = []
+        # Bound one Owner query at a time, without limiting the adopted set.
+        for offset in range(0, len(target_entries), 256):
+            batch = target_entries[offset:offset + 256]
+            current_catalog.extend(self._catalog_for_refs(
+                quest_ref=quest_ref,
+                target_commit_refs=tuple(str(item.get("target_commit_root_ref", "")) for item in batch),
+                current_only=require_current,
+                role_refs=tuple(str(item.get("role_ref", "")) for item in batch)))
+        current_by_ref = {str(item["evidence_ref"]): item for item in current_catalog}
+        supplied_refs = set()
         for item in evidence_catalog:
             evidence_ref = item.get("evidence_ref")
-            if (
-                not isinstance(evidence_ref, str)
-                or not evidence_ref
-                or evidence_ref in supplied_refs
-                or current_by_ref.get(evidence_ref) != item
-            ):
+            expected = item.get("source_binding", item) if item.get("source_kind") not in GENERIC_EVIDENCE_KINDS else item
+            if (not isinstance(evidence_ref, str) or not evidence_ref or evidence_ref in supplied_refs
+                    or (item.get("source_kind") not in GENERIC_EVIDENCE_KINDS and current_by_ref.get(evidence_ref) != expected)):
                 raise OwnerConflict("plan_evidence_catalog_invalid")
-            supplied_refs.append(evidence_ref)
+            supplied_refs.add(evidence_ref)
+        current_by_ref.update({str(item["evidence_ref"]): item for item in generic})
         # A Plan freezes its selected page, not the entire growing Quest.
         # New candidates cannot stale a valid cut; current membership still
         # fails closed when a selected source loses eligibility after pruning.
@@ -436,16 +455,15 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             raise OwnerConflict("plan_evidence_catalog_invalid")
 
     def _generic_plan_source(self, quest_ref, item):
-        if (set(item) != {'schema_ref','evidence_ref','source_kind','source_ref'}
-                or item.get('schema_ref') != EVIDENCE_SOURCE_REF_SCHEMA
-                or item.get('source_kind') not in GENERIC_EVIDENCE_KINDS
-                or not isinstance(item.get('source_ref'), str) or not item['source_ref']
-                or item.get('evidence_ref') != item['source_ref']):
-            raise OwnerConflict('plan_evidence_source_invalid')
+        from meta_research.research_content import adopted_source_binding
+        if (not isinstance(item, dict) or item.get("source_kind") not in GENERIC_EVIDENCE_KINDS
+                or not isinstance(item.get("source_ref"), str) or not item["source_ref"]):
+            raise OwnerConflict("plan_evidence_source_invalid")
         source = self._research_graph.resolve_reasoning_historical_evidence_leaf(
-            quest_ref=quest_ref, ref=item['source_ref'])
-        if source is None or source.get('kind') != item['source_kind'] or source.get('ref') != item['source_ref']:
-            raise OwnerConflict('plan_evidence_source_invalid')
+            quest_ref=quest_ref, ref=item["source_ref"])
+        if source is None or item != adopted_source_binding(
+                self._research_graph, quest_ref=quest_ref, source_ref=item["source_ref"], leaf=source):
+            raise OwnerConflict("plan_evidence_source_invalid")
         return source
 
     def resolve_plan_evidence_reuse_leaves(
@@ -469,37 +487,26 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                 raise OwnerConflict("plan_evidence_reuse_set_invalid")
             uses_by_ref.setdefault(evidence_ref, []).append(use)
         selected_refs = frozenset(uses_by_ref)
-        self.verify_plan_evidence_catalog(
-            quest_ref=quest_ref,
-            evidence_catalog=evidence_catalog,
-            expected_reference_revision=expected_reference_revision,
-            # The Plan cut is immutable and may be historical by the time
-            # Reasoning runs.  Verify its exact issuer-backed members without
-            # silently switching to the latest catalog.
-            require_current=False,
-            require_complete=False,
-            selected_evidence_refs=selected_refs,
-        )
         if not selected_refs:
             return ()
 
         catalog_by_ref = {
-            cast(str, item["evidence_ref"]): item for item in evidence_catalog
+            cast(str, item["evidence_ref"]): (item["source_binding"] if item.get("source_kind") == "TargetCommit" else item)
+            for item in evidence_catalog
         }
-        commits = {
-            commit.commit_ref: commit
-            for commit in self._research_graph.query_target_commits_for_quest(
-                quest_ref,
-                target_commit_refs=tuple(str(catalog_by_ref[ref]["target_commit_root_ref"]) for ref in selected_refs
-                                        if "target_commit_root_ref" in catalog_by_ref[ref]),
-            )
-        }
+        commits = {}
+        target_refs = tuple(str(catalog_by_ref[ref]["target_commit_root_ref"]) for ref in selected_refs
+                            if "target_commit_root_ref" in catalog_by_ref[ref])
+        for offset in range(0, len(target_refs), 256):
+            commits.update({commit.commit_ref: commit
+                for commit in self._research_graph.query_target_commits_for_quest(
+                    quest_ref, target_commit_refs=target_refs[offset:offset + 256])})
         leaves: list[EvidenceReuseLeaf] = []
         for evidence_ref in sorted(selected_refs):
             catalog_entry = catalog_by_ref.get(evidence_ref)
             if catalog_entry is None:
                 raise OwnerConflict("plan_evidence_reuse_closure_invalid")
-            if catalog_entry.get("schema_ref") == EVIDENCE_SOURCE_REF_SCHEMA:
+            if catalog_entry.get("source_kind") in GENERIC_EVIDENCE_KINDS:
                 source = self._generic_plan_source(quest_ref, catalog_entry)
                 leaves.append(EvidenceReuseLeaf(
                     evidence_ref=evidence_ref, role=source['kind'], evidence_item_ref=source['ref'],

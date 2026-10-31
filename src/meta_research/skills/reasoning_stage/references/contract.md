@@ -4,7 +4,7 @@
 
 `ReasoningSkillRequest` 绑定当前 StageRunRequest、Run、Attempt、Fence、根 Session、Cycle、Question、Quest、Goal revision、epoch、ContextPack ref／hash、冻结证据和运行绑定。ContextPack 包含已接纳 Question、文献版本或 none、Idea→Plan→Bundle StageCommit、Plan 证据或 none、TargetCommit 及研究上下文。
 
-Plan 复用保持精确 FormalPlan 和原样 `evidence_reuse_set`，各 `EvidenceReuseLeaf/v1` 绑定 catalog entry／use hashes 与真实来源：测量叶保留实际 MetricResult、EvaluationAttempt、Run／Commit 及 RM／RG receipts；无评价 WorkProduct 保留真实 Run／Commit，不补 EvaluationAttempt；HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 使用各自核实的 `source_binding`，不强加 Target 测量身份。
+Plan 经过或跳过 Bundle 时都交接同一完整 FormalPlan、`source_bindings.selected_evidence_bindings`、coverage 的 insufficiency 与实际安排；采用集合包括仅供 Brief 复用的材料，不能以 `evidence_reuse_set` 裁剪。EvidenceUse 继续单独派生原样 `evidence_reuse_set`，各 `EvidenceReuseLeaf/v1` 绑定其完整采用 entry／use hashes 与真实来源：测量叶保留实际 MetricResult、EvaluationAttempt、Run／Commit 及 RM／RG receipts；无评价 WorkProduct 保留真实 Run／Commit，不补 EvaluationAttempt；HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 使用各自核实的 `source_binding`，不强加 Target 测量身份。合法 absent-input skip 维持 Plan evidence 为 none，不补造未运行的 Plan。
 
 Target 结果可以没有总分类。沿精确结果版本、真实指标、评价或未评价状态、缺测说明、技术失败及研究记录独立综合科学支持与不确定性；历史结果的描述性分类只是原文材料。冻结来源说明可用依据，实际采用与用途以相应研究记录为准。本阶段 ScientificOutcome 继续表达自身的科学判断与边界。
 

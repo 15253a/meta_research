@@ -9,9 +9,10 @@ import json
 import pytest
 from sqlalchemy import text
 
-from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.plan_skill import _with_derived_answer_contract_hash
-from meta_research.target_commit_evidence import TargetCommitEvidenceCatalog
+from meta_research.target_commit_evidence import TargetCommitEvidenceCatalog, target_adoption_binding
+from meta_research.research_content import read_content
 from meta_research.target_run_finalizer import TargetRunFinalizer
 import test_public_bundle_stage as fixtures
 from test_public_first_question_deepfetch import (SnapshotAwareProposalDrafter,
@@ -28,11 +29,16 @@ class _Plan(_MultiRunPlanSkill):
     def __init__(self):
         super().__init__(no_gap=False)
         self.entry = None
+        self.scientific_entry = None
 
     def _document(self, request):
         document = super()._document(request)
         if self.entry is not None:
-            discovery = next(item for item in request.context_pack["evidence_catalog_page"]["projections"]
+            page, _ = self.page_reader(
+                quest_ref=request.context_pack["accepted_question_binding"]["quest_ref"],
+                question_ref=request.question_ref, limit=32,
+            )
+            discovery = next(item for item in page["projections"]
                 if item["evidence_ref"] == self.entry["evidence_ref"])
             assert discovery["research_summary"]["metric_count"] == 0
             assert discovery["research_summary"]["metric_names"] == []
@@ -42,7 +48,9 @@ class _Plan(_MultiRunPlanSkill):
                 "contributing_idea_refs": [request.accepted_idea_set["candidates"][0]["candidate_key"]]}
             document["coverage"][0]["evidence_uses"] = [use]
             document["evidence_reuse_set"] = [use]
-            document["additional_evidence_bindings"] = [self.entry]
+            document["source_bindings"]["selected_evidence_bindings"] = [target_adoption_binding(self.entry)]
+        if self.scientific_entry is not None:
+            document["source_bindings"]["selected_evidence_bindings"].append(self.scientific_entry)
         return _with_derived_answer_contract_hash(document, request)
 
 
@@ -72,16 +80,26 @@ class _Reasoning(_MultiRunReasoningSkill):
 
 @pytest.mark.parametrize("input_kind", ["evidence_ref", "asset_version_ref"])
 def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_evaluation(tmp_path, input_kind):
-    plan, bundle = _Plan(), _Bundle()
+    _workproduct_plan_selection(tmp_path, input_kind, check_cleanup=True)
+
+
+@pytest.mark.parametrize("input_kind", ["evidence_ref", "asset_version_ref"])
+def test_protected_workproduct_and_scientific_outcome_feed_the_next_plan(tmp_path, input_kind):
+    _workproduct_plan_selection(tmp_path, input_kind, check_cleanup=False)
+
+
+def _workproduct_plan_selection(tmp_path, input_kind, *, check_cleanup):
+    plan, bundle, reasoning = _Plan(), _Bundle(), _Reasoning(entry_stage="plan")
     runtime = fixtures.build_production_runtime(fixtures.prepare_data_root(tmp_path / "workproduct"),
         proposal_drafter=SnapshotAwareProposalDrafter(),
         intent_drafting_provider=fixtures._DeterministicDraftingAdapter(),
         host_compute_probe=DeterministicProbe(), deepfetch_provider=DeterministicDeepFetchProvider(),
         acquisition_provider=DeterministicAcquisitionProvider(),
         idea_skill_provider=_MultiRunIdeaSkill(), plan_skill_provider=plan, bundle_skill_provider=bundle,
-        reasoning_skill_provider=_Reasoning(entry_stage="plan"),
+        reasoning_skill_provider=reasoning,
         harness_adapters=(fixtures._FullConformanceAdapter("codex"),),
         power_inhibitor=fixtures._TogglePowerInhibitor())
+    plan.page_reader = runtime.owners.research_graph.query_plan_evidence_page
     try:
         quest = _confirm_deepfetch_quest(runtime)
         fixtures._finish_idea_stage(runtime)
@@ -120,9 +138,31 @@ def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_eva
         runtime.owners.agent_runtime.publish_target_root_completion(target_ref=handle.target_ref,
             completion_ref=completed.completion_ref, target_commit_ref=completed.target_commit_ref)
         graph = runtime.owners.research_graph
+        _, exact_sources = graph.query_plan_evidence_catalog(quest_ref=quest["quest_ref"],
+            target_commit_refs=(completed.target_commit_ref,), current_only=False)
+        evidence_version = exact_sources[0]["asset_version_ref"]
+        exact = read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
+                             source_ref=completed.target_commit_ref, version_ref=evidence_version)
+        assert exact["text"]
+        adopted = exact["selected_evidence_binding"]
+        assert adopted["source_kind"] == "TargetCommit"
+        assert adopted["reader"] == {"operation": "research_memory.content.read", "args": {
+            "source_ref": completed.target_commit_ref, "version_ref": evidence_version}}
+        assert read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
+                            **adopted["reader"]["args"])["selected_evidence_binding"] == adopted
+        for wrong_scope, wrong_version in (("foreign-quest", evidence_version),
+                                            (quest["quest_ref"], "asset_version_missing")):
+            with pytest.raises(OwnerConflict, match="content_version_unbound"):
+                read_content(graph, runtime.owners.research_memory, quest_ref=wrong_scope,
+                             source_ref=completed.target_commit_ref, version_ref=wrong_version)
         cleanup = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
-        assert len(cleanup) == 1 and cleanup[0]["action"] == "removed" and cleanup[0]["bytes"] > 0, cleanup
-        assert not workspace.exists()
+        if check_cleanup:
+            assert len(cleanup) == 1 and cleanup[0]["action"] == "removed" and cleanup[0]["bytes"] > 0, cleanup
+            assert not workspace.exists()
+        else:
+            assert len(cleanup) == 1 and cleanup[0]["action"] == "skipped", cleanup
+            assert cleanup[0]["reason"] == "cycle_incomplete"
+            assert cleanup[0]["bytes"] == 0 and workspace.exists()
         assert runtime.owners.research_memory.materialize_asset(retained.binding.version_ref).content == output
         facts = graph.query_target_formal_results(handle.target_ref)
         assert len(facts) == 1 and facts[0]["variant_run"]["status"] == "executed"
@@ -135,6 +175,11 @@ def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_eva
         plan.entry = entries[0]
         bundle.input_ref = entries[0][input_kind]
         _finish_stage(runtime, "reasoning")
+        scientific_ref = reasoning._result_parts(reasoning.requests[0])[0]["outcome_ref"]
+        scientific = read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
+                                  source_ref=scientific_ref, version_ref=scientific_ref)
+        plan.scientific_entry = scientific["selected_evidence_binding"]
+        assert plan.scientific_entry["source_kind"] == "ScientificOutcome"
         next_cycle = runtime.owners.advancement_engine.query_foreground(quest["quest_ref"])["cycle_ref"]
         assert next_cycle != quest["cycle_ref"]
         _finish_stage(runtime, "plan")
@@ -148,6 +193,7 @@ def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_eva
                     break
         assert second_graph is not None
         accepted = request.accepted_formal_plan
+        assert plan.scientific_entry in accepted.plan_document["source_bindings"]["selected_evidence_bindings"]
         assert accepted.plan_document["gap_set"] and accepted.plan_document["experiment_briefs"]
         leaves = graph.resolve_plan_evidence_reuse_leaves(quest_ref=quest["quest_ref"], accepted_formal_plan=accepted)
         assert len(leaves) == 1 and leaves[0].role == "WorkProduct"

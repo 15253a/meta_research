@@ -683,6 +683,7 @@ def _plan_evidence_operations(
             }, "required": ["target_commit_ref", "asset_version_ref", "content_hash", "role_ref", "offset", "limit"], "additionalProperties": False},
             output_schema={"type": "object", "properties": {
                 "context_pack_ref": _string(), "source_binding": {"type": "object"},
+                "selected_evidence_binding": {"type": "object"},
                 "frozen_for_plan": {"type": "boolean"}, "text": {"type": "string"},
                 "total_characters": {"type": "integer"},
                 "next_offset": {"type": "integer"},
@@ -760,8 +761,10 @@ def _read_plan_evidence_content(advancement_engine, agent_runtime, research_grap
     body = materialized.content.decode("utf-8")
     offset, limit = arguments["offset"], arguments["limit"]
     next_offset = offset + limit
+    from meta_research.target_commit_evidence import target_adoption_binding
     return {
         "context_pack_ref": request.context_pack_ref, "source_binding": binding,
+        "selected_evidence_binding": target_adoption_binding(binding),
         "frozen_for_plan": frozen is not None, "text": body[offset:next_offset],
         "total_characters": len(body),
         **({"next_offset": next_offset} if next_offset < len(body) else {}),

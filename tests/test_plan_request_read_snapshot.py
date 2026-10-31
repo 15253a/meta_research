@@ -11,6 +11,26 @@ from test_public_plan_stage import (
 )
 
 
+def test_plan_request_does_not_scan_a_discovery_page_before_research(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path / 'no-plan-prefetch', idea_skill=_DeterministicIdeaSkill(),
+                       plan_skill=_DeterministicPlanSkill(no_gap=False))
+    try:
+        quest = _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        page_reader = Mock(side_effect=AssertionError('Plan must discover sources on demand'))
+        monkeypatch.setattr(runtime.owners.research_graph, 'query_plan_evidence_page', page_reader)
+
+        assert runtime.plan_stage.process_once()
+        request = runtime.owners.advancement_engine.query_plan_stage_request(quest['cycle_ref'])
+
+        assert request.context_pack['evidence_catalog'] == []
+        assert request.context_pack['evidence_reference_revision'] == 0
+        assert 'evidence_catalog_page' not in request.context_pack
+        page_reader.assert_not_called()
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize('stage', ['idea', 'plan'])
 def test_stage_request_cut_preserves_epoch_and_write_boundary(tmp_path, monkeypatch, stage):
     runtime = _runtime(tmp_path / 'plan-request', idea_skill=_DeterministicIdeaSkill(),

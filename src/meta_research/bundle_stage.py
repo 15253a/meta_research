@@ -311,7 +311,7 @@ class BundleStageWorker:
         accepted_formal_plan = request.accepted_formal_plan
         if accepted_formal_plan is None:
             raise OwnerConflict("bundle_formal_plan_binding_invalid")
-        if accepted_formal_plan.plan_document.get("gap_set") == []:
+        if accepted_formal_plan.plan_document.get("experiment_briefs") == []:
             if (
                 self._advancement_engine.query_bundle_stage_commit(request.request_ref)
                 is not None

@@ -269,6 +269,39 @@ def test_codex_adapter_generates_a_schema_checked_proposal_outside_domain_state(
     assert timeout > 0
 
 
+@pytest.mark.parametrize("companion_fork", [False, True])
+def test_question_drafting_allows_empty_optional_background_and_constraints(
+    tmp_path: Path, companion_fork: bool,
+) -> None:
+    from jsonschema import Draft202012Validator
+
+    question = {**QUESTION, "background_context": "", "requirements_constraints": ""}
+    output = (
+        {"proposal_fork_native_session_ref": "proposal-child:1", "content": question}
+        if companion_fork else question
+    )
+    runner = RecordingRunner(output, thread_id="companion-native-1")
+    adapter = (
+        CodexCompanionAdapter(tmp_path / "drafting", process_runner=runner)
+        if companion_fork else CodexDraftingAdapter(
+            tmp_path / "drafting", process_runner=runner, version_runner=_locked_codex_version,
+        )
+    )
+
+    result = adapter.draft(
+        ProposalDraftRequest(
+            initialization_id="quest-init-optional-question-fields",
+            draft_revision=1,
+            draft_hash="b" * 64,
+            draft={"goal": "研究稀有形态", "completion_criteria": "说明有据的答案与限制"},
+            companion_native_session_ref="companion-native-1" if companion_fork else None,
+        )
+    )
+
+    assert result.content == question
+    Draft202012Validator(runner.schemas[0]).validate(output)
+
+
 def test_companion_proposal_fork_returns_public_content_without_replacing_root_session(
     tmp_path: Path,
 ) -> None:
@@ -298,6 +331,28 @@ def test_companion_proposal_fork_returns_public_content_without_replacing_root_s
     assert result.adapter_kind == "codex_companion_fork"
     assert result.companion_native_session_ref == "companion-native-1"
     assert result.proposal_fork_native_session_ref == "proposal-drafter-native-1"
+
+
+@pytest.mark.parametrize(
+    "field", ["title", "unknown_statement", "answer_shape", "applicability_scope"],
+)
+def test_question_drafting_still_rejects_a_missing_core_field(
+    tmp_path: Path, field: str,
+) -> None:
+    question = {**QUESTION, field: " ", "background_context": "", "requirements_constraints": ""}
+    adapter = CodexDraftingAdapter(
+        tmp_path / "drafting", process_runner=RecordingRunner(question),
+        version_runner=_locked_codex_version,
+    )
+    with pytest.raises(DraftingUnavailable, match="codex_proposal_invalid"):
+        adapter.draft(
+            ProposalDraftRequest(
+                initialization_id="quest-init-missing-core",
+                draft_revision=1,
+                draft_hash="c" * 64,
+                draft={"goal": "研究稀有形态", "completion_criteria": "说明有据的答案与限制"},
+            )
+        )
 
 
 def test_codex_proposal_marks_a_literature_snapshot_as_untrusted_data(

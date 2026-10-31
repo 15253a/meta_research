@@ -43,7 +43,7 @@ class _GenericPlan(_DeterministicPlanSkill):
             ref=page['items'][0]['reader']['version_ref']
             revision=memory.query_question_literature_revision_ref(question_ref=page['items'][0]['question_ref'],revision_ref=ref)
             ref=revision['literature_snapshot_ref']
-            allowed=_plan_document_schema(request)['properties']['additional_evidence_bindings']['items']['anyOf'][1]['properties']['source_kind']['enum']
+            allowed=_plan_document_schema(request)['properties']['selected_evidence_bindings']['items']['properties']['source_kind']['enum']
             assert self.kind in allowed
             reader={'source_ref':ref,'version_ref':ref}
         else:
@@ -53,12 +53,9 @@ class _GenericPlan(_DeterministicPlanSkill):
         read=read_content(graph,memory,quest_ref=quest,human_collaboration=runtime.owners.human_collaboration,**reader)
         assert read['text']
         self.reads.append(read)
-        entry={'schema_ref':'meta-research/evidence-source-ref/v1','evidence_ref':ref,'source_kind':self.kind,'source_ref':ref}
-        # Only the fixture document builder sees its selected source as a page;
-        # the accepted request remains unchanged and Owner verifies the real ref.
-        construction={**request.context_pack,'evidence_catalog':[entry]}
-        document=super()._document(replace(request,context_pack=construction))
-        document['additional_evidence_bindings']=[entry]
+        entry=read['selected_evidence_binding']
+        self.selected_evidence_bindings=[entry]
+        document=super()._document(request)
         document['coverage'][0]['evidence_uses'][0]['supported_claim']='The source records the observation and its context.'
         document['coverage'][0]['evidence_uses'][0]['support_boundary']='A reported observation; no causal or experimental claim.'
         return _with_derived_answer_contract_hash(document,request)
@@ -95,7 +92,7 @@ def test_generic_source_discovery_read_formal_plan_and_rebuilt_reasoning_closure
         submission=runtime.plan_stage.query_current()['run']['submission_ref']
         stored=runtime.owners.research_memory.query_plan_document(submission)
         assert stored.plan_document==accepted.plan_document
-        selected=accepted.plan_document['source_bindings']['selected_evidence_catalog']
+        selected=accepted.plan_document['source_bindings']['selected_evidence_bindings']
         assert selected[0]['source_kind']==kind
         leaves=runtime.owners.research_graph.resolve_plan_evidence_reuse_leaves(
             quest_ref=quest['quest_ref'],accepted_formal_plan=accepted)

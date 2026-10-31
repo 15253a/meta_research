@@ -1028,6 +1028,39 @@ def _autonomous_checkpoint_fixture(request):
     return _checkpoint(SimpleNamespace(request_ref=request.stage_request_ref, context_pack=request.context_pack, cycle_ref=request.cycle_ref, epoch=request.foreground_epoch, accepted_question=SimpleNamespace(question_ref=request.question_ref, quest_ref=request.quest_ref)), question_title="A literature-informed follow-up")
 
 
+def test_autonomous_question_checkpoint_accepts_empty_optional_fields() -> None:
+    from jsonschema import Draft202012Validator
+
+    request = _request()
+    checkpoint = _autonomous_checkpoint_fixture(request)
+    question = checkpoint["autonomous_scope"]["question_blueprint"]
+    question["background_context"] = ""
+    question["requirements_constraints"] = ""
+    checkpoint["scientific_outcome"]["notes"] = ""
+
+    validate_reasoning_skill_draft(request, ReasoningSkillDraft(
+        draft=checkpoint, primary_session_ref="provider-session:optional-question",
+        adapter_kind="deterministic-test",
+    ))
+    schema = _reasoning_autonomous_checkpoint_schema(request)
+    Draft202012Validator(schema).validate(checkpoint)
+
+
+@pytest.mark.parametrize(
+    "field", ["title", "unknown_statement", "answer_shape", "applicability_scope"],
+)
+def test_autonomous_question_checkpoint_rejects_a_missing_core(field: str) -> None:
+    request = _request()
+    checkpoint = _autonomous_checkpoint_fixture(request)
+    checkpoint["autonomous_scope"]["question_blueprint"][field] = " "
+
+    with pytest.raises(ReasoningContractError, match="autonomous_question_six_fields_incomplete"):
+        validate_reasoning_skill_draft(request, ReasoningSkillDraft(
+            draft=checkpoint, primary_session_ref="provider-session:missing-core",
+            adapter_kind="deterministic-test",
+        ))
+
+
 def _autonomous_resume_fixture(
     request: ReasoningSkillRequest,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:

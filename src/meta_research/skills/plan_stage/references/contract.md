@@ -47,13 +47,15 @@ CoverageDecision
   insufficiency | null
 ```
 
-每项义务恰出现一次。`covered` 至少有一个实际 EvidenceUse，`insufficiency=null`，没有对应 Brief。`gap` 说明不足，可保留部分 evidence use，至少由一个 Brief 覆盖。明确检索范围内证据不足可支持 gap；空分页或未展示条目不证明全库不存在。来源不可用、receipt／hash 冲突和未知结果先作为技术问题处理。
+每项义务恰出现一次。`covered` 至少有一个实际 EvidenceUse，`insufficiency=null`，没有对应 Brief。`gap` 以非空 insufficiency 说明不足，可保留部分 evidence use；未安排时同时说明本轮不安排的理由、依据与限制。明确检索范围内证据不足可支持 gap；空分页或未展示条目不证明全库不存在。来源不可用、receipt／hash 冲突和未知结果先作为技术问题处理。
 
 ## Brief 与后继
 
-每个 Brief 有 Plan 内唯一 `experiment_key`、一个或多个 gap obligation keys、goal、characteristics、boundary constraints、semantic delta 和实际 Idea 来源。全部且只有 gap 需被 Brief 覆盖。Plan 不形成 Target 身份、执行 DAG、Worker 或调度。
+每个 Brief 有 Plan 内唯一 `experiment_key`、非空且本 Brief 内不重复的合法 gap obligation keys、goal、characteristics、boundary constraints、semantic delta 和实际 Idea 来源。可只推进部分 gap，多份 Brief 也可推进同一 gap。可选 `reuse_material_refs[]` 用 evidence_ref 引用统一采用集合中的计划复用材料，省略或为空均合法；Bundle 再按实际用途选择实施输入。Plan 不形成 Target 身份、执行 DAG、Worker 或调度。
 
-全部 covered 且无 Brief → `no_new_experiment_required`；存在 gap 且均有 Brief → `experiments_required`。前者只给 Bundle skip 候选，由 AE 核验后形成 `StageCommit(Skipped)`。
+Brief 为空 → `no_new_experiment_required`；有 Brief → `experiments_required`。前者由 AE 按已接纳 Plan 形成 `StageCommit(Skipped)`，Reasoning 仍消费完整 Plan、采用来源、真实缺口及未安排理由。Plan 接纳与 Bundle skip 分别表达规划与路由，科研判断由 Reasoning 综合。
+
+`source_bindings.selected_evidence_bindings` 原样保存 Plan 提交的完整采用集合，包括只被 Brief 引用的材料。`evidence_reuse_set` 只从各 CoverageDecision 的 EvidenceUse 派生，不能重建或裁剪该集合。后续 Target 的新交付沿正式接纳、Bundle 整理与 Reasoning 综合进入研究积累，已接纳 Plan 保持当时判断。
 
 ## 接纳交接
 

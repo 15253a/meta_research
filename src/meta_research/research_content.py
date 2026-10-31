@@ -20,7 +20,47 @@ def _quest(agent_runtime, context):
     return scope["quest_ref"]
 
 
-def read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, offset=0, limit=8192, human_collaboration=None):
+def read_content(graph, memory, *, quest_ref, source_ref, version_ref, **arguments):
+    page = _read_content(graph, memory, quest_ref=quest_ref,
+                         source_ref=source_ref, version_ref=version_ref, **arguments)
+    # Return the Owner's exact adoption identity once the source is read. A
+    # discovery title or a work-folder path never creates this authority.
+    leaf = graph.resolve_reasoning_historical_evidence_leaf(quest_ref=quest_ref, ref=source_ref)
+    if leaf is not None and leaf.get("kind") in {"AssetVersion", "HumanInput", "ScientificOutcome", "LiteratureSnapshot"}:
+        page["selected_evidence_binding"] = adopted_source_binding(
+            graph, quest_ref=quest_ref, source_ref=source_ref, leaf=leaf)
+    return page
+
+
+def adopted_source_binding(graph, *, quest_ref, source_ref, leaf=None):
+    """Project an existing accepting Owner identity and its accurate reader."""
+    if leaf is None:
+        leaf = graph.resolve_reasoning_historical_evidence_leaf(quest_ref=quest_ref, ref=source_ref)
+    if leaf is None or leaf.get("kind") not in {"AssetVersion", "HumanInput", "ScientificOutcome", "LiteratureSnapshot"}:
+        raise OwnerConflict("plan_evidence_source_invalid")
+    kind = leaf["kind"]
+    binding = (graph.verify_asset_quest_scope(source_ref, quest_ref=quest_ref).as_dict()
+               if kind == "AssetVersion" else leaf)
+    version_ref = leaf["content_hash"] if kind == "HumanInput" else source_ref
+    return {"evidence_ref": source_ref, "source_kind": kind, "source_ref": source_ref,
+            "source_binding": binding,
+            "reader": {"operation": "research_memory.content.read",
+                       "args": {"source_ref": source_ref, "version_ref": version_ref}}}
+
+
+def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, offset=0, limit=8192, human_collaboration=None):
+    if source_ref.startswith("target_commit_"):
+        # The same accurate reader remains usable by downstream roles. The
+        # accepting Owners resolve the actual commit and exact retained version.
+        _, catalog = graph.query_plan_evidence_catalog(quest_ref=quest_ref,
+            target_commit_refs=(source_ref,), current_only=False)
+        binding = next((item for item in catalog if item["asset_version_ref"] == version_ref), None)
+        if binding is None:
+            raise OwnerConflict("content_version_unbound")
+        from meta_research.target_commit_evidence import target_adoption_binding
+        page = memory.read_asset_content_page(version_ref, entry_path=entry_path, offset=offset, limit=limit)
+        return {**page, "source_ref": source_ref, "version_ref": version_ref,
+                "selected_evidence_binding": target_adoption_binding(binding)}
     if source_ref.startswith("literature_snapshot_"):
         if version_ref != source_ref:
             raise OwnerConflict("content_version_unbound")

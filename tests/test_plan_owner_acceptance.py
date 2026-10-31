@@ -144,9 +144,11 @@ class _DoiInsteadOfSnapshotPlan(_GenericPlan):
     def _document(self, request):
         document = super()._document(request)
         if not request.owner_feedback:
-            selected = document["source_bindings"]["selected_evidence_catalog"][0]
+            selected = document["source_bindings"]["selected_evidence_bindings"][0]
             wrong_ref = "doi:10.1234/read-paper"
             selected["evidence_ref"] = selected["source_ref"] = wrong_ref
+            selected["source_binding"]["ref"] = wrong_ref
+            selected["reader"]["args"]["source_ref"] = selected["reader"]["args"]["version_ref"] = wrong_ref
             for use in document["evidence_reuse_set"]:
                 use["evidence_ref"] = wrong_ref
             for coverage in document["coverage"]:

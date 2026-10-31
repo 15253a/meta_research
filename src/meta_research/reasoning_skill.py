@@ -36,6 +36,11 @@ from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
+from meta_research.quest_drafting import (
+    QUESTION_CONTENT_GUIDANCE,
+    QUESTION_FIELD_MAX_LENGTHS,
+    REQUIRED_QUESTION_FIELDS,
+)
 from meta_research.runtime_binding_compatibility import reasoning_bindings_compatible
 from meta_research.root_capabilities import (
     ROOT_ROLE_OPERATION_DELTAS,
@@ -1239,6 +1244,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "改为返回非终态 reasoning-autonomous-checkpoint：同一 scientific_outcome 加"
             "一个 internal AutonomousQuestionScope；它只包含 reviewed question blueprint、"
             "mode、entry stage 与 typed skip basis，绝不能伪装成 outward transition。"
+            f"{QUESTION_CONTENT_GUIDANCE}"
             "正式建题必须先经现有 AutonomousCreation 的 DeepFetch 了解当前研究现状，"
             "再按上述 Skill 调整候选并决定是否创建。"
             "NextCycleProposal 必须闭合 entry_stage 与 exact typed skip basis；"
@@ -1755,15 +1761,12 @@ def _reasoning_autonomous_checkpoint_schema(
 ) -> dict[str, object]:
     text = {"type": "string", "minLength": 1}
     question_properties = {
-        field: text
-        for field in (
-            "title",
-            "unknown_statement",
-            "answer_shape",
-            "applicability_scope",
-            "background_context",
-            "requirements_constraints",
-        )
+        field: {
+            "type": "string",
+            "minLength": 1 if field in REQUIRED_QUESTION_FIELDS else 0,
+            "maxLength": maximum,
+        }
+        for field, maximum in QUESTION_FIELD_MAX_LENGTHS.items()
     }
     source = _reasoning_source_properties(request)
     scope_base_properties = {

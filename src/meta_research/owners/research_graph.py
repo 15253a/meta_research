@@ -3400,6 +3400,8 @@ class SQLiteResearchGraphReceiptVerifier:
             )
         ):
             raise OwnerConflict("plan_evidence_catalog_invalid")
+        if expected_reference_revision == 0 and not evidence_catalog and not selected_evidence_refs:
+            return
         authority = self._target_commit_evidence_authority
         if authority is None:
             if (
@@ -5026,48 +5028,10 @@ class SQLiteResearchGraphReceiptVerifier:
             review_hash=row.review_hash,
             receipt=plan_content_receipt,
         )
-        selected_evidence_refs = (
-            self._plan_content_verifier.query_plan_selected_evidence_refs(
-                submission_ref=row.submission_ref,
-                content_ref=row.plan_content_ref,
-                receipt=plan_content_receipt,
-            )
-        )
-        selected_catalog = self._plan_content_verifier.query_plan_selected_evidence_catalog(
-            submission_ref=row.submission_ref,
-            content_ref=row.plan_content_ref,
-            receipt=plan_content_receipt,
-        )
-        try:
-            evidence_catalog = selected_plan_evidence_catalog(
-                {"source_bindings": {"selected_evidence_catalog": selected_catalog},
-                 "evidence_reuse_set": [{"evidence_ref": ref} for ref in selected_evidence_refs]},
-                evidence_catalog,
-            )
-        except PlanContractError as error:
-            raise OwnerConflict(str(error)) from error
-        evidence_revision = len(evidence_catalog)
-        try:
-            self.verify_plan_evidence_catalog(
-                quest_ref=row.quest_ref,
-                evidence_catalog=evidence_catalog,
-                expected_reference_revision=evidence_revision,
-                # Decision creation already performed the current-state CAS. A
-                # later Bundle may add evidence without invalidating this cut.
-                require_current=False,
-                require_complete=False,
-                selected_evidence_refs=selected_evidence_refs,
-            )
-        except OwnerConflict as error:
-            # A signed rejection remains readable with the exact source error
-            # it rejects. It never authorizes an accepted FormalPlan or waives
-            # the remaining content, request and execution receipt checks.
-            if not (
-                row.decision == "rejected"
-                and row.reason_code == "plan_evidence_source_invalid"
-                and error.code == row.reason_code
-            ):
-                raise
+        # Exact signed RM content and RG decision receipts bind the adopted
+        # sources already admitted at Plan acceptance. Reading an accepted fact
+        # does not reopen domain admission or traverse its source graph. Current
+        # access, revocation and execution qualifications remain with their Owners.
         if self._execution_verifier is None:
             raise OwnerConflict("attempt_execution_verifier_unavailable")
         self._execution_verifier.verify_attempt_execution_receipt(
@@ -7497,6 +7461,7 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
     def bind_literature_source_reader(self, reader) -> None:
         self._literature_source_reader = reader
 
+    @snapshot_cached
     def resolve_reasoning_historical_evidence_leaf(
         self,
         *,
@@ -17418,18 +17383,12 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
                     AND p.plan_document_hash = d.plan_document_hash
                 JOIN rg_question_lifecycle shared ON shared.question_ref = d.question_ref
                     AND shared.quest_ref = d.quest_ref
-                JOIN ae_stage_run_requests request ON request.request_ref = d.request_ref
-                JOIN json_each(json_patch(
-                    json_object('frozen', json_extract(request.context_pack_json, '$.evidence_catalog')),
-                    json_object('selected', json_extract(p.plan_document_json, '$.source_bindings.selected_evidence_catalog'))
-                )) catalogs
-                JOIN json_each(catalogs.value) frozen
-                JOIN json_each(p.plan_document_json, '$.evidence_reuse_set') reuse
+                JOIN json_each(p.plan_document_json, '$.source_bindings.selected_evidence_bindings') adopted
                 WHERE d.quest_ref = g.quest_ref AND d.decision = 'accepted'
                     AND shared.status = 'active'
-                    AND json_extract(reuse.value, '$.evidence_ref') = json_extract(frozen.value, '$.evidence_ref')
-                    AND json_extract(frozen.value, '$.asset_version_ref') = r.version_ref
-                    AND json_extract(frozen.value, '$.target_commit_root_ref') = c.commit_ref
+                    AND json_extract(adopted.value, '$.source_kind') = 'TargetCommit'
+                    AND json_extract(adopted.value, '$.source_binding.asset_version_ref') = r.version_ref
+                    AND json_extract(adopted.value, '$.source_binding.target_commit_root_ref') = c.commit_ref
             ))""")
         base = """ FROM rg_target_commits c
             JOIN rg_targets t ON t.target_ref = c.target_ref
@@ -19788,21 +19747,13 @@ def _idea_decision(row) -> IdeaOutcomeDecision:
     )
 
 
-def _selected_plan_evidence_refs(
-    plan_document: dict[str, object],
-) -> frozenset[str]:
-    reuse_set = plan_document.get("evidence_reuse_set")
-    if not isinstance(reuse_set, list):
-        raise OwnerConflict("plan_evidence_reuse_set_invalid")
-    refs: set[str] = set()
-    for use in reuse_set:
-        if not isinstance(use, dict):
-            raise OwnerConflict("plan_evidence_reuse_set_invalid")
-        evidence_ref = use.get("evidence_ref")
-        if not isinstance(evidence_ref, str) or not evidence_ref:
-            raise OwnerConflict("plan_evidence_reuse_set_invalid")
-        refs.add(evidence_ref)
-    return frozenset(refs)
+def _selected_plan_evidence_refs(plan_document: dict[str, object]) -> frozenset[str]:
+    bindings = plan_document.get("source_bindings", {})
+    selected = bindings.get("selected_evidence_bindings") if isinstance(bindings, dict) else None
+    if not isinstance(selected, list) or any(not isinstance(item, dict)
+            or not isinstance(item.get("evidence_ref"), str) or not item["evidence_ref"] for item in selected):
+        raise OwnerConflict("plan_selected_evidence_invalid")
+    return frozenset(item["evidence_ref"] for item in selected)
 
 
 def _evaluate_formal_plan(

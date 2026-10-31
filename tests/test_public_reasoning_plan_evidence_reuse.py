@@ -66,7 +66,7 @@ class _EvidenceReuseAuthority(_FixtureTargetCommitEvidenceAuthority):
                 str(item["evidence_ref"]) for item in evidence_reuse_set
             ),
         )
-        evidence = evidence_catalog[0]
+        evidence = evidence_catalog[0]["source_binding"]
         target_commit_ref = str(evidence["target_commit_root_ref"])
         formal_receipt = AcceptanceReceipt(
             issuer="research_graph",

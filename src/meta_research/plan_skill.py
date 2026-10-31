@@ -21,6 +21,7 @@ from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
     IdeaSkillUnavailable,
     _DISABLED_CODEX_FEATURES,
+    _CODEX_JSON_OBJECT_STRING_MARKER,
     _compile_codex_output_schema,
     _codex_harness_manifest,
     _file_sha256,
@@ -467,22 +468,22 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             stage_position_prompt(request, "plan") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{_plan_skill_instructions()}\n\n"
             f"{human_resume}"
-            "Evidence catalog page metadata reports candidate totals, filtering, and next_offset. "
             "Use research_graph.plan_evidence.page to browse further candidates and "
             "research_memory.plan_evidence.read with the exact commit/version/hash/role to read content. "
-            "The initial evidence page is a bounded discovery index, not an exhaustive history. "
-            "Read exact sources before citing them. Additional accepted evidence may be selected "
-            "using its exact Owner catalog binding; the Owner revalidates selected evidence. "
+            "Discovery pages are bounded indexes, not an exhaustive history or an adopted set. "
+            "Read exact sources before citing them, and preserve the adopted binding returned by the reader. "
             "Use research_graph.questions.page, research_graph.question_history.read, human_request.read, "
             "and research_memory.content.read to discover and read "
             "same-Quest human input, earlier ScientificOutcome, or accepted AssetVersion relevant to this Plan. "
-            "For each actually adopted source, put a compact binding in additional_evidence_bindings: "
-            "{schema_ref: meta-research/evidence-source-ref/v1, evidence_ref: the exact source ref, "
-            "source_kind: HumanInput|ScientificOutcome|AssetVersion|LiteratureSnapshot, source_ref: the same exact ref}. "
+            "Return the complete actually adopted set in selected_evidence_bindings, including sources "
+            "used only for ExperimentBrief.reuse_material_refs. Copy the reader's exact selected_evidence_binding "
+            "{evidence_ref, source_kind, source_ref, source_binding, reader} verbatim; "
+            "the source kind is TargetCommit, HumanInput, ScientificOutcome, AssetVersion or LiteratureSnapshot. "
             "Use its evidence_ref in coverage.evidence_uses with the supported claim and support boundary. "
             "Preserve human input scope and distinguish reported opinion from observation or assessment. "
-            "Copy only actually reused later-page EvidenceRef objects verbatim into additional_evidence_bindings "
-            "(maximum 32; [] if none). The adapter stores these in source_bindings.selected_evidence_catalog. "
+            "The adapter preserves the complete set unchanged in source_bindings.selected_evidence_bindings. "
+            "There is no adoption count tied to a discovery page. Briefs may leave documented gaps "
+            "unarranged; explain the insufficiency, reason and limits without claiming them complete. "
             "Never invent receipt/hash fields or copy a discovery summary as an EvidenceRef. "
             "在当前原根中连续完成研究、独立审阅和修订后再交回最终完整候选。"
             "自主委派原生子智能体读取完整草稿和必要依据，聚合其独立反馈并修订；"
@@ -856,6 +857,7 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
                             "items": idea_ref,
                             "uniqueItems": True,
                         },
+                        "reuse_material_refs": {"type": "array", "items": text, "uniqueItems": True},
                     },
                     "required": [
                         "experiment_key",
@@ -865,6 +867,7 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
                         "boundary_constraints",
                         "semantic_delta",
                         "contributing_idea_refs",
+                        "reuse_material_refs",
                     ],
                 },
             },
@@ -954,27 +957,30 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
         schema["required"].remove(field)
     schema["properties"]["notes"] = {"type": "string"}
     schema["required"].append("notes")
-    receipt={"type":"object","additionalProperties":False,
-        "properties":{key:{"type":"string","minLength":1} for key in
-            ("status","issuer","kind","receipt_ref","subject_ref","payload_hash")},
-        "required":["status","issuer","kind","receipt_ref","subject_ref","payload_hash"]}
-    fields=("schema_ref","evidence_ref","asset_version_ref","asset_ref","content_hash",
-        "manifest_hash","target_commit_root_ref","eligibility_token_ref","integrity_receipt_ref",
-        "availability_receipt_ref","currentness_receipt_ref","role_ref")
-    props={key:{"type":"string","minLength":1} for key in fields}
-    props.update(provenance_closure_refs={"type":"array","items":{"type":"string"}},
-        capabilities={"type":"array","items":{"type":"string"}},asset_receipt=receipt,role_receipt=receipt)
-    schema["properties"]["additional_evidence_bindings"]={"type":"array","maxItems":32,
-        "items":{"anyOf":[
-            {"type":"object","additionalProperties":False,"properties":props,"required":list(props)},
-            {"type":"object","additionalProperties":False,
-             "properties":{"schema_ref":{"type":"string","enum":["meta-research/evidence-source-ref/v1"]},
-                "evidence_ref":{"type":"string","minLength":1},
-                "source_kind":{"type":"string","enum":["HumanInput","ScientificOutcome","AssetVersion","LiteratureSnapshot"]},
-                "source_ref":{"type":"string","minLength":1}},
-             "required":["schema_ref","evidence_ref","source_kind","source_ref"]}]}}
-    # Optional scientifically; an empty array is the strict transport spelling.
-    schema["required"].append("additional_evidence_bindings")
+    # Owner bindings vary by source type. Reuse the existing canonical-object
+    # transport rather than imposing a second field allowlist on those bindings.
+    domain_object = {_CODEX_JSON_OBJECT_STRING_MARKER: {
+        "max_collection_items": PROVIDER_RESULT_MAX_BYTES,
+        "max_depth": 64, "max_integer_abs": 2**63 - 1,
+        "max_nodes": PROVIDER_RESULT_MAX_BYTES,
+        "max_serialized_bytes": PROVIDER_RESULT_MAX_BYTES,
+        "max_string_bytes": PROVIDER_RESULT_MAX_BYTES,
+    }}
+    binding_properties = {
+        "evidence_ref": text,
+        "source_kind": {"type": "string", "enum": [
+            "TargetCommit", "HumanInput", "ScientificOutcome", "AssetVersion", "LiteratureSnapshot",
+        ]},
+        "source_ref": text, "source_binding": domain_object,
+        "reader": {"type": "object", "additionalProperties": False,
+                   "properties": {"operation": text, "args": domain_object},
+                   "required": ["operation", "args"]},
+    }
+    schema["properties"]["selected_evidence_bindings"] = {
+        "type": "array", "items": {"type": "object", "additionalProperties": False,
+            "properties": binding_properties, "required": list(binding_properties)},
+    }
+    schema["required"].append("selected_evidence_bindings")
     return schema
 
 
@@ -992,7 +998,9 @@ def _with_derived_answer_contract_hash(
                 plan.setdefault("evidence_reuse_set", uses)
             gaps = [item.get("obligation_key") for item in coverage if item.get("disposition") == "gap"]
             plan.setdefault("gap_set", gaps)
-            plan.setdefault("bundle_disposition", "experiments_required" if gaps else "no_new_experiment_required")
+        briefs = plan.get("experiment_briefs")
+        if isinstance(briefs, list):
+            plan.setdefault("bundle_disposition", "experiments_required" if briefs else "no_new_experiment_required")
         if isinstance(obligations, list) and all(isinstance(item, dict) and isinstance(item.get("idea_relevance"), list) for item in obligations):
             plan.setdefault("idea_trace", [
                 {"idea_ref": ref, "obligation_roles": [
@@ -1003,19 +1011,21 @@ def _with_derived_answer_contract_hash(
                 if any(isinstance(relevance,dict) and relevance.get("idea_ref")==ref
                     for item in obligations for relevance in item["idea_relevance"])
             ])
-        additional = plan.pop("additional_evidence_bindings", [])
+        selected = plan.pop("selected_evidence_bindings", None)
         plan.setdefault("source_bindings", {
             "question_ref": request.question_ref, "idea_set_ref": request.idea_set_ref,
             "context_pack_ref": request.context_pack_ref, "context_pack_hash": request.context_pack_hash,
             "evidence_reference_revision": request.context_pack.get("evidence_reference_revision", 0),
         })
-        if additional:
-            source=dict(plan["source_bindings"])
-            existing=source.get("selected_evidence_catalog")
-            if existing is not None and existing!=additional:
-                raise PlanSkillContractError("plan_selected_evidence_catalog_conflict")
-            source["selected_evidence_catalog"]=additional
-            plan["source_bindings"]=source
+        if not isinstance(plan["source_bindings"], dict):
+            raise PlanSkillContractError("plan_document_source_invalid")
+        source = dict(plan["source_bindings"])
+        if selected is not None:
+            existing = source.get("selected_evidence_bindings")
+            if existing is not None and existing != selected:
+                raise PlanSkillContractError("plan_selected_evidence_bindings_conflict")
+            source["selected_evidence_bindings"] = selected
+        plan["source_bindings"] = source
     answer_contract = plan.get("answer_contract")
     if not isinstance(answer_contract, dict):
         return plan
