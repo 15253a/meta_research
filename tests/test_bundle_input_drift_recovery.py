@@ -232,14 +232,26 @@ def test_equal_length_business_input_change_still_requires_owner_correction(tmp_
     assert len(runner.calls) == 1
 
 
-def test_input_correction_creates_new_attempt_and_operation_with_same_native_session(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fresh_replacement", [False, True], ids=["bound-root", "fresh-replacement"])
+def test_input_correction_creates_new_attempt_and_operation_with_same_native_session(tmp_path, monkeypatch, fresh_replacement):
     runtime = _current_bundle_runtime(tmp_path / "owner")
     try:
-        _graph, _target, original, _dispatch, _launch = _ready_launch(runtime)
+        graph, _target, original, _dispatch, _launch = _ready_launch(runtime)
+        owner = runtime.owners.agent_runtime
+        if fresh_replacement:
+            from test_bundle_native_replacement import _unavailable_proof
+            owner.begin_provider_unit(unit_ref="input-drift-unavailable", operation_ref=original.review_invocation.operation_ref,
+                run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref, unit_kind="bundle_review")
+            owner.record_stage_provider_hard_ceiling(unit_ref="input-drift-unavailable", run_ref=original.run_ref,
+                attempt_ref=original.attempt_ref, fence_ref=original.fence_ref, failure_code="codex_native_session_unavailable",
+                provider_exit=_unavailable_proof(original.native_session_ref))
+            original = owner.query_bundle_stage_run(original.request_ref)
+            assert original.native_session_ref is None
+        observed_native = "native:input-drift-replacement" if fresh_replacement else original.native_session_ref
         provider_path = tmp_path / "adapter"
         provider_path.mkdir()
         adapter, runner = _adapter(provider_path, _output("dispatch"), durable=True,
-            native_session_ref=original.native_session_ref)
+            native_session_ref=observed_native)
         # Use actual admitted Owner identities while retaining deterministic
         # provider output and the production durable invocation/correction path.
         monkeypatch.setattr(adapter, "runtime_binding", lambda: original.runtime_binding)
@@ -252,23 +264,34 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         monkeypatch.setattr(adapter, "_invoke_with_resident_mcp", invoke)
         request = replace(
             _request(adapter, "dispatch"), stage_request_ref=original.request_ref,
+            cycle_ref=original.cycle_ref,
+            cycle_position=runtime.owners.advancement_engine.query_stage_request_by_ref(original.request_ref).context_pack["cycle_position"],
             run_ref=original.run_ref, attempt_ref=original.attempt_ref,
             fence_ref=original.fence_ref, root_session_ref=original.root_session_ref,
+            graph_ref=graph.graph_ref,
             native_session_ref=original.native_session_ref, job_ref=original.review_invocation.operation_ref,
             inbox_checkpoint=_inbox_checkpoint(run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref),
         )
-        adapter.schedule_target(request)
+        if fresh_replacement:
+            stage_request = runtime.owners.advancement_engine.query_stage_request_by_ref(original.request_ref)
+            context = runtime.bundle_stage._rolling_replacement_context(stage_request, original, graph, ())
+            request = replace(request, native_replacement_context=context)
+        unit_ref = "bundle-input-cut-recovery"
+        owner.begin_provider_unit(unit_ref=unit_ref, operation_ref=original.review_invocation.operation_ref,
+            run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref, unit_kind="bundle_review")
+        completed = adapter.schedule_target(request)
+        assert completed.native_session_ref == observed_native
+        # The signed result exists, but its acknowledgement never reached AR.
+        assert owner.query_bundle_stage_run(original.request_ref).native_session_ref == original.native_session_ref
         original_operation = next((provider_path / "provider/provider-operations").glob("*/*"))
         original_files = {path.name: path.read_bytes() for path in original_operation.iterdir() if path.is_file()}
+        assert json.loads(original_files["invocation.json"])["payload"]["native_session_ref"] == original.native_session_ref
+        if fresh_replacement:
+            assert "resume" not in runner.calls[0][0]
         with pytest.raises(IdeaSkillUnavailable) as failed:
             adapter.schedule_target(_changed(request, "dispatch"))
-        owner = runtime.owners.agent_runtime
-        unit_ref = "bundle-input-cut-recovery"
-        owner.begin_provider_unit(
-            unit_ref=unit_ref, operation_ref=original.review_invocation.operation_ref,
-            run_ref=original.run_ref, attempt_ref=original.attempt_ref,
-            fence_ref=original.fence_ref, unit_kind="bundle_review",
-        )
+        assert failed.value.code == "bundle_review_result_contract_invalid"
+        assert failed.value.recovery_checkpoint["native_session_ref"] == observed_native
         owner.record_stage_provider_hard_ceiling(
             unit_ref=unit_ref, run_ref=original.run_ref,
             attempt_ref=original.attempt_ref, fence_ref=original.fence_ref,
@@ -279,7 +302,10 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         assert successor.fence_ref != original.fence_ref
         assert successor.review_invocation.operation_ref != original.review_invocation.operation_ref
         assert successor.root_session_ref == original.root_session_ref
-        assert successor.native_session_ref == original.native_session_ref
+        assert successor.native_session_ref == observed_native
+        if fresh_replacement:
+            assert successor.primary_draft is None and successor.execution is None
+        assert runtime.owners.research_graph.query_target_graph(original.request_ref) == graph
         feedback = owner.query_stage_provider_correction_feedback(
             run_ref=successor.run_ref, attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref,
         )
@@ -287,6 +313,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         assert feedback["provider_unit_ref"] == unit_ref
         assert len(runner.calls) == 1
         next_request = replace(_changed(request, "dispatch"),
+            native_session_ref=successor.native_session_ref, native_replacement_context=None,
             attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref,
             job_ref=successor.review_invocation.operation_ref,
             inbox_checkpoint=_inbox_checkpoint(run_ref=successor.run_ref,
@@ -299,7 +326,10 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         for operation in operations:
             invocation = json.loads((operation / "invocation.json").read_text())["payload"]
             assert invocation["transport_mode"] == "durable_supervisor"
-            assert invocation["native_session_ref"] == original.native_session_ref
+            assert invocation["native_session_ref"] in {original.native_session_ref, observed_native}
+            if operation != original_operation:
+                assert invocation["native_session_ref"] == observed_native
+        assert runner.calls[-1][0][-3:] == ["resume", observed_native, "-"]
     finally:
         runtime.close()
 

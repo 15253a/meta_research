@@ -283,3 +283,162 @@ def test_unknown_initial_rolling_turn_reconciles_actual_terminal_native_and_orig
     methods = [item["method"] for item in _calls(executable)]
     assert methods.count("thread/start") == methods.count("turn/start") == methods.count("thread/read") == 1
     assert "thread/resume" not in methods
+
+
+_IMMEDIATE_TERMINAL_SERVER = r'''
+import json,sys
+from pathlib import Path
+if '--version' in sys.argv:
+ print('codex-cli 0.159.0');sys.exit(0)
+if sys.argv[-2:]==['features','list']:
+ print('multi_agent stable true');sys.exit(0)
+requests=Path(__file__).with_suffix('.requests')
+state=Path(__file__).with_suffix('.state')
+status=Path(__file__).with_suffix('.terminal').read_text()
+def send(value):print(json.dumps(value),flush=True)
+for line in sys.stdin:
+ message=json.loads(line)
+ with requests.open('a') as stream:stream.write(json.dumps(message)+'\n')
+ method=message.get('method');params=message.get('params',{})
+ if method=='initialized':continue
+ result={}
+ if method=='thread/start':
+  result={'thread':{'id':'replacement-native-proof'}}
+ elif method=='turn/start':
+  turn={'id':'immediate-primary-turn','status':status,
+   'error':{'message':'The initial primary ended '+status,'codexErrorInfo':'other'},
+   'items':[{'id':'original-input','type':'userMessage','clientId':params['clientUserMessageId'],
+    'content':params['input']}]}
+  state.write_text(json.dumps(turn))
+  result={'turn':{'id':turn['id'],'status':'inProgress'}}
+ elif method=='thread/read':
+  turn=json.loads(state.read_text())
+  read_status=Path(__file__).with_suffix('.read-status')
+  if read_status.exists():
+   turn['status']=read_status.read_text();turn['error']=None
+  result={'thread':{'id':'replacement-native-proof','turns':[turn]}}
+ send({'id':message['id'],'result':result})
+ if method=='turn/start':
+  send({'method':'turn/completed','params':{'threadId':'replacement-native-proof','turn':turn}})
+'''
+
+
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+def test_immediate_initial_primary_terminal_keeps_verified_native_and_original_seal(tmp_path, status):
+    # The fixture acknowledges turn/start and then publishes the actual terminal
+    # notification. The production bridge exits 1; no lost ACK or return 75 is
+    # involved. Only metadata for this same turn may be read to attest N2.
+    executable = tmp_path / "codex-immediate"
+    executable.write_text("#!" + sys.executable + "\n" + _IMMEDIATE_TERMINAL_SERVER, encoding="utf-8")
+    executable.chmod(0o700)
+    executable.with_suffix(".terminal").write_text(status, encoding="utf-8")
+    workspace = tmp_path / "idea-immediate-provider"
+    adapter = CodexIdeaSkillAdapter(workspace, executable=str(executable), timeout_seconds=12)
+    adapter.bind_human_guidance_authority(_EmptyGuidanceAuthority())
+    request = _idea_request(
+        runtime_binding=adapter.runtime_binding(), job_ref="idea-primary:immediate-terminal",
+        run_ref="idea-run:immediate", attempt_ref="idea-attempt:immediate",
+        fence_ref="idea-fence:immediate",
+    )
+
+    with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_failed$") as failed:
+        adapter.generate_draft(request)
+
+    operation, = workspace.glob("provider-operations/*/primary")
+    original = {p.name: p.read_bytes() for p in operation.iterdir() if p.is_file()}
+    assert not (operation / "completed.json").exists()
+    _key_path, key = read_transport_key_for_operation(operation)
+    invocation = read_transport_envelope(operation / "invocation.json", key)
+    receipt = read_transport_envelope(operation / "supervisor-exit.json", key)
+    assert invocation["native_session_ref"] is None
+    assert invocation["transport_mode"] == "durable_supervisor"
+    assert receipt["returncode"] == 1 and receipt["termination_reason"] == "completed"
+    stdout = (operation / "stdout.jsonl").read_text()
+    events = [json.loads(line) for line in stdout.splitlines()]
+    assert {"type": "thread.started", "thread_id": _NATIVE} in events
+    assert any(event["type"] == "turn.failed" and event["turn_id"] == "immediate-primary-turn" for event in events)
+    proof = failed.value.recovery_checkpoint
+    assert proof["invocation_hash"] == receipt["invocation_hash"] == canonical_hash(invocation)
+    assert proof["prompt_hash"] == invocation["prompt_hash"]
+    assert proof["output_schema_hash"] == invocation["output_schema_hash"]
+    assert proof["stdout_hash"] == canonical_hash(stdout)
+    assert proof["result_file_hash"] == receipt["result_file_hash"] == (
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert proof["supervisor_receipt_hash"] == canonical_hash(json.loads(original["supervisor-exit.json"]))
+    assert proof["termination_reason"] == receipt["termination_reason"]
+    assert proof["schema_ref"] == "meta-research/provider-native-turn-terminal/v1"
+    assert set(proof) == (_ORIGINAL_FIELDS - {"contract_failure_code", "contract_failure_detail_code"}) | {
+        "native_session_ref", "supervisor_invocation_hash", "native_start_hash",
+        "native_reconciliation_hash", "native_turn_ref", "native_turn_status", "native_error",
+    }
+    assert proof["native_session_ref"] == failed.value.native_session_ref == _NATIVE
+    assert proof["native_turn_status"] == status and proof["native_turn_ref"] == "immediate-primary-turn"
+    assert proof["native_error"]["message"] == "The initial primary ended " + status
+    assert proof["supervisor_invocation_hash"] == proof["invocation_hash"]
+    assert proof["native_start_hash"] == canonical_hash(read_transport_envelope(operation / "native-turn-start.json", key))
+    assert proof["native_reconciliation_hash"] == canonical_hash(read_transport_envelope(operation / "native-reconciled.json", key))
+
+    with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_failed$") as repeated:
+        adapter.generate_draft(request)
+    assert repeated.value.recovery_checkpoint == proof
+    assert {name: (operation / name).read_bytes() for name in original} == original
+    assert not (operation / "completed.json").exists()
+    calls = _calls(executable)
+    methods = [item["method"] for item in calls]
+    assert methods.count("thread/start") == methods.count("turn/start") == methods.count("thread/read") == 1
+    assert "thread/resume" not in methods
+    read, = [item for item in calls if item["method"] == "thread/read"]
+    assert read["params"] == {"threadId": _NATIVE, "includeTurns": True}
+
+
+def test_immediate_primary_exit_with_unresolved_original_turn_stays_pending(tmp_path):
+    # A nonzero wrapper exit cannot replace the actual original turn's status.
+    # This metadata snapshot has not observed a terminal state yet.
+    executable = tmp_path / "codex-unresolved"
+    executable.write_text("#!" + sys.executable + "\n" + _IMMEDIATE_TERMINAL_SERVER, encoding="utf-8")
+    executable.chmod(0o700)
+    executable.with_suffix(".terminal").write_text("failed", encoding="utf-8")
+    executable.with_suffix(".read-status").write_text("inProgress", encoding="utf-8")
+    workspace = tmp_path / "idea-unresolved-provider"
+    adapter = CodexIdeaSkillAdapter(workspace, executable=str(executable), timeout_seconds=12)
+    adapter.bind_human_guidance_authority(_EmptyGuidanceAuthority())
+    request = _idea_request(
+        runtime_binding=adapter.runtime_binding(), job_ref="idea-primary:unresolved-terminal",
+        run_ref="idea-run:unresolved", attempt_ref="idea-attempt:unresolved",
+        fence_ref="idea-fence:unresolved",
+    )
+
+    with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_reconciliation_pending$") as unknown:
+        adapter.generate_draft(request)
+
+    assert unknown.value.recovery_checkpoint is None
+    operation, = workspace.glob("provider-operations/*/primary")
+    original = {p.name: p.read_bytes() for p in operation.iterdir() if p.is_file()}
+    _key_path, key = read_transport_key_for_operation(operation)
+    invocation = read_transport_envelope(operation / "invocation.json", key)
+    receipt = read_transport_envelope(operation / "supervisor-exit.json", key)
+    marker = json.loads(original["exit.json"])
+    assert invocation["native_session_ref"] is None
+    assert receipt["returncode"] == marker["returncode"] == 1
+    assert receipt["termination_reason"] == marker["termination_reason"] == "completed"
+    assert marker["invocation_hash"] == receipt["invocation_hash"] == canonical_hash(invocation)
+    assert marker["prompt_hash"] == invocation["prompt_hash"]
+    assert marker["output_schema_hash"] == invocation["output_schema_hash"]
+    assert marker["stdout_hash"] == canonical_hash(original["stdout.jsonl"].decode())
+    assert marker["supervisor_receipt_hash"] == canonical_hash(json.loads(original["supervisor-exit.json"]))
+    assert marker["result_file_hash"] == receipt["result_file_hash"] == (
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert not (operation / "completed.json").exists()
+    assert not (operation / "native-reconciled.json").exists()
+
+    with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_reconciliation_pending$") as repeated:
+        adapter.generate_draft(request)
+
+    assert repeated.value.recovery_checkpoint is None
+    assert {name: (operation / name).read_bytes() for name in original} == original
+    assert not (operation / "completed.json").exists()
+    assert not (operation / "native-reconciled.json").exists()
+    methods = [item["method"] for item in _calls(executable)]
+    assert methods.count("thread/start") == methods.count("turn/start") == 1
+    assert methods.count("thread/read") == 2
+    assert "thread/resume" not in methods

@@ -63,10 +63,10 @@ def _completed_operation(adapter, request, operation_name, raw_schema):
     return operation_input, output, session
 
 
-def _correction(adapter, request, operation_name, detail):
+def _correction(adapter, request, operation_name, detail, verified_native_session_ref):
     raise adapter._sealed_result_failure(
         job_ref=request.job_ref, operation_name=operation_name,
-        native_session_ref=request.native_session_ref,
+        native_session_ref=verified_native_session_ref,
         failure_code="bundle_review_result_contract_invalid", detail_code=detail,
     )
 
@@ -110,10 +110,10 @@ def recover_rejected_dispatch(
     try:
         validate_bundle_dispatch_result(original, result)
     except BundleSkillContractError as error:
-        _correction(adapter, request, operation_name, str(error))
+        _correction(adapter, request, operation_name, str(error), session)
     if (original.frontier != request.frontier or original.state != request.state
             or original.inbox_checkpoint != request.inbox_checkpoint):
-        _correction(adapter, request, operation_name, "bundle_operation_inputs_changed")
+        _correction(adapter, request, operation_name, "bundle_operation_inputs_changed", session)
 
 
 def recover_rejected_target_batch(
@@ -163,8 +163,8 @@ def recover_rejected_target_batch(
     try:
         validate_bundle_target_batch_result(original, result)
     except BundleSkillContractError as error:
-        _correction(adapter, request, operation_name, str(error))
+        _correction(adapter, request, operation_name, str(error), session)
     if (original.current_targets != request.current_targets
             or original.target_commits != request.target_commits
             or original.inbox_checkpoint != request.inbox_checkpoint):
-        _correction(adapter, request, operation_name, "bundle_operation_inputs_changed")
+        _correction(adapter, request, operation_name, "bundle_operation_inputs_changed", session)

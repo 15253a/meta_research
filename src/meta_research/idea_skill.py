@@ -2750,6 +2750,14 @@ class CodexIdeaSkillAdapter:
                 native_failure = _provider_native_session_unavailable(directory, exit_marker, native_session_ref)
                 if native_failure is not None:
                     raise native_failure
+                if (effective_returncode == 1
+                        and exit_marker.get("termination_reason") == "completed"
+                        and (directory / "native-turn-start.json").is_file()):
+                    # The wrapper exit is not a native outcome. Read only the
+                    # signed original turn, retaining its actual native identity
+                    # and terminal proof (or leaving an unresolved turn pending).
+                    return _read_completed_operation(directory, invocation_hash=invocation_hash,
+                        native_session_ref=native_session_ref, transport_limits=transport_limits)
                 hard_ceiling = _provider_hard_ceiling_error(exit_marker)
                 if hard_ceiling is not None:
                     raise hard_ceiling
@@ -3496,7 +3504,9 @@ def _read_completed_operation(
     native_failure = _provider_native_session_unavailable(directory, marker, native_session_ref)
     if native_failure is not None:
         raise native_failure
-    if marker.get("returncode") == 75 and (directory / "native-turn-start.json").is_file():
+    if ((marker.get("returncode") == 75
+            or (marker.get("returncode") == 1 and marker.get("termination_reason") == "completed"))
+            and (directory / "native-turn-start.json").is_file()):
         from meta_research.native_codex_bridge import reconcile_native_operation, NativeTerminalTurnError
         try:
             recovered = reconcile_native_operation(directory)
