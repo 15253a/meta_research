@@ -284,41 +284,239 @@ def test_unbound_replacement_without_authenticated_native_keeps_the_original_ope
         runtime.close()
 
 
-def test_unbound_replacement_with_only_owner_closure_left_reports_pending_without_new_native(tmp_path):
+def _owner_closure_replacement(runtime):
+    _target, graph_ref = _accept_real_target_root_commit(runtime)
+    request_ref = runtime.bundle_stage.query_current()["stage_run_request"]["request_ref"]
+    ar, rg = runtime.owners.agent_runtime, runtime.owners.research_graph
+    for _ in range(12):
+        runtime.bundle_stage.process_once()
+        graph = rg.query_target_graph(request_ref)
+        if graph.strategy_complete:
+            break
+    assert graph.strategy_complete and graph.graph_ref == graph_ref
+    old = ar.query_bundle_stage_run(request_ref)
+    ar.begin_provider_unit(unit_ref="owner-closure-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
+        run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
+    ar.record_stage_provider_hard_ceiling(unit_ref="owner-closure-unavailable-unit", run_ref=old.run_ref,
+        attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
+        provider_exit=_unavailable_proof(old.native_session_ref))
+    return graph, old, ar.query_bundle_stage_run(request_ref)
+
+
+def _owner_report_arguments(runtime, graph, run):
+    rg = runtime.owners.research_graph
+    content = rg.accept_formal_plan_content(formal_plan_ref=graph.formal_plan_ref,
+        idempotency_key="owner-report-content")
+    projection = rg.accept_target_formal_plan_projection(graph_ref=graph.graph_ref,
+        idempotency_key="owner-report-projection")
+    return dict(run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+        disposition="realized", formal_plan_content_receipt=content.receipt,
+        formal_plan_projection_receipt=projection.receipt, target_graph_ref=graph.graph_ref,
+        target_graph_receipt=graph.head_receipt)
+
+
+def test_unbound_replacement_with_only_owner_closure_left_completes_without_new_native(tmp_path):
     provider = _ReplacementAwareBundle()
     runtime = _current_bundle_runtime(tmp_path / "replacement-owner-closure", bundle_skill=provider)
     try:
-        _target, graph_ref = _accept_real_target_root_commit(runtime)
-        request_ref = runtime.bundle_stage.query_current()["stage_run_request"]["request_ref"]
+        graph, old, current = _owner_closure_replacement(runtime)
+        request_ref = old.request_ref
         ar, rg = runtime.owners.agent_runtime, runtime.owners.research_graph
-        for _ in range(12):
-            runtime.bundle_stage.process_once()
-            graph = rg.query_target_graph(request_ref)
-            if graph.strategy_complete:
-                break
-        assert graph.strategy_complete and graph.graph_ref == graph_ref
-        old = ar.query_bundle_stage_run(request_ref)
-        ar.begin_provider_unit(unit_ref="owner-closure-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
-            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
-        ar.record_stage_provider_hard_ceiling(unit_ref="owner-closure-unavailable-unit", run_ref=old.run_ref,
-            attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
-            provider_exit=_unavailable_proof(old.native_session_ref))
-        current = ar.query_bundle_stage_run(request_ref)
+        historical_execution = ar.query_bundle_attempt_execution(old.execution.submission_ref)
         prior_calls = len(provider.rolling_requests)
         with runtime._database.read() as connection:
             prior_units = connection.execute(text("SELECT COUNT(*) FROM ar_provider_units WHERE run_ref=:run"),
                 {"run": old.run_ref}).scalar_one()
-        for _ in range(2):
-            assert not runtime.bundle_stage.process_once()
-            assert runtime.bundle_stage.transient_error == "bundle_native_replacement_initialization_pending"
+        for _ in range(4):
+            runtime.bundle_stage.process_once()
+            if ar.query_bundle_run_completion(old.run_ref) is not None:
+                break
+        completion = ar.query_bundle_run_completion(old.run_ref)
+        assert completion is not None
+        accepted = ar.query_bundle_run_report(old.run_ref)
+        assert accepted is not None and accepted.report.disposition == "realized"
+        assert accepted.attempt_ref == current.attempt_ref and accepted.fence_ref == current.fence_ref
+        assert completion.outcome_ref == accepted.report_ref
         assert ar.query_bundle_stage_run(request_ref).attempt_ref == current.attempt_ref
         assert ar.query_bundle_stage_run(request_ref).native_session_ref is None
-        assert ar.query_bundle_run_report(old.run_ref) is None
         assert len(provider.rolling_requests) == prior_calls and provider.primary_calls == 1
         assert rg.query_target_graph(request_ref) == graph
+        assert ar.query_bundle_attempt_execution(old.execution.submission_ref) == historical_execution
+        assert ar.query_bundle_stage_run(request_ref).execution is None
+        assert runtime.bundle_stage.process_once()
+        assert runtime.owners.advancement_engine.query_bundle_stage_commit(request_ref) is not None
         with runtime._database.read() as connection:
             assert connection.execute(text("SELECT COUNT(*) FROM ar_provider_units WHERE run_ref=:run"),
                 {"run": old.run_ref}).scalar_one() == prior_units
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_bundle_reports WHERE run_ref=:run"),
+                {"run": old.run_ref}).scalar_one() == 1
+    finally:
+        runtime.close()
+
+
+def test_real_target_terminal_published_after_bundle_isolation_closes_without_new_native(tmp_path, monkeypatch):
+    class InitiallyCompleteStrategy(_ReplacementAwareBundle):
+        def _target_plan(self, request):
+            plan = super()._target_plan(request)
+            plan["initial_strategy_update"]["strategy_complete"] = True
+            return plan
+
+    provider = InitiallyCompleteStrategy()
+    runtime = _current_bundle_runtime(tmp_path / "owner-report-late-target", bundle_skill=provider)
+    try:
+        ar, rg = runtime.owners.agent_runtime, runtime.owners.research_graph
+        publish = ar.publish_target_root_completion
+        isolated = []
+
+        def publish_after_real_bundle_isolation(**values):
+            request_ref = runtime.bundle_stage.query_current()["stage_run_request"]["request_ref"]
+            old = ar.query_bundle_stage_run(request_ref)
+            ar.begin_provider_unit(unit_ref="late-target-bundle-unavailable", operation_ref=old.review_invocation.operation_ref,
+                run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
+            ar.record_stage_provider_hard_ceiling(unit_ref="late-target-bundle-unavailable", run_ref=old.run_ref,
+                attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
+                provider_exit=_unavailable_proof(old.native_session_ref))
+            current = ar.query_bundle_stage_run(request_ref)
+            assert current.native_session_ref is None
+            isolated.append((old, current))
+            return publish(**values)
+
+        monkeypatch.setattr(ar, "publish_target_root_completion", publish_after_real_bundle_isolation)
+        target, graph_ref = _accept_real_target_root_commit(runtime)
+        assert len(isolated) == 1
+        old, current = isolated[0]
+        graph = rg.query_target_graph(old.request_ref)
+        assert graph.graph_ref == graph_ref and graph.strategy_complete
+        assert ar.query_target_frontier_entry(target.target_ref).state == "terminal"
+        assert ar.query_bundle_run_report(old.run_ref) is None
+        original = ar.query_bundle_attempt_execution(old.execution.submission_ref)
+        prior_calls = len(provider.rolling_requests)
+        with runtime._database.read() as connection:
+            prior_units = connection.execute(text("SELECT COUNT(*) FROM ar_provider_units WHERE run_ref=:run"),
+                {"run":old.run_ref}).scalar_one()
+        for _ in range(4):
+            runtime.bundle_stage.process_once()
+            if runtime.owners.advancement_engine.query_bundle_stage_commit(old.request_ref) is not None:
+                break
+        assert ar.query_bundle_run_completion(old.run_ref) is not None
+        assert runtime.owners.advancement_engine.query_bundle_stage_commit(old.request_ref) is not None
+        report = ar.query_bundle_run_report(old.run_ref)
+        assert report.report.disposition == "realized" and report.attempt_ref == current.attempt_ref
+        assert report.fence_ref == current.fence_ref
+        assert ar.query_bundle_stage_run(old.request_ref).native_session_ref is None
+        assert ar.query_bundle_stage_run(old.request_ref).execution is None
+        assert ar.query_bundle_attempt_execution(old.execution.submission_ref) == original
+        assert rg.query_target_graph(old.request_ref) == graph
+        assert provider.primary_calls == 1 and len(provider.rolling_requests) == prior_calls
+        with runtime._database.read() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_provider_units WHERE run_ref=:run"),
+                {"run":old.run_ref}).scalar_one() == prior_units
+    finally:
+        runtime.close()
+
+
+def _change_owner_report_qualification(runtime, old, current, damage):
+    ar = runtime.owners.agent_runtime
+    if damage == "active-unit":
+        ar.begin_provider_unit(unit_ref="owner-closure-new-active-unit",
+            operation_ref=current.review_invocation.operation_ref, run_ref=current.run_ref,
+            attempt_ref=current.attempt_ref, fence_ref=current.fence_ref, unit_kind="bundle_review")
+    elif damage == "pending-human-request":
+        from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+        scope = ar.verify_root_agent_human_request_scope(run_ref=current.run_ref,
+            attempt_ref=current.attempt_ref, root_session_ref=current.root_session_ref,
+            fence_ref=current.fence_ref, runtime_binding_hash=current.runtime_binding_hash)
+        generation = scope["waiter_generation"]
+        binding = {"quest_ref":scope["quest_ref"], "task_ref":current.run_ref,
+            "root_session_ref":current.root_session_ref, "attempt_ref":current.attempt_ref,
+            "fence_ref":current.fence_ref, "runtime_binding_hash":current.runtime_binding_hash,
+            "root_kind":"bundle", "phase":"review", "generation":generation,
+            "operation_id":ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0], "request_owner":"agent_runtime"}
+        target = {"schema_ref":"meta-research/root-agent-human-request-target/v1",
+            "root":{"run_kind":"bundle", "run_ref":current.run_ref,
+                "attempt_ref":current.attempt_ref, "root_session_ref":current.root_session_ref,
+                "fence_ref":current.fence_ref, "waiter_generation":generation},
+            "condition":{"choice":"Review the exact terminal report before completing this run."}}
+        ar.open_human_request_effect(effect_key="owner-report-pending-human", effect_id="owner-report-pending-human",
+            operation_binding=binding, predecessor_request_ref=None, request_kind="offline_action",
+            obligation="Review this exact terminal report.", business_purpose="Close only the authorized current Bundle.",
+            target_assertion=target, acceptance_conditions=("The current report has an exact operator disposition.",),
+            direct_waiter={"waiter_ref":scope["waiter_ref"], "generation":generation,
+                "target_assertion":target,"wait_scope":"local","other_blockers":[]}, quest_ref=scope["quest_ref"])
+    else:
+        with runtime._database.write() as connection:
+            if damage == "revoked-fence":
+                connection.execute(text("INSERT INTO ar_fence_revocations (fence_ref,operation_ref,run_ref,attempt_ref,reason_code,revoked_at) "
+                    "VALUES (:fence,'owner-report-test-revocation',:run,:attempt,'operator_pause',1.0)"),
+                    {"fence":current.fence_ref,"run":current.run_ref,"attempt":current.attempt_ref})
+            elif damage == "foreign-basis":
+                root = connection.execute(text("SELECT root_session_ref FROM ar_stage_runs WHERE stage='plan'")).scalar_one()
+                connection.execute(text("UPDATE ar_safe_points SET root_session_ref=:root WHERE run_ref=:run "
+                    "AND json_extract(checkpoint_json,'$.action')='native_session_replacement'"),
+                    {"root":root,"run":current.run_ref})
+            elif damage == "unisolated-origin":
+                connection.execute(text("DELETE FROM ar_fence_revocations WHERE fence_ref=:fence"), {"fence":old.fence_ref})
+            else:
+                raise AssertionError(damage)
+
+
+@pytest.mark.parametrize("damage", ["stale-fence", "revoked-fence", "foreign-basis", "unisolated-origin",
+    "active-unit", "pending-human-request"])
+def test_unbound_owner_report_rejects_missing_current_authority(tmp_path, damage):
+    provider = _ReplacementAwareBundle()
+    runtime = _current_bundle_runtime(tmp_path / "owner-report-authority", bundle_skill=provider)
+    try:
+        graph, old, current = _owner_closure_replacement(runtime)
+        arguments = _owner_report_arguments(runtime, graph, current)
+        if damage == "stale-fence":
+            arguments.update(attempt_ref=old.attempt_ref, fence_ref=old.fence_ref)
+        else:
+            _change_owner_report_qualification(runtime, old, current, damage)
+        with pytest.raises(OwnerConflict):
+            runtime.owners.agent_runtime.build_bundle_report_candidate(**arguments)
+        with runtime._database.read() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_bundle_reports WHERE run_ref=:run"),
+                {"run":current.run_ref}).scalar_one() == 0
+            assert connection.execute(text("SELECT status FROM ar_stage_runs WHERE run_ref=:run"),
+                {"run":current.run_ref}).scalar_one() != "completed"
+        assert provider.primary_calls == 1
+        assert all(request.native_session_ref is not None for request in provider.rolling_requests)
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("change", ["active-unit", "pending-human-request", "revoked-fence"])
+def test_unbound_owner_report_completion_rechecks_authority_in_its_write(tmp_path, monkeypatch, change):
+    runtime = _current_bundle_runtime(tmp_path / "owner-report-write-race")
+    try:
+        graph, old, current = _owner_closure_replacement(runtime)
+        ar = runtime.owners.agent_runtime
+        arguments = _owner_report_arguments(runtime, graph, current)
+        report = ar.build_bundle_report_candidate(**arguments)
+        arguments.pop("disposition")
+        accepted = ar.accept_bundle_report(**arguments, report=report, idempotency_key="owner-report-before-race")
+        original = ar._verify_stage_decision
+        changed = []
+
+        def change_after_real_receipt_verification(**values):
+            original(**values)
+            assert not changed
+            _change_owner_report_qualification(runtime, old, current, change)
+            changed.append(change)
+
+        monkeypatch.setattr(ar, "_verify_stage_decision", change_after_real_receipt_verification)
+        with pytest.raises(OwnerConflict):
+            ar.complete_bundle_run(run_ref=current.run_ref, attempt_ref=current.attempt_ref,
+                fence_ref=current.fence_ref, report_ref=accepted.report_ref,
+                decision_receipt=accepted.receipt, idempotency_key="owner-report-complete-after-race")
+        assert changed == [change]
+        with runtime._database.read() as connection:
+            row = connection.execute(text("SELECT status,completion_receipt_ref FROM ar_stage_runs WHERE run_ref=:run"),
+                {"run":current.run_ref}).one()
+            assert row.status != "completed" and row.completion_receipt_ref is None
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_bundle_reports WHERE run_ref=:run"),
+                {"run":current.run_ref}).scalar_one() == 1
+        assert ar.query_bundle_stage_run(old.request_ref).native_session_ref is None
     finally:
         runtime.close()
 

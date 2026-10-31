@@ -19434,7 +19434,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 connection, run_ref, attempt_ref, fence_ref
             )
             _assert_runtime_control_allows(connection, run_ref, fence_ref)
-            _require_bundle_rolling_fence(connection, run, attempt, fence)
+            _require_bundle_report_fence(connection, run, attempt, fence)
             if run.stage != "bundle":
                 raise OwnerConflict("bundle_report_run_invalid")
         _verify_target_launch_stage_current(self, run)
@@ -19511,7 +19511,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 connection, run_ref, attempt_ref, fence_ref
             )
             _assert_runtime_control_allows(connection, run_ref, fence_ref)
-            _require_bundle_rolling_fence(connection, run, attempt, fence)
+            _require_bundle_report_fence(connection, run, attempt, fence)
             if run.stage != "bundle":
                 raise OwnerConflict("bundle_report_run_invalid")
         if replay is not None:
@@ -19562,7 +19562,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         )
                     )
                     _assert_runtime_control_allows(connection, run_ref, fence_ref)
-                    _require_bundle_rolling_fence(connection, current_run, current_attempt, current_fence)
+                    _require_bundle_report_fence(connection, current_run, current_attempt, current_fence)
                     _verify_target_launch_stage_current(self, current_run)
                     _assert_bundle_report_material_current(
                         connection,
@@ -20805,7 +20805,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         with self._database.read() as connection:
             run, attempt, _session, fence = _load_stage_fence(connection, run_ref, attempt_ref, fence_ref)
             if attempt.status == "running":
-                _require_bundle_rolling_fence(connection, run, attempt, fence)
+                _require_bundle_report_fence(connection, run, attempt, fence)
                 replacement_status = True
             else:
                 replacement_status = False
@@ -24105,6 +24105,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
             if run.stage != expected_stage:
                 raise OwnerConflict("stage_run_integrity_invalid")
+            if command_kind == "complete_bundle_run":
+                _require_bundle_report_fence(connection, run, attempt, fence)
             request_ref = run.request_ref
             submission_ref = attempt.submission_ref
         if expected_stage == "bundle":
@@ -24137,6 +24139,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     required_fence_status,
                 )
                 if expected_stage == "bundle":
+                    if command_kind == "complete_bundle_run":
+                        _require_bundle_report_fence(connection, run, attempt, fence)
                     _verify_target_launch_stage_current(self, run)
                 now = time.time()
                 receipt_ref = new_ref("ar_completion_receipt")
@@ -27983,6 +27987,49 @@ def _historical_stage_execution_row(connection, row):
         raise OwnerConflict("native_session_replacement_context_invalid")
     values = dict(row._mapping) if hasattr(row, "_mapping") else vars(row)
     return SimpleNamespace(**{**values, "native_session_ref": native})
+
+
+def _require_bundle_report_fence(connection, run, attempt, fence):
+    """Qualify Owner report closure without authorizing new provider work."""
+    session = connection.execute(text("SELECT * FROM ar_stage_sessions WHERE session_ref=:session"),
+                                 {"session": run.root_session_ref}).first()
+    if session is None:
+        raise OwnerConflict("bundle_report_replacement_context_invalid")
+    if attempt.status != "running" or session.native_session_ref is not None:
+        _require_bundle_rolling_fence(connection, run, attempt, fence)
+        return
+    _require_current_fence(run, attempt, fence, "running", "current")
+    _assert_runtime_control_allows(connection, run.run_ref, fence.fence_ref)
+    control = connection.execute(text("SELECT * FROM ar_run_controls WHERE run_ref=:run"),
+                                 {"run": run.run_ref}).first()
+    if (run.stage != "bundle" or session.status != "active" or control is None
+            or control.status != "running" or control.root_session_ref != run.root_session_ref
+            or control.attempt_ref != attempt.attempt_ref or control.fence_ref != fence.fence_ref
+            or attempt.primary_draft_json is not None or attempt.payload_json is not None
+            or attempt.submission_ref is not None or attempt.execution_receipt_ref is not None):
+        raise OwnerConflict("bundle_report_replacement_context_invalid")
+    basis = _stage_native_replacement_row(connection, run.run_ref, attempt.attempt_ref, fence.fence_ref)
+    if basis is None:
+        raise OwnerConflict("bundle_report_replacement_context_invalid")
+    point = decoded_object(basis.checkpoint_json)
+    unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:unit"),
+                              {"unit": point.get("provider_unit_ref")}).first()
+    isolation = connection.execute(text(
+        "SELECT 1 FROM ar_fence_revocations v JOIN ar_execution_fences f ON f.fence_ref=v.fence_ref "
+        "WHERE v.run_ref=:run AND v.attempt_ref=:attempt AND v.fence_ref=:fence "
+        "AND v.reason_code='native_session_unavailable' AND v.operation_ref=:operation AND f.status='rejected'"
+    ), {"run": run.run_ref, "attempt": basis.attempt_ref, "fence": basis.fence_ref,
+        "operation": basis.operation_ref}).first()
+    if (unit is None or unit.status != "completed" or isolation is None
+            or (unit.run_ref, unit.attempt_ref, unit.fence_ref, unit.operation_ref)
+                != (run.run_ref, basis.attempt_ref, basis.fence_ref, point.get("provider_operation_ref"))):
+        raise OwnerConflict("bundle_report_replacement_context_invalid")
+    _validated_stage_provider_hard_ceiling(unit_kind=unit.unit_kind,
+        failure_code="codex_native_session_unavailable", provider_exit=point.get("provider_exit"))
+    if (connection.execute(text("SELECT 1 FROM ar_provider_units WHERE run_ref=:run "
+            "AND status IN ('active','revocation_pending') LIMIT 1"), {"run": run.run_ref}).first() is not None
+            or _managed_run_has_pending_root_human_request(connection, control)):
+        raise OwnerConflict("bundle_report_replacement_not_quiescent")
 
 
 def _require_bundle_rolling_fence(connection, run, attempt, fence):

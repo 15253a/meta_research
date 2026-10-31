@@ -352,7 +352,7 @@ class BundleStageWorker:
                 return self._execute_target_plan(request, run)
             return self._advance_exhaustion(request, run)
         graph = self._research_graph.query_target_graph(request.request_ref)
-        if run.execution is None:
+        if run.execution is None and run.completion is None:
             if graph is None:
                 return self._execute_target_plan(request, run)
             if self._agent_runtime.query_stage_native_replacement_context(
@@ -1071,13 +1071,6 @@ class BundleStageWorker:
                 disposition = "replan_required"
         if disposition is None:
             return None
-        if run.native_session_ref is None:
-            # Pure Owner closure has no pending provider operation with which
-            # to authenticate an initial replacement native. Retain that
-            # recovery boundary without granting report acceptance or
-            # manufacturing a new model call.
-            self._transient_error = "bundle_native_replacement_initialization_pending"
-            return False
         try:
             candidate = self._agent_runtime.build_bundle_report_candidate(
                 run_ref=run.run_ref,
