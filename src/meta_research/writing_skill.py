@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.research_guidance import shared_reference_root
+
 from dataclasses import dataclass, replace
 import hashlib
 from importlib.resources import files
@@ -236,7 +238,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             'permissions.writing_snapshot={description="Frozen Writing '
             'Snapshot only",filesystem={":minimal"="read",'
             f'{json.dumps(str(agent_workspace))}="write",'
-            f'{json.dumps(str(source_root))}="read"}},'
+            f'{json.dumps(str(source_root))}="read",'
+            f'{json.dumps(str(shared_reference_root()))}="read"}},'
             'network={enabled=true}}'
         )
         return (

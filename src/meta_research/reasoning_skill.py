@@ -66,7 +66,7 @@ from meta_research.reasoning_contract import (
     validate_reasoning_stage_output,
     validate_scientific_outcome,
 )
-from .research_guidance import shared_research_guidance, shared_human_guidance
+from .research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources
 from meta_research.semantic_mcp import (
     ROOT_AGENT_COMMON_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
@@ -1148,7 +1148,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 self._root_agent_kind,
             ),
             resource_bindings=tuple(
-                "package:meta_research.skills.reasoning_stage/"
+                f"package:meta_research.skills{'' if name in SHARED_REFERENCE_PATHS else '.reasoning_stage'}/"
                 f"{name}@sha256:{canonical_hash(content)}"
                 for name, content in resources.items()
             )
@@ -1578,14 +1578,13 @@ def _reasoning_skill_resources() -> dict[str, str]:
     )
     try:
         return {
-            "research-guidance.md": shared_research_guidance(),
-            "human-guidance.md": shared_human_guidance(),
+            **shared_reference_resources(),
             **{
                 name: resource.read_text(encoding="utf-8")
                 for name, resource in resources
             },
         }
-    except (FileNotFoundError, ModuleNotFoundError) as error:
+    except (OSError, UnicodeError, ModuleNotFoundError) as error:
         raise ReasoningSkillUnavailable(
             "reasoning_skill_resource_unavailable"
         ) from error
@@ -1594,8 +1593,6 @@ def _reasoning_skill_resources() -> dict[str, str]:
 def _reasoning_skill_instructions(request: ReasoningSkillRequest | None = None) -> str:
     resources = _reasoning_skill_resources()
     names = [
-        "research-guidance.md",
-        "human-guidance.md",
         "SKILL.md",
         "references/contract.md",
         "references/owner-operations.md",
@@ -1605,7 +1602,8 @@ def _reasoning_skill_instructions(request: ReasoningSkillRequest | None = None) 
     return "\n\n".join(
         f"<!-- bundled resource: {name} -->\n{resources[name]}"
         for name in names
-    )
+    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "reasoning_stage" / "SKILL.md")
+         + "\nResolve role reference links relative to this source directory.")
 
 
 def _uses_authoritative_metadata(request: ReasoningSkillRequest) -> bool:

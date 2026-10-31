@@ -131,8 +131,14 @@ def test_actual_provider_instructions_preserve_cycle_dependencies_before_cleanup
     setting = next(argv[i+1] for i, value in enumerate(argv[:-1])
         if value == '--config' and argv[i+1].startswith('developer_instructions='))
     visible = tomllib.loads(setting)['developer_instructions']
-    assert 'Cycle 业务完成且必要交接结束后' in visible
-    assert '单个 Target 完成' in visible
+    assert 'references/materials-and-custody.md' in visible
+    root = Path(next(line.removeprefix('Shared reference root: ')
+                     for line in visible.splitlines() if line.startswith('Shared reference root: ')))
+    custody = (root / 'references/materials-and-custody.md').read_text(encoding='utf-8')
+    assert custody not in visible
+    assert '单个 Target 结束不能证明整个 Cycle 或目录已可回收' in custody
+    assert '实际执行、恢复、待接纳及后继读取依赖继续保护' in custody
+    assert '精确保管原件不作为临时材料删除' in custody
     target = target_execution_skill_text()
     source = Path(target.split('Skill source: ', 1)[1].splitlines()[0])
     preservation = (source.parent / 'references/data-preservation.md').read_text()

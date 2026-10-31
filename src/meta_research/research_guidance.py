@@ -1,28 +1,56 @@
-"""Research budget guidance shared by the four Stage instruction bundles."""
+"""Canonical packaged references, disclosed through role-scoped pointers."""
+from importlib.resources import files
+from pathlib import Path
+
+from meta_research.owners.common import canonical_hash
+from meta_research.resource_preparation import prepared_resource
+
+SHARED_REFERENCE_NAMES = (
+    "research-guidance.md", "human-guidance.md", "research-navigation.md",
+    "cycle-work.md", "materials-and-custody.md",
+)
+SHARED_REFERENCE_PATHS = frozenset(f"references/{name}" for name in SHARED_REFERENCE_NAMES)
 
 
-def shared_research_guidance() -> str:
-    """Return budget guidance included in runtime fingerprints."""
-    return """# Meta Research：投入与上下文
-
-科研元循环、研究方法、阶段交接与正式人类协作的共同指令由本根 Session 的系统提示提供。结合当前 Stage 的具体职责执行，按实际需要读取相关材料。
-
-Quest 的研究时长预算由各 Cycle 累计使用，进入下一轮不重置，也不以用满为目标。用系统明确提供的已用、剩余和资源状态比较研究价值、成本与可行性。缺少动态预算信息时如实保留未知，不能把静态上限当作当前剩余；暂停、等待和并行的计时口径以已提供规则为准。
-
-当前 Session 的上下文容量是另一项资源。按实际上下文信息和任务复杂度控制展开量，为核实与交接保留余量；接近容量时停止扩展新工作，整理已取得的证据、当前判断和可恢复的未完成事项。没有计量时保留不确定性，不自设固定 token 阈值、小时数或 Cycle 数量。这个软约束不改变已承诺工作的完成条件；真实在途、技术阻塞与等待继续由既有 Owner 执行和恢复路径处理，不能以容量不足宣告完成。阶段可能使用不同 native Session，通过正式研究材料和待办接续。
-
-## 检索责任与委派
-
-按系统提示中的六入口发现已有研究与资源，按本阶段的问题选择入口。数字材料沿精确版本读取，实体资源与现成服务核对来源、位置、能力及已知条件；资源登记与本次运行条件的边界见系统提示的 Environment 规则。资料规模较大时，将聚焦检索、对比或资源回顾委派给独立子智能体。子智能体自行沿分页与共用 reader 读取获授材料，不要求根先加载全库。
-
-委派时由根 Session 给出研究范围、检索问题、相关入口和需要确认的内容。检索子智能体在本研究的范围与授权内检索，返回简明候选、每条的精确读取入口、相关理由、关键证据边界、已检索范围和值得注意的未检索部分；没有匹配就如实报告，不回传整池文件或完整检索过程。
-
-根 Session 对实际采纳的内容亲自抽查阅读，保留方法、证据、投入与资产组织方面的判断；候选不会自动成为正式证据或执行输入。子智能体同样可用于对比、分析、实施或评价等工作。
-
-当整理、归类或入库工作量较大（如同批 Target 完成后产物较多、研究资产持续增长），按生产者或明确资产范围委派独立子智能体：在授予的任务权限内读取相关材料、确定归属并完成登记，返回对象／内容引用、整理说明与未决项；权威接纳仍由对应 Owner 承担，不设固定数量或阈值。各根 Session 的 review 由独立子智能体检查并提供自由格式反馈，主 Agent 自主修订；没有具体问题也可以改稿。同根 turn 的自查不构成独立 review。最终提交字段遵循当前阶段输出契约，审阅反馈本身不要求固定表单或 Owner 审阅者身份证明。
-"""
+def shared_reference_root() -> Path:
+    """Installed file root used by native tools, independent of their cwd."""
+    return Path(__file__).with_name("skills").resolve()
 
 
-def shared_human_guidance() -> str:
-    from importlib.resources import files
-    return (files("meta_research.skills") / "human-guidance.md").read_text(encoding="utf-8")
+@prepared_resource
+def shared_reference_resources() -> dict[str, str]:
+    package = files("meta_research.skills") / "references"
+    return {f"references/{name}": (package / name).read_text(encoding="utf-8")
+            for name in SHARED_REFERENCE_NAMES}
+
+
+@prepared_resource
+def shared_reference_bundle_hash() -> str:
+    return canonical_hash(shared_reference_resources())
+
+
+def shared_reference_instructions(root_kind: str) -> str:
+    """Point native readers at the sole packaged source without inlining it."""
+    purposes = {
+        "research-guidance.md": ("安排投入、持续会话或委派审阅", "判断研究价值、协作需要与连续工作"),
+        "human-guidance.md": ("主动求助、接收指导或处理人类材料", "把人的参与接入研究并保持协作连续性"),
+        "research-navigation.md": ("发现积累、追溯依据或复用成果", "从六个研究视角理解过程、内容、用途与来源"),
+        "cycle-work.md": ("阶段接续、建题、后继选题或正式目标演化", "处理问题发展、目标重审与实际工作衔接"),
+        "materials-and-custody.md": ("接收材料、加工文件、登记保管或清理工作区", "安排阅读、保存与生命周期"),
+    }
+    cycle_roles = {"idea", "plan", "bundle", "target", "reasoning"}
+    names = SHARED_REFERENCE_NAMES
+    if root_kind == "acquisition":
+        names = ("human-guidance.md", "materials-and-custody.md")
+    elif root_kind not in cycle_roles:
+        names = tuple(name for name in names if name != "cycle-work.md")
+    return (
+        f"Shared reference root: {shared_reference_root()}\n"
+        "公共参考中的 references/... 相对此安装目录；文件内链接相对该文件。"
+        "已有完整且仍有效的正文时直接使用；触发相关工作时，通过原生文件工具读取对应部分。"
+        "读取失败如实报告缺少的文件，不使用其他版本替代。\n"
+        f"当前角色：{root_kind}。仅履行本角色及当前授权范围内的职责。"
+        "Cycle 阶段提交、正式指导确认及目标演化规则仅适用于获得相应职责和工具的研究根；"
+        "Acquisition 负责指定获取，Companion／Writing 按各自请求协作，不因此接管 Cycle。\n"
+        + "\n".join(f"- **{purposes[name][0]}**：读取 `references/{name}`，{purposes[name][1]}。" for name in names)
+    )

@@ -4,7 +4,7 @@
 
 ## 发现、读取和精确引用
 
-人类或 Agent 取得的工作资料与后继已保管材料，按[共享资料处理合同](../../human-guidance.md#工作资料的当前处理与后继交接)发现、精确读取、处理及反馈。材料采用关系服务于本轮安排判断，正式执行输入继续由 Bundle 绑定。
+人类或 Agent 取得的工作资料与后继已保管材料，按[共享资料处理合同](../../references/materials-and-custody.md#工作资料的当前处理与后继交接)发现、精确读取、处理及反馈。材料采用关系服务于本轮安排判断，正式执行输入继续由 Bundle 绑定。
 
 按实际研究需要调用 `research_graph.plan_evidence.page`，通过 total、filter、next_offset 发现同 Quest 证据；`research_memory.plan_evidence.read` 读取精确 commit／version／hash／role 对应正文并返回 `selected_evidence_binding`。ContextPack 不预查候选目录，后续发现不改写原冻结请求。目录页长不限制本轮采用来源范围。
 

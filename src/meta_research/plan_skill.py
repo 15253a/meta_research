@@ -29,7 +29,7 @@ from meta_research.idea_skill import (
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import shared_research_guidance, shared_human_guidance
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources
 from meta_research.plan_contract import (
     MAX_PLAN_EXPERIMENT_BRIEFS,
     MAX_PLAN_OBLIGATIONS,
@@ -417,7 +417,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 self._root_agent_kind,
             ),
             resource_bindings=tuple(
-                f"package:meta_research.skills.plan_stage/{name}@sha256:"
+                f"package:meta_research.skills{'' if name in SHARED_REFERENCE_PATHS else '.plan_stage'}/{name}@sha256:"
                 f"{canonical_hash(content)}"
                 for name, content in resources.items()
             )
@@ -627,14 +627,13 @@ def _plan_skill_resources() -> dict[str, str]:
     )
     try:
         return {
-            "research-guidance.md": shared_research_guidance(),
-            "human-guidance.md": shared_human_guidance(),
+            **shared_reference_resources(),
             **{
                 name: resource.read_text(encoding="utf-8")
                 for name, resource in resources
             },
         }
-    except (FileNotFoundError, ModuleNotFoundError) as error:
+    except (OSError, UnicodeError, ModuleNotFoundError) as error:
         raise PlanSkillUnavailable("plan_skill_resource_unavailable") from error
 
 
@@ -642,7 +641,9 @@ def _plan_skill_instructions() -> str:
     return "\n\n".join(
         f"<!-- bundled resource: {name} -->\n{content}"
         for name, content in _plan_skill_resources().items()
-    )
+        if name not in SHARED_REFERENCE_PATHS
+    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "plan_stage" / "SKILL.md")
+         + "\nResolve role reference links relative to this source directory.")
 
 
 def _schema_template_request() -> PlanSkillRequest:

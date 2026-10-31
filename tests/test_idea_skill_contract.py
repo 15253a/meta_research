@@ -1422,8 +1422,9 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert "shell_tool" not in disabled
     assert "skill_search" not in disabled
     assert "view_image" not in disabled
-    from meta_research.research_guidance import shared_research_guidance
-    assert shared_research_guidance() in primary_prompt
+    from meta_research.research_guidance import shared_reference_resources
+    assert all(body not in primary_prompt for body in shared_reference_resources().values())
+    assert any("Shared reference root:" in value for value in primary_argv)
     assert primary_prompt.startswith("cycle_position=")
     assert "accepted_question=" in primary_prompt
     assert "context_pack_hash=" + request.context_pack_hash in primary_prompt

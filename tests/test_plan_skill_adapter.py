@@ -514,8 +514,9 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert "--json" in primary_argv
     assert 'model_reasoning_effort="ultra"' in primary_argv
-    from meta_research.research_guidance import shared_research_guidance
-    assert shared_research_guidance() in primary_prompt
+    from meta_research.research_guidance import shared_reference_resources
+    assert all(body not in primary_prompt for body in shared_reference_resources().values())
+    assert any("Shared reference root:" in value for value in primary_argv)
     assert "AcceptedQuestionBinding" in primary_prompt
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
