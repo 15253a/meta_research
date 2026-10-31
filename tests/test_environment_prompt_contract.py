@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import re
 from importlib.resources import files
 
 import pytest
@@ -26,10 +28,32 @@ def _root_instructions(root_kind, entry_path="initial"):
     return json.loads(encoded)
 
 
+def _root_reference(root_kind, name, entry_path="initial"):
+    instructions = _root_instructions(root_kind, entry_path)
+    assert f"references/{name}" in instructions
+    match = re.search(r"^Shared reference root: (.+)$", instructions, re.MULTILINE)
+    assert match, "reference pointers must identify the installed package root"
+    root = Path(match.group(1))
+    assert root.is_absolute()
+    body = (root / "references" / name).read_text(encoding="utf-8")
+    assert body.strip() and body not in instructions
+    return body
+
+
 @pytest.mark.parametrize("root_kind", ROOT_AGENT_KINDS)
 @pytest.mark.parametrize("entry_path", ROOT_CAPABILITY_ENTRY_PATHS)
 def test_every_root_launch_pairs_six_discovery_entries_with_actual_tools(root_kind, entry_path):
-    instructions = _root_instructions(root_kind, entry_path)
+    if root_kind == "acquisition":
+        # Acquisition receives a concrete download task, not Cycle discovery duties.
+        instructions = _root_instructions(root_kind, entry_path)
+        assert "references/research-navigation.md" not in instructions
+        assert "references/cycle-work.md" not in instructions
+        human = _root_reference(root_kind, "human-guidance.md", entry_path)
+        _root_reference(root_kind, "materials-and-custody.md", entry_path)
+        assert "human_request.open" in human
+        assert "human_request.open" in ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind]
+        return
+    instructions = _root_reference(root_kind, "research-navigation.md", entry_path)
     available = ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind]
     for operation in (
         "research_graph.questions.page",
@@ -48,7 +72,7 @@ def test_every_root_launch_pairs_six_discovery_entries_with_actual_tools(root_ki
 
 
 def test_root_guidance_separates_resource_knowledge_conditions_and_current_availability():
-    instructions = _root_instructions("target")
+    instructions = _root_reference("target", "research-navigation.md")
     # These are research/authorization boundaries, not a prescribed paragraph layout.
     for boundary in (
         "按真实来源直接登记",
@@ -68,7 +92,7 @@ def test_root_guidance_separates_resource_knowledge_conditions_and_current_avail
 
 
 def test_cross_quest_guidance_is_an_explicit_environment_reference_not_global_discovery():
-    instructions = _root_instructions("reasoning")
+    instructions = _root_reference("reasoning", "research-navigation.md")
     for boundary in (
         "已知另一 Quest 的精确 environment_ref",
         "每个数字 binding 在目标 Quest 的正式接纳",
@@ -81,7 +105,7 @@ def test_cross_quest_guidance_is_an_explicit_environment_reference_not_global_di
 
 
 def test_root_navigation_routes_operation_readers_before_reading_content():
-    instructions = _root_instructions("plan")
+    instructions = _root_reference("plan", "research-navigation.md")
     assert "reader 含 operation 时调用其指明的工具及参数" in instructions
     assert "共用正文 reader 的 source_ref／version_ref 才交给 research_memory.content.read" in instructions
     assert "摘要里的 reader 直接交给 research_memory.content.read" not in instructions
@@ -96,11 +120,13 @@ def test_root_navigation_routes_operation_readers_before_reading_content():
 def test_shipped_stage_resources_route_shared_entry_rules_and_preserve_independent_review(load_resources):
     resources = load_resources()
     assert "六入口" in resources["SKILL.md"]
-    assert "Environment 规则" in resources["research-guidance.md"]
+    assert "research-navigation.md" in resources["references/research-guidance.md"]
+    assert "research_graph.environments.page" in resources["references/research-navigation.md"]
     instructions = "\n".join(resources.values())
     assert "五入口" not in instructions
     assert "独立子智能体" in instructions
-    assert "同根 turn 的自查不构成独立 review" in resources["research-guidance.md"]
+    assert "独立审阅由子 Agent 对实际草稿与必要依据" in resources["references/research-guidance.md"]
+    assert "最终取舍由根负责" in resources["references/research-guidance.md"]
 
 
 @pytest.mark.parametrize("load_resources", (_bundle_skill_resources, _reasoning_skill_resources))
