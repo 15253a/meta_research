@@ -90,4 +90,3 @@ def test_reasoning_consumes_generic_evidence_from_the_complete_adopted_binding()
         }}, "evidence_reuse_set": [use], "evidence_reuse_closure": [leaf],
     }}
     assert plan_evidence_reuse_leaves(context) == [source]
-

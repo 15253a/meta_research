@@ -102,4 +102,3 @@ def test_complete_adoption_retains_identity_and_explicit_reference_checks(mutati
         code = "plan_selected_evidence_invalid"
     with pytest.raises(PlanContractError, match=code):
         _validate(document)
-
