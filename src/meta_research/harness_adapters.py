@@ -414,9 +414,9 @@ class _NativeCliHarnessAdapter:
         try:
             # Verify the current packaged references before any provider launch.
             root_capability_profile(invocation.root_kind or "target").as_dict()
-            argv = self._argv(invocation)
         except (OSError, UnicodeError, ModuleNotFoundError) as error:
             raise HarnessAdapterUnavailable("provider_resource_unavailable") from error
+        argv = self._argv(invocation)
         evidence_scope_ref = _harness_evidence_scope_ref(invocation)
         observation_scope = _target_root_observation_scope(invocation)
         timeout_seconds = invocation.provider_operation_timeout_seconds
