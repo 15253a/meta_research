@@ -13,6 +13,8 @@ from meta_research.codex_runtime import (
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, research_system_prompt
+from meta_research.research_guidance import shared_reference_bundle_hash, shared_reference_instructions
+from meta_research.resource_preparation import prepared_resource
 
 
 RootAgentKind = Literal[
@@ -154,7 +156,11 @@ class RootCapabilityProfile:
             "enabled_codex_features": list(_CODEX_ROOT_FEATURES),
             "multi_agent_enabled": self.multi_agent_enabled,
             "web_search_mode": self.web_search_mode,
-            "research_system_prompt_hash": canonical_hash(RESEARCH_SYSTEM_PROMPT),
+            "research_system_prompt_hash": canonical_hash({
+                "prompt": RESEARCH_SYSTEM_PROMPT,
+                "references": shared_reference_bundle_hash(),
+                "index": _shared_reference_index_hash(),
+            }),
             "model_ref": CODEX_MODEL_REF,
             "cli_reasoning_preset": CODEX_ROOT_REASONING_PRESET,
             "effective_reasoning_effort": CODEX_REASONING_EFFORT,
@@ -188,7 +194,10 @@ class RootCapabilityProfile:
             "--config",
             'web_search="live"',
             "--config",
-            "developer_instructions=" + json.dumps(research_system_prompt(output_language), ensure_ascii=False),
+            "developer_instructions=" + json.dumps(
+                research_system_prompt(output_language) + "\n\n"
+                + shared_reference_instructions(self.root_kind), ensure_ascii=False
+            ),
         )
 
     def runtime_bindings(self) -> tuple[str, ...]:
@@ -361,6 +370,13 @@ class RootCapabilityProfile:
                 "features": provider_features,
             },
         }
+
+
+@prepared_resource
+def _shared_reference_index_hash() -> str:
+    # The capability floor is common to all roots; role-specific navigation is
+    # part of that shared installation identity, not a new authorization.
+    return canonical_hash({kind: shared_reference_instructions(kind) for kind in ROOT_AGENT_KINDS})
 
 
 def root_capability_profile(root_kind: RootAgentKind) -> RootCapabilityProfile:

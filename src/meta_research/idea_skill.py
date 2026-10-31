@@ -60,7 +60,7 @@ from meta_research.idea_contract import (
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import shared_research_guidance, shared_human_guidance
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES,
@@ -1501,7 +1501,7 @@ class CodexIdeaSkillAdapter:
                 self._root_agent_kind,
             ),
             resource_bindings=tuple(
-                f"package:meta_research.skills.idea_stage/{name}@sha256:"
+                f"package:meta_research.skills{'' if name in SHARED_REFERENCE_PATHS else '.idea_stage'}/{name}@sha256:"
                 f"{canonical_hash(content)}"
                 for name, content in resources.items()
             )
@@ -3821,14 +3821,13 @@ def _idea_skill_resources() -> dict[str, str]:
     )
     try:
         return {
-            "research-guidance.md": shared_research_guidance(),
-            "human-guidance.md": shared_human_guidance(),
+            **shared_reference_resources(),
             **{
                 name: resource.read_text(encoding="utf-8")
                 for name, resource in resources
             },
         }
-    except (FileNotFoundError, ModuleNotFoundError) as error:
+    except (OSError, UnicodeError, ModuleNotFoundError) as error:
         raise IdeaSkillUnavailable("idea_skill_resource_unavailable") from error
 
 
@@ -3836,7 +3835,9 @@ def _idea_skill_instructions() -> str:
     return "\n\n".join(
         f"<!-- bundled resource: {name} -->\n{content}"
         for name, content in _idea_skill_resources().items()
-    )
+        if name not in SHARED_REFERENCE_PATHS
+    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "idea_stage" / "SKILL.md")
+         + "\nResolve role reference links relative to this source directory.")
 
 
 def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, object]:

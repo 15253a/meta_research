@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from meta_research.external_mcp import ExternalMcpAccess
+from meta_research.resource_preparation import resource_preparation
 from meta_research.native_guidance import live_native_argv
 
 import json
@@ -399,6 +400,7 @@ class _NativeCliHarnessAdapter:
             "no_proxy": _loopback_no_proxy(),
         }
 
+    @resource_preparation
     def _invoke(
         self, invocation: HarnessInvocation, *, terminal_replay_only: bool
     ) -> HarnessTurnEvidence:
@@ -409,7 +411,12 @@ class _NativeCliHarnessAdapter:
             invocation,
             provider_version=provider_version,
         )
-        argv = self._argv(invocation)
+        try:
+            # Verify the current packaged references before any provider launch.
+            root_capability_profile(invocation.root_kind or "target").as_dict()
+            argv = self._argv(invocation)
+        except (OSError, UnicodeError, ModuleNotFoundError) as error:
+            raise HarnessAdapterUnavailable("provider_resource_unavailable") from error
         evidence_scope_ref = _harness_evidence_scope_ref(invocation)
         observation_scope = _target_root_observation_scope(invocation)
         timeout_seconds = invocation.provider_operation_timeout_seconds

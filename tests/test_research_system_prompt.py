@@ -19,20 +19,16 @@ def test_real_root_adapter_passes_human_request_instructions(tmp_path, root_kind
     assert len(instructions) == 1
     actual = tomllib.loads(instructions[0])["developer_instructions"]
     assert actual.startswith(RESEARCH_SYSTEM_PROMPT)
-    assert "delivery.reply_reader" in actual
-    assert "uploaded_readers" in actual
-    assert "linked_locators" in actual
-    assert "provided_material" in actual
-    assert "research_workspace.materials.discover" in actual
-    assert "research_workspace.materials.read" in actual
-    assert "delivery.work_materials" in actual
-    assert "无需 RM binding" in actual
-    assert "提交回应不自动登记" in actual
+    assert "Shared reference root:" in actual
+    assert "references/human-guidance.md" in actual
+    assert "references/materials-and-custody.md" in actual
+    from meta_research.research_guidance import shared_reference_resources
+    assert all(body not in actual for body in shared_reference_resources().values())
     language_instructions = actual[len(RESEARCH_SYSTEM_PROMPT):]
     assert "本回合输出语言：zh。" in language_instructions
     assert "直接使用中文" in language_instructions
     assert "委派时传递同一语言要求" in language_instructions
-    assert "human_request.open.reconcile" in RESEARCH_SYSTEM_PROMPT
+    assert "HumanRequest" in RESEARCH_SYSTEM_PROMPT
 
 
 def test_all_lifecycle_paths_bind_the_same_instructions():
@@ -40,4 +36,4 @@ def test_all_lifecycle_paths_bind_the_same_instructions():
         profile = root_capability_profile(kind)
         assert "research_system_prompt_hash" in profile.as_dict()
         assert len({profile.codex_arguments(entry_path=entry) for entry in ROOT_CAPABILITY_ENTRY_PATHS}) == 1
-        assert "human_request" in json.loads(next(arg.split("=", 1)[1] for arg in profile.codex_arguments() if arg.startswith("developer_instructions=")))
+        assert "human-guidance.md" in json.loads(next(arg.split("=", 1)[1] for arg in profile.codex_arguments() if arg.startswith("developer_instructions=")))

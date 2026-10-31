@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources
+
 from meta_research.context_presentation import (
     STAGE_CONTEXT_DELIVERY_GUIDANCE, stage_context_json, stage_position_prompt,
 )
@@ -1246,7 +1248,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 self._root_agent_kind,
             ),
             resource_bindings=tuple(
-                f"package:meta_research.skills.bundle_stage/{name}@sha256:"
+                f"package:meta_research.skills{'' if name in SHARED_REFERENCE_PATHS else '.bundle_stage'}/{name}@sha256:"
                 f"{canonical_hash(content)}"
                 for name, content in resources.items()
             )
@@ -1826,14 +1828,11 @@ def _bundle_skill_resources() -> dict[str, str]:
         ),
     )
     try:
-        from .research_guidance import shared_research_guidance, shared_human_guidance
-
         return {
-            "research-guidance.md": shared_research_guidance(),
-            "human-guidance.md": shared_human_guidance(),
+            **shared_reference_resources(),
             **{name: resource.read_text(encoding="utf-8") for name, resource in resources},
         }
-    except (FileNotFoundError, ModuleNotFoundError) as error:
+    except (OSError, UnicodeError, ModuleNotFoundError) as error:
         raise BundleSkillUnavailable("bundle_skill_resource_unavailable") from error
 
 
@@ -1847,7 +1846,9 @@ def _bundle_skill_instructions(resources: dict[str, str] | None = None) -> str:
     return "\n\n".join(
         f"<!-- bundled resource: {name} -->\n{content}"
         for name, content in (resources if resources is not None else _bundle_skill_instruction_resources()).items()
-    )
+        if name not in SHARED_REFERENCE_PATHS
+    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "bundle_stage" / "SKILL.md")
+         + "\nResolve role reference links relative to this source directory.")
 
 
 def _rolling_operation_identity(request: BundleDispatchRequest | BundleTargetBatchRequest) -> dict[str, object]:

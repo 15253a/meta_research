@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 
 from meta_research import idea_skill, plan_skill, bundle_skill, reasoning_skill
-from meta_research.research_guidance import shared_human_guidance
+from meta_research.research_guidance import shared_reference_resources
 from meta_research.target_execution_contract import target_execution_skill_text
 from meta_research.owners.common import canonical_hash
 from meta_research.root_capabilities import root_capability_profile
@@ -10,34 +10,37 @@ from meta_research.runtime_binding_compatibility import reviewed_historical_root
 from test_human_guidance_providers import _adapter, _reasoning_runtime
 
 
-def test_shared_guidance_is_loaded_once_by_every_working_root_and_changes_fingerprints(tmp_path, monkeypatch):
+def test_shared_guidance_is_disclosed_by_every_working_root_and_changes_fingerprints(tmp_path, monkeypatch):
+    from io import StringIO
     modules = (idea_skill, plan_skill, bundle_skill, reasoning_skill)
     adapters = [_adapter(getattr(module, "Codex" + name + "SkillAdapter"), tmp_path)[0]
         for module, name in zip(modules, ("Idea", "Plan", "Bundle", "Reasoning"))]
     runtime = _reasoning_runtime(tmp_path / "runtime", idea_skill=adapters[0],
         plan_skill=adapters[1], bundle_skill=adapters[2], reasoning_skill=adapters[3])
     try:
-        original = shared_human_guidance()
+        original = shared_reference_resources()["references/human-guidance.md"]
         texts = [getattr(module, "_" + name + "_skill_instructions")()
             for module, name in zip(modules, ("idea", "plan", "bundle", "reasoning"))]
         texts.append(target_execution_skill_text())
-        for text in texts:
-            assert text.count(original) == 1
-            assert "human_guidance.read" in text
-            assert "human_guidance.feedback" in text
-            assert "needs_treatment=false" in text
-            assert "goal_alignment_pending" in text
+        assert all(original not in text for text in texts)
+        assert "human_guidance.read" in original
+        assert "human_guidance.feedback" in original
         before = [adapter.runtime_binding() for adapter in adapters]
-        from meta_research import research_guidance
-        for module in (idea_skill, plan_skill, reasoning_skill, research_guidance):
-            monkeypatch.setattr(module, "shared_human_guidance", lambda: original + "\nAdditional exact guidance instruction.\n")
+        target_before = root_capability_profile("target").digest
+        original_open = Path.open
+
+        def updated_reference(path, *args, **kwargs):
+            if path.name == "human-guidance.md" and path.parent.name == "references":
+                with original_open(path, *args, **kwargs) as stream:
+                    return StringIO(stream.read() + "\nAdditional exact guidance instruction.\n")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", updated_reference)
         after = [adapter.runtime_binding() for adapter in adapters]
         for previous, changed in zip(before, after):
             assert previous.packaged_skill_bundle_hash != changed.packaged_skill_bundle_hash
-            assert previous.instruction_set_hash != changed.instruction_set_hash
-        from meta_research import research_guidance
-        monkeypatch.setattr(research_guidance, "shared_human_guidance", lambda: original + "\nTarget instruction change.\n")
-        assert "Target instruction change." in target_execution_skill_text()
+            assert previous.resource_bindings != changed.resource_bindings
+        assert root_capability_profile("target").digest != target_before
     finally:
         runtime.close()
 
@@ -55,4 +58,4 @@ def test_system_instruction_profile_keeps_exact_historical_read_identity():
             key: value for key, value in after.items() if key != "research_system_prompt_hash"
         }
         assert document["before_profile_hash"] in reviewed_historical_root_profile_hashes(document["after_profile_hash"])
-        assert document["after_profile_hash"] in reviewed_historical_root_profile_hashes(current.digest)
+        assert document["after_profile_hash"] not in reviewed_historical_root_profile_hashes(current.digest)

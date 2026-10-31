@@ -2,7 +2,7 @@
 
 ## 输入
 
-运行中的工作资料按[共享资料处理合同](../../human-guidance.md#工作资料的当前处理与后继交接)读取、选择与反馈；向 Plan 交接实际影响、未读范围与所选 RM reader，原投递保持原根归属。
+运行中的工作资料按[共享资料处理合同](../../references/materials-and-custody.md#工作资料的当前处理与后继交接)读取、选择与反馈；向 Plan 交接实际影响、未读范围与所选 RM reader，原投递保持原根归属。
 
 首题上下文中的 `creation_basis` 指向正式 Question 关联的已有课题理解。用 `research_memory.stage_context.read` 的 `creation_understanding`、`creation_corrections` 和 `creation_sources` 分页读取。选中原件沿返回的 `research_memory.content.read` 精确版本入口继续读。未选中或未读的原材料保留 `research_memory.creation_basis.read` 入口，hash 变化或文件缺失如实报告。文献修正绑定准确 predecessor 和 snapshot，外部旧成果不能当成本 Quest 新 Run。
 
