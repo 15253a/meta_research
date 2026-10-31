@@ -22,7 +22,7 @@ from meta_research.owners.research_graph import (
     TargetCommitEvidenceAuthority,
 )
 from meta_research.owners.research_memory import ResearchMemoryInterface
-from meta_research.plan_contract import EVIDENCE_REF_SCHEMA_REF, EVIDENCE_SOURCE_REF_SCHEMA, GENERIC_EVIDENCE_KINDS
+from meta_research.plan_contract import EVIDENCE_REF_SCHEMA_REF, GENERIC_EVIDENCE_KINDS
 
 
 TARGET_COMMIT_EVIDENCE_SCHEMA_REF = "meta-research/target-commit-evidence/v1"
@@ -487,6 +487,14 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                 raise OwnerConflict("plan_evidence_reuse_set_invalid")
             uses_by_ref.setdefault(evidence_ref, []).append(use)
         selected_refs = frozenset(uses_by_ref)
+        if (type(expected_reference_revision) is not int
+                or not isinstance(evidence_catalog, list)
+                or len(evidence_catalog) != expected_reference_revision
+                or any(not isinstance(item, dict) or not isinstance(item.get("evidence_ref"), str)
+                       for item in evidence_catalog)
+                or len({item["evidence_ref"] for item in evidence_catalog}) != len(evidence_catalog)
+                or not selected_refs.issubset({item["evidence_ref"] for item in evidence_catalog})):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
         if not selected_refs:
             return ()
 

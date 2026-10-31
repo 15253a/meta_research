@@ -2841,6 +2841,17 @@ def test_unscheduled_gap_records_skipped_without_starting_bundle_or_target(tmp_p
         assert current["stage_commit"]["status"] == "Skipped"
         assert current["run"] is None
         assert current["target_commits"] == []
+        question = runtime.owners.research_graph.query_question_by_ref(accepted_plan["question_ref"])
+        assert question is not None
+        reasoning = runtime.owners.advancement_engine.ensure_reasoning_stage_request(
+            cycle_ref=current["stage_run_request"]["cycle_ref"],
+            accepted_question=question.as_binding(),
+            idempotency_key="unscheduled-plan-reasoning-request",
+        )
+        plan_input = reasoning.context_pack["plan_evidence_input"]
+        assert plan_input["kind"] == "accepted"
+        assert plan_input["formal_plan_binding"]["plan_document"] == accepted_plan
+        assert reasoning.context_pack["accepted_target_commit_closures"] == []
     finally:
         runtime.close()
 

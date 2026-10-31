@@ -2748,9 +2748,11 @@ class SQLiteTargetRunGraphAuthority:
                 resolved[ref] = _SelectedTargetInput(asset, row.quest_ref, role)
         companion_refs = {ref for ref in unresolved if ref.startswith("asset_") and ref not in resolved}
         if companion_refs and selected_commits:
-            sources = self._domain_reader.query_target_commit_input_asset_bindings(
-                quest_ref=row.quest_ref, target_commit_refs=tuple(sorted(selected_commits)),
-            )
+            sources = {}
+            commit_refs = tuple(sorted(selected_commits))
+            for offset in range(0, len(commit_refs), 256):
+                sources.update(self._domain_reader.query_target_commit_input_asset_bindings(
+                    quest_ref=row.quest_ref, target_commit_refs=commit_refs[offset:offset + 256]))
             for commit_ref, assets in sources.items():
                 for asset in assets:
                     relevant_refs = companion_refs.intersection((asset.asset_ref, asset.version_ref))

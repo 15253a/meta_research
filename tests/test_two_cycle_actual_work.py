@@ -64,11 +64,10 @@ class _Plan(_MultiRunPlanSkill):
         self.discoveries.append({'question':questions,'source_ref':ref,'baseline':baselines,
             'dataset':version,'outcome_read':read,'dataset_read':data,
             'environment':environment,'environment_read':environment_read})
-        entry={'schema_ref':'meta-research/evidence-source-ref/v1','evidence_ref':ref,
-            'source_kind':'ScientificOutcome','source_ref':ref}
+        entry=read['selected_evidence_binding']
         self.no_gap=True
-        document=super()._document(replace(request,context_pack={**request.context_pack,'evidence_catalog':[entry]}))
-        document['additional_evidence_bindings']=[entry]
+        self.selected_evidence_bindings=[entry]
+        document=super()._document(request)
         document['coverage'][0]['evidence_uses'][0]['supported_claim']='The previous accepted synthesis reports actual bounded work and preserved outputs.'
         document['coverage'][0]['evidence_uses'][0]['support_boundary']='Reuse of the accepted result; this cycle does not claim new execution.'
         return _with_derived_answer_contract_hash(document,request)

@@ -225,30 +225,21 @@ def test_invalid_plan_source_is_rejected_and_corrected_in_same_session(
                 receipt=replace(decision.receipt, payload_hash="0" * 64),
             )
 
-        # Only this source error on its signed rejection may be read back.
-        # Accepted decisions and unrelated integrity errors still fail closed.
-        def unavailable_source(**_kwargs):
-            raise OwnerConflict("plan_evidence_source_invalid")
-
+        # Signed historical decisions remain the accepting Owner's facts. Reading
+        # them does not re-admit the complete source graph; current material
+        # access and execution eligibility are checked at their own boundaries.
+        accepted_submission = completed["run"]["submission_ref"]
+        accepted_decision = graph.query_formal_plan_decision(accepted_submission)
+        from unittest.mock import Mock
+        admission = Mock(side_effect=AssertionError("historical decision readmission"))
         with monkeypatch.context() as patch:
             patch.setattr(
                 graph._receipt_verifier,
                 "verify_plan_evidence_catalog",
-                unavailable_source,
+                admission,
             )
-            with pytest.raises(OwnerConflict, match="plan_evidence_source_invalid"):
-                graph.query_formal_plan_decision(completed["run"]["submission_ref"])
-
-        def invalid_receipt(**_kwargs):
-            raise OwnerConflict("literature_snapshot_receipt_invalid")
-
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                graph._receipt_verifier,
-                "verify_plan_evidence_catalog",
-                invalid_receipt,
-            )
-            with pytest.raises(OwnerConflict, match="literature_snapshot_receipt_invalid"):
-                graph.query_formal_plan_decision(submission_ref)
+            assert graph.query_formal_plan_decision(accepted_submission) == accepted_decision
+            assert graph.query_formal_plan_decision(submission_ref) == decision
+            admission.assert_not_called()
     finally:
         runtime.close()

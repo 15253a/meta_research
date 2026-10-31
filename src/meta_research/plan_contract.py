@@ -15,7 +15,6 @@ PLAN_CONTEXT_PACK_SCHEMA_REF = "meta-research/plan-context-pack/v1"
 PLAN_DOCUMENT_SCHEMA_REF = "meta-research/plan-document/v1"
 PLAN_REVIEW_SCHEMA_REF = "meta-research/plan-advisory-review/v1"
 EVIDENCE_REF_SCHEMA_REF = "meta-research/evidence-ref/v1"
-EVIDENCE_SOURCE_REF_SCHEMA = "meta-research/evidence-source-ref/v1"
 GENERIC_EVIDENCE_KINDS = frozenset({"HumanInput", "ScientificOutcome", "AssetVersion", "LiteratureSnapshot"})
 MAX_PLAN_OBLIGATIONS = 64
 MAX_PLAN_EVIDENCE_REFS = 256
@@ -501,14 +500,6 @@ def _validate_idea_set_binding(
 
 
 def _validate_evidence_ref(evidence: dict[str, object]) -> None:
-    if evidence.get("schema_ref") == EVIDENCE_SOURCE_REF_SCHEMA:
-        _exact_keys(evidence, {"schema_ref", "evidence_ref", "source_kind", "source_ref"},
-                    "plan_evidence_ref_invalid")
-        if (evidence.get("source_kind") not in GENERIC_EVIDENCE_KINDS
-                or not _text(evidence.get("source_ref"))
-                or evidence.get("evidence_ref") != evidence.get("source_ref")):
-            raise PlanContractError("plan_evidence_ref_invalid")
-        return
     _exact_keys(
         evidence,
         {

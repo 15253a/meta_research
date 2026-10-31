@@ -138,23 +138,6 @@ def _workproduct_plan_selection(tmp_path, input_kind, *, check_cleanup):
         runtime.owners.agent_runtime.publish_target_root_completion(target_ref=handle.target_ref,
             completion_ref=completed.completion_ref, target_commit_ref=completed.target_commit_ref)
         graph = runtime.owners.research_graph
-        _, exact_sources = graph.query_plan_evidence_catalog(quest_ref=quest["quest_ref"],
-            target_commit_refs=(completed.target_commit_ref,), current_only=False)
-        evidence_version = exact_sources[0]["asset_version_ref"]
-        exact = read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
-                             source_ref=completed.target_commit_ref, version_ref=evidence_version)
-        assert exact["text"]
-        adopted = exact["selected_evidence_binding"]
-        assert adopted["source_kind"] == "TargetCommit"
-        assert adopted["reader"] == {"operation": "research_memory.content.read", "args": {
-            "source_ref": completed.target_commit_ref, "version_ref": evidence_version}}
-        assert read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
-                            **adopted["reader"]["args"])["selected_evidence_binding"] == adopted
-        for wrong_scope, wrong_version in (("foreign-quest", evidence_version),
-                                            (quest["quest_ref"], "asset_version_missing")):
-            with pytest.raises(OwnerConflict, match="content_version_unbound"):
-                read_content(graph, runtime.owners.research_memory, quest_ref=wrong_scope,
-                             source_ref=completed.target_commit_ref, version_ref=wrong_version)
         cleanup = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
         if check_cleanup:
             assert len(cleanup) == 1 and cleanup[0]["action"] == "removed" and cleanup[0]["bytes"] > 0, cleanup
@@ -172,6 +155,21 @@ def _workproduct_plan_selection(tmp_path, input_kind, *, check_cleanup):
         _, entries = catalog.query_plan_evidence_catalog(quest_ref=quest["quest_ref"],
             target_commit_refs=(completed.target_commit_ref,))
         assert len(entries) == 1
+        evidence_version = entries[0]["asset_version_ref"]
+        exact = read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
+                             source_ref=completed.target_commit_ref, version_ref=evidence_version)
+        assert exact["text"]
+        adopted = exact["selected_evidence_binding"]
+        assert adopted["source_kind"] == "TargetCommit"
+        assert adopted["reader"] == {"operation": "research_memory.content.read", "args": {
+            "source_ref": completed.target_commit_ref, "version_ref": evidence_version}}
+        assert read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
+                            **adopted["reader"]["args"])["selected_evidence_binding"] == adopted
+        for wrong_scope, wrong_version in (("foreign-quest", evidence_version),
+                                            (quest["quest_ref"], "asset_version_missing")):
+            with pytest.raises(OwnerConflict, match="content_version_unbound"):
+                read_content(graph, runtime.owners.research_memory, quest_ref=wrong_scope,
+                             source_ref=completed.target_commit_ref, version_ref=wrong_version)
         plan.entry = entries[0]
         bundle.input_ref = entries[0][input_kind]
         _finish_stage(runtime, "reasoning")

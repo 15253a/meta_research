@@ -126,10 +126,14 @@ def test_accepted_plan_metadata_and_evidence_prose_do_not_get_projection_short_l
            "contributing_idea_refs": ["topology"]}
     plan["coverage"][0]["evidence_uses"] = [use]
     plan["evidence_reuse_set"] = [deepcopy(use)]
-    plan["source_bindings"]["selected_evidence_catalog"] = [
-        {"schema_ref": "meta-research/evidence-source-ref/v1", "evidence_ref": source_ref,
-         "source_kind": "ScientificOutcome", "source_ref": source_ref}
-    ]
+    from meta_research.research_content import adopted_source_binding
+    # This contract test supplies an accepted-source fixture. Use the same
+    # projection as its exact reader without inventing a second entry format.
+    leaf = {"kind": "ScientificOutcome", "ref": source_ref,
+            "source_subject_ref": "reasoning-content:accepted-source",
+            "owner_acceptance_receipt_ref": "reasoning-receipt:accepted-source"}
+    plan["source_bindings"]["selected_evidence_bindings"] = [
+        adopted_source_binding(None, quest_ref="quest:1", source_ref=source_ref, leaf=leaf)]
     _round_trip(plan)
 
 
