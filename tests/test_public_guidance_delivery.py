@@ -1,6 +1,8 @@
 """Observe packaged, on-demand references at the actual provider boundary."""
 from pathlib import Path
 from dataclasses import replace
+import hashlib
+import json
 import re
 import tomllib
 
@@ -38,6 +40,17 @@ class _ReadingRunner:
         for name, body in documents.items():
             assert f"references/{name}" in developer
             assert body.strip() and body not in developer and body not in prompt
+            for target in re.findall(r"\]\(([^)]+)\)", body):
+                relative = target.split("#", 1)[0]
+                if relative and "://" not in relative:
+                    linked = (root / "references" / relative).resolve()
+                    assert linked.is_relative_to(root) and linked.is_file(), target
+        evidence = {
+            "cwd": str(cwd), "shared_reference_root": str(root),
+            "delivery_channels": {"developer": developer, "user": prompt},
+            "references_read": {name: {"utf8_bytes": len(body.encode()), "sha256": hashlib.sha256(body.encode()).hexdigest()} for name, body in documents.items()},
+        }
+        (cwd / f"public-guidance-observation-{len(self.observed)}.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
         self.observed.append((cwd, developer, documents))
         return self.delegate(argv, prompt, timeout, environment)
 
@@ -168,5 +181,5 @@ def test_harness_maintains_role_scoped_reference_access(tmp_path, root_kind, ent
     ))
     assert len(reading.observed) == 1
     developer = reading.observed[0][1]
-    assert "cycle-work.md" not in developer if "cycle-work.md" not in names else "cycle-work.md" in developer
+    assert ("cycle-work.md" in developer) == ("cycle-work.md" in names)
     assert result.profile["root_capability_diagnostics"]["side_effect_authorization"]["operation_ids"] == list(operation_ids)

@@ -26,6 +26,9 @@ def test_shared_guidance_is_disclosed_by_every_working_root_and_changes_fingerpr
         assert "human_guidance.read" in original
         assert "human_guidance.feedback" in original
         before = [adapter.runtime_binding() for adapter in adapters]
+        for binding in before:
+            for name in shared_reference_resources():
+                assert any(item.startswith(f"package:meta_research.skills/{name}@sha256:") for item in binding.resource_bindings)
         target_before = root_capability_profile("target").digest
         original_open = Path.open
 
@@ -45,7 +48,7 @@ def test_shared_guidance_is_disclosed_by_every_working_root_and_changes_fingerpr
         runtime.close()
 
 
-def test_system_instruction_profile_keeps_exact_historical_read_identity():
+def test_new_resource_profile_does_not_enable_old_task_compatibility():
     fixture = Path(__file__).parent / "fixtures" / "human_guidance_20261008" / "profiles.json"
     document = json.loads(fixture.read_text())
     before, after = document["before_profile"], document["after_profile"]
