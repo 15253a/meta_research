@@ -43,7 +43,9 @@ def _worker(tmp_path, request_exists=True):
     current = NS(cycle_ref="cycle", question=NS(
         quest_ref="quest", as_binding=lambda: question_binding
     ))
-    formal_plan = NS(plan_document={"gap_set": []}, as_dict=lambda: {"formal_plan_ref": "plan"})
+    formal_plan = NS(plan_document={"gap_set": [], "experiment_briefs": [],
+        "bundle_disposition": "no_new_experiment_required"},
+        as_dict=lambda: {"formal_plan_ref": "plan"})
     eligible = NS(accepted_formal_plan=lambda: formal_plan, accepted_idea_set=None)
     request = NS(request_ref="request", accepted_formal_plan=formal_plan)
     foreground = {"cycle_ref": "cycle", "stage": "bundle", "status": "active", "epoch": 1}

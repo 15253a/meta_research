@@ -34,8 +34,20 @@ def setup(kind=TARGET_COMMIT_RECEIPT_KIND):
 def test_native_and_supported_legacy_receipt_reach_issuer_leaf_validation(kind):
     catalog, commit, entry, args, leaf = setup(kind)
     assert catalog.resolve_plan_evidence_reuse_leaves(**args) == (leaf,)
-    catalog.verify_plan_evidence_catalog.assert_called_once()
+    catalog.verify_plan_evidence_catalog.assert_not_called()
     catalog._issuer_closed_role_leaves.assert_called_once()
+    passed = catalog._issuer_closed_role_leaves.call_args.kwargs
+    assert passed['catalog_entry'] == entry and passed['commit'] is commit
+    assert passed['evidence_ref'] == 'evidence_fixture' and passed['uses'] == args['evidence_reuse_set']
+
+
+def test_issuer_leaf_rejection_is_preserved_without_repeating_catalog_admission():
+    catalog, _commit, _entry, args, _leaf = setup()
+    catalog._issuer_closed_role_leaves.side_effect = OwnerConflict('plan_evidence_reuse_closure_invalid')
+    with pytest.raises(OwnerConflict, match='plan_evidence_reuse_closure_invalid'):
+        catalog.resolve_plan_evidence_reuse_leaves(**args)
+    catalog._issuer_closed_role_leaves.assert_called_once()
+    catalog.verify_plan_evidence_catalog.assert_not_called()
 
 @pytest.mark.parametrize('field,value', [('kind','untrusted'), ('issuer','other'), ('subject_ref','other')])
 def test_wrong_commit_receipt_is_rejected(field, value):
