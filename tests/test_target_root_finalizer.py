@@ -342,7 +342,7 @@ class _CurrentBindingBundleSkill(bundle_fixtures._DeterministicBundleSkill):
         )
 
 
-def _current_bundle_runtime(path: Path, *, bundle_skill=None, intent_drafting_provider=None):
+def _current_bundle_runtime(path: Path, *, bundle_skill=None, intent_drafting_provider=None, harness_adapters=None):
     """Use current operation-local Bundle and Target admission."""
 
     drafting = bundle_fixtures._DeterministicDraftingAdapter()
@@ -356,7 +356,7 @@ def _current_bundle_runtime(path: Path, *, bundle_skill=None, intent_drafting_pr
             no_gap=False
         ),
         bundle_skill_provider=bundle_skill or _CurrentBindingBundleSkill(),
-        harness_adapters=(
+        harness_adapters=harness_adapters or (
             bundle_fixtures._FullConformanceAdapter("codex"),
         ),
         power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),

@@ -183,3 +183,78 @@ def test_harness_maintains_role_scoped_reference_access(tmp_path, root_kind, ent
     developer = reading.observed[0][1]
     assert ("cycle-work.md" in developer) == ("cycle-work.md" in names)
     assert result.profile["root_capability_diagnostics"]["side_effect_authorization"]["operation_ids"] == list(operation_ids)
+
+
+def test_admitted_target_driver_delivers_resources_through_real_harness(tmp_path):
+    from meta_research.harness_adapters import CodexHarnessAdapter
+    from test_harness_adapters import _RecordedRunner
+    from test_target_root_finalizer import _current_bundle_runtime
+    from test_target_launch_admission import _ready_launch
+
+    class Delivered(BaseException):
+        pass
+
+    def stop_after_delivery(argv, prompt, timeout, environment):
+        assert "Exact Owner context:\n" in prompt
+        raise Delivered()
+
+    reading = _ReadingRunner(stop_after_delivery)
+    probes = _RecordedRunner("codex", ())
+
+    def runner(argv, prompt, timeout, environment):
+        if "--cd" not in argv:
+            return probes(argv, prompt, timeout, environment)
+        return reading(argv, prompt, timeout, environment)
+
+    adapter = CodexHarnessAdapter(tmp_path / "native-harness", runner=runner)
+    runtime = _current_bundle_runtime(tmp_path / "runtime", harness_adapters=(adapter,))
+    try:
+        graph, target, _bundle, dispatch, launch = _ready_launch(runtime)
+        runtime.owners.agent_runtime.admit_target_launch(launch, dispatch_decision_ref=dispatch.decision_ref, idempotency_key="public-guidance-target")
+        runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+        runtime.target_run_runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+        for _ in range(16):
+            try:
+                runtime.target_run_runtime.process_once(target.target_ref)
+            except Delivered:
+                break
+        assert len(reading.observed) == 1, runtime.target_run_runtime.query_status(target.target_ref)
+        cwd = reading.observed[0][0]
+        record = json.loads((cwd / "public-guidance-observation-0.json").read_text(encoding="utf-8"))
+        user = record["delivery_channels"]["user"]
+        assert "Skill source:" in user and "target-execution" in user
+        material, _ = json.JSONDecoder().raw_decode(user.split("Exact Owner context:\n", 1)[1])
+        assert material["research_context"]["target_ref"] == target.target_ref
+        assert material["research_context"]["graph_ref"] == graph.graph_ref
+        assert material["execution_contract"]["measurement_contract"]
+        original = runtime.target_run_authorities.research_graph.query_target_research_context(target_ref=target.target_ref)
+        for field in ("question", "plan_notes", "bundle_notes"):
+            assert material["research_context"][field] == original[field]
+        assert Path(material["frozen_input_manifest_path"]).is_file()
+    finally:
+        runtime.close()
+
+
+def test_writing_real_adapter_grants_read_only_packaged_references(tmp_path):
+    from meta_research.writing_skill import CodexWritingSkillAdapter
+    from test_writing_skill_adapter import _request as writing_request, _draft_output, _SequenceRunner as WritingRunner
+    names = tuple(name for name in SHARED_NAMES if name != "cycle-work.md")
+    reading = _ReadingRunner(WritingRunner([_draft_output()]), names)
+
+    def runner(argv, prompt, timeout, environment=None):
+        developer = _developer(argv)
+        root = re.search(r"^Shared reference root: (.+)$", developer, re.MULTILINE).group(1)
+        permission = tomllib.loads(next(value for value in argv if value.startswith("permissions.writing_snapshot=")))["permissions"]["writing_snapshot"]
+        assert permission["filesystem"][root] == "read"
+        assert permission["filesystem"][argv[argv.index("--cd") + 1]] == "write"
+        assert sum(value == "read" for value in permission["filesystem"].values()) == 3
+        return reading(argv, prompt, timeout, environment)
+
+    adapter = CodexWritingSkillAdapter(tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
+    request = writing_request(adapter)
+    adapter.generate_draft(request)
+    assert len(reading.observed) == 1
+    assert "accepted_source_manifest=" in reading.calls[0][1]
+    source_root = tmp_path / "provider" / "writing-inputs" / request.snapshot["snapshot_hash"]
+    manifest = json.loads((source_root / "manifest.json").read_text(encoding="utf-8"))
+    assert Path(manifest["sources"][0]["path"]).read_bytes() == request.source_materials[0].content
