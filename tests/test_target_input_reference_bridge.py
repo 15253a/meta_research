@@ -13,6 +13,7 @@ from meta_research.owners.common import (
 )
 from meta_research.owners.research_graph import AcceptedAssetRole
 from meta_research.owners.target_run_runtime import SQLiteTargetRunGraphAuthority
+from meta_research.target_commit_evidence import target_adoption_binding
 
 
 def _receipt(ref):
@@ -51,8 +52,11 @@ def _authority(refs, *, plan=False, existing=False):
     leaves = tuple(SimpleNamespace(role="MetricResult", evidence_ref=entry["evidence_ref"],
         evidence_catalog_entry_hash=canonical_hash(entry), target_commit_ref=entry["target_commit_root_ref"])
         for entry in catalog)
-    binding = AcceptedFormalPlanBinding("plan", "content", "b" * 64, "c" * 64,
-        _receipt("content"), _receipt("plan"), "stage_commit", _receipt("stage_commit"), {})
+    plan_document = {"source_bindings": {"selected_evidence_bindings": [
+        target_adoption_binding(entry) for entry in catalog
+    ]}}
+    binding = AcceptedFormalPlanBinding("plan", "content", canonical_hash(plan_document), "c" * 64,
+        _receipt("content"), _receipt("plan"), "stage_commit", _receipt("stage_commit"), plan_document)
     bundle_context = {"accepted_formal_plan_binding": binding.as_dict()}
     plan_context = {"evidence_catalog": catalog}
     with engine.begin() as db:

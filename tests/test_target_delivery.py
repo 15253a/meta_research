@@ -23,11 +23,12 @@ def test_unselected_foreign_evidence_cannot_supply_companions():
 
 def test_evidence_source_commit_tamper_cannot_supply_foreign_artifacts():
     owner = _authority(('evidence_1',), plan=True)
-    original = owner._domain_reader.resolve_plan_evidence_reuse_leaves
-    leaves = list(original())
-    leaves[0] = SimpleNamespace(**{**vars(leaves[0]), 'target_commit_ref':'commit_foreign'})
-    owner._domain_reader.resolve_plan_evidence_reuse_leaves = lambda **kw: leaves
-    with pytest.raises(OwnerConflict, match='target_input_evidence_catalog_invalid'):
+    original = owner._domain_reader.query_target_measurement_domain_authority('target')
+    # The adopted Commit set is fixed by the accepting Owner's exact Plan
+    # binding; replacing that authority cannot authorize foreign companions.
+    owner._domain_reader.query_target_measurement_domain_authority = lambda _: SimpleNamespace(
+        **{**vars(original), 'accepted_formal_plan_binding_hash': 'f' * 64})
+    with pytest.raises(OwnerConflict, match='target_input_reference_scope_invalid'):
         owner.selected_evidence_target_commits('target')
 
 

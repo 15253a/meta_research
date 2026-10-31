@@ -21,18 +21,30 @@ def test_target_input_reads_pin_fresh_cuts_without_crossing_writes(tmp_path, mon
         owner = runtime.target_run_authorities.research_graph
         database = runtime._database
         reader = owner._domain_reader
-        method = 'query_target_graph' if query_kind == 'research_context' else 'resolve_plan_evidence_reuse_leaves'
+        method = 'query_target_graph' if query_kind == 'research_context' else 'verify_asset_quest_scope'
         original = getattr(reader, method)
         cuts, writes = [], []
+        qualification_reads = []
+        active_reads = []
 
         def inspect(*args, **kwargs):
             cut, cache = database._read_cut.get(), database._read_cache.get()
             assert cut is not None and cache is not None
             cuts.append((cut, cache))
-            return original(*args, **kwargs)
+            reads = []
+            active_reads.append(reads)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                qualification_reads.append(len(reads))
+                active_reads.pop()
 
         def observe_sql(_conn, _cursor, statement, _parameters, _context, _many):
-            if statement.lstrip().split(None, 1)[0].upper() in {'INSERT', 'UPDATE', 'DELETE', 'REPLACE'}:
+            kind = statement.lstrip().split(None, 1)[0].upper()
+            if kind == 'SELECT':
+                for reads in active_reads:
+                    reads.append(statement)
+            if kind in {'INSERT', 'UPDATE', 'DELETE', 'REPLACE'}:
                 writes.append(statement)
 
         monkeypatch.setattr(reader, method, inspect)
@@ -47,6 +59,13 @@ def test_target_input_reads_pin_fresh_cuts_without_crossing_writes(tmp_path, mon
             assert query() == expected
             assert cuts[-1][0] is connection
             assert cuts[-1][1] is database._read_cache.get()
+            calls_before = len(qualification_reads)
+            assert query() == expected
+            assert cuts[-1][0] is connection
+            assert cuts[-1][1] is database._read_cache.get()
+            if query_kind == 'selected_sources':
+                assert len(qualification_reads) > calls_before
+                assert all(count == 0 for count in qualification_reads[calls_before:])
         event.remove(database._engine, 'before_cursor_execute', observe_sql)
         assert writes == []
 
