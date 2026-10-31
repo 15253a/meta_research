@@ -94,6 +94,7 @@ def test_actual_plan_provider_accepts_compact_output_and_passes_idea_notes(tmp_p
     omitted = ("evidence_reuse_set", "gap_set", "idea_trace", "bundle_disposition", "source_bindings")
     for field in omitted:
         plan.pop(field)
+    plan["selected_evidence_bindings"] = []
     plan["answer_contract"].pop("answer_contract_hash", None)
     runner = plan_fixtures._SequenceRunner([
         {"plan": plan}, { "final_plan": plan, },
@@ -109,6 +110,7 @@ def test_actual_plan_provider_accepts_compact_output_and_passes_idea_notes(tmp_p
     validate_plan_skill_result(request, result)
     assert result.final_plan["notes"] == NOTE
     assert result.final_plan["evidence_reuse_set"] == []
+    assert result.final_plan["source_bindings"]["selected_evidence_bindings"] == []
     assert result.final_plan["gap_set"] == [row["obligation_key"] for row in plan["coverage"]]
     for _, prompt, schema in runner.calls:
         assert canonical_json(idea) in prompt
