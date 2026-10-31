@@ -705,17 +705,6 @@ class PlanContentReceiptVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
-    def query_plan_selected_evidence_refs(
-        self,
-        *,
-        submission_ref: str,
-        content_ref: str,
-        receipt: AcceptanceReceipt,
-    ) -> frozenset[str]: ...
-
-    def query_plan_selected_evidence_catalog(
-        self, *, submission_ref: str, content_ref: str, receipt: AcceptanceReceipt,
-    ) -> list[dict[str, object]]: ...
 
 
 class IdeaOutcomeDecisionVerifier(Protocol):

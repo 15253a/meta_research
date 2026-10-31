@@ -2608,86 +2608,6 @@ class SQLiteResearchMemoryReceiptVerifier:
             reference_reader=self._reference_reader,
         )
 
-    def query_plan_selected_evidence_refs(
-        self,
-        *,
-        submission_ref: str,
-        content_ref: str,
-        receipt: AcceptanceReceipt,
-    ) -> frozenset[str]:
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM rm_plan_documents WHERE content_ref = "
-                    ":content_ref AND submission_ref = :submission_ref"
-                ),
-                {"content_ref": content_ref, "submission_ref": submission_ref},
-            ).first()
-        if row is None:
-            raise OwnerConflict("plan_content_receipt_invalid")
-        self.verify_plan_content_receipt(
-            request_ref=row.request_ref,
-            submission_ref=row.submission_ref,
-            content_ref=row.content_ref,
-            payload_hash=row.payload_hash,
-            plan_hash=row.plan_document_hash,
-            reviewed_draft_hash=row.reviewed_draft_hash,
-            review_hash=row.review_hash,
-            receipt=receipt,
-        )
-        try:
-            plan_document = decoded_object(row.plan_document_json)
-        except (TypeError, ValueError) as error:
-            raise OwnerConflict("plan_content_invalid") from error
-        if (
-            canonical_json(plan_document) != row.plan_document_json
-            or canonical_hash(plan_document) != row.plan_document_hash
-        ):
-            raise OwnerConflict("plan_content_invalid")
-        return _selected_plan_evidence_refs(plan_document)
-
-    def query_plan_selected_evidence_catalog(
-        self,
-        *,
-        submission_ref: str,
-        content_ref: str,
-        receipt: AcceptanceReceipt,
-    ) -> list[dict[str, object]]:
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM rm_plan_documents WHERE content_ref = "
-                    ":content_ref AND submission_ref = :submission_ref"
-                ),
-                {"content_ref": content_ref, "submission_ref": submission_ref},
-            ).first()
-        if row is None:
-            raise OwnerConflict("plan_content_receipt_invalid")
-        self.verify_plan_content_receipt(
-            request_ref=row.request_ref,
-            submission_ref=row.submission_ref,
-            content_ref=row.content_ref,
-            payload_hash=row.payload_hash,
-            plan_hash=row.plan_document_hash,
-            reviewed_draft_hash=row.reviewed_draft_hash,
-            review_hash=row.review_hash,
-            receipt=receipt,
-        )
-        try:
-            plan_document = decoded_object(row.plan_document_json)
-        except (TypeError, ValueError) as error:
-            raise OwnerConflict("plan_content_invalid") from error
-        if (
-            canonical_json(plan_document) != row.plan_document_json
-            or canonical_hash(plan_document) != row.plan_document_hash
-        ):
-            raise OwnerConflict("plan_content_invalid")
-        bindings = plan_document.get("source_bindings", {})
-        selected = bindings.get("selected_evidence_bindings", [])
-        if not isinstance(selected, list) or not all(isinstance(item, dict) for item in selected):
-            raise OwnerConflict("plan_selected_evidence_invalid")
-        return selected
-
     def verify_asset_receipt(
         self,
         *,
@@ -13045,15 +12965,6 @@ def _verify_idea_payload(
     except IdeaContractError as error:
         raise OwnerConflict(str(error)) from error
     return outcome, reviewed_draft, review
-
-
-def _selected_plan_evidence_refs(plan_document: dict[str, object]) -> frozenset[str]:
-    bindings = plan_document.get("source_bindings", {})
-    selected = bindings.get("selected_evidence_bindings") if isinstance(bindings, dict) else None
-    if not isinstance(selected, list) or any(not isinstance(item, dict)
-            or not isinstance(item.get("evidence_ref"), str) or not item["evidence_ref"] for item in selected):
-        raise OwnerConflict("plan_selected_evidence_invalid")
-    return frozenset(item["evidence_ref"] for item in selected)
 
 
 def _verify_plan_document_projection(row, plan_document: dict[str, object]) -> None:

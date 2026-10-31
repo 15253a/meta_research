@@ -14,6 +14,7 @@ from meta_research.owners.common import OwnerConflict, canonical_hash, canonical
 from meta_research.owners.target_root_lifecycle import SQLiteTargetRootLifecycleAuthority
 from meta_research.owners.target_run_runtime import canonical_target_scope_binding
 from meta_research.plan_skill import _with_derived_answer_contract_hash
+from meta_research.research_content import read_content
 from meta_research.target_commit_evidence import TargetCommitEvidenceCatalog
 from meta_research.target_run_finalizer import SQLiteTargetRootCompletionMemoryAuthority, TargetRunFinalizer
 from test_plan_asset_target_input import _asset, _origin
@@ -42,7 +43,7 @@ class _SelectedEvidencePlan(_MultiRunPlanSkill):
                 for entry in self.entries]
             document["coverage"][0]["evidence_uses"] = uses
             document["evidence_reuse_set"] = uses
-            document["additional_evidence_bindings"] = deepcopy(self.entries)
+            document["source_bindings"]["selected_evidence_bindings"] = deepcopy(self.entries)
         return _with_derived_answer_contract_hash(document, request)
 
 
@@ -156,7 +157,13 @@ def _admitted_evidence_input(tmp_path, assessed):
         _, entries = TargetCommitEvidenceCatalog(graph, runtime.owners.research_memory).query_plan_evidence_catalog(
             quest_ref=quest["quest_ref"], target_commit_refs=(completed.target_commit_ref,))
         assert len(entries) == 1
-        plan.entries = list(entries)
+        plan.entries = []
+        for entry in entries:
+            read = read_content(graph, runtime.owners.research_memory, quest_ref=quest["quest_ref"],
+                source_ref=entry["target_commit_root_ref"], version_ref=entry["asset_version_ref"])
+            selected = read["selected_evidence_binding"]
+            assert selected["source_binding"] == entry
+            plan.entries.append(selected)
         bundle.input_ref = [entry["evidence_ref"] for entry in entries]
         _finish_stage(runtime, "reasoning")
         _finish_stage(runtime, "plan")
