@@ -10,7 +10,7 @@ npm run typecheck
 npm run build
 ```
 
-`npm test` runs the four existing `tests/*.test.mjs` files with Node's test
+`npm test` runs the existing `tests/*.test.mjs` files with Node's test
 runner. `npm run typecheck` checks application and Playwright TypeScript without
 executing behavior. `npm run build` typechecks and rebuilds
 `src/meta_research/web_dist/`; it does not run browser behavior tests.
@@ -80,10 +80,4 @@ Windows Python. Use Linux for the product-backed scenario; the fixture-backed
 browser UI scenario above works in native Windows. Changing the backend's
 platform support is outside this verification setup.
 
-At the #170 verification baseline, an additional Linux ManualCreation scenario
-fails its existing focus-restoration assertion after closing
-the dialog (`manual-creation.spec.ts:111`). The recommended Proposal scenario
-and fixture-backed current-Cycle scenario pass. Keep the ManualCreation failure
-visible when choosing subsequent validation; the preparation work does not
-change the focus assertion or product
-behavior.
+The #170 baseline on 2026-10-07 recorded a Linux ManualCreation focus-restoration failure. This documentation cleanup does not establish whether that failure persists; record current results when running the affected checks.

@@ -1,21 +1,9 @@
-# Meta-research
+# Meta Research
 
-This branch preserves the source installed in the backend listening on port 8768 on 2026-09-24.
+Meta Research is a platform for sustained autonomous research and human collaboration.
 
-- `baseline/v0.0.0`: frozen source baseline. All 286 packaged files were byte-for-byte equal to the deployed package when captured.
-- `v1-test`: continuation branch for the memory, storage, intake and indexing design review.
-- [Baseline manifest](docs/baselines/v0.0.0.json): source provenance and package SHA-256 values.
-- [Domain language](CONTEXT.md): the existing research concepts.
+Current optimization follows [spec #262](https://github.com/15253a/meta_research/issues/262), within [overall spec #169](https://github.com/15253a/meta_research/issues/169). See [AGENTS.md](AGENTS.md) for repository instructions and [CONTEXT.md](CONTEXT.md) for domain concepts.
 
-`v0.0.0` names this preservation point; it is not a claim of production release acceptance. The package's existing `0.1.0` version is unchanged. The parent is the last published `test-all` history; the 8768 source snapshot replaces its older deployment tree.
+Use Python 3.11–3.13 with the checked-in `uv.lock`. Backend verification requires Linux (`fcntl`). Frontend source and lockfile live in `web/`; packaged assets live in `src/meta_research/web_dist/`.
 
-The repository contains source, tests, pinned Python and frontend dependencies, and the packaged frontend served by the backend. It does not contain research databases, research files, credentials, virtual environments or caches. Restoring code alone does not restore research data.
-
-Use Python 3.11–3.13 and the checked-in `uv.lock` for the Python environment. The frontend source and npm lockfile live in `web/`; the deployed static assets live in `src/meta_research/web_dist/`. The source-preservation and design pass does not restart or migrate the running service.
-
-Current design work: [memory-system map](https://github.com/15253a/meta_research/issues/148) and [evidence documents](docs/memory/README.md).
-
-Implementation of [spec #169](https://github.com/15253a/meta_research/issues/169)
-starts with [the recovered baseline and verification entrypoints](docs/implementation-baseline.md).
-Frontend behavior tests and typechecks are described in [web/README.md](web/README.md).
-Scientific asset changes, retained retirement, and public verification entrypoints are described in [the asset lifecycle contract](docs/asset-lifecycle.md).
+[Environment and backend checks](docs/implementation-baseline.md), [frontend checks](web/README.md), and [asset lifecycle contracts](docs/asset-lifecycle.md) provide the relevant development references.
