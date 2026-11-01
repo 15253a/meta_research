@@ -4588,6 +4588,22 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         if row is None:
             return None
         if bool(row.request_payload_scrubbed):
+            _verified_scrubbed_asset_request_summary(row)
+            if row.status == "accepted":
+                result = self.query_asset_intake(row.job_ref)
+                if result.asset is None:
+                    raise OwnerConflict("asset_intake_request_invalid")
+                return {
+                    "request": None,
+                    "result": result.as_public_dict(),
+                    "source_locators": [
+                        custody.source_locator
+                        for custody in self.query_asset_custodies(result.asset.version_ref)
+                        if custody.custody_mode == result.custody_mode
+                        and custody.source_locator is not None
+                        and custody.locator_receipted
+                    ],
+                }
             raise OwnerConflict("asset_intake_effect_payload_unavailable")
         request = _validated_stored_asset_request(
             row.request_json, row.request_hash

@@ -17,6 +17,10 @@ def channel(runtime, question, generation=1):
     context = SemanticCallContext(scope['run_ref'], scope['attempt_ref'],
         scope['root_session_ref'], scope['fence_ref'], scope['runtime_binding_hash'],
         'companion', 'primary', '')
+    return context, context_channel(runtime, context)
+
+
+def context_channel(runtime, context):
     operations = research_content_operations(research_graph=runtime.owners.research_graph,
         research_memory=runtime.owners.research_memory, agent_runtime=runtime.owners.agent_runtime,
         human_collaboration=runtime.owners.human_collaboration)
@@ -30,7 +34,7 @@ def channel(runtime, question, generation=1):
         _, result = gateway.dispatch(token.token, {'jsonrpc':'2.0', 'id':1, 'method':'tools/call',
             'params': {'name':operation, 'arguments':arguments}})
         return result['result']
-    return context, call
+    return call
 
 
 @pytest.mark.parametrize('custody', ['managed', 'linked_local'])
@@ -186,5 +190,64 @@ def test_intake_rechecks_source_and_fence_before_accepting_prepared_bytes(tmp_pa
         assert value['status'] == ('queued' if boundary == 'source_change' else 'failed')
         if boundary == 'revocation':
             assert 'scope_stale' in value['failure']['code']
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize('source_kind', ['workspace', 'material'])
+def test_lost_intake_ack_reconciles_exact_operation_while_suspended_without_original(tmp_path, monkeypatch, source_kind):
+    from dataclasses import replace
+    from test_root_workspace import _channel, _call, _accepted
+    from test_root_human_request_lifecycle import _open_arguments
+
+    class LostAck(BaseException):
+        pass
+
+    runtime = _make(tmp_path / 'runtime')
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+        question = SimpleNamespace(quest_ref=confirmed['quest_ref'], question_ref=confirmed['question_ref'])
+        context, call = channel(runtime, question)
+        location = runtime.root_workspaces.bind_runtime(context).location
+        original = location.directory / 'original.bin'
+        original.write_bytes(b'\xfforiginal identity')
+        source = {'kind':'workspace', 'workspace_ref':location.workspace_ref, 'path':'original.bin'}
+        if source_kind == 'material':
+            registered = runtime.owners.human_collaboration.acquire_work_material(context=context,
+                effect_id='acquired', absolute_path=str(original), description='Material used for exact reconciliation.')
+            source = {'kind':'material', 'reference_ref':registered['references'][0]['reference_ref'], 'path':''}
+        args = {'effect_id':'lost-ack', 'intake': {'source_kind':'local_path', 'custody_mode':'linked_local',
+            'display_name':'original.bin', 'source':source}}
+        memory = runtime.owners.research_memory
+        submit = memory.submit_asset_intake
+        committed = []
+        def lose_ack(*a, **kw):
+            result = submit(*a, **kw)
+            committed.append(result.as_public_dict())
+            raise LostAck()
+        with monkeypatch.context() as fault:
+            fault.setattr(memory, 'submit_asset_intake', lose_ack)
+            with pytest.raises(LostAck):
+                call('research_memory.assets.intake', **args)
+        assert committed[0]['status'] == 'accepted'
+        _accepted(_call(runtime, _channel(runtime, context), 'human_request.open',
+            **_open_arguments('wait-after-lost-ack', 'offline_action')))
+        assert runtime.owners.agent_runtime.query_managed_run(context.run_ref)['status'] == 'suspended'
+        original.unlink()
+        reconciled = call('research_memory.assets.intake.reconcile', **args)
+        assert not reconciled['isError'], reconciled
+        assert reconciled['structuredContent'] == {'status':'accepted', 'result':committed[0]}
+        changed = call('research_memory.assets.intake.reconcile', **{**args,
+            'intake':{**args['intake'], 'display_name':'different.bin'}})
+        assert changed['structuredContent']['code'] == 'asset_intake_idempotency_conflict'
+        changed_source = call('research_memory.assets.intake.reconcile', **{**args,
+            'intake':{**args['intake'], 'source':{**source, 'path':'other.bin'}}})
+        assert changed_source['structuredContent']['code'] == 'asset_intake_idempotency_conflict'
+        assert call('research_memory.assets.intake', **{**args, 'effect_id':'new-work'})['isError']
+        assert call('research_memory.assets.intake.reconcile', **{**args, 'effect_id':'unknown'})['structuredContent'] == {
+            'status':'not_found', 'result':None}
+        stale = context_channel(runtime, replace(context, fence_ref='old-fence'))
+        denied = stale('research_memory.assets.intake.reconcile', **args)
+        assert denied['isError'] and 'scope_stale' in denied['structuredContent']['code']
     finally:
         runtime.close()
