@@ -271,82 +271,28 @@ class _UnknownOutcomeCompanionJobRunner:
 class _ResidentHumanRequestCompanionRunner:
     def __init__(self) -> None:
         self.harnesses = None
-        self.calls: list[tuple[str, list[str]]] = []
-        self.finished_jobs: list[str] = []
-        self.opened: dict[str, object] | None = None
-        self.reconciled: dict[str, object] | None = None
+        self.calls = []
+        self.finished_jobs = []
+        self.denial = None
 
-    def run_job(
-        self,
-        job_ref: str,
-        argv: list[str],
-        prompt: str,
-        timeout: float | None,
-        environment: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        del prompt, timeout
-        assert self.harnesses is not None
-        assert environment is not None
-        token = environment["META_RESEARCH_MCP_TOKEN"]
-        effect_id = "companion-spool-human-request"
-        if self.opened is None:
-            operation_id = ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0]
-            arguments = {
-                "effect_id": effect_id,
-                "request_kind": "offline_action",
-                "obligation": "Choose how this exact Companion turn continues.",
-                "business_purpose": "Resume only this Companion Session.",
-                "condition": {
-                    "impact": "Only this Companion turn is paused.",
-                    "safe_response": "Defer and continue safely.",
-                },
-                "acceptance_conditions": [
-                    "The response is bound to this exact waiter."
-                ],
-            }
-        else:
-            operation_id = ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1]
-            arguments = {"effect_id": effect_id}
-        status, payload = self.harnesses.dispatch_mcp(
-            token,
-            {
-                "jsonrpc": "2.0",
-                "id": len(self.calls) + 1,
-                "method": "tools/call",
-                "params": {"name": operation_id, "arguments": arguments},
-            },
-        )
+    def run_job(self, job_ref, argv, prompt, timeout, environment=None):
+        from test_root_human_request_lifecycle import _open_arguments
+        assert environment is not None and self.harnesses is not None
+        status, payload = self.harnesses.dispatch_mcp(environment["META_RESEARCH_MCP_TOKEN"], {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "human_request.open",
+                "arguments": _open_arguments("ordinary-chat-must-not-open", "offline_action")}})
         assert status == 200
-        assert payload is not None
-        result = payload["result"]
-        assert result["isError"] is False
-        structured = result["structuredContent"]
-        assert isinstance(structured, dict)
-        if self.opened is None:
-            self.opened = structured
-            reply = "Waiting for the exact human response."
-        else:
-            self.reconciled = structured
-            reply = "Continued after reading the exact human response."
+        assert payload["result"]["isError"] is True
+        self.denial = payload["result"]["structuredContent"]["code"]
         self.calls.append((job_ref, list(argv)))
-        output_path = Path(argv[argv.index("--output-last-message") + 1])
-        output_path.write_text(
-            json.dumps({"reply": reply, "agent_proposal": None}),
-            encoding="utf-8",
-        )
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=json.dumps(
-                {
-                    "type": "thread.started",
-                    "thread_id": "native-companion-human-request",
-                }
-            ),
-            stderr="",
-        )
+        Path(argv[argv.index("--output-last-message") + 1]).write_text(json.dumps({
+            "reply": "I can prepare the response for your explicit submission.",
+            "agent_proposal": None}), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({
+            "type": "thread.started", "thread_id": "native-companion-readonly"}), stderr="")
 
-    def finish_job(self, job_ref: str) -> None:
+    def finish_job(self, job_ref):
         self.finished_jobs.append(job_ref)
 
 
@@ -1558,84 +1504,29 @@ def test_companion_completion_recovery_finishes_the_continuation_job(
         restarted.close()
 
 
-def test_codex_companion_resumes_human_request_in_one_new_durable_operation(
-    tmp_path: Path,
-) -> None:
-    data_path = tmp_path / "companion-codex-human-request-data"
-    provider_workspace = tmp_path / "companion-codex-human-request-provider"
-    executable = str(_fake_codex(tmp_path / "companion-codex"))
+def test_codex_companion_does_not_open_a_research_human_request(tmp_path):
     runner = _ResidentHumanRequestCompanionRunner()
-    first_adapter = CodexCompanionAdapter(
-        provider_workspace,
-        executable=executable,
-        process_runner=runner,  # type: ignore[arg-type]
-    )
-    runtime = _runtime_with_companion_adapter(data_path, first_adapter)
+    adapter = CodexCompanionAdapter(tmp_path / "companion-provider",
+        executable=str(_fake_codex(tmp_path / "companion-codex")), process_runner=runner)
+    runtime = _runtime_with_companion_adapter(tmp_path / "companion-data", adapter)
     runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
     runner.harnesses = runtime.harnesses
-    human = runtime.owners.human_collaboration
+    human, owner = runtime.owners.human_collaboration, runtime.owners.agent_runtime
     try:
         confirmed = _confirm_direct_quest(runtime)
         assert human.reconcile_once()
-        creation = human.query_quest_creation(confirmed["initialization_id"])
-        quest_ref = cast(str, creation["quest_ref"])
-        scope_ref = f"quest:{quest_ref}"
-        queued = human.send_companion_message(
-            scope_ref,
-            "Pause once, then continue in this exact Companion Session.",
-            "companion-codex-human-request-message",
-        )
-
-        assert not human.process_drafting_once()
-        assert runner.opened is not None
-        assert len(runner.calls) == 1
-        first_job_ref, first_argv = runner.calls[0]
-        assert first_job_ref == queued["interaction_ref"]
-        assert "resume" not in first_argv
-        [waiting] = human.query_companion(scope_ref)["turns"]
-        assert waiting["assistant_status"] == "processing"
-        assert waiting["assistant_content"] is None
-        request_ref = cast(str, runner.opened["request_ref"])
-        human.respond_to_human_request(
-            request_ref,
-            decision="deferred",
-            facts={"safe_route": "continue_without_optional_input"},
-            note="Continue in the same Companion Session.",
-            idempotency_key="companion-codex-human-request-response",
-        )
+        quest_ref = human.query_quest_creation(confirmed["initialization_id"])["quest_ref"]
+        scope = "quest:" + quest_ref
+        before = owner.query_human_requests(quest_ref=quest_ref)
+        queued = human.send_companion_message(scope, "Prepare the request response.", "ordinary-no-formal-open")
         assert human.process_drafting_once()
-        assert len(runner.calls) == 2
-        continuation_job_ref, continuation_argv = runner.calls[1]
-        assert continuation_job_ref != first_job_ref
-        assert continuation_job_ref.startswith("companion_continuation_")
-        resume_index = continuation_argv.index("resume")
-        assert continuation_argv[resume_index + 1] == (
-            "native-companion-human-request"
-        )
-        assert runner.reconciled is not None
-        resolution = runner.reconciled["resolution"]
-        assert isinstance(resolution, dict)
-        assert isinstance(resolution["response_ref"], str)
-        assert {
-            key: value
-            for key, value in resolution.items()
-            if key != "response_ref"
-        } == {
-            "decision": "deferred",
-            "facts": {"safe_route": "continue_without_optional_input"},
-            "note": "Continue in the same Companion Session.",
-            "disposition": "unsatisfied",
-            "reason_code": "human_deferred_exact_obligation",
-            "accepted_evidence_refs": [],
-        }
-        [completed] = human.query_companion(scope_ref)["turns"]
-        assert completed["assistant_status"] == "completed"
-        assert completed["assistant_content"] == (
-            "Continued after reading the exact human response."
-        )
-        assert runner.finished_jobs == [first_job_ref, continuation_job_ref]
-        assert not human.process_drafting_once()
-        assert len(runner.calls) == 2
+        assert runner.denial == "capability_unavailable"
+        assert owner.query_human_requests(quest_ref=quest_ref) == before
+        [turn] = human.query_companion(scope)["turns"]
+        assert turn["assistant_status"] == "completed"
+        assert turn["assistant_content"] == "I can prepare the response for your explicit submission."
+        assert runner.finished_jobs == [queued["interaction_ref"]]
+        assert len(runner.calls) == 1
     finally:
         runtime.close()
 

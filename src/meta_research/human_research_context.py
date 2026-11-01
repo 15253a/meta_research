@@ -14,7 +14,7 @@ def human_research_reader() -> dict[str, object]:
 
 
 def read_human_research_context(agent_runtime, human_collaboration, context, arguments):
-    """The root determines the Quest; callers may select only an exact request."""
+    """Read human records within the root or the selected HC-authorized Quest."""
     try:
         scope = agent_runtime.verify_root_agent_runtime_scope(
             root_kind=context.root_kind, run_ref=context.run_ref,
@@ -111,6 +111,17 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
                 value["used_by_owner_evaluation"] = response_ref in evaluation.get("response_refs", [])
                 value["owner_disposition"] = (response_context.get("disposition") or {}).get("decision")
             source_ref = response_ref or request_ref
+        if arguments.get("source_quest_ref") is not None:
+            # Only generated navigation descriptors gain the selector. Exact
+            # human text, response facts and delivery workspace bindings stay intact.
+            entries = [value, *value.get("items", []), *value.get("research_inputs", {}).get("items", [])]
+            for item in entries:
+                for key in ("reader", "responses_reader", "formal_guidance_reader"):
+                    if key in item:
+                        item[key] = {**item[key], "source_quest_ref": quest_ref}
+                latest = item.get("latest_response")
+                if latest is not None and "reader" in latest:
+                    latest["reader"] = {**latest["reader"], "source_quest_ref": quest_ref}
         chunk = context_read_page(value, path=[], offset=arguments.get("offset", 0),
                                   limit=arguments.get("limit", 8192))
     except (OwnerConflict, ValueError) as error:

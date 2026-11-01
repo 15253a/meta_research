@@ -393,7 +393,8 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
     def read(context, arguments, *, page):
         arguments = dict(arguments)
         try:
-            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.pop("source_quest_ref", None),
+            selected_quest = arguments.pop("source_quest_ref", None)
+            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=selected_quest,
                 human_collaboration=human_collaboration)
             if page:
                 return research_graph.query_baselines(**arguments, quest_ref=quest_ref)
@@ -405,6 +406,15 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
                 reader = (research_graph.query_baseline_relations if "relation" in arguments
                           else research_graph.query_baseline_variants)
                 result["reusable_entities"] = reader(**arguments, quest_ref=quest_ref)
+                if selected_quest is not None:
+                    for item in result["reusable_entities"]["items"]:
+                        for record in (item, *item.get("runs", [])):
+                            descriptor = record.get("reader")
+                            if descriptor is not None:
+                                if "args" in descriptor:
+                                    descriptor["args"] = {**descriptor["args"], "source_quest_ref": selected_quest}
+                                else:
+                                    descriptor["source_quest_ref"] = selected_quest
             return {"status": "not_found" if result is None else "accepted", "result": result}
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
