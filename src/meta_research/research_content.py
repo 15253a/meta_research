@@ -8,6 +8,7 @@ from sqlalchemy import text
 from meta_research.context_presentation import ExactContextPages, context_read_page
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
+from meta_research.research_pagination import bind_page, page_state
 
 
 def _quest(agent_runtime, context):
@@ -83,10 +84,10 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
         with memory._database.read_snapshot() as c:
             response=c.execute(text("SELECT request_ref FROM hc_human_request_responses WHERE response_ref=:ref"),{"ref":source_ref}).first()
         if response is not None:
-            request=human_collaboration.query_human_request(response.request_ref)
-            if request is None or request.get("quest_ref")!=quest_ref:raise OwnerConflict("content_version_unbound")
-            value=next((x for x in request.get("responses",[]) if x["response_ref"]==source_ref),None)
-            if value is None or canonical_hash(value)!=version_ref:raise OwnerConflict("content_version_unbound")
+            selected = human_collaboration.query_research_help_response(
+                response.request_ref,source_ref,quest_ref=quest_ref)
+            value = selected["response"]
+            if canonical_hash(value)!=version_ref:raise OwnerConflict("content_version_unbound")
             return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
     if source_ref == version_ref and memory.query_asset_version(version_ref) is not None:
         graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
@@ -149,6 +150,11 @@ _STAGE_CONTENT = (("rm_idea_outcome_contents", "query_idea_outcome_content", "ou
 
 
 def read_stage_content(memory, *, quest_ref, source_ref, version_ref):
+    from meta_research.historical_research import read_historical_stage_content
+    historical = read_historical_stage_content(memory, quest_ref=quest_ref,
+        source_ref=source_ref, version_ref=version_ref)
+    if historical is not None:
+        return historical
     with memory._database.read_snapshot() as connection:
         for table, method, field in _STAGE_CONTENT:
             row=connection.execute(text(f"SELECT c.submission_ref,c.payload_hash,r.quest_ref FROM {table} c "
@@ -162,10 +168,14 @@ def read_stage_content(memory, *, quest_ref, source_ref, version_ref):
     return None
 
 
-def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12):
+def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12, query_revision=None):
     if type(offset)is not int or offset<0 or type(limit)is not int or not 1<=limit<=100:
         raise OwnerConflict("research_library_page_invalid")
     with graph._database.read_snapshot() as c:
+        revision = c.execute(text("SELECT question_ref,status,updated_at FROM rg_question_lifecycle "
+            "WHERE quest_ref=:quest ORDER BY question_ref"), {"quest": quest_ref}).all()
+        revision = bind_page({"entry": "questions", "quest_ref": quest_ref, "query": query, "limit": limit},
+            [list(row) for row in revision], offset=offset, query_revision=query_revision)
         rows=c.execute(text("""SELECT l.question_ref,l.status FROM rg_question_lifecycle l
             LEFT JOIN rg_questions a ON a.question_ref=l.question_ref
             LEFT JOIN rg_manual_questions b ON b.question_ref=l.question_ref
@@ -185,13 +195,26 @@ def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12
                 "summary":body.get("unknown_statement","")[:1200],"status":row.status,
                 "reader":{"source_ref":q.question_ref,"version_ref":q.content_ref},
                 "history_reader":{"operation":"research_graph.question_history.read","question_ref":q.question_ref,"offset":0,"limit":12}})
-    return {"items":items,"offset":offset,"next_offset":offset+limit if len(rows)>limit else None}
+    next_offset = offset + limit if len(rows) > limit else None
+    return {"items":items,"offset":offset,"next_offset":next_offset,"query_revision":revision,
+            **page_state(items,next_offset,offset=offset,query=query)}
 
 
-def discover_literature(graph, memory, *, quest_ref, query="", offset=0, limit=12, record_ref=None):
+def discover_literature(graph, memory, *, quest_ref, query="", offset=0, limit=12, record_ref=None, query_revision=None):
     if type(offset)is not int or offset<0 or type(limit)is not int or not 1<=limit<=100:
         raise OwnerConflict("research_library_page_invalid")
     with memory._database.read_snapshot() as c:
+        revisions = c.execute(text("SELECT revision_ref,revision_number FROM rm_question_literature_revisions "
+            "WHERE quest_ref=:quest ORDER BY revision_ref"), {"quest": quest_ref}).all()
+        judgment_revisions = []
+        for table, _, _ in _STAGE_CONTENT:
+            judgment_revisions.extend(list(row) for row in c.execute(text(
+                f"SELECT a.content_ref,a.payload_hash FROM {table} a "
+                "JOIN ae_stage_run_requests r ON r.request_ref=a.request_ref "
+                "WHERE r.quest_ref=:quest ORDER BY a.content_ref"), {"quest":quest_ref}).all())
+        query_revision_token = bind_page({"entry":"literature","quest_ref":quest_ref,"query":query,
+            "record_ref":record_ref,"limit":limit},[list(row) for row in revisions]+judgment_revisions,
+            offset=offset,query_revision=query_revision)
         rows=c.execute(text("""SELECT r.revision_ref,r.question_ref,json_extract(e.value,'$.ref') AS record_ref
             FROM rm_question_literature_revisions r,json_each(r.records_json) e
             WHERE r.quest_ref=:quest AND (:record IS NULL OR json_extract(e.value,'$.ref')=:record)
@@ -222,7 +245,9 @@ def discover_literature(graph, memory, *, quest_ref, query="", offset=0, limit=1
             items.append({"record_ref":row.record_ref,"question_ref":row.question_ref,"name":paper.get("title",row.record_ref),
                 "summary":str(paper.get("abstract") or paper.get("summary") or "")[:1200],
                 "reader":{"source_ref":row.record_ref,"version_ref":row.revision_ref},"judgments":judgments})
-    return {"items":items,"offset":offset,"next_offset":offset+limit if len(rows)>limit else None}
+    next_offset = offset + limit if len(rows) > limit else None
+    return {"items":items,"offset":offset,"next_offset":next_offset,"query_revision":query_revision_token,
+            **page_state(items,next_offset,offset=offset,query=query)}
 
 
 def research_content_operations(*, research_graph, research_memory, agent_runtime, human_collaboration=None,
@@ -277,10 +302,11 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
             try:return reader(research_graph,research_memory,quest_ref=_quest(agent_runtime,context),**arguments)
             except OwnerConflict as error:raise SemanticMcpError(error.code) from error
         properties={"query":{"type":"string","maxLength":1024},"offset":{"type":"integer","minimum":0},
-                    "limit":{"type":"integer","minimum":1,"maximum":100}}
+                    "limit":{"type":"integer","minimum":1,"maximum":100},
+                    "query_revision":{"type":"string","pattern":"^[0-9a-f]{64}$"}}
         if reader is discover_literature:properties["record_ref"]={"type":"string","minLength":1,"maxLength":1024}
         operations.append(SemanticOperation(semantic_operation_id=name,owning_module=name.split('.')[0],
-            description="Discover accepted sources in the current Quest by research clues, including related Questions and retained history. Follow each reader with research_memory.content.read; next_offset continues the independent entry page. Literature also links accepted Question-specific judgments to their exact content.",
+            description="Discover accepted sources in the current Quest by research clues. Follow each reader with research_memory.content.read. Continue next_offset with the returned query_revision and unchanged filters/limit; research_query_changed requires restarting at offset=0. An empty page_pending is an unfinished scan, not no_match. Literature also links accepted Question-specific judgments to their exact content.",
             input_schema={"type":"object","properties":properties,"additionalProperties":False},output_schema={"type":"object"},handler=discover))
     return (*operations, *asset_lifecycle_operations(
         research_graph, research_memory, agent_runtime, target_run_agent, human_collaboration

@@ -6113,10 +6113,11 @@ export type ResearchLibraryEntry = "questions" | "baselines" | "datasets" | "lit
 export type ResearchContentReader = { source_ref?: string; version_ref?: string | null; entry_path?: string; ref?: string; operation?: string; question_ref?: string };
 export type ResearchLibraryItem = Record<string, unknown> & {
   ref?: string; title?: string; name?: string; summary?: string; status?: string;
+  request_ref?: string; response_count?: number;
   reader?: ResearchContentReader | null;
   history_reader?: ResearchContentReader | null;
 };
-export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; total_count?: number; request_next_cursor?: string | null };
+export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; query_revision?: string; result_state?: string; total_count?: number; request_next_cursor?: string | null };
 export type ResearchContentPage = {
   text?: string; content?: unknown; next_offset: number | null; status?: string;
   [key: string]: unknown;

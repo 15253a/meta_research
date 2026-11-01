@@ -62,6 +62,7 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
   const query = queries[entry] ?? "";
   const scope = scopes[entry] ?? [];
   const filters = scope[scope.length - 1]?.filters;
+  const queryRevisions = useRef(new Map<string, string>());
   function expand(name: string, filters: Record<string, string>) {
     setScopes(value => ({ ...value, [entry]: [...scope, { name, filters }] }));
     setOffsets(value => ({ ...value, [entry]: [0] }));
@@ -70,9 +71,15 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
     setPage(null); setSelected(null); setBody(""); setBodyMeta(null); bodyRequest.current?.abort(); requestPage.current?.abort(); setRequestBusy(false); setRequestError(null);
     if (!questRef) return;
     const controller = new AbortController(); setBusy(true); setError(null);
-    fetchResearchLibrary(entry, questRef, query, offset, controller.signal, filters).then(value => {
+    const queryKey = JSON.stringify([entry, questRef, query, filters]);
+    const queryRevision = offset ? queryRevisions.current.get(queryKey) : undefined;
+    fetchResearchLibrary(entry, questRef, query, offset, controller.signal,
+      { ...filters, ...(queryRevision ? { query_revision: queryRevision } : {}) }).then(value => {
       if (!Array.isArray(value.items)) throw new Error("research_library_response_invalid");
-      if (!controller.signal.aborted) setPage(value);
+      if (!controller.signal.aborted) {
+        if (value.query_revision) queryRevisions.current.set(queryKey, value.query_revision);
+        setPage(value);
+      }
     }).catch(caught => {
       if (!controller.signal.aborted) setError(String(caught instanceof Error ? caught.message : caught));
     }).finally(() => {
@@ -163,6 +170,11 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
               <h4>{name}</h4>
               {entry === "human" && (text(item.input_ref) || (text(item.ref).startsWith("research_input:") ? text(item.ref) : "")) ? <ResearchInputMaterialReferences inputRef={text(item.input_ref) || text(item.ref)} questRef={questRef} refreshRevision={refreshRevision} /> : null}
               {text(item.summary) ? <p>{text(item.summary)}</p> : null}
+              {entry === "human" && item.request_ref && typeof item.response_count === "number" ? (
+                item.response_count > 0
+                  ? <button type="button" onClick={() => expand(name, { request_ref: item.request_ref! })}>{t("查看全部回复", "View all responses")} ({item.response_count})</button>
+                  : <p className="library-muted">{t("尚无回复。", "No responses yet.")}</p>
+              ) : null}
               {entry === "environments" ? <>
                 {isEnvironmentReference ? <>
                   <p><b>{t("研究问题：", "Question: ")}</b>{text(item.question_ref)}</p>

@@ -2624,18 +2624,20 @@ def create_app(
     def query_research_library(entry: str,quest_ref: str,query: str="",offset: int=Query(default=0,ge=0),
             limit: int=Query(default=12,ge=1,le=100),dataset_ref: str|None=None,environment_ref: str|None=None,
             baseline_ref: str|None=None,variant_ref: str|None=None,question_ref: str|None=None,
-            request_cursor: str|None=Query(default=None,max_length=512)) -> dict[str,object]:
+            query_revision: str|None=Query(default=None,pattern="^[0-9a-f]{64}$"),
+            request_cursor: str|None=Query(default=None,max_length=512),
+            request_ref: str|None=Query(default=None,min_length=1,max_length=256)) -> dict[str,object]:
         from meta_research.research_content import discover_questions,discover_literature
         graph=runtime.owners.research_graph;memory=runtime.owners.research_memory
         if graph.query_quest_by_ref(quest_ref) is None:raise OwnerConflict("research_library_quest_invalid")
-        args={"quest_ref":quest_ref,"query":query,"offset":offset,"limit":limit}
+        args={"quest_ref":quest_ref,"query":query,"offset":offset,"limit":limit,"query_revision":query_revision}
         if entry=="questions":
             if question_ref:
                 question=graph.query_question_history_by_ref(question_ref)
                 if question is None or question.quest_ref!=quest_ref:
                     raise OwnerConflict("research_history_source_unbound")
                 page=graph.query_question_research_history(quest_ref=quest_ref,question_ref=question_ref,
-                                                          offset=offset,limit=min(limit,12))
+                                                          offset=offset,limit=min(limit,12),query_revision=query_revision)
                 page["items"]=[{**item,"ref":item["source_ref"],"name":question_ref,
                     "summary":item.get("claim",{}).get("text",""),
                     "reader":{"source_ref":item["source_ref"],"version_ref":item["source_ref"]}}
@@ -2647,7 +2649,7 @@ def create_app(
             if baseline_ref:
                 result=graph.query_baseline(baseline_ref,quest_ref=quest_ref)
                 if result is None:return {"items":[],"next_offset":None}
-                return graph.query_baseline_variants(baseline_ref,variant_ref=variant_ref,quest_ref=quest_ref,offset=offset,limit=limit)
+                return graph.query_baseline_variants(baseline_ref,variant_ref=variant_ref,quest_ref=quest_ref,offset=offset,limit=limit,query_revision=query_revision)
             page=graph.query_baselines(**args)
             page["items"]=[{**x,"name":x.get("method_key") or x["baseline_ref"],"ref":x["baseline_ref"]} for x in page["items"]]
             return page
@@ -2680,16 +2682,34 @@ def create_app(
             return page
         if entry=="human":
             hc=runtime.owners.human_collaboration
+            if request_ref is not None:
+                if request_cursor is not None:
+                    raise OwnerConflict("research_help_cursor_invalid")
+                responses=hc.query_research_response_page(quest_ref=quest_ref,request_ref=request_ref,
+                    offset=offset,limit=limit,query_revision=query_revision)
+                responses["items"]=[{"ref":response["response_ref"],"request_ref":request_ref,
+                    "name":response.get("note","")[:80] or "Human response",
+                    "summary":response.get("note","")[:1200],"decision":response.get("decision"),
+                    "reader":{"source_ref":response["response_ref"],"version_ref":canonical_hash(response)}}
+                    for response in responses["items"]]
+                return responses
             page=hc.query_research_inputs(**args) if request_cursor is None else {"items":[],"next_offset":None}
             if offset==0 or request_cursor is not None:
-                requests=hc.query_research_help_page(quest_ref=quest_ref,cursor=request_cursor)
+                requests=hc.query_research_help_page(quest_ref=quest_ref,cursor=request_cursor,query=query)
                 for request in requests["items"]:
-                    if query and query.casefold() not in str(request).casefold():continue
-                    for response in request.get("responses",[]):
-                        page["items"].append({"ref":response["response_ref"],"name":request.get("obligation","Human request"),
-                            "summary":response.get("note","")[:1200],"status":request["status"],
-                            "reader":{"source_ref":response["response_ref"],"version_ref":canonical_hash(response)}})
+                    latest=request["responses"][-1] if request["responses"] else None
+                    page["items"].append({"ref":request["request_ref"],"request_ref":request["request_ref"],
+                        "name":request.get("obligation","Human request"),"status":request["status"],
+                        "response_count":request["response_count"],
+                        "summary":(latest.get("note","") if latest is not None else request.get("business_purpose",""))[:1200],
+                        "reader":None if latest is None else {
+                            "source_ref":latest["response_ref"],"version_ref":canonical_hash(latest)}})
                 page["request_next_cursor"]=requests["next_cursor"]
+                page["scan_complete"]=page["next_offset"] is None and requests["next_cursor"] is None
+                if page["items"]:
+                    page["result_state"]="matches"
+                elif not page["scan_complete"]:
+                    page["result_state"]="page_pending"
             return page
         raise OwnerConflict("research_library_entry_invalid")
 

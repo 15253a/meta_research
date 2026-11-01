@@ -6651,20 +6651,38 @@ class SQLiteResearchGraphReceiptVerifier:
             "selection": "recent_quest_evidence", "complete": len(rows)==total,
             "references_hash": canonical_hash(list(refs))}, refs
 
-    def query_question_research_history(self, *, quest_ref, question_ref, offset=0, limit=12):
+    def query_question_research_history(self, *, quest_ref, question_ref, offset=0, limit=12,
+                                        query_revision=None):
+        from meta_research.research_pagination import bind_page, page_state
+
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 12:
             raise OwnerConflict("research_history_page_invalid")
         where = "decision='accepted' AND json_extract(transition_json,'$.source_quest_ref')=:quest_ref AND json_extract(transition_json,'$.source_question_ref')=:question_ref"
-        params={"quest_ref":quest_ref,"question_ref":question_ref,"offset":offset,"limit":limit}
+        params = {"quest_ref": quest_ref, "question_ref": question_ref, "offset": offset, "limit": limit}
         with self._database.read_snapshot() as connection:
-            total=int(connection.execute(text("SELECT COUNT(*) FROM rg_reasoning_outcome_decisions WHERE "+where),params).scalar_one())
-            rows=connection.execute(text("SELECT * FROM rg_reasoning_outcome_decisions WHERE "+where+" ORDER BY decided_at DESC,outcome_ref LIMIT :limit OFFSET :offset"),params).all()
-        items=[]
-        for row in rows:
-            source=self.read_question_scientific_outcome(quest_ref=quest_ref,question_ref=question_ref,outcome_ref=row.outcome_ref)
-            items.append(scientific_handoff(source,source_ref=row.outcome_ref,next_action=decoded_object(row.transition_json)))
-        return {"items":items,"total_count":total,"shown_count":len(items),"offset":offset,
-            "next_offset":offset+len(items) if offset+len(items)<total else None,"summary_only":True}
+            visible = connection.execute(text("SELECT 1 FROM rg_question_lifecycle WHERE "
+                "quest_ref=:quest_ref AND question_ref=:question_ref"),params).first()
+            if visible is None:
+                raise OwnerConflict("historical_question_not_visible")
+            revisions = connection.execute(text(
+                "SELECT outcome_ref,receipt_hash,reasoning_content_ref,payload_hash FROM rg_reasoning_outcome_decisions WHERE "
+                + where + " ORDER BY outcome_ref"), params).all()
+            token = bind_page({"operation": "question_outcomes", "quest_ref": quest_ref,
+                               "question_ref": question_ref}, [list(row) for row in revisions],
+                              offset=offset, query_revision=query_revision)
+            rows = connection.execute(text("SELECT * FROM rg_reasoning_outcome_decisions WHERE " + where
+                + " ORDER BY decided_at DESC,outcome_ref LIMIT :limit OFFSET :offset"), params).all()
+            items = []
+            for row in rows:
+                source = self.read_question_scientific_outcome(quest_ref=quest_ref,
+                    question_ref=question_ref, outcome_ref=row.outcome_ref)
+                items.append(scientific_handoff(source, source_ref=row.outcome_ref,
+                                                next_action=decoded_object(row.transition_json)))
+        total = len(revisions)
+        next_offset = offset + len(items) if offset + len(items) < total else None
+        return {"items": items, "total_count": total, "shown_count": len(items), "offset": offset,
+                "next_offset": next_offset, "query_revision": token, "summary_only": True,
+                **page_state(items, next_offset, offset=offset)}
 
     def _verified_reasoning_history_source(self, row):
         if row.decision != "accepted" or row.receipt_hash != _reasoning_decision_receipt_hash(row):

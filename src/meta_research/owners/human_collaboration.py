@@ -249,7 +249,7 @@ class HumanCollaborationInterface(Protocol):
     ) -> dict[str, object] | None: ...
 
     def query_research_help_page(
-        self, *, quest_ref: str, cursor: str | None = None, limit: int = 12
+        self, *, quest_ref: str, cursor: str | None = None, limit: int = 12, query: str = ""
     ) -> dict[str, object]: ...
 
     def respond_to_human_request(
@@ -2057,45 +2057,163 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             raise
 
     def query_research_help_page(
-        self, *, quest_ref: str, cursor: str | None = None, limit: int = 12
+        self, *, quest_ref: str, cursor: str | None = None, limit: int = 12, query: str = ""
     ) -> dict[str, object]:
         """Read a bounded cross-issuer page, including answered prior requests.
 
-        Keyset pagination keeps older pages stable when a new request arrives.
-        Each selected record is still verified by its original issuing Owner.
+        Continuation is bound to this Quest's existing request/response facts.
+        Changes require restarting; each selected record is verified by its Owner.
         """
         if not isinstance(quest_ref, str) or not quest_ref or len(quest_ref) > 256:
             raise OwnerConflict("human_request_quest_ref_invalid")
-        if type(limit) is not int or not 1 <= limit <= 12:
+        if (type(limit) is not int or not 1 <= limit <= 12
+                or not isinstance(query, str) or len(query) > 1024):
             raise OwnerConflict("research_help_page_invalid")
-        parameters = {"quest_ref": quest_ref, "limit": limit + 1}
+        from meta_research.research_pagination import bind_page, page_state
+        parameters = {"quest_ref": quest_ref, "limit": limit + 1, "query": query}
         clause = ""
+        previous_revision = None
         if cursor is not None:
             try:
                 before = json.loads(cursor)
-                if (not isinstance(before, list) or len(before) != 2
+                if (not isinstance(before, list) or len(before) != 3
                     or type(before[0]) not in {float, int} or not math.isfinite(before[0])
                     or not isinstance(before[1], str) or not before[1]
-                    or len(before[1]) > 96):
+                    or len(before[1]) > 96 or not isinstance(before[2], str)):
                     raise ValueError("cursor")
+                previous_revision = before[2]
                 parameters.update(before_time=before[0], before_ref=before[1])
             except (TypeError, ValueError) as error:
                 raise OwnerConflict("research_help_cursor_invalid") from error
             clause = " AND (created_at < :before_time OR (created_at = :before_time AND request_ref < :before_ref))"
         with self._database.read_snapshot() as connection:
+            requests = connection.execute(text(
+                "SELECT request_ref,identity_hash,revision,status,is_current,updated_at "
+                "FROM owner_human_requests WHERE quest_ref=:quest_ref ORDER BY request_ref"
+            ), parameters).all()
+            responses = connection.execute(text(
+                "SELECT s.response_ref,s.receipt_hash,d.state,d.manifest_hash FROM hc_human_request_responses s "
+                "JOIN owner_human_requests r ON r.request_ref=s.request_ref "
+                "LEFT JOIN hc_reply_deliveries d ON d.response_ref=s.response_ref "
+                "WHERE r.quest_ref=:quest_ref ORDER BY s.response_ref"
+            ), parameters).all()
+            revision = bind_page({"entry": "human_requests", "quest_ref": quest_ref, "query": query},
+                {"requests": [list(row) for row in requests], "responses": [list(row) for row in responses]},
+                offset=int(cursor is not None), query_revision=previous_revision)
             rows = connection.execute(text(
-                "SELECT request_ref, created_at FROM owner_human_requests WHERE quest_ref = :quest_ref"
+                "SELECT * FROM owner_human_requests WHERE quest_ref = :quest_ref"
+                " AND (:query='' OR instr(lower(obligation),lower(:query))>0 "
+                "OR instr(lower(business_purpose),lower(:query))>0 "
+                "OR instr(lower(target_assertion_json),lower(:query))>0)"
                 + clause + " ORDER BY created_at DESC, request_ref DESC LIMIT :limit"
             ), parameters).all()
             items = []
             for row in rows[:limit]:
-                request = self.query_human_request(row.request_ref)
-                if request is None or request.get("quest_ref") != quest_ref:
-                    raise OwnerConflict("human_request_integrity_invalid")
-                items.append(request)
+                items.append(self._research_help_summary(connection, row))
         tail = rows[limit - 1] if len(rows) > limit else None
         return {"items": items, "limit": limit,
-                "next_cursor": None if tail is None else canonical_json([float(tail.created_at), tail.request_ref])}
+                "query_revision": revision,
+                **page_state(items, 1 if tail is not None else None, offset=int(cursor is not None), query=query),
+                "next_cursor": None if tail is None else canonical_json([float(tail.created_at), tail.request_ref, revision])}
+
+    def _research_help_summary(self, connection, row, *, include_latest=True):
+        """Verify the issuing Owner's request artifact without preparing its lifecycle."""
+        from meta_research.owners.human_requests import _public_request, _verify_request_state_integrity
+        disposition = connection.execute(text(
+            "SELECT * FROM owner_human_request_dispositions WHERE request_ref=:ref"
+        ), {"ref": row.request_ref}).first()
+        _verify_request_state_integrity(connection, row, disposition)
+        request = _public_request(row, (), None, disposition, {}, {}, (), ())
+        response_count = connection.execute(text(
+            "SELECT count(*) FROM hc_human_request_responses WHERE request_ref=:ref"
+        ), {"ref": row.request_ref}).scalar_one()
+        latest = connection.execute(text(
+            "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses responses "
+            "LEFT JOIN hc_reply_deliveries deliveries ON deliveries.response_ref=responses.response_ref "
+            "AND deliveries.state='ready' WHERE responses.request_ref=:ref "
+            "ORDER BY responses.created_at DESC,responses.response_ref DESC LIMIT 1"
+        ), {"ref": row.request_ref}).first() if include_latest else None
+        return {**{key: request[key] for key in (
+            "request_ref", "quest_ref", "kind", "obligation", "business_purpose", "target_assertion",
+            "acceptance_conditions", "required_authorization", "status", "current")},
+            "response_count": response_count,
+            "responses": [] if latest is None else [_public_human_response(latest)],
+            "responses_reader": {"operation": "human_request.read", "entry_kind": "responses",
+                                 "request_ref": row.request_ref, "response_offset": 0}}
+
+    def query_research_help_request(self, request_ref, *, quest_ref):
+        with self._database.read_snapshot() as connection:
+            row = connection.execute(text(
+                "SELECT * FROM owner_human_requests WHERE request_ref=:ref AND quest_ref=:quest"
+            ), {"ref": request_ref, "quest": quest_ref}).first()
+            if row is None:
+                raise OwnerConflict("research_help_request_unbound")
+            result = self._research_help_summary(connection, row, include_latest=False)
+            result["predecessor_request_ref"] = row.predecessor_request_ref
+            result["successor_request_ref"] = connection.execute(text(
+                "SELECT request_ref FROM owner_human_requests WHERE issuer=:issuer "
+                "AND predecessor_request_ref=:ref AND quest_ref=:quest"),
+                {"issuer":row.issuer,"ref":request_ref,"quest":quest_ref}).scalar_one_or_none()
+            return result
+
+    def query_research_help_response(self, request_ref, response_ref, *, quest_ref):
+        from meta_research.owners.human_requests import _public_request, _verify_request_state_integrity
+        with self._database.read_snapshot() as connection:
+            row = connection.execute(text(
+                "SELECT * FROM owner_human_requests WHERE request_ref=:ref AND quest_ref=:quest"
+            ), {"ref": request_ref, "quest": quest_ref}).first()
+            if row is None:
+                raise OwnerConflict("research_help_request_unbound")
+            evaluation = connection.execute(text(
+                "SELECT * FROM owner_human_request_evaluations WHERE request_ref=:ref ORDER BY sequence DESC LIMIT 1"
+            ), {"ref": request_ref}).first()
+            disposition = connection.execute(text(
+                "SELECT * FROM owner_human_request_dispositions WHERE request_ref=:ref"
+            ), {"ref": request_ref}).first()
+            _verify_request_state_integrity(connection, row, disposition)
+            request = _public_request(row, (), evaluation, disposition, {}, {}, (), ())
+            response_row = connection.execute(text(
+                "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses responses "
+                "LEFT JOIN hc_reply_deliveries deliveries ON deliveries.response_ref=responses.response_ref "
+                "AND deliveries.state='ready' WHERE responses.request_ref=:ref AND responses.response_ref=:response"
+            ), {"ref": request_ref, "response": response_ref}).first()
+            if response_row is None:
+                raise OwnerConflict("research_help_response_unbound")
+            response = _public_human_response(response_row)
+            return {"response": response, "evaluation": request["evaluation"], "disposition": request["disposition"]}
+
+    def query_research_response_page(self, *, quest_ref, request_ref, offset=0, limit=12,
+                                    query_revision=None):
+        """Read only the selected request's bounded replies, with exact HC receipts."""
+        from meta_research.research_pagination import bind_page, page_state
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise OwnerConflict("research_help_page_invalid")
+        with self._database.read_snapshot() as connection:
+            request = connection.execute(text(
+                "SELECT * FROM owner_human_requests WHERE request_ref=:ref"
+            ), {"ref": request_ref}).first()
+            if request is None or request.quest_ref != quest_ref:
+                raise OwnerConflict("research_help_request_unbound")
+            from meta_research.owners.human_requests import _public_request
+            _public_request(request, (), None, None, {}, {}, (), ())
+            revisions = connection.execute(text(
+                "SELECT s.response_ref,s.receipt_hash,d.state,d.manifest_hash FROM hc_human_request_responses s "
+                "LEFT JOIN hc_reply_deliveries d ON d.response_ref=s.response_ref "
+                "WHERE s.request_ref=:ref ORDER BY s.response_ref"
+            ), {"ref": request_ref}).all()
+            revision = bind_page({"entry": "human_responses", "quest_ref": quest_ref,
+                "request_ref": request_ref}, [list(row) for row in revisions],
+                offset=offset, query_revision=query_revision)
+            rows = connection.execute(text(
+                "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses responses "
+                "LEFT JOIN hc_reply_deliveries deliveries ON deliveries.response_ref=responses.response_ref "
+                "AND deliveries.state='ready' WHERE responses.request_ref=:ref "
+                "ORDER BY responses.created_at DESC,responses.response_ref DESC LIMIT :limit OFFSET :offset"
+            ), {"ref": request_ref, "limit": limit + 1, "offset": offset}).all()
+            items = [_public_human_response(row) for row in rows[:limit]]
+            next_offset = offset + limit if len(rows) > limit else None
+            return {"items": items, "offset": offset, "next_offset": next_offset,
+                    "query_revision": revision, **page_state(items, next_offset, offset=offset)}
 
     def send_companion_message(
         self,

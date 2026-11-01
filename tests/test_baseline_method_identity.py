@@ -222,7 +222,8 @@ def test_explicit_new_version_or_distinct_method_is_never_semantically_auto_merg
         assert page["automatic_merge"] is False
         assert page["selection_required"] is True
         assert page["next_offset"] == 1
-        next_page = runtime.owners.research_graph.query_baselines(method_contract_hash=first["method_contract_hash"], limit=1, offset=1)
+        next_page = runtime.owners.research_graph.query_baselines(method_contract_hash=first["method_contract_hash"], limit=1, offset=1,
+            query_revision=page["query_revision"])
         assert next_page["next_offset"] is None
         assert {page["items"][0]["baseline_ref"], next_page["items"][0]["baseline_ref"]} == set(refs)
     finally:

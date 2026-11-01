@@ -63,7 +63,7 @@ class QuestionRelationOwnerMixin:
         return {**values, "kind": "related"}
 
     def query_question_relations(self, *, quest_ref, question_ref=None, offset=0,
-                                 source_run_ref=None, effect_id=None):
+                                 source_run_ref=None, effect_id=None, query_revision=None):
         if type(offset) is not int or offset < 0:
             raise OwnerConflict("question_relation_page_invalid")
         parameters = {"quest_ref": quest_ref, "question_ref": question_ref, "offset": offset,
@@ -76,11 +76,20 @@ class QuestionRelationOwnerMixin:
             where += " AND (left_question_ref=:question_ref OR right_question_ref=:question_ref)"
         if effect_id is not None:
             where += " AND source_run_ref=:source_run_ref AND effect_id=:effect_id"
-        with self._database.read() as connection:
+        from meta_research.research_pagination import bind_page, page_state
+        with self._database.read_snapshot() as connection:
+            revisions = connection.execute(text("SELECT relation_ref,content_hash FROM rg_question_relations WHERE "
+                + where + " ORDER BY relation_ref"), parameters).all()
+            token = bind_page({"operation": "question_relations", "quest_ref": quest_ref,
+                               "question_ref": question_ref, "source_run_ref": source_run_ref,
+                               "effect_id": effect_id}, [list(row) for row in revisions],
+                              offset=offset, query_revision=query_revision)
             rows = connection.execute(text("SELECT * FROM rg_question_relations WHERE " + where
                 + " ORDER BY created_at,relation_ref LIMIT 13 OFFSET :offset"), parameters).all()
-        return {"items": [_relation(row) for row in rows[:12]], "offset": offset,
-                "next_offset": offset + 12 if len(rows) > 12 else None}
+        items = [_relation(row) for row in rows[:12]]
+        next_offset = offset + 12 if len(rows) > 12 else None
+        return {"items": items, "offset": offset, "query_revision": token,
+                "next_offset": next_offset, **page_state(items, next_offset, offset=offset)}
 
 
 def _relation(row):
@@ -127,20 +136,24 @@ def question_history_operations(*, research_graph, agent_runtime):
             question = research_graph.query_question_history_by_ref(
                 arguments["question_ref"])
             if question is None or question.quest_ref != quest_ref:
-                return {"status": "not_found", "question": None, "items": []}
+                return {"status": "not_visible", "question": None, "items": [],
+                        "result_state": "not_visible", "scan_complete": False}
             # Reads deliberately include pruned questions; history stays exact.
-            history = research_graph.query_question_research_history(
-                quest_ref=question.quest_ref, question_ref=question.question_ref,
-                offset=arguments.get("offset",0), limit=arguments.get("limit",12))
+            from meta_research.historical_research import discover_question_cycles
+            history = discover_question_cycles(
+                research_graph, quest_ref=question.quest_ref, question_ref=question.question_ref,
+                offset=arguments.get("offset", 0), limit=arguments.get("limit", 12),
+                query_revision=arguments.get("query_revision"))
             return {"status": "accepted", "question": asdict(question), **history}
         except OwnerConflict as error:
             raise SemanticMcpError(str(error)) from error
 
     return SemanticOperation(
         semantic_operation_id=QUESTION_HISTORY_OPERATION_ID, owning_module="research_graph",
-        description="Read one exact accepted Question record of this Quest (including a question set aside) plus its accepted reasoning-outcome history refs.",
+        description="Read one accepted Question of this Quest (including a question set aside) and a bounded page of historical Cycles. Each Cycle lists stage dispositions and exact readers. Pass query_revision with next_offset; changed scope or Owner facts require restarting at offset 0. Bundle readers resolve the stored AE closure/report, independent of current Sessions.",
         input_schema={"type": "object", "properties": {
             "question_ref": {"type": "string", "minLength": 1, "maxLength": 96},
+            "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "offset": {"type":"integer","minimum":0},
             "limit": {"type":"integer","minimum":1,"maximum":12}},
             "required": ["question_ref"], "additionalProperties": False},
@@ -167,14 +180,15 @@ def question_relation_operations(*, research_graph, agent_runtime):
     ref = {"type": "string", "minLength": 1, "maxLength": 96}
     effect = {"type": "string", "minLength": 1, "maxLength": 128}
     schemas = (
-        {"type": "object", "properties": {"question_ref": ref, "offset": {"type": "integer", "minimum": 0}}, "additionalProperties": False},
+        {"type": "object", "properties": {"question_ref": ref, "offset": {"type": "integer", "minimum": 0},
+         "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": False},
         {"type": "object", "properties": {"effect_id": effect, "left_question_ref": ref,
          "right_question_ref": ref, "notes": {"type": "string", "minLength": 1, "maxLength": 8000}},
          "required": ["effect_id", "left_question_ref", "right_question_ref", "notes"], "additionalProperties": False},
         {"type": "object", "properties": {"effect_id": effect}, "required": ["effect_id"], "additionalProperties": False},
     )
     descriptions = (
-        "Read a page of related accepted Questions in this Quest, optionally focused on one Question.",
+        "Read a page of related accepted Questions in this Quest, optionally focused on one Question. Continue with next_offset and query_revision; restart if the query or scoped Owner facts changed.",
         "Record a related/overlapping Question pair and a concise explanation, using exact accepted refs. The current Reasoning run supplies provenance; effect_id has stable retry identity.",
         "Reconcile a Question relation effect recorded by this same Reasoning run, including after a technical retry.",
     )

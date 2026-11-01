@@ -12,24 +12,79 @@ def read_research_input(database, input_ref, *, quest_ref=None):
     with database.read_snapshot() as c:
         row=c.execute(text("SELECT * FROM hc_research_inputs WHERE input_ref=:ref"),{"ref":input_ref}).first()
         if row is None or quest_ref is not None and row.quest_ref!=quest_ref:return None
-        try:
-            value=json.loads(row.payload_json)
-        except (TypeError, ValueError) as error:
-            raise OwnerConflict("human_input_receipt_invalid") from error
-        if not isinstance(value, dict):
-            raise OwnerConflict("human_input_receipt_invalid")
-        if (canonical_hash(value)!=row.content_hash or value.get("quest_ref")!=row.quest_ref
-            or value.get("question_ref")!=row.question_ref
-            or row.receipt_hash!=canonical_hash({"input_ref":row.input_ref,"content_hash":row.content_hash,
-                "receipt_ref":row.receipt_ref,"created_at":row.created_at})):
-            raise OwnerConflict("human_input_receipt_invalid")
+        value = _verified_input_value(row)
         from meta_research.work_materials import material_submissions_for
         return {"input_ref":row.input_ref,**value,"work_materials": material_submissions_for(database, "input", row.input_ref), "content_hash":row.content_hash,"created_at":row.created_at,
                 "receipt":{"issuer":"human_collaboration","kind":"research_input","receipt_ref":row.receipt_ref,
                            "subject_ref":row.input_ref,"payload_hash":row.receipt_hash}}
 
 
+def _verified_input_value(row):
+    try:
+        value=json.loads(row.payload_json)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("human_input_receipt_invalid") from error
+    if not isinstance(value, dict):
+        raise OwnerConflict("human_input_receipt_invalid")
+    if (canonical_hash(value)!=row.content_hash or value.get("quest_ref")!=row.quest_ref
+        or value.get("question_ref")!=row.question_ref
+        or row.receipt_hash!=canonical_hash({"input_ref":row.input_ref,"content_hash":row.content_hash,
+            "receipt_ref":row.receipt_ref,"created_at":row.created_at})):
+        raise OwnerConflict("human_input_receipt_invalid")
+    return value
+
+
 class HumanResearchInputMixin:
+    def query_research_guidance(self, *, quest_ref, query="", offset=0, limit=12,
+                                query_revision=None):
+        """Discover confirmed guidance without claiming delivery or reading it."""
+        from meta_research.research_pagination import bind_page, page_state
+        from meta_research.owners.human_collaboration_ladder import guidance_binding_from_row
+        if (type(offset) is not int or offset < 0 or type(limit) is not int
+                or not 1 <= limit <= 100 or not isinstance(query, str) or len(query) > 1024):
+            raise OwnerConflict("human_input_page_invalid")
+        with self._database.read_snapshot() as connection:
+            revisions = connection.execute(text(
+                "SELECT constraint_ref,revision,guidance_hash,status,receipt_hash FROM hc_soft_constraints "
+                "WHERE scope_ref=:scope ORDER BY constraint_ref"
+            ), {"scope": "quest:" + quest_ref}).all()
+            revision = bind_page({"entry": "guidance", "quest_ref": quest_ref, "query": query},
+                [list(row) for row in revisions], offset=offset, query_revision=query_revision)
+            rows = connection.execute(text(
+                "SELECT * FROM hc_soft_constraints WHERE scope_ref=:scope "
+                "AND (:query='' OR instr(lower(guidance_json),lower(:query))>0) "
+                "ORDER BY created_at DESC,constraint_ref LIMIT :limit OFFSET :offset"
+            ), {"scope": "quest:" + quest_ref, "query": query, "limit": limit + 1, "offset": offset}).all()
+            items = []
+            for row in rows[:limit]:
+                binding = guidance_binding_from_row(row)
+                guide = binding["guidance"]
+                items.append({"constraint_ref": row.constraint_ref,
+                    "summary": guide.get("text", "")[:1200], "strength": guide.get("strength", 3),
+                    "semantic_scope": guide.get("semantic_scope"), "status": row.status,
+                    "meaning": "formally_submitted_guidance", "revision": row.revision,
+                    "reader": {"operation": "human_request.read", "constraint_ref": row.constraint_ref,
+                               "version_ref": row.guidance_hash}})
+            next_offset = offset + limit if len(rows) > limit else None
+        return {"items": items, "offset": offset, "next_offset": next_offset,
+                "query_revision": revision, **page_state(items, next_offset, offset=offset, query=query)}
+
+    def read_research_guidance(self, constraint_ref, *, quest_ref, version_ref):
+        """Read the retained formal instruction; current status is explicit."""
+        from meta_research.owners.human_collaboration_ladder import guidance_binding_from_row
+        from meta_research.work_materials import material_submissions_for
+        with self._database.read_snapshot() as connection:
+            row = connection.execute(text(
+                "SELECT * FROM hc_soft_constraints WHERE constraint_ref=:ref AND scope_ref=:scope"
+            ), {"ref": constraint_ref, "scope": "quest:" + quest_ref}).first()
+            if row is None:
+                raise OwnerConflict("content_source_unbound")
+            binding = guidance_binding_from_row(row)
+            if version_ref != binding["guidance_hash"]:
+                raise OwnerConflict("content_version_unbound")
+            return {**binding, "status": row.status, "meaning": "formally_submitted_guidance",
+                    "work_materials": material_submissions_for(self._database, "guidance", row.constraint_ref)}
+
     def submit_research_input(self, *, quest_ref, text_content, question_ref=None, asset_bindings=(), work_materials=None, idempotency_key):
         if not isinstance(text_content,str) or not text_content.strip() or len(text_content)>65536:
             raise OwnerConflict("human_input_text_invalid")
@@ -86,13 +141,23 @@ class HumanResearchInputMixin:
     def query_research_input(self,input_ref,*,quest_ref=None):
         return read_research_input(self._database,input_ref,quest_ref=quest_ref)
 
-    def query_research_inputs(self,*,quest_ref,query="",offset=0,limit=12):
-        if type(offset)is not int or offset<0 or type(limit)is not int or not 1<=limit<=100:
+    def query_research_inputs(self,*,quest_ref,query="",offset=0,limit=12,query_revision=None):
+        from meta_research.research_pagination import bind_page, page_state
+        if (type(offset)is not int or offset<0 or type(limit)is not int or not 1<=limit<=100
+                or not isinstance(query, str) or len(query) > 1024):
             raise OwnerConflict("human_input_page_invalid")
         with self._database.read_snapshot() as c:
-            rows=c.execute(text("SELECT input_ref FROM hc_research_inputs WHERE quest_ref=:quest AND (:query='' OR instr(lower(payload_json),lower(:query))>0) ORDER BY created_at DESC,input_ref LIMIT :limit OFFSET :offset"),
+            revisions=c.execute(text("SELECT input_ref,content_hash,receipt_hash FROM hc_research_inputs "
+                "WHERE quest_ref=:quest ORDER BY input_ref"),{"quest":quest_ref}).all()
+            revision=bind_page({"entry":"human_inputs","quest_ref":quest_ref,"query":query},
+                [list(row) for row in revisions],offset=offset,query_revision=query_revision)
+            rows=c.execute(text("SELECT * FROM hc_research_inputs WHERE quest_ref=:quest AND (:query='' OR instr(lower(payload_json),lower(:query))>0) ORDER BY created_at DESC,input_ref LIMIT :limit OFFSET :offset"),
                 {"quest":quest_ref,"query":query,"limit":limit+1,"offset":offset}).all()
-            values=[self.query_research_input(row.input_ref,quest_ref=quest_ref) for row in rows[:limit]]
-        return {"items":[{"input_ref":v["input_ref"],"question_ref":v["question_ref"],"name":v["text"][:80],
+            values=[{"input_ref": row.input_ref, "content_hash": row.content_hash,
+                     **_verified_input_value(row)} for row in rows[:limit]]
+        items=[{"input_ref":v["input_ref"],"question_ref":v["question_ref"],"name":v["text"][:80],
                           "summary":v["text"][:1200],"status":"accepted","reader":{"source_ref":v["input_ref"],"version_ref":v["content_hash"]}}
-                         for v in values],"offset":offset,"next_offset":offset+limit if len(rows)>limit else None}
+                         for v in values]
+        next_offset=offset+limit if len(rows)>limit else None
+        return {"items":items,"offset":offset,"next_offset":next_offset,"query_revision":revision,
+                **page_state(items,next_offset,offset=offset,query=query)}

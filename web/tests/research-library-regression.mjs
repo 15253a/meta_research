@@ -17,7 +17,10 @@ let language="zh"; let input=null; let failContentOnce=true;
 const requests=[]; const errors=[];
 const server=createServer(async(req,res)=>{
   const u=new URL(req.url,"http://fixture");
-  const send=(body,status=200)=>{res.writeHead(status,{"Content-Type":"application/json","Set-Cookie":"meta_research_csrf=fixture; Path=/"});res.end(JSON.stringify(body));};
+  const send=(body,status=200)=>{
+    if(u.pathname.startsWith("/api/v1/research-library/") && status===200) body={...body,query_revision:"a".repeat(64)};
+    res.writeHead(status,{"Content-Type":"application/json","Set-Cookie":"meta_research_csrf=fixture; Path=/"});res.end(JSON.stringify(body));
+  };
   if(u.pathname.startsWith("/api/")){
     requests.push(u.pathname+u.search);
     if(u.pathname==="/api/v1/preferences"){
@@ -27,8 +30,20 @@ const server=createServer(async(req,res)=>{
     if(u.pathname.startsWith("/api/v1/research-library/")){
       const entry=u.pathname.split("/").at(-1);
       const offset=Number(u.searchParams.get("offset")??0);
+      if(offset>0) assert.equal(u.searchParams.get("query_revision"),"a".repeat(64),"continuations must carry the Owner query revision: "+u.href);
       if(u.searchParams.get("query")==="no-library-match")return send({items:[],next_offset:null});
+      if(entry==="human"&&u.searchParams.has("request_ref")) {
+        assert.equal(u.searchParams.get("request_ref"),"request-with-history");
+        return send({items:Array.from({length:offset===0?12:1},(_,index)=>({
+          ref:"historical-response-"+(offset+index),name:"Historical response "+(offset+index),
+          request_ref:"request-with-history",summary:"Preserved human collaboration.",
+          reader:{source_ref:"historical-response-"+(offset+index),version_ref:"response-version-"+(offset+index)},
+        })),next_offset:offset===0?12:null});
+      }
       if(entry==="human"&&u.searchParams.has("request_cursor"))return send({items:[{ref:"later-response",name:"Later request response",summary:"A second page of human guidance."}],next_offset:null,request_next_cursor:null});
+      if(entry==="human")return send({items:[{ref:"request-with-history",request_ref:"request-with-history",
+        name:"A request with preserved replies",summary:"Latest response summary.",response_count:13,
+        reader:{source_ref:"historical-response-12",version_ref:"response-version-12"}}],next_offset:null,request_next_cursor:"request-page-2"});
       if(entry==="questions") return send({items:u.searchParams.has("question_ref")
         ?[{ref:"outcome-"+offset,name:"Preserved conclusion "+offset,summary:"A previous accepted research finding.",reader:{source_ref:"outcome-"+offset,version_ref:"outcome-"+offset}}]
         :[{question_ref:"question-library-"+offset,name:"questions material "+offset,reader:{source_ref:"question-library-"+offset,version_ref:"question-content-"+offset},history_reader:{operation:"research_graph.question_history.read",question_ref:"question-library-"+offset,offset:0,limit:12}}],next_offset:offset===0?12:null});
@@ -47,6 +62,11 @@ const server=createServer(async(req,res)=>{
     if(u.pathname==="/api/v1/research-content"){
       assert.ok(u.searchParams.get("source_ref")&&!['undefined','null'].includes(u.searchParams.get("source_ref")));
       assert.ok(u.searchParams.get("version_ref"));
+      if(u.searchParams.get("source_ref").startsWith("historical-response-")) {
+        const index=u.searchParams.get("source_ref").slice("historical-response-".length);
+        assert.equal(u.searchParams.get("version_ref"),"response-version-"+index);
+        return send({text:"Preserved response original "+index+".",next_offset:null,complete:true});
+      }
       if(u.searchParams.get("source_ref").startsWith("outcome-")) return send({text:JSON.stringify({claim:"The accepted conclusion remains readable.",support_scope:"Only the retained measurements."}),next_offset:null,complete:true});
       if(u.searchParams.get("source_ref")==="environment-simulator") {
         const version=u.searchParams.get("version_ref");assert.ok(["asset-env-manual","asset-env-config"].includes(version));
@@ -151,6 +171,20 @@ try{
   await expect(dialog.getByRole("tab",{name:"Human input",exact:true})).toBeVisible();
   await expect(dialog.locator(".asset-header-chip")).toHaveText("Saved content versions: 1089");
   await dialog.getByRole("tab",{name:"Human input",exact:true}).click();
+  await dialog.getByRole("button",{name:"View all responses (13)",exact:true}).click();
+  await expect(dialog.getByText("Historical response 0",{exact:true})).toBeVisible();
+  await expect(dialog.locator(".library-card")).toHaveCount(12);
+  await dialog.locator(".library-card").filter({hasText:"Historical response 0"}).getByRole("button",{name:"Read original",exact:true}).click();
+  await expect(dialog.getByText("Preserved response original 0.",{exact:true})).toBeVisible();
+  await dialog.getByRole("button",{name:"Next",exact:true}).click();
+  await expect(dialog.getByText("Historical response 12",{exact:true})).toBeVisible();
+  await expect(dialog.locator(".library-card")).toHaveCount(1);
+  await dialog.getByRole("button",{name:"Read original",exact:true}).click();
+  await expect(dialog.getByText("Preserved response original 12.",{exact:true})).toBeVisible();
+  await dialog.getByRole("button",{name:"Previous",exact:true}).click();
+  await expect(dialog.getByText("Historical response 0",{exact:true})).toBeVisible();
+  await dialog.getByRole("button",{name:"Back",exact:true}).click();
+  await expect(dialog.getByText("A request with preserved replies",{exact:true})).toBeVisible();
   await dialog.getByRole("button",{name:"More request responses",exact:true}).click();
   await expect(dialog.getByText("Later request response",{exact:true})).toBeVisible();
   await dialog.getByLabel("Research guidance").fill("Test user guidance: compare uncertainty before choosing a method.");
@@ -164,5 +198,5 @@ try{
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   await page.screenshot({path:evidence+"/library-mobile.png"});
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({status:"passed",checks:["inventory-total-distinct-from-library-tab-cards","library-empty-state-independent-from-inventory-total","six-entry-navigation","independent-pagination","question-research-history-pages-and-original","exact-content-continuation","baseline-variant-run-output","dataset-version-directory-file","environment-physical-resource-without-digital-material","environment-research-use-pagination","environment-multiple-exact-material-bindings","failed-content-retains-read-pages-and-retries","language-save-and-render","human-input-csrf-idempotency","independent-human-response-cursor","desktop-mobile-no-overflow"],requests:requests.filter(x=>x.includes("research-library")||x.includes("research-content")||x.includes("research-formal"))}));
+  console.log(JSON.stringify({status:"passed",checks:["inventory-total-distinct-from-library-tab-cards","library-empty-state-independent-from-inventory-total","six-entry-navigation","independent-pagination","question-research-history-pages-and-original","exact-content-continuation","baseline-variant-run-output","dataset-version-directory-file","environment-physical-resource-without-digital-material","environment-research-use-pagination","environment-multiple-exact-material-bindings","failed-content-retains-read-pages-and-retries","language-save-and-render","human-input-csrf-idempotency","independent-human-response-cursor","request-response-history-pages-and-originals","desktop-mobile-no-overflow"],requests:requests.filter(x=>x.includes("research-library")||x.includes("research-content")||x.includes("research-formal"))}));
 }finally{await browser.close();server.closeAllConnections();await new Promise(done=>server.close(done));}

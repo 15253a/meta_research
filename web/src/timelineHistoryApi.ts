@@ -60,8 +60,11 @@ export function useTimelineHistory(questRef: string | null, liveQuestRef: string
       const items: ResearchLibraryItem[] = [];
       try {
         let offset = 0;
+        let queryRevision: string | undefined;
         while (true) {
-          const page = await fetchResearchLibrary("questions", questRef, "", offset, controller.signal, { limit: "100" });
+          const page = await fetchResearchLibrary("questions", questRef, "", offset, controller.signal,
+            { limit: "100", ...(queryRevision ? { query_revision: queryRevision } : {}) });
+          queryRevision = page.query_revision;
           if (!Array.isArray(page.items) || page.items.some(item => !item.question_ref || (item.quest_ref && item.quest_ref !== questRef))) throw new Error("timeline_questions_invalid");
           items.push(...page.items);
           if (!controller.signal.aborted) setQuestions({ questRef, items: [...items], error: false, loading: page.next_offset != null });

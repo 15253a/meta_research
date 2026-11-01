@@ -122,7 +122,8 @@ def test_child_matches_do_not_duplicate_pagination_or_bypass_method_hash(runtime
     first = graph.query_baselines(query="shared-needle", quest_ref=quest.quest_ref, limit=1)
     assert _refs(first) == [newer]
     assert first["next_offset"] == 1
-    second = graph.query_baselines(query="shared-needle", quest_ref=quest.quest_ref, limit=1, offset=1)
+    second = graph.query_baselines(query="shared-needle", quest_ref=quest.quest_ref, limit=1, offset=1,
+                                   query_revision=first["query_revision"])
     assert _refs(second) == [older]
     assert second["next_offset"] is None
     assert _refs(graph.query_baselines(quest_ref=quest.quest_ref)) == [newer, older]

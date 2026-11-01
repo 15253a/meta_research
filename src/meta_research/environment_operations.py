@@ -92,9 +92,10 @@ def environment_operations(graph, agent_runtime):
             output_schema={"type": "object"},
             handler=lambda context, arguments, action=action: effect(context, arguments, action, True)))
     operations.append(SemanticOperation(semantic_operation_id="research_graph.environments.page", owning_module="research_graph",
-        description="分页发现本 Quest 登记或使用的 Environment。query 搜索含义/来源，semantic_key 查看同资源不可变快照，environment_ref 或 question_ref 查看用途（过滤模式互斥）。数字原件用 content.read，source_ref=environment_ref，version_ref 取 asset_bindings。物理设备、服务或现成目录可仅有资源说明，hash不证明实体状态。",
+        description="分页发现本 Quest 登记或使用的 Environment。query 搜索含义/来源，semantic_key 查看同资源不可变快照，environment_ref 或 question_ref 查看用途（过滤模式互斥）。数字原件用 content.read，source_ref=environment_ref，version_ref 取 asset_bindings。用 next_offset/query_revision 续页并保持过滤与limit；research_query_changed 后从0重开，research_query_revision_required 表示缺修订。result_state/scan_complete 区分空结果与扫描结束。物理设备、服务或现成目录可仅有资源说明，hash不证明实体状态。",
         input_schema={"type": "object", "properties": {"query": {"type": "string", "maxLength": 1024},
             "semantic_key": string, "environment_ref": string, "question_ref": string,
+            "query_revision": {"type":"string","pattern":"^[0-9a-f]{64}$"},
             "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
             "additionalProperties": False}, output_schema={"type": "object"},
         handler=lambda context, arguments: read(context, arguments, True)))
