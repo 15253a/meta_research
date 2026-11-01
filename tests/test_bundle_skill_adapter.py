@@ -66,6 +66,9 @@ from meta_research.bundle_target_contract import (
     normalized_completion_contract_to_dict,
 )
 from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF, CODEX_REASONING_EFFORT_BINDING, CODEX_ROOT_REASONING_PRESET_CONFIG,
+)
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.quest_drafting import (
     PROVIDER_RESULT_MAX_BYTES,
@@ -297,8 +300,6 @@ def _target_plan(plan: dict[str, object], context_hash: str) -> dict[str, object
         ),
     )
     completion_document = normalized_completion_contract_to_dict(completion)
-    implementation_hash = canonical_hash({"implementation": "structure"})
-    source_version = "source-version:structure"
     candidate = {
         "schema_ref": FORMAL_TARGET_CANDIDATE_SCHEMA_REF,
         "candidate": {
@@ -313,44 +314,6 @@ def _target_plan(plan: dict[str, object], context_hash: str) -> dict[str, object
             ],
             "implementation_revision_ref": "implementation:structure",
             "code_changed": False,
-            "reuse_trace": {
-                "tier_decisions": [
-                    {
-                        "tier": "self-implementation",
-                        "disposition": "selected",
-                        "reason_ref": "reuse-reason:structure",
-                        "source_proofs": [
-                            {
-                                "source_ref": "source:structure",
-                                "exact_version_ref": source_version,
-                                "implementation_revision_ref": (
-                                    "implementation:structure"
-                                ),
-                                "eligible_tier": "self-implementation",
-                                "verification_receipt": _receipt(
-                                    "source-verification:structure",
-                                    source_version,
-                                ),
-                                "implementation_binding": {
-                                    "subject_ref": "implementation:structure",
-                                    "content_hash_ref": implementation_hash,
-                                },
-                                "implementation_acceptance_receipt": _receipt(
-                                    "implementation-acceptance:structure",
-                                    implementation_hash,
-                                ),
-                                "eligibility_anchor_ref": None,
-                                "eligibility_binding": None,
-                                "eligibility_receipt": None,
-                                "license_ref": None,
-                                "content_hash_ref": None,
-                                "patch_ref": None,
-                            }
-                        ],
-                    }
-                ],
-                "greenfield_exception": "simple-implementation",
-            },
             "routes": [
                 {
                     "route_ref": "route:structure",
@@ -388,16 +351,6 @@ def _target_plan(plan: dict[str, object], context_hash: str) -> dict[str, object
             "context_pack_ref": "context-pack:bundle-1",
             "context_pack_hash": context_hash,
         },
-    }
-
-
-def _receipt(receipt_ref: str, subject_ref: str) -> dict[str, object]:
-    return {
-        "receipt_ref": receipt_ref,
-        "subject_ref": subject_ref,
-        "verified": True,
-        "currentness_known": True,
-        "current": True,
     }
 
 
@@ -871,66 +824,6 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
                                 "implementation_revision_ref": (
                                     "implementation:structure-replication"
                                 ),
-                                "reuse_trace": {
-                                    "tier_decisions": [
-                                        {
-                                            "tier": "self-implementation",
-                                            "disposition": "selected",
-                                            "reason_ref": (
-                                                "reuse-reason:structure-replication"
-                                            ),
-                                            "source_proofs": [
-                                                {
-                                                    **deepcopy(
-                                                        target_plan[
-                                                            "initial_strategy_update"
-                                                        ]["candidates"][0][
-                                                            "candidate"
-                                                        ]["reuse_trace"][
-                                                            "tier_decisions"
-                                                        ][0]["source_proofs"][0]
-                                                    ),
-                                                    "source_ref": (
-                                                        "source:structure-replication"
-                                                    ),
-                                                    "exact_version_ref": (
-                                                        "source-version:structure-replication"
-                                                    ),
-                                                    "implementation_revision_ref": (
-                                                        "implementation:structure-replication"
-                                                    ),
-                                                    "verification_receipt": _receipt(
-                                                        "source-verification:structure-replication",
-                                                        "source-version:structure-replication",
-                                                    ),
-                                                    "implementation_binding": {
-                                                        "subject_ref": (
-                                                            "implementation:structure-replication"
-                                                        ),
-                                                        "content_hash_ref": canonical_hash(
-                                                            {
-                                                                "implementation": (
-                                                                    "structure-replication"
-                                                                )
-                                                            }
-                                                        ),
-                                                    },
-                                                    "implementation_acceptance_receipt": _receipt(
-                                                        "implementation-acceptance:structure-replication",
-                                                        canonical_hash(
-                                                            {
-                                                                "implementation": (
-                                                                    "structure-replication"
-                                                                )
-                                                            }
-                                                        ),
-                                                    ),
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                    "greenfield_exception": "simple-implementation",
-                                },
                                 "routes": [
                                     {
                                         "route_ref": "route:structure-replication",
@@ -1069,11 +962,8 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     assert result.primary_session_ref == "codex-bundle-primary:1"
     assert result.review_mode == "advisory_unobserved"
     assert result.reviewer_agent_ref is None
-    assert binding.model_ref == "gpt-5.6-sol"
-    assert (
-        "codex-config:model_reasoning_effort=max"
-        in binding.resource_bindings
-    )
+    assert binding.model_ref == CODEX_MODEL_REF
+    assert CODEX_REASONING_EFFORT_BINDING in binding.resource_bindings
     assert any(
         "meta_research.skills.bundle_stage/SKILL.md" in item
         for item in binding.resource_bindings
@@ -1089,7 +979,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     batch_argv, batch_prompt, batch_schema = runner.calls[2]
     serialized_checkpoint = canonical_json(request.inbox_checkpoint)
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
-    assert 'model_reasoning_effort="max"' in primary_argv
+    assert CODEX_ROOT_REASONING_PRESET_CONFIG in primary_argv
     assert f"inbox_checkpoint={serialized_checkpoint}" in primary_prompt
     role_source = Path(next(line.removeprefix("Role skill source: ")
         for line in primary_prompt.splitlines() if line.startswith("Role skill source: ")))
@@ -1867,33 +1757,11 @@ def test_bundle_large_rolling_prompt_reaches_the_public_batch_operation(
         label = f"structure-{index}"
         cell = f"cell:structure-{index}"
         implementation_ref = f"implementation:{label}"
-        implementation_hash = canonical_hash({"implementation": label})
-        source_version_ref = f"source-version:{label}"
         spec = deepcopy(base_spec)
         candidate = spec["candidate"]
         candidate["local_label"] = f"target:{label}"
         candidate["measurement_unit_keys"] = [cell]
         candidate["implementation_revision_ref"] = implementation_ref
-        source_proof = candidate["reuse_trace"]["tier_decisions"][0][
-            "source_proofs"
-        ][0]
-        source_proof.update(
-            {
-                "source_ref": f"source:{label}",
-                "exact_version_ref": source_version_ref,
-                "implementation_revision_ref": implementation_ref,
-                "verification_receipt": _receipt(
-                    f"source-verification:{label}", source_version_ref
-                ),
-                "implementation_binding": {
-                    "subject_ref": implementation_ref,
-                    "content_hash_ref": implementation_hash,
-                },
-                "implementation_acceptance_receipt": _receipt(
-                    f"implementation-acceptance:{label}", implementation_hash
-                ),
-            }
-        )
         candidate["routes"] = [
             {
                 "route_ref": f"route:{label}",
@@ -2169,19 +2037,6 @@ def test_target_plan_rejects_a_cycle_before_research_graph_acceptance() -> None:
     )
     second_candidate["depends_on_labels"] = ["target:structure"]
     second_candidate["implementation_revision_ref"] = "implementation:replication"
-    second_candidate["reuse_trace"]["tier_decisions"][0]["source_proofs"][0][
-        "implementation_revision_ref"
-    ] = "implementation:replication"
-    second_hash = canonical_hash({"implementation": "replication"})
-    second_candidate["reuse_trace"]["tier_decisions"][0]["source_proofs"][0][
-        "implementation_binding"
-    ] = {
-        "subject_ref": "implementation:replication",
-        "content_hash_ref": second_hash,
-    }
-    second_candidate["reuse_trace"]["tier_decisions"][0]["source_proofs"][0][
-        "implementation_acceptance_receipt"
-    ] = _receipt("implementation-acceptance:replication", second_hash)
     target_plan["initial_strategy_update"]["candidates"] = [first, second]
 
     with pytest.raises(BundleContractError, match="strategy_dependency_cycle"):

@@ -66,7 +66,6 @@ def _request(adapter, kind):
     target_plan = _target_plan(plan, "7" * 64)
     target_plan["completion_contract"]["experiments"][0]["brief"]["required_measurement_unit_keys"] = ["cell:structure-primary"]
     spec = target_plan["initial_strategy_update"]["candidates"][0]
-    spec["candidate"].pop("reuse_trace")
     return BundleTargetBatchRequest(
         **scope, formal_plan_ref="formal-plan:bundle-1", context_pack_ref="context-pack:bundle-1",
         context_pack_hash="7" * 64, plan_document=plan, initial_target_plan=target_plan,
