@@ -53,8 +53,7 @@ def store_body(object_store: Path, content: str):
 class LiteratureContentPageReader:
     def __init__(self, object_store: Path):
         self._object_store = object_store.resolve()
-        # Reuse RM's bounded streaming verifier. It caches only file signatures,
-        # and no literature source bytes or acceptance receipts.
+        # Reuse RM's streaming verifier; every open verifies its actual bytes.
         self._pages = VerifiedContentPages()
 
     def _path(self, body):
@@ -101,14 +100,7 @@ class LiteratureContentPageReader:
         path = self._path(body)
         try:
             with _open_asset_regular_file(path, "literature_content_unavailable") as source:
-                self._pages.read_page(source, path, body, 0, 1)
-                before = self._pages.signature(path, source, body["sha256"])
-                source.seek(0)
-                data = source.read(body["size"] + 1)
-                if (len(data) != body["size"]
-                    or hashlib.sha256(data).hexdigest() != body["sha256"]
-                    or self._pages.signature(path, source, body["sha256"]) != before):
-                    raise OwnerConflict("content_drifted")
+                data = self._pages.read_page(source, path, body, 0, body["size"])
                 return data.decode("utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise OwnerConflict("literature_content_unavailable") from error

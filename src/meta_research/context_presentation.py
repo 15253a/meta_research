@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import OrderedDict
+from threading import RLock
 from typing import Any
 
 CATALOG_LIMIT = 32
@@ -328,8 +330,41 @@ def _observe_context_projection(stage, source, view, source_ref, source_hash,
     }))
 
 
+class ExactContextPages:
+    """Bounded representations of already-authorized immutable Owner sources.
+
+    Keys are supplied only after the caller rechecks its current authority and
+    exact source binding. Unrevisioned history/index values must omit identity.
+    Neither source authorization nor mutable file verification is cached here.
+    """
+
+    def __init__(self, *, max_bytes=8 * 1024 * 1024, max_entries=128):
+        self.max_bytes, self.max_entries = max_bytes, max_entries
+        self._entries = OrderedDict()
+        self._bytes = 0
+        self._lock = RLock()
+
+    def representation(self, node, identity, path):
+        key = (identity, tuple((type(part).__name__, part) for part in path))
+        with self._lock:
+            if key in self._entries:
+                self._entries.move_to_end(key)
+                return self._entries[key]
+            raw = _json(node).encode('utf-8')
+            value = raw, hashlib.sha256(raw).hexdigest()
+            if len(raw) <= self.max_bytes and self.max_entries > 0:
+                while self._entries and (self._bytes + len(raw) > self.max_bytes
+                                         or len(self._entries) >= self.max_entries):
+                    _, removed = self._entries.popitem(last=False)
+                    self._bytes -= len(removed[0])
+                self._entries[key] = value
+                self._bytes += len(raw)
+            return value
+
+
 def context_read_page(value: object, *, path: list[str | int], offset: int,
-                      limit: int) -> dict[str, object]:
+                      limit: int, cache: ExactContextPages | None = None,
+                      identity: tuple | None = None) -> dict[str, object]:
     """Exact JSON text byte page, not a filesystem path or object truncation."""
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 16384:
         raise ValueError("stage_context_page_invalid")
@@ -343,7 +378,11 @@ def context_read_page(value: object, *, path: list[str | int], offset: int,
             node = node[int(key)]
         else:
             raise ValueError("stage_context_path_invalid")
-    raw = _json(node).encode("utf-8")
+    if cache is not None and identity is not None:
+        raw, content_hash = cache.representation(node, identity, path)
+    else:
+        raw = _json(node).encode("utf-8")
+        content_hash = hashlib.sha256(raw).hexdigest()
     if offset > len(raw) or (offset < len(raw) and raw[offset] & 0xC0 == 0x80):
         raise ValueError("stage_context_offset_invalid")
     chunk = raw[offset:offset + limit]
@@ -352,7 +391,7 @@ def context_read_page(value: object, *, path: list[str | int], offset: int,
     if not consumed and offset < len(raw):
         raise ValueError("stage_context_limit_too_small")
     return {"text": text, "encoding": "canonical-json-utf8-bytes",
-            "content_hash": hashlib.sha256(raw).hexdigest(), "path": path,
+            "content_hash": content_hash, "path": path,
             "offset": offset, "offset_unit": "utf8_bytes", "returned_bytes": consumed, "total_bytes": len(raw),
             "next_offset": offset + consumed if offset + consumed < len(raw) else None,
             "complete": offset == 0 and consumed == len(raw)}

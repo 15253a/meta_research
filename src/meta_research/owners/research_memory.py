@@ -342,6 +342,11 @@ class AssetIntakeResult:
             "custody_mode": self.custody_mode,
             "attempt_count": self.attempt_count,
             "asset": None if self.asset is None else self.asset.as_public_dict(),
+            "reader": None if self.asset is None else {
+                "operation": "research_memory.content.read",
+                "source_ref": self.asset.version_ref,
+                "version_ref": self.asset.version_ref,
+            },
             "failure": (
                 None if self.failure_code is None else {"code": self.failure_code}
             ),
@@ -965,6 +970,8 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     ) -> AcceptedAssetVersion | None: ...
 
     def query_asset_lifecycle(self, asset_ref: str) -> dict[str, object]: ...
+
+    def query_asset_status(self, asset_ref: str, version_ref: str | None = None) -> dict[str, object]: ...
 
     def query_current_asset(self, asset_ref: str) -> AcceptedAssetVersion | None: ...
 
@@ -3156,6 +3163,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         self._asset_handoff_lock = threading.RLock()
         from meta_research.owners.research_asset_content import AssetContentPageReader
         self._asset_content_pages = AssetContentPageReader(object_store, receipt_verifier)
+        from meta_research.context_presentation import ExactContextPages
+        self._json_content_pages = ExactContextPages()
         self._literature_content_pages = LiteratureContentPageReader(self._object_store)
         from meta_research.creation_basis import CreationBasisMemory
         self.creation_bases = CreationBasisMemory(self)
@@ -3883,7 +3892,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             row = connection.execute(
                 text(
                     "SELECT attempt_count, request_source_kind, "
-                    "request_custody_mode FROM rm_asset_intakes WHERE job_ref = "
+                    "request_custody_mode, request_json, request_hash FROM rm_asset_intakes WHERE job_ref = "
                     ":job_ref AND status = 'processing'"
                 ),
                 {"job_ref": job_ref},
@@ -3892,15 +3901,13 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 return
             now = time.time()
             if int(row.attempt_count) >= ASSET_INTAKE_MAX_ATTEMPTS:
-                request_summary_json = _scrubbed_asset_request_json(
-                    row.request_source_kind, row.request_custody_mode
-                )
+                request_summary_json, request_payload_scrubbed = _failed_asset_request_storage(row)
                 connection.execute(
                     text(
                         "UPDATE rm_asset_intakes SET status = 'failed', "
                         "failure_code = 'asset_intake_retry_exhausted', "
                         "request_json = :request_summary_json, "
-                        "request_payload_scrubbed = 1, completed_at = :now, "
+                        "request_payload_scrubbed = :request_payload_scrubbed, completed_at = :now, "
                         "updated_at = :now WHERE job_ref = :job_ref AND "
                         "status = 'processing'"
                     ),
@@ -3908,6 +3915,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                         "job_ref": job_ref,
                         "now": now,
                         "request_summary_json": request_summary_json,
+                        "request_payload_scrubbed": request_payload_scrubbed,
                     },
                 )
                 connection.execute(
@@ -4453,7 +4461,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         with self._database.write() as connection:
             row = connection.execute(
                 text(
-                    "SELECT status, request_source_kind, request_custody_mode "
+                    "SELECT status, request_source_kind, request_custody_mode, request_json, request_hash "
                     "FROM rm_asset_intakes WHERE job_ref = :job_ref"
                 ),
                 {"job_ref": job_ref},
@@ -4461,15 +4469,13 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             if row is None or row.status in {"accepted", "failed"}:
                 return
             now = time.time()
-            request_summary_json = _scrubbed_asset_request_json(
-                row.request_source_kind, row.request_custody_mode
-            )
+            request_summary_json, request_payload_scrubbed = _failed_asset_request_storage(row)
             connection.execute(
                 text(
                     "UPDATE rm_asset_intakes SET status = 'failed', "
                     "failure_code = :failure_code, completed_at = :now, "
                     "request_json = :request_summary_json, "
-                    "request_payload_scrubbed = 1, updated_at = :now WHERE "
+                    "request_payload_scrubbed = :request_payload_scrubbed, updated_at = :now WHERE "
                     "job_ref = :job_ref"
                 ),
                 {
@@ -4477,6 +4483,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     "failure_code": failure_code,
                     "now": now,
                     "request_summary_json": request_summary_json,
+                    "request_payload_scrubbed": request_payload_scrubbed,
                 },
             )
             connection.execute(
@@ -4579,12 +4586,28 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         if row is None:
             return None
         if bool(row.request_payload_scrubbed):
+            _verified_scrubbed_asset_request_summary(row)
+            if row.status == "accepted":
+                result = self.query_asset_intake(row.job_ref)
+                if result.asset is None:
+                    raise OwnerConflict("asset_intake_request_invalid")
+                return {
+                    "request": None,
+                    "result": result.as_public_dict(),
+                    "source_locators": [
+                        custody.source_locator
+                        for custody in self.query_asset_custodies(result.asset.version_ref)
+                        if custody.custody_mode == result.custody_mode
+                        and custody.source_locator is not None
+                        and custody.locator_receipted
+                    ],
+                }
             raise OwnerConflict("asset_intake_effect_payload_unavailable")
         request = _validated_stored_asset_request(
             row.request_json, row.request_hash
         )
         return {
-            "request": _asset_request_document(request),
+            "request": request,
             "result": self.query_asset_intake(row.job_ref).as_public_dict(),
         }
 
@@ -5024,8 +5047,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         """Read an exact bounded page in original custody after receipt verification."""
         page = self._asset_content_pages.read_page(
             memory_ref, entry_path=entry_path, offset=offset, limit=limit)
-        version = self.query_asset_version(memory_ref)
-        return {**page, "lifecycle": self.query_asset_lifecycle(version.asset_ref)}
+        return {**page, "lifecycle": self.query_asset_status(page['asset_binding']['asset_ref'], memory_ref)}
 
     def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
         return self._receipt_verifier.describe_asset_export(memory_ref)
@@ -6606,10 +6628,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         )
         if row is None or stored_hash != expected_hash:
             raise OwnerConflict("question_content_not_found")
-        if autonomous:
-            _verify_autonomous_question_content_object(self._object_store, row)
-        else:
-            _verify_object(self._object_store, row)
+        # The selected receipt path below checks the actual file against this
+        # exact accepted JSON. Do not open and verify it a second time first.
         if autonomous:
             accepted = self.query_autonomous_question_content(content_ref)
             if accepted is None:
@@ -6824,7 +6844,6 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             ).first()
         if row is None:
             return None
-        _verify_object(self._object_store, row)
         accepted = _accepted_manual_content(row)
         quest_query = getattr(self._reference_reader, "query_quest_by_ref", None)
         if not callable(quest_query):
@@ -9475,7 +9494,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 if evidence_basis_ref not in {None, record_ref}:
                     raise OwnerConflict("content_source_unbound")
                 return {
-                    **context_read_page(paper, path=[], offset=offset, limit=min(limit, 16384)),
+                    **context_read_page(paper, path=[], offset=offset, limit=min(limit, 16384),
+                        cache=self._json_content_pages, identity=(snapshot_ref, record_ref, 'paper-metadata')),
                     "paper": paper,
                 }
             if evidence_basis_ref is not None and evidence_basis_ref != selected["content_hash"]:
@@ -11166,6 +11186,21 @@ def _validated_stored_asset_request(
         return normalized
     except (KeyError, TypeError, ValueError, OwnerConflict) as error:
         raise OwnerConflict("asset_intake_request_invalid") from error
+
+
+def _failed_asset_request_storage(row: object) -> tuple[str, int]:
+    # Selected-source requests contain locator/provenance metadata, no source
+    # bytes. Keep their existing exact operation binding when no accepted asset
+    # receipt exists, so a lost failure acknowledgement needs no live original.
+    try:
+        request = _validated_stored_asset_request(row.request_json, row.request_hash)
+    except (TypeError, ValueError, OwnerConflict):
+        request = {}
+    if (request.get("source_kind") in {"local_path", "directory"}
+        and request.get("effect_scope_required") is True
+        and request.get("provenance", {}).get("kind") in {"workspace_selection", "material_selection"}):
+        return row.request_json, 0
+    return _scrubbed_asset_request_json(row.request_source_kind, row.request_custody_mode), 1
 
 
 def _scrubbed_asset_request_json(

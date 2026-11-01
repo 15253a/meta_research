@@ -79,7 +79,9 @@ def test_discovery_and_pages_do_not_load_the_corpus(tmp_path,monkeypatch):
         for _ in range(8):
             content=read_content(runtime.owners.research_graph,memory,quest_ref=request.accepted_question.quest_ref,**item["reader"],offset=content["next_offset"],limit=8192)
         _,read_peak=tracemalloc.get_traced_memory();tracemalloc.stop()
-        assert reads[selected]-first_reads<=8*8192
+        # Each independent open must verify mutable physical custody; only
+        # the selected body is scanned, never the rest of the corpus.
+        assert reads[selected]-first_reads==8*Path(selected).stat().st_size
         assert discovery_peak<4*1024*1024 and read_peak<8*1024*1024
         assert set(reads)=={selected}
         assert {str(p.relative_to(storage)) for p in storage.rglob("*")} == original_entries
@@ -159,10 +161,11 @@ def test_exact_literature_pages_recover_and_revalidate_authority(tmp_path, monke
         runtime.close()
 
 
-def test_full_snapshot_rejects_mutation_between_cached_validation_and_full_read(tmp_path, monkeypatch):
+def test_full_snapshot_consumes_verified_bytes_without_reopening_mutable_body(tmp_path, monkeypatch):
     runtime, request, snapshot, revision = make_corpus(tmp_path / "full-read-race", SmallCorpusProvider())
     try:
         memory = runtime.owners.research_memory
+        expected = memory.read_literature_snapshot(snapshot.snapshot_ref)
         reader = memory._literature_content_pages
         original = reader._pages.read_page
         changed = []
@@ -175,8 +178,11 @@ def test_full_snapshot_rejects_mutation_between_cached_validation_and_full_read(
             changed.append(path)
             return result
         monkeypatch.setattr(reader._pages, "read_page", mutate_after_validation)
+        # A change after the exact bytes were obtained must not replace those
+        # bytes under the accepted identity during this consumption.
+        assert memory.read_literature_snapshot(snapshot.snapshot_ref) == expected
+        assert changed
         with pytest.raises(OwnerConflict, match="content_drifted"):
             memory.read_literature_snapshot(snapshot.snapshot_ref)
-        assert changed
     finally:
         runtime.close()

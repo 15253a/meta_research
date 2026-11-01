@@ -8,7 +8,7 @@
 
 工作规则由指定 Skill、合同和操作说明提供；当前目标、Question、计划及上游结果说明研究从哪里继续；正式资产沿精确版本和读取入口使用；草稿、缓存与工作副本由 Workspace 承载。已有准确正文、路径或 reader 时直接使用，按当前需要补足缺失内容。核对公共材料 intake、正文 reader、分页或错误时，读本文的[准确读取与错误](#准确读取与错误)及[工作资料的当前处理与后继交接](#工作资料的当前处理与后继交接)；实际参数、返回和错误合同沿[当前获授工具与准确入口](research-navigation.md#当前获授工具与准确入口)按需取得。目录位置和相邻文件本身不赋予正式输入或证据身份。
 
-创建 Quest、手动创建 Question、主动指导和 HumanRequest 回复提供的目录，按本次实际获授的只读入口访问；真实路径、可见范围与位置可用性以当前提供的授权和返回为准。按需从原目录读取，需要编辑、解包或试跑时，复制关键部分到当前工作的 Workspace。主动指导和求助回复上传的小文件进入对应 Workspace，按实际接收工作保留来源。
+创建 Quest、手动创建 Question、主动指导和 HumanRequest 回复提供的目录，在整个 Quest 内按当前授权只读访问，不受临时 Workspace 三轮窗口限制；原接收工作关系不随后继根改绑。每次访问重新核对当前权限和真实位置可用性，撤权、离线与路径变化如实反馈。按需从原目录读取，需要编辑、解包或试跑时，复制关键部分到当前工作的 Workspace。主动指导和求助回复上传的小文件进入对应 Workspace，按实际接收工作保留来源。
 
 挂载或收到材料后，由 Agent 判断何时理解、使用和登记。当前研究需要决定阅读范围和副本规模，无须立即全量扫描、读取、复制或登记。人提供的只读原目录保持其原件性质。
 
@@ -58,6 +58,8 @@ Idea、Plan、Bundle 和 Reasoning 可在本阶段调查、推导和综合，工
 
 正式整理时保留实际生产来路：调用 intake 的根只确定本次提交绑定，不自动证明实际接收者或生产者。执行或接纳绑定已能核验的工作身份及研究关联，由相应 Owner/adapter 沿既有事实给出；尚不能核验的关联如实保留为来源说明，不升级成系统已核事实；角色如实说明科研内容、真实生产与接收来路、处理派生、用途及限制。后继沿该 Question 的阶段产物或资产研究关系取得正式身份与准确 reader。阶段正文沿已经交付的准确交接与 reader 使用；独立 Stage 资产生产关系及按 Question 的完整发现以实际提供的能力为准，当前 `query_question_research_notes` 只查 Target notes。
 
+已获授权的非 Target 文件、二进制和目录可直接通过 `research_memory.assets.intake` 选择：`source_kind:"local_path"`（文件或目录）或 `"directory"`，`custody_mode:"managed"` 或 `"linked_local"`，并提供 `display_name`。工作区来源为 `source:{kind:"workspace",workspace_ref,path}`；原始材料来源为 `source:{kind:"material",reference_ref,path}`，其中 path 为安全相对路径，材料引用的空路径表示所选原件。仅所选内容进入保管，不因登记而扫描、复制全部工作区；二进制无须转成 UTF-8。原有 `text` 与 `target_workspace_note` 分支保持，Target 笔记继续使用其专门来源核验。返回的 `AssetIntakeResult.reader` 指向准确版本，按其中 operation 调用，不能把 intake 成功当作原件永远可用。重复提交与未知结果对账使用同一 effect_id 和相同参数；`.intake.reconcile` 在当前对账权限内，可于原件已离线或原根因求助而暂停时返回原接纳或失败结果，实际正文可用性仍由 reader 当次核验。工具记录来源工作或原接收关系，调用方额外 provenance 仅保留为 `declared_provenance`，不视为已核验生产关系。
+
 ### Target 过程中积累的资源
 
 Target 沿 [正式工作交接](../target-execution/references/formal-work.md) 提交实际执行、产物和适用评价。正式接纳后由 Bundle 整理可复用资源；Bundle 已不再运行时，由 Reasoning 在综合交接前承接。沿准确 TargetCommit 和正式结果入口读取资源候选，关联真实生产工作与精确内容，根据用途补充 Dataset、Environment、Literature 等身份、版本、派生和关系。
@@ -74,7 +76,7 @@ Target 过程中发现、取得或阅读的 Literature 也进入整理范围。�
 
 各阶段及具体工作使用自己的 Workspace，按 Cycle 统筹生命周期。完整 Workspace 采用三轮滑窗，保留当前 Cycle 与前两轮；最初不足三轮时保留实际轮数。原生目录窗口接通后，系统须提供窗口内实际可读的目录路径、所属 Cycle／阶段／工作及读写范围。当前只按本次实际提供的路径和授权使用原生目录、文件和 shell 工具；未提供的跨阶段或三轮目录不可由相邻路径推断可读。三个 Cycle 可以包含多个目录，无须复制或重排工作台，也不预先枚举全部文件或 hash。同一 Session 的技术重试或恢复继续原工作，不产生新的轮次。
 
-三轮滑窗及会话回收由系统负责；其接通与实际执行须按真实运行结果核验，不由本文声明为已完成，也不要求 Agent 代替系统清理。滑窗实施时，新一轮进入后清理退出窗口的最早一轮，实际删除其临时文件、缓存和工作副本，释放磁盘空间。已由 RM 正式以 `linked_local` 保管的原件留在原位置，只保留所需文件及必要父目录，其余内容删除；无需迁移原件，也不因一份原件保留整轮 Workspace。残留原件目录按 RM 保管入口读取，不再作为完整工作台。人提供的只读原目录不属于临时清理对象。
+三轮滑窗及会话回收由系统负责；其接通与实际执行须按真实运行结果核验，不由本文声明为已完成，也不要求 Agent 代替系统清理。滑窗实施时，新一轮进入后清理退出窗口的最早一轮，实际删除其临时文件、缓存和工作副本，释放磁盘空间。已由 RM 正式以 `linked_local` 保管的原件留在原位置，只保留所需文件及必要父目录，其余内容删除；无需迁移原件，也不因一份原件保留整轮 Workspace。语义退役不解除原位保护，也不表示物理回收；原件暂时离线仍保留其位置关系。残留原件目录按 RM 保管入口读取，不再作为完整工作台。人提供的只读原目录不属于临时清理对象。
 
 清理前辨明正式保管内容与执行、恢复、待接纳等真实依赖，由系统协调必要保护和清理。暂时受阻时记录具体文件与解除条件，依赖解除后完成相应清理；以实际删除与空间释放确认完成，登记清理意图不代表文件已移除。
 
@@ -104,12 +106,18 @@ selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保
 
 收到 summary_only=true 的 stage-context-presentation 时，将其视为导航摘要，完整 Owner 冻结输入保持原状。目录提供 research_memory.stage_context.read 时，必填 context_pack_ref、source、path、offset、limit；path 为 JSON key 字符串数组，数字字符串表示数组索引，[] 读取整个来源；offset/limit 是 UTF-8 字节，limit 为 1..16384。source 可选 context_pack、question、literature_records，或用 scientific_outcome/predecessor_closure 加 source_ref 读取精确 outcome/commit 原文。question_history、question_index、evidence_index 提供目录；先沿 byte next_offset 读完本页 JSON，再按 index_page.next_offset 设置 index_offset 翻目录页，同时将 byte offset 归零。核对来源 ref/hash，只展开当前判断需要的部分。阶段冻结上下文与正式采用保持原 Owner 绑定；共用正文 reader 可用于同 Quest 的普通参考阅读，Plan 选择后仍由原接纳路径核验。
 
+准确 reader 每次核对当前授权、范围和接纳身份。相同不可变来源、所选路径及表示可复用已编码字节及该表示自己的摘要；current history/index 没有准确修订身份时每次重新读取。可变文件每次打开都核对实际字节，校验与取页共用同一次读取；stat 未变化不能证明内容相等，也不能以 context_pack_hash 代替正文 content_hash。原件缺失或漂移分别按 reader 的准确错误处理；本次已验证的值直接交给消费者，另一次打开仍重新核验。
+
+常规资产页只附所选版本的当前／被替换／退役状态、适用说明及 history_reader；详细变更沿该入口按需读取。资产语义状态不代替实际原件可用性，历史精确引用保留原义。
+
 reader 指针只把 operation 以外的参数交给指定工具；summary_only 是外层展示标志，不是 research_notes_reader 的调用参数。序列化 JSON 的 offset/limit 按 UTF-8 字节计，以 next_offset=null 结束；complete 仅说明单页是否包含全部来源，尾页仍可能为 false。资产文件页按字节计，以 complete=true 结束；目录页按 entries 计，以 next_offset=null 结束。不要混用这三种结束条件。公共 MCP 工具错误按 isError 和 structuredContent.code 判断，保留 details 中的原操作与对账信息；正常 Owner status 仍表达业务状态。capability_unavailable 表示操作未注册或未获 grant；content_version_unbound 表示本次 source/version 在授权范围内未绑定，应核对精确引用或重新发现适用版本，不能据此断言全库不存在。重试或对账继续使用原 operation/effect 身份。
 
 当前获授目录若仍提供普通 `research_workspace.discover/read`，按其现有合同发现和读取临时工作材料；原生目录替代尚未提供时不虚构替代路径。待整理的本地文件用 research_workspace.discover 发现，沿 next_offset 分页；按返回的 workspace_ref、相对 path 和 sha256 调用 research_workspace.read，用 expected_sha256 核对实际观察，再沿字节 next_offset 读完正文。正文返回 UTF-8 text 或 base64 二进制。发现页的 limits 给出单文件、每次读取及扫描上限；readable=false 的大文件仍有来源、大小和 read_error，按已授权原工作或正式资产入口继续处理。文件存在、读取成功和人类交付分别只是工作材料事实，需经既有 RM／RG 接纳才能成为正式证据、Dataset、Environment 或冻结输入。
 
 ## 当前工作目录与回复材料
 
-当前工作目录沿实际工作保持稳定，技术 turn 或 job 更换后继续使用原目录。Idea 读取本工作；Plan 可读本 Cycle 的 Idea；Bundle 可读 Idea、Plan 和自己启用的 Target；Target 可读自己与前序 Idea、Plan；Reasoning 可读本 Cycle 的阶段和 Target。可见范围由实际 Owner 绑定确定，跨 Cycle 历史继续沿正式研究入口阅读。正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle，不随当前前台切换。用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read 读取精确回复；无 Quest 时须传精确 request_ref 与 response_ref。delivery.reply_reader 与 uploaded_readers 的 workspace_ref、path、expected_sha256 直接交给 research_workspace.read，沿字节 next_offset 读完 reply.json 和需要的上传原件。linked_locators 是保留原位置的文件或目录，用原生工具按 locator 有界读取，先看目录中必要条目再读取相关原件，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
+当前工作目录沿实际工作保持稳定，技术 turn 或 job 更换后继续使用原目录。Idea 读取本工作；Plan 可读本 Cycle 的 Idea；Bundle 可读 Idea、Plan 和自己启用的 Target；Target 可读自己与前序 Idea、Plan；Reasoning 可读本 Cycle 的阶段和 Target。可见范围由实际 Owner 绑定确定，跨 Cycle 历史继续沿正式研究入口阅读。正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle，不随当前前台切换。用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read 读取精确回复；无 Quest 时须传精确 request_ref 与 response_ref。delivery.reply_reader 与 uploaded_readers 的 workspace_ref、path、expected_sha256 直接交给 research_workspace.read，沿字节 next_offset 读完 reply.json 和需要的上传原件。linked_locators 保留所选原件的位置说明；其目录或文件也进入 delivery.work_materials 的既有授权材料引用，按当前授权及实际可用性读取，先展开必要条目，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
 
 现有按工作授权的可见性与后续三轮原生目录窗口分别核验；本轮不因共享说明迁入而扩大目录授权。清理的执行仍由系统负责，单个 Target 结束不能证明整个 Cycle 或目录已可回收；实际执行、恢复、待接纳及后继读取依赖继续保护，精确保管原件不作为临时材料删除。
+
+主动指导可随 work_materials 上传小文件（uploads），与所选外部目录分开处理。上传文件投递到已确认 receiver 的实际工作空间，回执 uploads 保留接收 work/root 与准确 reader；二进制无需转换为文本。外部原目录保持只读原位引用。投递失败或结果未知保留原提交身份重试；pending 投递不表示正式指导已接纳，也不自动生成正式资产或生产关联。

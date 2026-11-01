@@ -1,5 +1,5 @@
 """Authenticated, paged reading of a stage's frozen inputs and scoped history."""
-from meta_research.context_presentation import context_read_page, literature_reference, reasoning_handoff_reference
+from meta_research.context_presentation import ExactContextPages, context_read_page, literature_reference, reasoning_handoff_reference
 from meta_research.owners.common import OwnerConflict
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from meta_research.target_research_note_access import read_target_research_notes
@@ -49,7 +49,7 @@ def _request(advancement_engine, agent_runtime, context):
         raise SemanticMcpError('semantic_call_scope_stale') from error
 
 
-def read_stage_context(advancement_engine, agent_runtime, research_graph, research_memory, context, arguments):
+def read_stage_context(advancement_engine, agent_runtime, research_graph, research_memory, context, arguments, *, page_cache=None):
     request=_request(advancement_engine,agent_runtime,context)
     if arguments.get('context_pack_ref')!=request.context_pack_ref:
         raise SemanticMcpError('stage_context_ref_unbound')
@@ -133,7 +133,12 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
             source_ref=question.question_ref if source=='question_history' else question.quest_ref
         else:
             raise SemanticMcpError('stage_context_source_invalid')
-        page=context_read_page(value,path=arguments.get('path',[]),offset=arguments.get('offset',0),limit=arguments.get('limit',8192))
+        # Source resolution and all current scope checks above run even on a
+        # representation hit. Current history has no exact revision identity.
+        identity = None if source in {'question_history', 'question_index', 'evidence_index', 'research_notes', 'creation_sources'} else (
+            request.context_pack_ref, request.context_pack_hash, source, source_ref)
+        page=context_read_page(value,path=arguments.get('path',[]),offset=arguments.get('offset',0),limit=arguments.get('limit',8192),
+            cache=page_cache, identity=identity)
     except ValueError as error:
         raise SemanticMcpError(str(error)) from error
     except OwnerConflict as error:
@@ -143,6 +148,7 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
 
 
 def stage_context_operations(*, advancement_engine, agent_runtime, research_graph, research_memory):
+    page_cache = ExactContextPages()
     return (SemanticOperation(semantic_operation_id=STAGE_CONTEXT_OPERATION_ID,
         owning_module='research_memory',
         description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. For byte/index pagination and errors, read this operation\'s tools.contracts.read contract.',
@@ -162,7 +168,7 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
             'index_offset':{'type':'integer','minimum':0}},
             'required':['context_pack_ref','source','path','offset','limit'],'additionalProperties':False},
         output_schema={'type':'object'},
-        handler=lambda context,arguments:read_stage_context(advancement_engine,agent_runtime,research_graph,research_memory,context,arguments)),
+        handler=lambda context,arguments:read_stage_context(advancement_engine,agent_runtime,research_graph,research_memory,context,arguments,page_cache=page_cache)),
         SemanticOperation(semantic_operation_id='research_memory.research_notes.read',
             owning_module='research_memory',
             description='Read bounded research-note summaries or an exact immutable note version. For Stage/Target scope and byte/index pagination, read this operation\'s tools.contracts.read contract. Explanations do not replace formal metrics or input bindings.',
@@ -183,4 +189,4 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
                 'required':['source','path','offset','limit'],'additionalProperties':False},
             output_schema={'type':'object'},
             handler=lambda context,arguments:read_target_research_notes(agent_runtime,research_memory,context,arguments)
-                if context.root_kind == 'target' else read_stage_context(advancement_engine,agent_runtime,research_graph,research_memory,context,arguments)))
+                if context.root_kind == 'target' else read_stage_context(advancement_engine,agent_runtime,research_graph,research_memory,context,arguments,page_cache=page_cache)))

@@ -4273,7 +4273,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             raise OwnerConflict("human_request_material_response_invalid")
         linked = [{**item, **_probe_linked_reply(item["locator"])}
                   for item in normalized if item["kind"] == "linked_local"]
+        for item in linked:
+            item["selection"] = self._root_workspaces.server_files.inspect(
+                item["locator"], description=item["description"])
         selections = [item["selection"] for item in normalized if item["kind"] == "server_reference"]
+        selections.extend(item["selection"] for item in linked)
         for selection in selections:
             self._root_workspaces.server_files.validate_selection(selection)
         delivery_ref = "human_reply:" + canonical_hash({"request_ref": request_ref, "idempotency_key": idempotency_key})
@@ -4333,10 +4337,16 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 probe = _probe_linked_reply(saved["locator"])
                 if any(saved[name] != probe[name] for name in ("device", "inode", "observed_kind")):
                     raise OwnerConflict("human_response_linked_path_changed")
+                if (saved["selection"]["absolute_path"] != saved["locator"]
+                        or saved["selection"]["description"] != saved["description"]
+                        or {"kind": "linked_local", "locator": saved["locator"], "description": saved["description"]}
+                        not in command["materials"]):
+                    raise OwnerConflict("human_response_spool_invalid")
                 linked.append({name: saved[name] for name in ("kind", "locator", "description", "observed_kind")})
             material_command = spool.get("material_command")
             material_readers = []
             selections = [item["selection"] for item in command["materials"] if item["kind"] == "server_reference"]
+            selections.extend(item["selection"] for item in spool["linked_probes"])
             if bool(selections) != (material_command is not None):
                 raise OwnerConflict("human_response_spool_invalid")
             if material_command is not None:

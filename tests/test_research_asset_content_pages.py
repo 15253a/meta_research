@@ -1,4 +1,4 @@
-"""RM pages verify original custody once per unchanged opened-file signature."""
+"""RM pages verify the original bytes on every separately opened read."""
 from contextlib import contextmanager
 import os
 
@@ -48,7 +48,7 @@ def count_io(monkeypatch):
 
 
 @pytest.mark.parametrize('custody',['linked_local','managed'])
-def test_real_owner_three_pages_scan_once_and_never_copy_asset(owner,tmp_path,monkeypatch,custody):
+def test_real_owner_each_page_verifies_once_and_never_copies_asset(owner,tmp_path,monkeypatch,custody):
     body=b'0123456789abcdef'*(1024*1024//16)
     path=tmp_path/'corpus.txt';asset=accepted(owner,path,body,custody=custody)
     before={str(p.relative_to(owner._object_store)) for p in owner._object_store.rglob('*')}
@@ -59,7 +59,7 @@ def test_real_owner_three_pages_scan_once_and_never_copy_asset(owner,tmp_path,mo
         assert page['source_ref']==page['version_ref']==asset.version_ref
         assert page['content_hash']==asset.content_hash
         pages.append(page)
-    assert len(body)<=io['bytes']<=len(body)+3*8192,io
+    assert io['bytes']==3*len(body),io
     assert {str(p.relative_to(owner._object_store)) for p in owner._object_store.rglob('*')}==before
     assert path.read_bytes()==body
     print('ASSET_PAGE_IO',{'custody':custody,'asset_bytes':len(body),'returned_bytes':sum(p['returned_bytes'] for p in pages),'read_bytes':io['bytes']})
@@ -98,6 +98,26 @@ def test_replacing_inode_never_reuses_an_old_signature(owner,tmp_path,monkeypatc
     assert io['bytes']-before>=len(body)
 
 
+def test_unchanged_stat_cannot_return_new_body_under_old_version(owner,tmp_path,monkeypatch):
+    """A file signature is not evidence that mutable custody still has its bytes."""
+    from meta_research.owners.verified_content_pages import VerifiedContentPages
+    path=tmp_path/'stable-metadata.txt';body=b'accepted scientific result'
+    asset=accepted(owner,path,body)
+    # Filesystems can expose unchanged/coarse metadata. Keep the real open/read
+    # and accepted receipt, controlling only the metadata observation.
+    original=VerifiedContentPages.signature
+    signatures={}
+    def stable(path,source,expected_hash):
+        return signatures.setdefault(str(path),original(path,source,expected_hash))
+    monkeypatch.setattr(VerifiedContentPages,'signature',staticmethod(stable))
+    assert owner.read_asset_content_page(asset.version_ref,limit=65536)['text']==body.decode()
+    path.write_bytes(b'changed! scientific result')
+    with pytest.raises(OwnerConflict,match='content_drifted'):
+        owner.read_asset_content_page(asset.version_ref,limit=65536)
+    path.write_bytes(body)
+    assert owner.read_asset_content_page(asset.version_ref,limit=65536)['text']==body.decode()
+
+
 @pytest.mark.parametrize('warm',[False,True])
 def test_concurrent_change_and_restore_during_open_read_cannot_publish_page(owner,tmp_path,monkeypatch,warm):
     path=tmp_path/'concurrent.txt';body=b'a'*(2*1024*1024);asset=accepted(owner,path,body)
@@ -107,8 +127,14 @@ def test_concurrent_change_and_restore_during_open_read_cannot_publish_page(owne
     def transient_change():
         with path.open('r+b') as writer:
             writer.seek(len(body)-1);writer.write(b'b');writer.flush()
-            writer.seek(len(body)-1);writer.write(b'a');writer.flush()
         os.utime(path,ns=(before.st_atime_ns,before.st_mtime_ns))
+        # Restore after the next chunk is captured, so the read really sees
+        # changed bytes even if metadata timestamps have coarse resolution.
+        def restore():
+            with path.open('r+b') as writer:
+                writer.seek(len(body)-1);writer.write(b'a');writer.flush()
+            os.utime(path,ns=(before.st_atime_ns,before.st_mtime_ns))
+        io['hook']=restore
     io['hook']=transient_change
     with pytest.raises(OwnerConflict,match='content_drifted'):
         owner.read_asset_content_page(asset.version_ref,limit=32)
@@ -140,15 +166,12 @@ def test_directory_metadata_then_exact_entry_is_bounded(owner,tmp_path,monkeypat
         owner.read_asset_content_page(asset.version_ref,entry_path='../b.txt')
 
 
-def test_verified_signature_lru_evicts_metadata_and_rehashes_next_use(owner,tmp_path,monkeypatch):
-    from meta_research.owners.research_asset_content import AssetContentPageReader
-    # Small configured capacity exercises eviction through the real RM API.
-    owner._asset_content_pages=AssetContentPageReader(owner._object_store,owner._receipt_verifier,max_verified_files=2)
+def test_repeated_selected_files_keep_no_signature_success_cache(owner,tmp_path,monkeypatch):
     assets=[accepted(owner,tmp_path/f'{index}.txt',bytes([97+index])*4096,key=str(index)) for index in range(3)]
     io=count_io(monkeypatch)
     for index in (0,1,0,2):
         assert owner.read_asset_content_page(assets[index].version_ref,limit=2)['text']==chr(97+index)*2
-    assert io['bytes']==3*4096+2
+    assert io['bytes']==4*4096
     before=io['bytes']
     assert owner.read_asset_content_page(assets[1].version_ref,limit=2)['text']=='bb'
     assert io['bytes']-before==4096

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
+import binascii
 import json
 import hashlib
 import os
@@ -19,20 +21,48 @@ class MaterialSubmission:
     receiver: dict[str, object]
     selections: tuple[dict[str, object], ...]
     description: str
+    uploads: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def parse(cls, value):
-        if not isinstance(value, dict) or set(value) != {"receiver", "selections", "description"}:
+        if (not isinstance(value, dict) or set(value) - {"receiver", "selections", "description", "uploads"}
+                or not {"receiver", "selections", "description"} <= set(value)):
             raise OwnerConflict("material_submission_invalid")
         receiver, selections, description = value["receiver"], value["selections"], value["description"]
         if (not isinstance(receiver, dict) or receiver.get("kind") not in {"creation", "manual", "current", "request", "acquired"}
-            or not isinstance(selections, list) or not 1 <= len(selections) <= 100
+            or not isinstance(selections, list) or not 0 <= len(selections) <= 100
             or not isinstance(description, str) or len(description) > 4000):
             raise OwnerConflict("material_submission_invalid")
-        return cls(receiver, tuple(selections), description)
+        uploads = value.get("uploads", [])
+        if (not isinstance(uploads, list) or len(uploads) > 20 or not (selections or uploads)
+                or uploads and receiver.get("kind") != "current"):
+            raise OwnerConflict("material_submission_invalid")
+        names = set()
+        total = 0
+        from meta_research.root_workspace import _relative_parts
+        for upload in uploads:
+            if (not isinstance(upload, dict) or set(upload) != {"relative_path", "media_type", "content_base64"}
+                    or not isinstance(upload["media_type"], str) or not 1 <= len(upload["media_type"]) <= 256
+                    or not isinstance(upload["content_base64"], str) or len(upload["content_base64"]) > 12 * 1024 * 1024):
+                raise OwnerConflict("material_upload_invalid")
+            try:
+                parts = _relative_parts(upload["relative_path"])
+                content = base64.b64decode(upload["content_base64"], validate=True)
+            except (SemanticMcpError, ValueError, binascii.Error) as error:
+                raise OwnerConflict("material_upload_invalid") from error
+            name = upload["relative_path"]
+            if (name in names or any(part.startswith('.delivery-') or part == '.delivery.json' for part in parts)
+                    or any(name.startswith(prior + '/') or prior.startswith(name + '/') for prior in names)):
+                raise OwnerConflict("material_upload_invalid")
+            names.add(name)
+            total += len(content)
+            if total > 8 * 1024 * 1024:
+                raise OwnerConflict("material_upload_too_large")
+        return cls(receiver, tuple(selections), description, tuple(uploads))
 
     def as_dict(self):
-        return {"receiver": self.receiver, "selections": list(self.selections), "description": self.description}
+        return {"receiver": self.receiver, "selections": list(self.selections), "description": self.description,
+                **({"uploads": list(self.uploads)} if self.uploads else {})}
 
 
 def material_reference(database, reference_ref):
@@ -84,9 +114,20 @@ def material_submission(database, submission_ref):
         if row is None or row.state != "ready":
             raise OwnerConflict("material_reference_not_found")
         references = connection.execute(text("SELECT reference_ref FROM hc_work_material_references WHERE submission_ref=:ref ORDER BY ordinal"), {"ref": submission_ref}).all()
+    command = json.loads(row.command_json)
+    if canonical_hash(command) != row.command_hash or command['receiver'] != json.loads(row.receiver_json):
+        raise OwnerConflict('material_receipt_invalid')
+    uploads = []
+    for root in command['receiver'].get('roots', []):
+        for upload in command.get('uploads', []):
+            uploads.append({**root, 'media_type': upload['media_type'], 'reader': {
+                'workspace_ref': root['workspace_ref'],
+                'path': 'inbox/' + canonical_hash({'delivery_ref': submission_ref}) + '/' + upload['relative_path'],
+                'expected_sha256': hashlib.sha256(base64.b64decode(upload['content_base64'], validate=True)).hexdigest()}})
     return {"submission_ref": submission_ref, "receiver": json.loads(row.receiver_json),
             "references": [material_reference(database, item.reference_ref) for item in references],
-            "description": json.loads(row.command_json)["description"], "state": "saved", "created_at": row.created_at}
+            "description": command["description"], "state": "saved", "created_at": row.created_at,
+            **({'uploads': uploads} if uploads else {})}
 
 
 def material_submissions_for(database, anchor_kind, anchor_ref):
@@ -168,11 +209,21 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
                                     state="ready", validate_receiver=True):
         replay = self._material_replay(connection, key, command)
         if replay is not None:
+            if replay.state == 'pending' and state == 'ready' and command.get('uploads'):
+                if replay.anchor_kind != anchor_kind:
+                    raise OwnerConflict('material_idempotency_conflict')
+                self._validate_material_receiver(command['receiver'])
+                connection.execute(text("UPDATE hc_work_material_submissions SET state='ready',anchor_ref=:anchor WHERE submission_ref=:ref AND state='pending'"),
+                    {'anchor': anchor_ref, 'ref': replay.submission_ref})
+                self._feed.record(connection, 'human_collaboration.work_materials_submitted',
+                    {'submission_ref': replay.submission_ref, 'anchor_kind': anchor_kind, 'anchor_ref': anchor_ref})
             return replay.submission_ref
         submission = MaterialSubmission.parse(command)
         if validate_receiver:
             self._validate_material_receiver(submission.receiver)
         reference = "material_submission:" + canonical_hash({"key": key})
+        if submission.uploads and state != 'pending':
+            raise OwnerConflict('material_upload_pending')
         connection.execute(text("INSERT INTO hc_work_material_submissions (submission_ref,idempotency_key,command_hash,command_json,receiver_json,anchor_kind,anchor_ref,state,created_at) "
             "VALUES (:ref,:key,:hash,:command,:receiver,:kind,:anchor,:state,:now)"),
             {"ref": reference, "key": key, "hash": canonical_hash(command), "command": canonical_json(command),
@@ -184,8 +235,31 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
         for root in submission.receiver.get("roots", []):
             connection.execute(text("INSERT INTO hc_work_material_roots (submission_ref,workspace_ref) VALUES (:ref,:workspace)"),
                 {"ref": reference, "workspace": root["workspace_ref"]})
-        self._feed.record(connection, "human_collaboration.work_materials_submitted", {"submission_ref": reference, "anchor_kind": anchor_kind, "anchor_ref": anchor_ref})
+        if state == 'ready':
+            self._feed.record(connection, "human_collaboration.work_materials_submitted", {"submission_ref": reference, "anchor_kind": anchor_kind, "anchor_ref": anchor_ref})
         return reference
+
+    def _prepare_material_upload_delivery(self, command, key, anchor_kind):
+        """Persist the exact pending command before any inbox publication.
+
+        A retry completes the same delivery. A failed receiving-root write or
+        final authority transaction leaves a traceable, protected pending
+        submission rather than unowned files or a false accepted result.
+        """
+        submission = MaterialSubmission.parse(command)
+        if not submission.uploads:
+            return
+        with self._database.fenced_write() as connection:
+            existing = self._material_replay(connection, key, command)
+            if existing is not None and existing.state == 'ready':
+                return
+            if existing is not None and existing.anchor_kind != anchor_kind:
+                raise OwnerConflict('material_idempotency_conflict')
+            reference = self._insert_material_submission(connection, command=command, key=key,
+                anchor_kind=anchor_kind, anchor_ref='pending:' + canonical_hash({'key': key}), state='pending')
+        self._root_workspaces.deliver_current_material(submission.receiver, delivery_ref=reference,
+            files=tuple((item['relative_path'], base64.b64decode(item['content_base64'], validate=True))
+                        for item in submission.uploads))
 
     def register_work_materials(self, *, anchor_kind, anchor_ref, command, idempotency_key):
         if anchor_kind not in {"creation", "manual"} or not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
@@ -245,8 +319,29 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
             return
         visible = self._material_visible_workspaces(context)
         receiver = reference["receiver"]
-        if not visible.intersection(root["workspace_ref"] for root in receiver.get("roots", [])):
+        if (not visible.intersection(root["workspace_ref"] for root in receiver.get("roots", []))
+                and reference["reference_ref"] not in self._quest_directory_references(context)):
             raise OwnerConflict("material_not_visible")
+
+    def _quest_directory_references(self, context):
+        # The current runtime binding is checked on every call. Only human
+        # originals cross receiving-work/Cycle boundaries, never scratch files.
+        location = self._root_workspaces.bind_runtime(context).location
+        if not location.quest_ref:
+            return set()
+        with self._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT r.reference_ref FROM hc_work_material_references r "
+                "JOIN hc_work_material_submissions s USING(submission_ref) "
+                "WHERE s.state='ready' AND s.anchor_kind IN ('creation','manual','guidance','input','request') "
+                "AND json_extract(r.selection_json,'$.kind')='directory' AND ("
+                "json_extract(s.receiver_json,'$.quest_ref')=:quest OR "
+                "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+                "WHERE json_extract(root.value,'$.quest_ref')=:quest) OR "
+                "(s.anchor_kind='creation' AND EXISTS (SELECT 1 FROM rg_quests q "
+                "WHERE q.initialization_id=s.anchor_ref AND q.quest_ref=:quest)))"
+            ), {"quest": location.quest_ref}).all()
+        return {row.reference_ref for row in rows}
 
     def _record_material_access(self, reference_ref, actor, path, value):
         with self._database.fenced_write() as connection:
@@ -268,12 +363,14 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
                         "next_offset": offset + limit if len(operation.inputs.references) > offset + limit else None,
                         "material_set_hash": operation.inputs.set_hash}
             visible = None if context is None else sorted(self._material_visible_workspaces(context))
+            directories = [] if context is None else sorted(self._quest_directory_references(context))
             with self._database.read() as connection:
                 query = "SELECT r.reference_ref FROM hc_work_material_references r JOIN hc_work_material_submissions s USING(submission_ref) WHERE s.state='ready'"
                 params = {"offset": offset, "limit": limit + 1}
                 if visible is not None:
-                    query += " AND EXISTS (SELECT 1 FROM hc_work_material_roots w WHERE w.submission_ref=s.submission_ref AND w.workspace_ref IN (SELECT value FROM json_each(:visible)))"
+                    query += " AND (EXISTS (SELECT 1 FROM hc_work_material_roots w WHERE w.submission_ref=s.submission_ref AND w.workspace_ref IN (SELECT value FROM json_each(:visible))) OR r.reference_ref IN (SELECT value FROM json_each(:directories)))"
                     params["visible"] = json.dumps(visible)
+                    params["directories"] = json.dumps(directories)
                 rows = connection.execute(text(query + " ORDER BY s.created_at,r.reference_ref LIMIT :limit OFFSET :offset"), params).all()
             retained = []
             if context is not None:
@@ -294,6 +391,7 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
             self._record_material_access(reference_ref, actor, path, {"operation": "discover", "error": error.code, "availability": error.code, "path": path})
             raise
         self._record_material_access(reference_ref, actor, path, {"operation": "discover", "availability": "available", "path": path})
+        self._authorize_material(reference, context)
         return {"reference_ref": reference_ref, **result, "read_state": reference["read_state"]}
 
     def read_work_material(self, *, reference_ref, path, observation_ref, offset=0, max_bytes=65536, context=None, actor="browser"):
@@ -306,6 +404,7 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
             self._record_material_access(reference_ref, actor, path, {"operation": "read", "error": error.code, "availability": error.code, "path": path})
             raise
         witness = None
+        self._authorize_material(reference, context)
         if context is not None and context.phase == "creation_materials":
             operation = self._creation_material_operation(context)
             witness = operation.witness(reference_ref, path, value)
@@ -439,7 +538,7 @@ def material_operations(human):
             raise SemanticMcpError(error.code) from error
     properties = {"reference_ref": {"type": "string", "maxLength": 96}, "path": {"type": "string", "maxLength": 4096}}
     return (*material_processing_operations(human), SemanticOperation(WORK_MATERIAL_OPERATION_IDS[0], "human_collaboration",
-        "Discover saved work material references visible to this actual root and eligible earlier work. A registered Quest Companion can read submitted inputs for the same Quest while their original receiver remains unchanged. Expand one original server directory at a time without preloading, hashing, copying or formal RM intake. Entries and unexpanded scope do not prove reading or understanding. Use observation_ref from an entry for a bounded read.", call,
+        "Discover saved work material references visible to this actual root and eligible earlier work. Human directory references stay read-only and visible to current authorized roots throughout their Quest while their original receiver remains unchanged. A registered Quest Companion also sees submitted inputs for its Quest. Expand one original server directory at a time without preloading, hashing, copying or formal RM intake. Entries and unexpanded scope do not prove reading or understanding. Use observation_ref from an entry for a bounded read.", call,
         {"type": "object", "properties": {**properties, "cursor": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": False}, {"type": "object"}),
         SemanticOperation(WORK_MATERIAL_OPERATION_IDS[1], "human_collaboration",
         "Read at most 65536 requested bytes from a saved server material reference with its discovered observation_ref. Recheck original source identity and current root visibility. Returns UTF-8 or base64, exact byte interval and EOF; records successful ranges and failures without claiming comprehension. Changed originals require fresh discovery. No RM binding is required.", call,

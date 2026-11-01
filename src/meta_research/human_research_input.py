@@ -60,6 +60,8 @@ class HumanResearchInputMixin:
         for binding in bindings:
             self._research_memory.verify_asset_binding(asset_ref=binding.asset_ref,version_ref=binding.version_ref,content_hash=binding.content_hash,manifest_hash=binding.manifest_hash,receipt=binding.receipt)
             self._research_graph.verify_asset_quest_scope(binding.version_ref,quest_ref=quest_ref)
+        if work_materials is not None:
+            self._prepare_material_upload_delivery(work_materials, idempotency_key, 'input')
         with self._database.fenced_write() as c:
             row=c.execute(text("SELECT input_ref,content_hash FROM hc_research_inputs WHERE idempotency_key=:key"),{"key":idempotency_key}).first()
             if row is not None:
