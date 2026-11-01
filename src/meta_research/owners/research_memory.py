@@ -342,6 +342,11 @@ class AssetIntakeResult:
             "custody_mode": self.custody_mode,
             "attempt_count": self.attempt_count,
             "asset": None if self.asset is None else self.asset.as_public_dict(),
+            "reader": None if self.asset is None else {
+                "operation": "research_memory.content.read",
+                "source_ref": self.asset.version_ref,
+                "version_ref": self.asset.version_ref,
+            },
             "failure": (
                 None if self.failure_code is None else {"code": self.failure_code}
             ),

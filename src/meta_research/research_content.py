@@ -277,5 +277,5 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
             description="Discover accepted sources in the current Quest by research clues, including related Questions and retained history. Follow each reader with research_memory.content.read; next_offset continues the independent entry page. Literature also links accepted Question-specific judgments to their exact content.",
             input_schema={"type":"object","properties":properties,"additionalProperties":False},output_schema={"type":"object"},handler=discover))
     return (*operations, *asset_lifecycle_operations(
-        research_graph, research_memory, agent_runtime, target_run_agent
+        research_graph, research_memory, agent_runtime, target_run_agent, human_collaboration
     ))

@@ -27,7 +27,7 @@ _TARGET_NOTE_RESERVED_PROVENANCE = frozenset(
 )
 
 
-def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=None):
+def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=None, human_collaboration=None):
     string = {"type": "string", "minLength": 1, "maxLength": 16000}
     integer = {"type": "integer", "minimum": 0}
 
@@ -125,7 +125,11 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
             effect_key = key(context, arguments["effect_id"], action)
             if action == "intake":
                 values = dict(arguments["intake"])
+                if sum(name in values for name in ("text", "source", "target_workspace_note")) != 1:
+                    raise OwnerConflict("asset_source_payload_ambiguous")
                 selector = values.pop("target_workspace_note", None)
+                source_selector = values.pop("source", None)
+                selected_source = None
                 text_value = values.pop("text", None)
                 if selector is not None:
                     if values.get("asset_ref") is not None or values.get("change") is not None:
@@ -160,6 +164,13 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     )
                     values["content"] = content
                     values["provenance"] = expected
+                elif source_selector is not None:
+                    from meta_research.asset_intake_sources import resolve_intake_source
+                    _reject_target_note_provenance(values.get("provenance"))
+                    selected_source = resolve_intake_source(human_collaboration, context, source_selector)
+                    values["source_locator"] = selected_source.locator
+                    values["provenance"] = {**selected_source.provenance,
+                        "declared_provenance": values.get("provenance", {})}
                 else:
                     _reject_target_note_provenance(values.get("provenance"))
                     if not isinstance(text_value, str):
@@ -182,6 +193,12 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                         "result": None if result is None else result.as_public_dict(),
                     }
 
+                if selected_source is not None:
+                    replay = memory.query_asset_intake_by_idempotency_key(effect_key, request)
+                    if replay is not None and replay.status in {"accepted", "failed"}:
+                        return replay.as_public_dict()
+                    observed_source = selected_source.inspect()
+
                 def effect_scope():
                     if scope(context) != quest:
                         raise OwnerConflict("asset_quest_scope_invalid")
@@ -192,6 +209,12 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                             quest_ref=quest,
                             provenance=expected,
                         )
+                    if selected_source is not None:
+                        current = resolve_intake_source(human_collaboration, context, source_selector)
+                        if (current.locator != selected_source.locator
+                            or current.provenance != selected_source.provenance
+                            or current.inspect() != observed_source):
+                            raise OwnerConflict("asset_source_changed_during_intake")
                     if change is not None:
                         scope(context, change["predecessor_version_ref"])
                         for binding in change.get("evidence_bindings", []):
@@ -259,11 +282,22 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
     intake_schema = {
         "type": "object",
         "properties": {
-            "source_kind": {"type": "string", "enum": ["text", "file"]},
-            "custody_mode": {"type": "string", "enum": ["managed"]},
+            "source_kind": {"type": "string", "enum": ["text", "file", "local_path", "directory"]},
+            "custody_mode": {"type": "string", "enum": ["managed", "linked_local"]},
             "display_name": string,
             "media_type": string,
             "text": {"type": "string", "maxLength": 16000000},
+            "source": {
+                "type": "object",
+                "oneOf": [
+                    {"type": "object", "properties": {"kind": {"const": "workspace"},
+                        "workspace_ref": string, "path": {"type": "string", "minLength": 1, "maxLength": 4096}},
+                     "required": ["kind", "workspace_ref", "path"], "additionalProperties": False},
+                    {"type": "object", "properties": {"kind": {"const": "material"},
+                        "reference_ref": string, "path": {"type": "string", "maxLength": 4096}},
+                     "required": ["kind", "reference_ref", "path"], "additionalProperties": False},
+                ]
+            },
             "target_workspace_note": {
                 "type": "object",
                 "properties": {
@@ -295,14 +329,20 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
         "required": ["source_kind", "custody_mode", "display_name"],
         "additionalProperties": False,
         "oneOf": [
-            {"required": ["text"], "not": {"required": ["target_workspace_note"]}},
+            {"required": ["text"], "properties": {"source_kind": {"enum": ["text", "file"]},
+                 "custody_mode": {"const": "managed"}},
+             "allOf": [{"not": {"required": ["target_workspace_note"]}}, {"not": {"required": ["source"]}}]},
             {
                 "required": ["target_workspace_note"],
                 "allOf": [
                     {"not": {"required": ["text"]}},
                     {"not": {"required": ["provenance"]}},
+                    {"not": {"required": ["source"]}},
                 ],
+                "properties": {"source_kind": {"enum": ["text", "file"]}, "custody_mode": {"const": "managed"}},
             },
+            {"required": ["source"], "properties": {"source_kind": {"enum": ["local_path", "directory"]}},
+             "allOf": [{"not": {"required": ["text"]}}, {"not": {"required": ["target_workspace_note"]}}]},
         ],
     }
     binding_schema = {
@@ -446,7 +486,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     reconciliation_operation_id=None
                     if reconcile
                     else name + ".reconcile",
-                    description="Accept an asset supplement, substantive change, or correction atomically with its exact predecessor, explanation and current selection. Correction requires error, exact evidence bindings, scope, and per-work recheck/redo/unaffected/unknown judgments; if no work is affected, record no_affected_work_explanation with the checked scope and reason. Retirement requires confirmed low value, obsolescence and error, understood impact and no explanatory value; fresh references and holds block it. Failure, negative results and goal changes never trigger retirement. All historical bytes are retained. Keep the same effect_id and exact payload when reconciling. A queued intake awaits an authorized caller: retry the same effect and payload with the current root scope; background workers cannot accept it without that scope.",
+                    description="Intake text, verified Target notes, or selected authorized Workspace/material files and directories. Select source_kind=local_path or directory plus source and managed/linked_local custody; returned reader names the accepted exact version. Caller provenance stays a declaration, never a verified producer. Accept an asset supplement, substantive change, or correction atomically with its exact predecessor, explanation and current selection. Correction requires error, exact evidence bindings, scope, and per-work recheck/redo/unaffected/unknown judgments; if no work is affected, record no_affected_work_explanation with the checked scope and reason. Retirement requires confirmed low value, obsolescence and error, understood impact and no explanatory value; fresh references and holds block it. Failure, negative results and goal changes never trigger retirement. All historical bytes are retained. Keep the same effect_id and exact payload when reconciling. A queued intake awaits an authorized caller: retry the same effect and payload with the current root scope; background workers cannot accept it without that scope.",
                     input_schema={
                         "type": "object",
                         "properties": properties,
