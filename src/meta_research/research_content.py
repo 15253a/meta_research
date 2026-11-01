@@ -68,10 +68,10 @@ def adopted_source_binding(graph, *, quest_ref, source_ref, leaf=None):
                        "args": {"source_ref": source_ref, "version_ref": version_ref}}}
 
 
-def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, offset=0, limit=8192, human_collaboration=None, page_cache=None):
+def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, offset=0, limit=8192, human_collaboration=None, page_cache=None, reader_source_quest_ref=None):
     def exact_page(value):
         return context_read_page(value, path=[], offset=offset, limit=min(limit, 16384),
-            cache=page_cache, identity=(quest_ref, source_ref, version_ref, 'canonical-json'))
+            cache=page_cache, identity=(quest_ref, source_ref, version_ref, 'canonical-json', reader_source_quest_ref))
     if source_ref.startswith("target_commit_"):
         # The same accurate reader remains usable by downstream roles. The
         # accepting Owners resolve the actual commit and exact retained version.
@@ -157,7 +157,8 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
                         "doi":paper.get("doi"),"url":paper.get("url"),
                         "location":{"unit":page.get("offset_unit","serialized_source_character"),"offset":offset,
                                     "note":"For article sections or page numbers, use locators present in the retrieved source; do not invent them."}}}
-    value = read_stage_content(memory, quest_ref=quest_ref, source_ref=source_ref, version_ref=version_ref)
+    value = read_stage_content(memory, quest_ref=quest_ref, source_ref=source_ref, version_ref=version_ref,
+        reader_source_quest_ref=reader_source_quest_ref)
     if value is not None:
         return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
     raise OwnerConflict("content_source_unbound")
@@ -168,11 +169,13 @@ _STAGE_CONTENT = (("rm_idea_outcome_contents", "query_idea_outcome_content", "ou
                   ("rm_reasoning_contents", "query_reasoning_content", "scientific_outcome"))
 
 
-def read_stage_content(memory, *, quest_ref, source_ref, version_ref):
+def read_stage_content(memory, *, quest_ref, source_ref, version_ref, reader_source_quest_ref=None):
     from meta_research.historical_research import read_historical_stage_content
     historical = read_historical_stage_content(memory, quest_ref=quest_ref,
         source_ref=source_ref, version_ref=version_ref)
     if historical is not None:
+        if reader_source_quest_ref is not None and "content_reader" in historical:
+            historical["content_reader"] = {**historical["content_reader"], "source_quest_ref": reader_source_quest_ref}
         return historical
     with memory._database.read_snapshot() as connection:
         for table, method, field in _STAGE_CONTENT:
@@ -377,7 +380,8 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
             selected_quest = arguments.pop("source_quest_ref", None)
             quest_ref = _reading_quest(agent_runtime, context,
                 source_quest_ref=selected_quest, human_collaboration=human_collaboration)
-            result = read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,page_cache=page_cache,**arguments)
+            result = read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,page_cache=page_cache,
+                reader_source_quest_ref=selected_quest, **arguments)
             if selected_quest is not None:
                 exact_reader = result.get("selected_evidence_binding", {}).get("reader")
                 if exact_reader is not None:

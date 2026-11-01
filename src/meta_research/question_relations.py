@@ -146,6 +146,12 @@ def question_history_operations(*, research_graph, agent_runtime, human_collabor
                 research_graph, quest_ref=question.quest_ref, question_ref=question.question_ref,
                 offset=arguments.get("offset", 0), limit=arguments.get("limit", 12),
                 query_revision=arguments.get("query_revision"))
+            if arguments.get("source_quest_ref") is not None:
+                for cycle in history["items"]:
+                    for stage in cycle["stages"]:
+                        for key in ("reader", "basis_reader"):
+                            if key in stage:
+                                stage[key] = {**stage[key], "source_quest_ref": quest_ref}
             return {"status": "accepted", "question": asdict(question), **history}
         except OwnerConflict as error:
             raise SemanticMcpError(str(error)) from error
