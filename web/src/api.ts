@@ -2002,6 +2002,7 @@ export type HarnessStatus = {
 };
 
 export type PublicSnapshot = {
+  revision_domain?: string;
   query_warnings?: Array<{ section: string; code: string; target_ref?: string }>;
   observed_at?: string;
   product: { name: string; version: string };
@@ -2835,6 +2836,7 @@ export class ProductError extends Error {
     public readonly code: string,
     public readonly details?: Record<string, unknown>,
     public readonly httpStatus?: number,
+    public readonly retryAfterMs = 0,
   ) {
     super(code);
   }
@@ -2913,6 +2915,12 @@ export async function fetchQuestRuntimeDevices(
   return devices.map(({ uuid, name, memory_total_mib }) => ({ uuid, name, memory_total_mib }));
 }
 
+export class SnapshotReadError extends Error {
+  constructor(public readonly retryAfterMs: number, public readonly status: number) {
+    super(`snapshot_unavailable:${status}`);
+  }
+}
+
 export async function fetchSnapshot(
   signal?: AbortSignal,
   sections: { includeAssets?: boolean; includeHistory?: boolean } = {},
@@ -2921,49 +2929,24 @@ export async function fetchSnapshot(
   const abort = () => controller.abort();
   if (signal?.aborted) controller.abort();
   signal?.addEventListener("abort", abort, { once: true });
-  let timer: number | undefined;
+  const timer = window.setTimeout(abort, 22_000);
   try {
-    for (;;) {
-      // Bound each request; explicit server retry responses may need more than
-      // one request window before the shared read is ready for delivery.
-      timer = window.setTimeout(abort, 22_000);
-      const response = await fetch("/api/v1/snapshot", {
-        credentials: "same-origin",
-        headers: {
-          Accept: "application/json",
-          "X-Meta-Research-Snapshot-Assets": sections.includeAssets === false ? "defer" : "include",
-          "X-Meta-Research-Snapshot-History": sections.includeHistory === false ? "defer" : "include",
-        },
-        signal: controller.signal,
-      });
-      if (response.status === 503) {
-        const failure = await response.json().catch(() => null);
-        if (failure?.detail?.code === "snapshot_query_in_progress" ||
-            failure?.detail?.code === "snapshot_query_timeout") {
-          // The shared read is still running. Honor its retry delay while keeping
-          // navigation cancellation active, without an offline/error interlude.
-          window.clearTimeout(timer);
-          const seconds = Number(response.headers.get("Retry-After") ?? "2");
-          const delay = Number.isFinite(seconds) ? Math.min(5_000, Math.max(250, seconds * 1_000)) : 2_000;
-          await new Promise<void>((resolve, reject) => {
-            const cancel = () => {
-              window.clearTimeout(retryTimer);
-              controller.signal.removeEventListener("abort", cancel);
-              reject(new DOMException("Snapshot request aborted", "AbortError"));
-            };
-            const retryTimer = window.setTimeout(() => {
-              controller.signal.removeEventListener("abort", cancel);
-              resolve();
-            }, delay);
-            controller.signal.addEventListener("abort", cancel, { once: true });
-            if (controller.signal.aborted) cancel();
-          });
-          continue;
-        }
-      }
-      if (!response.ok) throw new ProductError(`snapshot_unavailable:${response.status}`);
-      return (await response.json()) as PublicSnapshot;
+    const response = await fetch("/api/v1/snapshot", {
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "X-Meta-Research-Snapshot-Assets": sections.includeAssets === false ? "defer" : "include",
+        "X-Meta-Research-Snapshot-History": sections.includeHistory === false ? "defer" : "include",
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const retry = response.headers.get("Retry-After");
+      const milliseconds = retry === null ? 0 : /^\d+(\.\d+)?$/.test(retry)
+        ? Number(retry) * 1_000 : Date.parse(retry) - Date.now();
+      throw new SnapshotReadError(Number.isFinite(milliseconds) ? Math.max(0, milliseconds) : 0, response.status);
     }
+    return await response.json() as PublicSnapshot;
   } finally {
     window.clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
@@ -3575,15 +3558,23 @@ export function startNewCompanionSession(scopeRef: string): Promise<CompanionSes
   return writeJson("/api/v1/companion/sessions/new", "POST", { scope_ref: scopeRef });
 }
 
-export function readHumanRequestHandoff(
+export async function readHumanRequestHandoff(
   requestRef: string,
   revision: number,
   signal?: AbortSignal,
 ): Promise<HumanRequestHandoff> {
-  return readJson(
+  const response = await fetch(
     `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff?revision=${revision}`,
-    signal,
+    { credentials: "same-origin", headers: { Accept: "application/json" }, signal },
   );
+  if (!response.ok) {
+    const retry = response.headers.get("Retry-After");
+    const delay = retry === null ? 0 : /^\d+(\.\d+)?$/.test(retry)
+      ? Number(retry) * 1000 : Date.parse(retry) - Date.now();
+    throw new ProductError(`request_failed:${response.status}`, undefined, response.status,
+      Number.isFinite(delay) ? Math.max(0, delay) : 0);
+  }
+  return await response.json() as HumanRequestHandoff;
 }
 
 export async function downloadHumanRequestHandoff(
@@ -3604,13 +3595,34 @@ export async function respondToHumanRequest(
   response: HumanRequestResponseBody,
 ): Promise<Record<string, unknown>> {
   return runHumanRequestRecoverySingleFlight(
-    `response-submit:${requestRef}`,
+    `response:${requestRef}`,
     requestRef,
     async () => {
       await stageHumanRequestResponse(requestRef, response);
       return deliverPendingHumanRequestResponseOnce(requestRef);
     },
   );
+}
+
+// Local delivery observations retain an exact acknowledgement across view changes.
+// Research acceptance and resumption still come only from the Owner projection.
+export type HumanResponseDeliveryState = {
+  status: "pending" | "recorded" | "rejected";
+  result?: Record<string, unknown>;
+  error?: string;
+};
+const humanResponseDeliveries = new Map<string, HumanResponseDeliveryState>();
+const humanResponseDeliveryListeners = new Set<() => void>();
+export function humanResponseDeliveryState(requestRef: string): HumanResponseDeliveryState | undefined {
+  return humanResponseDeliveries.get(requestRef);
+}
+export function subscribeHumanResponseDelivery(listener: () => void): () => void {
+  humanResponseDeliveryListeners.add(listener);
+  return () => { humanResponseDeliveryListeners.delete(listener); };
+}
+function observeHumanResponseDelivery(requestRef: string, state: HumanResponseDeliveryState) {
+  humanResponseDeliveries.set(requestRef, state);
+  humanResponseDeliveryListeners.forEach(listener => listener());
 }
 
 export function retryHumanRequest(
@@ -3682,6 +3694,7 @@ async function stageHumanRequestResponse(
     pendingWrite.clear();
     throw error;
   }
+  observeHumanResponseDelivery(requestRef, { status: "pending" });
   return delivery;
 }
 
@@ -3727,6 +3740,7 @@ async function deliverPendingHumanRequestResponseOnce(
       "POST",
       response,
       {
+        signal: AbortSignal.timeout(22_000),
         retainPending: () => true,
         onRetained: () => undefined,
         onReserved: (pendingWrite) => {
@@ -3738,6 +3752,7 @@ async function deliverPendingHumanRequestResponseOnce(
         },
       },
     );
+    observeHumanResponseDelivery(requestRef, { status: "recorded", result });
     await deleteHumanRequestRecoveryRecord(
       "response",
       delivery.request_ref,
@@ -3754,6 +3769,9 @@ async function deliverPendingHumanRequestResponseOnce(
     if (isCorrectableHumanResponseRejection(error)
         || isPermanentHumanResponseRejection(error)) {
       await discardPendingHumanRequestResponse(delivery);
+      observeHumanResponseDelivery(requestRef, { status: "rejected", error: error instanceof Error ? error.message : "request_failed" });
+    } else if (humanResponseDeliveryState(requestRef)?.status !== "recorded") {
+      observeHumanResponseDelivery(requestRef, { status: "pending" });
     }
     throw error;
   }
@@ -3766,15 +3784,17 @@ async function deliverPendingHumanRequestResponseOnce(
 export async function reconcileHumanRequestResponses(): Promise<boolean> {
   await hydratePendingHumanRequestRecovery();
   let changed = false;
+  let unresolved: unknown;
   for (const response of readPendingHumanRequestResponses()) {
     try {
       await deliverPendingHumanRequestResponse(response.request_ref);
       changed = true;
     } catch (error) {
       if (!readPendingHumanRequestResponse(response.request_ref)) changed = true;
-      else throw error;
+      else unresolved = error;
     }
   }
+  if (unresolved) throw unresolved;
   return changed || hasLegacyHumanRequestMaterial();
 }
 
@@ -4430,6 +4450,7 @@ export async function writeJson<T>(
   method: "POST" | "PUT",
   body: object,
   options?: {
+    signal?: AbortSignal;
     retainPending: (payload: T) => boolean;
     onRetained: (payload: T, pendingWrite: PendingWrite) => void | Promise<void>;
     onReserved?: (pendingWrite: PendingWrite) => void;
@@ -4456,6 +4477,7 @@ export async function writeJson<T>(
       "X-CSRF-Token": csrfToken,
     },
     body: bodyJson,
+    signal: options?.signal,
   });
   if (!response.ok) {
     let code = `request_failed:${response.status}`;
@@ -6095,6 +6117,7 @@ export function followProjection(
         clearTimeout(reloadTimer);
         reloadTimer = null;
       }
+      onRevision(cursor);
       onSnapshotRequired();
     });
   };

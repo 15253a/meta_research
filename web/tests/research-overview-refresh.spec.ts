@@ -20,7 +20,7 @@ const javascript = ts.transpileModule(functions.map(node => node.getText(parsed)
 }).outputText;
 
 type Slot = { value?: unknown; deps?: readonly unknown[]; cleanup?: () => void };
-type Reply = { ok: boolean; status: number; json: () => Promise<unknown> };
+type Reply = { ok: boolean; status: number; headers: Headers; json: () => Promise<unknown> };
 type Read = { signal: AbortSignal; finish: (status?: number, questRef?: string) => void };
 const settle = async () => { for (let index = 0; index < 8; index++) await Promise.resolve(); };
 
@@ -30,7 +30,7 @@ function harness() {
   const same = (a: readonly unknown[] | undefined, b: readonly unknown[]) => a?.length === b.length
     && a.every((value, index) => Object.is(value, b[index]));
   const sandbox = {
-    exports: {} as { useResearchOverview: typeof useResearchOverview }, AbortController, URLSearchParams,
+    exports: {} as { useResearchOverview: typeof useResearchOverview }, AbortController, URLSearchParams, setTimeout, clearTimeout,
     useState<T>(initial: T | (() => T)) {
       const index = cursor++;
       slots[index] ??= { value: typeof initial === "function" ? (initial as () => T)() : initial };
@@ -54,7 +54,7 @@ function harness() {
       const capturedScope = scope;
       return new Promise<Reply>((resolveReply, reject) => {
         reads.push({ signal: options.signal, finish: (status = 200, questRef = capturedScope) => resolveReply({
-          ok: status === 200, status, json: async () => ({
+          ok: status === 200, status, headers: new Headers(), json: async () => ({
             schema_ref: "meta-research/research-overview/v1", quest_ref: questRef,
             cycle_ref: capturedScope, question_ref: capturedScope,
             cycles: [], findings: { quest: [], question: [], cycle: [] },
@@ -122,14 +122,15 @@ test("scope changes and leaving the workspace cancel old reads without publishin
   hook.unmount();
 });
 
-test("a failed read keeps its error and explicit retry starts a new request", async () => {
+test("a failed read keeps its error and explicit retry respects backoff", async () => {
   const hook = harness(); hook.render();
   hook.reads[0].finish(503); await settle();
   const failed = hook.render();
   expect(failed.error).toBe("research_overview_unavailable:503");
   expect(failed.loading).toBe(false);
   failed.retry(); hook.render();
-  expect(hook.reads).toHaveLength(2);
+  expect(hook.reads).toHaveLength(1);
+  await expect.poll(() => hook.reads.length).toBe(2);
   hook.reads[1].finish(); await settle();
   expect(hook.render().data?.quest_ref).toBe("one");
   expect(hook.render().error).toBeNull();
@@ -140,7 +141,8 @@ test("a response with another scope is rejected and queued updates still get the
   const hook = harness(); hook.render(); hook.render(2);
   hook.reads[0].finish(200, "other"); await settle();
   expect(hook.render(2).data).toBeNull();
-  expect(hook.reads).toHaveLength(2);
+  expect(hook.reads).toHaveLength(1);
+  await expect.poll(() => hook.reads.length).toBe(2);
   hook.reads[1].finish(); await settle();
   expect(hook.render(2).data?.quest_ref).toBe("one");
   hook.unmount();

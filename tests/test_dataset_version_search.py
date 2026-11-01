@@ -78,7 +78,8 @@ def test_matching_versions_do_not_duplicate_cards_or_change_pagination(runtime):
     assert page["items"] == [first]
     assert page["total"] == 2
     assert page["next_offset"] == 1
-    page = graph.query_datasets(query="NDA", quest_ref=question.quest_ref, offset=1, limit=1)
+    page = graph.query_datasets(query="NDA", quest_ref=question.quest_ref, offset=1, limit=1,
+                                query_revision=page["query_revision"])
     assert page["items"] == [second]
     assert page["total"] == 2
     assert page["next_offset"] is None

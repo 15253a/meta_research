@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import vm from "node:vm";
 import ts from "typescript";
+import { selectTarget } from "../src/targetResearchFacts.ts";
 
 // Execute the actual launcher and scope-filter bodies without mounting the app,
 // starting a browser, fetching APIs, or fabricating a Bundle projection.
@@ -39,7 +40,7 @@ function fixtures() {
 function mount(props) {
   const state = [], effects = [], refs = [];
   let cursor = 0, pending = [], tree, scrolls = 0;
-  const context = { exports: {}, require: createRequire(import.meta.url),
+  const context = { exports: {}, require: createRequire(import.meta.url), selectTarget,
     useState(initial) { const i = cursor++; if (!(i in state)) state[i] = initial;
       return [state[i], value => state[i] = typeof value === "function" ? value(state[i]) : value]; },
     useRef(initial) { const i = cursor++; return refs[i] ??= { current: initial }; },

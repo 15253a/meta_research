@@ -208,7 +208,7 @@ def test_global_search_is_bounded_and_preserves_free_notes(runtime):
     for index in range(3):
         _dataset(graph, f"observations-{index}")
     first = graph.query_datasets(limit=2)
-    second = graph.query_datasets(offset=first["next_offset"], limit=2)
+    second = graph.query_datasets(offset=first["next_offset"], limit=2, query_revision=first["query_revision"])
     assert first["total"] == 3 and len(first["items"]) == 2
     assert len(second["items"]) == 1 and second["next_offset"] is None
     assert all(item["notes"] == "Interpret in the observer's context." for item in [*first["items"], *second["items"]])

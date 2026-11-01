@@ -41,7 +41,7 @@ def test_data_lineage_supports_multiple_sources_cross_quest_reuse_and_exact_page
     assert graph.query_datasets(question_ref=two.question_ref)["items"] == [usage]
     page = graph.query_datasets(dataset_version_ref=split["dataset_version_ref"], direction="sources", limit=1)
     next_page = graph.query_datasets(dataset_version_ref=split["dataset_version_ref"], direction="sources",
-        offset=page["next_offset"], limit=1)
+        offset=page["next_offset"], limit=1, query_revision=page["query_revision"])
     assert [*page["items"], *next_page["items"]] == [second, third]
     assert next_page["next_offset"] is None
     assert graph.query_datasets(dataset_version_ref=raw["dataset_version_ref"], direction="derived")["items"] == [first, third]

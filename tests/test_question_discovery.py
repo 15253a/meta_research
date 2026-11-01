@@ -10,7 +10,7 @@ def test_discovery_finds_question_by_clue_and_reads_exact_content(tmp_path):
   item=page["items"][0];assert item["question_ref"]==q.question_ref
   content=read_content(r.owners.research_graph,r.owners.research_memory,quest_ref=q.quest_ref,**item["reader"])
   assert "证据" in content["text"]
-  assert discover_questions(r.owners.research_graph,r.owners.research_memory,quest_ref=q.quest_ref,query="证据",offset=1,query_revision=page["query_revision"])["items"]==[]
+  assert discover_questions(r.owners.research_graph,r.owners.research_memory,quest_ref=q.quest_ref,query="证据",offset=1,limit=1,query_revision=page["query_revision"])["items"]==[]
  finally:r.close()
 
 

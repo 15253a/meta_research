@@ -123,13 +123,14 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
             if type(index_offset)is not int or index_offset<0:
                 raise SemanticMcpError('stage_context_page_invalid')
             if source=='question_history':
-                value=research_graph.query_question_research_history(quest_ref=question.quest_ref,question_ref=question.question_ref,offset=index_offset,limit=12)
+                value=research_graph.query_question_research_history(quest_ref=question.quest_ref,question_ref=question.question_ref,
+                    offset=index_offset,limit=12,query_revision=arguments.get('query_revision'))
             elif source=='question_index':
                 value=research_graph.query_active_question_page(quest_ref=question.quest_ref,offset=index_offset,limit=12,focus_question_ref=question.question_ref)
             else:
                 page,refs=research_graph.query_evidence_reference_page(question.quest_ref,offset=index_offset,limit=32)
                 value={**page,'items':list(refs)}
-            index_page={k:v for k,v in value.items() if k in {'total_count','shown_count','offset','next_offset'}}
+            index_page={k:v for k,v in value.items() if k in {'total_count','shown_count','offset','next_offset','query_revision'}}
             source_ref=question.question_ref if source=='question_history' else question.quest_ref
         else:
             raise SemanticMcpError('stage_context_source_invalid')
@@ -152,17 +153,20 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
     return (SemanticOperation(semantic_operation_id=STAGE_CONTEXT_OPERATION_ID,
         owning_module='research_memory',
         description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. For byte/index pagination and errors, read this operation\'s tools.contracts.read contract.',
-        return_description='Return <=16384 UTF-8 JSON bytes with exact source hash; next_offset=null ends the byte stream, while complete only means this page contains the entire source. Then follow index_page.next_offset with index_offset and reset byte offset to 0; history pages 12 outcomes/Questions or 32 evidence references.',
+        return_description='Return <=16384 UTF-8 JSON bytes with exact source hash; next_offset=null ends the byte stream, while complete only means this page contains the entire source. Then follow index_page.next_offset with index_offset and reset byte offset to 0; history pages 12 outcomes/Questions or 32 evidence references. For question_history, carry index_page.query_revision as query_revision when continuing; keep it for byte pages of that index page. Changed Owner history requires restarting at index_offset=0 and byte offset=0 without the old revision.',
         error_descriptions={
             'semantic_call_scope_stale': 'The current stage root, attempt or fence no longer matches the Owner; recover through the current authorized root.',
             'stage_context_ref_unbound': 'context_pack_ref must match this stage request\'s frozen context.',
             'stage_predecessor_source_unbound': 'The requested predecessor is not the exact accepted predecessor bound to this successor.',
             'stage_context_page_invalid': 'The history index offset is invalid; use the returned index_page continuation.',
+            'research_query_revision_required': 'A question_history continuation requires the query_revision returned by its first index page.',
+            'research_query_changed': 'The Question scope or its Owner history changed; restart the history query from its first page.',
         },
         input_schema={'type':'object','properties':{
             'context_pack_ref':{'type':'string','minLength':1,'maxLength':256},
             'source':{'type':'string','enum':['context_pack','question','literature_records','creation_understanding','creation_corrections','creation_sources','scientific_outcome','predecessor_closure','question_history','question_index','evidence_index']},
             'source_ref':{'type':'string','maxLength':256},
+            'query_revision':{'type':'string','pattern':'^[0-9a-f]{64}$'},
             'path':{'type':'array','maxItems':16,'items':{'type':'string','maxLength':256}},
             'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':16384},
             'index_offset':{'type':'integer','minimum':0}},

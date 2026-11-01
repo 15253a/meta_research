@@ -12,7 +12,9 @@ def test_waiting_reason_follows_current_attempt_and_not_a_newer_historical_reque
             'ae_foreground_heads':'quest_ref, cycle_ref, question_ref, stage, epoch INTEGER, status, pending_operation_ref, updated_at REAL',
             'ae_stage_run_requests':'request_ref,quest_ref,cycle_ref,question_ref,stage,epoch INTEGER',
             'ar_stage_runs':'run_ref,request_ref,cycle_ref,stage,epoch INTEGER,status,current_attempt_ref,current_fence_ref,root_session_ref,created_at REAL,updated_at REAL',
-            'ar_target_root_lifecycles':'lifecycle_ref,target_ref,target_run_ref,status,updated_at,cancel_reason,launch_ref,root_session_ref,created_at',
+            'ar_target_root_lifecycles':'lifecycle_ref,target_ref,target_run_ref,status,updated_at,cancel_reason,launch_ref,root_session_ref,target_attempt_ref,target_fence_ref,created_at',
+            'ar_harness_runs':'run_ref,root_session_ref,attempt_ref,fence_ref,status,failure_code',
+            'ar_runtime_observability_identity':'singleton,correlation_ref',
             'ar_target_launches':'launch_ref,target_ref,target_run_ref,root_session_ref,graph_ref,stage_request_ref,quest_ref',
             'rg_targets':'target_ref,graph_ref,target_key',
             'ar_bundle_dispatch_decisions':'run_ref,attempt_ref,fence_ref,generation INTEGER,action,rationale',
@@ -22,6 +24,7 @@ def test_waiting_reason_follows_current_attempt_and_not_a_newer_historical_reque
         for name,columns in schemas.items():
             c.exec_driver_sql(f'CREATE TABLE {name} ({columns})')
         c.exec_driver_sql('INSERT INTO durable_feed VALUES (20,100)')
+        c.exec_driver_sql("INSERT INTO ar_runtime_observability_identity VALUES ('runtime','test-runtime-domain')")
         c.exec_driver_sql("INSERT INTO ae_foreground_heads VALUES ('quest','cycle','question','bundle',3,'active',NULL,100)")
         c.exec_driver_sql("INSERT INTO ae_stage_run_requests VALUES ('request','quest','cycle','question','bundle',3)")
         c.exec_driver_sql("INSERT INTO ar_stage_runs VALUES ('run','request','cycle','bundle',3,'awaiting_acceptance','attempt-current','fence-current','session-current',100,100)")

@@ -81,7 +81,7 @@ export function useResearchOverview(snapshot: PublicSnapshot | null, active = tr
     snapshot?.bundle_stage?.stage_commit, snapshot?.bundle_stage?.bundle_report,
     snapshot?.reasoning_stage?.stage_commit, snapshot?.reasoning_stage?.reasoning_acceptance?.outcome_ref,
   ]);
-  const identity = JSON.stringify([questRef, cycleRef, questionRef]);
+  const identity = JSON.stringify([snapshot?.revision_domain, questRef, cycleRef, questionRef]);
   const [attempt, setAttempt] = useState(0);
   const [result, setResult] = useState<{ identity: string; data: ResearchOverviewData | null; error: string | null; loading: boolean }>({ identity: "", data: null, error: null, loading: false });
   const retry = useCallback(() => setAttempt(value => value + 1), []);
@@ -94,16 +94,34 @@ export function useResearchOverview(snapshot: PublicSnapshot | null, active = tr
     if (!active || !questRef) return;
     const controller = new AbortController();
     let running = false;
+    let failures = 0;
+    let retryAt = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let requestedVersion: string | null = null;
     const read = async () => {
       if (controller.signal.aborted || running || requestedVersion === latestQueryVersion.current) return;
+      clearTimeout(retryTimer);
+      if (Date.now() < retryAt) {
+        retryTimer = setTimeout(() => { requestedVersion = null; void read(); }, retryAt - Date.now());
+        return;
+      }
       running = true;
       requestedVersion = latestQueryVersion.current;
+      const request = new AbortController();
+      const cancel = () => request.abort();
+      controller.signal.addEventListener("abort", cancel, { once: true });
+      const deadline = setTimeout(cancel, 22_000);
+      let retryAfter = 0;
       setResult(previous => ({ identity, data: previous.identity === identity ? previous.data : null, error: null, loading: true }));
       try {
         const response = await fetch(`/api/v1/research-overview?${new URLSearchParams({ quest_ref: questRef })}`, {
-          credentials: "same-origin", headers: { Accept: "application/json" }, signal: controller.signal,
+          credentials: "same-origin", headers: { Accept: "application/json" }, signal: request.signal,
         });
+        if (response.status === 503) {
+          const value = response.headers.get("Retry-After");
+          const seconds = value === null ? NaN : Number(value);
+          retryAfter = Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : Math.max(0, Date.parse(value ?? "") - Date.now()) || 0;
+        }
         if (!response.ok) throw new Error(`research_overview_unavailable:${response.status}`);
         const data = await response.json() as ResearchOverviewData;
         if (data.schema_ref !== "meta-research/research-overview/v1" || !Array.isArray(data.cycles)
@@ -113,10 +131,17 @@ export function useResearchOverview(snapshot: PublicSnapshot | null, active = tr
         if (data.quest_ref !== questRef || (cycleRef && data.cycle_ref !== cycleRef) || (questionRef && data.question_ref !== questionRef)) {
           throw new Error("research_overview_scope_changed");
         }
-        if (!controller.signal.aborted) setResult({ identity, data, error: null, loading: false });
+        if (!controller.signal.aborted) { failures = 0; retryAt = 0; setResult({ identity, data, error: null, loading: false }); }
       } catch (caught) {
-        if (!controller.signal.aborted) setResult(previous => ({ identity, data: previous.identity === identity ? previous.data : null, error: caught instanceof Error ? caught.message : "research_overview_unavailable", loading: false }));
+        if (!controller.signal.aborted) {
+          failures++;
+          setResult(previous => ({ identity, data: previous.identity === identity ? previous.data : null, error: caught instanceof Error ? caught.message : "research_overview_unavailable", loading: false }));
+          retryAt = Date.now() + Math.max(retryAfter, Math.min(2_000 * 2 ** Math.min(failures - 1, 4), 30_000));
+          retryTimer = setTimeout(() => { requestedVersion = null; void read(); }, retryAt - Date.now());
+        }
       } finally {
+        clearTimeout(deadline);
+        controller.signal.removeEventListener("abort", cancel);
         running = false;
         // Same-scope revisions must not cancel a slow history read. Deliver
         // that cut first, then coalesce intervening updates into one new read.
@@ -125,7 +150,7 @@ export function useResearchOverview(snapshot: PublicSnapshot | null, active = tr
     };
     refresh.current = read;
     void read();
-    return () => { controller.abort(); if (refresh.current === read) refresh.current = null; };
+    return () => { controller.abort(); clearTimeout(retryTimer); if (refresh.current === read) refresh.current = null; };
   }, [active, questRef, cycleRef, questionRef, identity]);
   useEffect(() => { refresh.current?.(); }, [queryVersion]);
 
@@ -405,7 +430,7 @@ function StageResultDialog({ data, selection, onSelect, onClose, error, loading,
   return <OverviewDialog title={stageNames[selection.stage]} subtitle={`${cycleOrdinalLabel(cycle?.ordinal)} · ${stageTechnicalNames[selection.stage]}${artifact ? ` · 记录版本 ${artifact.epoch}` : ""}`} onClose={onClose}>
     {loading && data ? <p className="overview-empty" role="status">历史成果正在更新，以下保留已读取记录。</p> : null}
     <div className="overview-history-controls"><label>研究轮次<select value={cycle?.cycle_ref ?? ""} onChange={event => onSelect({ ...selection, cycleRef: event.target.value, epoch: null })}>{data?.cycles.length ? data.cycles.map(item => <option key={item.cycle_ref} value={item.cycle_ref}>{cycleOrdinalLabel(item.ordinal)}{item.cycle_ref === data.cycle_ref ? " · 当前" : ""}</option>) : <option value="">轮次记录暂不可用</option>}</select></label>{artifacts.length > 1 && <label>阶段记录<select value={artifact?.epoch ?? ""} onChange={event => onSelect({ ...selection, epoch: Number(event.target.value) })}>{artifacts.map(item => <option key={item.epoch} value={item.epoch}>版本 {item.epoch} · {acceptedStatusNames[item.status]}</option>)}</select></label>}</div>
-    {artifact ? <><p className="overview-result-status">{acceptedStatusNames[artifact.status]}</p><StageCoreResult artifact={artifact} cycle={cycle} /><SourceDetails source={{ ...artifact.source, cycle_ref: cycle?.cycle_ref, question_ref: cycle?.question_ref, epoch: artifact.epoch, reason: artifact.reason?.code }} />{artifact.content && <details className="overview-source-details"><summary>查看完整原始结果</summary><pre>{JSON.stringify(artifact.content, null, 2)}</pre></details>}</> : loading || (!data && !error) ? <p className="overview-empty" role="status">正在读取阶段结果与历史记录…</p> : <p className="overview-empty">{error || data?.status === "limited" ? "阶段结果暂不可用。" : "该轮次尚无此阶段的已接纳结果。"} 当前 Stage 对话仍可继续阅读。</p>}
+    {artifact ? <><p className="overview-result-status">{acceptedStatusNames[artifact.status]}</p><StageCoreResult artifact={artifact} cycle={cycle} cycles={data?.cycles} /><SourceDetails source={{ ...artifact.source, cycle_ref: cycle?.cycle_ref, question_ref: cycle?.question_ref, epoch: artifact.epoch, reason: artifact.reason?.code }} />{artifact.content && <details className="overview-source-details"><summary>查看完整原始结果</summary><pre>{JSON.stringify(artifact.content, null, 2)}</pre></details>}</> : loading || (!data && !error) ? <p className="overview-empty" role="status">正在读取阶段结果与历史记录…</p> : <p className="overview-empty">{error || data?.status === "limited" ? "阶段结果暂不可用。" : "该轮次尚无此阶段的已接纳结果。"} 当前 Stage 对话仍可继续阅读。</p>}
     {error && onRetry && <button className="overview-text-button" onClick={onRetry}>重新读取阶段结果</button>}
   </OverviewDialog>;
 }
@@ -465,7 +490,29 @@ export function mapStageCoreResult(artifact: OverviewStageArtifact, cycle: Overv
   return { sections, supplementary };
 }
 
-function StageCoreResult({ artifact, cycle }: { artifact: OverviewStageArtifact; cycle: OverviewCycle | null }) {
+function StageCoreResult({ artifact, cycle, cycles }: { artifact: OverviewStageArtifact; cycle: OverviewCycle | null; cycles?: OverviewCycle[] }) {
+  if (artifact.stage === "bundle" && artifact.status === "skipped") {
+    const formalPlanRef = text(artifact.source.formal_plan_ref) ?? text(artifact.content?.formal_plan_ref);
+    const plan = formalPlanRef ? (cycles ?? (cycle ? [cycle] : [])).flatMap(item => item.stages.plan ?? []).find(item => item.status === "accepted"
+      && (item.source.outcome_ref === formalPlanRef || item.source.formal_plan_ref === formalPlanRef)) : null;
+    const content = plan?.content;
+    const obligations = new Map(rows(record(content?.answer_contract).obligations).map(item => [item.obligation_key, item.statement]));
+    return <div className="overview-core-result">
+      <p className="overview-readable-text">本轮未安排新的实验；这不表示研究问题已完成。</p>
+      {content ? <>
+        <section><h3>已接纳计划中的支持与未满足责任</h3>{rows(content.coverage).map((item, index) => <article key={index}>
+          <h4>{text(obligations.get(item.obligation_key)) ?? text(item.obligation_key)}</h4>
+          <p>{item.disposition === "covered" ? "已有证据支持" : "仍有未满足责任"}</p>
+          <ReadableValue value={item.evidence_uses} />
+          {text(item.insufficiency) ? <p>{text(item.insufficiency)}</p> : null}
+        </article>)}</section>
+        <section><h3>仍待解决的缺口</h3><ReadableValue value={Array.isArray(content.gap_set)
+          ? content.gap_set.map(key => obligations.get(key) ?? key) : content.gap_set} /></section>
+        <section><h3>未安排新实验的说明</h3><p>{text(content.notes) ?? "已接纳计划未附说明；不能由跳过状态推断原因。"}</p></section>
+        <SourceDetails source={{ ...plan.source, formal_plan_ref: formalPlanRef }} />
+      </> : <p className="overview-empty">该跳过安排的准确计划内容暂不可用；保留来源记录，不推断责任已满足。</p>}
+    </div>;
+  }
   if (!artifact.content) return <p className="overview-empty">{artifact.status === "skipped" ? "该阶段已按本轮安排跳过；来源记录保留在下方。" : "目前没有可展示的结果正文；可查看下方来源记录。"}</p>;
   const mapped = mapStageCoreResult(artifact, cycle);
   return <div className="overview-core-result">{mapped.sections.length ? mapped.sections.map(section => <section key={section.label}><h3>{section.label}</h3><div className="overview-core-items"><PageWindow items={section.items} label={`${section.label}分页`} render={(item, index) => <article key={index}>{item.title && <h4>{item.title}</h4>}{item.text && <p className="overview-readable-text">{item.text}</p>}{item.details && Object.keys(item.details).length > 0 && <BoundedDetails className="overview-source-details overview-core-extra" summary="展开条件与依据">{() => <ReadableValue value={item.details} />}</BoundedDetails>}</article>} /></div></section>) : <p className="overview-empty">这份结果尚无可映射的核心字段，完整正文保留在下方。</p>}{Object.keys(mapped.supplementary).length > 0 && <BoundedDetails className="overview-source-details" summary="展开证据、限制与其他说明">{() => <ReadableValue value={mapped.supplementary} />}</BoundedDetails>}</div>;
@@ -598,7 +645,7 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
   const data = availableData ?? (retainedData.current?.questRef === questRef ? retainedData.current.data : null);
   const readError = isLiveQuest ? error : history.overviewError;
   const retryHistory = () => { history.retry(); if (isLiveQuest) onRetry?.(); };
-  const historicalRoots = useRootConversations({ questRef, foreground: null, checks: [], stale: false }, !isLiveQuest);
+  const historicalRoots = useRootConversations({ revisionDomain: snapshot.revision_domain, questRef, foreground: null, checks: [], stale: false }, !isLiveQuest);
   const roots = isLiveQuest ? rootConversations : historicalRoots;
   const [historicalConversation, setHistoricalConversation] = useState(false);
   const cycles = data?.cycles ?? [];

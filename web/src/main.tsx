@@ -11,6 +11,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
+import { useProjectionRecovery } from "./projectionRecovery";
 import { StatusHome } from "./StatusHome";
 import { HostResources } from "./HostResources";
 import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
@@ -32,7 +33,6 @@ import {
   fetchLiteratureSnapshot,
   fetchManualQuestionCreation,
   fetchQuestGoalHistory,
-  fetchSnapshot,
   fetchStageRawOutput,
   fetchTargetRawOutput,
   followProjection,
@@ -266,33 +266,6 @@ const humanRequestPanelByKind: Record<HumanRequestItem["kind"], string> = {
   capability_authorization: "permission-request",
   system_operation_help: "system-operation-help",
 };
-
-const humanRequestPresentedPrefix = "meta_research_human_request_presented:";
-const humanRequestPresentedFallback = new Set<string>();
-
-function humanRequestPresentationKey(request: HumanRequestItem): string {
-  return `${humanRequestPresentedPrefix}${request.request_ref}:${request.revision}`;
-}
-
-function humanRequestWasPresented(request: HumanRequestItem): boolean {
-  const key = humanRequestPresentationKey(request);
-  if (humanRequestPresentedFallback.has(key)) return true;
-  try {
-    return window.sessionStorage.getItem(key) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function markHumanRequestPresented(request: HumanRequestItem): void {
-  const key = humanRequestPresentationKey(request);
-  humanRequestPresentedFallback.add(key);
-  try {
-    window.sessionStorage.setItem(key, "1");
-  } catch {
-    // An unavailable session store must not make the request impossible to dismiss.
-  }
-}
 
 function humanRequestKindFromPanel(
   panel: string | null,
@@ -3947,7 +3920,7 @@ function ExperimentLogLauncher({snapshot, blocked, paused, observationPointers, 
   const opener = useRef<HTMLButtonElement>(null);
   const sessionForeground = rootConversations.context.foreground;
   const sessionsConfirmed = !rootConversations.error && !rootConversations.context.stale
-    && Boolean(foreground && rootConversations.data?.limited === false && rootConversations.data.quest_ref === foreground.quest_ref
+    && Boolean(foreground && rootConversations.data?.quest_ref === foreground.quest_ref
       && sessionForeground?.quest_ref === foreground.quest_ref && sessionForeground.cycle_ref === foreground.cycle_ref
       && sessionForeground.question_ref === foreground.question_ref);
   const target = selectTarget(available, selected, sessionsConfirmed ? rootConversations.data : null, foreground);
@@ -4101,6 +4074,12 @@ function WorkspaceMain({
       aria-labelledby="workspace-title"
       aria-busy={state === "loading" && !liveContext.foreground}
     >
+      {snapshot?.human_collaboration?.human_requests.waiting.scope === "quest"
+        && snapshot.human_collaboration.human_requests.waiting.safe_meaningful_runnable_exists === false
+        ? <div className="lumen-reconnect-warning" role="status" data-testid="research-human-wait">
+          <p>当前研究正在等待人类回应，暂没有可独立继续的工作。</p>
+          <button onClick={() => onBrowseHumanRequests()}>查看待回应请求 · {requests.length}</button>
+        </div> : null}
       {snapshot?.query_warnings?.length ? (
         <div className="lumen-reconnect-warning" role="status" data-testid="workspace-partial-warning">
           <span aria-hidden="true">!</span>
@@ -4118,10 +4097,10 @@ function WorkspaceMain({
         </div>
       ) : null}
       {(error || streamInterrupted) && snapshot ? (
-        <div className="lumen-reconnect-warning" role="alert">
+        <div className={streamInterrupted ? "lumen-reconnect-warning" : "projection-refresh"} role={streamInterrupted ? "alert" : "status"}>
           <span aria-hidden="true">↺</span>
           <p>
-            <b>{error ? "详细状态刷新失败，正在重试。" : "研究活动连接中断，正在重连。"}</b>
+            <b>{streamInterrupted ? "事件通道中断，正在重连；定时读取继续核对。" : "详细状态暂时无法更新，将自动重试。"}</b>
             <small>保留上次成功读取的状态 · {snapshot.observed_at ? new Date(snapshot.observed_at).toLocaleString("zh-CN", { hour12: false }) : "查询时间未记录"} · 版本 {snapshot.revision} · <a href="/">查看运行摘要</a></small>
           </p>
         </div>
@@ -4456,7 +4435,6 @@ function DetailedApp() {
     snapshot?.human_collaboration?.companion.status,
     snapshot?.human_collaboration?.companion.scope_ref,
   ]);
-  const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [streamInterrupted, setStreamInterrupted] = useState(false);
   const [creationMode, setCreationMode] = useState<"current" | "new" | null>(
@@ -4515,24 +4493,19 @@ function DetailedApp() {
     ),
   );
   const [selectedHumanRequestRef, setSelectedHumanRequestRef] = useState<string | null>(null);
-  const [streamCursor, setStreamCursor] = useState<number | null>(null);
   const [latestResearchActivity, setLatestResearchActivity] = useState<
     ResearchActivitySignal | null
   >(null);
   const [targetRootObservationPointers, setTargetRootObservationPointers] =
     useState<Record<string, TargetRootObservationPointer>>({});
-  const [snapshotRetrySequence, setSnapshotRetrySequence] = useState(0);
-  const reloadRequest = useRef<Promise<void> | null>(null);
-  const reloadController = useRef<AbortController | null>(null);
-  const reloadQueued = useRef(false);
-  const snapshotSections = useRef({ includeAssets: false, includeHistory: false });
-  const requestedSections = useRef<{ includeAssets: boolean; includeHistory: boolean } | null>(null);
   const includeAssets = assetsOpen || creationMode !== null || manualPanel !== null;
   const includeHistory = questionTreeOpen || writingOpen || showCompanion;
-  snapshotSections.current = { includeAssets, includeHistory };
-  const eventRefreshTimer = useRef<number | null>(null);
-  const observedSinceRef = useRef(Date.now());
+  const recovery = useProjectionRecovery(snapshot, setSnapshot, runtimeStatus.status,
+    { includeAssets, includeHistory });
+  const { reload, error, cursor: streamCursor, observe: scheduleEventReload } = recovery;
   const streamCursorRef = useRef<number | null>(null);
+  streamCursorRef.current = streamCursor;
+  const observedSinceRef = useRef(Date.now());
   const manualDetailSequence = useRef(0);
   const questionTreeButtonRef = useRef<HTMLButtonElement>(null);
   const historyButtonRef = useRef<HTMLButtonElement>(null);
@@ -4564,10 +4537,11 @@ function DetailedApp() {
     setConnected(next);
     if (next) {
       setStreamInterrupted(false);
+      scheduleEventReload();
     } else {
       setStreamInterrupted(true);
     }
-  }, []);
+  }, [scheduleEventReload]);
 
   const handleResearchActivity = useCallback((activity: {
     event_type: string;
@@ -4588,92 +4562,6 @@ function DetailedApp() {
     ));
   }, []);
 
-  const reload = useCallback((): Promise<void> => {
-    const controller = reloadController.current;
-    if (!controller || controller.signal.aborted) return Promise.resolve();
-    reloadQueued.current = true;
-    if (reloadRequest.current) return reloadRequest.current;
-    const request = (async () => {
-      do {
-        reloadQueued.current = false;
-        // A new read supersedes the previous failure while preserving cached data.
-        setError(null);
-        try {
-          const sections = snapshotSections.current;
-          requestedSections.current = sections;
-          const next = await fetchSnapshot(controller.signal, sections);
-          if (controller.signal.aborted) return;
-          setSnapshot((current) =>
-            current && current.revision > next.revision ? current : next,
-          );
-          streamCursorRef.current = Math.max(
-            streamCursorRef.current ?? next.revision,
-            next.revision,
-          );
-          setStreamCursor(streamCursorRef.current);
-          setSnapshotRetrySequence(0);
-          setError(null);
-        } catch (caught) {
-          if (!controller.signal.aborted) {
-            setSnapshotRetrySequence((current) => current + 1);
-            setError("详细状态刷新失败，页面保留上次结果；可返回首页查看运行摘要。");
-          }
-        }
-        if (reloadQueued.current && !controller.signal.aborted) {
-          await new Promise<void>(resolve => {
-            const done = () => { window.clearTimeout(timer); controller.signal.removeEventListener("abort", done); resolve(); };
-            const timer = window.setTimeout(done, 2_000);
-            controller.signal.addEventListener("abort", done, { once: true });
-          });
-        }
-      } while (reloadQueued.current && !controller.signal.aborted);
-    })().finally(() => {
-      if (reloadRequest.current === request) reloadRequest.current = null;
-    });
-    reloadRequest.current = request;
-    return request;
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    reloadController.current = controller;
-    void reload();
-    return () => {
-      controller.abort();
-      reloadController.current = null;
-      reloadRequest.current = null;
-      reloadQueued.current = false;
-    };
-  }, [reload]);
-
-  useEffect(() => {
-    if (!error || snapshotRetrySequence === 0) return;
-    const exponent = Math.min(snapshotRetrySequence - 1, 4);
-    const timer = window.setTimeout(
-      () => void reload(),
-      Math.min(5_000 * 2 ** exponent, 30_000),
-    );
-    return () => window.clearTimeout(timer);
-  }, [error, reload, snapshotRetrySequence]);
-
-  useEffect(() => {
-    const requested = requestedSections.current;
-    if (requested && (requested.includeAssets !== includeAssets || requested.includeHistory !== includeHistory)) {
-      void reload();
-    }
-  }, [includeAssets, includeHistory, reload]);
-
-  const scheduleEventReload = useCallback(() => {
-    if (eventRefreshTimer.current !== null) return;
-    eventRefreshTimer.current = window.setTimeout(() => {
-      eventRefreshTimer.current = null;
-      void reload();
-    }, 2_000);
-  }, [reload]);
-  useEffect(() => () => {
-    if (eventRefreshTimer.current !== null) window.clearTimeout(eventRefreshTimer.current);
-  }, []);
-
   const streamReady = streamCursor !== null;
   useEffect(() => {
     if (!streamReady) return;
@@ -4692,7 +4580,7 @@ function DetailedApp() {
     // followProjection advances its own monotonic cursor. Reconnecting this
     // long-lived stream for every Snapshot revision can briefly occupy every
     // browser connection slot and starve an Owner command.
-  }, [handleConnection, handleResearchActivity, scheduleEventReload, streamReady]);
+  }, [handleConnection, handleResearchActivity, scheduleEventReload, streamReady, recovery.domain]);
 
   const manualContextRef = manualPanel?.raw.context_ref ?? null;
   useEffect(() => {
@@ -4738,62 +4626,9 @@ function DetailedApp() {
       (item) => item.kind === humanRequestRouteKind && item.status === "open",
     ) ?? humanRequests.items.find((item) => item.kind === humanRequestRouteKind);
     if (!selected) return;
-    if (selected.status === "open") markHumanRequestPresented(selected);
     setSelectedHumanRequestRef(selected.request_ref);
     setHumanRequestRouteKind(null);
   }, [humanRequestRouteKind, humanRequestsOpen, snapshot?.human_collaboration?.human_requests]);
-
-  useEffect(() => {
-    if (
-      !humanRequestsOpen
-      || humanRequestRouteKind !== null
-      || currentOpenRequests.length === 0
-      || currentOpenRequests.some(
-        (item) => item.request_ref === selectedHumanRequestRef,
-      )
-    ) return;
-    const selectedHistory = snapshot?.human_collaboration?.human_requests.items.find(
-      (item) => item.request_ref === selectedHumanRequestRef,
-    );
-    const nextRequest = currentOpenRequests.find(
-      (item) => item.request_ref === selectedHistory?.successor_request_ref,
-    ) ?? currentOpenRequests[0];
-    markHumanRequestPresented(nextRequest);
-    setSelectedHumanRequestRef(nextRequest.request_ref);
-    window.history.replaceState(
-      null,
-      "",
-      `/?panel=${humanRequestPanelByKind[nextRequest.kind]}`,
-    );
-  }, [
-    currentOpenRequests,
-    humanRequestRouteKind,
-    humanRequestsOpen,
-    selectedHumanRequestRef,
-    snapshot?.human_collaboration?.human_requests.items,
-  ]);
-
-  useEffect(() => {
-    if (humanRequestsOpen) return;
-    const currentRequest = currentOpenRequests.find(
-      (request) => !humanRequestWasPresented(request),
-    );
-    if (!currentRequest) return;
-    markHumanRequestPresented(currentRequest);
-    prepareHumanRequestReturn();
-    setSelectedHumanRequestRef(currentRequest.request_ref);
-    setHumanRequestRouteKind(null);
-    window.history.replaceState(
-      null,
-      "",
-      `/?panel=${humanRequestPanelByKind[currentRequest.kind]}`,
-    );
-    setHumanRequestsOpen(true);
-  }, [
-    currentOpenRequests,
-    humanRequestsOpen,
-    prepareHumanRequestReturn,
-  ]);
 
   const state = shellState(snapshot, error);
   const canCreate = questCreationReady(snapshot);
@@ -4845,7 +4680,7 @@ function DetailedApp() {
     setQuestionRouteNodeRef(null);
     setSelectedQuestionContext(null);
     setPendingDirectManualParentRef(null);
-    if (currentOpenRequests.length === 0) {
+    {
       setHumanRequestsOpen(false);
       setHumanRequestRouteKind(null);
       setSelectedHumanRequestRef(null);
@@ -5241,7 +5076,6 @@ function DetailedApp() {
     const request = snapshot?.human_collaboration?.human_requests.items.find(
       (item) => item.request_ref === requestRef,
     );
-    if (request?.status === "open") markHumanRequestPresented(request);
     const panel = request ? humanRequestPanelByKind[request.kind] : "human-requests";
     window.history.replaceState(null, "", `/?panel=${panel}`);
     setHumanRequestsOpen(true);
@@ -5256,7 +5090,6 @@ function DetailedApp() {
       (item) => item.request_ref === requestRef,
     );
     if (request) {
-      if (request.status === "open") markHumanRequestPresented(request);
       window.history.replaceState(
         null,
         "",
@@ -5265,7 +5098,6 @@ function DetailedApp() {
     }
   };
   const closeHumanRequests = () => {
-    currentOpenRequests.forEach(markHumanRequestPresented);
     const returnFocus = humanRequestReturnFocusRef.current;
     const returnUrl = humanRequestReturnUrlRef.current ?? "/";
     setHumanRequestsOpen(false);
@@ -5285,6 +5117,7 @@ function DetailedApp() {
       <a className="lumen-skip" href={showCompanion ? "#research-companion" : "#main-content"} data-hc-background>
         {showCompanion ? "跳到研究助手" : "跳到主要内容"}
       </a>
+      {(recovery.updating || error) ? <div className="projection-refresh" data-testid="projection-refresh" role="status">{error ?? "详细状态正在更新"}</div> : null}
       <div className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-companion-open={showCompanion} data-hc-background>
         <header className="lumen-header" data-shell-region="header">
           <a className="lumen-brand" aria-label="Meta-research 首页" href="/" style={{ color: "inherit", textDecoration: "none" }}>
@@ -5295,10 +5128,10 @@ function DetailedApp() {
             <small>{detailsScopeChanged ? "研究详情更新中" : observedForeground || snapshot?.research_space.status === "active" ? "当前研究" : "新的研究空间"}</small>
             <b>{detailsScopeChanged || !snapshot ? runtimeStatus.status?.current_task?.title ?? "正在读取研究空间" : exactForegroundQuestion(snapshot)?.title ?? (snapshot.research_space.status === "active" ? "当前研究现场" : "等待第一个研究问题")}</b>
           </div>
-          <div className={`lumen-connection ${connected && !error && !streamInterrupted && (runtimeStatus.error || runtimeStatus.status?.state !== "failed") ? "connected" : ""}`} aria-live="polite">
+          <div className={`lumen-connection ${connected && !streamInterrupted && (runtimeStatus.error || runtimeStatus.status?.state !== "failed") ? "connected" : ""}`} aria-live="polite">
             <i aria-hidden="true" />
             <span>
-              {!runtimeStatus.error && runtimeStatus.status?.state === "failed" ? "研究推进受阻" : error || streamInterrupted ? "研究记录正在重连" : connected ? "研究记录连接正常" : snapshot ? "正在连接研究记录" : "读取研究状态"}
+              {!runtimeStatus.error && runtimeStatus.status?.state === "failed" ? "研究推进受阻" : streamInterrupted ? "事件通道中断，正在重连" : connected ? "研究记录连接正常" : snapshot ? "正在连接研究记录" : "读取研究状态"}
             </span>
             {snapshot ? <code>状态 {snapshot.revision}</code> : null}
           </div>
@@ -5591,7 +5424,7 @@ function DetailedApp() {
       ) : null}
       <HumanRequestSurface
         open={humanRequestSurfaceOpen}
-        blocking={currentOpenRequests.length > 0}
+        blocking={false}
         selectedRef={selectedHumanRequestRef}
         collaboration={snapshot?.human_collaboration}
         onSelect={selectHumanRequest}

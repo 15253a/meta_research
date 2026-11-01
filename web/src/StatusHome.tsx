@@ -11,6 +11,7 @@ type Health = { status: string; checks: { name: string; status: string; reason?:
 export type RuntimeStatus = {
   schema_ref: "meta-research/runtime-status/v1";
   revision: number;
+  revision_domain?: string;
   observed_at: string;
   updated_at: string;
   state: string;
@@ -51,21 +52,28 @@ const states: Record<string, string> = {
 const stages: Record<string, string> = { idea: "研究思路", plan: "验证计划", bundle: "实验与证据", reasoning: "研究判断" };
 
 // Keep one bounded index request across StrictMode remounts and manual refreshes.
-let pendingRoots: { questRef: string; promise: Promise<RootSessions> } | null = null;
-let rootsStartedAt = -Infinity;
-let lastRoots: RootSessions | null = null;
-async function readHomeRoots(questRef: string): Promise<RootSessions | null> {
-  if (pendingRoots) return pendingRoots.questRef === questRef ? pendingRoots.promise : null;
-  if (Date.now() - rootsStartedAt < TARGET_OBSERVATION_INTERVAL_MS) return lastRoots?.quest_ref === questRef ? lastRoots : null;
-  rootsStartedAt = Date.now();
-  const promise = fetchRootSessions(questRef, new AbortController().signal).then(data => {
-    lastRoots = data;
+type HomeRootObservation = {
+  scope: string; startedAt: number; data: RootSessions | null;
+  pending: Promise<RootSessions> | null; controller: AbortController;
+};
+let homeRoots: HomeRootObservation | null = null;
+async function readHomeRoots(questRef: string, scope: string): Promise<RootSessions | null> {
+  if (homeRoots?.scope !== scope) {
+    homeRoots?.controller.abort();
+    homeRoots = { scope, startedAt: -Infinity, data: null, pending: null, controller: new AbortController() };
+  }
+  const observation = homeRoots;
+  if (observation.pending) return observation.pending;
+  if (Date.now() - observation.startedAt < TARGET_OBSERVATION_INTERVAL_MS) return observation.data;
+  observation.startedAt = Date.now();
+  const promise = fetchRootSessions(questRef, observation.controller.signal).then(data => {
+    observation.data = data;
     return data;
   }).catch(error => {
-    lastRoots = null;
+    observation.data = null;
     throw error;
-  }).finally(() => { pendingRoots = null; });
-  pendingRoots = { questRef, promise };
+  }).finally(() => { observation.pending = null; });
+  observation.pending = promise;
   return promise;
 }
 
@@ -94,7 +102,8 @@ export function StatusHome() {
       try {
         const next = await readStatus();
         if (stopped) return;
-        setStatus(current => current && current.revision > next.revision ? current : next);
+        setStatus(current => current && current.revision_domain === next.revision_domain
+          && current.revision > next.revision ? current : next);
         setError(false);
         failures = 0;
       } catch {
@@ -109,11 +118,18 @@ export function StatusHome() {
       }
     };
     refresh.current = () => void reload();
+    const onVisible = () => { if (!document.hidden) void reload(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", onVisible);
     void reload();
-    return () => { stopped = true; window.clearTimeout(timer); };
+    return () => {
+      stopped = true; window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", onVisible);
+    };
   }, []);
   const rootScope = !error && canObserveActiveTarget(rawStatus) ? JSON.stringify([
-    rawStatus!.foreground!.quest_ref, rawStatus!.foreground!.cycle_ref, rawStatus!.foreground!.question_ref,
+    rawStatus!.foreground!.quest_ref, rawStatus!.foreground!.cycle_ref, rawStatus!.foreground!.question_ref, rawStatus!.revision_domain,
   ]) : "";
   useEffect(() => {
     setRootObservation(null);
@@ -127,14 +143,14 @@ export function StatusHome() {
       if (stopped || reading || document.visibilityState === "hidden") return;
       reading = true;
       try {
-        const data = await readHomeRoots(questRef);
+        const data = await readHomeRoots(questRef, rootScope);
         if (!stopped && data) setRootObservation({ scope: rootScope, data });
       } catch {
         if (!stopped) setRootObservation(null);
       } finally {
         reading = false;
         if (!stopped && !document.hidden) {
-          timer = window.setTimeout(load, Math.max(1_000, TARGET_OBSERVATION_INTERVAL_MS - (Date.now() - rootsStartedAt)));
+          timer = window.setTimeout(load, Math.max(1_000, TARGET_OBSERVATION_INTERVAL_MS - (Date.now() - (homeRoots?.scope === rootScope ? homeRoots.startedAt : -Infinity))));
         }
       }
     };
@@ -168,7 +184,7 @@ export function StatusHome() {
           </span>
         </div>
         <h1 id="current-task-title">{status?.current_task?.title ?? (status ? "还没有运行中的研究任务" : error ? "暂时无法读取运行状态" : "正在读取当前任务")}</h1>
-        {error ? <p className="status-home-error" role="alert">刷新失败。{status ? "下面保留上次成功读取的状态，不代表此刻的最新进度。" : "请稍后重试；尚未取得有效状态。"}</p> : null}
+        {error ? <p className="status-home-error" role="status">暂时无法更新状态，将自动重试。{status ? "下面保留上次成功读取的状态，不代表此刻的最新进度。" : "尚未取得有效状态。"}</p> : null}
         <div className="status-home-primary">
           <a className="status-home-primary-link" href={status?.state === "idle" ? "/?panel=create-quest" : "/?workspace=1"}>{status?.state === "idle" ? "开始研究" : "当前任务与实验日志"} <span>↗</span></a>
           {status && status.pending_requests > 0 ? <a className="status-home-response" href="/?panel=human-requests">需要你回应 · {status.pending_requests} 项 ↗</a> : null}

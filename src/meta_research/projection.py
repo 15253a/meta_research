@@ -394,6 +394,8 @@ class PublicProjection:
                     include_stages=include_stages,
                 )
                 snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
+                if self._database:
+                    snapshot["revision_domain"] = self._database.revision_domain()
                 snapshot["query_diagnostics"] = timing.public()
                 return snapshot
 

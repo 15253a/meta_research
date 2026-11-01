@@ -82,7 +82,8 @@ def test_environment_pages_preserve_metadata_and_do_not_discover_other_quests(ru
         quest_ref=one.quest_ref)["environment_ref"] for index in range(3)}
     foreign = _environment(graph, key="two", quest_ref=two.quest_ref)
     first = graph.query_environments(quest_ref=one.quest_ref, limit=2)
-    second = graph.query_environments(quest_ref=one.quest_ref, offset=first["next_offset"], limit=2)
+    second = graph.query_environments(quest_ref=one.quest_ref, offset=first["next_offset"], limit=2,
+                                     query_revision=first["query_revision"])
     items = first["items"] + second["items"]
     assert first["total"] == 3 and len(first["items"]) == 2
     assert len(second["items"]) == 1 and second["next_offset"] is None
