@@ -2148,7 +2148,13 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             ), {"ref": request_ref, "quest": quest_ref}).first()
             if row is None:
                 raise OwnerConflict("research_help_request_unbound")
-            return self._research_help_summary(connection, row, include_latest=False)
+            result = self._research_help_summary(connection, row, include_latest=False)
+            result["predecessor_request_ref"] = row.predecessor_request_ref
+            result["successor_request_ref"] = connection.execute(text(
+                "SELECT request_ref FROM owner_human_requests WHERE issuer=:issuer "
+                "AND predecessor_request_ref=:ref AND quest_ref=:quest"),
+                {"issuer":row.issuer,"ref":request_ref,"quest":quest_ref}).scalar_one_or_none()
+            return result
 
     def query_research_help_response(self, request_ref, response_ref, *, quest_ref):
         from meta_research.owners.human_requests import _public_request, _verify_request_state_integrity
