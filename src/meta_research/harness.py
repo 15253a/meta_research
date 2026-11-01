@@ -3236,6 +3236,7 @@ class HarnessRuntime:
         if self._creation_channels is not None and self._creation_channels.creation_channel_is_current(token):
             current = True
         resident_scope = self._resident_channel_scopes.get(token_hash)
+        allowed_operation_ids = None
         if resident_scope is not None:
             verifier = self._resident_scope_verifier
             if verifier is None:
@@ -3281,6 +3282,10 @@ class HarnessRuntime:
                             current = False
                         else:
                             current = True
+                            allowed_operation_ids = tuple(
+                                operation_id for operation_id in resident_scope.operation_ids
+                                if _resident_reconcile_dispatch_allowed({
+                                    "method": "tools/call", "params": {"name": operation_id}}))
                     if not current:
                         self._gateway.revoke_channel(token)
                         self._resident_channel_scopes.pop(token_hash, None)
@@ -3295,7 +3300,8 @@ class HarnessRuntime:
                 }
             }, None
 
-        status, payload = self._gateway.dispatch(token, message)
+        status, payload = self._gateway.dispatch(
+            token, message, allowed_operation_ids=allowed_operation_ids)
         method = message.get("method") if isinstance(message, dict) else None
         response_session_id = (
             secrets.token_urlsafe(24)
@@ -4149,6 +4155,8 @@ def _resident_reconcile_dispatch_allowed(message: object) -> bool:
         and isinstance(params, dict)
         and params.get("name")
         in {
+            "tools.catalog.page",
+            "tools.contracts.read",
             ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
             "human_guidance.read.reconcile",

@@ -145,7 +145,14 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
 def stage_context_operations(*, advancement_engine, agent_runtime, research_graph, research_memory):
     return (SemanticOperation(semantic_operation_id=STAGE_CONTEXT_OPERATION_ID,
         owning_module='research_memory',
-        description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. Return <=16384 UTF-8 JSON bytes with exact source hash; next_offset=null ends the byte stream, while complete only means this page contains the entire source. Then follow index_page.next_offset with index_offset and reset byte offset to 0; history pages 12 outcomes/Questions or 32 evidence references.',
+        description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. For byte/index pagination and errors, read this operation\'s tools.contracts.read contract.',
+        return_description='Return <=16384 UTF-8 JSON bytes with exact source hash; next_offset=null ends the byte stream, while complete only means this page contains the entire source. Then follow index_page.next_offset with index_offset and reset byte offset to 0; history pages 12 outcomes/Questions or 32 evidence references.',
+        error_descriptions={
+            'semantic_call_scope_stale': 'The current stage root, attempt or fence no longer matches the Owner; recover through the current authorized root.',
+            'stage_context_ref_unbound': 'context_pack_ref must match this stage request\'s frozen context.',
+            'stage_predecessor_source_unbound': 'The requested predecessor is not the exact accepted predecessor bound to this successor.',
+            'stage_context_page_invalid': 'The history index offset is invalid; use the returned index_page continuation.',
+        },
         input_schema={'type':'object','properties':{
             'context_pack_ref':{'type':'string','minLength':1,'maxLength':256},
             'source':{'type':'string','enum':['context_pack','question','literature_records','creation_understanding','creation_corrections','creation_sources','scientific_outcome','predecessor_closure','question_history','question_index','evidence_index']},
@@ -158,7 +165,13 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
         handler=lambda context,arguments:read_stage_context(advancement_engine,agent_runtime,research_graph,research_memory,context,arguments)),
         SemanticOperation(semantic_operation_id='research_memory.research_notes.read',
             owning_module='research_memory',
-            description='Read bounded research-note summaries or an exact immutable note version. Stage calls require context_pack_ref; optional predecessor_ref selects an accepted frozen predecessor within the same Quest. Target calls omit both and read only this Target, its frozen upstream Targets and selected note versions. next_offset=null ends the UTF-8 JSON byte stream even if complete=false; index_page.next_offset continues the version index via index_offset with byte offset reset to 0. index_offset pages 12 versions for Targets; source_ref selects an exact version for research_note_body. summary_only is display metadata, not an argument. Explanations do not replace formal metrics or input bindings.',
+            description='Read bounded research-note summaries or an exact immutable note version. For Stage/Target scope and byte/index pagination, read this operation\'s tools.contracts.read contract. Explanations do not replace formal metrics or input bindings.',
+            return_description='Stage calls require context_pack_ref; optional predecessor_ref selects an accepted frozen predecessor within the same Quest. Target calls omit both and read only this Target, its frozen upstream Targets and selected note versions. next_offset=null ends the UTF-8 JSON byte stream even if complete=false; index_page.next_offset continues the version index via index_offset with byte offset reset to 0. index_offset pages 12 versions for Targets; source_ref selects an exact version for research_note_body. summary_only is display metadata, not an argument.',
+            error_descriptions={
+                'semantic_call_scope_stale': 'The current root, attempt or fence no longer matches the Owner.',
+                'stage_context_ref_unbound': 'Stage context_pack_ref must match the frozen request.',
+                'research_note_predecessor_unbound': 'The requested predecessor is not bound to the current stage.',
+            },
             input_schema={'type':'object','properties':{
                 'context_pack_ref':{'type':'string','minLength':1,'maxLength':256},
                 'source':{'type':'string','enum':['research_notes','research_note_body']},

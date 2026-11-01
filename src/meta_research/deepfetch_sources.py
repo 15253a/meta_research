@@ -32,7 +32,20 @@ def source_operations(owner, registry: SearchSourceRegistry | None) -> tuple[Sem
         output_schema={"type": "object"},
         access_mode="read",
         handler=lambda context, arguments: source_action(owner, registry, context, arguments),
+        unavailable_reason=lambda context: _source_unavailable_reason(owner, registry, context),
     ),)
+
+
+def _source_unavailable_reason(owner, registry, context):
+    if context.root_kind != "deepfetch":
+        return "deepfetch_source_action_unauthorized"
+    if registry is None:
+        return "deepfetch_search_source_runtime_missing"
+    scope = owner.verify_root_agent_runtime_scope(
+        root_kind=context.root_kind, run_ref=context.run_ref, attempt_ref=context.attempt_ref,
+        root_session_ref=context.root_session_ref, fence_ref=context.fence_ref,
+        runtime_binding_hash=context.capability_binding_hash)
+    return "deepfetch_source_action_provided_only" if scope.get("literature_access_mode") == "provided_only" else None
 
 
 def source_action(owner, registry: SearchSourceRegistry | None, context: SemanticCallContext,
