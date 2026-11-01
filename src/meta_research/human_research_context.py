@@ -14,7 +14,7 @@ def human_research_reader() -> dict[str, object]:
 
 
 def read_human_research_context(agent_runtime, human_collaboration, context, arguments):
-    """The root determines the Quest; callers may select only an exact request."""
+    """Read human records within the root or the selected HC-authorized Quest."""
     try:
         scope = agent_runtime.verify_root_agent_runtime_scope(
             root_kind=context.root_kind, run_ref=context.run_ref,

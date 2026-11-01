@@ -9,7 +9,7 @@ description: 写作或修订研究论文、报告、配套 PPT、提纲与局部
 
 ## 任务与材料
 
-保留用户或调用方的完整要求，明确本次要写什么、给谁看、用途、语言、研究范围、模板与输出形式。仅加载本次所需的[论文指导](references/paper-v1-advisory.md)、[报告指导](references/report-writing.md)或[演示指导](references/presentation-v1-advisory.md)。局部写作按本次任务完成，正式交付按成品要求完成。
+保留用户或调用方的完整要求，明确本次要写什么、给谁看、用途、语言、研究范围、模板与输出形式。仅加载本次所需的[论文指导](references/paper-v1-advisory.md)、[报告指导](references/report-writing.md)或[演示指导](references/presentation-v1-advisory.md)。局部写作按本次任务完成；未明确要求切换语言时沿用所选前稿的语言、风格与格式，修改范围外的内容保持不变。正式交付按成品要求完成。
 
 结合直接提供的关键结论、结果、反证和限制理解研究，再按论证需要阅读准确原件及历史。材料入口和摘要帮助定位，重要主张、数字与引文以实际读取的来源为依据。保留影响判断的负结果、失败、缺测与适用条件。
 

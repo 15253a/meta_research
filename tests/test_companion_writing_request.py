@@ -109,7 +109,34 @@ def test_configured_model_does_not_follow_redirects(tmp_path, status):
             worker.join()
 
 
-def test_configured_model_is_callable_through_the_actual_assistant_grant(tmp_path, monkeypatch):
+@pytest.fixture
+def content_model_endpoint():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+    state = {"calls": [], "status": 200}
+    class Endpoint(BaseHTTPRequestHandler):
+        def do_POST(self):
+            state["calls"].append({"body": json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
+                "authorization": self.headers.get("Authorization")})
+            self.send_response(state["status"])
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"choices":[{"message":{"content":"Selected model content."}}]}')
+
+        def log_message(self, *_):
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), Endpoint) as server:
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/v1/chat/completions", state
+        finally:
+            server.shutdown()
+            worker.join()
+
+
+def test_configured_model_is_callable_through_the_actual_assistant_grant(tmp_path, monkeypatch, content_model_endpoint):
     from test_public_manual_question_lifecycle import _build_runtime, _accept_root_question
     from test_dataset_effect_scope_recovery import _scope
     from test_root_workspace import _channel, _external_context, _call, _accepted
@@ -118,28 +145,32 @@ def test_configured_model_is_callable_through_the_actual_assistant_grant(tmp_pat
         quest_ref, _ = _accept_root_question(runtime, "external-content")
         scope = _scope(runtime, quest_ref=quest_ref, run_ref="content-call", root_ref="assistant-content")
         channel = _channel(runtime, _external_context(scope))
+        endpoint, provider = content_model_endpoint
         config = tmp_path / "content-models.json"
-        config.write_text(json.dumps({"selected": {"endpoint": "https://model.example/v1/chat/completions",
+        config.write_text(json.dumps({"selected": {"endpoint": endpoint,
             "model": "explicit-model", "api_key_env": "CONTENT_TEST_KEY"}}))
         monkeypatch.setenv("META_RESEARCH_CONTENT_MODELS", str(config))
         monkeypatch.setenv("CONTENT_TEST_KEY", "test-private-key")
-        calls = []
-        def provider(request, timeout):
-            calls.append(json.loads(request.data))
-            return BytesIO(b'{"choices":[{"message":{"content":"Selected model content."}}]}')
-        monkeypatch.setattr("meta_research.writing_content._open_content_model", provider)
         messages = [{"role": "user", "content": "Selected evidence only."}]
         before = runtime.owners.research_graph.query_snapshot()
         reply = _accepted(_call(runtime, channel, "assistant.content.generate",
             config_ref="selected", messages=messages))
         assert reply == {"config_ref": "selected", "content": "Selected model content."}
-        assert calls == [{"model": "explicit-model", "messages": messages}]
+        assert provider["calls"] == [{"body": {"model": "explicit-model", "messages": messages},
+            "authorization": "Bearer test-private-key"}]
         assert runtime.owners.research_graph.query_snapshot() == before
         failure = _call(runtime, channel, "assistant.content.generate",
             config_ref="unknown", messages=messages)
         assert failure["isError"] is True
         assert "content_model_configuration_unavailable" in str(failure)
-        assert len(calls) == 1
+        assert len(provider["calls"]) == 1
+        provider["status"] = 503
+        unavailable = _call(runtime, channel, "assistant.content.generate",
+            config_ref="selected", messages=messages)
+        assert unavailable["isError"] is True
+        assert "content_model_call_failed" in str(unavailable)
+        assert len(provider["calls"]) == 2  # No silent model retry or fallback.
         assert "test-private-key" not in str(reply) + str(failure)
+        assert "test-private-key" not in str(unavailable)
     finally:
         runtime.close()
