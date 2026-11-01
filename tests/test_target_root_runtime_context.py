@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from meta_research.harness import HarnessAdmissionError
@@ -11,8 +12,25 @@ from test_target_run_owner import _records
 SOURCE_SPEC_HASH = "b" * 64
 
 
-def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
+def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Path) -> None:
+    from meta_research.codex_runtime import CODEX_MODEL_REF
+    from meta_research.harness_adapters import CodexHarnessAdapter, HarnessInvocation
+    from meta_research.root_resident_mcp import RootResidentMcpChannels
+    from test_public_guidance_delivery import _developer
+    from test_root_capability_floor import _NoActivityCodexRunner
+
     candidate, formal_plan, handle, _preflight, request = _records()
+    session_ref = "target-context-native-root"
+    provider_calls = []
+    no_activity_runner = _NoActivityCodexRunner(session_ref)
+
+    def runner(argv, prompt, timeout, environment):
+        if "--cd" in argv:
+            provider_calls.append((list(argv), prompt))
+        return no_activity_runner(argv, prompt, timeout, environment)
+
+    adapter = CodexHarnessAdapter(tmp_path / "provider", runner=runner)
+    operations = RootResidentMcpChannels("target").operation_ids
     launch = SimpleNamespace(
         stage_request_ref="stage-request:target",
         launch_ref="target-launch-root",
@@ -136,6 +154,20 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
             assert request_ref == "target-harness-request-root"
             assert set(values) == {"prompt", "mcp_base_url"}
             self.root_calls.append((request_ref, values))
+            turn = len(self.root_calls)
+            delivered = adapter.invoke(HarnessInvocation(
+                harness_family="codex", provider_operation_ref=f"target-context-turn:{turn}",
+                run_ref=handle.target_run_ref, attempt_ref=handle.execution_attempt_ref,
+                attempt_generation=1, root_session_ref="target-context-root",
+                fence_ref=handle.execution_fence_ref, model_ref=CODEX_MODEL_REF,
+                prompt=values["prompt"], mcp_url=values["mcp_base_url"] + "/mcp",
+                mcp_token="test-target-context-bearer", root_kind="target",
+                native_session_ref=None if turn == 1 else session_ref,
+                entry_path="initial" if turn == 1 else "resume",
+                authorized_operation_ids=operations,
+            ))
+            assert delivered.native_session_ref == session_ref
+            assert delivered.profile["root_capability_diagnostics"]["side_effect_authorization"]["operation_ids"] == list(operations)
             if len(self.root_calls) == 2:
                 self.evidence = SimpleNamespace(evidence_ref="root-evidence")
             return SimpleNamespace(status="executed")
@@ -191,24 +223,37 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
         assert runtime.query_status(handle.target_ref).phase == expected_phase  # type: ignore[union-attr]
 
     assert len(harnesses.root_calls) == 2
-    for _request_ref, values in harnesses.root_calls:
-        material = json.loads(values["prompt"].split("Exact Owner context:\n", 1)[1])
+    assert len(provider_calls) == 2
+    assert provider_calls[1][0][-3:] == ["resume", session_ref, "-"]
+    for (_request_ref, values), (argv, prompt) in zip(harnesses.root_calls, provider_calls, strict=True):
+        assert prompt == values["prompt"]
+        material = json.loads(prompt.split("Exact Owner context:\n", 1)[1])
         research = material["research_context"]
         assert research["question"]["unknown_statement"] == "fixture research question" + "q" * 5000
         assert research["plan_notes"] == "plan failed, unmeasured, limited: " + "p" * 9000
         assert research["bundle_notes"] == "bundle held-fixed caveats: " + "b" * 9000
         assert "exact_context_path" not in research
         assert material["execution_contract"]["measurement_contract"]["protocol_version"]["split"] == {"split": "heldout"}
-    assert all(
-        "进行研究、检查与局部修订" in values["prompt"]
-        and "最终交接前完成独立子智能体审阅" in values["prompt"]
-        and "普通检索、实施和整理按需要委派" in values["prompt"]
-        and "子智能体使用当前任务授予的工具与权限" in values["prompt"]
-        and "根负责整体判断" in values["prompt"]
-        and "/var/lib/meta-research/target-frozen-inputs/manifest.json"
-        in values["prompt"]
-        for _request_ref, values in harnesses.root_calls
-    )
+        developer = _developer(argv)
+        source = Path(prompt.split("Skill source: ", 1)[1].splitlines()[0])
+        role_source = Path(developer.split("Role skill source: ", 1)[1].splitlines()[0])
+        reference_root = Path(developer.split("Shared reference root: ", 1)[1].splitlines()[0])
+        assert source.is_absolute() and source == role_source == reference_root / "target-execution/SKILL.md"
+        method = source.read_text(encoding="utf-8")
+        assert method.strip() in developer and method not in prompt
+        assert "实施、观察和修订" in method
+        assert "最终交接前委派原生独立子智能体" in method
+        assert "将聚焦检索、比较、实施、评价或整理委派给原生子智能体" in method
+        assert "根负责最终研究判断" in method
+        assert "仅履行本角色及当前授权范围内的职责。" in developer
+        assert "(../references/research-guidance.md)" in method
+        guidance_path = (source.parent / "../references/research-guidance.md").resolve()
+        assert guidance_path == reference_root / "references/research-guidance.md"
+        guidance = guidance_path.read_text(encoding="utf-8")
+        assert "交代问题、范围、已授入口和完成条件" in guidance
+        assert guidance not in developer and guidance not in prompt
+        assert "/var/lib/meta-research/target-frozen-inputs/manifest.json" in prompt
+    (tmp_path / "target-context-observation.json").write_text(json.dumps(provider_calls), encoding="utf-8")
     assert finalizer.calls == [(handle, harnesses.evidence)]
     assert finalizer.materialize_calls == 3
     assert agent_runtime.publications == [
