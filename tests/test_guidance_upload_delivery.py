@@ -1,4 +1,5 @@
 import base64
+from contextlib import closing
 import pytest
 from sqlalchemy import text
 
@@ -18,7 +19,9 @@ def test_guidance_binary_upload_keeps_receiving_work_and_exact_replay(tmp_path, 
     class Submit(_DeterministicIdeaSkill):
         def generate_draft(self, request):
             human = self.runtime.owners.human_collaboration
-            with TestClient(create_app(self.runtime, base_url='http://testserver', control_key='control')) as client:
+            # This test drives the Stage synchronously; starting application
+            # workers here would re-enter this provider during fault injection.
+            with closing(TestClient(create_app(self.runtime, base_url='http://testserver', control_key='control'))) as client:
                 headers = _login(client, self.runtime)
                 receiver = client.get('/api/v1/work-materials/receiver', params={'quest_ref': self.quest}).json()
                 command = {'receiver': receiver, 'selections': [], 'description': 'Supplied measurement',
