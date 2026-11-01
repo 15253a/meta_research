@@ -55,6 +55,6 @@ export function conversationContext(snapshot: PublicSnapshot | null, status: Run
   const useStatus = status && (!snapshot || status.revision_domain !== snapshot.revision_domain || status.revision > snapshot.revision
     || status.revision === snapshot.revision && Date.parse(status.observed_at) >= Date.parse(snapshot.observed_at ?? ""));
   return useStatus
-    ? { foreground: status.foreground, checks: status.health.checks, stale: error }
-    : { foreground: snapshot?.research_control.foreground ?? null, checks: snapshot?.readiness.checks ?? [], stale: !snapshot };
+    ? { revisionDomain: status.revision_domain, foreground: status.foreground, checks: status.health.checks, stale: error }
+    : { revisionDomain: snapshot?.revision_domain, foreground: snapshot?.research_control.foreground ?? null, checks: snapshot?.readiness.checks ?? [], stale: !snapshot };
 }

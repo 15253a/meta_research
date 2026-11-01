@@ -315,3 +315,47 @@ test("a hung read exits at the 22 second ceiling, stays quiet, and recovers auto
   await expect(page.getByRole("alert").filter({ hasText: /详细|网络|断网/ })).toHaveCount(0);
   console.log(JSON.stringify({ scenario: "hung-read", releasedAfterMs: closed - started, reads }));
 });
+
+
+test("overview Retry-After survives a newer snapshot arriving during its failed read", async ({ page }) => {
+  let reads = 0;
+  let release!: () => void;
+  const held = new Promise<void>(done => { release = done; });
+  await page.clock.install();
+  await page.route("**/api/v1/research-overview?*", async route => {
+    if (++reads === 1) {
+      await held;
+      await route.fulfill({ status: 503, headers: { "Retry-After": "30" }, json: { detail: { code: "busy" } } });
+    } else await route.fulfill({ json: app.overview });
+  });
+  await page.goto(app.url + "/?workspace=1&stage=bundle");
+  await expect.poll(() => reads).toBe(1);
+  app.status.revision = 11;
+  app.readSnapshot = async (req, res) => app.send(res, app.cut(11, undefined, req));
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect(page.locator(".lumen-connection code")).toContainText("11");
+  release();
+  await expect(page.getByRole("dialog", { name: "实验与证据" })).toContainText("暂");
+  await page.clock.runFor(5_000);
+  expect(reads).toBe(1);
+  await page.clock.runFor(26_000);
+  await expect.poll(() => reads).toBe(2);
+});
+
+
+test("required section read failure cannot acknowledge a rendered target", async ({ page }) => {
+  let reads = 0;
+  let recover = false;
+  app.readSnapshot = async (req, res) => {
+    const value = app.cut(10, undefined, req);
+    reads++;
+    if (!recover) value.question_tree = { loaded: true, status: "unavailable", items: [], reason: { code: "query_in_progress" } };
+    app.send(res, value);
+  };
+  await page.goto(app.url + "/?workspace=1&panel=question-tree");
+  await expect.poll(() => reads, { timeout: 8000 }).toBeGreaterThanOrEqual(2);
+  await page.waitForTimeout(200);
+  await expect(page.getByTestId("projection-refresh")).toBeVisible();
+  recover = true;
+  await expect(page.getByTestId("projection-refresh")).toHaveCount(0);
+});

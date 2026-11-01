@@ -117,7 +117,8 @@ export function useProjectionRecovery(snapshot: PublicSnapshot | null,
       && foreground?.cycle_ref === expected?.cycle_ref && foreground?.question_ref === expected?.question_ref
       && foreground?.stage.toLowerCase() === expected?.stage.toLowerCase());
     const loaded = matchesScope && (!sections.includeAssets || snapshot.research_assets.loaded !== false)
-      && (!sections.includeHistory || (snapshot.question_tree.loaded !== false && snapshot.writing.loaded !== false));
+      && (!sections.includeHistory || (snapshot.question_tree.loaded !== false
+        && snapshot.question_tree.status === "ready" && snapshot.writing.loaded !== false));
     if (loaded) acknowledged.current = { scope, revision: snapshot.revision };
     const behind = !loaded || snapshot.revision < target.current.revision;
     setUpdating(behind);
@@ -128,4 +129,3 @@ export function useProjectionRecovery(snapshot: PublicSnapshot | null,
   useEffect(() => { observe(status?.revision); }, [status?.revision, health, observe]);
   return { reload, observe, error, updating, cursor, domain };
 }
-

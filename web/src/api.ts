@@ -2836,6 +2836,7 @@ export class ProductError extends Error {
     public readonly code: string,
     public readonly details?: Record<string, unknown>,
     public readonly httpStatus?: number,
+    public readonly retryAfterMs = 0,
   ) {
     super(code);
   }
@@ -3557,15 +3558,23 @@ export function startNewCompanionSession(scopeRef: string): Promise<CompanionSes
   return writeJson("/api/v1/companion/sessions/new", "POST", { scope_ref: scopeRef });
 }
 
-export function readHumanRequestHandoff(
+export async function readHumanRequestHandoff(
   requestRef: string,
   revision: number,
   signal?: AbortSignal,
 ): Promise<HumanRequestHandoff> {
-  return readJson(
+  const response = await fetch(
     `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff?revision=${revision}`,
-    signal,
+    { credentials: "same-origin", headers: { Accept: "application/json" }, signal },
   );
+  if (!response.ok) {
+    const retry = response.headers.get("Retry-After");
+    const delay = retry === null ? 0 : /^\d+(\.\d+)?$/.test(retry)
+      ? Number(retry) * 1000 : Date.parse(retry) - Date.now();
+    throw new ProductError(`request_failed:${response.status}`, undefined, response.status,
+      Number.isFinite(delay) ? Math.max(0, delay) : 0);
+  }
+  return await response.json() as HumanRequestHandoff;
 }
 
 export async function downloadHumanRequestHandoff(

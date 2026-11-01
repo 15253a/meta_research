@@ -25,6 +25,7 @@ const timeText = (value: number | null) => value ? new Date(value * 1_000).toLoc
 
 export type RootConversationContext = {
   questRef?: string | null;
+  revisionDomain?: string;
   foreground: { quest_ref: string; cycle_ref: string; question_ref: string; stage: string; status?: string; grant_status?: string } | null;
   checks: readonly { name: string; status: string; reason?: { code?: string } | null }[];
   stale: boolean;
@@ -50,13 +51,15 @@ function usePageVisible() {
 
 export function useRootConversations(context: RootConversationContext, active: boolean) {
   const questRef = context.foreground?.quest_ref ?? context.questRef ?? null;
+  const scope = JSON.stringify([context.revisionDomain, questRef]);
   const visible = usePageVisible();
-  const [result, setResult] = useState<{ questRef: string; data: RootSessions } | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{ scope: string; data: RootSessions } | null>(null);
+  const [failure, setFailure] = useState<{ scope: string; message: string } | null>(null);
+  const error = failure?.scope === scope ? failure.message : null;
   const [retry, setRetry] = useState(0);
-  const [selection, setSelection] = useState<{ questRef: string; cycleRef: string | null; stage: SpectrumStage | null; ref: string | null; role?: ReasoningRole } | null>(null);
-  const retainedSelection = useRef<{ questRef: string; session: RootSession } | null>(null);
-  const readingCache = useMemo(() => new Map<string, SessionReadingState>(), [questRef]);
+  const [selection, setSelection] = useState<{ scope: string; cycleRef: string | null; stage: SpectrumStage | null; ref: string | null; role?: ReasoningRole } | null>(null);
+  const retainedSelection = useRef<{ scope: string; session: RootSession } | null>(null);
+  const readingCache = useMemo(() => new Map<string, SessionReadingState>(), [scope]);
   const refresh = useCallback(() => setRetry(value => value + 1), []);
   useEffect(() => {
     if (!active || !visible || !questRef) return;
@@ -67,22 +70,22 @@ export function useRootConversations(context: RootConversationContext, active: b
       try {
         const data = await fetchRootSessions(questRef, controller.signal);
         if (controller.signal.aborted) return;
-        setResult({ questRef, data }); setError(null); failures = 0;
+        setResult({ scope, data }); setFailure(null); failures = 0;
       } catch (caught) {
         if (controller.signal.aborted) return;
         failures += 1;
-        setError(caught instanceof Error ? caught.message : "root_sessions_unavailable");
+        setFailure({ scope, message: caught instanceof Error ? caught.message : "root_sessions_unavailable" });
       }
       if (!controller.signal.aborted) timer = window.setTimeout(load, Math.min(10_000, 2_500 * 2 ** failures));
     };
     void load();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [questRef, active, visible, retry]);
-  const data = result?.questRef === questRef ? result.data : null;
+  }, [questRef, scope, active, visible, retry]);
+  const data = result?.scope === scope ? result.data : null;
   const sessions = data?.sessions ?? [];
   const cycleRef = context.foreground?.cycle_ref ?? null;
   const currentStage = spectrumStage(context.foreground?.stage);
-  const chosen = selection?.questRef === questRef ? selection : null;
+  const chosen = selection?.scope === scope ? selection : null;
   const reasoningDeepFetch = (session: RootSession) => {
     if (session.creation_context_kind !== "autonomous_question_creation" || spectrumStage(session.stage) !== "reasoning"
       || !session.cycle_ref || !session.owner_session_ref) return false;
@@ -122,25 +125,25 @@ export function useRootConversations(context: RootConversationContext, active: b
   const observedSelection = chosen?.ref ? sessions.find(item => item.session_ref === chosen.ref) ?? null
     : !chosen ? current : selectedRole ? roleRoot(selectedRole, chosen.cycleRef) : defaultRoot(selectedStage, chosen.cycleRef);
   const pendingRoot = chosen && !chosen.ref ? observedSelection : null;
-  const selected = observedSelection ?? (chosen?.ref && retainedSelection.current?.questRef === questRef
+  const selected = observedSelection ?? (chosen?.ref && retainedSelection.current?.scope === scope
     && retainedSelection.current.session.session_ref === chosen.ref ? retainedSelection.current.session : null);
   const selectedUnavailable = Boolean(chosen?.ref && !observedSelection);
   useEffect(() => {
-    if (questRef && chosen?.ref && observedSelection) retainedSelection.current = { questRef, session: observedSelection };
-  }, [questRef, chosen?.ref, observedSelection]);
+    if (questRef && chosen?.ref && observedSelection) retainedSelection.current = { scope, session: observedSelection };
+  }, [questRef, scope, chosen?.ref, observedSelection]);
   // A pending role has no invented session identity. Bind it once its real root appears,
   // then keep that exact root through subsequent index refreshes and new roots.
   useEffect(() => {
     if (!pendingRoot || !chosen) return;
     setSelection(previous => previous === chosen ? { ...previous, ref: pendingRoot.session_ref } : previous);
   }, [chosen, pendingRoot?.session_ref]);
-  const selectStage = (stage: SpectrumStage, ref: string | null = null) => setSelection(questRef ? { questRef, cycleRef, stage, ref: ref ?? defaultRoot(stage)?.session_ref ?? null } : null);
-  const selectReasoningRole = (role: ReasoningRole) => setSelection(questRef ? { questRef, cycleRef, stage: "reasoning", ref: null, role } : null);
+  const selectStage = (stage: SpectrumStage, ref: string | null = null) => setSelection(questRef ? { scope, cycleRef, stage, ref: ref ?? defaultRoot(stage)?.session_ref ?? null } : null);
+  const selectReasoningRole = (role: ReasoningRole) => setSelection(questRef ? { scope, cycleRef, stage: "reasoning", ref: null, role } : null);
   const returnCurrent = () => setSelection(null);
   const pinReading = () => {
-    if (!chosen && questRef && selected) setSelection({ questRef, cycleRef: selected.cycle_ref, stage: selectedStage, ref: selected.session_ref });
+    if (!chosen && questRef && selected) setSelection({ scope, cycleRef: selected.cycle_ref, stage: selectedStage, ref: selected.session_ref });
   };
-  return { context, questRef, data, sessions, error, refresh, current, selected, selectedStage, currentStage, selectedRole,
+  return { context, questRef, scope, data, sessions, error, refresh, current, selected, selectedStage, currentStage, selectedRole,
     selectedRef: chosen?.ref ?? null, selectedUnavailable, manualSelection: Boolean(chosen), readingCache, pinReading, forStage, selectStage, selectReasoningRole, returnCurrent, active: active && visible };
 
 }
@@ -210,7 +213,7 @@ export function RootConversations({ model, connected, polling = false, targetRet
     {failure ? <div className="lumen-idea-health-blocker" data-testid="research-current-worker-blocker" role="status"><span aria-hidden="true">!</span><div><b>{retrySummary ?? (usageLimit ? "模型额度已用尽" : failure.name === "target_run_worker" ? "Target 推进受阻" : "当前阶段推进受阻")}</b><small>{retrySummary ? "原会话正在继续；上次错误与研究记录仍保留。" : usageLimit ? "原会话和研究记录已保留；额度恢复后可继续研究。" : "已形成的会话与研究记录仍可查看。"}</small></div><code title={failure.reason?.code}>{failure.reason?.code ?? "worker_unavailable"}</code></div> : null}
     {model.error || model.data?.limited ? <div className="root-session-warning" role="status">{model.data ? "会话状态更新不完整，保留已读取记录。" : "暂时无法读取研究会话。"}<button onClick={model.refresh}>重新读取</button>{model.error ? <details><summary>状态详情</summary><code>{model.error}</code></details> : null}</div> : null}
     {model.selectedUnavailable && model.selected ? <div className="root-session-warning" role="status">所选根会话暂不可读取，保留已读取内容和阅读位置。<button onClick={model.refresh}>重新读取所选会话</button></div> : null}
-    {model.selected && model.questRef ? <RootSessionTimeline key={`${model.questRef}:${model.selected.session_ref}:${model.manualSelection ? "selected" : "current"}`} questRef={model.questRef} session={model.selected} scope={sessionScope(model.selected, model.context)} active={model.active} stale={Boolean(model.context.stale || model.error || model.data?.limited || model.selectedUnavailable)} readingCache={model.readingCache} followCurrent={!model.manualSelection} onReadHistory={model.pinReading} />
+    {model.selected && model.questRef ? <RootSessionTimeline key={`${model.scope}:${model.selected.session_ref}:${model.manualSelection ? "selected" : "current"}`} questRef={model.questRef} session={model.selected} scope={sessionScope(model.selected, model.context)} active={model.active} stale={Boolean(model.context.stale || model.error || model.data?.limited || model.selectedUnavailable)} readingCache={model.readingCache} followCurrent={!model.manualSelection} onReadHistory={model.pinReading} />
       : model.selectedStage === "reasoning" && model.selectedRole && !model.selectedRef ? <section className="research-conversation root-pending-role" aria-label={`${reasoningRoleLabels[model.selectedRole]} 待启动会话`} data-root-role={model.selectedRole}>
         <h3>{reasoningRoleLabels[model.selectedRole]}</h3>
         <p>{!model.data || model.error || model.data.limited ? "正在确认此入口的根会话状态。" : model.selectedRole === "deepfetch" ? "Reasoning 尚未建立由本阶段发起的 DeepFetch 根会话。" : model.selectedRole === "reasoning" ? "当前轮尚未建立 Reasoning 根会话。" : "此 Quest 尚未建立共享 Acquisition 根会话。"}</p>

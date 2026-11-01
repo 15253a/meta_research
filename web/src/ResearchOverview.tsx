@@ -95,11 +95,16 @@ export function useResearchOverview(snapshot: PublicSnapshot | null, active = tr
     const controller = new AbortController();
     let running = false;
     let failures = 0;
+    let retryAt = 0;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let requestedVersion: string | null = null;
     const read = async () => {
       if (controller.signal.aborted || running || requestedVersion === latestQueryVersion.current) return;
       clearTimeout(retryTimer);
+      if (Date.now() < retryAt) {
+        retryTimer = setTimeout(() => { requestedVersion = null; void read(); }, retryAt - Date.now());
+        return;
+      }
       running = true;
       requestedVersion = latestQueryVersion.current;
       const request = new AbortController();
@@ -126,12 +131,13 @@ export function useResearchOverview(snapshot: PublicSnapshot | null, active = tr
         if (data.quest_ref !== questRef || (cycleRef && data.cycle_ref !== cycleRef) || (questionRef && data.question_ref !== questionRef)) {
           throw new Error("research_overview_scope_changed");
         }
-        if (!controller.signal.aborted) { failures = 0; setResult({ identity, data, error: null, loading: false }); }
+        if (!controller.signal.aborted) { failures = 0; retryAt = 0; setResult({ identity, data, error: null, loading: false }); }
       } catch (caught) {
         if (!controller.signal.aborted) {
           failures++;
           setResult(previous => ({ identity, data: previous.identity === identity ? previous.data : null, error: caught instanceof Error ? caught.message : "research_overview_unavailable", loading: false }));
-          retryTimer = setTimeout(() => { requestedVersion = null; void read(); }, Math.max(retryAfter, Math.min(2_000 * 2 ** Math.min(failures - 1, 4), 30_000)));
+          retryAt = Date.now() + Math.max(retryAfter, Math.min(2_000 * 2 ** Math.min(failures - 1, 4), 30_000));
+          retryTimer = setTimeout(() => { requestedVersion = null; void read(); }, retryAt - Date.now());
         }
       } finally {
         clearTimeout(deadline);
@@ -639,7 +645,7 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
   const data = availableData ?? (retainedData.current?.questRef === questRef ? retainedData.current.data : null);
   const readError = isLiveQuest ? error : history.overviewError;
   const retryHistory = () => { history.retry(); if (isLiveQuest) onRetry?.(); };
-  const historicalRoots = useRootConversations({ questRef, foreground: null, checks: [], stale: false }, !isLiveQuest);
+  const historicalRoots = useRootConversations({ revisionDomain: snapshot.revision_domain, questRef, foreground: null, checks: [], stale: false }, !isLiveQuest);
   const roots = isLiveQuest ? rootConversations : historicalRoots;
   const [historicalConversation, setHistoricalConversation] = useState(false);
   const cycles = data?.cycles ?? [];

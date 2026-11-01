@@ -52,21 +52,28 @@ const states: Record<string, string> = {
 const stages: Record<string, string> = { idea: "研究思路", plan: "验证计划", bundle: "实验与证据", reasoning: "研究判断" };
 
 // Keep one bounded index request across StrictMode remounts and manual refreshes.
-let pendingRoots: { questRef: string; promise: Promise<RootSessions> } | null = null;
-let rootsStartedAt = -Infinity;
-let lastRoots: RootSessions | null = null;
-async function readHomeRoots(questRef: string): Promise<RootSessions | null> {
-  if (pendingRoots) return pendingRoots.questRef === questRef ? pendingRoots.promise : null;
-  if (Date.now() - rootsStartedAt < TARGET_OBSERVATION_INTERVAL_MS) return lastRoots?.quest_ref === questRef ? lastRoots : null;
-  rootsStartedAt = Date.now();
-  const promise = fetchRootSessions(questRef, new AbortController().signal).then(data => {
-    lastRoots = data;
+type HomeRootObservation = {
+  scope: string; startedAt: number; data: RootSessions | null;
+  pending: Promise<RootSessions> | null; controller: AbortController;
+};
+let homeRoots: HomeRootObservation | null = null;
+async function readHomeRoots(questRef: string, scope: string): Promise<RootSessions | null> {
+  if (homeRoots?.scope !== scope) {
+    homeRoots?.controller.abort();
+    homeRoots = { scope, startedAt: -Infinity, data: null, pending: null, controller: new AbortController() };
+  }
+  const observation = homeRoots;
+  if (observation.pending) return observation.pending;
+  if (Date.now() - observation.startedAt < TARGET_OBSERVATION_INTERVAL_MS) return observation.data;
+  observation.startedAt = Date.now();
+  const promise = fetchRootSessions(questRef, observation.controller.signal).then(data => {
+    observation.data = data;
     return data;
   }).catch(error => {
-    lastRoots = null;
+    observation.data = null;
     throw error;
-  }).finally(() => { pendingRoots = null; });
-  pendingRoots = { questRef, promise };
+  }).finally(() => { observation.pending = null; });
+  observation.pending = promise;
   return promise;
 }
 
@@ -122,7 +129,7 @@ export function StatusHome() {
     };
   }, []);
   const rootScope = !error && canObserveActiveTarget(rawStatus) ? JSON.stringify([
-    rawStatus!.foreground!.quest_ref, rawStatus!.foreground!.cycle_ref, rawStatus!.foreground!.question_ref,
+    rawStatus!.foreground!.quest_ref, rawStatus!.foreground!.cycle_ref, rawStatus!.foreground!.question_ref, rawStatus!.revision_domain,
   ]) : "";
   useEffect(() => {
     setRootObservation(null);
@@ -136,14 +143,14 @@ export function StatusHome() {
       if (stopped || reading || document.visibilityState === "hidden") return;
       reading = true;
       try {
-        const data = await readHomeRoots(questRef);
+        const data = await readHomeRoots(questRef, rootScope);
         if (!stopped && data) setRootObservation({ scope: rootScope, data });
       } catch {
         if (!stopped) setRootObservation(null);
       } finally {
         reading = false;
         if (!stopped && !document.hidden) {
-          timer = window.setTimeout(load, Math.max(1_000, TARGET_OBSERVATION_INTERVAL_MS - (Date.now() - rootsStartedAt)));
+          timer = window.setTimeout(load, Math.max(1_000, TARGET_OBSERVATION_INTERVAL_MS - (Date.now() - (homeRoots?.scope === rootScope ? homeRoots.startedAt : -Infinity))));
         }
       }
     };

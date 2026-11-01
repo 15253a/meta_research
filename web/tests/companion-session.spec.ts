@@ -126,6 +126,10 @@ test("a request selects completed assistant work and server artifacts before exp
     await page.screenshot({ path: testInfo.outputPath(`companion-human-request-${viewport.width}.png`) });
   }
   await formal.getByRole("button", { name: "提交", exact: true }).click();
+  const review = page.getByRole("dialog", { name: "审阅正式回应", exact: true });
+  await expect(review).toContainText("已运行核验脚本，结果 4；限制是样本仅一项。");
+  expect(state.writes.filter(write => write.path.endsWith("/responses"))).toHaveLength(0);
+  await review.getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect(formal).toContainText("回应已提交");
   await expect(assistant.getByText("已选入正式回应", { exact: true })).toBeVisible();
   const delivered = state.writes.filter(write => write.path.endsWith("/responses"));
@@ -134,7 +138,8 @@ test("a request selects completed assistant work and server artifacts before exp
   expect(delivered[0].body.note).toContain("已运行核验脚本，结果 4；限制是样本仅一项。");
   expect(JSON.stringify(delivered[0].body)).not.toContain("未选结果不能进入");
   expect(delivered[0].body.materials).toMatchObject([{ kind: "server_reference", selection: { absolute_path: "/data/companion/quest-stable/result.txt" } }]);
-  await dialog.getByRole("button", { name: "查看下一个待办" }).click();
+  await dialog.getByRole("button", { name: "返回请求列表" }).click();
+  await dialog.getByRole("button", { name: /second 原始核验请求/ }).click();
   await expect(dialog.getByRole("heading", { name: "second 原始核验请求" })).toBeVisible();
   await expect(formal.getByRole("region", { name: "已选助手说明" })).toHaveCount(0);
   await expect(formal.locator(".server-material-picker__candidate")).toHaveCount(0);

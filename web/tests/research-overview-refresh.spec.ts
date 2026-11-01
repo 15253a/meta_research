@@ -122,14 +122,15 @@ test("scope changes and leaving the workspace cancel old reads without publishin
   hook.unmount();
 });
 
-test("a failed read keeps its error and explicit retry starts a new request", async () => {
+test("a failed read keeps its error and explicit retry respects backoff", async () => {
   const hook = harness(); hook.render();
   hook.reads[0].finish(503); await settle();
   const failed = hook.render();
   expect(failed.error).toBe("research_overview_unavailable:503");
   expect(failed.loading).toBe(false);
   failed.retry(); hook.render();
-  expect(hook.reads).toHaveLength(2);
+  expect(hook.reads).toHaveLength(1);
+  await expect.poll(() => hook.reads.length).toBe(2);
   hook.reads[1].finish(); await settle();
   expect(hook.render().data?.quest_ref).toBe("one");
   expect(hook.render().error).toBeNull();
@@ -140,7 +141,8 @@ test("a response with another scope is rejected and queued updates still get the
   const hook = harness(); hook.render(); hook.render(2);
   hook.reads[0].finish(200, "other"); await settle();
   expect(hook.render(2).data).toBeNull();
-  expect(hook.reads).toHaveLength(2);
+  expect(hook.reads).toHaveLength(1);
+  await expect.poll(() => hook.reads.length).toBe(2);
   hook.reads[1].finish(); await settle();
   expect(hook.render(2).data?.quest_ref).toBe("one");
   hook.unmount();

@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 
 type Json = Record<string, any>;
-async function workspace(page: Page, respond: (route: Route, snapshot: Json) => Promise<void>, initial = "/?workspace=1&panel=offline-operation") {
+async function workspace(page: Page, respond: (route: Route, snapshot: Json) => Promise<void>, initial = "/?workspace=1&panel=offline-operation", handoff?: (route: Route) => Promise<void>) {
   const snapshot: Json = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   const original = snapshot.human_collaboration.human_requests.items[0];
   const request = { ...original, request_ref: "research_graph:HR-273:r1", request_id: "HR-273", kind: "offline_action", status: "open", obligation: "核对现场原始记录", required_authorization: null, responses: [], evaluation: null, disposition: null, direct_waiters: [] };
@@ -23,7 +23,7 @@ async function workspace(page: Page, respond: (route: Route, snapshot: Json) => 
     if (url.pathname === "/api/v1/snapshot") return json(snapshot);
     if (url.pathname === "/api/v1/preferences") return json({ output_language: "zh" });
     if (url.pathname === "/api/v1/events") return route.fulfill({ contentType: "text/event-stream", body: "" });
-    if (url.pathname.includes("/handoff")) return json({ request_ref: request.request_ref, revision: request.revision, is_current: true, sections: [] });
+    if (url.pathname.includes("/handoff")) return handoff ? handoff(route) : json({ request_ref: request.request_ref, revision: request.revision, is_current: true, sections: [] });
     if (url.pathname.startsWith("/api/")) return json({ status: "ready", items: [], sessions: [], cycles: [], questions: [], total: 0 });
     const file = resolve(webRoot, url.pathname === "/" ? "index.html" : `.${url.pathname}`);
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
@@ -150,4 +150,50 @@ test("reconciliation continues after more than four failures without a new event
   }
   await expect(dialog).toContainText("回应已提交");
   expect(attempts.every(attempt => JSON.stringify(attempt) === JSON.stringify(attempts[0]))).toBeTruthy();
+});
+
+test("handoff retries a transient read quietly without a new request revision", async ({ page }) => {
+  let reads = 0;
+  await workspace(page, route => route.abort(), undefined, async route => {
+    if (++reads === 1) return route.fulfill({ status: 503, headers: { "Retry-After": "1" }, body: "busy" });
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ request_ref: "research_graph:HR-273:r1", revision: 1, is_current: true,
+      sections: [{ key: "work", title: "原请求的工作依据", paragraphs: ["已恢复读取，仍归属原请求。"] }] }) });
+  });
+  const handoff = page.getByRole("region", { name: "求助交接材料" });
+  await expect(handoff.getByRole("status")).toContainText("自动重试");
+  await expect(handoff.getByRole("alert")).toHaveCount(0);
+  await expect(handoff).toContainText("已恢复读取，仍归属原请求。", { timeout: 6000 });
+  expect(reads).toBe(2);
+});
+
+test("handoff Retry-After survives background returns while prior text, expansion and draft remain", async ({ page }) => {
+  await page.clock.install();
+  let reads = 0;
+  const { snapshot } = await workspace(page, route => route.abort(), undefined, async route => {
+    if (++reads === 2) return route.fulfill({ status: 503, headers: { "Retry-After": "30" }, body: "busy" });
+    const label = reads === 1 ? "仍可阅读的原说明" : "已更新的当前说明";
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ request_ref: "research_graph:HR-273:r1", revision: 1, is_current: true,
+      sections: [{ key: "work", title: "原请求的工作依据", paragraphs: Array.from({ length: 12 }, (_, i) => `${label} ${i}：原始材料和执行条件保持可见。`) }] }) });
+  });
+  const handoff = page.getByRole("region", { name: "求助交接材料" });
+  await expect(handoff).toContainText("仍可阅读的原说明");
+  const note = page.getByRole("textbox", { name: "自然语言回应", exact: true });
+  await note.fill("读取恢复不覆盖我的未提交回应");
+  const details = page.locator(".hc-request-details");
+  await details.locator("summary").click();
+  await page.locator(".hc-request-core").evaluate(el => { el.scrollTop = 200; });
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect(handoff.getByRole("status")).toContainText("自动重试");
+  await expect(handoff).toContainText("仍可阅读的原说明");
+  snapshot.revision++;
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await page.clock.runFor(29_000);
+  expect(reads).toBe(2);
+  await page.clock.runFor(1_100);
+  await expect(handoff).toContainText("已更新的当前说明");
+  expect(reads).toBe(3);
+  await expect(note).toHaveValue("读取恢复不覆盖我的未提交回应");
+  await expect(details).toHaveAttribute("open", "");
+  expect(await page.locator(".hc-request-core").evaluate(el => el.scrollTop)).toBeGreaterThan(100);
+  await expect(handoff.getByRole("alert")).toHaveCount(0);
 });

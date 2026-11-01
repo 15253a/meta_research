@@ -2496,16 +2496,50 @@ function RequestHandoff({ request, onChanged }: { request: HumanRequestItem; onC
   const [handoff, setHandoff] = useState<HumanRequestHandoff | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
-  const [readAttempt, setReadAttempt] = useState(0);
+  const refresh = useRef<() => void>(() => undefined);
   useEffect(() => {
     const controller = new AbortController();
-    void readHumanRequestHandoff(request.request_ref, request.revision, controller.signal)
-      .then((value) => setHandoff(value))
-      .catch((caught) => {
-        if (!controller.signal.aborted) setError(reasonCode(caught));
-      });
-    return () => controller.abort();
-  }, [request.request_ref, request.revision, readAttempt]);
+    let running = false;
+    let failures = 0;
+    let retryAt = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async () => {
+      if (controller.signal.aborted || running) return;
+      clearTimeout(timer);
+      if (Date.now() < retryAt) { timer = setTimeout(read, retryAt - Date.now()); return; }
+      running = true;
+      const attempt = new AbortController();
+      const cancel = () => attempt.abort();
+      controller.signal.addEventListener("abort", cancel, { once: true });
+      const deadline = setTimeout(cancel, 22_000);
+      try {
+        const value = await readHumanRequestHandoff(request.request_ref, request.revision, attempt.signal);
+        if (!controller.signal.aborted) { setHandoff(value); setError(null); failures = 0; retryAt = 0; }
+      } catch (caught) {
+        if (!controller.signal.aborted) {
+          setError(reasonCode(caught));
+          failures++;
+          retryAt = Date.now() + Math.max(caught instanceof ProductError ? caught.retryAfterMs : 0,
+            Math.min(2_000 * 2 ** Math.min(failures - 1, 4), 30_000));
+          timer = setTimeout(read, retryAt - Date.now());
+        }
+      } finally {
+        clearTimeout(deadline);
+        controller.signal.removeEventListener("abort", cancel);
+        running = false;
+      }
+    };
+    refresh.current = () => void read();
+    const returned = () => { if (!document.hidden) void read(); };
+    document.addEventListener("visibilitychange", returned);
+    window.addEventListener("online", returned);
+    void read();
+    return () => {
+      controller.abort(); clearTimeout(timer);
+      document.removeEventListener("visibilitychange", returned);
+      window.removeEventListener("online", returned);
+    };
+  }, [request.request_ref, request.revision]);
   const download = async (format: "md" | "html" | "pdf") => {
     if (!handoff || downloading) return;
     setDownloading(format);
@@ -2536,13 +2570,12 @@ function RequestHandoff({ request, onChanged }: { request: HumanRequestItem; onC
           </button>
         ))}
       </div>
-      {error ? <div role="alert">
+      {error ? <div role="status">
         <p>{error === "request_failed:409"
           ? "这张请求的修订无法确认，请重新读取后下载交接材料。"
-          : "交接材料暂时无法读取，请重试。"}</p>
+          : "交接材料暂时无法更新，将自动重试。"}{handoff ? " 已保留上次读取的说明与阅读位置。" : ""}</p>
         <button type="button" onClick={() => {
-          setError(null);
-          setReadAttempt((attempt) => attempt + 1);
+          refresh.current();
           onChanged();
         }}>重新读取请求</button>
       </div> : null}
@@ -3171,7 +3204,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
       {error || !["library_reconnect", "capability_authorization"].includes(request.kind) ? (
       <div className="hc-response-boundary" role="status">
         {error ? (
-          <><b>{request.kind === "system_operation_help" ? "重试未成功" : sealedResponse || pendingHumanRequestResponse(request.request_ref) ? "提交结果待确认" : "回应未提交"}</b><br />{error}</>
+          <><b>{request.kind === "system_operation_help" ? "重试未成功" : sealedResponse || pendingHumanRequestResponse(request.request_ref) ? "提交结果待确认" : "回应未提交"}</b><br />{sealedResponse || pendingHumanRequestResponse(request.request_ref) ? "已保留本次回应，正在自动核对原提交。" : error}</>
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
           <><b>正式提交将回应交回请求原根</b><br />负责当前请求的 Agent 会解释回应、核验材料并决定下一步。</>
         ) : request.kind === "system_operation_help" ? (

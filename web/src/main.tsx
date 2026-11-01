@@ -3920,7 +3920,7 @@ function ExperimentLogLauncher({snapshot, blocked, paused, observationPointers, 
   const opener = useRef<HTMLButtonElement>(null);
   const sessionForeground = rootConversations.context.foreground;
   const sessionsConfirmed = !rootConversations.error && !rootConversations.context.stale
-    && Boolean(foreground && rootConversations.data?.limited === false && rootConversations.data.quest_ref === foreground.quest_ref
+    && Boolean(foreground && rootConversations.data?.quest_ref === foreground.quest_ref
       && sessionForeground?.quest_ref === foreground.quest_ref && sessionForeground.cycle_ref === foreground.cycle_ref
       && sessionForeground.question_ref === foreground.question_ref);
   const target = selectTarget(available, selected, sessionsConfirmed ? rootConversations.data : null, foreground);
