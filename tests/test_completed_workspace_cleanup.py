@@ -165,8 +165,34 @@ def test_actual_provider_instructions_preserve_cycle_dependencies_before_cleanup
     assert '后继读取' in reasoning_skill and '执行、恢复、待接纳等依赖' in reasoning_skill
 
 
-def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_readable(tmp_path):
+def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_readable(tmp_path, monkeypatch):
+    from collections import Counter
+    from meta_research.research_guidance import CYCLE_ROLE_DIRECTORIES, shared_reference_root
+
     runtime, handle, manifest, workspace, _, _, _ = _complete(tmp_path)
+    resource_root = shared_reference_root()
+    original_read = Path.read_text
+    resource_observations = []
+
+    def cleanup_with_resource_observation():
+        reads = Counter()
+
+        def counted(path, *args, **kwargs):
+            if path.is_relative_to(resource_root) and path.suffix == '.md':
+                reads[path.relative_to(resource_root).as_posix()] += 1
+            return original_read(path, *args, **kwargs)
+
+        with monkeypatch.context() as context:
+            context.setattr(Path, 'read_text', counted)
+            result = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        expected = {f'{directory}/SKILL.md' for directory in CYCLE_ROLE_DIRECTORIES.values()}
+        expected.update(f'target-execution/references/{name}' for name in ('formal-work.md', 'data-preservation.md'))
+        assert expected <= reads.keys(), 'each cleanup pass must read current role resources'
+        assert set(reads.values()) == {1}, reads
+        resource_observations.append(dict(reads))
+        (tmp_path / 'cleanup-resource-observation.json').write_text(json.dumps(resource_observations), encoding='utf-8')
+        return result
+
     try:
         cycle = runtime.cleanup_test_cycle_ref
         locations = [skill.locations[cycle] for skill in runtime.cleanup_test_skills.values()]
@@ -182,7 +208,7 @@ def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_r
         assert {body['root_kind'] for body in runtime.cleanup_test_skills['reasoning'].handoff_readbacks} == {
             'idea', 'plan', 'bundle', 'reasoning'}
         asset = next(entry for entry in manifest.entries if entry.declared_relative_path == 'outputs/data/run1.txt')
-        result = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        result = cleanup_with_resource_observation()
         removed = {item['root_kind'] for item in result if item['action'] == 'removed'}
         assert removed == {'target', 'idea', 'plan', 'bundle', 'reasoning'}, result
         assert not workspace.exists() and all(not location.directory.exists() for location in locations)
@@ -204,7 +230,7 @@ def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_r
         discovery = runtime.cleanup_test_skills['plan'].successor_discovery
         assert discovery['files'] and all(item['cycle_ref'] != cycle for item in discovery['files'])
         assert {item['root_kind'] for item in discovery['files']} == {'idea', 'plan'}
-        runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        cleanup_with_resource_observation()
         assert all(Path(item.directory).is_dir() for kind in ('idea', 'plan')
             for ref, item in runtime.cleanup_test_skills[kind].locations.items() if ref != cycle)
         print('CYCLE_CLEANUP ' + json.dumps({'cycle_ref': cycle, 'report': result,

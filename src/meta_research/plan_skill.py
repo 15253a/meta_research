@@ -29,7 +29,7 @@ from meta_research.idea_skill import (
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 from meta_research.plan_contract import (
     MAX_PLAN_EXPERIMENT_BRIEFS,
     MAX_PLAN_OBLIGATIONS,
@@ -627,6 +627,7 @@ def _plan_skill_resources() -> dict[str, str]:
         ("references/tool-contracts.md", package / "references" / "tool-contracts.md"),
     )
     try:
+        prepare_cycle_role_resources()
         return {
             **shared_reference_resources(),
             **{

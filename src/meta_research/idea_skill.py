@@ -60,7 +60,7 @@ from meta_research.idea_contract import (
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES,
@@ -3820,6 +3820,7 @@ def _idea_skill_resources() -> dict[str, str]:
         ("references/contract.md", package / "references" / "contract.md"),
     )
     try:
+        prepare_cycle_role_resources()
         return {
             **shared_reference_resources(),
             **{

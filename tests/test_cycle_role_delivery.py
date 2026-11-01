@@ -268,6 +268,94 @@ def test_target_reference_revision_changes_the_bound_capability_profile(monkeypa
     assert root_capability_profile("target").digest != before
 
 
+@pytest.mark.parametrize("role", ("idea", "plan", "bundle", "reasoning"))
+@pytest.mark.parametrize("missing_resource", ("formal-work.md", "data-preservation.md", "other-role"))
+def test_stage_binding_reports_cross_role_resource_failure_before_provider(tmp_path, monkeypatch, role, missing_resource):
+    from importlib import import_module
+
+    module = import_module(f"meta_research.{role}_skill")
+    adapter_type = getattr(module, f"Codex{role.title()}SkillAdapter")
+    unavailable = getattr(module, f"{role.title()}SkillUnavailable")
+    provider_calls = []
+
+    def runner(*args, **kwargs):
+        provider_calls.append(args)
+        raise AssertionError("missing installed resource must prevent provider calls")
+
+    adapter = adapter_type(tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
+    other_role = "plan_stage" if role == "idea" else "idea_stage"
+    suffix = (f"/{other_role}/SKILL.md" if missing_resource == "other-role"
+              else f"/target-execution/references/{missing_resource}")
+    original_read = Path.read_text
+
+    def missing(path, *args, **kwargs):
+        if path.as_posix().endswith(suffix):
+            raise FileNotFoundError("required cross-role resource unavailable")
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", missing)
+    with pytest.raises(unavailable, match=f"^{role}_skill_resource_unavailable$") as caught:
+        adapter.runtime_binding()
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+    assert provider_calls == []
+
+
+@pytest.mark.parametrize("role", ("idea", "plan", "bundle", "reasoning"))
+def test_stage_binding_reads_each_role_resource_once_per_preparation(tmp_path, monkeypatch, role):
+    from collections import Counter
+    from importlib import import_module
+    from meta_research.research_guidance import CYCLE_ROLE_DIRECTORIES, shared_reference_root
+
+    module = import_module(f"meta_research.{role}_skill")
+    adapter_type = getattr(module, f"Codex{role.title()}SkillAdapter")
+    adapter = adapter_type(tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")))
+    root = shared_reference_root()
+    reads = Counter()
+    original_read = Path.read_text
+
+    def counted(path, *args, **kwargs):
+        if path.is_relative_to(root) and path.suffix == ".md":
+            reads[path.relative_to(root).as_posix()] += 1
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted)
+    first = adapter.runtime_binding()
+    expected_role_resources = {f"{directory}/SKILL.md" for directory in CYCLE_ROLE_DIRECTORIES.values()}
+    expected_role_resources.update(f"target-execution/references/{name}" for name in ("formal-work.md", "data-preservation.md"))
+    assert expected_role_resources <= reads.keys()
+    assert set(reads.values()) == {1}
+    assert adapter.runtime_binding() == first
+    assert set(reads.values()) == {2}, "a fresh preparation must read current resource bytes again"
+
+
+def test_standalone_profile_prepares_one_resource_root_and_observes_next_revision(monkeypatch):
+    from meta_research.root_capabilities import root_capability_profile
+
+    original_resolve, original_read = Path.resolve, Path.read_text
+    resolutions = []
+    revision = ""
+
+    def resolved(path, *args, **kwargs):
+        if path.name == "skills" and path.parent.name == "meta_research":
+            resolutions.append(str(path))
+        return original_resolve(path, *args, **kwargs)
+
+    def read(path, *args, **kwargs):
+        body = original_read(path, *args, **kwargs)
+        if path.as_posix().endswith("/target-execution/references/formal-work.md"):
+            return body + revision
+        return body
+
+    monkeypatch.setattr(Path, "resolve", resolved)
+    monkeypatch.setattr(Path, "read_text", read)
+    first = root_capability_profile("plan").as_dict()
+    assert len(resolutions) == 1
+    revision = "\nCurrent Target resource revision.\n"
+    second = root_capability_profile("plan").as_dict()
+    assert len(resolutions) == 2
+    assert first["research_system_prompt_hash"] != second["research_system_prompt_hash"]
+
+
 @pytest.mark.parametrize("resource", ("SKILL.md", "references/formal-work.md", "references/data-preservation.md"))
 def test_missing_target_role_resource_fails_before_native_model_delivery(tmp_path, monkeypatch, resource):
     from meta_research.codex_runtime import CODEX_MODEL_REF

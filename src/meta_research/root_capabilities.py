@@ -14,7 +14,7 @@ from meta_research.codex_runtime import (
 from meta_research.owners.common import canonical_hash
 from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, research_system_prompt
 from meta_research.research_guidance import shared_reference_bundle_hash, shared_reference_instructions, cycle_role_instructions, target_role_reference_hash
-from meta_research.resource_preparation import prepared_resource
+from meta_research.resource_preparation import prepared_resource, resource_preparation
 
 
 RootAgentKind = Literal[
@@ -149,6 +149,7 @@ class RootCapabilityProfile:
     multi_agent_enabled: bool = True
     web_search_mode: Literal["live"] = "live"
 
+    @resource_preparation
     def as_dict(self) -> dict[str, object]:
         return {
             "schema_ref": ROOT_CAPABILITY_PROFILE_SCHEMA,

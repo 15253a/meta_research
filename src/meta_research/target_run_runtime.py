@@ -119,6 +119,7 @@ class TargetRunRuntime:
     def query_status(self, target_ref: str) -> TargetRunRuntimeStatus | None:
         return self._status_by_target.get(target_ref)
 
+    @resource_preparation
     def cleanup_completed_workspaces(self, *, dry_run=True, now=None, limit=10, retention_seconds=None):
         from meta_research.target_workspace_cleanup import cleanup_completed_workspaces
         return cleanup_completed_workspaces(self, dry_run=dry_run, now=now,

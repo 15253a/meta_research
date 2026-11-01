@@ -47,6 +47,15 @@ def target_role_reference_hash() -> str:
                            for name in ("formal-work.md", "data-preservation.md")})
 
 
+@prepared_resource
+def prepare_cycle_role_resources() -> None:
+    """Prepare the shared role identity inside each adapter's resource boundary."""
+    for root_kind in CYCLE_ROLE_DIRECTORIES:
+        cycle_role_instructions(root_kind)
+    target_role_reference_hash()
+
+
+@prepared_resource
 def shared_reference_root() -> Path:
     """Installed file root used by native tools, independent of their cwd."""
     return Path(__file__).with_name("skills").resolve()

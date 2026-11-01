@@ -66,7 +66,7 @@ from meta_research.reasoning_contract import (
     validate_reasoning_stage_output,
     validate_scientific_outcome,
 )
-from .research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text
+from .research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 from meta_research.semantic_mcp import (
     ROOT_AGENT_COMMON_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
@@ -1577,6 +1577,7 @@ def _reasoning_skill_resources() -> dict[str, str]:
         ),
     )
     try:
+        prepare_cycle_role_resources()
         return {
             **shared_reference_resources(),
             **{

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 
 from meta_research.context_presentation import (
     STAGE_CONTEXT_DELIVERY_GUIDANCE, stage_context_json, stage_position_prompt,
@@ -1740,6 +1740,7 @@ def _bundle_skill_resources() -> dict[str, str]:
         ),
     )
     try:
+        prepare_cycle_role_resources()
         return {
             **shared_reference_resources(),
             **{name: cycle_role_skill_text("bundle") if name == "SKILL.md" else resource.read_text(encoding="utf-8") for name, resource in resources},
