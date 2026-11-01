@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from meta_research.research_guidance import shared_reference_resources
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources
 
 from meta_research.context_presentation import (
     STAGE_CONTEXT_DELIVERY_GUIDANCE, stage_context_json, stage_position_prompt,

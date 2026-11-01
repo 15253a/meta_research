@@ -2,7 +2,7 @@
 
 当前 scoped 工具目录决定实际可用能力，输入已有内容不要求按固定顺序再读。按需要选择以下阶段入口及共享发现／reader：
 
-工作资料的读取、加工和保管按[材料与保管](../../references/materials-and-custody.md)处理；研究积累及实际用途从 RG 对应入口发现，涉及人类协作历史时经 RG.humaninteract 返回准确入口读取。当前根交接未读、待验证部分及影响；需要上游重做或继续投入时，由本 Reasoning 按现有后继入口决定，不从材料反馈直接创建 Cycle。
+工作资料的读取、加工和保管按[材料与保管](../../references/materials-and-custody.md)处理；研究积累及实际用途从 RG 对应入口发现，涉及人类协作时沿实际提供的 human_request.read／human_guidance.read 与精确资料入口读取；统一 Human Interact 历史发现尚待接通。当前根交接未读、待验证部分及影响；需要上游重做或继续投入时，由本 Reasoning 按现有后继入口决定，不从材料反馈直接创建 Cycle。
 
 | 操作 | 用途 |
 | --- | --- |
@@ -18,7 +18,7 @@
 
 本轮 `cycle_focus` 原文与来源随首轮直接提供；需要补读时沿返回的正式 transition 入口取得同一正文，读取、恢复及缺失处理遵循[NextCycleProposal 合同](contract.md#nextcycleproposal)。字段沿现行 transition 合同保存、读取与接续。
 
-检索或复用历史时读[研究导航](../../references/research-navigation.md)，不把首批目录当作全集。人类输入与处理历史经 RG.humaninteract 返回的准确入口读取，按[人类协作指导](../../references/human-guidance.md)区分意见、授权、HumanRequest satisfied 与 Quest 完成确认。
+检索或复用历史时读[研究导航](../../references/research-navigation.md)，不把首批目录当作全集。人类输入与处理历史按当前获授的准确 reader 读取，按[人类协作指导](../../references/human-guidance.md)区分意见、授权、HumanRequest satisfied 与 Quest 完成确认。
 
 ## 上下文装配与准确读取
 

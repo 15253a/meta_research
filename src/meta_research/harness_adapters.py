@@ -407,15 +407,15 @@ class _NativeCliHarnessAdapter:
         self._validate_invocation(invocation)
         provider_version = self._provider_version()
         self._record_provider_capability(provider_version)
-        provider_feature_inventory = self._provider_feature_inventory(
-            invocation,
-            provider_version=provider_version,
-        )
         try:
             # Verify the current packaged references before any provider launch.
             root_capability_profile(invocation.root_kind or "target").as_dict()
         except (OSError, UnicodeError, ModuleNotFoundError) as error:
             raise HarnessAdapterUnavailable("provider_resource_unavailable") from error
+        provider_feature_inventory = self._provider_feature_inventory(
+            invocation,
+            provider_version=provider_version,
+        )
         argv = self._argv(invocation)
         evidence_scope_ref = _harness_evidence_scope_ref(invocation)
         observation_scope = _target_root_observation_scope(invocation)

@@ -61,5 +61,5 @@ def test_target_prompt_has_complete_selected_science_without_unrelated_briefs():
     assert 'exact_context_path' not in prompt
     assert prompt.startswith('cycle_position=')
     assert '"execution_input_binding_receipt"' not in prompt
-    assert 'result_schema 是初始表达指导' in prompt
-    assert 'Protocol 指标集合' in prompt
+    assert 'Skill source:' in prompt
+    assert '"required_metric_keys":["f1"]' in prompt

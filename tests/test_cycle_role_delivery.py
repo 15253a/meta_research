@@ -8,6 +8,9 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from io import StringIO
+
+import pytest
 
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from test_plan_skill_adapter import _fake_codex, _plan, _request, _SequenceRunner
@@ -53,6 +56,8 @@ class _RoleReadingRunner(_ReadingRunner):
         assert skill_body.strip() in developer, "Harness must maintain the role's short methods"
         evidence = {
             "cwd": str(cwd), "role": self.role_directory,
+            "provider_argv": argv,
+            "system_channel": "provider-owned; no separate application system payload",
             "channels": {"developer": developer, "user": prompt},
             "reference_reads": {str(path.relative_to(root)): {
                 "utf8_bytes": len(body.encode()), "sha256": hashlib.sha256(body.encode()).hexdigest(),
@@ -220,3 +225,71 @@ def test_target_admission_delivers_methods_and_exact_owner_science(tmp_path):
         assert Path(material["frozen_input_manifest_path"]).is_file()
     finally:
         runtime.close()
+
+
+def test_target_resume_harness_maintains_role_and_exact_authorization(tmp_path):
+    from meta_research.codex_runtime import CODEX_MODEL_REF
+    from meta_research.harness_adapters import CodexHarnessAdapter, HarnessInvocation
+    from meta_research.root_resident_mcp import RootResidentMcpChannels
+    from test_root_capability_floor import _NoActivityCodexRunner
+    session = "session:target"
+    reading = _RoleReadingRunner(_NoActivityCodexRunner(session), "target-execution")
+
+    def runner(argv, prompt, timeout, environment):
+        if "--cd" not in argv:
+            return reading.delegate(argv, prompt, timeout, environment)
+        return reading(argv, prompt, timeout, environment)
+
+    operations = RootResidentMcpChannels("target").operation_ids
+    result = CodexHarnessAdapter(tmp_path / "target", runner=runner).invoke(HarnessInvocation(
+        harness_family="codex", provider_operation_ref="operation:target:resume",
+        run_ref="run:target", attempt_ref="attempt:target:resume", attempt_generation=1,
+        root_session_ref="root:target", fence_ref="fence:target", model_ref=CODEX_MODEL_REF,
+        prompt="Continue the current authorized work.", mcp_url="http://127.0.0.1:0/mcp", mcp_token="test-bearer",
+        native_session_ref=session, root_kind="target", entry_path="resume", authorized_operation_ids=operations,
+    ))
+    assert len(reading.role_observations) == 1
+    assert result.profile["root_capability_diagnostics"]["side_effect_authorization"]["operation_ids"] == list(operations)
+
+
+@pytest.mark.parametrize("reference", ("formal-work.md", "data-preservation.md"))
+def test_target_reference_revision_changes_the_bound_capability_profile(monkeypatch, reference):
+    from meta_research.root_capabilities import root_capability_profile
+    before = root_capability_profile("target").digest
+    original_open = Path.open
+
+    def changed(path, *args, **kwargs):
+        if path.name == reference and path.parent.parent.name == "target-execution":
+            with original_open(path, *args, **kwargs) as stream:
+                return StringIO(stream.read() + "\nA revised Target handoff requirement.\n")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", changed)
+    assert root_capability_profile("target").digest != before
+
+
+@pytest.mark.parametrize("resource", ("SKILL.md", "references/formal-work.md", "references/data-preservation.md"))
+def test_missing_target_role_resource_fails_before_native_model_delivery(tmp_path, monkeypatch, resource):
+    from meta_research.codex_runtime import CODEX_MODEL_REF
+    from meta_research.harness_adapters import CodexHarnessAdapter, HarnessAdapterUnavailable, HarnessInvocation
+    from meta_research.root_resident_mcp import RootResidentMcpChannels
+    from test_root_capability_floor import _NoActivityCodexRunner
+    original_open = Path.open
+
+    def missing(path, *args, **kwargs):
+        if path.as_posix().endswith("/target-execution/" + resource):
+            raise FileNotFoundError("required Target role resource unavailable")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", missing)
+    runner = _NoActivityCodexRunner("session:target")
+    invocation = HarnessInvocation(
+        harness_family="codex", provider_operation_ref="operation:target:initial",
+        run_ref="run:target", attempt_ref="attempt:target:initial", attempt_generation=1,
+        root_session_ref="root:target", fence_ref="fence:target", model_ref=CODEX_MODEL_REF,
+        prompt="Execute the authorized Target.", mcp_url="http://127.0.0.1:0/mcp", mcp_token="test-bearer",
+        root_kind="target", entry_path="initial", authorized_operation_ids=RootResidentMcpChannels("target").operation_ids,
+    )
+    with pytest.raises(HarnessAdapterUnavailable, match="provider_resource_unavailable"):
+        CodexHarnessAdapter(tmp_path / "target", runner=runner).invoke(invocation)
+    assert all("--cd" not in argv and "features" not in argv for argv in runner.calls)

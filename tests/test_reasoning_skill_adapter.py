@@ -1044,7 +1044,14 @@ def test_autonomous_question_checkpoint_accepts_empty_optional_fields() -> None:
         adapter_kind="deterministic-test",
     ))
     schema = _reasoning_autonomous_checkpoint_schema(request)
-    Draft202012Validator(schema).validate(checkpoint)
+    # The provider authors scientific judgments. The Owner binds these frozen
+    # metadata fields before the complete checkpoint above is validated.
+    provider_checkpoint = json.loads(json.dumps(checkpoint))
+    outcome = provider_checkpoint["scientific_outcome"]
+    for field in ("target_commit_refs", "changed_axis_fact_refs", "held_fixed_fact_refs", "provenance_refs"):
+        outcome["causal_interpretation"].pop(field)
+    outcome["research_synthesis"]["current_question"].pop("prior_accepted_outcome_refs")
+    Draft202012Validator(schema).validate(provider_checkpoint)
 
 
 @pytest.mark.parametrize(

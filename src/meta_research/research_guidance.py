@@ -29,6 +29,18 @@ def cycle_role_instructions(root_kind: str) -> str:
             + source.read_text(encoding="utf-8"))
 
 
+@prepared_resource
+def target_role_reference_hash() -> str:
+    """Bind Target's required references through its existing Harness profile.
+
+    The other Cycle adapters already bind their complete role resource bundles.
+    Target runs directly through the Harness, so its references belong here.
+    """
+    root = shared_reference_root() / "target-execution" / "references"
+    return canonical_hash({name: (root / name).read_text(encoding="utf-8")
+                           for name in ("formal-work.md", "data-preservation.md")})
+
+
 def shared_reference_root() -> Path:
     """Installed file root used by native tools, independent of their cwd."""
     return Path(__file__).with_name("skills").resolve()
