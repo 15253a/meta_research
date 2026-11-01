@@ -54,6 +54,8 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 日志按真实工作命名。实际训练的完整 stdout／stderr 才写 `logs/train.log` 或 `train-*.log`；实际模型或实验系统评价才写 `logs/eval.log` 或 `eval-*.log`。从进程开始保留原始输出和退出状态，每次重试用独立路径。可用 `logs/audit.log`、`logs/protocol-check.log`、`logs/gate-closure.log`、`logs/verify.log` 保存可用性、来源、准入及结构检查；准备检查只支持其自身事实。没有训练或模型评价时，相应日志保持不存在。
 
+长任务按实际语言和工具选择无缓冲或行缓冲输出，使运行中的观察能及时读到日志。用 `tee` 等管道同时显示和保存输出时，保留 stdout／stderr 与原工作进程的退出状态；在适用 shell 中使用 `2>&1` 和 `pipefail`，不能把日志写入成功当成研究命令成功。
+
 维护 `outputs/analysis/research-note.md`：开头给出短摘要，再说明认识、支持与缺失证据、继续／改向／等待的理由。交接或压缩后续接前更新；沿精确旧版本核查先前边界。整份目录含具体科研产物时，按[正式工作交接](references/formal-work.md#实际-run评价与产物)核对文件与容器的选择边界和真实归属。当前及上游 `research_notes` 提供摘要和正文入口；历史分页用 `research_memory.research_notes.read` 的 `research_notes_reader` 与 `index_page.next_offset`。精确正文用 `source=research_note_body`、`source_ref=version_ref`；Target 调用省略 `context_pack_ref` 与 `predecessor_ref`。说明不替代正式输入绑定或实际指标。
 
 执行中发现新未知时，在研究说明中向调用本 Target 的 Bundle 交接发现依据、与当前或已有问题的关系及值得继续研究的线索。能够在已有题内处理的，保留为该题的后续工作；确有独立追踪价值时说明理由和可能开展的研究。Target 按当前合同交回实际结果与线索，不直接向 Reasoning 提交建题候选；由 Bundle 汇总多个 Target、保留并筛选后统一交接。一次失败、待办事项或资源缺口本身不足以成为建题理由。
