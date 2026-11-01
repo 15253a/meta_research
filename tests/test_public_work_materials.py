@@ -195,7 +195,7 @@ print(json.dumps(call({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
         server.should_exit = True
         thread.join(5)
         assert not thread.is_alive()
-        foreign = _external_context(_scope(runtime, run_ref="foreign-work", root_ref="foreign-root"))
+        foreign = _external_context(_scope(runtime, quest_ref="foreign-quest", run_ref="foreign-work", root_ref="foreign-root"))
         denied = _call(runtime, _channel(runtime, foreign), "research_workspace.materials.read", **child_arguments)
         assert denied["structuredContent"]["code"] == "material_not_visible"
         assert runtime.owners.human_collaboration.query_work_material(reference_ref)["read_ranges"][0]["bytes"] == 20

@@ -18,14 +18,17 @@ from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 
 
-def _workspace_bytes(path: Path) -> int:
+def _workspace_bytes(path: Path, protected=()) -> int:
     root_info = path.lstat()
     if not stat.S_ISDIR(root_info.st_mode) or path.is_mount():
         raise OwnerConflict('workspace_cleanup_unsafe_boundary')
     total = 0
     for directory, names, files in os.walk(path, followlinks=False):
+        names[:] = [name for name in names if Path(directory) / name not in protected]
         for name in (*names, *files):
             child = Path(directory) / name
+            if child in protected:
+                continue
             info = child.lstat()
             if (stat.S_ISLNK(info.st_mode) or info.st_dev != root_info.st_dev
                     or child.is_mount() or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))):
@@ -34,11 +37,14 @@ def _workspace_bytes(path: Path) -> int:
     return total
 
 
-def _workspace_entries(path: Path) -> dict[str, dict[str, int]]:
+def _workspace_entries(path: Path, protected=()) -> dict[str, dict[str, int]]:
     entries = {}
     for directory, names, files in os.walk(path, followlinks=False):
+        names[:] = [name for name in names if Path(directory) / name not in protected]
         for name in (*names, *files):
             child = Path(directory) / name
+            if child in protected:
+                continue
             info = child.lstat()
             identity = {'device': info.st_dev, 'inode': info.st_ino, 'type': stat.S_IFMT(info.st_mode)}
             if not stat.S_ISDIR(info.st_mode):
@@ -74,7 +80,7 @@ def _write_cleanup_scope(journal: Path, scope: dict) -> None:
         os.close(descriptor)
 
 
-def _cleanup_scope(candidate, path: Path, journal_root: Path, *, dry_run: bool):
+def _cleanup_scope(candidate, path: Path, journal_root: Path, *, dry_run: bool, protected=()):
     if journal_root.is_symlink() or journal_root.resolve(strict=False) != journal_root:
         raise OwnerConflict('workspace_cleanup_unsafe_boundary')
     journal = journal_root / (canonical_hash({'workspace_ref': candidate['workspace_ref'],
@@ -82,7 +88,7 @@ def _cleanup_scope(candidate, path: Path, journal_root: Path, *, dry_run: bool):
     identity = {'workspace_ref': candidate['workspace_ref'], 'cycle_ref': candidate['cycle_ref'],
         'path': str(path)}
     info = path.lstat()
-    entries = _workspace_entries(path)
+    entries = _workspace_entries(path, protected)
     if journal.exists() or journal.is_symlink():
         descriptor = os.open(journal, os.O_RDONLY | os.O_NOFOLLOW)
         try:
@@ -109,7 +115,9 @@ def _cleanup_scope(candidate, path: Path, journal_root: Path, *, dry_run: bool):
     return None, journal, scope
 
 
-def _pending_dependency(connection, candidate, path):
+def _pending_dependency(connection, candidate, path, *, pending_uploads=(), pending_intakes=()):
+    if candidate['workspace_ref'] in pending_uploads:
+        return 'pending_human_upload'
     cycle = connection.execute(text("SELECT status FROM ae_cycles WHERE cycle_ref=:ref"),
         {'ref': candidate['cycle_ref']}).first()
     if cycle is None or cycle.status != 'completed':
@@ -145,22 +153,106 @@ def _pending_dependency(connection, candidate, path):
         return 'active_or_recoverable_session'
     if (path / '.target-completion-intakes').exists():
         return 'pending_finalizer_intake'
+    if any(_paths_overlap(source, path) for source in pending_intakes):
+        return 'pending_asset_intake'
+    return None
+
+
+def _pending_intake_paths(connection):
+    paths = []
     for row in connection.execute(text("SELECT request_json,request_hash FROM rm_asset_intakes "
                                        "WHERE status IN ('queued','processing')")):
-        request = json.loads(row.request_json)
-        if canonical_hash(request) != row.request_hash:
+        try:
+            request = json.loads(row.request_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict('workspace_cleanup_pending_intake_invalid') from error
+        if not isinstance(request, dict) or canonical_hash(request) != row.request_hash:
             raise OwnerConflict('workspace_cleanup_pending_intake_invalid')
-        locator = request.get('source_locator')
-        if isinstance(locator, str):
-            if _paths_overlap(Path(locator), path):
-                return 'pending_asset_intake'
+        if isinstance(request.get('source_locator'), str):
+            paths.append(Path(request['source_locator']))
+    return tuple(paths)
+
+
+def _protected_originals(connection):
+    """Stored custody and human selections protect physical originals, even retired ones."""
+    paths = set()
     for row in connection.execute(text("SELECT source_locator FROM rm_asset_custodies "
                                        "WHERE custody_mode='linked_local'")):
         if not row.source_locator:
-            return 'linked_local_locator_unavailable'
-        if _paths_overlap(Path(row.source_locator), path):
-            return 'linked_local_original'
-    return None
+            raise OwnerConflict('linked_local_locator_unavailable')
+        original = Path(row.source_locator)
+        if not original.is_absolute():
+            raise OwnerConflict('linked_local_locator_unavailable')
+        paths.add(original)
+    for row in connection.execute(text(
+            "SELECT r.selection_json,r.selection_hash FROM hc_work_material_references r "
+            "JOIN hc_work_material_submissions s USING(submission_ref) "
+            "WHERE s.state IN ('ready','pending') AND "
+            "s.anchor_kind IN ('creation','manual','guidance','input','request')")):
+        try:
+            selection = json.loads(row.selection_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid') from error
+        if (not isinstance(selection, dict) or canonical_hash(selection) != row.selection_hash
+                or not isinstance(selection.get('absolute_path'), str)
+                or not Path(selection['absolute_path']).is_absolute()):
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid')
+        original = Path(selection['absolute_path'])
+        paths.add(original)
+    return tuple(paths)
+
+
+def _pending_human_uploads(connection):
+    workspaces = set()
+    for row in connection.execute(text(
+            "SELECT s.command_json,s.command_hash,s.receiver_json,w.workspace_ref "
+            "FROM hc_work_material_submissions s JOIN hc_work_material_roots w USING(submission_ref) "
+            "WHERE s.state='pending'")):
+        try:
+            command = json.loads(row.command_json)
+            receiver = json.loads(row.receiver_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid') from error
+        if (not isinstance(command, dict) or not isinstance(receiver, dict) or canonical_hash(command) != row.command_hash
+                or command.get('receiver') != receiver
+                or not any(root.get('workspace_ref') == row.workspace_ref for root in receiver.get('roots', []))):
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid')
+        if command.get('uploads'):
+            workspaces.add(row.workspace_ref)
+    return workspaces
+
+
+def _prune_workspace(path, protected, entries):
+    """Keep originals and their ancestors; delete siblings through held directory fds."""
+    def visit(directory, descriptor):
+        for name in os.listdir(descriptor):
+            child = directory / name
+            if any(child == original or original in child.parents for original in protected):
+                continue
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            saved = entries.get(str(child.relative_to(path)))
+            identity = {'device': info.st_dev, 'inode': info.st_ino, 'type': stat.S_IFMT(info.st_mode)}
+            if not stat.S_ISDIR(info.st_mode):
+                identity.update(size=info.st_size, mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
+            if identity != saved:
+                raise OwnerConflict('workspace_cleanup_scope_changed')
+            if any(child in original.parents for original in protected):
+                held = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+                try:
+                    if (os.fstat(held).st_dev, os.fstat(held).st_ino) != (info.st_dev, info.st_ino):
+                        raise OwnerConflict('workspace_cleanup_scope_changed')
+                    visit(child, held)
+                finally:
+                    os.close(held)
+            elif stat.S_ISDIR(info.st_mode):
+                shutil.rmtree(name, dir_fd=descriptor)
+            else:
+                os.unlink(name, dir_fd=descriptor)
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        visit(path, descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, retention_seconds=None):
@@ -201,6 +293,7 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
             {'limit': limit, 'offset': offset}).mappings().all()
     runtime._workspace_cleanup_offset = offset + len(candidates) if len(candidates) == limit else 0
     report = []
+    eligible = []
     for candidate in candidates:
         candidate = dict(candidate)
         if candidate['root_kind'] == 'target':
@@ -253,17 +346,40 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
                 if ae is None or getattr(ae, 'query_' + candidate['root_kind'] + '_stage_commit')(request.request_ref) is None:
                     record['reason'] = 'handoff_incomplete'
                     continue
-            with database.fenced_write() as connection:
-                reason = _pending_dependency(connection, candidate, path)
+            eligible.append((candidate, path, root, record))
+        except (OwnerConflict, OSError) as error:
+            record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
+    if not eligible:
+        return tuple(report)
+    with database.fenced_write() as connection:
+        try:
+            protected_originals = _protected_originals(connection)
+            pending_uploads = _pending_human_uploads(connection)
+            pending_intakes = _pending_intake_paths(connection)
+        except (OwnerConflict, OSError) as error:
+            for _, _, _, record in eligible:
+                record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            return tuple(report)
+        for candidate, path, root, record in eligible:
+            try:
+                if (root.is_symlink() or root.resolve() != root or path.is_symlink()
+                        or path.resolve(strict=False) != path):
+                    raise OwnerConflict('workspace_cleanup_unsafe_boundary')
+                reason = _pending_dependency(connection, candidate, path,
+                    pending_uploads=pending_uploads, pending_intakes=pending_intakes)
                 if reason:
                     record['reason'] = reason
                     continue
-                record['bytes'] = _workspace_bytes(path)
+                originals = tuple(original for original in protected_originals if _paths_overlap(original, path))
+                if any(path == original or original in path.parents for original in originals):
+                    record['reason'] = 'protected_original'
+                    continue
+                record['bytes'] = _workspace_bytes(path, originals)
                 if any(_paths_overlap(path, protected)
                        for protected in (*runtime._protected_storage_roots, journal_root)):
                     record['reason'] = 'retained_content_storage'
                     continue
-                reason, journal, scope = _cleanup_scope(candidate, path, journal_root, dry_run=dry_run)
+                reason, journal, scope = _cleanup_scope(candidate, path, journal_root, dry_run=dry_run, protected=originals)
                 if reason:
                     record['reason'] = reason
                     continue
@@ -271,14 +387,20 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
                 record['action'] = 'candidate'
                 if not dry_run:
                     # Recheck immediately before the fd-based recursive remove.
-                    _workspace_bytes(path)
-                    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                    try:
-                        shutil.rmtree(candidate['root_name'], dir_fd=descriptor)
-                    finally:
-                        os.close(descriptor)
-                    _write_cleanup_scope(journal, {**scope, 'state': 'removed'})
-                    record['action'] = 'removed'
-        except (OwnerConflict, OSError) as error:
-            record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
+                    _workspace_bytes(path, originals)
+                    if originals:
+                        _prune_workspace(path, originals, scope['entries'])
+                        record['bytes'] -= _workspace_bytes(path, originals)
+                        record['action'] = 'pruned'
+                        record['reason'] = 'originals_preserved_in_place'
+                    else:
+                        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                        try:
+                            shutil.rmtree(candidate['root_name'], dir_fd=descriptor)
+                        finally:
+                            os.close(descriptor)
+                        _write_cleanup_scope(journal, {**scope, 'state': 'removed'})
+                        record['action'] = 'removed'
+            except (OwnerConflict, OSError) as error:
+                record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
     return tuple(report)

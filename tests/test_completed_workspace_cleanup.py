@@ -407,8 +407,8 @@ def test_cleanup_preserves_external_originals_and_unsafe_or_recent_workspace(tmp
             now = time.time()
         report = tuple(item for item in runtime.target_run_runtime.cleanup_completed_workspaces(
             dry_run=False, now=now) if item['path'] == str(workspace))
-        assert report[0]['action'] == 'skipped', report
-        assert report[0]['reason'] == {'linked_local':'linked_local_original', 'linked_local_stage':'linked_local_original',
+        assert report[0]['action'] == ('pruned' if protection in {'linked_local', 'linked_local_stage'} else 'skipped'), report
+        assert report[0]['reason'] == {'linked_local':'originals_preserved_in_place', 'linked_local_stage':'originals_preserved_in_place',
             'symlink':'workspace_cleanup_unsafe_boundary', 'retention':'retention_period',
             'mount_detection':'workspace_cleanup_unsafe_boundary'}[protection]
         assert workspace.exists()
