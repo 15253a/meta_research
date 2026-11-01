@@ -26,6 +26,8 @@ from meta_research.target_execution_contract import (
     target_execution_context, target_execution_skill_text,
 )
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
+from meta_research.resource_preparation import resource_preparation
+from meta_research.root_capabilities import root_capability_profile
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime_harness import (
@@ -132,12 +134,20 @@ class TargetRunRuntime:
             and getattr(lifecycle, "cancel_ref", None) is not None
         )
 
+    @resource_preparation
     def process_once(self, target_ref: str) -> bool:
         """Wake one root turn or replay its one finalization boundary."""
 
         launch = self._agent_runtime.query_admitted_target_launch(target_ref)
         if launch is None:
             self._set_status(target_ref, "launch_pending")
+            return False
+        # Receipt verification also consumes the installed capability identity.
+        # Prepare it once before those reads and reuse it through this wake.
+        try:
+            root_capability_profile("target").as_dict()
+        except (OSError, UnicodeError, ModuleNotFoundError):
+            self._set_status(target_ref, "root_pending", "provider_resource_unavailable")
             return False
         # One immutable read cut lets the projection-level snapshot
         # caches deduplicate the shared verification subtrees inside
