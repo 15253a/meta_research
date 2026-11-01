@@ -1509,6 +1509,7 @@ def _validate_reasoning_resident_channel(
         "output_schema_hash",
         "reconciliation_operation_id",
         "discovered_tool_name",
+        "contract_documentation_hash",
     }
     for value in bindings:
         if (
@@ -1519,6 +1520,9 @@ def _validate_reasoning_resident_channel(
             != value.get("semantic_operation_id")
             or value.get("access_mode")
             not in {"read", "verify", "effect", "reconcile"}
+            or not isinstance(value.get("contract_documentation_hash"), str)
+            or len(value["contract_documentation_hash"]) != 64
+            or any(character not in "0123456789abcdef" for character in value["contract_documentation_hash"])
         ):
             raise ReasoningSkillUnavailable(
                 "reasoning_semantic_mcp_operation_binding_invalid"

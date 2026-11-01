@@ -42,9 +42,12 @@ ROOT_AGENT_ENVIRONMENT_OPERATION_IDS = (
     "research_graph.environments.reference",
     "research_graph.environments.reference.reconcile",
 )
-ROOT_AGENT_COMMON_OPERATION_IDS = (
+TOOL_DISCOVERY_OPERATION_IDS = (
     "tools.catalog.page",
     "tools.contracts.read",
+)
+ROOT_AGENT_COMMON_OPERATION_IDS = (
+    *TOOL_DISCOVERY_OPERATION_IDS,
     *RUNTIME_MATERIAL_OPERATION_IDS,
     "research_workspace.discover",
     "research_workspace.read",

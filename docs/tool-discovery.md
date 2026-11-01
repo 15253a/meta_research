@@ -25,6 +25,9 @@ The Harness checks the current root/attempt/fence before dispatch. A root waitin
 for a HumanRequest response only sees the operations permitted during that wait;
 resuming the same root restores its current execution scope. Revoked channels
 cannot read catalogs, load contracts or call previously discovered readers.
+Protected creation channels also grant discovery and contract reading alongside
+their existing material readers; they do not inherit the research root's effect
+operations.
 
 ## Adding or changing an operation
 
@@ -58,3 +61,6 @@ as placeholders. Preserve each slice's changes to shared guidance when merging.
 `tests/test_tool_discovery.py` checks catalog paging, contracts and direct readers;
 `tests/test_tool_discovery_integration.py` uses admitted roots and public MCP HTTP
 to check restricted grants, revocation, HumanRequest waiting and resumption.
+`tests/test_tool_discovery_creation.py` checks the restricted creation channel;
+the Reasoning resident tests exercise its strict binding consumer on a real
+Harness-issued channel.

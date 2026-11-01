@@ -10,6 +10,7 @@ import stat
 
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.protected_creation_runtime import ProtectedCreationRuntime
+from meta_research.semantic_mcp import TOOL_DISCOVERY_OPERATION_IDS
 from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
 
 
@@ -85,7 +86,7 @@ class ProtectedCreation:
         from meta_research.root_resident_mcp import RootResidentMcpAccess
         if self._terminal or self.owner._creation_gateway is None or self.owner._creation_endpoint is None:
             raise OwnerConflict("creation_material_channel_unavailable")
-        operations = (*CREATION_MATERIAL_OPERATION_IDS, *extra_operations)
+        operations = (*TOOL_DISCOVERY_OPERATION_IDS, *CREATION_MATERIAL_OPERATION_IDS, *extra_operations)
         connection, _ = self.owner._creation_gateway.issue_channel(
             run_ref=self.operation.operation_ref, attempt_ref=self.operation.operation_ref,
             root_session_ref=self.operation.binding.location.root_session_ref,

@@ -107,6 +107,10 @@ class _MalformedChannelAuthority(_FullConformanceAuthority):
                 "access_mode": "effect",
                 "reconciliation_operation_id": None,
             }
+        elif self._mutation == "unknown_binding_field":
+            bindings[0] = {**bindings[0], "unknown_authority": True}
+        elif self._mutation == "invalid_documentation_hash":
+            bindings[0] = {**bindings[0], "contract_documentation_hash": "not-a-hash"}
         else:  # pragma: no cover - protects the test double itself
             raise AssertionError(self._mutation)
         return replace(
@@ -126,6 +130,8 @@ class _MalformedChannelAuthority(_FullConformanceAuthority):
             "effect_without_reconcile",
             "reasoning_semantic_mcp_reconciliation_unavailable",
         ),
+        ("unknown_binding_field", "reasoning_semantic_mcp_operation_binding_invalid"),
+        ("invalid_documentation_hash", "reasoning_semantic_mcp_operation_binding_invalid"),
     ],
 )
 def test_malformed_effect_admission_fails_before_provider(
@@ -237,9 +243,10 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
             )
         )
 
+        provider_runner = _SequenceRunner([_stage_output()])
         adapter = _adapter(
             tmp_path / "real-adapter",
-            _SequenceRunner([]),
+            provider_runner,
         )
         adapter.bind_full_conformance_authority(runtime.harnesses)
         binding = adapter.runtime_binding()
@@ -310,6 +317,16 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
         assert [
             tool["name"] for tool in response["result"]["tools"]
         ] == list(REASONING_ROOT_SEMANTIC_OPERATION_IDS)
+
+        # Exercise the public provider adapter with the live Harness binding,
+        # not the older hand-built eight-field binding used by unit fixtures.
+        adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+        draft = adapter.generate_draft(replace(
+            _request(), run_ref=run.run_ref, attempt_ref=run.attempt_ref,
+            root_session_ref=run.root_session_ref, fence_ref=run.fence_ref,
+            runtime_binding=binding))
+        assert draft.draft == _stage_output()
+        assert len(provider_runner.calls) == 1
 
         with pytest.raises(
             HarnessAdmissionError,
