@@ -13,7 +13,7 @@ from meta_research.codex_runtime import (
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, research_system_prompt
-from meta_research.research_guidance import shared_reference_bundle_hash, shared_reference_instructions
+from meta_research.research_guidance import shared_reference_bundle_hash, shared_reference_instructions, cycle_role_instructions
 from meta_research.resource_preparation import prepared_resource
 
 
@@ -160,6 +160,7 @@ class RootCapabilityProfile:
                 "prompt": RESEARCH_SYSTEM_PROMPT,
                 "references": shared_reference_bundle_hash(),
                 "index": _shared_reference_index_hash(),
+                "role_method": cycle_role_instructions(self.root_kind),
             }),
             "model_ref": CODEX_MODEL_REF,
             "cli_reasoning_preset": CODEX_ROOT_REASONING_PRESET,
@@ -196,7 +197,8 @@ class RootCapabilityProfile:
             "--config",
             "developer_instructions=" + json.dumps(
                 research_system_prompt(output_language) + "\n\n"
-                + shared_reference_instructions(self.root_kind), ensure_ascii=False
+                + shared_reference_instructions(self.root_kind) + "\n\n"
+                + cycle_role_instructions(self.root_kind), ensure_ascii=False
             ),
         )
 

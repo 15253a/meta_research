@@ -2,18 +2,33 @@
 
 当前 scoped 工具目录决定实际可用能力，输入已有内容不要求按固定顺序再读。按需要选择以下阶段入口及共享发现／reader：
 
-工作资料按[共享资料处理合同](../../references/materials-and-custody.md#工作资料的当前处理与后继交接)处理；`materials.discover.retained_treatments` 提供已选内容与原采用关系。当前根交接未读、待验证部分及影响；需要上游重做或继续投入时，由本 Reasoning 按现有后继入口决定，不从材料反馈直接创建 Cycle。
+工作资料的读取、加工和保管按[材料与保管](../../references/materials-and-custody.md)处理；研究积累及实际用途从 RG 对应入口发现，涉及人类协作历史时经 RG.humaninteract 返回准确入口读取。当前根交接未读、待验证部分及影响；需要上游重做或继续投入时，由本 Reasoning 按现有后继入口决定，不从材料反馈直接创建 Cycle。
 
 | 操作 | 用途 |
 | --- | --- |
 | `advancement_engine.reasoning_stage_run.observe` | 核验当前请求、epoch 和 AE 闭包。 |
 | `research_memory.reasoning_evidence.read` | 按研究需要读取精确冻结证据与角色，包括已核验 Plan 复用来源；可用列表本身不表示实际采用。 |
 | `research_graph.reasoning_context.read` | 读取本次冻结的已接纳 Question／Quest／Goal、历史身份与领域上下文，结合正文作独立研究判断；系统使用同一冻结版本装配元信息。 |
+| `research_graph.questions.page` | 按需发现同 Quest 的问题、状态及准确正文／历史 reader；按返回范围和分页继续，帮助比较相关路线。 |
+| `research_graph.question_history.read` | 按精确 Question 读取题目记录与已接纳综合历史，包括暂放题；沿返回的准确入口展开必要正文。 |
+| `research_graph.question_relations.read` | 读取相关问题及已有横向关系说明，核实联系的依据和适用范围。 |
 | `research_graph.quest_goal.read` | 读取当前 Quest Goal、持续条件、本逻辑操作冻结工作切面和指导对齐。 |
-| `research_graph.quest_goal.evolve` / `.reconcile` | 在实质新指导或证据要求改向时提交完整、有原因的新 Goal revision；未知效果仅对账原 effect。 |
-| `research_graph.target_formal_results.read` | 按精确 target_ref 展开 VariantRun、适用评价和 MetricResult，包括已交接但尚未评价的 Run；resource_candidates 提供已接纳 Dataset／Environment 候选、精确 RM binding、当前生产归属和 TargetCommit／manifest 身份，按主 Skill 整理步骤使用。 |
+| `research_graph.quest_goal.evolve` / `.reconcile` | 真正改变整体目标或完成标准时，沿[正式目标演化流程](../../references/cycle-work.md)判断变化并形成完整新 Goal revision，未变项沿有效基准继承；未知效果对账原操作。 |
+| `research_graph.target_formal_results.read` | 按精确 target_ref 展开 VariantRun、适用评价和 MetricResult，包括已交接但尚未评价的 Run；资源候选按[主 Skill 的整理步骤](../SKILL.md#交接前整理已接纳-target-资源)与共享登记流程使用。 |
 
-共享六入口及分页 reader 用于发现同 Quest 历史，不把首批目录当作全集。人类输入沿 `human_request.read` 读真实原话及材料，意见、授权、HumanRequest satisfied 与 Quest 完成确认分别核对。
+本轮 `cycle_focus` 原文与来源随首轮直接提供；需要补读时沿返回的正式 transition 入口取得同一正文，读取、恢复及缺失处理遵循[NextCycleProposal 合同](contract.md#nextcycleproposal)。字段沿现行 transition 合同保存、读取与接续。
+
+检索或复用历史时读[研究导航](../../references/research-navigation.md)，不把首批目录当作全集。人类输入与处理历史经 RG.humaninteract 返回的准确入口读取，按[人类协作指导](../../references/human-guidance.md)区分意见、授权、HumanRequest satisfied 与 Quest 完成确认。
+
+## 上下文装配与准确读取
+
+首轮通过正式 ContextPack 呈现完整 Question、Goal／指导、FormalPlan 及全部采用来源绑定、Bundle 最后非空已接纳策略 notes，以及每项 Target 的关键结果和限制。已交付装配沿 `context_presentation`、`stage_context_access` 和研究主链的冻结输入进行；按返回 reader 展开准确原文与分页，不用 latest 替换。正式修订保留当前声明与原依据。
+
+`cycle_focus` 已由 Reasoning 的输出 schema、原接纳及后继装配接通；正文随 transition 保存与读取，各根沿实际前驱或首轮来源取得同一重心。恢复仍在原根、原目录和准确冻结输入上进行。按[语义契约](contract.md)修正缺失或冲突，不能补造首轮前驱。
+
+Target 文献整理继承共享材料保管与导航合同。现有正式 DeepFetch → LiteratureSnapshot → QuestionLiteratureRevision 路径可以读取；Target 资源候选专用链提供 Dataset／Environment。普通取得文献的导入、关联以及 Target research_notes 阅读判断进入文献索引尚待文献能力接通。当前只沿真实可用工具读取与保留说明，不能虚构 `literature_candidates`、登记接口或成功回执。需要这些入口时记录具体未完成步骤；接口缺失不是无候选，完整文献整理验收仍待完成。
+
+历史跨轮发现、三轮目录和回收、材料保管及工具目录的新增能力分别按实际目录和 reader 可用性使用；文件中的设计语义不授予额外权限。
 
 ## 写入权限与资源登记
 

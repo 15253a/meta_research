@@ -2,16 +2,16 @@
 
 获取与整理本身可以是 Target 的研究工作。按研究价值、替代成本和预计复用决定保存源材料、处理结果、划分或标注；保留有价值派生物时尽可能保存稳定源副本，并在研究说明记录来源、处理和局限。版本及关系应有研究意义，无需逐文件或逐中间步骤登记。
 
-人类答复、主动资料与 Agent 自取材料按[共享工作资料合同](../../references/materials-and-custody.md#工作资料的当前处理与后继交接)初读、处理、选择保管并反馈影响。共同 `materials.copy` 的副本及临时结果留在 `.work-materials/`，只有明确选择才保管；需要正式研究产物的内容沿下述 Target 交接声明实际工作与精确路径。后继读取所选材料的 RM reader 与原用途，不能把未选副本因目录位置带进自动产物范围。
+人类答复、主动资料与 Agent 自取材料的读取、工作副本和选择保管按[材料与保管](../../references/materials-and-custody.md)处理；人的提交及影响判断沿[人类材料与研究用途](../../references/human-guidance.md#人类材料与研究用途)。`materials.copy` 的副本及临时结果留在 `.work-materials/`，只有明确选择才保管；需要正式研究产物的内容沿下述 Target 交接声明实际工作与精确路径。后继读取所选材料的精确 reader 与原用途，不能把未选副本因目录位置带进自动产物范围。
 
 选定数据通常放在 `outputs/data/`，checkpoint 状态通常放在 `outputs/checkpoints/`；其他工作区位置或不同角色用结果中的 `retained_artifacts` 明确选择，其精确归属与修订方式见[正式工作交接](formal-work.md#实现快照状态与局部输入)。实现、分析和日志沿现有交接路径保存。按 `execution_contract.artifact_limits` 核实本次行为；正常交接会流式保存大型文件和目录，无需另填大小模式。多 GB 本身不要求拆成小压缩包或请人导入。各 Run 的数据归入 `formal_runs[].artifact_paths`，评价报告归入对应评价，需独立复用的生产者和状态分别寻址。
 
-最终交接前完成写入，并保持所选路径稳定至 Owner 接纳。持久保存由 Owner 接纳的精确版本与内容 receipt 证明；说明中的路径、hash 或单独 Dataset／Environment 登记都不能代替。暂存、未接纳材料留在工作区。原始数据、派生数据、文字、湿实验记录和辅助材料走相同保存路径。
+最终交接前完成写入，并保持所选路径稳定至 Owner 接纳。持久保存由 Owner 接纳的精确版本与内容 receipt 证明；说明中的路径、hash 或单独 Dataset／Environment／Literature 登记都不能代替。暂存、未接纳材料留在工作区。原始数据、派生数据、文字、湿实验记录和辅助材料走相同保存路径。
 
-Target 接纳后，Bundle／Reasoning 在同一整理环节用精确 RM binding 登记值得复用的 Dataset 版本、Environment 和用途；Target 的候选交接见[正式工作交接](formal-work.md)。以 `research_graph.datasets.derive` 关联源版本和派生版本，说明真实处理；多个来源分别记录。关系保存来源，不复制原件，也不自动构成科学结论。用 `research_graph.datasets.page` 的 `dataset_version_ref` 和 `direction` 读回来源或派生关系，并核对精确版本、当前用途引用及原件。
+Target 的候选交接见[正式工作交接](formal-work.md)；接纳后由 Bundle／Reasoning 按[资源整理与正式登记](../../references/materials-and-custody.md#资源整理与正式登记)选择值得复用的 Dataset、Environment、Literature 和用途。文献原作保持其外部来源，本次阅读与分析按实际工作归属保存。源版本、派生版本及多个来源的真实处理分别关联，核对精确版本、当前用途与原件；关系不复制原件，也不自动构成科学结论。
 
-`linked_local` 版本引用稳定原文件，不构成备份。保留其底层副本，清理前核实是否是唯一副本或仍被已接纳版本使用。已有版本保持不可变，有意义的内容变化沿当前 intake 形成新版本。
+`linked_local` 不构成备份。正式保管文件、临时工作副本和外部原件的保留与清理按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理。已有版本保持不可变，有意义的内容变化沿当前 intake 形成新版本。
 
-Cycle 业务完成且必要交接结束后，临时工作副本才进入系统清理范围；具体清理条件见根系统提示。Target 交接只结束当前工作，后续 Bundle／Reasoning 仍可使用本轮工作资料。交接前选中需要长期保留的原件与处理结果，核验 RM 精确版本真实可读；仍用于执行、恢复、待接纳或后续工作的路径继续保留，linked_local 外部原件保持原位置。
+Target 交接只结束当前工作，后续 Bundle／Reasoning 仍可按授权使用本轮资料。跨 Cycle 接续、正式内容保留及物理清理统一按上述共享生命周期处理，核对执行、恢复和待接纳等真实依赖。
 
-仅为具体无法访问的来源、缺少权限、额外资源或必须由人执行的动作提出 HumanRequest；同时推进已授权的独立工作。真实获取或保存失败应说明当前已保存位置、缺少步骤和继续条件。
+获取、保存或相关研究判断需要人的专业知识、判断、权限、资源或行动时，按[主动发起与接续 HumanRequest](../../references/human-guidance.md#主动发起与接续-humanrequest)及时请求协作，并沿其等待与恢复规则安排独立工作。真实获取或保存失败应说明当前已保存位置、缺少步骤和继续条件。

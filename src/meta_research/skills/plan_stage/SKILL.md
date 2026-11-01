@@ -1,50 +1,44 @@
 ---
 name: plan-stage
-description: 根据当前研究重心、构想与历史证据选择本轮投入及复盘条件，形成可接纳 PlanDocument；用于 Plan 阶段草稿、独立审阅和按反馈修订。
+description: 将当前 Question、完整 IdeaSet 和必要前驱交接转化为本轮研究工作；用于 Plan 的调查、证据判断、Brief、独立审阅与续接修订。
 ---
 
-# Plan：选择本轮工作
+# Plan：组织值得开展的研究
 
-把已接纳 Question、IdeaSet 与已有研究转化为值得投入的工作和重新判断的检查点。Question 可以跨多轮推进，本轮范围由当前研究需要决定。按根系统提示执行六入口、预算、人类输入和语言偏好；委派子智能体时传递范围与输出语言。
+接住当前认识，判断本轮值得继续什么、可以复用什么、还需取得什么观察，并交出后续能开展工作的 Plan。Question 可以跨多轮推进，一轮也可以只完成阅读、分析、准备或负结果调查。
 
-字段语义见[Plan 契约](references/contract.md)；发现、精确引用与反馈处理见[Owner 操作](references/owner-operations.md)。
+输入与输出语义见[Plan 合同](references/contract.md)。需要选工具、理解返回、采用来源或处理接纳反馈时，读[工具与 Owner 操作](references/owner-operations.md)；查找研究积累时读[研究导航](../references/research-navigation.md)，安排投入与委派时读[研究指导](../references/research-guidance.md)。
 
+## 接住本轮任务
 
-正式人类指导按运行时加载的[共享指导合同](../references/human-guidance.md)读取原文、声明处理并延续约束。
-## 1. 读取当前认识
+理解当前完整 Question、目标与有效条件，以及**本轮明确绑定的一份完整 IdeaSet 中的全部 Idea**。正常路径使用本 Cycle 前一 Idea 阶段的正式产物；跳过 Idea 时使用前驱 Reasoning 明确沿用的准确集合。其原始来源可以更早，仍保留原身份。本轮接续目的来自实际前驱 Reasoning，不能用 IdeaSet 的生产轮次代替。
 
-先读上轮综合、notes、已完成工作和相关证据。默认缺上轮摘要时，用 `research_memory.stage_context.read` 的 `source=question_history` 找已接纳结果，再用 `source=scientific_outcome`、`source_ref=outcome_ref` 读正文；缺摘要不代表没有历史。
+应用组织首轮及必要续轮／恢复的业务 user 时，按[本次阶段定位](../references/cycle-work.md#本次阶段定位)直接在开头说明请求绑定的 Cycle 身份／已有序号、当前为 Plan 阶段，以及本 Cycle 的 `cycle_focus` 原文；准确来源随输入保留。正常后继中，重心由上一 Cycle 的 Reasoning 为本 Cycle 给出。结合实际材料自主确定本轮责任、投入和具体安排，必要取舍及理由留在既有 notes；首个 Cycle 的起步来源及与稳定 Question、有效指导和正式承诺的关系见[本轮重心](../references/cycle-work.md#本轮重心)。经过或跳过 Idea 都保留这份焦点。
 
-本 Cycle 的 Idea 暂存材料与本工作人类交付文件，用 `research_workspace.discover`／`read` 按根系统提示发现并读取；核对真实内容后判断其用途，正式证据仍需原接纳路径。
+结合必要交接，辨认已有判断及限制、未决问题和本次投入理由。前两轮的其他 IdeaSet、草稿与中间认识按需读取，更远构想从 RG Question 发现；已知准确引用直接读。复用 IdeaSet 后仍重新判断本轮义务和覆盖，旧 Plan 的 covered、gap 与 Brief 不自动继承。
 
-明确本轮继续、复用及补充什么。复用 Idea 不继承旧 Plan 的 coverage、gap 或 Brief 状态；仍适用的工作保留精确来源，重做需说明新条件、疑点或预期增量。新 Cycle 或空 TargetGraph 本身不要求重跑。
+## 围绕判断调查
 
-完成条件：本轮投入依据与历史关系清楚，关键采用材料已读到精确原文。
+先明确哪项未知会改变本轮安排，再选择能回答它的入口。近期脚本、工作副本或暂存认识可沿本次已获授路径用原生文件；研究积累及关系从 RG 查找，方法、方案、实际执行、产物和评价从 Baseline 进入，再沿准确 reader 读 RM 正文。当前协作和交接可直接用 HC／WF；入口按问题选择，不按材料年龄固定分流。
 
-## 2. 选择义务与检查点
+读已有工作时保留当时的目标、条件、实际结果与限制。优先复用仍适用的成果；需要复核时说明影响当前判断的疑点、条件变化或预期增量。阅读、分析、数据准备、脚本与子 Agent 都可用于形成依据，工具分组不缩减已获授能力。工作副本和暂存分析可供思考，正式支持仍沿准确来源与接纳事实采用；保管取舍见[材料与保管](../references/materials-and-custody.md)。
 
-选择非空 obligations：`statement` 表达本轮调查责任，`minimum_support` 和 notes 说明投入依据、拟取得观察与复盘条件。可调查广泛缺口或具体假设，履行意味着做过相关工作并如实报告，不能保证假设获支持或问题被解决。完整性只检查本轮承诺。
+已有信息足以说明本轮工作目的、支持边界和下一步取舍，且没有尚未处理、会改变该取舍的关键已知依据时，可以形成计划。若冲突、遗漏或未读原件可能改变安排，就继续有针对性地调查。工具的未命中、未完分页、无记录、权限问题和原件不可读含义不同，按返回继续或处理，不能由空页推出没有历史。确实没有相关记录的新任务也可依据当前 Question、IdeaSet 和现有材料开展工作。
 
-每项义务通过 `question_trace` 指向实际相关 Question 字段；`idea_relevance` 仅记录真正影响义务的候选、角色和理由。读完整 IdeaSet 后取舍，无需逐项重复所有候选。
+## 形成义务、支持与 Brief
 
-局部工作条件与 Quest／Question 总体完成标准分开。已具备数据、方法和授权的局部工作可先取得限定证据；确需整体资格时在相关 Brief 说明。冻结核心科学语义后，由 Bundle／Target 自主判断实现、实际方法归属、补充核验与顺序；需要改变核心承诺时由 Reasoning 与后继 Cycle 承接。
+选择本轮交给判断、安排与复盘的 obligations：说明要调查或交付什么，怎样的观察、支持或产物足以履行责任，以及需要复盘的边界。它们不保证正结果、全部在当轮完成或解决整个 Question。只追溯实际相关的 Question 字段和 Idea；取舍全部候选之后，无需逐项重复候选。草稿可随认识、重心、投入和有效指导修订，同时重审受影响的覆盖与 Brief，保留重要变更理由；不能靠删除未完成责任或降低支持标准把失败改写成 covered。
 
-## 3. 核实证据并形成 Brief
+对每项义务分别判断已有支持与本轮安排：`covered` 说明已实际履责的支持主张和适用边界；`gap` 如实保留已有支持与未履行部分。值得本轮开展的补充工作用 Brief 承接，可以只推进部分缺口；未安排 Brief 的 gap，在既有 `insufficiency` 中同时说明实际不足、为何本轮不安排及其依据与限制。可开展不等于本轮值得开展，但困难、耗时或一次未命中本身不足以支持放下。未安排且缺少有依据的取舍时，规划仍未完成，应继续调查或修订。有效指导与交付要求继续保留；没有选入本轮的其他未知放在必要 notes 中。负结果、定性分析及人类输入按真实内容判断研究价值。
 
-先用相关历史或六入口索引发现，再按需分页和读取精确正文。首目录不限制候选全集，同 Quest 后续发现的已接纳来源可正式选用；未取得身份的新发现先作为研究观察。
+Brief 交代目的、需要取得的观察或产物、边界条件、相对已有工作的增量及实际 Idea 来路，可以有多份，由 Bundle 组织实际 Target，不预定一份 Brief 恰好一个 Target。计划复用的脚本、数据等沿统一来源集合准确引用，供后继选择；普通材料可以修复或替换，明确固定的科学条件仍须保持，具体边界见 Plan 合同。阅读、数据整理、分析、负结果调查和写作均可成为有研究目的的工作。Bundle／Target 决定具体实现、方法归属、依赖与执行顺序。规划形成充分判断后，Brief 非空则进入 Bundle，其他未安排的 gap 仍保留；Brief 为空则由 AE 核验正式 Plan 后跳过 Bundle，交 Reasoning 综合。跳过不表示所有责任已履行，也不表示 Question 已完成。
 
-`research_graph.baselines.page`／`read` 的 `limit` 是条目数，默认 20，范围 1–100；`read` 只传精确 `baseline_ref` 即可读取方法合同，展开关联实体时再按返回的 `next_offset`／`next_evaluation_offset` 分页。各工具的分页单位独立，正文 reader 的字符上限不适用于 Baseline 列表。遇 `baseline_query_invalid` 时按当前 schema 修正参数，再继续读取。
+材料、授权或答复仍是作出当前规划判断的必要条件时，保留已完成认识，处理可独立继续的工作，按问题尝试恢复或通过 HC 求助。无可独立继续的工作且请求成功后，结束本次执行并交回系统等待，不自行轮询，也不结束原 Session 或提交未完成 Plan；正式答复后由系统恢复原根，具体步骤见[工具与 Owner 操作](references/owner-operations.md)。若现有依据已足以决定本轮不安排某项工作，可按上述 gap 规则交接；已有 HumanRequest、在途承诺及有效人类条件仍按原生命周期处理，不因该判断被静默关闭或绕过。Idea 的 NoViable 沿既有流程处理，本阶段不另造 Plan NoViable。
 
-逐 obligation 判断 `covered | gap`，写支持主张及边界。`covered` 至少有一个实际 evidence use；无测量观察、分析、负结果、人类输入等可按真实内容使用，来源类型不预设科学价值。`gap` 的非空 insufficiency 说明实际不足；本轮未安排的 gap 同时说明不安排理由、依据与限制。按真实需要选择本轮推进哪些 gap，可部分推进，也可多份 Brief 推进同一 gap。
+## 独立审阅、修订与续接
 
-Brief 用 goal、characteristics、boundary constraints、semantic delta 和真实 Idea 来源说明目的、可接受观察与局部限制；计划复用材料按需写入 `reuse_material_refs`。Target、实现和依赖由 Bundle 决定。adapter 按 Brief 是否为空派生 `bundle_disposition`；无 Brief 时保留真实 gap 和未安排理由，交 Reasoning 综合。
+在连续工作中委派原生独立子 Agent，提供完整草稿、具体审阅问题及必要依据和获授入口。让其审视工作是否有意义、已有成果是否被合理使用、支持是否充分，以及已安排工作与未安排缺口的取舍是否有依据，质疑遗漏与过早放弃。根取得反馈后核实并自行决定修订，随后交付最终科学内容；审阅者的批准不是正式接纳条件。
 
-完成条件：每项义务有唯一覆盖判断，所有新工作对应真实缺口，复用来源与适用边界可核查。
+新指导、求助答复、拒绝反馈或必要恢复到来时，沿原工作处理实际变化，重审受影响的义务、来源、覆盖和 Brief，保留仍适用的认识。指导的正文、范围、力度及处理见[人类协作](../references/human-guidance.md)；涉及整体目标或已承诺核心科学语义时，按[Cycle 工作与目标演化](../references/cycle-work.md)处理。
 
-## 4. 独立审阅与提交
-
-委派原生独立子智能体审阅完整草稿和关键原文；根据自由格式反馈及自身判断修订并交接完整最终内容。同根自查不替代独立审阅，没有具体问题也可改稿。Owner 绑定草稿／最终 hash 并核验科研来源，不要求审查表单、审阅者身份证明或批准记录。
-
-输出 `answer_contract`、`coverage`、`experiment_briefs`、`selected_evidence_bindings` 和必要 `notes`。采用集合同时保留科学支持及 Brief 计划复用的材料，精确绑定直接复制准确 reader 的 `selected_evidence_binding`，格式见 Owner 操作。adapter 原样保存整组采用来源并派生 `evidence_reuse_set`、`gap_set`、`idea_trace`、`bundle_disposition`、其他来源绑定和合同 hash。拒绝时修订具体原因并保留来源；未知效果先对账原身份。
-
-完成条件：真实 RM／RG 接纳及 AR／AE 交接可验证。Plan 不创建 receipt、StageCommit、Bundle Run 或 Target；无新实验只提供由 AE 核验的 skip 依据。
+最终交接包括本轮责任、已有支持及限制、剩余缺口、Brief 与未安排理由、真实采用来源，以及必要 notes。写作等产物责任按[Plan 合同的两个时点](references/contract.md#写作与产物交付)判断，已有科学支持不替代尚未完成的交付。准确绑定、receipt 与阶段推进由平台按实际结果处理；Plan 不把文件写成、工具成功或审阅完成当作正式接纳。

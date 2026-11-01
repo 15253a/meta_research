@@ -4,7 +4,9 @@
 
 ## 实际 Run、评价与产物
 
-每个 `run_key` 对应一次真实实施，`attempt_key` 对应该 Run 内的一次真实评价。工具调用、调试和机械重试通常属于实施细节；只有形成独立实质研究比较时才按真实因果关系另列。审计、观察、推导和湿实验同样使用该层级。
+Run 的保存粒度由其评价对当前科研任务的有效性决定：结合要回答的问题、比较对象和可解释的评价边界组织真实实施。每个 `run_key` 对应在这个边界上有独立研究含义的一项真实工作，`attempt_key` 对应该 Run 内的一次真实评价。共同支持同一研究判断的折、随机种子、训练阶段、批次、检查点或工具操作，可作为 Run 内部明细保存；形成有科研意义的独立实施与评价对象时，按真实因果关系另列。
+
+Run 数量不预设。按研究含义合并或拆分声明时，保留原始执行明细、产物、指标及新旧归属对应关系，在研究说明中解释粒度与评价如何支持当前科研任务。审计、观察、推导和湿实验同样适用；失败或尚未评价的真实工作按事实保留。
 
 ```json
 {
@@ -68,7 +70,7 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 ## 实现快照、状态与局部输入
 
-修订实现前保留每个实际 Run 使用的快照。多版本可放在 `implementation/run-a/`、`implementation/run-b/`，各 Run 用 `implementation_paths` 精确选择；多个 Run 可选择同一快照。只有一份普通 `implementation/` 时可省略选择器，多条目时逐 Run 明确指定。系统派生实现版本，显式 `implementation_revision_ref` 仅断言该精确值。记录真实命令和观察输出，hash 本身不证明实施。
+修订实现前保留每个实际 Run 使用的快照。多版本可放在 `implementation/run-a/`、`implementation/run-b/`，各 Run 用 `implementation_paths` 选择自己实际使用的实现文件或目录；多个 Run 可选择同一快照，也可分别选择父目录和其中的文件或子目录。只有一份普通 `implementation/` 时可省略选择器，多条目时逐 Run 明确指定。系统派生实现版本，显式 `implementation_revision_ref` 仅断言该精确值。记录真实命令和观察输出，hash 本身不证明实施。
 
 按研究需要保留状态；`checkpoint_policy` 不要求数量，也不把产物存在作为门槛。checkpoint 通常保存在 `outputs/checkpoints/`；其他位置用 `retained_artifacts` 明确 `role=checkpoint`。`checkpoint_paths` 声明该 Run 实际产生的精确状态路径，单独列路径不会改变保留角色。
 
@@ -86,14 +88,18 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 生产者须在 `artifact_paths` 或 `checkpoint_paths` 声明该路径。最终交接冻结后，RG 解析为精确 RM 版本；前向引用和循环被拒绝。既有已接纳输入继续用 `input_refs`。
 
-## 可复用 Dataset 与 Environment 候选
+## 可复用 Dataset、Environment 与 Literature 的交接
 
 有独立数据或环境复用价值的已保存产物，在结果中分别列 `dataset_candidates`／`environment_candidates`，每项含 `artifact_path`、`name`、`purpose`。Dataset 选择实际保留为 data／analysis 的精确文件或目录；Environment 也可引用既有 `implementation/` 实现快照、checkpoint 或日志条目，保存环境代码、配置、运行说明或已知条件。其他工作区位置先用 `retained_artifacts` 选择保留内容及角色。候选名称与用途对应所选精确范围；环境说明写清资源位置、实际构建或改动、已知使用条件及尚未核实的事项，供后继登记和采用。
 
-已有资源的直接登记按根系统提示的 Environment 规则执行；本 Target 新建或改动的成果先走这里的候选交接。现成持久目录、安装或服务的跨机器适配不构成入库前提；设备说明与使用记录作为数字材料保存，设备本体按真实来源表达。
+已有资源的直接登记及适配关系按[研究导航](../../references/research-navigation.md)的 Environment 分支判断；本 Target 新建或改动的成果先走这里的候选交接。现成持久目录、安装或服务的跨机器适配不构成入库前提；设备说明与使用记录作为数字材料保存，设备本体按真实来源表达。
 
-系统在 data／analysis 内按候选边界冻结资产并保留相邻产物；其余角色选已有保存条目，`implementation_paths` 可选择完整实现目录快照，内部文件沿精确版本按需读取。候选须归属真实 Run／Evaluation：多生产者或显式 `artifact_paths` 时使用相同精确路径，实现快照归属选择它的实际 Run。两类入口可指同一精确条目并共用原件；候选之间的父子范围应改为不重叠边界。收尾反馈后保留已有成果，在同一 Session 修正声明后再次交接。
+上述 Dataset／Environment 候选由系统在 data／analysis 内按候选边界冻结资产并保留相邻产物；其余角色选已有保存条目，实现文件与目录按各 Run 的 `implementation_paths` 保存为精确条目。候选须归属真实 Run／Evaluation：多生产者或显式 `artifact_paths` 时使用相同精确路径，实现快照归属选择它的实际 Run。两类入口可指同一精确条目并共用原件；候选之间的父子范围应改为不重叠边界。收尾反馈后保留已有成果，在同一 Session 修正声明后再次交接。
 
-Target 先沿 Baseline → Variant → VariantRun 保存实际工作、产物和适用评价，接纳前只交候选；接纳后由 Bundle／Reasoning 在同一整理核验环节选择入口，关联原工作和精确 RM binding。Dataset 登记版本及用途，有真实派生时 derive；Environment 用 environments.register／reference 保存含义、真实来源及用途，适配成果可用 `source_environment_ref` 关联原环境。最后一个 Target 的候选由 Reasoning 在综合交接前承接；先发现／对账，复用已有身份与原件。
+Target 新建或改动的数据与环境先沿 Baseline → Variant → VariantRun 保存实际工作、产物和适用评价，接纳前只交候选。接纳后由 Bundle／Reasoning 按[资源整理与正式登记](../../references/materials-and-custody.md#资源整理与正式登记)选择研究入口、关联原工作与精确 RM binding。Bundle 仍在运行时完成包括最后一个 Target 在内的结果读取与资源整理；Bundle 已不再运行时由 Reasoning 在综合交接前承接，复用已有身份和原件。
 
-正式发布核实并超过保留期后，系统可回收完成的临时工作区。把需保留的科学产物完整选入交接，`linked_local` 原件放在已登记的稳定位置；后续使用正式精确版本。
+Target 过程中发现、取得或阅读的 Literature 同样需要交接。记录准确文献身份与真实来源、已取得原文的准确入口或尚未取得全文的状态、本次实际阅读判断、相关主张及限制、与当前 Question／Target 的用途关系。已有正式文献复用其准确引用；新取得原文与新写的阅读分析按各自真实来源选择保管，本次整理或阅读不改变原作者与外部出版来源。Bundle／Reasoning 按共享整理流程核对、登记或关联值得保留的文献，后继可继续阅读与采用。
+
+文献线索与阅读说明可沿现有研究说明交接，选中保存的数字材料沿实际保管路径处理；结构化 Literature 候选与正式登记的工具装配属于待接通设计，不假定现行结果 schema 已有 `literature_candidates`。
+
+把需保留的科学产物完整选入交接，后续使用正式精确版本。工作区引用期限、`linked_local` 与外部原件的保管条件按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理；系统仅在正式发布已核实、保留期已过且执行、恢复、待接纳等真实依赖解除后回收完成的临时工作区。

@@ -70,7 +70,8 @@ def target_execution_context(*, authority: object, target_ref: str,
 
 
 def target_execution_skill_text() -> str:
+    """Point the business turn at the role method maintained by the Harness."""
     path = Path(__file__).with_name("skills") / "target-execution" / "SKILL.md"
-    return (path.read_text(encoding="utf-8") +
-            f"\n\nSkill source: {path.resolve()}\n"
-            "Resolve the reference links above relative to this source directory.")
+    return (f"Skill source: {path.resolve()}\n"
+            "角色方法由 Harness 指令维持；按实际工作读取正式工作交接或数据保存参考。"
+            "Resolve role reference links relative to this source directory.")

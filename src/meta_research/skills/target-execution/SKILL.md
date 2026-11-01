@@ -5,21 +5,26 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 # 实施已接纳的 Target
 
-负责本 Target 的实际方法、实施、证据检查和局部修订。以 Owner 上下文的 `execution_contract.measurement_contract` 为精确科研合同，先明确研究问题、方法、输入、证据和完成判据，再选择动作。研究范围取自相关 obligations 与 Briefs；Question 和 Quest 的总体标准留给综合判断。负结果、无定论和如实报告的失败尝试都可能完成一项调查责任，技术阻塞保持其真实状态。
+执行由 Bundle 派发并经 Owner 接纳的具体 Target，负责实际方法、实施、证据检查和局部修订。本项责任由已接纳的 Target 目标、cell 与局部合同界定；以 `execution_contract.measurement_contract` 为精确科研合同，理解已派发工作的目的、输入、固定条件、证据与完成判据后开展执行。相关 obligations／Brief 说明任务来路和适用约束，关联关系不将整份 Brief 或整个 Question 的责任转交本 Target。上游开放选择已由本项合同落实时，按已定条件执行；与上游明确约束确有冲突时，沿既有正式路径核对和处理。负结果、无定论和如实报告的失败尝试都可能完成一项调查责任，技术阻塞保持其真实状态。
 
-本 Skill 用中文描述执行规则；面向用户的标题、说明、研究正文及回复，按当前根 Session 的 `zh`／`en` 语言偏好直接撰写，委派时传给子智能体。原文、引用、字段和协议标识保持原貌。
+每次业务 user 开头按[本次阶段定位](../references/cycle-work.md#本次阶段定位)说明正在请求绑定的 Cycle／Bundle 阶段执行哪个 Target。任务说明/notes 直接带入本轮同一 `cycle_focus` 原文及实际来源，结合本 Target 理解其研究用意；按系统共同研究指导审视实施，有据调整写入既有 research_notes。重心含义见[Cycle 工作](../references/cycle-work.md)，不新增冻结合同字段、不改变 Bundle 已接纳的任务或授权；原 focus 保留。
 
-
-正式人类指导按本回合加载的[共享指导合同](../references/human-guidance.md)读取原文、声明处理并延续约束。
+处理适用指导、主动材料或求助答复时，读[人类协作指导](../references/human-guidance.md)，结合原文、范围与既有处理继续本 Target 工作。
 外部 MCP 发现或调用失败影响当前实施时，按本回合外部 MCP 上下文中的[故障协作与恢复](../external-mcp-recovery.md)核对影响、请求人的明确路线选择，并由本 Target 根核验后继续。
-指导或证据要求改变整个 Quest 方向时，用 `research_graph.quest_goal.read` 核对本逻辑操作的冻结 Goal／条件／工作切面，按共享合同用 `research_graph.quest_goal.evolve` 作完整判断；未知效果仅用 `.reconcile` 对账原 effect。新工作使切面 stale 时，交还后由新签发操作取新切面，不更改本 Target 已冻结的局部科学合同。
+指导或证据确实要求改变 Quest 整体目标或完成标准时，读[正式目标演化流程](../references/cycle-work.md)，判断实际变化并沿有效基准继承未变内容。本次正式操作仍核对冻结的 Goal／条件／工作切面，未知效果沿原操作对账；切面 stale 时由新签发操作取得新切面，不更改本 Target 已冻结的局部科学合同。
 ## 1. 读取合同和真实输入
 
-按根系统提示的六入口查找与本 Target 相关的已有工作和资源，从冻结输入 manifest 读取实际需要的数据、划分、预测、方法实现与协议。摘要或 hash 不替代原件；缺少材料时指出精确来源和缺口，沿既有输入交接处理。既有结果只按适用范围复用，不因新 Target 或空工作区重复已完成研究。采用 Environment 时沿其来源与使用说明核对当前条件；需要适配或修复时，在已接纳 Target 范围内保存实际工作与原环境关系。
+首轮围绕 Bundle 已派发的本项工作，读取并理解随任务交付的完整局部 `execution_contract`（含 `measurement_contract`、Protocol、结果表达及保存边界）、依赖与 held-fixed 条件、正式输入和必要规程。关联 obligations／Brief 按当前 Target 精确选择，说明本项承担的部分及已经落实的条件；Question／Quest 提供当前工作所需的目的、适用边界和约束。适用指导、本项相关的已知失败、负结果和关键输入限制直接给出。由 Bundle 的任务说明和既有材料交接表达相关内容，宿主保留准确绑定与读取入口；Target 据已派发任务开展执行。必要语义按准确版本完整提供，不按统一字数截断；完整上游背景、原 Plan／IdeaSet、其他 Target 和规划过程说明按实际疑问沿获授入口读取。
 
-本 Target 与本 Cycle 的 Idea、Plan 暂存材料，用 `research_workspace.discover`／`read` 按根系统提示核对；人类文件在原工作 inbox，读取后判断用途。它们成为正式执行输入时仍需原交接流程，`implementation/`、`inputs/`、`outputs/` 保持原合同用途。
+按科研用途区分已接纳输入、待阅读参考、实际采用和本次产物。规程或方法只有引用时，实施前取得正文；Bundle 临时工作区路径本身不构成 Target 授权。沿已有实现版本或 Commit／manifest／准确 AssetVersion 的正式交接取得本次所需原件，说明其用途、版本和实际 reader 或已交付 locator。来源失配时先核对交付，继续可独立开展的工作。
 
-查找方法时用 `research_graph.baselines.page`／`read`，复用前读完整方法。Bundle 的 Baseline 是初始建议；在承诺范围内，按实际工作复用精确 Baseline／Variant（含跨 Baseline），或在正式交接中声明真实新方法。数据版本、上游 Commit、临时路径和研究说明属于本次输入或分析，不改变方法身份；相似方法需人工判断式的明确选择，不自动合并。
+`exact_context_path` 保留本次准确研究背景与完整 Plan／Bundle notes，供按需核对；它不是全部动态执行合同的镜像。首轮核对随任务直接交付的、与本项执行、输入校核、测量口径和解释相关的说明；已知关键限制须有实际正文及准确来源，单列 reader 不等于已经给出该事实。长材料在需要其具体内容的判断或实施前沿准确原文读取。后来新增的研究说明按其精确版本 reader 读取，不用冻结旧文件代表最新说明，也不把最新说明当成已改变的冻结输入。
+
+先从已给出的冻结输入 manifest、准确正文或 reader 取得实际需要的数据、划分、预测、方法实现与协议。参考材料引用不是全量使用要求；如实选择与记录实际采用的准确版本，保持明确的 held-fixed 科学比较条件。需要查找或复用更多已有工作、资源时，读[研究导航](../references/research-navigation.md)，从 RG 对应入口展开。摘要或 hash 不替代原件；缺少材料时指出精确来源和缺口，沿既有输入交接处理。既有结果只按适用范围复用，不因新 Target 或空工作区重复已完成研究。采用 Environment 时核对当前使用条件；需要适配或修复时，在已接纳 Target 范围内保存实际工作与原环境关系。
+
+本 Target 与本 Cycle 的 Idea、Plan 暂存材料及本工作已交付文件沿获授 Workspace reader 核对；加工、副本和保管读[材料与保管](../references/materials-and-custody.md)。成为正式执行输入时仍需原交接流程，`implementation/`、`inputs/`、`outputs/` 保持原合同用途。
+
+查找方法、方案或评价时按[研究导航](../references/research-navigation.md#baseline复用方法实施与评价)从相关命中或准确引用展开，复用前读完整相关方法。Bundle 的 Baseline 是初始建议；在科学目的与明确固定边界内，普通实现建议可有理由调整，按实际工作复用精确 Baseline／Variant（含跨 Baseline），或在正式交接中声明真实新方法。数据版本、上游 Commit、临时路径和研究说明属于本次输入或分析，不改变方法身份；相似方法需人工判断式的明确选择，不自动合并。
 
 完成条件：当前范围、必需输入及其精确版本已明确；缺失条件有具体说明，未被摘要掩盖。
 
@@ -27,9 +32,11 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 在既有授权内开展获取、整理、观察、访谈、档案或定性比较、理论推导、数据构建、计算或湿实验。选择能解决当前疑点的工具与检查；多次尝试、调整和意外观察可以属于同一 Target。Baseline／Variant 表达方法和配方，VariantRun 记录实际实施；ProtocolVersion／Evaluation 表达评价规则，EvaluationAttempt 记录对某个 Run 或其产物的真实评价，MetricResult 保存已声明的观察。实施与评价可以交替，已实施工作也可以等待评价。
 
-资料规模较大时，可把聚焦检索、比较、实施、评价或资产回顾委派给原生子智能体。给出范围、入口和需确认事项，按文件或对象划分并行写入；子智能体返回精确来源、结果、边界和未决项。根 Session 抽查关键原文并负责最终研究判断。候选检索结果还需正式选择，才成为证据或执行输入。
+资料规模较大或需要分工时，读[研究指导](../references/research-guidance.md)，将聚焦检索、比较、实施、评价或整理委派给原生子智能体。按文件或对象划分并行写入，根负责最终研究判断；候选检索结果还需正式选择，才成为证据或执行输入。
 
 长任务应在观察之间交还控制。用 `agent_runtime.target_run.progress` 和当前 `target_ref` 读取有界输出，后续沿返回 cursor 取增量。按运行阶段、异常、预期有效输出、干预成本和读取开销决定下次观察；`suggested_poll_seconds` 只是备用建议。启动、变更或异常后及时检查，稳定时拉开间隔并推进独立工作。读旧片段时用 `mode=raw`，同时给出 `log_ref`、`stream_ref` 和整数 `before`。完整原始日志仍保留。
+
+原生根内持续组织实施、观察和审阅；普通工具返回不要求结束根再续接。确有新输入、Owner 拒绝或恢复需要时，沿原根接住本次阶段定位、任务、变化及准确反馈，必要时回读原绑定缺失的材料。适用指令、工具、权限、schema 和有效历史仍由运行时维持。原操作按其原输入解释，当前执行资格另由 Owner 核对。
 
 运行中即可检查可用数据或 checkpoint，据证据决定继续、调查、暂停、停止当前进程或局部修正。记录观察、决定、实际状态和受影响产物；保留前次尝试。若观察被用于自适应选择参数、checkpoint、停止或路线，在结果中说明其用途，不能再把同一数据当作未接触的最终评估。改变核心科学承诺、Protocol 指标或 held-fixed 条件时，沿正式修订路径处理。
 
@@ -39,11 +46,11 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 写 `outputs/result.json`，包含 `metrics` 及忠实表达研究的领域字段。Owner 从当前执行与已接纳记录接续 Target／Run 身份、Protocol、冻结输入和精确版本；这些已有信息无需转抄。`schema_ref` 和历史 `result_disposition` 字段可省略，结果无需总分类或统一 claim；提供身份断言时须与该权威记录一致。初始 `result_schema` 是表达指导，字段、嵌套和类型可随真实观察演化；Protocol 指标集合、来源、合法 JSON 与有限数值检查仍有效。实测零为 `0`，合同允许的未测量值为 `null`，类别、数组和对象保留真实 JSON 值；缺测原因写入结果或 `outputs/analysis`。
 
-保存具体实施／评价产物，出现多个实际 Run、分离或交替评价、无指标报告评价、待评价实施、复用已接纳 Run、正式工作声明反馈，或交接可复用 Dataset／Environment 候选时，读取[正式工作交接](references/formal-work.md)。以 `formal_runs` 声明真实生产者、实际采用关系和精确产物路径；系统携带的冻结输入只说明可用来源，真实采用、用途和科学含义由本次研究说明。需要独立选择文件、目录或一组不连续路径及其用途时，用 `retained_artifacts` 声明保留范围和角色。`evaluations: []` 表示尚未评价；空指标的已执行评价必须有真实评价记录及归属报告。一次工具调用或技术重试本身不构成新的科研 Run。
+确定 Run 保存粒度、保存具体实施／评价产物，或出现分离或交替评价、无指标报告评价、待评价实施、复用已接纳 Run、正式工作声明反馈，或交接可复用 Dataset／Environment 候选或过程中发现、取得、阅读的 Literature 时，读取[正式工作交接](references/formal-work.md)。以 `formal_runs` 声明真实生产者、实际采用关系和精确产物路径；系统携带的冻结输入只说明可用来源，真实采用、用途和科学含义由本次研究说明。需要独立选择文件、目录或一组不连续路径及其用途时，用 `retained_artifacts` 声明保留范围和角色。`evaluations: []` 表示尚未评价；空指标的已执行评价必须有真实评价记录及归属报告。一次工具调用或技术重试本身不构成新的科研 Run。
 
 `implementation/` 保存足以核查实际方法的说明、规程、推导、编码框架或代码。按研究价值、可复核性、复用和存储成本决定每个 Run／评价的保留产物与粒度；checkpoint 可有多个、部分或没有，不限于模型权重。`checkpoint_policy` 的 `required`／`forbidden` 是先前保存建议，不是产物有无的接纳门槛。把重要取舍和局限写入研究说明。
 
-数据获取、版本选择、大型数据或 checkpoint 保存时，读取[数据保存](references/data-preservation.md)，并核对 `execution_contract.artifact_limits`。大型产物沿正常交接保存，体积本身不要求人工导入。仅为具体缺少的权限、来源、资源或必须由人执行的动作请求 HumanRequest，同时继续获授权的独立工作。
+数据获取、版本选择、大型数据或 checkpoint 保存时，读取[数据保存](references/data-preservation.md)，并核对 `execution_contract.artifact_limits`。大型产物沿正常交接保存，体积本身不要求人工导入。确需人的权限、来源、资源或行动时，按[主动发起与接续 HumanRequest](../references/human-guidance.md#主动发起与接续-humanrequest)选择求助类型、安排真实依赖与独立工作，并按实际恢复结果接续。
 
 日志按真实工作命名。实际训练的完整 stdout／stderr 才写 `logs/train.log` 或 `train-*.log`；实际模型或实验系统评价才写 `logs/eval.log` 或 `eval-*.log`。从进程开始保留原始输出和退出状态，每次重试用独立路径。可用 `logs/audit.log`、`logs/protocol-check.log`、`logs/gate-closure.log`、`logs/verify.log` 保存可用性、来源、准入及结构检查；准备检查只支持其自身事实。没有训练或模型评价时，相应日志保持不存在。
 

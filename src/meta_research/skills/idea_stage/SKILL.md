@@ -1,36 +1,32 @@
 ---
 name: idea-stage
-description: 根据当前研究状态形成供 Plan 选择的构想或有依据的 NoViableCandidate；用于 Idea 阶段草稿、独立审阅及按反馈修订。
+description: Idea 阶段形成供 Plan 选择的研究构想，或供 Reasoning 综合的 NoViableCandidate，连续完成独立审阅、修订与正式交接。
 ---
 
 # Idea：形成研究构想
 
-理解当前 Question 和研究交接，提出值得投入的方向。候选可以针对广泛缺口或具体假设；让 Plan 看清为什么此刻值得研究、什么证据会改变判断。数量服从实质区别与研究需要。
+结合当前 Question、研究交接与有效目标，围绕直接收到的本轮 `cycle_focus` 原文及实际来源提出值得投入的构想，再由 Plan 细化本轮工作。候选可以针对广泛缺口或具体假设；让 Plan 看清为什么此刻值得研究、在什么条件下成立、什么证据会改变判断。数量服从实质区别与研究需要。
 
-输入和交接查[输入／输出契约](references/io-contract.md)；构造结果或 ExhaustionProposal 时查[候选与闭包契约](references/contract.md)。按本根系统提示的六入口、预算、人类输入和语言偏好执行，用户可见内容直接用所选语言，委派时传递同一要求。
+开始工作时，按[输入与交接](references/io-contract.md)取得当前科学输入并辨明来源；构造结果、处理拒绝或提出 ExhaustionProposal 时，读[候选与闭包契约](references/contract.md)。已有完整且仍有效的正文直接使用。
 
-
-正式人类指导按运行时加载的[共享指导合同](../references/human-guidance.md)读取原文、声明处理并延续约束。
 ## 1. 读取与形成候选
 
-先读已接纳 Question、上轮综合与 notes、当前指导和相关历史索引，再按判断需要分页、取精确原文。输入已有内容无需机械重复读取。保持已接纳证据、推断和未知分开；新材料取得正式身份前作为研究观察，必要输入缺失或冲突保留具体技术阻塞。
+从完整当前科学交接继续，结合 Quest 目标、完成标准、有效持续条件、研究风格及实际工作状态判断构想的价值。按系统共同研究指导审视前提和已有认识；有据调整投入时，在既有 notes 中说明理由，保留收到的 focus 原文，其含义与首轮来源见[Cycle 工作](../references/cycle-work.md)。需要追溯历史、比较方法或复用成果时，读[研究导航](../references/research-navigation.md)，沿相关入口取得影响判断的精确原文与限制。检索、取得、精读和比较文献可以是本阶段的主要工作。
 
-本工作暂存的观察和人类交付文件，用 `research_workspace.discover`／`read` 按根系统提示发现、核对并读取；交接给 Plan 时保留文件用途与来源，正式采用继续沿既有接纳流程。
+接收、加工、选择保管或接续工作材料时，读[材料与保管](../references/materials-and-custody.md)。按当前需要理解已有材料，保留实际读过的部分、可支持的认识和仍待深入的内容。正式证据、研究观察、推断与未知各按事实表达；必要材料缺失时，明确其对当前判断的影响。
 
-检索、取得、精读和比较文献可以是主要工作。材料多时按共享指导委派聚焦检索／初读，由根抽查关键原文并作比较与取舍。人类主动指导可影响研究判断，但不自动构成授权或已满足 HumanRequest。
+需要人的参与、收到正式指导或答复时，读[人类协作](../references/human-guidance.md)，结合确认原文、适用范围和已有处理接着工作。发现新问题线索或需要重审 Quest 目标时，读[Cycle 工作](../references/cycle-work.md)；在本阶段职责内判断目标演化，保留供 Reasoning 综合的新问题线索与依据。
 
-寻找解释、方法、关键条件、比较或核验方向，合并语义重复，说明适用条件、假设、风险及可改变判断的观察。已有构想仍适用时说明延续理由；正式复用由后继入口与 skip 接纳处理，不为凑候选重造同义内容。
+形成构想时，善于从具体研究现象中抽象问题的结构，从哲学视角审视概念、前提与解释框架，辨析不同问题之间的内在联系及关键差异。结合当前证据与约束，寻找解释、方法、关键条件、比较或核验方向，合并语义重复，说明适用条件、假设、风险及可改变判断的观察。已有构想仍适用时说明延续理由；正式复用由后继入口与 skip 接纳处理，不为凑候选重造同义内容。
 
-完成条件：返回 `IdeaSet | NoViableCandidate` 中一项，候选的价值和证据边界可读，或明确探索范围、不可行理由与可推翻条件。技术失败或一次受阻不代替研究不可行判断。
+草稿能够说明候选的价值与证据边界，或明确当前探索范围内不能继续 Plan 的科学理由、限制与可推翻条件后，进入独立审阅。技术失败或一次受阻不代替研究不可行判断。
 
 ## 2. 独立审阅与交接
 
-根 Session 委派原生独立子智能体审阅完整草稿与必要原文，取得自由格式反馈；根根据反馈和自身判断修订，交接完整最终内容。没有具体问题也可以改稿。同根自查不是独立审阅；实际反馈保留在原生执行记录中，Owner 校验草稿／最终 hash 和科研来源，不要求审查表单、审阅者身份证明或批准记录。
+安排投入、委派或接续会话时，读[研究指导](../references/research-guidance.md)。根 Session 连续形成草稿、自主委派独立子 Agent 审阅完整草稿与必要依据、取得反馈并修订，再提交完整最终内容。具体分工、材料、上下文和调用方式由根组织；根核实关键依据并作最终取舍，实际反馈保留在原生执行记录中。
 
-Owner 拒绝后针对精确反馈修订，保留 predecessor 和 rejection 来源；未知结果由系统先对账原操作。完成条件：最终内容与实际来源一致，真正 Owner receipts 构成接纳交接。
+独立反馈已取得、问题已处理且最终内容满足本阶段职责时，按[正式交接](references/io-contract.md#输出与交接)提交。保留实际分歧、未决事项及其对后继工作的影响；已接纳 IdeaSet 供 Plan 选择，已接纳 NoViableCandidate 交 Reasoning 综合。正式接纳以真实 Owner 结果为准。正常内部审阅持续在根内完成，需要 resume 时仅追加实际新增的业务输入。
 
 ## 权限边界
 
-在当前研究工作区自主研究。正式身份、hash、receipt、内容保管和领域接纳由系统处理；仅经公开 Owner Interface 操作，不读写研究 SQLite、provider spool／seal key 或控制文件绕过权限。Idea 不创建 Question、Plan、Run、正式 selected Idea 或 StageCommit。
-
-收到正式人类答复后，用原 effect_id 对账 human_request.open.reconcile，再以精确 request_ref／response_ref 调用 human_request.read。按 delivery.reply_reader／uploaded_readers 读取原根工作文件，linked_locators 沿原生工具读取原路径；先核对实际意见与材料，再继续工作。library_reconnect 的 provided_material 路线使用工作文件，不要求预先入库。提交本身不登记 Literature、Dataset、Environment 或 ResearchAsset；判断有复用价值后再用既有 RM／RG 流程接纳登记。
+在当前授权工作空间与材料范围内自主研究。正式身份、hash、receipt、内容保管和领域接纳由系统处理；仅经公开 Owner Interface 操作，不读写研究 SQLite、provider spool／seal key 或控制文件绕过权限。Idea 不创建 Question、Plan、Run、正式 selected Idea 或 StageCommit。

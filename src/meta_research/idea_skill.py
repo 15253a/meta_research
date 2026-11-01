@@ -3832,12 +3832,12 @@ def _idea_skill_resources() -> dict[str, str]:
 
 
 def _idea_skill_instructions() -> str:
-    return "\n\n".join(
-        f"<!-- bundled resource: {name} -->\n{content}"
-        for name, content in _idea_skill_resources().items()
-        if name not in SHARED_REFERENCE_PATHS
-    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "idea_stage" / "SKILL.md")
-         + "\nResolve role reference links relative to this source directory.")
+    return (
+        "Role skill source: " + str(Path(__file__).with_name("skills") / "idea_stage" / "SKILL.md")
+        + "\nHarness maintains this role's research method. Read references/io-contract.md when "
+        "establishing inputs or handing off; read references/contract.md when forming an outcome, "
+        "handling rejection or considering exhaustion. Resolve links relative to the source directory."
+    )
 
 
 def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, object]:

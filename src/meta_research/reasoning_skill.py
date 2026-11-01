@@ -626,6 +626,7 @@ def _validate_request(request: ReasoningSkillRequest) -> None:
         or request.context_pack.get("cycle_ref") != request.cycle_ref
         or request.context_pack.get("foreground_epoch") != request.foreground_epoch
         or not isinstance(research_context, dict)
+        or research_context.get("schema_ref") != REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF
         or research_context.get("cycle_ref") != request.cycle_ref
         or research_context.get("question_ref") != request.question_ref
         or research_context.get("quest_ref") != request.quest_ref
@@ -1238,7 +1239,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "返回闭合 reasoning-stage-output：ScientificOutcomeCandidate 必须是 "
             "affirmed | denied | uncertain | insufficient_evidence 之一，并且恰有一个 "
             "NextCycleProposal | CandidateCompletion。按上述 Skill 评估 Bundle 统一交接的"
-            "唯一建题推荐；没有推荐时完成普通综合，保留项不逐个升级为新题。"
+            "建题推荐，也可从本轮结果与历史自主形成候选；保留项不逐个升级为新题。"
             "比较已有题覆盖范围与独立研究价值后，若保留"
             "新建或分解 Question 的候选，"
             "改为返回非终态 reasoning-autonomous-checkpoint：同一 scientific_outcome 加"
@@ -1368,7 +1369,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         schema = {"type": "object", "additionalProperties": False,
             "properties": {"action": {"type": "string", "enum": ["create", "decline", "retry"]}, "final_output": final_schema},
             "required": ["action", "final_output"]}
-        prompt = (_reasoning_skill_instructions(request) + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；新建题推荐按上述 Skill 由 Bundle 统一交接。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
+        prompt = (_reasoning_skill_instructions(request) + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；候选可来自 Bundle 推荐或本根综合判断。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
             + "completion_feedback=" + canonical_json(list(request.continuation_feedback)) + "\ncheckpoint=" + canonical_json(checkpoint) + "\nfacts=" + canonical_json(facts) + "\nsummary=" + canonical_json(summary))
         decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref, operation_input=stage_operation_input(request, "reasoning", extra={"checkpoint": checkpoint, "facts": facts, "summary": summary}))
         if native_session != request.native_session_ref:
@@ -1570,7 +1571,6 @@ def _reasoning_skill_resources() -> dict[str, str]:
         ("SKILL.md", package / "SKILL.md"),
         ("agents/openai.yaml", package / "agents" / "openai.yaml"),
         ("references/contract.md", package / "references" / "contract.md"),
-        ("references/legacy-v2-contract.md", package / "references" / "legacy-v2-contract.md"),
         (
             "references/owner-operations.md",
             package / "references" / "owner-operations.md",
@@ -1591,24 +1591,8 @@ def _reasoning_skill_resources() -> dict[str, str]:
 
 
 def _reasoning_skill_instructions(request: ReasoningSkillRequest | None = None) -> str:
-    resources = _reasoning_skill_resources()
-    names = [
-        "SKILL.md",
-        "references/contract.md",
-        "references/owner-operations.md",
-    ]
-    if request is not None and not _uses_authoritative_metadata(request):
-        names.append("references/legacy-v2-contract.md")
-    return "\n\n".join(
-        f"<!-- bundled resource: {name} -->\n{resources[name]}"
-        for name in names
-    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "reasoning_stage" / "SKILL.md")
-         + "\nResolve role reference links relative to this source directory.")
-
-
-def _uses_authoritative_metadata(request: ReasoningSkillRequest) -> bool:
-    research = cast(dict[str, object], request.context_pack["research_context"])
-    return research.get("schema_ref") == REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF
+    return ("Role skill source: " + str(Path(__file__).with_name("skills") / "reasoning_stage" / "SKILL.md")
+            + "\n角色方法由 Harness 持续提供；按本次研究需要读取相对该文件的合同与参考。")
 
 
 def _assemble_reasoning_output(
@@ -1849,41 +1833,7 @@ def _scientific_outcome_schema(
         dict[str, object], request.context_pack["research_context"]
     )
     graph = cast(dict[str, object], research_context["graph_binding"])
-    parent_bindings = cast(
-        list[dict[str, object]], graph["parent_question_bindings"]
-    )
-    prior_outcomes = cast(
-        list[dict[str, object]], graph["prior_current_question_outcomes"]
-    )
-    parent_refs = [cast(str, value["question_ref"]) for value in parent_bindings]
-    prior_refs = [cast(str, value["outcome_ref"]) for value in prior_outcomes]
-    system_metadata = _uses_authoritative_metadata(request)
-    frozen_causal = cast(dict[str, object], research_context["causal_context"])
     text_array = {"type": "array", "items": text, "uniqueItems": True}
-    causal_ref_arrays = {} if system_metadata else {
-        field: {
-            "type": "array",
-            "minItems": len(cast(list[object], frozen_causal[field])),
-            "maxItems": len(cast(list[object], frozen_causal[field])),
-            "items": {
-                **text,
-                "maxLength": max(
-                    (len(ref) for ref in cast(list[str], frozen_causal[field])),
-                    default=1,
-                ),
-            },
-            "description": (
-                f"Copy research_context.causal_context.{field} in its frozen "
-                "order, with one complete, unmodified reference per string."
-            ),
-        }
-        for field in (
-            "target_commit_refs",
-            "changed_axis_fact_refs",
-            "held_fixed_fact_refs",
-            "provenance_refs",
-        )
-    }
     return {
         "type": "object",
         "additionalProperties": False,
@@ -1924,7 +1874,6 @@ def _scientific_outcome_schema(
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    **causal_ref_arrays,
                     "attribution_basis_refs": {
                         "type": "array",
                         "items": text,
@@ -1936,7 +1885,7 @@ def _scientific_outcome_schema(
                     "confounders": text_array,
                 },
                 "required": [
-                    *causal_ref_arrays, "attribution_basis_refs", "claim_scope", "statement",
+                    "attribution_basis_refs", "claim_scope", "statement",
                     "sufficiency_rationale", "confounders",
                 ],
             },
@@ -1953,32 +1902,13 @@ def _scientific_outcome_schema(
                         "type": "object", "additionalProperties": False,
                         "properties": {
                             "question_ref": {"const": request.question_ref},
-                            **({} if system_metadata else {"prior_accepted_outcome_refs": {
-                                "type": "array",
-                                "items": {
-                                    **text,
-                                    "maxLength": max(
-                                        (len(ref) for ref in prior_refs), default=1
-                                    ),
-                                },
-                                "minItems": len(prior_refs),
-                                "maxItems": len(prior_refs),
-                                "uniqueItems": True,
-                                "description": (
-                                    "Copy each outcome_ref from the frozen "
-                                    "research_context.graph_binding."
-                                    "prior_current_question_outcomes in order; "
-                                    "each string contains one complete reference exactly once."
-                                ),
-                            }}),
                             "progress": text,
                         },
-                        "required": ["question_ref", "progress"] + ([] if system_metadata else ["prior_accepted_outcome_refs"]),
+                        "required": ["question_ref", "progress"],
                     },
                     "parent_questions": {
                         "type": "array",
-                        **({} if system_metadata else {"minItems": len(parent_refs), "maxItems": len(parent_refs)}),
-                        **({"description": "Give each frozen parent Question its own impact and statement. question_ref associates the judgment with its subject; order is chosen by the system."} if system_metadata else {}),
+                        "description": "Give each frozen parent Question its own impact and statement. question_ref associates the judgment with its subject; order is chosen by the system.",
                         "items": {
                             "type": "object", "additionalProperties": False,
                             "properties": {

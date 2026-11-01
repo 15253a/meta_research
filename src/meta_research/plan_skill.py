@@ -624,6 +624,7 @@ def _plan_skill_resources() -> dict[str, str]:
             "references/owner-operations.md",
             package / "references" / "owner-operations.md",
         ),
+        ("references/tool-contracts.md", package / "references" / "tool-contracts.md"),
     )
     try:
         return {
@@ -638,12 +639,13 @@ def _plan_skill_resources() -> dict[str, str]:
 
 
 def _plan_skill_instructions() -> str:
-    return "\n\n".join(
-        f"<!-- bundled resource: {name} -->\n{content}"
-        for name, content in _plan_skill_resources().items()
-        if name not in SHARED_REFERENCE_PATHS
-    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "plan_stage" / "SKILL.md")
-         + "\nResolve role reference links relative to this source directory.")
+    return (
+        "Role skill source: " + str(Path(__file__).with_name("skills") / "plan_stage" / "SKILL.md")
+        + "\nHarness maintains this role's research method. Read references/contract.md when "
+        "forming obligations, coverage or Briefs; read references/owner-operations.md for sources, "
+        "handoff and feedback; read references/tool-contracts.md for tool arguments and current "
+        "capabilities. Resolve links relative to the source directory."
+    )
 
 
 def _schema_template_request() -> PlanSkillRequest:

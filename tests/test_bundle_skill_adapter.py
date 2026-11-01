@@ -1091,9 +1091,13 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert 'model_reasoning_effort="max"' in primary_argv
     assert f"inbox_checkpoint={serialized_checkpoint}" in primary_prompt
-    assert "Agent Session 绝不是 Target 或 TargetRun" in primary_prompt
-    assert "本回合形成可提交的 TargetPlan 或 exhaustion_assessment" in primary_prompt
-    assert "TargetPlan 不选择 provider、adapter" in primary_prompt
+    role_source = Path(next(line.removeprefix("Role skill source: ")
+        for line in primary_prompt.splitlines() if line.startswith("Role skill source: ")))
+    contract = (role_source.parent / "references" / "contract.md").read_text(encoding="utf-8")
+    assert "Target 是 RG 工作身份，TargetRun 是 AR 可恢复执行" in contract
+    assert "返回 target_plan 或 exhaustion_assessment" in primary_prompt
+    assert "领域规则不携带 provider、adapter、image、command 或 execution 路由" in contract
+    assert contract not in primary_prompt
     assert "installed_experiment_provider_catalog=" not in primary_prompt
     assert "Provider transport envelope" in primary_prompt
     assert "Provider transport encoding" in primary_prompt
@@ -1160,7 +1164,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     } & set(candidate_core)
     assert "execution" not in target_schema["properties"]
     assert "semantic_inputs" in target_schema["properties"]
-    assert "ordered Metric definitions" in primary_prompt
+    assert "Metric definitions 保持顺序" in contract
     assert dispatch.selected_target_ref == "target:accepted-structure"
     assert dispatch.native_session_ref == result.primary_session_ref
     assert dispatch_argv[-3:] == ["resume", "codex-bundle-primary:1", "-"]
@@ -1180,8 +1184,9 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     assert canonical_json(
         {"inbox_checkpoint": request.inbox_checkpoint}
     )[1:-1] in batch_prompt
-    assert "append-only Target" in batch_prompt
-    assert "measurement_contract" in batch_prompt
+    assert "现有 Target／Commit 保持不变" in contract
+    assert "measurement_contract" in contract
+    assert contract not in batch_prompt
     assert "installed_experiment_provider_catalog" not in batch_prompt
     assert "targets" not in batch_schema["properties"]
     assert batch_schema["properties"]["strategy_update"]["properties"][

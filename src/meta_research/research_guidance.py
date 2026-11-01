@@ -11,6 +11,23 @@ SHARED_REFERENCE_NAMES = (
 )
 SHARED_REFERENCE_PATHS = frozenset(f"references/{name}" for name in SHARED_REFERENCE_NAMES)
 
+CYCLE_ROLE_DIRECTORIES = {
+    "idea": "idea_stage", "plan": "plan_stage", "bundle": "bundle_stage",
+    "target": "target-execution", "reasoning": "reasoning_stage",
+}
+
+
+@prepared_resource
+def cycle_role_instructions(root_kind: str) -> str:
+    """Maintain the selected role method in Harness instructions, not turn data."""
+    directory = CYCLE_ROLE_DIRECTORIES.get(root_kind)
+    if directory is None:
+        return ""
+    source = shared_reference_root() / directory / "SKILL.md"
+    return (f"Role skill source: {source}\n"
+            "Resolve role reference links relative to this source directory.\n"
+            + source.read_text(encoding="utf-8"))
+
 
 def shared_reference_root() -> Path:
     """Installed file root used by native tools, independent of their cwd."""

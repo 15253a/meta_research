@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources
+from meta_research.research_guidance import shared_reference_resources
 
 from meta_research.context_presentation import (
     STAGE_CONTEXT_DELIVERY_GUIDANCE, stage_context_json, stage_position_prompt,
@@ -1319,79 +1319,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             f"{human_resume}"
-            "本回合形成可提交的 TargetPlan 或 exhaustion_assessment。普通研究、检索、"
-            "整理和实施任务按需要委派；子智能体在明确授予的任务范围内使用当前 catalog "
-            "与 fence 完成操作，根负责最终判断、核实及交接，正式接纳由 Owner 负责。"
-            "返回前按 Skill 完成独立审阅：委派原生独立子智能体检查完整候选和必要原文，"
-            "取得自由格式反馈后由根核对并自主修订；同根自查不替代独立审阅。"
-            "反馈保留在原生执行记录中，不要求审查表单、固定反馈数量或审阅者身份证明。"
-            "返回冻结后的完整候选；此后系统沿 Owner 接纳流程核验，不另设模型审阅回合。"
-            "TargetPlan 由结构与领域校验器核验；exhaustion_assessment 另由 Owner "
-            "重验工作清单、frontier 和当前有效性。"
-            '你是 Bundle 根 Agent。返回且只返回下列两个闭合分支之一：'
-            '{"target_plan": ...} 的 formal v3，或固定合同中的 '
-            '{"exhaustion_assessment": ...}。不得同时返回、混合或扩展两分支。'
-            "target_plan 分支必须是 formal v3："
-            "直接序列化完整 NormalizedCompletionContract 与初始 StrategyUpdate。"
-            "先从全部 ExperimentBrief 的 "
-            "Goal、Characteristics、BoundaryConstraints、SemanticDelta 与 "
-            "required_measurement_unit_keys 冻结所有 measurement completion cells；候选列表"
-            "不能反向缩小这份合同。每个 formal TargetCandidate 必须恰含一个 cell、"
-            "精确 implementation_revision_ref（声明实际采用的材料及其用途与实际修改；"
-            "外部来源、license 与使用限制由 research_memory.implementation_content "
-            "内容 receipt 携带）、"
-            "held-fixed slot revision、语义保持 route、真实 dependency/direct accepted asset "
-            "refs。canonical TargetCandidate 本体不扩展；"
-            "formal wrapper 另以必填 risk_class=normal|high 冻结 Owner admission metadata，"
-            "缺失或未知风险必须 fail closed，绝不能默认 normal。"
-            "同一 formal wrapper 还必须冻结完整纯领域 measurement_contract，且其 "
-            "ExperimentKeys 与唯一 measurement cell 必须和 canonical candidate exact 一致。"
-            "baseline_forward_contract 表达稳定研究方法和输入到产出语义；"
-            "先用 research_graph.baselines.page 检索，并按需用 baselines.read 读取候选的完整方法；"
-            "复用时该字段提交 {baseline_ref: 已读取的精确引用}。新方法提交 "
-            "{method_key: 稳定方法名, method_version: 明确版本, method_contract: 稳定方法含义与输入输出约定}。"
-            "同一名称和版本的内容哈希只校验一致性，不能用备注改写原版本或依语义相似自动合并。"
-            "本次数据版本、上游 Commit、临时路径与实现放在 run_bindings 或正式执行输入绑定，"
-            "研究解释放 notes/研究说明资产，均不要放入 method_contract；改变这些信息不新增 Baseline。"
-            "Variant recipe 保留具体方法与参数配方；ProtocolVersion 保留评价规则与指标定义。"
-            "implementation 可为非代码方法材料，required_metrics 可表达定性判据；纯报告评价可为空，"
-            "由实际 EvaluationAttempt 保存检查报告。下载与整理数据可作为 Target 的实际研究工作，"
-            "Baseline/Variant 描述来源与获取/处理方法，VariantRun 保存实际工作与数据产物。"
-            "按真实研究方法声明湿实验、数据、文字、辅助材料、分析或推导，不预设模型训练。"
-            "合同完整携带 baseline 方法、variant 方法配方、evaluation protocol lineage，"
-            "以及包含 evaluation data、split、preprocessing 的 ProtocolVersion candidate；"
-            "required/optional ordered Metric definitions 必须按声明顺序逐项携带 MetricKey "
-            "与非空完整 definition，"
-            "不得只列名字。internal parts 保持声明顺序；有 parts 就必须同时冻结 aggregation "
-            "rule ref 与完整 rule content，无 parts 则禁止 aggregation。每条 preregistered stop "
-            "rule 同样冻结 ref 与完整 content，并冻结 checkpoint policy、result schema ref 与完整"
-            " result schema content。这四类领域文档和规则不得在根层携带 provider、adapter、"
-            "image、command 或 execution 路由。TargetPlan 不选择 provider、adapter "
-            "或 execution payload；后续 TargetRun 根 Agent 根据冻结执行合同与既有授权，"
-            "自主获取材料、实现、自检、使用已授权原生工具运行，并提交可核验结果。"
-            "当前 initial StrategyUpdate revision=1、"
-            "requires_accepted_labels=[]、candidates 非空、strategy_complete=false。"
-            "后续非空追加批次也保持 false，为最后一个 Target 接纳后保留 Bundle 汇总回合。"
-            "读回全部结果并按 Skill 完成候选筛选与交接后，用空 candidates、"
-            "strategy_complete=true 和完整 notes 最终 seal。只 append/seal，"
-            "不得回写旧 Target。Target identity、DAG、frontier、TargetCommit 都由 Research "
-            "Graph 接纳；receipt 必须来自实际 Owner 操作，不得自造。Agent Session "
-            "绝不是 Target 或 TargetRun；risk_class 只供 Owner/Human Collaboration 的正式 "
-            "admission 使用，不进入 canonical TargetCandidate 本体。\n"
-            "只有在冻结 FormalPlan 内确实没有实质不同且可接纳的候选，"
-            "才能使用 exhaustion_assessment。该分支必须序列化完整 "
-            "NormalizedCompletionContract，并对每个 measurement cell 的每条已探索"
-            "保语义 route 给出一条记录（一个 cell 可有多 route）。"
-            "每条记录必须携带 exact held-fixed bindings、RouteSpec、完整 RouteDisposition "
-            "与可重算 frozen fingerprint。未执行且经冻结语义审阅关闭的 route 只能标为 "
-            "duplicate_frozen_semantics 或 semantically_ineligible；实际提交并被 Owner "
-            "拒绝的 route 只能标为 attempted_rejected，并在 evidence_refs 中精确引用下方"
-            " issuer-verified predecessor rejection inventory。Route 声明过的每个 external "
-            "operation 必须有同 subject 的 terminal reconciliation receipt。无历史时"
-            " predecessor_rejections 必须为空。任何可执行 route、semantic "
-            "barrier、active/blocked/pending/unknown work、HumanRequest、未对账 external "
-            "operation 或 accepted-unconsumed result 都禁止该分支。失败次数、"
-            "attempt 上限、耗时、费用和只失败一条 route 都不是耗尽证明。"
+            "本回合按角色方法及 references/contract.md 的正式输出合同形成完整候选，"
+            "完成独立子智能体审阅并由根自主修订后，返回 target_plan 或 exhaustion_assessment。"
+            "保持下列准确 FormalPlan、完整采用来源与当前反馈；核验未知效果后再决定是否可提交。\n"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"cycle_ref={request.cycle_ref}\n"
@@ -1717,29 +1647,11 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
-            "继续使用同一个 Bundle 根 Session。当前 batch 的全部 Target 已形成正式 "
-            "TargetCommit。基于冻结 FormalPlan、当前 append-only Target 集和真实 commit "
-            "closure，直接返回下一份 FormalStrategyUpdate。若仍需新的独立 measurement "
-            "closure，update.candidates 非空且 strategy_complete=false，保留结果接纳后的汇总回合。"
-            "全部承诺已有真实结果且无需追加 Target 时，按 Skill 汇总包括最后一个 Target 的"
-            "发现、保留线索并筛出零或一个建题推荐，写入完整 notes，再用空 candidates、"
-            "strategy_complete=true 最终 seal。建题推荐不是用于启用 Target 的 candidates。"
-            "普通研究任务按需要委派；新的重要策略按 Skill 审阅。无论是否追加候选，"
-            "最终封口前都委派原生独立子智能体审阅完整策略、已接纳结果和必要原文，"
-            "根根据自由格式反馈核对并自主修订，同根自查不替代独立审阅。"
-            "资产整理可由子智能体在明确授予的范围与当前 fence 内完成，根按 Skill "
-            "独立读回所登记版本及关系。审阅反馈保留在原生执行记录中，"
-            "返回字段遵循当前 schema。"
-            "revision 必须恰为当前 revision+1；"
-            "requires_accepted_labels 只引用真实已接纳 label，并同时进入每个自适应候选的 "
-            "depends_on_labels。不得改写旧 Target/Commit，不得把 Agent tree 当 Target DAG，"
-            "每个新 formal wrapper 仍必须携带与 candidate ExperimentKeys/cell exact 绑定的完整"
-            "纯领域 measurement_contract；ordered Metric definitions、evaluation data/split/"
-            "preprocessing、parts 与完整 aggregation rule、完整 preregistered stop rules、"
-            "checkpoint policy 及 result schema 均不可缩水、改成名字列表或换成运行时路由。"
-            "不得编造 Owner ref，也不得在 TargetPlan 中选择 provider/adapter 或伪造"
-            "execution operation；Target 按系统提供的冻结执行合同与现有授权，"
-            "自主实现、获取材料、自检、运行并提交可核验的结果。\n"
+            "继续当前 Bundle 根。根据本次正式 TargetCommit、仍未完成的责任及真实反馈，"
+            "按 references/contract.md 形成下一份 FormalStrategyUpdate。需要继续实施时追加候选；"
+            "全部所需 cells 已由 current accepted TargetCommit 覆盖时，先读最后结果、整理可复用资源、"
+            "完成独立审阅，再以空 candidates、strategy_complete=true 和完整 notes 封口。"
+            "保留后续研究线索与零或一个建题推荐，修订事实不改写冻结输入。\n"
             f"batch_context={canonical_json(reading_context)}"
         )
         if len(prompt.encode("utf-8")) > BUNDLE_TARGET_BATCH_PROMPT_MAX_BYTES:
@@ -1843,12 +1755,15 @@ def _bundle_skill_instruction_resources() -> dict[str, str]:
 
 
 def _bundle_skill_instructions(resources: dict[str, str] | None = None) -> str:
-    return "\n\n".join(
-        f"<!-- bundled resource: {name} -->\n{content}"
-        for name, content in (resources if resources is not None else _bundle_skill_instruction_resources()).items()
-        if name not in SHARED_REFERENCE_PATHS
-    ) + ("\n\nRole skill source: " + str(Path(__file__).with_name("skills") / "bundle_stage" / "SKILL.md")
-         + "\nResolve role reference links relative to this source directory.")
+    # Load and bind the complete resource set even though the native Harness
+    # maintains the role method and references are read only when needed.
+    if resources is None:
+        _bundle_skill_instruction_resources()
+    return (
+        "Role skill source: " + str(Path(__file__).with_name("skills") / "bundle_stage" / "SKILL.md")
+        + "\n角色方法由 Harness 指令维持；按当前工作读取所需合同及 Owner 操作参考。"
+        "Resolve role reference links relative to this source directory."
+    )
 
 
 def _rolling_operation_identity(request: BundleDispatchRequest | BundleTargetBatchRequest) -> dict[str, object]:

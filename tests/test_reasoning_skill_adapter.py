@@ -64,7 +64,7 @@ def _request() -> ReasoningSkillRequest:
         },
         "accepted_target_commit_closures": [],
         "research_context": {
-            "schema_ref": "meta-research/reasoning-research-context/v2",
+            "schema_ref": "meta-research/reasoning-research-context/v3",
             "cycle_ref": "cycle:1",
             "question_ref": "question:1",
             "quest_ref": "quest:1",
@@ -140,6 +140,7 @@ def _stage_output() -> dict[str, object]:
         "schema_ref": SCIENTIFIC_OUTCOME_SCHEMA_REF,
         "kind": "ScientificOutcomeCandidate",
         "outcome_ref": "scientific-outcome:1",
+        "notes": "Bounded literature support; no new experiment was performed.",
         "stage_run_request_ref": "stage-request:reasoning:1",
         "cycle_ref": "cycle:1",
         "question_ref": "question:1",
