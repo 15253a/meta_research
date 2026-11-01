@@ -162,7 +162,14 @@ def test_material_directory_intake_retains_original_receiver_and_selected_subtre
 
 
 @pytest.mark.parametrize('boundary', ['source_change', 'revocation'])
-def test_intake_rechecks_source_and_fence_before_accepting_prepared_bytes(tmp_path, monkeypatch, boundary):
+@pytest.mark.parametrize('custody', ['managed', 'linked_local'])
+@pytest.mark.parametrize('directory', [False, True])
+def test_intake_rechecks_source_and_fence_before_accepting_prepared_bytes(tmp_path, monkeypatch, boundary, custody, directory):
+    import hashlib
+    import os
+    import meta_research.server_materials as server_materials
+    from meta_research.owners.research_memory import _file_matches
+
     runtime = _make(tmp_path / 'runtime')
     try:
         confirmed = _confirm_direct_quest(runtime)
@@ -170,19 +177,35 @@ def test_intake_rechecks_source_and_fence_before_accepting_prepared_bytes(tmp_pa
         context, call = channel(runtime, question)
         location = runtime.root_workspaces.bind_runtime(context).location
         source = location.directory / 'selected.txt'
-        source.write_bytes(b'original bytes')
+        if directory:
+            source.mkdir()
+        content_source = source / 'entry.txt' if directory else source
+        content_source.write_bytes(b'original bytes')
+        source_stat = source.stat()
+        content_stat = content_source.stat()
+        observed = server_materials.observation(source_stat)
+        observe = server_materials.observation
+        if boundary == 'source_change':
+            # Coarse timestamps and a warm fingerprint must not turn unchanged
+            # metadata into proof of unchanged original bytes.
+            assert _file_matches(content_source, 14, hashlib.sha256(b'original bytes').hexdigest())
+            monkeypatch.setattr(server_materials, 'observation', lambda info:
+                observed if (info.st_dev, info.st_ino) == (source_stat.st_dev, source_stat.st_ino)
+                else observe(info))
         memory = runtime.owners.research_memory
         original = memory._accept_prepared_asset
         def intervene(*args, **kwargs):
             monkeypatch.setattr(memory, '_accept_prepared_asset', original)
             if boundary == 'source_change':
-                source.write_bytes(b'changed bytes!')
+                content_source.write_bytes(b'changed bytes!')
+                os.utime(content_source, ns=(content_stat.st_atime_ns, content_stat.st_mtime_ns))
+                assert server_materials.observation(source.stat()) == observed
             else:
                 channel(runtime, question, generation=2)
             return original(*args, **kwargs)
         monkeypatch.setattr(memory, '_accept_prepared_asset', intervene)
         result = call('research_memory.assets.intake', effect_id='changed-before-accept',
-            intake={'source_kind':'local_path', 'custody_mode':'managed', 'display_name':'selected.txt',
+            intake={'source_kind':'directory' if directory else 'local_path', 'custody_mode':custody, 'display_name':'selected.txt',
                 'source':{'kind':'workspace', 'workspace_ref':location.workspace_ref, 'path':'selected.txt'}})
         assert not result['isError'], result
         value = result['structuredContent']

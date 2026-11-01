@@ -4228,9 +4228,15 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         prepared: _PreparedAsset,
         *, effect_scope: Callable[[], None] | None = None,
     ) -> None:
+        selected_source = (
+            request.get("effect_scope_required") is True
+            and request.get("source_kind") in {"local_path", "directory"}
+            and isinstance(request.get("provenance"), dict)
+            and request["provenance"].get("kind") in {"workspace_selection", "material_selection"}
+        )
         if request.get("custody_mode") == "managed":
             _verify_managed_manifest(self._object_store, prepared.manifest)
-        else:
+        if request.get("custody_mode") != "managed" or selected_source:
             source_locator = request.get("source_locator")
             if not isinstance(source_locator, str):
                 raise OwnerConflict("asset_source_unavailable")
@@ -4238,7 +4244,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 source_matches = _linked_source_matches(
                     prepared.manifest,
                     Path(source_locator),
-                    enforce_limits=not bool(request.get("asynchronous")),
+                    enforce_limits=request.get("custody_mode") != "managed" and not bool(request.get("asynchronous")),
+                    verify_bytes=selected_source,
                 )
             except (OSError, OwnerConflict) as error:
                 raise OwnerConflict("asset_source_changed_during_intake") from error
@@ -12375,12 +12382,21 @@ def _linked_source_matches(
     source: Path,
     *,
     enforce_limits: bool = True,
+    verify_bytes: bool = False,
 ) -> bool:
     entries = manifest["entries"]
     if manifest["kind"] == "file":
         if not source.is_file() or len(entries) != 1:
             return False
         entry = entries[0]
+        if verify_bytes:
+            # Admission compares the live original with the prepared bytes.
+            # A previously verified size/mtime cannot prove current equality.
+            return _sha256_exact_file(
+                source, int(entry["size"]),
+                unavailable_code="asset_source_unavailable",
+                mismatch_code="asset_source_changed_during_intake",
+            ) == entry["sha256"]
         return _file_matches(
             source, int(entry["size"]), str(entry["sha256"])
         )
