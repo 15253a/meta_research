@@ -218,6 +218,21 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
             if commit is not None and commit.disposition != "completed":
                 artifact["status"] = commit.disposition
                 artifact["source"]["basis_ref"] = commit.basis_ref
+                if commit.stage == "bundle" and commit.outcome_kind == "bundle_skip":
+                    accepted = None if request is None else request.accepted_formal_plan
+                    if (
+                        accepted is None or commit.disposition != "skipped"
+                        or accepted.formal_plan_ref != commit.outcome_ref
+                        or accepted.formal_plan_receipt != commit.outcome_receipt
+                        or not isinstance(commit.closure, dict)
+                        or commit.closure.get("formal_plan_ref") != accepted.formal_plan_ref
+                        or accepted.plan_document.get("experiment_briefs") != []
+                        or accepted.plan_document.get("bundle_disposition") != "no_new_experiment_required"
+                    ):
+                        raise OwnerConflict("research_overview_bundle_skip_binding_invalid")
+                    # Link to the exact accepted Plan artifact already exposed
+                    # by this reader. A skip supplies no scientific conclusion.
+                    artifact["source"]["formal_plan_ref"] = accepted.formal_plan_ref
                 return artifact
             if request is None:
                 raise OwnerConflict("research_overview_stage_request_missing")

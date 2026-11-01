@@ -132,6 +132,7 @@ class RuntimeStatusReader:
             result = {
                 'schema_ref': 'meta-research/runtime-status/v1',
                 'revision': 0 if event is None else event['revision'],
+                'revision_domain': self.database.revision_domain(),
                 'observed_at': observed_at,
                 'updated_at': observed_at if event is None else timestamp(event['recorded_at']),
                 'state': state, 'current_task': task, 'waiting_reason': reason,

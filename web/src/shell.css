@@ -3897,3 +3897,5 @@ a:focus-visible,
 .lumen-guidance-delivery dt { font-weight: 600; }
 .lumen-guidance-delivery dd { margin-left: 0; white-space: pre-wrap; }
 .lumen-constraint > p { white-space: pre-wrap; }
+
+.projection-refresh { padding: 6px 16px; color: var(--muted, #666); font-size: 12px; background: transparent; }

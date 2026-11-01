@@ -20,7 +20,7 @@ const javascript = ts.transpileModule(functions.map(node => node.getText(parsed)
 }).outputText;
 
 type Slot = { value?: unknown; deps?: readonly unknown[]; cleanup?: () => void };
-type Reply = { ok: boolean; status: number; json: () => Promise<unknown> };
+type Reply = { ok: boolean; status: number; headers: Headers; json: () => Promise<unknown> };
 type Read = { signal: AbortSignal; finish: (status?: number, questRef?: string) => void };
 const settle = async () => { for (let index = 0; index < 8; index++) await Promise.resolve(); };
 
@@ -30,7 +30,7 @@ function harness() {
   const same = (a: readonly unknown[] | undefined, b: readonly unknown[]) => a?.length === b.length
     && a.every((value, index) => Object.is(value, b[index]));
   const sandbox = {
-    exports: {} as { useResearchOverview: typeof useResearchOverview }, AbortController, URLSearchParams,
+    exports: {} as { useResearchOverview: typeof useResearchOverview }, AbortController, URLSearchParams, setTimeout, clearTimeout,
     useState<T>(initial: T | (() => T)) {
       const index = cursor++;
       slots[index] ??= { value: typeof initial === "function" ? (initial as () => T)() : initial };
@@ -54,7 +54,7 @@ function harness() {
       const capturedScope = scope;
       return new Promise<Reply>((resolveReply, reject) => {
         reads.push({ signal: options.signal, finish: (status = 200, questRef = capturedScope) => resolveReply({
-          ok: status === 200, status, json: async () => ({
+          ok: status === 200, status, headers: new Headers(), json: async () => ({
             schema_ref: "meta-research/research-overview/v1", quest_ref: questRef,
             cycle_ref: capturedScope, question_ref: capturedScope,
             cycles: [], findings: { quest: [], question: [], cycle: [] },

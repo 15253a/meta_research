@@ -1358,7 +1358,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     .toBeVisible();
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "重试", exact: true }).click();
-  await expect(dialog.locator(".hc-response-boundary b")).toHaveText("这件事已处理");
+  await expect(dialog.locator(".hc-response-boundary b")).toHaveText("重试已完成");
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 });
 
@@ -1747,243 +1747,79 @@ test("an orphaned material delivery is discarded when its request revision is no
   );
 });
 
-test("a current HumanRequest revision auto-opens once and stays reopenable from the persistent rail", async ({
-  page,
-}) => {
+test("current and new HumanRequest revisions notify without opening or redirecting the reader", async ({ page }) => {
   const snapshot = await installHumanCollaborationSnapshot(page, { questBlock: true });
-  const requests = ((snapshot.human_collaboration as JsonRecord)
-    .human_requests as JsonRecord).items as JsonRecord[];
+  const requests = ((snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord).items as JsonRecord[];
   const returnLocation = "/?variant=A&view=questions&panel=question-tree";
-  await page.goto(`${product!.baseUrl}${returnLocation}`, {
-    waitUntil: "domcontentloaded",
-  });
-
+  await page.goto(`${product!.baseUrl}${returnLocation}`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("heading", {
-    name: "恢复当前图书馆会话，或选择合法全文替代路线。",
-  })).toBeVisible();
+  await expect(page.getByRole("button", { name: "需要你", exact: true })).toBeEnabled();
+  await expect(dialog).toBeHidden();
+  await expect.poll(() => new URL(page.url()).search).toBe(new URL(returnLocation, product!.baseUrl).search);
+  await page.getByRole("button", { name: "需要你", exact: true }).click();
+  await dialog.getByRole("button", { name: /图书馆访问 · 恢复当前图书馆会话/ }).click();
+  await expect(dialog.getByRole("heading", { name: "恢复当前图书馆会话，或选择合法全文替代路线。" })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
-  await expect.poll(() => new URL(page.url()).pathname
-    + new URL(page.url()).search + new URL(page.url()).hash).toBe(returnLocation);
+  const previous = requests.find(item => item.request_ref === "research_graph:HR-52:r1")!;
+  previous.status = "superseded";
+  previous.successor_request_ref = "research_graph:HR-52:r2";
+  requests.push({ ...previous, request_ref: "research_graph:HR-52:r2", revision: 2, status: "open",
+    obligation: "修订后的线下校准请求，交回原始结果。", predecessor_request_ref: "research_graph:HR-52:r1", successor_request_ref: null });
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(dialog).toBeHidden();
-  await expect(page.getByRole("complementary", { name: "研究助手" })).toContainText(
-    "需要你处理",
-  );
-  await page.getByRole("button", { name: "需要你" }).click();
-  await expect(dialog).toBeVisible();
-  await dialog.getByRole("button", { name: "关闭需要你处理的事项" }).click();
-  await expect(dialog).toBeHidden();
-
-  const questWide = requests.find(
-    (item) => item.request_ref === "research_graph:HR-52:r1",
-  )!;
-  questWide.status = "superseded";
-  questWide.successor_request_ref = "research_graph:HR-52:r2";
-  requests.push({
-    ...questWide,
-    request_ref: "research_graph:HR-52:r2",
-    revision: 2,
-    status: "open",
-    obligation: "修订后的线下校准请求，交回原始结果。",
-    predecessor_request_ref: "research_graph:HR-52:r1",
-    successor_request_ref: null,
-  });
-  await page.reload({ waitUntil: "domcontentloaded" });
-  await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText("修订后的线下校准请求，交回原始结果。");
-  await dialog.getByRole("button", { name: "关闭需要你处理的事项" }).click();
-  await page.reload({ waitUntil: "domcontentloaded" });
-  await expect(dialog).toBeHidden();
+  await page.getByRole("button", { name: "需要你", exact: true }).click();
+  await dialog.getByRole("button", { name: /线下操作 · 修订后的线下校准请求/ }).click();
+  await expect(dialog.getByRole("heading", { name: "修订后的线下校准请求，交回原始结果。" })).toBeVisible();
 });
 
-test("auto presentation holds one exact request and dismissal does not cascade", async ({
-  page,
-}) => {
+test("a selected request keeps its receipt after becoming non-open with another open request", async ({ page }) => {
   const snapshot = await installHumanCollaborationSnapshot(page);
-  const humanRequests = (snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord;
-  const items = humanRequests.items as JsonRecord[];
-  const first = items.find(
-    (item) => item.request_ref === "research_graph:HR-52:r1",
-  )!;
-  const second = request(
-    "offline_action",
-    "research_graph:HR-53:r1",
-    "research_graph",
-    "处理当前 Quest 的第二个全局阻塞。",
-    "ExperimentBrief-13",
-  );
-  items.push(second);
-  for (const item of items) item.status = "satisfied";
-
-  const mutableSnapshot = snapshot as JsonRecord;
-  const initialRevision = Number(mutableSnapshot.revision);
-  expect(Number.isSafeInteger(initialRevision)).toBeTruthy();
-  const queueRevision = initialRevision + 1;
-  let releaseQueue!: () => void;
-  const queueGate = new Promise<void>((resolve) => {
-    releaseQueue = resolve;
+  const items = ((snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord).items as JsonRecord[];
+  const selected = items.find(item => item.request_ref === "research_graph:HR-52:r1")!;
+  await page.route("**/api/v1/human-requests/research_graph%3AHR-52%3Ar1/responses", async route => {
+    selected.status = "unsatisfied";
+    selected.responses = [{ response_ref: "original-unsatisfied", ...route.request().postDataJSON() }];
+    selected.evaluation = { decision: "needs_input" };
+    selected.disposition = { decision: "unsatisfied" };
+    (snapshot as JsonRecord).revision = Number((snapshot as JsonRecord).revision) + 1;
+    await fulfillJson(route, { response_ref: "original-unsatisfied", status: "recorded" });
   });
-  let eventRequests = 0;
-  await page.unroute("**/api/v1/events*");
-  await page.route("**/api/v1/events*", async (route) => {
-    eventRequests += 1;
-    if (eventRequests > 1) {
-      await route.abort("connectionrefused");
-      return;
-    }
-    await queueGate;
-    await route.fulfill({
-      status: 200,
-      contentType: "text/event-stream",
-      headers: { "Cache-Control": "no-cache" },
-      body: `id: ${queueRevision}\nevent: projection.updated\ndata: {"revision":${queueRevision}}\n\n`,
-    });
-  });
-
-  let draftingReloads = 0;
-  await page.route("**/api/v1/companion/messages", async (route) => {
-    draftingReloads += 1;
-    mutableSnapshot.revision = queueRevision + 1;
-    await fulfillJson(
-      route,
-      ((snapshot.human_collaboration as JsonRecord).companion as object),
-    );
-  });
-
-  const returnLocation = "/?variant=A&view=questions&panel=question-tree#queue-return";
-  await page.goto(`${product!.baseUrl}${returnLocation}`, {
-    waitUntil: "domcontentloaded",
-  });
-  const returnFocus = page.getByRole("button", { name: "问题树", exact: true });
-  await expect(returnFocus).toBeEnabled();
-  await returnFocus.focus();
-  await expect(returnFocus).toBeFocused();
-  await expect.poll(() => eventRequests).toBe(1);
-
-  (first.direct_waiters as JsonRecord[])[0].wait_scope = "quest";
-  (second.direct_waiters as JsonRecord[])[0].wait_scope = "quest";
-  first.status = "open";
-  second.status = "open";
-  humanRequests.waiting = {
-    scope: "quest",
-    safe_meaningful_runnable_exists: false,
-    other_blockers: [],
-  };
-  mutableSnapshot.revision = queueRevision;
-  releaseQueue();
-
-  const firstPresentationKey =
-    "meta_research_human_request_presented:research_graph:HR-52:r1:1";
-  const secondPresentationKey =
-    "meta_research_human_request_presented:research_graph:HR-53:r1:1";
+  await page.goto(`${product!.baseUrl}/?panel=offline-operation`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText("按已接纳协议完成线下校准并交回原始结果。");
-  await expect(dialog).not.toContainText("处理当前 Quest 的第二个全局阻塞。");
-  await expect.poll(() => page.evaluate(
-    (key) => sessionStorage.getItem(key),
-    firstPresentationKey,
-  )).toBe("1");
-  await expect.poll(() => page.evaluate(
-    (key) => sessionStorage.getItem(key),
-    secondPresentationKey,
-  )).toBeNull();
-
-  await dialog.getByLabel("就线下操作事项发消息")
-    .fill("刷新 Projection 后仍保持这个精确请求。");
-  await dialog.getByRole("button", { name: "发送消息" }).click();
-  await expect.poll(() => draftingReloads).toBe(1);
-  await expect(page.locator(".lumen-connection code"))
-    .toHaveText(`状态 ${queueRevision + 1}`);
-  await expect(dialog).toContainText("按已接纳协议完成线下校准并交回原始结果。");
-  await expect(dialog).not.toContainText("处理当前 Quest 的第二个全局阻塞。");
-  await expect.poll(() => page.evaluate(
-    (key) => sessionStorage.getItem(key),
-    secondPresentationKey,
-  )).toBeNull();
-
-  await dialog.getByRole("button", { name: "关闭需要你处理的事项" }).click();
-  await expect(dialog).toBeHidden();
-  await expect.poll(() => page.evaluate(
-    (key) => sessionStorage.getItem(key),
-    secondPresentationKey,
-  )).toBe("1");
-  await expect.poll(() => new URL(page.url()).pathname
-    + new URL(page.url()).search + new URL(page.url()).hash).toBe(returnLocation);
-  await expect(returnFocus).toBeFocused();
+  await dialog.getByRole("textbox", { name: "自然语言回应", exact: true }).fill("现场条件仍有缺口。");
+  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
+  await expect(dialog).toContainText("已回应，未满足");
+  await expect(dialog.getByRole("heading", { name: "按已接纳协议完成线下校准并交回原始结果。" })).toBeVisible();
+  await expect(dialog).toContainText("original-unsatisfied");
+  await expect(dialog).toContainText("提交不表示原根已恢复");
 });
 
-test("a newly current HumanRequest remains dismissible beside a formal creation window", async ({
-  page,
-}) => {
+test("a new HumanRequest does not interrupt a formal creation window", async ({ page }) => {
   await installHumanCollaborationSnapshot(page, { questBlock: true });
-  await page.goto(`${product!.baseUrl}/?panel=create-quest`, {
-    waitUntil: "domcontentloaded",
-  });
-
-  const quest = page.getByRole("dialog", {
-    name: "创建 Quest，并决定第一个研究问题",
-  });
-  const humanRequest = page.getByRole("dialog", { name: "需要你处理的事项" });
+  await page.goto(`${product!.baseUrl}/?panel=create-quest`, { waitUntil: "domcontentloaded" });
+  const quest = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
   await expect(quest).toBeVisible();
-  await expect(humanRequest).toBeVisible();
-  await expect(page.getByRole("complementary", { name: "研究助手" }))
-    .toContainText("需要你处理");
-
-  await humanRequest.getByRole("button", { name: "关闭需要你处理的事项" }).click();
-  await expect(humanRequest).toBeHidden();
-  await expect(quest).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "需要你处理的事项" })).toBeHidden();
   await quest.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
   await expect(quest).toBeHidden();
+  await page.getByRole("button", { name: "需要你", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "需要你处理的事项" })).toBeVisible();
 });
 
-test("auto presentation skips requests already presented in this browser session", async ({
-  page,
-}) => {
-  const snapshot = await installHumanCollaborationSnapshot(page, { questBlock: true });
-  const humanRequests = (snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord;
-  const items = humanRequests.items as JsonRecord[];
-  const secondCurrent = request(
-    "offline_action",
-    "research_graph:HR-53:r1",
-    "research_graph",
-    "处理当前 Quest 的第二个全局阻塞。",
-    "ExperimentBrief-13",
-  );
-  (secondCurrent.direct_waiters as JsonRecord[])[0].wait_scope = "quest";
-  const foreignQuest = request(
-    "offline_action",
-    "research_graph:HR-99:r1",
-    "research_graph",
-    "FOREIGN QUEST GLOBAL BLOCK",
-    "ExperimentBrief-99",
-  );
-  foreignQuest.quest_ref = "quest_foreign_9";
-  (foreignQuest.direct_waiters as JsonRecord[])[0].wait_scope = "quest";
-  foreignQuest.status = "satisfied";
-  items.push(secondCurrent, foreignQuest);
-  await page.addInitScript((alreadyPresented: Array<{ requestRef: string; revision: number }>) => {
-    for (const item of alreadyPresented) {
-      sessionStorage.setItem(
-        `meta_research_human_request_presented:${item.requestRef}:${item.revision}`,
-        "1",
-      );
-    }
-  }, items.filter((item) => item !== secondCurrent && item.status === "open").map((item) => ({
-    requestRef: String(item.request_ref),
-    revision: Number(item.revision),
-  })));
-
+test("request notifications remain available after dismissal and page reload without reopening", async ({ page }) => {
+  await installHumanCollaborationSnapshot(page, { questBlock: true });
   await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  const notification = page.getByRole("button", { name: "需要你", exact: true });
+  await expect(notification).toBeEnabled();
+  await expect(dialog).toBeHidden();
+  await notification.click();
   await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText("处理当前 Quest 的第二个全局阻塞。");
-  await expect(dialog).not.toContainText("FOREIGN QUEST GLOBAL BLOCK");
   await dialog.getByRole("button", { name: "关闭需要你处理的事项" }).click();
   await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(notification).toBeEnabled();
   await expect(dialog).toBeHidden();
 });
 

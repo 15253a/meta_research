@@ -93,6 +93,14 @@ class Database:
     def close(self) -> None:
         self._engine.dispose()
 
+    def revision_domain(self) -> str:
+        """The existing durable identity, shared by all observations of this DB."""
+        with self.read() as connection:
+            return str(connection.exec_driver_sql(
+                "SELECT correlation_ref FROM ar_runtime_observability_identity "
+                "WHERE singleton = 'runtime'"
+            ).scalar_one())
+
 
 def _configure_sqlite(dbapi_connection, _connection_record) -> None:
     cursor = dbapi_connection.cursor()

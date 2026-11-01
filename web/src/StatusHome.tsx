@@ -11,6 +11,7 @@ type Health = { status: string; checks: { name: string; status: string; reason?:
 export type RuntimeStatus = {
   schema_ref: "meta-research/runtime-status/v1";
   revision: number;
+  revision_domain?: string;
   observed_at: string;
   updated_at: string;
   state: string;
@@ -94,7 +95,8 @@ export function StatusHome() {
       try {
         const next = await readStatus();
         if (stopped) return;
-        setStatus(current => current && current.revision > next.revision ? current : next);
+        setStatus(current => current && current.revision_domain === next.revision_domain
+          && current.revision > next.revision ? current : next);
         setError(false);
         failures = 0;
       } catch {
@@ -109,8 +111,15 @@ export function StatusHome() {
       }
     };
     refresh.current = () => void reload();
+    const onVisible = () => { if (!document.hidden) void reload(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", onVisible);
     void reload();
-    return () => { stopped = true; window.clearTimeout(timer); };
+    return () => {
+      stopped = true; window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", onVisible);
+    };
   }, []);
   const rootScope = !error && canObserveActiveTarget(rawStatus) ? JSON.stringify([
     rawStatus!.foreground!.quest_ref, rawStatus!.foreground!.cycle_ref, rawStatus!.foreground!.question_ref,
@@ -168,7 +177,7 @@ export function StatusHome() {
           </span>
         </div>
         <h1 id="current-task-title">{status?.current_task?.title ?? (status ? "还没有运行中的研究任务" : error ? "暂时无法读取运行状态" : "正在读取当前任务")}</h1>
-        {error ? <p className="status-home-error" role="alert">刷新失败。{status ? "下面保留上次成功读取的状态，不代表此刻的最新进度。" : "请稍后重试；尚未取得有效状态。"}</p> : null}
+        {error ? <p className="status-home-error" role="status">暂时无法更新状态，将自动重试。{status ? "下面保留上次成功读取的状态，不代表此刻的最新进度。" : "尚未取得有效状态。"}</p> : null}
         <div className="status-home-primary">
           <a className="status-home-primary-link" href={status?.state === "idle" ? "/?panel=create-quest" : "/?workspace=1"}>{status?.state === "idle" ? "开始研究" : "当前任务与实验日志"} <span>↗</span></a>
           {status && status.pending_requests > 0 ? <a className="status-home-response" href="/?panel=human-requests">需要你回应 · {status.pending_requests} 项 ↗</a> : null}

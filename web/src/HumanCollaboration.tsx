@@ -26,6 +26,8 @@ import {
   hydratePendingHumanRequestRecovery,
   pendingHumanRequestResponse,
   pendingHumanRequestResponsePreview,
+  humanResponseDeliveryState,
+  subscribeHumanResponseDelivery,
   hasLegacyHumanRequestMaterial,
   previewHumanCommand,
   ProductError,
@@ -2100,11 +2102,7 @@ export function HumanRequestSurface({
   const requestedSelected = items.find(
     (item) => item.request_ref === selectedRef,
   ) ?? null;
-  const selected = blocking
-    ? currentItems.find((item) => item.request_ref === selectedRef)
-      ?? currentItems[0]
-      ?? null
-    : requestedSelected;
+  const selected = requestedSelected;
   const queuePosition = selected
     ? currentItems.findIndex((item) => item.request_ref === selected.request_ref) + 1
     : 0;
@@ -2116,31 +2114,46 @@ export function HumanRequestSurface({
     : null;
   const dialogRef = useRef<HTMLDialogElement>(null);
   const onCloseRef = useRef(onClose);
-  const [orphanRecoveryAttempt, setOrphanRecoveryAttempt] = useState(0);
-  const currentRequestRefs = currentItems.map((item) => item.request_ref);
-  const currentRequestRefsKey = currentRequestRefs.join("\n");
-
+  const recoveryChanged = useRef(onChanged);
+  recoveryChanged.current = onChanged;
   useEffect(() => {
     if (collaboration?.human_requests.status !== "ready") return;
+    let active = true;
+    let running = false;
+    let failures = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    void reconcileHumanRequestResponses()
-      .then((changed) => {
-        if (changed) onChanged();
-      })
-      .catch(() => {
-        if (orphanRecoveryAttempt >= 4) return;
-        retryTimer = setTimeout(() => {
-          setOrphanRecoveryAttempt((attempt) => attempt + 1);
-        }, Math.min(250 * 2 ** orphanRecoveryAttempt, 2_000));
-      });
-    return () => {
+    const schedule = (delay: number) => {
+      if (!active || running) return;
       if (retryTimer !== null) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => void reconcile(), delay);
     };
-  }, [collaboration?.human_requests.status, currentRequestRefsKey, orphanRecoveryAttempt]);
-
-  useEffect(() => {
-    setOrphanRecoveryAttempt(0);
-  }, [currentRequestRefsKey]);
+    const reconcile = async () => {
+      if (!active || running) return;
+      running = true;
+      try {
+        if (await reconcileHumanRequestResponses()) recoveryChanged.current();
+        failures = 0;
+      } catch {
+        failures += 1;
+      } finally {
+        running = false;
+        schedule(failures ? Math.min(1000 * 2 ** Math.min(failures - 1, 5), 30_000) : 30_000);
+      }
+    };
+    const wake = () => schedule(1000);
+    const unsubscribe = subscribeHumanResponseDelivery(wake);
+    const returned = () => { if (document.visibilityState === "visible") wake(); };
+    window.addEventListener("online", wake);
+    document.addEventListener("visibilitychange", returned);
+    void reconcile();
+    return () => {
+      active = false;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      unsubscribe();
+      window.removeEventListener("online", wake);
+      document.removeEventListener("visibilitychange", returned);
+    };
+  }, [collaboration?.human_requests.status]);
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -2264,7 +2277,7 @@ export function HumanRequestSurface({
             onBack={() => onSelect(null)}
             onClose={onClose}
             onChanged={onChanged}
-            blocking={blocking}
+            blocking={blocking && selected.status === "open"}
             queuePosition={queuePosition}
             queueSize={currentItems.length}
             onPrevious={() => {
@@ -2887,15 +2900,17 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
 }) {
   const [note, setNote] = usePageDraft(`hr-note:${request.request_ref}`, "");
   const [sealedResponse, setSealedResponse] = useState<HumanRequestResponseBody | null>(null);
+  const [recoveryReady, setRecoveryReady] = useState(false);
   const [pending, setPending] = useState(false);
   const [review, setReview] = useState<HumanRequestResponseBody | null>(null);
   const reviewAction = useRef<(() => Promise<void>) | null>(null);
   const delivering = useRef(false);
   useEffect(() => { onReviewChange(review !== null); return () => onReviewChange(false); }, [review, onReviewChange]);
-  const [recorded, setRecorded] = useState(false);
+  const [recorded, setRecorded] = useState(() => humanResponseDeliveryState(request.request_ref)?.status === "recorded");
   const [retryStatus, setRetryStatus] = useState<"processing" | "succeeded" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const currentRequestRef = useRef(request.request_ref);
+  const mounted = useRef(true);
   const successRef = useRef<HTMLElement>(null);
   const evaluationDecision = typeof request.evaluation?.decision === "string"
     ? request.evaluation.decision
@@ -2903,24 +2918,40 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
 
   useEffect(() => {
     let active = true;
-    void pendingHumanRequestResponsePreview(request.request_ref).then(value => { if (active) setSealedResponse(value); })
-      .catch(caught => { if (active) setError(reasonCode(caught)); });
-    return () => { active = false; };
+    let read = 0;
+    const update = () => {
+      const sequence = ++read;
+      const delivery = humanResponseDeliveryState(request.request_ref);
+      if (delivery?.status === "recorded") {
+        setRecorded(true);
+        setSealedResponse(null);
+        setError(null);
+        setRecoveryReady(true);
+        onChanged();
+        return;
+      }
+      if (delivery?.status === "pending") setRecorded(false);
+      if (delivery?.status === "rejected") { setRecorded(false); setError(delivery.error ?? "request_rejected"); }
+      void pendingHumanRequestResponsePreview(request.request_ref).then(value => {
+        if (active && sequence === read) { setSealedResponse(value); setRecoveryReady(true); }
+      }).catch(caught => { if (active && sequence === read) { setError(reasonCode(caught)); setRecoveryReady(false); } });
+    };
+    update();
+    const unsubscribe = subscribeHumanResponseDelivery(update);
+    return () => { active = false; unsubscribe(); };
   }, [request.request_ref]);
 
   useEffect(() => {
-    setPending(false);
-    setRecorded(false);
-    setRetryStatus(null);
-    setError(null);
-  }, [request.request_ref, evaluationDecision]);
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   currentRequestRef.current = request.request_ref;
 
   const markResponseRecorded = () => {
-    if (currentRequestRef.current !== request.request_ref) return;
+    if (!mounted.current || currentRequestRef.current !== request.request_ref) return;
     setRecorded(true);
-    setNote("");
+    setNote(current => current === note ? "" : current);
     onChanged();
   };
 
@@ -2933,7 +2964,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   }, [recorded]);
 
   const submit: SubmitResponse = async (facts = {}, decision = "provided", material, alreadyReviewed = false) => {
-    if ((pending && !alreadyReviewed) || recorded) return;
+    if ((pending && !alreadyReviewed) || (recorded && evaluationDecision !== "needs_input")) return;
     const response: HumanRequestResponseBody = {
       decision, facts,
       note: [note, ...selectedReplies.map(message => messageText(message))].filter(value => value.trim()).join("\n\n"),
@@ -2951,7 +2982,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   };
 
   const deliverResponse = async (response: HumanRequestResponseBody) => {
-    if (delivering.current || recorded) return;
+    if (delivering.current || (recorded && evaluationDecision !== "needs_input")) return;
     delivering.current = true;
     setPending(true);
     setError(null);
@@ -2963,7 +2994,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
           throw new ProductError("human_request_response_recovery_conflict");
         }
         await deliverPendingHumanRequestResponse(request.request_ref);
-        setSealedResponse(null);
+        if (mounted.current) setSealedResponse(null);
         markResponseRecorded();
         return;
       }
@@ -2972,10 +3003,13 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         throw new ProductError("human_response_material_reselection_required");
       }
       await respondToHumanRequest(request.request_ref, response);
-      setSealedResponse(null);
+      if (mounted.current) setSealedResponse(null);
       markResponseRecorded();
     } catch (caught) {
-      void pendingHumanRequestResponsePreview(request.request_ref).then(setSealedResponse).catch(() => undefined);
+      if (!mounted.current) return;
+      void pendingHumanRequestResponsePreview(request.request_ref).then(value => {
+        if (mounted.current) setSealedResponse(value);
+      }).catch(() => undefined);
       const code = reasonCode(caught);
       setError(humanRequestScopeStale(code)
         ? "任务已更新，这次回应未提交。正在刷新当前待办，请在更新后重新选择。"
@@ -2983,8 +3017,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
       if (humanRequestScopeStale(code)) onChanged();
     } finally {
       delivering.current = false;
-      setPending(false);
-      setReview(null);
+      if (mounted.current) { setPending(false); setReview(null); }
     }
   };
 
@@ -3009,12 +3042,14 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     }
   };
 
-  if (request.status !== "open" || retryStatus === "succeeded") {
+  const unresolvedResponse = !recorded && Boolean(sealedResponse || pendingHumanRequestResponse(request.request_ref));
+  if (recoveryReady && !unresolvedResponse && (request.status !== "open" || retryStatus === "succeeded")) {
     return (
       <div className="hc-response-boundary" role="status">
-        <b>这件事已处理{request.status !== "satisfied" && retryStatus !== "succeeded"
-          ? ` · ${requestStatusLabel(request.status)}` : ""}</b><br />
-        处理记录可在详情中查看；如果出现后续待办，可在那里补充。
+        <b>{retryStatus === "succeeded" ? "重试已完成" : `${recorded || request.responses?.length ? "回应已提交" : "请求状态已更新"} · ${requestStatusLabel(request.status)}`}</b><br />
+        <p>本请求的回执与后继状态保留在此。提交不表示原根已恢复，也不表示科学问题已解决。</p>
+        <p>原根核验：{evaluationDecision ?? "尚无确认"}；后续处理：{String(request.disposition?.decision ?? "尚无确认")}。</p>
+        <code>{String(humanResponseDeliveryState(request.request_ref)?.result?.response_ref ?? "")}</code>
         <HumanRequestMaterialReferences responses={request.responses ?? []} />
       </div>
     );
@@ -3029,7 +3064,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     && request.evaluation === null
     && request.disposition === null;
   const retryProcessing = retryStatus === "processing" || projectedRetryProcessing;
-  const awaitingOwner = request.kind !== "system_operation_help" && (recorded
+  const awaitingOwner = request.kind !== "system_operation_help" && ((recorded && evaluationDecision !== "needs_input")
     || ((request.responses?.length ?? 0) > 0 && evaluationDecision !== "needs_input"));
   if (awaitingOwner) {
     return (
@@ -3042,6 +3077,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         <span aria-hidden="true">✓</span>
         <div>
           <h3>回应已提交</h3>
+          <code>{String(humanResponseDeliveryState(request.request_ref)?.result?.response_ref ?? "")}</code>
           <HumanRequestMaterialReferences responses={request.responses ?? []} />
           <p>回应及原始来源引用已提交到请求原根。材料保留在原服务器路径，原根可按需读取；提交本身不自动入库。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
         </div>
@@ -3051,6 +3087,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
 
   return (
     <>
+      {!recoveryReady ? <p role="status">正在核对原提交记录…</p> : null}
       {review ? <HumanResponseReview request={request} response={review} pending={pending}
         onClose={() => { if (!pending) { reviewAction.current = null; setReview(null); } }}
         onConfirm={() => {
@@ -3066,15 +3103,15 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         <small>正式提交包含以上说明。文件产物需在下方明确选择。</small>
       </section> : null}
       {sealedResponse && <section className="server-material-picker__candidate" role="status">
-        <b>原求助回应有待重试的封存提交</b><code>{request.request_ref}</code>
+        <b>提交结果待确认</b><code>{request.request_ref}</code>
         <p>{sealedResponse.note}</p>
         {sealedResponse.materials?.filter(item => item.kind === "server_reference").map((item, index) => item.kind === "server_reference" && <div key={index}><code>{item.selection.absolute_path}</code><p>{item.selection.description}</p><span>{item.selection.server.hostname} · {item.selection.server.platform} · {item.selection.server.permission_context}</span></div>)}
-        <button type="button" disabled={pending} onClick={() => void submit()}>重试封存回应</button>
-        <p>重试使用原回应、原材料及原请求身份。</p>
+        <button type="button" disabled={pending} onClick={() => void submit()}>核对原提交</button>
+        <p>正在自动核对原提交；安全重投只使用封存正文、原材料及原请求身份，新草稿不能替换它。</p>
       </section>}
       {hasLegacyHumanRequestMaterial(request.request_ref) ? <p role="status">检测到旧版材料恢复记录。原入库回执保留；请重新选择文件或原路径后提交，旧记录不会自动重放。</p> : null}
       {request.kind === "library_reconnect" ? (
-        <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending || !!sealedResponse} workspacePath={workspacePath} />
+        <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending || !!sealedResponse || !recoveryReady} workspacePath={workspacePath} />
       ) : null}
       {request.kind === "external_material_api_access" ? (
         <NaturalLanguageMaterialForm
@@ -3082,7 +3119,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
           note={note}
           setNote={setNote}
           submit={submit}
-          disabled={pending || !!sealedResponse}
+          disabled={pending || !!sealedResponse || !recoveryReady}
           workspacePath={workspacePath}
         />
       ) : null}
@@ -3092,7 +3129,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
           note={note}
           setNote={setNote}
           submit={submit}
-          disabled={pending || !!sealedResponse}
+          disabled={pending || !!sealedResponse || !recoveryReady}
           workspacePath={workspacePath}
         />
       ) : null}
@@ -3104,7 +3141,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
           note={note}
           setNote={setNote}
           submit={submit}
-          disabled={pending || !!sealedResponse}
+          disabled={pending || !!sealedResponse || !recoveryReady}
           onChanged={onChanged}
           reviewAuthorization={action => {
             reviewAction.current = action;
@@ -3126,7 +3163,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
           <button
             className="hc-submit"
             type="button"
-            disabled={pending || !!sealedResponse}
+            disabled={pending || !!sealedResponse || !recoveryReady}
             onClick={() => void retry()}
           >重试</button>
         )
@@ -3134,7 +3171,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
       {error || !["library_reconnect", "capability_authorization"].includes(request.kind) ? (
       <div className="hc-response-boundary" role="status">
         {error ? (
-          <><b>{request.kind === "system_operation_help" ? "重试未成功" : "回应没有记录"}</b><br />{error}</>
+          <><b>{request.kind === "system_operation_help" ? "重试未成功" : sealedResponse || pendingHumanRequestResponse(request.request_ref) ? "提交结果待确认" : "回应未提交"}</b><br />{error}</>
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
           <><b>正式提交将回应交回请求原根</b><br />负责当前请求的 Agent 会解释回应、核验材料并决定下一步。</>
         ) : request.kind === "system_operation_help" ? (
