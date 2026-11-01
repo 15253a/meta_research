@@ -259,7 +259,7 @@ class ResearchDatasetOwnerMixin:
         return result
 
     def query_datasets(self, *, query="", dataset_ref=None, question_ref=None,
-                       dataset_version_ref=None, direction="both", offset=0, limit=50, quest_ref=None):
+                       dataset_version_ref=None, direction="both", offset=0, limit=50, quest_ref=None, query_revision=None):
         """Page identities, versions, Question usage, or exact version lineage."""
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise OwnerConflict("dataset_page_invalid")
@@ -304,11 +304,18 @@ class ResearchDatasetOwnerMixin:
             params["quest_scope"] = quest_ref
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._database.read_snapshot() as connection:
-            total = int(connection.execute(text(f"SELECT COUNT(*) FROM {table}{where}"), params).scalar_one())
+            from meta_research.research_pagination import bind_page, page_state
+            identities = connection.execute(text(f"SELECT {key},payload_hash FROM {table}{where} ORDER BY {key}"), params).all()
+            revision = bind_page({"entry":"datasets","quest_ref":quest_ref,"query":query,
+                "dataset_ref":dataset_ref,"question_ref":question_ref,"dataset_version_ref":dataset_version_ref,
+                "direction":direction,"limit":limit},[list(row) for row in identities],offset=offset,query_revision=query_revision)
+            total = len(identities)
             rows = connection.execute(text(f"SELECT * FROM {table}{where} ORDER BY accepted_at, {key} LIMIT :limit OFFSET :offset"), params).all()
             items = [self._dataset_record(operation, row) for row in rows]
+        next_offset = offset + len(items) if offset + len(items) < total else None
         return {"kind": operation, "items": items, "total": total, "offset": offset,
-                "limit": limit, "next_offset": offset + len(items) if offset + len(items) < total else None}
+                "limit": limit, "next_offset": next_offset, "query_revision":revision,
+                **page_state(items,next_offset,offset=offset,query=query)}
 
     def _verify_dataset_asset(self, binding, *, current):
         verify = self._asset_verifier.verify_asset_binding if current else self._asset_verifier.verify_asset_receipt

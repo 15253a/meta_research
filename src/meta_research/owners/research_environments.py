@@ -251,7 +251,7 @@ class ResearchEnvironmentOwnerMixin:
         return self._query_environment_fact("reference", environment_reference_ref, quest_ref=quest_ref)
 
     def query_environments(self, *, query="", environment_ref=None, question_ref=None, semantic_key=None,
-                           offset=0, limit=50, quest_ref=None):
+                           offset=0, limit=50, quest_ref=None, query_revision=None):
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
             raise OwnerConflict("environment_page_invalid")
         _validate(dataset_text, query, "query", optional=True)
@@ -273,14 +273,20 @@ class ResearchEnvironmentOwnerMixin:
             clauses.append(self._environment_scope_clause(operation))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._database.read_snapshot() as connection:
-            total = connection.execute(text(f"SELECT count(*) FROM {table}{where}"), params).scalar_one()
+            from meta_research.research_pagination import bind_page, page_state
+            identities = connection.execute(text(f"SELECT {key},payload_hash FROM {table}{where} ORDER BY {key}"), params).all()
+            revision = bind_page({"entry":"environments","quest_ref":quest_ref,"query":query,
+                "filters":filters,"limit":limit},[list(row) for row in identities],offset=offset,query_revision=query_revision)
+            total = len(identities)
             rows = connection.execute(text(f"SELECT * FROM {table}{where} ORDER BY accepted_at,{key} LIMIT :limit OFFSET :offset"), params).all()
             items = [self._environment_record(operation, row) for row in rows]
             if operation == "register" and quest_ref is not None:
                 for item in items:
                     self._verify_environment_visibility(item, quest_ref=quest_ref)
+        next_offset = offset + len(items) if offset + len(items) < total else None
         return {"kind": operation, "items": items, "total": total, "offset": offset, "limit": limit,
-                "next_offset": offset + len(items) if offset + len(items) < total else None}
+                "next_offset":next_offset,"query_revision":revision,
+                **page_state(items,next_offset,offset=offset,query=query)}
 
     def reconcile_environment_operation(self, *, operation, idempotency_key):
         if operation not in _FACTS:

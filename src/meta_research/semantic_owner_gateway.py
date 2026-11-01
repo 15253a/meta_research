@@ -392,9 +392,14 @@ def _baseline_operations(research_graph, agent_runtime):
         try:
             if page:
                 return research_graph.query_baselines(**arguments, quest_ref=quest_ref)
+            if "relation" not in arguments and any(key in arguments for key in (
+                    "variant_run_ref", "evaluation_ref", "evaluation_attempt_ref")):
+                raise OwnerConflict("baseline_query_invalid")
             result = research_graph.query_baseline(arguments["baseline_ref"], quest_ref=quest_ref)
             if result is not None:
-                result["reusable_entities"] = research_graph.query_baseline_variants(**arguments, quest_ref=quest_ref)
+                reader = (research_graph.query_baseline_relations if "relation" in arguments
+                          else research_graph.query_baseline_variants)
+                result["reusable_entities"] = reader(**arguments, quest_ref=quest_ref)
             return {"status": "not_found" if result is None else "accepted", "result": result}
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
@@ -402,19 +407,25 @@ def _baseline_operations(research_graph, agent_runtime):
     return (
         SemanticOperation(
             semantic_operation_id="research_graph.baselines.page", owning_module="research_graph",
-            description="在当前 Quest 发现可复用的 Baseline 方法版本。query 匹配方法合同、该方法下的 Variant 配方和 Evaluation 协议说明。文本或内容匹配只提供候选，由 Agent 明确选择；沿分页发现，再用选中的 baseline_ref 读取完整不可变方法合同及关联实体。",
+            description="在当前 Quest 发现可复用的 Baseline 方法版本。query 匹配方法合同、Variant 配方、Evaluation 协议、真实 Run／Attempt 输入与结果说明及 Artifact 描述。文本或内容匹配只提供候选，由 Agent 明确选择；沿分页发现，再用选中的 baseline_ref 读取完整不可变方法合同及关联实体。",
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string", "maxLength": 1024},
                 "method_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "offset": {"type": "integer", "minimum": 0}}, "additionalProperties": False},
             output_schema={"type": "object"},
             handler=lambda context, arguments: read(context, arguments, page=True)),
         SemanticOperation(
             semantic_operation_id="research_graph.baselines.read", owning_module="research_graph",
-            description="读取当前 Quest 内一个精确 Baseline 方法版本，并用 variant_ref、offset 和 limit 按需展开关联实体。Bundle 在初始 Target 候选的 measurement_contract.baseline_forward_contract 中声明复用；Target 在 formal_runs 的 baseline_forward_contract 中引用实际 Baseline，或用 variant_ref 复用精确 Variant，遵循正式工作交接契约。每次实际工作的数据和证据另行绑定。",
+            description="读取当前 Quest 内一个精确 Baseline 方法版本，并用 variant_ref、offset 和 limit 按需展开关联实体。Bundle 在初始 Target 候选的 measurement_contract.baseline_forward_contract 中声明复用；Target 在 formal_runs 的 baseline_forward_contract 中引用实际 Baseline，或用 variant_ref 复用精确 Variant，遵循正式工作交接契约。relation 可独立选择 variants/runs/evaluations/attempts/metrics/artifacts；更深 ref 过滤须提供 relation。按返回 reader.operation/args 准确读取。以 next_offset 和 query_revision 续页，保持过滤与limit；缺修订 research_query_revision_required，范围或Owner记录变化 research_query_changed 后从0重开。result_state 区分 matches/page_pending/no_match/no_records/exhausted，scan_complete 只说明本查询扫描结束。每次实际工作的数据和证据另行绑定。",
             input_schema={"type": "object", "properties": {"baseline_ref": _string(max_length=1024),
                 "variant_ref": _string(max_length=1024),
+                "variant_run_ref": _string(max_length=1024),
+                "evaluation_ref": _string(max_length=1024),
+                "evaluation_attempt_ref": _string(max_length=1024),
+                "relation": {"type":"string","enum":["variants","runs","evaluations","attempts","metrics","artifacts"]},
+                "query_revision": {"type":"string","pattern":"^[0-9a-f]{64}$"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "offset": {"type": "integer", "minimum": 0}},
                 "required": ["baseline_ref"], "additionalProperties": False},
@@ -564,11 +575,12 @@ def _dataset_operations(research_graph, agent_runtime):
     result.extend((
         SemanticOperation(
             semantic_operation_id="research_graph.datasets.page", owning_module="research_graph",
-            description="分页发现当前 Quest 使用的 Dataset。每次选择一种模式：query 搜索语义身份、dataset_ref 列精确版本、question_ref 列研究用途，或 dataset_version_ref 列派生关系；各模式分别调用。direction 仅用于派生模式：sources 查该版本的输入，derived 查下游数据，默认 both。保留 notes 和 metadata；发现记录仍须经正式证据和执行输入绑定才能采用。",
+            description="分页发现当前 Quest 使用的 Dataset。每次选择一种模式：query 搜索语义身份、dataset_ref 列精确版本、question_ref 列研究用途，或 dataset_version_ref 列派生关系；各模式分别调用。direction 仅用于派生模式：sources 查该版本的输入，derived 查下游数据，默认 both。以 next_offset/query_revision 续页，保持查询与limit；research_query_changed 后从0重开，缺修订返回 research_query_revision_required。result_state/scan_complete 区分空结果与扫描结束。保留 notes 和 metadata；发现记录仍须经正式证据和执行输入绑定才能采用。",
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string", "maxLength": 1024}, "dataset_ref": _string(max_length=1024),
                 "question_ref": _string(max_length=1024), "dataset_version_ref": _string(max_length=1024),
                 "direction": {"type": "string", "enum": ["sources", "derived", "both"]},
+                "query_revision": {"type":"string","pattern":"^[0-9a-f]{64}$"},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
                 "additionalProperties": False}, output_schema={"type": "object"},

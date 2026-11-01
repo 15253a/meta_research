@@ -32,7 +32,7 @@ def test_primary_may_explicitly_select_an_existing_cross_baseline_variant(tmp_pa
         assert page['next_offset'] is not None
         baselines=[*page['items']]
         while page['next_offset'] is not None:
-            page=graph.query_baselines(quest_ref=quest,limit=1,offset=page['next_offset'])
+            page=graph.query_baselines(quest_ref=quest,limit=1,offset=page['next_offset'],query_revision=page['query_revision'])
             baselines.extend(page['items'])
         assert baseline in {item['baseline_ref'] for item in baselines}
         assert len(baselines)>=2

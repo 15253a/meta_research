@@ -22,46 +22,90 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
         quest_ref = scope.get("quest_ref")
         request_ref = arguments.get("request_ref")
         response_ref = arguments.get("response_ref")
-        if request_ref is None:
+        constraint_ref = arguments.get("constraint_ref")
+        if constraint_ref is not None:
+            if request_ref is not None or response_ref is not None or arguments.get("cursor") is not None:
+                raise OwnerConflict("research_help_selection_invalid")
+            if not quest_ref:
+                raise OwnerConflict("content_source_unbound")
+            value = human_collaboration.read_research_guidance(
+                constraint_ref, quest_ref=quest_ref, version_ref=arguments.get("version_ref"))
+            source_ref = constraint_ref
+        elif arguments.get("entry_kind") == "guidance":
+            if not quest_ref or request_ref is not None or response_ref is not None or arguments.get("cursor") is not None:
+                raise OwnerConflict("research_help_selection_invalid")
+            value = human_collaboration.query_research_guidance(quest_ref=quest_ref,
+                query=arguments.get("query", ""), offset=arguments.get("guidance_offset", 0),
+                query_revision=arguments.get("query_revision"))
+            source_ref = quest_ref
+        elif arguments.get("entry_kind") == "responses":
+            if not quest_ref or request_ref is None or response_ref is not None or arguments.get("cursor") is not None:
+                raise OwnerConflict("research_help_selection_invalid")
+            value = human_collaboration.query_research_response_page(quest_ref=quest_ref,
+                request_ref=request_ref, offset=arguments.get("response_offset", 0),
+                query_revision=arguments.get("query_revision"))
+            value = {**value, "items": [_response_summary(response, request_ref) for response in value["items"]]}
+            source_ref = request_ref
+        elif request_ref is None:
             if not isinstance(quest_ref, str) or not quest_ref:
                 raise OwnerConflict("research_help_request_required")
             if response_ref is not None:
                 raise OwnerConflict("research_help_response_unbound")
             page = human_collaboration.query_research_help_page(
-                quest_ref=quest_ref, cursor=arguments.get("cursor"))
-            inputs = human_collaboration.query_research_inputs(quest_ref=quest_ref,offset=arguments.get("input_offset",0),limit=12,query=arguments.get("query",""))
+                quest_ref=quest_ref, cursor=arguments.get("cursor"),
+                **({"query": arguments["query"]} if arguments.get("query") else {}))
+            inputs = human_collaboration.query_research_inputs(quest_ref=quest_ref,
+                offset=arguments.get("input_offset",0),limit=12,query=arguments.get("query",""),
+                **({"query_revision": arguments["input_query_revision"]} if "input_query_revision" in arguments else {}))
             value = {"research_inputs":inputs,"schema_ref": "meta-research/human-research-context/v1",
                      "summary_only": True, "items": [_request_summary(item) for item in page["items"]],
+                     "formal_guidance_reader": {"operation": HUMAN_RESEARCH_READ_OPERATION,
+                                                "entry_kind": "guidance"},
                      "next_cursor": page["next_cursor"], "selection": "recent_quest_requests"}
+            for key in ("query_revision", "result_state", "scan_complete"):
+                if key in page:
+                    value[key] = page[key]
             source_ref = quest_ref
         else:
             if arguments.get("cursor") is not None:
                 raise OwnerConflict("research_help_cursor_invalid")
-            request = human_collaboration.query_human_request(request_ref)
+            request = (human_collaboration.query_research_help_request(request_ref, quest_ref=quest_ref)
+                       if quest_ref else human_collaboration.query_human_request(request_ref, materialize_expiration=False))
             if request is None or request.get("quest_ref") != quest_ref:
                 raise OwnerConflict("research_help_request_unbound")
             if not quest_ref:
                 binding = (request.get("open_effect") or {}).get("operation_binding") or {}
                 if binding.get("task_ref") != context.run_ref or binding.get("root_session_ref") != context.root_session_ref:
                     raise OwnerConflict("research_help_request_unbound")
+            if response_ref is None and arguments.get("version_ref") is not None:
+                if arguments["version_ref"] != _request_content_hash(request):
+                    raise OwnerConflict("content_version_unbound")
             value = {key: request.get(key) for key in (
                 "request_ref", "quest_ref", "kind", "obligation", "business_purpose",
                 "target_assertion", "acceptance_conditions", "required_authorization",
                 "status", "current", "predecessor_request_ref", "successor_request_ref")}
             value["request_content_hash"] = _request_content_hash(request)
             if response_ref is None:
-                value["responses"] = [_response_summary(response, request_ref)
-                                      for response in request.get("responses", [])]
+                if quest_ref:
+                    value["response_count"] = request["response_count"]
+                    value["responses_reader"] = request["responses_reader"]
+                else:
+                    value["responses"] = [_response_summary(response, request_ref)
+                                          for response in request.get("responses", [])]
             else:
-                response = next((item for item in request.get("responses", [])
-                                 if item.get("response_ref") == response_ref), None)
+                response_context = (human_collaboration.query_research_help_response(
+                    request_ref, response_ref, quest_ref=quest_ref) if quest_ref else request)
+                response = (response_context["response"] if quest_ref else
+                    next((item for item in request.get("responses", []) if item.get("response_ref") == response_ref), None))
                 if response is None:
                     raise OwnerConflict("research_help_response_unbound")
+                if arguments.get("version_ref") is not None and arguments["version_ref"] != canonical_hash(response):
+                    raise OwnerConflict("content_version_unbound")
                 value["response"] = response
                 value["response_content_hash"] = canonical_hash(response)
-                evaluation = request.get("evaluation") or {}
+                evaluation = response_context.get("evaluation") or {}
                 value["used_by_owner_evaluation"] = response_ref in evaluation.get("response_refs", [])
-                value["owner_disposition"] = (request.get("disposition") or {}).get("decision")
+                value["owner_disposition"] = (response_context.get("disposition") or {}).get("decision")
             source_ref = response_ref or request_ref
         chunk = context_read_page(value, path=[], offset=arguments.get("offset", 0),
                                   limit=arguments.get("limit", 8192))
@@ -84,7 +128,7 @@ def _response_summary(response, request_ref):
             "facts": bounded_text(response.get("facts", {}), 512),
             "response_content_hash": canonical_hash(response),
             "reader": {**human_research_reader(), "request_ref": request_ref,
-                       "response_ref": response["response_ref"]}}
+                       "response_ref": response["response_ref"], "version_ref": canonical_hash(response)}}
 
 
 def _request_summary(request):
@@ -94,9 +138,12 @@ def _request_summary(request):
             "request_content_hash": _request_content_hash(request),
             "obligation": bounded_text(request["obligation"], 512),
             "business_purpose": bounded_text(request["business_purpose"], 1024),
-            "response_count": len(responses),
+            "response_count": request.get("response_count", len(responses)),
             "latest_response": _response_summary(responses[-1], request["request_ref"]) if responses else None,
-            "reader": {**human_research_reader(), "request_ref": request["request_ref"]}}
+            "responses_reader": {"operation": HUMAN_RESEARCH_READ_OPERATION, "entry_kind": "responses",
+                                 "request_ref": request["request_ref"], "response_offset": 0},
+            "reader": {**human_research_reader(), "request_ref": request["request_ref"],
+                       "version_ref": _request_content_hash(request)}}
 
 
 def human_research_context_operation(*, agent_runtime, human_collaboration):
@@ -104,12 +151,24 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
         semantic_operation_id=HUMAN_RESEARCH_READ_OPERATION,
         owning_module="human_collaboration",
         description=("读取当前 Quest 跨阶段、Target 和 Cycle 的人类输入。列表模式同时返回最多 12 条请求摘要和最多 12 条主动提交材料；"
-                     "先沿 next_offset 读完当前 UTF-8 字节页，再用 next_cursor 翻旧请求；主动材料用 query 检索，"
-                     "按 research_inputs.next_offset 设置 input_offset 独立翻页。切换任一列表页时将字节 offset 归零。"
+                     "先沿 next_offset 读完当前 UTF-8 字节页，再用 next_cursor 翻旧请求；query 检索请求研究说明和主动材料，"
+                     "按 research_inputs.next_offset 设置 input_offset，并携带 research_inputs.query_revision 为 input_query_revision 独立翻页。"
+                     "正式指导沿 formal_guidance_reader 的 entry_kind=guidance 发现；以 guidance_offset 和 query_revision 续页，"
+                     "constraint_ref/version_ref 纯读已提交原文、力度、作用范围及当前状态，不产生已读回执或把助手讨论作为指导。"
+                     "页间研究事实变化返回 research_query_changed，重启该范围查询。切换任一列表页时将字节 offset 归零。"
                      "主动材料的 reader 交给 research_memory.content.read；精确请求使用 request_ref，"
-                     "精确回复同时提供 request_ref 和 response_ref，并省略 cursor。offset／limit 按 UTF-8 字节重建原文与 hash。"
+                     "精确回复同时提供 request_ref 和 response_ref，携带 reader 的 version_ref 并省略 cursor。offset／limit 按 UTF-8 字节重建原文与 hash。"
+                     "请求目录只附最新回复；沿 responses_reader 的 entry_kind=responses 及 request_ref 查询全部历史回复，"
+                     "以 response_offset 和 query_revision 独立续页。每条回复提供准确 reader，目录不准备请求的完整执行生命周期。"
                      "正式回复的 delivery.reply_reader／uploaded_readers 参数交给 research_workspace.read，linked_locators 用原生工具按原 locator 有界读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
         input_schema={"type": "object", "properties": {
+            "entry_kind": {"type": "string", "enum": ["guidance", "responses"]},
+            "guidance_offset": {"type": "integer", "minimum": 0},
+            "response_offset": {"type": "integer", "minimum": 0},
+            "constraint_ref": {"type": "string", "minLength": 1, "maxLength": 96},
+            "version_ref": {"type": "string", "minLength": 1, "maxLength": 256},
+            "query_revision": {"type": "string", "minLength": 1, "maxLength": 256},
+            "input_query_revision": {"type": "string", "minLength": 1, "maxLength": 256},
             "input_offset": {"type":"integer","minimum":0},
             "query": {"type":"string","maxLength":1024},
             "cursor": {"type": "string", "maxLength": 256},

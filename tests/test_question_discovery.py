@@ -10,7 +10,7 @@ def test_discovery_finds_question_by_clue_and_reads_exact_content(tmp_path):
   item=page["items"][0];assert item["question_ref"]==q.question_ref
   content=read_content(r.owners.research_graph,r.owners.research_memory,quest_ref=q.quest_ref,**item["reader"])
   assert "证据" in content["text"]
-  assert discover_questions(r.owners.research_graph,r.owners.research_memory,quest_ref=q.quest_ref,offset=1)["items"]==[]
+  assert discover_questions(r.owners.research_graph,r.owners.research_memory,quest_ref=q.quest_ref,query="证据",offset=1,query_revision=page["query_revision"])["items"]==[]
  finally:r.close()
 
 
@@ -35,7 +35,7 @@ def test_question_entry_paginates_and_keeps_pruned_questions_readable(tmp_path):
    "target_question_ref":children[0].question_ref},"reason":"operator_requested"},key="prune")
   _execute_control(human,command,"prune")
   first=discover_questions(graph,r.owners.research_memory,quest_ref=q.quest_ref,limit=2)
-  second=discover_questions(graph,r.owners.research_memory,quest_ref=q.quest_ref,limit=2,offset=first["next_offset"])
+  second=discover_questions(graph,r.owners.research_memory,quest_ref=q.quest_ref,limit=2,offset=first["next_offset"],query_revision=first["query_revision"])
   all_items=first["items"]+second["items"]
   assert len(all_items)==3 and second["next_offset"] is None
   pruned=next(x for x in all_items if x["question_ref"]==children[0].question_ref)
@@ -45,7 +45,7 @@ def test_question_entry_paginates_and_keeps_pruned_questions_readable(tmp_path):
   op=question_history_operations(research_graph=graph,agent_runtime=r.owners.agent_runtime)
   gateway=SemanticMcpGateway((op,))
   channel,_=gateway.issue_channel(run_ref=scope["run_ref"],attempt_ref=scope["attempt_ref"],root_session_ref=scope["root_session_ref"],fence_ref=scope["fence_ref"],capability_binding_hash=scope["runtime_binding_hash"],root_kind="companion",phase="primary",operation_ids=(op.semantic_operation_id,))
-  _,result=gateway.dispatch(channel.token,{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":op.semantic_operation_id,"arguments":{"question_ref":children[0].question_ref,"offset":1,"limit":1}}})
+  _,result=gateway.dispatch(channel.token,{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":op.semantic_operation_id,"arguments":{"question_ref":children[0].question_ref,"offset":0,"limit":1}}})
   assert not result["result"].get("isError"),result
   assert result["result"]["structuredContent"]["status"]=="accepted"
  finally:r.close()

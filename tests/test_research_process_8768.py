@@ -30,7 +30,13 @@ def test_human_reply_reaches_any_entry_with_exact_content_and_scope(stage):
                "status": "satisfied", "current": True, "responses": [response],
                "evaluation": {"response_refs": ["response-1"]}, "disposition": {"decision": "satisfied"}}
     inputs_page = {"items": [], "offset": 0, "next_offset": None}
+    def exact_response(request_ref, response_ref, *, quest_ref):
+        if response_ref != response["response_ref"]:
+            raise OwnerConflict("research_help_response_unbound")
+        return {"response": response, "evaluation": request["evaluation"], "disposition": request["disposition"]}
     owner = NS(query_human_request=Mock(return_value=request),
+               query_research_help_request=Mock(return_value=request),
+               query_research_help_response=exact_response,
                query_research_help_page=Mock(return_value={"items": [request], "next_cursor": None}),
                query_research_inputs=Mock(return_value=inputs_page))
     runtime = NS(verify_root_agent_runtime_scope=Mock(return_value={"quest_ref": "quest"}))

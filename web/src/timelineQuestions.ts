@@ -17,8 +17,11 @@ export function useTimelineQuestions(questRef: string | null, questionRefs: stri
     void (async () => {
       try {
         let offset = 0;
+        let queryRevision: string | undefined;
         while (wanted.size) {
-          const page = await fetchResearchLibrary("questions", questRef, "", offset, controller.signal, { limit: "100" });
+          const page = await fetchResearchLibrary("questions", questRef, "", offset, controller.signal,
+            { limit: "100", ...(queryRevision ? { query_revision: queryRevision } : {}) });
+          queryRevision = page.query_revision;
           if (controller.signal.aborted) return;
           if (!Array.isArray(page.items)) throw new Error("timeline_questions_invalid");
           for (const item of page.items) {

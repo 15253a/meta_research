@@ -64,7 +64,7 @@ def test_input_scope_pagination_and_corrupt_receipt_are_rejected(tmp_path):
    hc.submit_research_input(quest_ref=q.quest_ref,question_ref=foreign.question_ref,text_content="wrong scope",idempotency_key="foreign")
   values=[hc.submit_research_input(quest_ref=q.quest_ref,text_content=f"Test analyst observation {i}",idempotency_key=f"input-{i}") for i in range(3)]
   first=hc.query_research_inputs(quest_ref=q.quest_ref,query="analyst",limit=2)
-  second=hc.query_research_inputs(quest_ref=q.quest_ref,query="analyst",limit=2,offset=first["next_offset"])
+  second=hc.query_research_inputs(quest_ref=q.quest_ref,query="analyst",limit=2,offset=first["next_offset"],query_revision=first["query_revision"])
   assert len(first["items"])==2 and len(second["items"])==1 and second["next_offset"] is None
   assert {x["input_ref"] for x in first["items"]+second["items"]}=={v["input_ref"] for v in values}
   original=values[0]

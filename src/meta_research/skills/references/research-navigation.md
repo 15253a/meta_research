@@ -33,7 +33,7 @@ RG 通过 Question、Baseline、Literature、Environment、Dataset、Human Inter
 
 先理解问题与实际工作的联系，再在既有对象含义和关系中选择合宜的组织方式，让研究思考能够跨越单一分类展开。
 
-检索按当前已提供的范围发现相关研究描述，再回溯归属或展开关联。当前 Baseline 检索覆盖方法合同、Variant recipe 和 Evaluation protocol；执行、产物及反馈的统一文字命中范围以实际接口为准，未提供时沿已知正式结果入口读取，不以空匹配推断没有相关工作。已有准确引用时直接读取。复用前理解方法的目的与条件，沿实际输入、处理过程、产物和评价判断适用性；相近的方法或相同的内容不能代替执行依据。Target 的声明、修订与正式接纳见 [正式工作交接](../target-execution/references/formal-work.md)。
+检索按当前已提供的范围发现相关研究描述，再回溯归属或展开关联。Baseline 检索覆盖方法合同、Variant recipe、Evaluation protocol、VariantRun／EvaluationAttempt 的正式输入描述与结果 manifest，以及 Artifact 的角色和 RM 描述。命中只提供候选；使用 baselines.read 的 relation 分别展开 variants、runs、evaluations、attempts、metrics、artifacts，并用返回 reader 读取准确记录。各关系独立续页，真实 Run 可以没有评价。已有准确引用时直接读取。复用前理解方法的目的与条件，沿实际输入、处理过程、产物和评价判断适用性；相近的方法或相同的内容不能代替执行依据。Target 的声明、修订与正式接纳见 [正式工作交接](../target-execution/references/formal-work.md)。
 
 ## Literature：理解外部研究及已有阅读
 
@@ -57,7 +57,7 @@ Target 执行中也可能发现、取得并阅读文献；值得保留的文献�
 
 ## Human Interact：理解人类协作及其研究影响
 
-需要发现人类协作历史、追溯要求来路或回顾协作经验时，从 Human Interact 视角理解请求、回复、已确认指导、主动材料及其处理与研究影响。统一 RG 历史发现尚未提供时，沿本次获授的 `human_request.read` 和 `human_guidance.read` 读取它们实际支持的记录，不把这个视角名当作已注册工具。读取人的原文与必要背景，区分意见、授权、适用要求与实际结果，理解采纳理由、有效条件和未决事项。当前求助、适用指导及已送达答复可沿 HC 的准确入口直接接续。
+需要发现人类协作历史、追溯要求来路或回顾协作经验时，从 Human Interact 视角理解请求、回复、已确认指导、主动材料及其处理与研究影响。沿本次获授的 `human_request.read` 查请求、回复、主动提交材料；entry_kind=guidance 查正式提交的指导，再用目录返回的 constraint_ref／version_ref 纯读其正文、约束力度与作用范围。历史读取不会领取指导或标为已读；当前指导的交付处理仍沿 human_guidance 操作。助手未正式提交的交流不进入这份指导历史。读取人的原文与必要背景，区分意见、授权、适用要求与实际结果，理解采纳理由、有效条件和未决事项。当前求助、适用指导及已送达答复可沿 HC 的准确入口直接接续。
 
 HC 保存协作原记录与流程，RG 组织研究关联。HC、系统工作和 Agent 登记均可提供关系来源，按实际来路保留。当前协作的发起、回应和指导处理见 [人类协作](human-guidance.md)。
 
@@ -73,7 +73,7 @@ HC 保存协作原记录与流程，RG 组织研究关联。HC、系统工作和
 
 ## 当前获授工具与准确入口
 
-先读当前研究交接。当前 Quest 内可跨 Question、跨 Cycle 检索已接纳材料，包括暂放问题的历史；按实际研究需要选择入口，不要求每轮遍历全部入口。Question 用 research_graph.questions.page 从名称/关键词发现，再用 question_history.read 分页看已有认识；Baseline 用 research_graph.baselines.page/read 展开方法、Variant、Run 和评价；Dataset 用 research_graph.datasets.page/read 查含义、版本与派生关系；Environment 用 research_graph.environments.page/read 查环境、设备设施及现实资源的含义、来源、条件和精确内容引用；Literature 用 research_memory.literature.page 查原文和不同 Question 的阅读判断；人类输入用 human_request.read 查看请求、回复与主动提交。每页沿 next_offset/next_cursor 继续。reader 含 operation 时调用其指明的工具及参数，如 history_reader／formal_results reader；共用正文 reader 的 source_ref／version_ref 才交给 research_memory.content.read，并沿返回的字节偏移读取精确原件。大文件与 linked_local 直接使用受控原位置，不为参考阅读复制全份材料；发现与读取限于当前 Quest 可见范围，已知 Environment 的显式跨 Quest 引用按下文规则办理，其他资产仍沿原 Owner 权限与接纳边界。结论摘要、结果 JSON 或 hash 不等于可继续实施的完整材料：复用时核对实际需要的数据、划分、预测、方法实现和协议，经现有 Owner 引用与执行输入流程交接精确资产。六入口按查看或复用目的组织：Question 汇总研究进展，Baseline 展开真实方法与实施，人类输入保留协作过程与经验，Literature、Dataset、Environment 便于复用已有资源；入口不是互斥分类，同一原件可关联多个入口。只带入本阶段需要的内容与来源，保留完整历史的按需读取入口。
+先读当前研究交接。当前 Quest 内可跨 Question、跨 Cycle 检索已接纳材料，包括暂放问题的历史；按实际研究需要选择入口，不要求每轮遍历全部入口。Question 用 research_graph.questions.page 从名称/关键词发现，再用 research_graph.question_history.read 分页看历史 Cycle 与各阶段；沿阶段 reader 读取准确 RM 内容，Bundle 沿 AE 已存 closure／report／notes 读取，保留原同轮交接；Baseline 用 research_graph.baselines.page/read 展开方法、Variant、Run 和评价；Dataset 用 research_graph.datasets.page/read 查含义、版本与派生关系；Environment 用 research_graph.environments.page/read 查环境、设备设施及现实资源的含义、来源、条件和精确内容引用；Literature 用 research_memory.literature.page 查原文和不同 Question 的阅读判断；人类输入用 human_request.read 查看请求、回复与主动提交。目录沿 next_offset 与 query_revision 继续，保持查询、过滤与页大小；请求目录沿 next_cursor 继续；各请求的 responses_reader 用 entry_kind=responses、request_ref、response_offset/query_revision 独立查看全部回复。相关 Owner 记录插入、删除或变化时返回 research_query_changed，从首项重开查询；无关 Quest 的变化不使当前续页失效。result_state=page_pending 表示仍在扫描，exhausted 表示本次续页结束；只有首个完整空查询才可报告 no_match（有检索词）或 no_records（无检索词）。不可见、content_unavailable、content_drifted 分别是授权或材料问题，不等于没有研究积累。reader 含 operation 时调用其指明的工具及参数，如 history_reader／formal_results reader；共用正文 reader 的 source_ref／version_ref 才交给 research_memory.content.read，并沿返回的字节偏移读取精确原件。大文件与 linked_local 直接使用受控原位置，不为参考阅读复制全份材料；发现与读取限于当前 Quest 可见范围，已知 Environment 的显式跨 Quest 引用按下文规则办理，其他资产仍沿原 Owner 权限与接纳边界。结论摘要、结果 JSON 或 hash 不等于可继续实施的完整材料：复用时核对实际需要的数据、划分、预测、方法实现和协议，经现有 Owner 引用与执行输入流程交接精确资产。六入口按查看或复用目的组织：Question 汇总研究进展，Baseline 展开真实方法与实施，人类输入保留协作过程与经验，Literature、Dataset、Environment 便于复用已有资源；入口不是互斥分类，同一原件可关联多个入口。只带入本阶段需要的内容与来源，保留完整历史的按需读取入口。
 
 正文、目录与阶段上下文的分页和错误处理见[准确读取与错误](materials-and-custody.md#准确读取与错误)。正式采用集合与五类来源绑定沿[Plan 的 Owner 操作](../plan_stage/references/owner-operations.md#发现读取和精确引用)处理；可读与正式采用分别判断。
 
