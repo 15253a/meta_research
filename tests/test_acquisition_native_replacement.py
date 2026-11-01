@@ -26,9 +26,19 @@ if sys.argv[-2:]==['features','list']:
 root=Path(__file__);requests=root.with_suffix('.requests');count=root.with_suffix('.count')
 if 'exec' in sys.argv:
  root.with_suffix('.exec-argv').write_text(json.dumps(sys.argv))
+ with root.with_suffix('.exec-calls').open('a') as stream:stream.write(json.dumps(sys.argv)+'\n')
+ if root.with_suffix('.strict-missing').exists() and 'resume' in sys.argv:
+  sys.stderr.write('Error: thread/resume: thread/resume failed: no rollout found for thread id '+sys.argv[sys.argv.index('resume')+1]+' (code -32600)\n');sys.exit(1)
  sys.stdin.read()
+ if root.with_suffix('.supplied').exists():
+  output=json.loads(root.with_suffix('.payload').read_text())
+  for item in output['results']:
+   target=Path(item['path'])
+   if not target.exists():
+    target.write_bytes(root.with_suffix('.supplied').read_bytes())
+    with root.with_suffix('.copies').open('a') as stream:stream.write(str(target)+'\n')
  Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(root.with_suffix('.payload').read_text())
- print(json.dumps({'type':'thread.started','thread_id':sys.argv[sys.argv.index('resume')+1]}))
+ print(json.dumps({'type':'thread.started','thread_id':sys.argv[sys.argv.index('resume')+1] if 'resume' in sys.argv else 'strict-replacement-native'}))
  sys.exit(0)
 thread=None
 for line in sys.stdin:
@@ -177,3 +187,30 @@ def test_provided_only_production_runner_keeps_strict_exec_boundary(native_sessi
     assert argv[argv.index('--sandbox') + 1] == 'workspace-write'
     assert argv[argv.index('--add-dir') + 1] == request.target_dir
     assert argv[argv.index('--cd') + 1] == str(workspace)
+
+
+def test_provided_only_missing_native_replaces_with_same_strict_policy_and_reconciles(native_session):
+    runtime, adapter, server, request, workspace, provider = native_session
+    request = replace(request, session_mode='provided_only')
+    server.with_suffix('.strict-missing').touch()
+    server.with_suffix('.supplied').write_bytes(b'user-supplied full article')
+    before = server.with_suffix('.requests').read_bytes()
+    result = adapter.acquire(request)
+    assert Path(result[0].path).read_bytes() == b'user-supplied full article'
+    assert (workspace / 'downloads' / 'previous.html').read_text() == 'previous verified body'
+    assert (workspace / 'download-notes.md').is_file()
+    calls = [json.loads(line) for line in server.with_suffix('.exec-calls').read_text().splitlines()]
+    assert len(calls) == 2 and 'resume' in calls[0] and 'resume' not in calls[1]
+    for argv in calls:
+        assert '--ignore-user-config' in argv and '--ignore-rules' in argv
+        assert 'sandbox_workspace_write.network_access=false' in argv
+        assert argv[argv.index('--sandbox') + 1] == 'workspace-write'
+        assert argv[argv.index('--cd') + 1] == str(workspace)
+        assert argv[argv.index('--add-dir') + 1] == request.target_dir
+    restarted = CodexAcquisitionRootAdapter(provider, _AcquisitionDelegate(), executable=str(server))
+    restarted.bind_workspaces(runtime.root_workspaces)
+    restarted.bind_external_mcp(runtime.external_mcp)
+    assert restarted.reconcile(request) == result
+    assert len(server.with_suffix('.exec-calls').read_text().splitlines()) == 2
+    assert len(server.with_suffix('.copies').read_text().splitlines()) == 1
+    assert server.with_suffix('.requests').read_bytes() == before

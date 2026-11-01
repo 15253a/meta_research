@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -489,6 +490,109 @@ def reconcile_native_operation(directory):
                 "native_turn_status": status, "native_error": turn.get("error"),
                 "native_start_hash": canonical_hash(start), "native_reconciliation_hash": canonical_hash(recovered)})
     return recovered["last_message"], recovered["thread_id"], stdout
+def _strict_exec(argv, args, key):
+    """Preserve exec policy; attest only its exact, output-free resume rejection."""
+    if (len(argv) < 3 or argv[1] != "exec" or argv.count("--output-last-message") != 1
+        or argv.count("--output-schema") != 1):
+        raise ValueError("native_codex_exec_arguments_invalid")
+    directory = args.operation_directory
+    original_result = argv[argv.index("--output-last-message") + 1]
+    if (original_result != str(directory / "last-message.json")
+        or args.output_schema is None
+        or str(args.output_schema) != argv[argv.index("--output-schema") + 1]
+        or args.output_last_message is None):
+        raise ValueError("native_result_path_conflict")
+    destination = args.output_last_message
+    valid = destination in {directory / "last-message.json", directory / ".last-message.supervisor.tmp"}
+    pipe = re.fullmatch(r"/proc/([0-9]+)/fd/([0-9]+)", str(destination))
+    request = read_supervisor_request(directory / "supervisor-request.json", key)
+    if pipe is not None:
+        ready = read_transport_envelope(directory / "supervisor-ready.json", key)
+        valid = (ready.get("supervisor_process_id") == int(pipe[1])
+            and ready.get("invocation_hash") == request.get("invocation_hash")
+            and int(pipe[2]) >= 3 and stat.S_ISFIFO(destination.stat().st_mode))
+    if not valid:
+        raise ValueError("native_result_path_conflict")
+    command = list(argv)
+    command[command.index("--output-last-message") + 1] = str(destination)
+    # Inherit stdin/cwd/environment and the supervisor's provider process group.
+    # Do not consume/rewrite the prompt or translate any exec permission option.
+    process = None
+    stopped = False
+
+    def stop(_signum, _frame):
+        nonlocal stopped
+        stopped = True
+        # The supervisor signals our whole group. Stay alive long enough to
+        # reap the exec child, instead of leaving it orphaned during shutdown.
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    if stopped:
+        return 70
+    process = subprocess.Popen(command, stdin=sys.stdin.buffer, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, bufsize=0)
+    if stopped and process.poll() is None:
+        process.terminate()
+    stderr = bytearray()
+    stdout_bytes = 0
+    complete = [False, False]
+    errors = []
+    stderr_overflow = False
+
+    def drain(stream, index):
+        nonlocal stdout_bytes, stderr_overflow
+        try:
+            while chunk := stream.read(65536):
+                if index == 0:
+                    stdout_bytes += len(chunk)
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                elif len(stderr) + len(chunk) <= 4096 and not stderr_overflow:
+                    stderr.extend(chunk)
+                else:
+                    # Drain the rest without retaining it; overflow is never
+                    # proof and must not deadlock the provider on its stderr.
+                    stderr_overflow = True
+            complete[index] = True
+        except (OSError, ValueError) as error:
+            errors.append(error)
+
+    drainers = [threading.Thread(target=drain, args=(stream, index), daemon=True)
+                for index, stream in enumerate((process.stdout, process.stderr))]
+    for drainer in drainers:
+        drainer.start()
+    returncode = process.wait()
+    for drainer in drainers:
+        drainer.join(timeout=1)
+    if stopped or errors or not all(complete):
+        # The outer supervisor owns descendant cleanup and the signed terminal
+        # reason. Incomplete pipes cannot authorize a replacement.
+        return 70
+    native = argv[-2] if argv[-3] == "resume" and argv[-1] == "-" else None
+    expected = ("Error: thread/resume: thread/resume failed: no rollout found for thread id "
+                + str(native) + " (code -32600)\n").encode("utf-8")
+    if returncode != 1 or native is None or stdout_bytes or stderr_overflow or bytes(stderr) != expected:
+        return returncode
+    version = subprocess.run([command[0], "--version"], capture_output=True, text=True, timeout=10)
+    from meta_research.codex_runtime import CODEX_LOCKED_VERSION
+    if stopped or version.returncode != 0 or version.stdout.strip() != "codex-cli " + CODEX_LOCKED_VERSION:
+        return returncode
+    proof = {"source": "exec", "method": "thread/resume", "thread_id": native,
+        "error": {"code": -32600, "message": "no rollout found for thread id " + native},
+        "exec_returncode": returncode, "exec_stdout_bytes": stdout_bytes,
+        "exec_stderr": stderr.decode("utf-8"), "provider_version_output": version.stdout.strip(),
+        "provider_argv_hash": canonical_hash(argv),
+        "supervisor_invocation_hash": request["invocation_hash"]}
+    # This is candidate evidence, not recovery authorization. The adapter also
+    # requires the final supervisor receipt and its empty result-file hash.
+    write_transport_envelope(directory / "native-resume-rejected.json", proof, key)
+    _emit({"type": "meta_research.native_resume_rejected", **proof})
+    return 70
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-argv", required=True, type=Path)
@@ -497,10 +601,15 @@ def main():
     parser.add_argument("--output-last-message", type=Path)
     parser.add_argument("prompt_source", nargs="?", choices=("-",))
     parser.add_argument("--reconcile-only", action="store_true")
+    parser.add_argument("--passthrough-exec", action="store_true")
     args = parser.parse_args()
     try:
         _key_path, key = read_transport_key_for_operation(args.operation_directory)
         argv = read_transport_envelope(args.provider_argv, key)["argv"]
+        if args.passthrough_exec:
+            if args.reconcile_only:
+                raise ValueError("native_exec_reconcile_mode_invalid")
+            return _strict_exec(argv, args, key)
         bridge = NativeCodexBridge(argv, args.operation_directory, "" if args.reconcile_only else sys.stdin.read())
         if args.output_schema is not None and str(args.output_schema) != bridge.options.get("--output-schema"):
             raise ValueError("native_schema_path_conflict")

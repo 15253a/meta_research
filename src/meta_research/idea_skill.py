@@ -2616,7 +2616,8 @@ class CodexIdeaSkillAdapter:
         try:
             try:
                 argv = live_native_argv(argv, directory, enabled=isinstance(runner, _CancellableProcessRunner),
-                    force_transport=self._root_agent_kind == "acquisition" and execution_access_mode != "provided_only")
+                    force_transport=self._root_agent_kind == "acquisition",
+                    passthrough_exec=self._root_agent_kind == "acquisition" and execution_access_mode == "provided_only")
             except (OSError, ValueError, KeyError, TypeError, ProviderSupervisorError) as error:
                 raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
             environment = (
@@ -3229,7 +3230,20 @@ def _provider_native_session_unavailable(directory, marker, native_session_ref):
         if canonical_hash(stream) != marker.get("stdout_hash"):
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
         observed = [json.loads(line) for line in stream.splitlines() if line.strip()]
-        if not any(record == {"type": "meta_research.native_resume_rejected", **proof} for record in observed):
+        event = {"type": "meta_research.native_resume_rejected", **proof}
+        if proof.get("source") == "exec":
+            # The result destination is a supervisor-owned FIFO. Only its final
+            # signed empty-result hash proves no result bytes were produced.
+            if (type(proof.get("exec_returncode")) is not int or proof["exec_returncode"] != 1
+                or type(proof.get("exec_stdout_bytes")) is not int
+                or proof["exec_stdout_bytes"] != 0
+                or proof.get("exec_stderr") != "Error: thread/resume: thread/resume failed: " + expected_message + " (code -32600)\n"
+                or marker.get("result_file_hash") != hashlib.sha256(b"").hexdigest()
+                or observed != [event]):
+                return None
+        elif "source" in proof:
+            return None
+        if not any(record == event for record in observed):
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     except (OSError, ValueError, KeyError, TypeError, ProviderSupervisorError) as error:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error

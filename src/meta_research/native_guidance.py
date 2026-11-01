@@ -51,7 +51,7 @@ def bind_live_guidance(authority, scope, binding):
         state.update(authority=authority, scope=scope, binding=binding)
 
 
-def live_native_argv(argv, directory, *, enabled=True, force_transport=False):
+def live_native_argv(argv, directory, *, enabled=True, force_transport=False, passthrough_exec=False):
     state = _operation.get()
     has_guidance = state is not None and state["binding"] is not None
     if not enabled or not (has_guidance or force_transport):
@@ -71,6 +71,8 @@ def live_native_argv(argv, directory, *, enabled=True, force_transport=False):
         pump.start()
     wrapped = [sys.executable, "-m", "meta_research.native_codex_bridge",
                "--provider-argv", str(original), "--operation-directory", str(directory)]
+    if passthrough_exec:
+        wrapped.append("--passthrough-exec")
     # The mature supervisor binds these exact paths before launching any
     # provider. Preserve that contract for the native transport wrapper.
     for flag in ("--output-schema", "--output-last-message"):
