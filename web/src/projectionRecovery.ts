@@ -116,7 +116,12 @@ export function useProjectionRecovery(snapshot: PublicSnapshot | null,
     const matchesScope = !status || (foreground?.quest_ref === expected?.quest_ref
       && foreground?.cycle_ref === expected?.cycle_ref && foreground?.question_ref === expected?.question_ref
       && foreground?.stage.toLowerCase() === expected?.stage.toLowerCase());
-    const loaded = matchesScope && (!sections.includeAssets || snapshot.research_assets.loaded !== false)
+    const stage = foreground?.stage.toLowerCase();
+    const stageData = { idea: snapshot.idea_stage, plan: snapshot.plan_stage,
+      bundle: snapshot.bundle_stage, reasoning: snapshot.reasoning_stage };
+    const failedStage = stage && stage in stageData && !stageData[stage as keyof typeof stageData]
+      && snapshot.query_warnings?.some(warning => warning.section === `${stage}_stage`);
+    const loaded = matchesScope && !failedStage && (!sections.includeAssets || snapshot.research_assets.loaded !== false)
       && (!sections.includeHistory || (snapshot.question_tree.loaded !== false
         && snapshot.question_tree.status === "ready" && snapshot.writing.loaded !== false));
     if (loaded) acknowledged.current = { scope, revision: snapshot.revision };

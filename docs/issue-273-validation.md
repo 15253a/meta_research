@@ -32,6 +32,10 @@ Python 在独立临时 Linux 数据目录运行，避免 Windows 既有 fcntl �
 
 同一受控输入以 SQLAlchemy engine hook 计实际 SQL：轻量 316、完整 354、三个并发请求共 356、retained 1 次 feed 查询。复制约 30.1／33.6 KB；deferred 返回复制的 assets/history items 为 0。源查询、SQL 和复制计时分开；冷热差异使完整请求样本耗时更短，不能据此宣称速度提升，也未将回调次数冒充 SQL。
 
+实际 Linux 产品实例上的四个 HR 浏览器场景也全部通过（38.7 秒）：通知不自动开窗、原请求非 open 后保留回执、新求助不打断创建、关闭与刷新不重开。复用已有 Chromium 140／Playwright 1.55.1；归档与受测源码及前端字节一致，测试结束清理临时 fixture 进程。不存在安装或部署操作。
+
+Node 行为测试 36/36 通过；类型检查及构建通过。浏览器专项包括真实页面行为和少量已有 hook 检查，不能将 hook 测试数单独冒充浏览器用例数。当前阶段因读取失败而缺失时也保持追赶；可用阶段内的可选观察告警不阻塞已交付内容。全研究因 HR 等待的提示仅采用服务端 quest/false 证明，并与局部等待作对照验证。
+
 ## 验证限制与证据
 
 本地证据目录为工作区 `.scratch/issue-273-20261101/`，包含实际浏览器 traces／截图、backend-01／backend-02／hr-api-01、SQL cost observation、基底失败复现及真实 CC 终审回执。完整运行记录不发布到仓库。

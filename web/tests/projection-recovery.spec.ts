@@ -359,3 +359,59 @@ test("required section read failure cannot acknowledge a rendered target", async
   recover = true;
   await expect(page.getByTestId("projection-refresh")).toHaveCount(0);
 });
+
+
+test("a failed active stage read cannot finish catch-up at the target revision", async ({ page }) => {
+  await page.goto(app.url + "/?workspace=1");
+  await expect(heading(page, "研究详情 10")).toBeVisible();
+  await expect(page.getByTestId("projection-refresh")).toHaveCount(0);
+  let reads = 0, recover = false;
+  app.status.revision = 11;
+  app.readSnapshot = async (req, res) => {
+    const value = app.cut(11, undefined, req);
+    reads++;
+    if (!recover) {
+      delete value.bundle_stage;
+      value.query_warnings = [{ section: "bundle_stage", code: "stage_read_temporarily_unavailable" }];
+    }
+    app.send(res, value);
+  };
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect.poll(() => reads).toBeGreaterThanOrEqual(2);
+  await page.waitForTimeout(200);
+  await expect(page.getByTestId("projection-refresh")).toBeVisible();
+  await expect(page.getByTestId("workspace-partial-warning")).toBeVisible();
+  recover = true;
+  await expect(page.getByTestId("projection-refresh")).toHaveCount(0);
+  await expect(page.getByTestId("workspace-partial-warning")).toHaveCount(0);
+});
+
+test("only server-proven whole research human waiting displays the business blocker", async ({ page }) => {
+  let allWaiting = false;
+  app.readSnapshot = async (req, res) => {
+    const value = app.cut(allWaiting ? 11 : 10, undefined, req);
+    value.human_collaboration.human_requests.waiting = { scope: allWaiting ? "quest" : "local", safe_meaningful_runnable_exists: !allWaiting, other_blockers: [] };
+    app.send(res, value);
+  };
+  await page.goto(app.url + "/?workspace=1");
+  await expect(heading(page, "研究详情 10")).toBeVisible();
+  await expect(page.getByTestId("research-human-wait")).toHaveCount(0);
+  allWaiting = true;
+  app.status.revision = 11;
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect(page.getByTestId("research-human-wait")).toContainText("暂没有可独立继续的工作");
+  await expect(page.locator(".lumen-connection")).not.toContainText(/断网|离线/);
+});
+
+
+test("an optional observation warning does not block delivered active stage content", async ({ page }) => {
+  app.readSnapshot = async (req, res) => {
+    const value = app.cut(10, undefined, req);
+    value.query_warnings = [{ section: "bundle_stage", code: "target_observation_unavailable", target_ref: "optional-target" }];
+    app.send(res, value);
+  };
+  await page.goto(app.url + "/?workspace=1");
+  await expect(heading(page, "研究详情 10")).toBeVisible();
+  await expect(page.getByTestId("workspace-partial-warning")).toBeVisible();
+  await expect(page.getByTestId("projection-refresh")).toHaveCount(0);
+});
