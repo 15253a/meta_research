@@ -11,7 +11,7 @@ def test_authenticated_api_roundtrip_default_roots_and_empty_selection(tmp_path)
     try:
         client, headers = _authenticated_client(runtime)
         current = client.get("/api/v1/external-mcp").json()
-        assert current["root_kinds"] == ["deepfetch", "acquisition", "companion", "idea", "plan", "bundle", "target", "reasoning", "writing"]
+        assert current["root_kinds"] == ["deepfetch", "acquisition", "companion", "idea", "plan", "bundle", "target", "reasoning"]
         payload = {"services": [service(tmp_path)], "expected_revision": current["revision"]}
         assert client.put("/api/v1/external-mcp", json=payload).status_code == 403
         saved = client.put("/api/v1/external-mcp", json=payload, headers=headers)

@@ -71,5 +71,5 @@ def test_bundle_history_keeps_rm_and_rg_plan_acceptances_distinct(mismatch):
         assert artifact["status"] == "unavailable"
         assert artifact["content"] is None
         assert artifact["reason"]["code"] == (
-            "bundle_report_receipt_invalid" if mismatch == "receipt" else "writing_bundle_result_invalid"
+            "bundle_report_receipt_invalid" if mismatch == "receipt" else "research_bundle_result_invalid"
         )

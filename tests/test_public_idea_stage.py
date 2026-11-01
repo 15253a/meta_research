@@ -376,17 +376,14 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         )
         assert persisted_run is not None and persisted_run.execution is not None
 
-        writing = runtime.writing.create_report_intent(
-            quest_ref=quest["quest_ref"],
-            title="Idea 后阶段报告",
-            audience="研究负责人",
-            purpose="验证 Writing Snapshot 接收已接纳结果",
-            instructions="保持精确结果 lineage。",
-            idempotency_key="idea-committed-writing-snapshot",
-        )
-        accepted_idea = writing["snapshot"]["advancement"]["stages"]["idea"][
-            "accepted"
-        ]
+        from meta_research.accepted_research import AcceptedResearchReader
+        owners = runtime.owners
+        reader = AcceptedResearchReader(owners.research_graph, owners.advancement_engine,
+                                        owners.research_memory, owners.agent_runtime)
+        request = owners.advancement_engine.query_idea_stage_request(quest["cycle_ref"])
+        commit = owners.advancement_engine.query_idea_stage_commit(request.request_ref)
+        with runtime._database.read_snapshot():
+            accepted_idea = reader._stage_value(request, commit)
         assert accepted_idea["commit_ref"] == committed["stage_commit"][
             "commit_ref"
         ]

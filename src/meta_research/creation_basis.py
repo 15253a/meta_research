@@ -14,6 +14,7 @@ from sqlalchemy import text
 from meta_research.context_presentation import context_read_page
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
+from meta_research.resource_preparation import prepared_resource
 
 
 UNDERSTANDING_FIELDS = (
@@ -84,11 +85,17 @@ def empty_understanding() -> dict[str, object]:
     return {**{key: [] for key in UNDERSTANDING_FIELDS}, "coverage": [], "selection": []}
 
 
+@prepared_resource
 def first_creation_instructions():
-    root = Path(__file__).parent / "skills" / "first_creation"
-    paths = ("SKILL.md", "references/source-evidence.md", "references/literature-corrections.md")
-    contents = {name: (root / name).read_text(encoding="utf-8") for name in paths}
-    return {"bundle_hash": canonical_hash(contents), "files": list(paths), "instructions": "\n\n".join(contents.values())}
+    root = Path(__file__).resolve().parent / "skills" / "first_creation"
+    names = ("SKILL.md", "references/context-contract.md", "references/source-evidence.md",
+             "references/literature-corrections.md")
+    paths = {name: str(root / name) for name in names}
+    contents = {name: Path(path).read_text(encoding="utf-8") for name, path in paths.items()}
+    return {"bundle_hash": canonical_hash(contents), "files": list(names), "paths": paths,
+            "instructions": "First creation skill source: " + paths["SKILL.md"]
+            + "\nResolve references relative to this source; read the relevant reference before its action.\n"
+            + contents["SKILL.md"]}
 
 
 def understanding_schema(*, references=False) -> dict[str, object]:

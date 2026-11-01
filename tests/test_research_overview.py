@@ -80,7 +80,7 @@ def test_wrong_accepted_outcome_reference_stays_a_gap(tmp_path: Path, monkeypatc
         artifact = actual['cycles'][0]['stages']['idea'][0]
         assert artifact['status'] == 'unavailable'
         assert artifact['content'] is None
-        assert artifact['reason']['code'] == 'writing_stage_result_invalid'
+        assert artifact['reason']['code'] == 'research_stage_result_invalid'
         assert actual['findings']['quest'] == []
     finally:
         runtime.close()

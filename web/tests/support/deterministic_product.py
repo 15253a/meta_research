@@ -97,18 +97,6 @@ from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
 )
 from meta_research.web import create_app
-from meta_research.writing_contract import WritingRuntimeBinding
-from meta_research.writing_delivery import (
-    LocalFilesystemWritingDeliveryProvider,
-    WritingDeliveryOutcomeUnknown,
-    WritingDeliveryProviderRegistry,
-)
-from meta_research.writing_skill import (
-    WritingSkillDraft,
-    WritingSkillRequest,
-    WritingSkillResult,
-    writing_review_task_hash,
-)
 
 
 def _reasoning_research_synthesis(
@@ -880,159 +868,6 @@ class ControlledAutonomousReasoningSkill:
         raise AssertionError("autonomous Reasoning must preserve its checkpoint")
 
 
-class DeterministicWritingSkill:
-    """A resumable Writing provider used through the production public seams."""
-
-    def runtime_binding(self) -> WritingRuntimeBinding:
-        return WritingRuntimeBinding(
-            packaged_skill_bundle_hash=canonical_hash(
-                {"skill": "chrome-production-writing"}
-            ),
-            instruction_set_hash=canonical_hash(
-                {"instructions": "chrome-production-writing"}
-            ),
-            model_ref="chrome-test-model",
-            harness_adapter_ref="chrome-deterministic-writing-v1",
-            mcp_bindings=(),
-            capability_bindings=(),
-            resource_bindings=(),
-        )
-
-    def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
-        # Keep the active Session observable long enough for pause and browser-close
-        # recovery checks without introducing a test-only product endpoint.
-        time.sleep(0.35)
-        return WritingSkillDraft(
-            markdown=deterministic_writing_markdown(request, draft=True),
-            citations=(),
-            primary_session_ref=request.native_session_ref
-            or f"chrome-writing-native-session:{request.run_ref}",
-            adapter_kind="chrome_deterministic_writing",
-        )
-
-    def review_draft(
-        self, request: WritingSkillRequest, draft: WritingSkillDraft
-    ) -> WritingSkillResult:
-        time.sleep(0.35)
-        return WritingSkillResult(
-            reviewed_markdown=draft.markdown,
-            final_markdown=deterministic_writing_markdown(request, draft=False),
-            citations=(),
-            findings=(
-                {
-                    "category": "evidence_boundary",
-                    "finding": "草稿没有明确陈述当前证据缺口。",
-                },
-            ),
-            dispositions=(
-                {
-                    "category": "evidence_boundary",
-                    "action": "revised",
-                    "reason": "在最终报告中明确冻结 Snapshot 的证据边界。",
-                },
-            ),
-            primary_session_ref=draft.primary_session_ref,
-            review_mode="advisory_unobserved",
-            reviewer_agent_ref=None,
-            review_task_hash=writing_review_task_hash(request, draft),
-            adapter_kind=draft.adapter_kind,
-        )
-
-
-class DeterministicHistoryWritingDeliveryProvider(
-    LocalFilesystemWritingDeliveryProvider
-):
-    """Exercise durable delivery boundary states through the real daemon seam."""
-
-    @staticmethod
-    def _fault_mode(request) -> str | None:
-        file_name = Path(str(request.target["path"])).name
-        if file_name.startswith("history-partial."):
-            return "partial"
-        if file_name.startswith("history-unknown."):
-            return "outcome_unknown"
-        return None
-
-    def execute(self, request):
-        fault_mode = self._fault_mode(request)
-        if fault_mode is None:
-            return super().execute(request)
-        super().execute(request)
-        if fault_mode == "outcome_unknown":
-            raise WritingDeliveryOutcomeUnknown("deterministic_ack_lost")
-        return self._observation(
-            request,
-            "partial",
-            {
-                "fault_mode": "stable_partial",
-                "target_hash": request.artifact_sha256,
-            },
-        )
-
-    def reconcile(self, request):
-        fault_mode = self._fault_mode(request)
-        if fault_mode is None:
-            return super().reconcile(request)
-        if fault_mode == "outcome_unknown":
-            raise WritingDeliveryOutcomeUnknown(
-                "deterministic_reconcile_outcome_unknown"
-            )
-        return self._observation(
-            request,
-            "partial",
-            {
-                "fault_mode": "stable_partial",
-                "target_hash": request.artifact_sha256,
-            },
-        )
-
-
-def deterministic_writing_markdown(
-    request: WritingSkillRequest, *, draft: bool
-) -> str:
-    suffix = f"draft r{request.revision}" if draft else f"r{request.revision}"
-    title = f"# {request.intent['title']} · {suffix}"
-    evidence_gap = (
-        "当前冻结 Snapshot 尚无可引用研究资产，因此不形成超出证据的确定性结论。"
-    )
-    if request.document_type == "paper":
-        sections = []
-        for role, heading in (
-            ("abstract", "摘要"),
-            ("framing", "研究问题"),
-            ("methods", "证据方法"),
-            ("results", "有界结果"),
-            ("limitations", "局限"),
-            ("conclusion", "结论"),
-        ):
-            sections.extend(
-                (
-                    f"<!-- meta-research-paper-section role={role} -->\n## {heading}",
-                    "<!-- meta-research-claim:evidence-gap -->\n"
-                    f"**Evidence gap:** {heading}：{evidence_gap}",
-                )
-            )
-        return title + "\n\n" + "\n\n".join(sections) + "\n"
-    if request.document_type == "presentation":
-        return (
-            title
-            + "\n\n<!-- meta-research-structure -->\n## Slide 1: 证据边界\n\n"
-            + "<!-- meta-research-claim:evidence-gap -->\n"
-            + f"**Evidence gap:** {evidence_gap}\n\n"
-            + "<!-- meta-research-structure -->\n## Slide 2: 下一步\n\n"
-            + "<!-- meta-research-claim:uncertainty -->\n"
-            + "**Uncertainty:** 尚需接纳研究资产后才能形成可复核结论。\n"
-        )
-    feedback = "；".join(request.feedback) or "无追加反馈"
-    if draft:
-        return f"{title}\n\n当前草稿依据冻结 Snapshot。反馈：{feedback}。\n"
-    return (
-        f"{title}\n\n<!-- meta-research-structure -->\n## 结论\n\n"
-        "<!-- meta-research-claim:evidence-gap -->\n"
-        f"**Evidence gap:** {evidence_gap}\n"
-    )
-
-
 class ProviderPhaseControl:
     """Private adapter handshake; it never changes Owner or Projection state."""
 
@@ -1509,7 +1344,6 @@ async def serve(
     manual_root: bool,
     web_root: Path | None,
     stage_pipeline: str | None,
-    writing_delivery_faults: str | None,
     human_request_handoff: bool,
     human_request_handoff_kind: str,
 ) -> None:
@@ -1543,13 +1377,6 @@ async def serve(
                 prepared_data_root.run / "chrome-provider-control"
             )
         )
-    writing_delivery_registry = (
-        WritingDeliveryProviderRegistry(
-            (DeterministicHistoryWritingDeliveryProvider(),)
-        )
-        if writing_delivery_faults == "history-boundaries"
-        else None
-    )
     power_inhibitor = ConfirmedDeterministicPowerInhibitor()
     harness_adapters = (
         (
@@ -1568,8 +1395,6 @@ async def serve(
         plan_skill_provider=plan_skill,
         bundle_skill_provider=bundle_skill,
         reasoning_skill_provider=reasoning_skill,
-        writing_skill_provider=DeterministicWritingSkill(),
-        writing_delivery_provider_registry=writing_delivery_registry,
         deepfetch_provider=DeterministicDeepFetchProvider(),
         acquisition_provider=DeterministicAcquisitionProvider(),
         power_inhibitor=power_inhibitor,
@@ -1730,9 +1555,6 @@ def main() -> None:
             "quest-completion",
         ),
     )
-    parser.add_argument(
-        "--writing-delivery-faults", choices=("history-boundaries",)
-    )
     parser.add_argument("--web-root", type=Path)
     args = parser.parse_args()
     asyncio.run(
@@ -1742,7 +1564,6 @@ def main() -> None:
             args.manual_root,
             args.web_root,
             args.stage_pipeline,
-            args.writing_delivery_faults,
             args.human_request_handoff,
             args.human_request_handoff_kind,
         )

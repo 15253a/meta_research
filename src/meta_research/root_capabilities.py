@@ -26,7 +26,6 @@ RootAgentKind = Literal[
     "bundle",
     "target",
     "reasoning",
-    "writing",
 ]
 
 ROOT_AGENT_KINDS: tuple[RootAgentKind, ...] = (
@@ -38,7 +37,6 @@ ROOT_AGENT_KINDS: tuple[RootAgentKind, ...] = (
     "bundle",
     "target",
     "reasoning",
-    "writing",
 )
 
 RootCapabilityEntryPath = Literal[
@@ -104,10 +102,10 @@ CODEX_ROOT_FEATURE_INVENTORY_NAMES = (
 ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
     "deepfetch": ("deepfetch_source_action",),
     "acquisition": (),
-    "companion": (),
-    "idea": (*GUIDANCE_OPERATION_IDS, *GOAL_OPERATION_IDS, "research_memory.research_notes.read", "research_memory.stage_context.read"),
-    "plan": (*GUIDANCE_OPERATION_IDS, *GOAL_OPERATION_IDS, "research_memory.research_notes.read", "research_memory.stage_context.read", "research_graph.plan_evidence.page", "research_memory.plan_evidence.read"),
-    "bundle": (
+    "companion": ("assistant.content.generate",),
+    "idea": ("assistant.content.generate", *GUIDANCE_OPERATION_IDS, *GOAL_OPERATION_IDS, "research_memory.research_notes.read", "research_memory.stage_context.read"),
+    "plan": ("assistant.content.generate", *GUIDANCE_OPERATION_IDS, *GOAL_OPERATION_IDS, "research_memory.research_notes.read", "research_memory.stage_context.read", "research_graph.plan_evidence.page", "research_memory.plan_evidence.read"),
+    "bundle": ("assistant.content.generate",
         *GUIDANCE_OPERATION_IDS,
         *GOAL_OPERATION_IDS,
         "research_memory.research_notes.read",
@@ -125,9 +123,9 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
         "agent_runtime.target_frontier.read",
         "agent_runtime.bundle_inbox.read",
     ),
-    "target": (*GUIDANCE_OPERATION_IDS, *GOAL_OPERATION_IDS, "research_memory.research_notes.read", "agent_runtime.target_run.observe",
+    "target": ("assistant.content.generate", *GUIDANCE_OPERATION_IDS, *GOAL_OPERATION_IDS, "research_memory.research_notes.read", "agent_runtime.target_run.observe",
                "agent_runtime.target_run.progress"),
-    "reasoning": (
+    "reasoning": ("assistant.content.generate",
         *GUIDANCE_OPERATION_IDS,
         *GOAL_OPERATION_IDS,
         "research_graph.question_relations.record",
@@ -138,7 +136,6 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
         "research_memory.reasoning_evidence.read",
         "research_graph.reasoning_context.read",
     ),
-    "writing": (),
 }
 
 
@@ -968,6 +965,13 @@ def root_operation_catalog(
     ):
         raise ValueError("root_common_operation_catalog_invalid")
     delta = ROOT_ROLE_OPERATION_DELTAS[root_kind]
+    if root_kind == "companion":
+        # Catalog membership is not a research-write grant. Native tools still
+        # write the assistant's own files; formal research actions belong to
+        # the user's reviewed submission or the responsible research root.
+        common_operation_ids = tuple(operation_id for operation_id in common_operation_ids
+            if operation_id.endswith(
+                (".read", ".page", ".discover", ".current", ".lifecycle")))
     overlap = set(common_operation_ids) & set(delta)
     if overlap:
         raise ValueError("root_operation_catalog_overlap")

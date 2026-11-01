@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from meta_research.plan_stage import PlanStageWorker
     from meta_research.quest_completion import QuestCompletionService
     from meta_research.reasoning_stage import ReasoningStageWorker
-    from meta_research.writing import WritingReportService
 
 
 _MAX_SNAPSHOT_ATTEMPTS = 3
@@ -62,7 +61,6 @@ class PublicProjection:
         reasoning_stage: ReasoningStageWorker | None = None,
         autonomous_creation: AutonomousCreationService | None = None,
         quest_completion: QuestCompletionService | None = None,
-        writing: WritingReportService | None = None,
         harnesses: HarnessRuntime | None = None,
         database: Database | None = None,
     ) -> None:
@@ -80,7 +78,6 @@ class PublicProjection:
         self._reasoning_stage = reasoning_stage
         self._autonomous_creation = autonomous_creation
         self._quest_completion = quest_completion
-        self._writing = writing
         self._harnesses = harnesses
         self._interfaces = {
             "research_graph": research_graph,
@@ -590,7 +587,7 @@ class PublicProjection:
                 if self._quest_completion is None
                 else self._quest_completion.query_current()
             )
-            with query_section("history_and_writing"):
+            with query_section("history"):
                 current_question = _query_foreground_question(
                     self._research_graph,
                     self._research_memory,
@@ -604,17 +601,6 @@ class PublicProjection:
                     bundle_stage=bundle_stage,
                     reasoning_stage=reasoning_stage,
                     stage_display=cycle_stage_display,
-                )
-                writing = (
-                    {
-                        "status": "unavailable",
-                        "document_types": ["report"],
-                        "runs": [],
-                        "reason": {"code": "writing_capability_not_configured"},
-                    }
-                    if self._writing is None
-                    else self._writing.query_overview() if include_history
-                    else {"status": "ready", "document_types": ["report"], "runs": [], "reason": None, "loaded": False}
                 )
                 harnesses = (
                     {
@@ -908,7 +894,6 @@ class PublicProjection:
                 safe_runnable_basis,
             ),
             "research_control": research_control,
-            "writing": writing,
             "harnesses": harnesses,
             "runtime_observability": runtime_observability,
             "query_warnings": query_warnings,

@@ -100,7 +100,6 @@ from meta_research.runtime_protection import (
     RuntimeProtectionUnavailable,
     record_runtime_boundary,
 )
-from meta_research.writing_contract import validate_frozen_writing_snapshot
 
 
 QUESTION_FIELDS = tuple(QUESTION_FIELD_MAX_LENGTHS)
@@ -273,6 +272,7 @@ class HumanCollaborationInterface(Protocol):
         *,
         view_context: dict[str, object] | None = None,
         guidance_options: dict[str, object] | None = None,
+        writing_request: dict[str, object] | None = None,
     ) -> dict[str, object]: ...
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
@@ -335,9 +335,6 @@ class HumanCollaborationInterface(Protocol):
 
     def verify_guidance_binding(self, binding: dict[str, object]) -> None: ...
 
-    def bind_writing_delivery_binding_validator(
-        self, validator: Callable[[dict[str, object]], None]
-    ) -> None: ...
 
     def create_command_draft(
         self, scope_ref: str, command: dict[str, object], idempotency_key: str
@@ -1815,7 +1812,6 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             intent_drafting_provider,
             context_resolver=self._resolve_companion_context,
             control_preview_resolver=self._resolve_control_preview,
-            writing_snapshot_validator=validate_frozen_writing_snapshot,
             runtime_protection=runtime_protection,
             agent_runtime=agent_runtime,
         )
@@ -2223,13 +2219,29 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         *,
         view_context: dict[str, object] | None = None,
         guidance_options: dict[str, object] | None = None,
+        writing_request: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        def prepare_writing():
+            from meta_research.companion_writing import WritingRequest, writing_message
+            from meta_research.research_overview import ResearchOverviewReader
+            if not scope_ref.startswith("quest:"):
+                raise OwnerConflict("writing_quest_required")
+            task = WritingRequest.model_validate(writing_request)
+            reader = ResearchOverviewReader(self._research_graph, self._advancement_engine,
+                self._research_memory, self._agent_runtime)
+            science = reader.writing_context(scope_ref.removeprefix("quest:"),
+                question_ref=None if view_context is None else view_context.get("question_ref"))
+            if self._root_workspaces is None:
+                raise OwnerConflict("writing_workspace_unavailable")
+            self._collaboration_ladder.ensure_companion_session(scope_ref)
+            session = self._collaboration_ladder.query_companion(scope_ref)
+            workspace = self._root_workspaces.bind_companion_session(scope_ref, session["session_ref"])
+            return writing_message(task, message, self._research_memory, science=science,
+                workspace_root=workspace.directory, input_key=idempotency_key)
         return self._collaboration_ladder.send_companion_message(
-            scope_ref,
-            message,
-            idempotency_key,
-            view_context=view_context,
-            guidance_options=guidance_options,
+            scope_ref, message, idempotency_key, view_context=view_context,
+            guidance_options=guidance_options, writing_request=writing_request,
+            prepare_writing=prepare_writing if writing_request is not None else None,
         )
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
@@ -2249,8 +2261,18 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         if session is None:
             return None
         context = self._resolve_companion_context_without_history(session["scope_ref"])
-        return {name: session[name] for name in ("scope_ref", "session_ref", "status")} | {
+        result = {name: session[name] for name in ("scope_ref", "session_ref", "status")} | {
             "quest_ref": context.get("quest_ref")}
+        if result["quest_ref"] is not None:
+            quest = self._research_graph.query_quest_by_ref(result["quest_ref"])
+            if quest is None:
+                raise OwnerConflict("companion_scope_stale")
+            with self._database.read() as connection:
+                preparation_root = connection.execute(text(
+                    "SELECT session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id"),
+                    {"id": quest.initialization_id}).scalar_one()
+            result.update(initialization_id=quest.initialization_id, preparation_root_session_ref=preparation_root)
+        return result
 
     def query_companion_reply(
         self, scope_ref: str, interaction_ref: str
@@ -2393,6 +2415,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "receipt_ref": quest.receipt.receipt_ref,
             },
             "current_question": current_question,
+            "observed_at": time.time(),
+            "observation_source": "current Owner projections",
+            "authorized_research_reader": {"operation": "research_graph.questions.page",
+                "args": {"entry_kind": "quests", "offset": 0, "limit": 12}},
             "activity": {
                 "foreground": foreground,
                 "research_targets": research_targets,
@@ -2662,12 +2688,6 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
     def verify_guidance_binding(self, binding: dict[str, object]) -> None:
         self._collaboration_ladder.verify_guidance_binding(binding)
 
-    def bind_writing_delivery_binding_validator(
-        self, validator: Callable[[dict[str, object]], None]
-    ) -> None:
-        self._collaboration_ladder.bind_writing_delivery_binding_validator(
-            validator
-        )
 
     def create_command_draft(
         self, scope_ref: str, command: dict[str, object], idempotency_key: str

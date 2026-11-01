@@ -1,6 +1,7 @@
 """Bounded human research advice, readable from any authenticated Quest root."""
 from __future__ import annotations
 
+from meta_research.research_content import _reading_quest
 from meta_research.context_presentation import bounded_text, context_read_page
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
@@ -20,6 +21,9 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
             attempt_ref=context.attempt_ref, root_session_ref=context.root_session_ref,
             fence_ref=context.fence_ref, runtime_binding_hash=context.capability_binding_hash)
         quest_ref = scope.get("quest_ref")
+        if "source_quest_ref" in arguments:
+            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments["source_quest_ref"],
+                human_collaboration=human_collaboration)
         request_ref = arguments.get("request_ref")
         response_ref = arguments.get("response_ref")
         constraint_ref = arguments.get("constraint_ref")
@@ -150,7 +154,7 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
     return SemanticOperation(
         semantic_operation_id=HUMAN_RESEARCH_READ_OPERATION,
         owning_module="human_collaboration",
-        description=("读取当前 Quest 跨阶段、Target 和 Cycle 的人类输入。列表模式同时返回最多 12 条请求摘要和最多 12 条主动提交材料；"
+        description=("Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 跨阶段、Target 和 Cycle 的人类输入。列表模式同时返回最多 12 条请求摘要和最多 12 条主动提交材料；"
                      "先沿 next_offset 读完当前 UTF-8 字节页，再用 next_cursor 翻旧请求；query 检索请求研究说明和主动材料，"
                      "按 research_inputs.next_offset 设置 input_offset，并携带 research_inputs.query_revision 为 input_query_revision 独立翻页。"
                      "正式指导沿 formal_guidance_reader 的 entry_kind=guidance 发现；以 guidance_offset 和 query_revision 续页，"
@@ -161,7 +165,7 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
                      "请求目录只附最新回复；沿 responses_reader 的 entry_kind=responses 及 request_ref 查询全部历史回复，"
                      "以 response_offset 和 query_revision 独立续页。每条回复提供准确 reader，目录不准备请求的完整执行生命周期。"
                      "正式回复的 delivery.reply_reader／uploaded_readers 参数交给 research_workspace.read，linked_locators 用原生工具按原 locator 有界读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
-        input_schema={"type": "object", "properties": {
+        input_schema={"type": "object", "properties": {"source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
             "entry_kind": {"type": "string", "enum": ["guidance", "responses"]},
             "guidance_offset": {"type": "integer", "minimum": 0},
             "response_offset": {"type": "integer", "minimum": 0},

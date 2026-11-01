@@ -117,6 +117,7 @@ def test_real_unscoped_companion_uses_its_durable_session_work(tmp_path, context
         runtime = build_production_runtime(data_root, proposal_drafter=DeterministicDraftingAdapter(),
             intent_drafting_provider=adapter, acquisition_provider=acquisition,
             host_compute_probe=DeterministicProbe())
+        runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
         human = runtime.owners.human_collaboration
         assert human.query_companion(scope_ref)["session_ref"] == root_ref
         assert runtime.root_workspaces.bind_companion_session(scope_ref, root_ref) == binding

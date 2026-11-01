@@ -326,7 +326,7 @@ class RootWorkspaces:
     def _save_conversation(self, binding: WorkspaceBinding, generation: int,
                            document: dict[str, object]) -> dict[str, object]:
         root = binding.directory
-        filename = f"native-session-{generation}.json"
+        filename = f"{canonical_hash(binding.location.root_session_ref)}-native-session-{generation}.json"
         path = "companion-history/" + filename
         content = canonical_json(document).encode("utf-8")
         temporary = ".conversation-" + secrets.token_hex(16)
@@ -361,9 +361,18 @@ class RootWorkspaces:
             or facts["scope_ref"] != scope_ref or require_open and facts["status"] != "open"):
             raise SemanticMcpError("workspace_companion_scope_invalid")
         identity = {"companion_session_ref": root_session_ref}
-        location = WorkspaceLocation("workspace:" + canonical_hash(identity), "companion",
-            root_session_ref, root_session_ref, self._bases["companion"] / canonical_hash(identity),
-            quest_ref=facts["quest_ref"], request_ref=scope_ref)
+        workspace_ref = "workspace:" + canonical_hash(identity)
+        directory = self._bases["companion"] / canonical_hash(identity)
+        initialization_id = None
+        if facts["quest_ref"] is not None:
+            initialization_id = facts["initialization_id"]
+            prepared = self._initialization_location(initialization_id, facts["preparation_root_session_ref"])
+            # The Quest keeps its preparation folder. Session rotation changes
+            # conversation identity, never file identity or original bytes.
+            workspace_ref, directory = prepared.workspace_ref, prepared.directory
+        location = WorkspaceLocation(workspace_ref, "companion",
+            root_session_ref, root_session_ref, directory,
+            quest_ref=facts["quest_ref"], request_ref=scope_ref, initialization_id=initialization_id)
         self._ensure_directory(location.directory)
         return WorkspaceBinding(location, canonical_hash({"owner": "human_collaboration",
             **identity, "scope_ref": scope_ref}))
@@ -519,6 +528,21 @@ class RootWorkspaces:
     def read_companion_session(self, scope_ref: str, root_session_ref: str, **arguments):
         return self._read((self._companion_session_binding(scope_ref, root_session_ref,
             require_open=False).location,), **arguments)
+
+    def download_companion_session(self, scope_ref: str, root_session_ref: str, *,
+                                   workspace_ref: str, path: str, expected_sha256: str):
+        """Return one exact file from the authorized persistent assistant folder."""
+        source = self._companion_session_binding(scope_ref, root_session_ref, require_open=False).location
+        if source.workspace_ref != workspace_ref:
+            raise SemanticMcpError("workspace_not_visible")
+        parts = _relative_parts(path)
+        if any(part.startswith(".") for part in parts):
+            raise SemanticMcpError("workspace_file_unsafe")
+        content = _read_bytes(source.directory, path)
+        digest = hashlib.sha256(content).hexdigest()
+        if expected_sha256 != digest:
+            raise SemanticMcpError("workspace_content_changed")
+        return {**source.source(), "path": path, "sha256": digest, "total_bytes": len(content), "content": content}
 
     def _read(self, locations, *, workspace_ref, path, expected_sha256=None, offset=0, max_bytes=65536):
         if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 65536:

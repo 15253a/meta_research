@@ -17,7 +17,6 @@ from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
 from meta_research.owners.common import canonical_hash
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.reasoning_skill import CodexReasoningSkillAdapter
-from meta_research.writing_skill import CodexWritingSkillAdapter
 from test_external_mcp import service
 from test_runtime_conditions_provider_prompts import _SignedRunner, _idea_call
 from test_deepfetch_adapter import DurableSegmentSequenceRunner, _request, _deepfetch_web_evidence_gate_output_schema
@@ -72,7 +71,7 @@ class ProtocolRunner(_SignedRunner):
 
 
 @pytest.mark.parametrize("adapter_type", (CodexIdeaSkillAdapter, CodexPlanSkillAdapter, CodexBundleSkillAdapter,
-    CodexReasoningSkillAdapter, CodexWritingSkillAdapter, CodexCompanionAdapter, _AcquisitionCodexAdapter))
+    CodexReasoningSkillAdapter, CodexCompanionAdapter, _AcquisitionCodexAdapter))
 def test_all_shared_consumers_get_real_catalog_instructions_and_frozen_resume(tmp_path, adapter_type):
     runtime = ExternalMcpRuntime(tmp_path / "settings")
     first = runtime.save_config(services=parse_services([service(tmp_path, research_instructions="Instruction A")]),
@@ -81,21 +80,8 @@ def test_all_shared_consumers_get_real_catalog_instructions_and_frozen_resume(tm
     workspace = tmp_path / "provider"
     adapter = adapter_type(workspace, process_runner=runner)
     adapter.bind_external_mcp(runtime)
-    read_root = workspace / "writing-inputs" / "snapshot"
-    if adapter_type is CodexWritingSkillAdapter:
-        read_root.mkdir(parents=True)
-
     def invoke(adapter, *, job="job:initial", native=None):
-        if adapter_type is not CodexWritingSkillAdapter:
-            return _idea_call(adapter, job=job, native=native)
-        return adapter._invoke_root_operation(
-            operation_name="primary", prompt="Research the actual question.",
-            schema={"type": "object", "properties": {"ok": {"type": "boolean"}},
-                "required": ["ok"], "additionalProperties": False},
-            native_session_ref=native, job_ref=job, run_ref="stage-run:current",
-            attempt_ref=None, root_session_ref="session:current", fence_ref=None,
-            sandbox_read_root=read_root,
-        )
+        return _idea_call(adapter, job=job, native=native)
 
     with gateway(runtime):
         result = invoke(adapter)

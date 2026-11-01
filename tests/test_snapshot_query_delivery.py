@@ -15,7 +15,6 @@ def snapshot(revision):
                             'offset': 0, 'total_count': 1, 'reference_revision': revision},
         'question_tree': {'loaded': True, 'items': ['question']},
         'research_control': {'recovery_records': ['recovery']},
-        'writing': {'status': 'ready', 'runs': ['report'], 'reason': None, 'loaded': True},
     }
 
 

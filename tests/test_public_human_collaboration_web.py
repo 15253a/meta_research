@@ -567,23 +567,24 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
     assert prepared_session_ref is not None
     client, auth = _authenticated_client(runtime)
     try:
-        with client:
-            owner_revisions = {
-                name: owner.query_snapshot().revision
-                for name, owner in vars(runtime.owners).items()
-            }
-            first_snapshot_response = client.get("/api/v1/snapshot")
-            second_snapshot_response = client.get("/api/v1/snapshot")
-            assert first_snapshot_response.status_code == 200
-            assert second_snapshot_response.status_code == 200
-            assert first_snapshot_response.json()["human_collaboration"][
-                "companion"
-            ]["session_ref"] == prepared_session_ref
-            assert {
-                name: owner.query_snapshot().revision
-                for name, owner in vars(runtime.owners).items()
-            } == owner_revisions
+        # Verify read-only snapshots before background stage workers start.
+        owner_revisions = {
+            name: owner.query_snapshot().revision
+            for name, owner in vars(runtime.owners).items()
+        }
+        first_snapshot_response = client.get("/api/v1/snapshot")
+        second_snapshot_response = client.get("/api/v1/snapshot")
+        assert first_snapshot_response.status_code == 200
+        assert second_snapshot_response.status_code == 200
+        assert first_snapshot_response.json()["human_collaboration"][
+            "companion"
+        ]["session_ref"] == prepared_session_ref
+        assert {
+            name: owner.query_snapshot().revision
+            for name, owner in vars(runtime.owners).items()
+        } == owner_revisions
 
+        with client:
             stale_scope_response = client.post(
                 "/api/v1/companion/messages",
                 headers=_write_headers(auth, "companion-stale-scope-web"),

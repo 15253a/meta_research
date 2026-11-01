@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from meta_research.composition import build_production_runtime
 from meta_research.harness import HarnessAdmissionError, HarnessProbeRequest
 from meta_research.paths import prepare_data_root
+from meta_research.power_inhibitors import OperatorAttestedPowerInhibitor
 from meta_research.quest_drafting import HostComputeDevice, HostComputeSnapshot
 from meta_research.semantic_mcp import (
     ROOT_AGENT_ACQUISITION_OPERATION_IDS,
@@ -26,6 +27,28 @@ from test_public_acquisition_session import (
     _authenticated_client,
     _open_ready_acquisition,
 )
+from test_public_idea_stage import (
+    _DeterministicDraftingAdapter, _DeterministicIdeaSkill, _DeterministicProbe,
+    _confirm_direct_quest,
+)
+
+
+def _acquisition_effect_runtime(path, provider):
+    drafting = _DeterministicDraftingAdapter()
+    return build_production_runtime(prepare_data_root(path), acquisition_provider=provider,
+        host_compute_probe=_DeterministicProbe(), proposal_drafter=drafting,
+        intent_drafting_provider=drafting, idea_skill_provider=_DeterministicIdeaSkill(),
+        power_inhibitor=OperatorAttestedPowerInhibitor())
+
+
+def _admitted_idea_scope(runtime):
+    quest = _confirm_direct_quest(runtime)
+    admitted = runtime.idea_stage.start("acquisition-caller-idea")
+    run = runtime.owners.agent_runtime.query_idea_stage_run(admitted["stage_run_request"]["request_ref"])
+    assert run is not None
+    return quest["quest_ref"], {"run_ref": run.run_ref, "attempt_ref": run.attempt_ref,
+        "root_session_ref": run.root_session_ref, "fence_ref": run.fence_ref,
+        "runtime_binding_hash": run.runtime_binding_hash}
 
 
 def test_effectful_semantic_operation_fails_closed_without_reconciliation() -> None:
@@ -516,7 +539,6 @@ def test_web_composition_binds_all_root_resident_mcp_channels(tmp_path) -> None:
             "deepfetch",
             "idea",
             "plan",
-            "writing",
         }
         assert all(
             channels._authority is runtime.harnesses
@@ -777,11 +799,7 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
     tmp_path,
 ) -> None:
     provider = ObtainingAcquisitionProvider()
-    runtime = build_production_runtime(
-        prepare_data_root(tmp_path / "root-acquisition-effect"),
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
+    runtime = _acquisition_effect_runtime(tmp_path / "root-acquisition-effect", provider)
     client, write_headers = _authenticated_client(runtime)
     try:
         initialization_id, _saved, session_ref = _open_ready_acquisition(
@@ -789,7 +807,7 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
             write_headers,
             prefix="root-acquisition-effect",
         )
-        quest_ref = "quest:root-acquisition-effect"
+        quest_ref, idea_scope = _admitted_idea_scope(runtime)
         bound = runtime.owners.agent_runtime.bind_acquisition_session_to_quest(
             initialization_id,
             quest_ref,
@@ -806,10 +824,12 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
                 "runtime_binding_hash": suffix * 64,
                 "generation": 1,
             }
-            runtime.owners.agent_runtime.register_external_root_task_scope(
-                root_kind=root_kind,
-                root_runtime_scope=scope,
-            )
+            if root_kind == "idea":
+                scope = idea_scope
+            else:
+                runtime.owners.agent_runtime.register_external_root_task_scope(
+                    root_kind=root_kind, root_runtime_scope=scope,
+                )
             return runtime.harnesses.issue_resident_mcp_channel(
                 run_ref=scope["run_ref"],
                 attempt_ref=scope["attempt_ref"],
@@ -840,32 +860,32 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
             assert response.status_code == 200
             return response.json()["result"]
 
-        companion = channel_for("companion", "c")
+        idea = channel_for("idea", "c")
         first_arguments = {
-            "effect_id": "companion-fulltext-1",
+            "effect_id": "idea-fulltext-1",
             "targets": [
                 {
-                    "paper_id": "paper:companion-fulltext-1",
-                    "title": "One Companion full-text target",
-                    "doi": "10.1000/companion-fulltext-1",
+                    "paper_id": "paper:idea-fulltext-1",
+                    "title": "One Idea full-text target",
+                    "doi": "10.1000/idea-fulltext-1",
                     "source_urls": [],
                 }
             ],
         }
         first = call(
-            companion.connection.token,
+            idea.connection.token,
             1,
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
             first_arguments,
         )
         assert first["isError"] is False
         first_value = first["structuredContent"]
-        assert first_value["effect_id"] == "companion-fulltext-1"
+        assert first_value["effect_id"] == "idea-fulltext-1"
         assert first_value["status"] == "obtained"
         assert set(first_value) == {"effect_id", "request_id", "status", "results"}
         assert len(first_value["results"]) == 1
         assert first_value["results"][0]["paper_id"] == (
-            "paper:companion-fulltext-1"
+            "paper:idea-fulltext-1"
         )
         assert first_value["results"][0]["format"] == "html"
         assert first_value["results"][0]["content_sha256"] == hashlib.sha256(
@@ -875,10 +895,10 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
 
         # Treat the request response as transport-lost. Reconcile is read-only.
         reconciled = call(
-            companion.connection.token,
+            idea.connection.token,
             2,
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
-            {"effect_id": "companion-fulltext-1"},
+            {"effect_id": "idea-fulltext-1"},
         )
         assert reconciled["structuredContent"] == first_value
         assert len(provider.batches) == 1
@@ -972,16 +992,16 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
             b"drifted-after-owner-proof"
         )
         drifted = call(
-            companion.connection.token,
+            idea.connection.token,
             5,
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
-            {"effect_id": "companion-fulltext-1"},
+            {"effect_id": "idea-fulltext-1"},
         )
         assert drifted["isError"] is False
         assert drifted["structuredContent"]["status"] == "missing"
         assert drifted["structuredContent"]["results"] == [
             {
-                "paper_id": "paper:companion-fulltext-1",
+                "paper_id": "paper:idea-fulltext-1",
                 "status": "missing",
                 "failure": {
                     "code": "acquisition_artifact_drift",
@@ -992,7 +1012,7 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
             }
         ]
         replay_after_drift = call(
-            companion.connection.token,
+            idea.connection.token,
             6,
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
             first_arguments,
@@ -1010,11 +1030,7 @@ def test_common_acquisition_effect_resumes_only_after_its_human_waiter(
     tmp_path,
 ) -> None:
     provider = HumanRequestAcquisitionProvider()
-    runtime = build_production_runtime(
-        prepare_data_root(tmp_path / "root-acquisition-human-resume"),
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
+    runtime = _acquisition_effect_runtime(tmp_path / "root-acquisition-human-resume", provider)
     provider.owner = runtime.owners.agent_runtime
     client, write_headers = _authenticated_client(runtime)
     try:
@@ -1023,23 +1039,10 @@ def test_common_acquisition_effect_resumes_only_after_its_human_waiter(
             write_headers,
             prefix="root-acquisition-human-resume",
         )
-        quest_ref = "quest:root-acquisition-human-resume"
+        quest_ref, scope = _admitted_idea_scope(runtime)
         runtime.owners.agent_runtime.bind_acquisition_session_to_quest(
             initialization_id,
             quest_ref,
-        )
-        scope = {
-            "quest_ref": quest_ref,
-            "run_ref": "companion-human-resume",
-            "attempt_ref": "companion-human-resume-attempt",
-            "root_session_ref": "companion-human-resume-session",
-            "fence_ref": "companion-human-resume-fence",
-            "runtime_binding_hash": "d" * 64,
-            "generation": 1,
-        }
-        runtime.owners.agent_runtime.register_external_root_task_scope(
-            root_kind="companion",
-            root_runtime_scope=scope,
         )
         channel = runtime.harnesses.issue_resident_mcp_channel(
             run_ref=scope["run_ref"],
@@ -1047,8 +1050,8 @@ def test_common_acquisition_effect_resumes_only_after_its_human_waiter(
             root_session_ref=scope["root_session_ref"],
             fence_ref=scope["fence_ref"],
             capability_binding_hash=scope["runtime_binding_hash"],
-            operation_ids=ROOT_AGENT_SEMANTIC_OPERATION_IDS["companion"],
-            root_kind="companion",
+            operation_ids=ROOT_AGENT_SEMANTIC_OPERATION_IDS["idea"],
+            root_kind="idea",
             phase="primary",
             subject_policy="operation_tree",
         )

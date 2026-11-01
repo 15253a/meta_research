@@ -10,7 +10,7 @@ from sqlalchemy import text
 import meta_research.owners.agent_runtime as agent_runtime_module
 from meta_research.owners.common import OwnerConflict, canonical_json
 from meta_research.research_overview import ResearchOverviewReader
-from meta_research.writing_snapshot import WritingResearchSnapshotReader
+from meta_research.accepted_research import AcceptedResearchReader
 from test_bundle_report_read_snapshot import _accept_report
 from test_bundle_report_receipt_order import committed_targets
 
@@ -51,7 +51,7 @@ def test_bundle_display_keeps_exact_accepted_text_and_bindings_without_replaying
         owners.research_graph, owners.advancement_engine,
         owners.research_memory, owner,
     )
-    writing = WritingResearchSnapshotReader(*readers)
+    accepted = AcceptedResearchReader(*readers)
     overview = ResearchOverviewReader(*readers)
     cycle = SimpleNamespace(
         cycle_ref=request.cycle_ref,
@@ -61,7 +61,7 @@ def test_bundle_display_keeps_exact_accepted_text_and_bindings_without_replaying
     displayed_fields = ("run_ref", "report_ref", "report_hash", "report")
 
     with database.read_snapshot():
-        old = writing._bundle_stage_value(request, None)["report"]
+        old = accepted._bundle_stage_value(request, None)["report"]
     expected = {key: old[key] for key in displayed_fields}
     prepare = Mock(side_effect=AssertionError("display_replayed_target_proofs"))
     with monkeypatch.context() as patch:
@@ -102,7 +102,7 @@ def test_bundle_display_keeps_exact_accepted_text_and_bindings_without_replaying
     commit = owners.advancement_engine.query_bundle_stage_commit(run.request_ref)
     assert commit is not None
     with database.read_snapshot():
-        old_completed = writing._bundle_stage_value(request, commit)["report"]
+        old_completed = accepted._bundle_stage_value(request, commit)["report"]
         assert {key: old_completed[key] for key in displayed_fields} == expected
 
     with monkeypatch.context() as patch:

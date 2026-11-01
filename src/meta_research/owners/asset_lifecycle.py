@@ -169,7 +169,6 @@ def retained_asset_references(connection, version_ref):
         ("rm_target_implementation_bundles", "implementation_revision_ref"),
         ("rm_target_input_asset_proofs", "proof_ref"),
         ("rm_target_research_notes", "note_ref"),
-        ("rg_writing_citation_decisions", "decision_ref"),
     )
     for table, key in direct:
         rows = (

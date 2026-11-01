@@ -1774,6 +1774,8 @@ class ManualQuestionCreation:
                     "quest_initialization_id": row.quest_initialization_id,
                     "parent_question_ref": row.parent_question_ref,
                     "proposal_revision": int(row.proposal_revision),
+                    "proposal_ref": row.proposal_ref,
+                    "proposal_hash": row.proposal_hash,
                     "confirmed_seed": seed,
                     "confirmed_seed_ref": row.seed_ref,
                     "confirmed_seed_hash": row.seed_hash,
@@ -3231,6 +3233,8 @@ class ManualQuestionCreation:
                     require_current
                     and (
                         revision != int(creation.proposal_revision)
+                        or context.get("proposal_ref") != creation.proposal_ref
+                        or context.get("proposal_hash") != creation.proposal_hash
                         or proposal != current_proposal
                     )
                 )

@@ -203,9 +203,13 @@ def test_each_root_actual_adapter_uses_its_effective_catalog_without_tool_ritual
         "research_graph.baselines.page",
         "research_graph.baselines.read",
         "research_graph.target_formal_results.read",
-        "research_graph.datasets.derive",
-        "research_graph.datasets.derive.reconcile",
+        "research_graph.datasets.read",
     }.issubset(operation_ids)
+    if root_kind == "companion":
+        assert "research_graph.datasets.derive" not in operation_ids
+        assert "research_graph.datasets.derive.reconcile" not in operation_ids
+    else:
+        assert {"research_graph.datasets.derive", "research_graph.datasets.derive.reconcile"}.issubset(operation_ids)
     assert ("research_memory.research_notes.read" in operation_ids) == (
         root_kind in {"idea", "plan", "bundle", "reasoning", "target"}
     )

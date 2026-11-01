@@ -2,7 +2,6 @@ import type { Page } from "@playwright/test";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import {
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -31,7 +30,6 @@ type DeterministicProductOptions = {
     | "reasoning-no-evidence"
     | "reasoning-autonomous"
     | "quest-completion";
-  writingDeliveryFaults?: "history-boundaries";
 };
 
 export type PlanProviderPhase = "plan-primary" | "plan-review";
@@ -86,9 +84,6 @@ export class DeterministicProduct {
     }
     if (options.stagePipeline) {
       argv.push("--stage-pipeline", options.stagePipeline);
-    }
-    if (options.writingDeliveryFaults) {
-      argv.push("--writing-delivery-faults", options.writingDeliveryFaults);
     }
     const child = spawn(
       python ?? "uv",
@@ -255,52 +250,6 @@ export class DeterministicProduct {
     writeFileSync(this.providerMarker(phase, "release"), "release\n", {
       encoding: "utf8",
     });
-  }
-
-  prepareWritingDeliveryTarget(fileName: string): string {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(fileName)) {
-      throw new Error("invalid deterministic Writing delivery file name");
-    }
-    const directory = join(this.dataRoot, "writing-deliveries");
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    return join(directory, fileName);
-  }
-
-  writingDeliveryExists(fileName: string): boolean {
-    return existsSync(this.writingDeliveryPath(fileName));
-  }
-
-  readWritingDelivery(fileName: string): string {
-    return readFileSync(this.writingDeliveryPath(fileName), "utf8");
-  }
-
-  readWritingDeliveryBytes(fileName: string): Buffer {
-    return readFileSync(this.writingDeliveryPath(fileName));
-  }
-
-  damageWritingAssetCustody(contentHash: string): void {
-    if (!/^[0-9a-f]{64}$/.test(contentHash)) {
-      throw new Error("invalid deterministic Writing asset hash");
-    }
-    const objectPath = join(
-      this.dataRoot,
-      "objects",
-      "sha256",
-      "assets",
-      contentHash.slice(0, 2),
-      contentHash,
-    );
-    if (!existsSync(objectPath)) {
-      throw new Error("deterministic Writing asset custody is missing");
-    }
-    rmSync(objectPath);
-  }
-
-  private writingDeliveryPath(fileName: string): string {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(fileName)) {
-      throw new Error("invalid deterministic Writing delivery file name");
-    }
-    return join(this.dataRoot, "writing-deliveries", fileName);
   }
 
   private providerMarker(

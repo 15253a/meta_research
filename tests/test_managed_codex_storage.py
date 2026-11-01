@@ -234,7 +234,6 @@ def test_default_codex_adapters_share_managed_runner_and_stage_ledgers(
             runtime.bundle_stage._provider,
             runtime.reasoning_stage._provider,
             runtime.deepfetch._provider,
-            runtime.writing._provider,
         )
         codex_runner = drafting._runner
         assert runtime.owners.human_collaboration._intent_drafting_provider is drafting

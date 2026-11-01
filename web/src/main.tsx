@@ -75,7 +75,7 @@ import {
 } from "./QuestCreation";
 import { QuestionTree } from "./QuestionTree";
 import { ResearchAssetsWorkbench } from "./ResearchAssets";
-import { WritingReportWorkbench } from "./WritingReport";
+import { WritingRequestForm } from "./WritingRequest";
 import {
   ForegroundResearchControlShortcut,
   HumanRequestSurface,
@@ -367,10 +367,6 @@ function uniqueCapabilities(snapshot: PublicSnapshot | null): CapabilityState[] 
       ...snapshot.quest_creation.first_question_deepfetch,
     },
     ...snapshot.unavailable,
-    {
-      capability: "writing",
-      status: snapshot.writing.status,
-    },
   ];
   return entries.filter(
     (entry, index) =>
@@ -393,7 +389,6 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
         "plan_stage_worker",
         "bundle_stage_worker",
         "reasoning_stage_worker",
-        "writing_worker",
         "research_asset_intake_worker",
         "research_asset_verification_worker",
       ].includes(check.name),
@@ -4498,7 +4493,7 @@ function DetailedApp() {
   >(null);
   const [targetRootObservationPointers, setTargetRootObservationPointers] =
     useState<Record<string, TargetRootObservationPointer>>({});
-  const includeAssets = assetsOpen || creationMode !== null || manualPanel !== null;
+  const includeAssets = assetsOpen || writingOpen || creationMode !== null || manualPanel !== null;
   const includeHistory = questionTreeOpen || writingOpen || showCompanion;
   const recovery = useProjectionRecovery(snapshot, setSnapshot, runtimeStatus.status,
     { includeAssets, includeHistory });
@@ -4644,7 +4639,8 @@ function DetailedApp() {
     (item) => item.question_ref === projectedCurrentQuestionRef,
   )?.question_ref ?? scopedHistoryQuestions[0]?.question_ref ?? projectedCurrentQuestionRef ?? null;
   const canBrowseHistory = Boolean(canBrowseQuestions && historyQuestionRef);
-  const canBrowseWriting = snapshot?.writing.status === "ready";
+  const canBrowseWriting = snapshot?.human_collaboration?.companion.status === "ready"
+    && Boolean(snapshot.human_collaboration?.companion.scope_ref);
   const manualCreationReady =
     snapshot?.manual_question_creation.status === "ready";
   const manualView = useMemo(
@@ -5244,7 +5240,7 @@ function DetailedApp() {
           </button>
         ) : null}
       </div>
-      {((creationMode && snapshot?.research_assets.loaded === false) || (writingOpen && snapshot?.writing.loaded === false)) ? (
+      {((creationMode && snapshot?.research_assets.loaded === false) || (writingOpen && snapshot?.research_assets.loaded === false)) ? (
         <div className="lumen-reconnect-warning" role="status"><p>{error ? "详情读取失败，请重试。" : "正在读取所需的研究资料…"}</p><button onClick={() => void reload()}>刷新详情</button></div>
       ) : null}
       {creationMode && snapshot && snapshot.research_assets.loaded !== false ? (
@@ -5272,17 +5268,18 @@ function DetailedApp() {
           onChanged={() => void reload()}
         />
       ) : null}
-      {writingOpen && snapshot && snapshot.writing.loaded !== false ? (
-        <WritingReportWorkbench
-          initial={snapshot.writing}
-          questRef={
-            snapshot.research_space.current_question?.quest_ref
-              ?? snapshot.question_tree.items[0]?.quest_ref
-              ?? snapshot.quest_creation.current?.quest_ref
-              ?? null
-          }
+      {writingOpen && snapshot && snapshot.research_assets.loaded !== false ? (
+        <WritingRequestForm
+          assets={snapshot.research_assets}
+          scopeRef={snapshot.human_collaboration?.companion.scope_ref ?? null}
+          workspacePath={snapshot.human_collaboration?.companion.workspace_path ?? null}
           onClose={closeWriting}
-          onChanged={() => void reload()}
+          onSent={() => {
+            setWritingOpen(false);
+            setCompanionOpen(true);
+            window.history.replaceState(null, "", "/?workspace=1&companion=1");
+            void reload();
+          }}
         />
       ) : null}
       {manualPanel && manualView ? (

@@ -8,7 +8,6 @@ from test_public_acquisition_session import RecordingAcquisitionProvider
 from test_public_manual_question_lifecycle import DeterministicDraftingAdapter, DeterministicProbe, _accept_root_question
 from test_public_human_collaboration_web import _authenticated_client
 from test_public_work_materials import _source
-from test_dataset_effect_scope_recovery import _scope
 from test_root_workspace import _external_context, _channel, _call, _accepted
 from test_root_human_request_lifecycle import _open_arguments
 
@@ -20,6 +19,8 @@ def test_quest_companion_reads_original_request_materials_without_rebinding_or_f
             context = SemanticCallContext(scope["run_ref"], scope["attempt_ref"], scope["root_session_ref"],
                 scope["fence_ref"], scope["runtime_binding_hash"], "companion", "companion-turn", "research_workspace.materials.read")
             channel = _channel(self.runtime, context)
+            assert _call(self.runtime, channel, "human_request.open",
+                **_open_arguments("ordinary-chat-cannot-open-request", "offline_action"))["isError"]
             listed = _accepted(_call(self.runtime, channel, "research_workspace.materials.discover"))
             assert [item["reference_ref"] for item in listed["references"]] == [self.reference]
             page = _accepted(_call(self.runtime, channel, "research_workspace.materials.discover", reference_ref=self.reference))
@@ -42,9 +43,15 @@ def test_quest_companion_reads_original_request_materials_without_rebinding_or_f
         foreign_quest, _ = _accept_root_question(runtime, "material-foreign")
         references = []
         for index, selected_quest in enumerate((quest, foreign_quest)):
-            scope = _scope(runtime, quest_ref=selected_quest, run_ref=f"original-work-{index}", root_ref=f"original-root-{index}")
-            context = _external_context(scope)
-            opened = _accepted(_call(runtime, _channel(runtime, context), "human_request.open",
+            # Original Acquisition work requests the observations; Companion only reads them.
+            scope = dict(quest_ref=selected_quest, run_ref=f"original-work-{index}",
+                attempt_ref=f"original-attempt-{index}", root_session_ref=f"original-root-{index}",
+                fence_ref=f"original-fence-{index}", runtime_binding_hash="b" * 64, generation=1)
+            runtime.owners.agent_runtime.register_external_root_task_scope(root_kind="acquisition", root_runtime_scope=scope)
+            context = SemanticCallContext(scope["run_ref"], scope["attempt_ref"], scope["root_session_ref"],
+                scope["fence_ref"], scope["runtime_binding_hash"], "acquisition", "primary", "human_request.open")
+            original = _channel(runtime, context)
+            opened = _accepted(_call(runtime, original, "human_request.open",
                 **_open_arguments(f"material-request-{index}", "offline_action")))
             source = tmp_path / f"original-{index}"
             source.mkdir()

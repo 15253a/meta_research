@@ -152,7 +152,7 @@ def test_bundle_provider_reads_shared_references_with_complete_formal_plan(tmp_p
     assert len(authority.issued) == len(authority.revoked) == 1
 
 
-@pytest.mark.parametrize("root_kind", ("idea", "plan", "bundle", "reasoning", "target", "deepfetch", "acquisition", "companion", "writing"))
+@pytest.mark.parametrize("root_kind", ("idea", "plan", "bundle", "reasoning", "target", "deepfetch", "acquisition", "companion"))
 @pytest.mark.parametrize("entry_path", ("initial", "resume"))
 def test_harness_maintains_role_scoped_reference_access(tmp_path, root_kind, entry_path):
     from meta_research.codex_runtime import CODEX_MODEL_REF
@@ -233,28 +233,3 @@ def test_admitted_target_driver_delivers_resources_through_real_harness(tmp_path
         assert Path(material["frozen_input_manifest_path"]).is_file()
     finally:
         runtime.close()
-
-
-def test_writing_real_adapter_grants_read_only_packaged_references(tmp_path):
-    from meta_research.writing_skill import CodexWritingSkillAdapter
-    from test_writing_skill_adapter import _request as writing_request, _draft_output, _SequenceRunner as WritingRunner
-    names = tuple(name for name in SHARED_NAMES if name != "cycle-work.md")
-    reading = _ReadingRunner(WritingRunner([_draft_output()]), names)
-
-    def runner(argv, prompt, timeout, environment=None):
-        developer = _developer(argv)
-        root = re.search(r"^Shared reference root: (.+)$", developer, re.MULTILINE).group(1)
-        permission = tomllib.loads(next(value for value in argv if value.startswith("permissions.writing_snapshot=")))["permissions"]["writing_snapshot"]
-        assert permission["filesystem"][root] == "read"
-        assert permission["filesystem"][argv[argv.index("--cd") + 1]] == "write"
-        assert sum(value == "read" for value in permission["filesystem"].values()) == 3
-        return reading(argv, prompt, timeout, environment)
-
-    adapter = CodexWritingSkillAdapter(tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
-    request = writing_request(adapter)
-    adapter.generate_draft(request)
-    assert len(reading.observed) == 1
-    assert "accepted_source_manifest=" in reading.calls[0][1]
-    source_root = tmp_path / "provider" / "writing-inputs" / request.snapshot["snapshot_hash"]
-    manifest = json.loads((source_root / "manifest.json").read_text(encoding="utf-8"))
-    assert Path(manifest["sources"][0]["path"]).read_bytes() == request.source_materials[0].content

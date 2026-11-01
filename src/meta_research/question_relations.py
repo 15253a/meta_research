@@ -5,6 +5,7 @@ import time
 from dataclasses import asdict
 from sqlalchemy import text
 
+from meta_research.research_content import _reading_quest
 from meta_research.owners.common import OwnerConflict, canonical_hash, new_ref
 from meta_research.root_capabilities import ROOT_AGENT_KINDS
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
@@ -129,10 +130,11 @@ def _read_scope(agent_runtime, context, *, expected_root_kind=None):
     return quest_ref
 
 
-def question_history_operations(*, research_graph, agent_runtime):
+def question_history_operations(*, research_graph, agent_runtime, human_collaboration=None):
     def read(context, arguments):
         try:
-            quest_ref = _read_scope(agent_runtime, context)
+            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
+                human_collaboration=human_collaboration)
             question = research_graph.query_question_history_by_ref(
                 arguments["question_ref"])
             if question is None or question.quest_ref != quest_ref:
@@ -150,8 +152,9 @@ def question_history_operations(*, research_graph, agent_runtime):
 
     return SemanticOperation(
         semantic_operation_id=QUESTION_HISTORY_OPERATION_ID, owning_module="research_graph",
-        description="Read one accepted Question of this Quest (including a question set aside) and a bounded page of historical Cycles. Each Cycle lists stage dispositions and exact readers. Pass query_revision with next_offset; changed scope or Owner facts require restarting at offset 0. Bundle readers resolve the stored AE closure/report, independent of current Sessions.",
+        description="Companion may select another HC-authorized source_quest_ref and carry it when following returned readers. Read one accepted Question of this Quest (including a question set aside) and a bounded page of historical Cycles. Each Cycle lists stage dispositions and exact readers. Pass query_revision with next_offset; changed scope or Owner facts require restarting at offset 0. Bundle readers resolve the stored AE closure/report, independent of current Sessions.",
         input_schema={"type": "object", "properties": {
+            "source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
             "question_ref": {"type": "string", "minLength": 1, "maxLength": 96},
             "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "offset": {"type":"integer","minimum":0},
@@ -161,11 +164,13 @@ def question_history_operations(*, research_graph, agent_runtime):
         handler=lambda context, arguments: read(context, arguments))
 
 
-def question_relation_operations(*, research_graph, agent_runtime):
+def question_relation_operations(*, research_graph, agent_runtime, human_collaboration=None):
     def invoke(action, context, arguments):
         try:
-            quest_ref = _read_scope(agent_runtime, context,
-                expected_root_kind=None if action == "read" else "reasoning")
+            arguments = dict(arguments)
+            quest_ref = (_reading_quest(agent_runtime, context, source_quest_ref=arguments.pop("source_quest_ref", None),
+                human_collaboration=human_collaboration) if action == "read" else
+                _read_scope(agent_runtime, context, expected_root_kind="reasoning"))
             if action == "record":
                 return research_graph.record_question_relation(quest_ref=quest_ref,
                     source_run_ref=context.run_ref, **arguments)
@@ -180,7 +185,7 @@ def question_relation_operations(*, research_graph, agent_runtime):
     ref = {"type": "string", "minLength": 1, "maxLength": 96}
     effect = {"type": "string", "minLength": 1, "maxLength": 128}
     schemas = (
-        {"type": "object", "properties": {"question_ref": ref, "offset": {"type": "integer", "minimum": 0},
+        {"type": "object", "properties": {"source_quest_ref": ref, "question_ref": ref, "offset": {"type": "integer", "minimum": 0},
          "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": False},
         {"type": "object", "properties": {"effect_id": effect, "left_question_ref": ref,
          "right_question_ref": ref, "notes": {"type": "string", "minLength": 1, "maxLength": 8000}},
@@ -188,7 +193,7 @@ def question_relation_operations(*, research_graph, agent_runtime):
         {"type": "object", "properties": {"effect_id": effect}, "required": ["effect_id"], "additionalProperties": False},
     )
     descriptions = (
-        "Read a page of related accepted Questions in this Quest, optionally focused on one Question. Continue with next_offset and query_revision; restart if the query or scoped Owner facts changed.",
+        "Companion may select another HC-authorized source_quest_ref. Read a page of related accepted Questions in this Quest, optionally focused on one Question. Continue with next_offset and query_revision; restart if the query or scoped Owner facts changed.",
         "Record a related/overlapping Question pair and a concise explanation, using exact accepted refs. The current Reasoning run supplies provenance; effect_id has stable retry identity.",
         "Reconcile a Question relation effect recorded by this same Reasoning run, including after a technical retry.",
     )

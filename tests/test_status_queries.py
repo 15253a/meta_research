@@ -110,7 +110,6 @@ def test_deferred_sections_do_not_query_assets_or_question_history(tmp_path, mon
         pytest.fail('a deferred section was queried')
     monkeypatch.setattr(runtime.owners.research_memory, 'query_asset_projection_inventory', unwanted)
     monkeypatch.setattr(runtime.owners.research_graph, 'query_question_tree', unwanted)
-    monkeypatch.setattr(runtime.writing, 'query_overview', unwanted)
     try:
         snapshot = runtime.projection.query_snapshot(include_assets=False, include_history=False)
         assert snapshot['research_assets']['loaded'] is False

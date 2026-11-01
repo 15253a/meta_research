@@ -1,7 +1,6 @@
 import { defineConfig } from "@playwright/test";
 
 const manualCreationFixedRaster = /@manual-creation-fixed-raster/;
-const writingFixedRaster = /@writing-fixed-raster/;
 
 export default defineConfig({
   testDir: "./tests",
@@ -15,15 +14,11 @@ export default defineConfig({
   projects: [
     {
       name: "functional",
-      grepInvert: [manualCreationFixedRaster, writingFixedRaster],
+      grepInvert: [manualCreationFixedRaster],
     },
     {
       name: "manual-creation-fixed-raster",
       grep: manualCreationFixedRaster,
-    },
-    {
-      name: "writing-fixed-raster",
-      grep: writingFixedRaster,
     },
   ],
   snapshotPathTemplate:

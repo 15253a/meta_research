@@ -1,0 +1,10 @@
+.companion-files { margin: 0 12px 8px; font-size: 12px; border: 1px solid #d5d6d1; border-radius: 7px; background: #fafbf7; }
+.companion-files summary { cursor: pointer; padding: 8px 10px; }
+.companion-files > div { padding: 0 10px 10px; max-height: 240px; overflow-y: auto; }
+.companion-files p { margin: 6px 0; line-height: 1.6; }
+.companion-files ul { padding: 0; list-style: none; }
+.companion-files li { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; }
+.companion-files a, .companion-files span { overflow-wrap: anywhere; min-width: 0; }
+.companion-files small { white-space: nowrap; color: #72776d; }
+.companion-files button { border: 1px solid #c9cfc1; background: #fff; border-radius: 4px; padding: 4px 8px; font: inherit; cursor: pointer; }
+.companion-files [role=alert] { color: #973e2a; }

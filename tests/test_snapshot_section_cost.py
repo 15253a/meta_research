@@ -20,7 +20,6 @@ def test_http_closed_panels_do_not_build_deferred_sections(tmp_path, monkeypatch
 
     monkeypatch.setattr(runtime.owners.research_memory, 'query_asset_projection_inventory', forbidden)
     monkeypatch.setattr(runtime.owners.research_graph, 'query_question_tree', forbidden)
-    monkeypatch.setattr(runtime.writing, 'query_overview', forbidden)
     client, _ = _authenticated_client(runtime)
     try:
         response = client.get('/api/v1/snapshot?include_assets=false&include_history=false')

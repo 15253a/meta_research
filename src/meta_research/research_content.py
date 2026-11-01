@@ -21,6 +21,24 @@ def _quest(agent_runtime, context):
     return scope["quest_ref"]
 
 
+def _reading_quest(agent_runtime, context, *, source_quest_ref=None, human_collaboration=None):
+    """Page selection is context, not the limit of an authorized Companion read.
+
+    Reuse the existing receipt-bound HC authority on each cross-Quest read.
+    This function is deliberately separate from the scope used for effects.
+    """
+    current = _quest(agent_runtime, context)
+    if source_quest_ref is None or source_quest_ref == current:
+        return current
+    if context.root_kind != "companion" or human_collaboration is None:
+        raise OwnerConflict("content_quest_not_authorized")
+    authorization = human_collaboration.query_broad_research_authorization(source_quest_ref)
+    if (authorization is None or authorization.get("quest_ref") != source_quest_ref
+            or authorization.get("is_current") is not True or authorization.get("decision") != "granted"):
+        raise OwnerConflict("content_quest_not_authorized")
+    return source_quest_ref
+
+
 def read_content(graph, memory, *, quest_ref, source_ref, version_ref, **arguments):
     page = _read_content(graph, memory, quest_ref=quest_ref,
                          source_ref=source_ref, version_ref=version_ref, **arguments)
@@ -168,6 +186,30 @@ def read_stage_content(memory, *, quest_ref, source_ref, version_ref):
     return None
 
 
+def discover_authorized_quests(graph, human_collaboration, *, query="", offset=0, limit=12, query_revision=None):
+    """Page the existing HC authority; no assistant-owned permission records."""
+    with graph._database.read_snapshot() as connection:
+        rows = connection.execute(text(
+            "SELECT a.quest_ref,a.authorization_ref,a.revision,a.decision,q.goal_json "
+            "FROM hc_capability_authorizations a JOIN rg_quests q ON q.quest_ref=a.quest_ref "
+            "WHERE a.authorization_kind='broad_research' AND a.is_current=1 "
+            "AND a.decision='granted' AND (:query='' OR instr(lower(q.goal_json),lower(:query))>0) "
+            "ORDER BY a.quest_ref"), {"query": query}).all()
+        revision = bind_page({"entry": "authorized_quests", "query": query, "limit": limit},
+            [[row.quest_ref, row.authorization_ref, row.revision] for row in rows],
+            offset=offset, query_revision=query_revision)
+        items = []
+        for row in rows[offset:offset + limit]:
+            authority = human_collaboration.query_broad_research_authorization(row.quest_ref)
+            if authority is None or authority["authorization_ref"] != row.authorization_ref or not authority["is_current"]:
+                raise OwnerConflict("research_query_changed")
+            items.append({"quest_ref": row.quest_ref, "goal": json.loads(row.goal_json).get("goal", ""),
+                "reader": {"operation": "research_graph.questions.page", "args": {"source_quest_ref": row.quest_ref}}})
+    next_offset = offset + limit if offset + limit < len(rows) else None
+    return {"items": items, "offset": offset, "next_offset": next_offset, "query_revision": revision,
+        **page_state(items, next_offset, offset=offset, query=query)}
+
+
 def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12, query_revision=None):
     if type(offset)is not int or offset<0 or type(limit)is not int or not 1<=limit<=100:
         raise OwnerConflict("research_library_page_invalid")
@@ -257,6 +299,8 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
     def invoke(context, arguments):
         try:
             if context.phase == "creation_materials":
+                if "source_quest_ref" in arguments:
+                    raise OwnerConflict("content_quest_not_authorized")
                 operation = human_collaboration._creation_material_operation(context)
                 operation.authorize(context)
                 work = operation.work
@@ -278,19 +322,23 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
                 if version not in {item["binding"]["version_ref"] for item in basis["sources"] if item["binding"] is not None}:
                     raise OwnerConflict("content_source_unbound")
                 return research_memory.read_asset_content_page(version, **page_arguments)
-            quest_ref=_quest(agent_runtime,context)
+            arguments = dict(arguments)
+            quest_ref = _reading_quest(agent_runtime, context,
+                source_quest_ref=arguments.pop("source_quest_ref", None), human_collaboration=human_collaboration)
             return read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,page_cache=page_cache,**arguments)
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
     operations=[SemanticOperation(semantic_operation_id="research_memory.content.read",owning_module="research_memory",
-        description="Read an exact authorized source using its returned source_ref/version_ref. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
+        description="Read an exact authorized source using its returned source_ref/version_ref. Companion may explicitly select source_quest_ref outside the page selection when current HC authority grants it; other roots retain their current Quest scope. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
         return_description="Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Asset file pages use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. A hash names complete digital content, not a physical resource or its verified condition. Preserve returned exact source bindings and readers.",
         error_descriptions={
             "content_version_unbound": "This exact source/version is not bound within the authorized scope; this does not mean all research content is absent.",
             "content_source_unbound": "The supplied source has no readable binding in the current scope.",
+            "content_quest_not_authorized": "The requested Quest is not currently authorized for this Companion read; page visibility grants no permission.",
             "content_receipt_invalid": "The stored stage source does not match its accepted receipt; do not substitute latest content.",
         },
         input_schema={"type":"object","properties":{
+            "source_quest_ref":{"type":"string","minLength":1,"maxLength":256},
             "source_ref":{"type":"string","minLength":1,"maxLength":1024},
             "version_ref":{"type":"string","minLength":1,"maxLength":1024},
             "entry_path":{"type":"string","minLength":1,"maxLength":4096},
@@ -299,14 +347,25 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
         output_schema={"type":"object"},handler=invoke)]
     for name,reader in (("research_graph.questions.page",discover_questions),("research_memory.literature.page",discover_literature)):
         def discover(context,arguments,reader=reader):
-            try:return reader(research_graph,research_memory,quest_ref=_quest(agent_runtime,context),**arguments)
+            try:
+                arguments = dict(arguments)
+                entry_kind = arguments.pop("entry_kind", "questions")
+                if entry_kind == "quests":
+                    _quest(agent_runtime, context)
+                    if context.root_kind != "companion" or human_collaboration is None or "source_quest_ref" in arguments:
+                        raise OwnerConflict("content_quest_not_authorized")
+                    return discover_authorized_quests(research_graph, human_collaboration, **arguments)
+                quest_ref = _reading_quest(agent_runtime, context,
+                    source_quest_ref=arguments.pop("source_quest_ref", None), human_collaboration=human_collaboration)
+                return reader(research_graph, research_memory, quest_ref=quest_ref, **arguments)
             except OwnerConflict as error:raise SemanticMcpError(error.code) from error
-        properties={"query":{"type":"string","maxLength":1024},"offset":{"type":"integer","minimum":0},
+        properties={"source_quest_ref":{"type":"string","minLength":1,"maxLength":256}, "query":{"type":"string","maxLength":1024},"offset":{"type":"integer","minimum":0},
                     "limit":{"type":"integer","minimum":1,"maximum":100},
                     "query_revision":{"type":"string","pattern":"^[0-9a-f]{64}$"}}
+        if reader is discover_questions:properties["entry_kind"]={"type":"string","enum":["questions","quests"]}
         if reader is discover_literature:properties["record_ref"]={"type":"string","minLength":1,"maxLength":1024}
         operations.append(SemanticOperation(semantic_operation_id=name,owning_module=name.split('.')[0],
-            description="Discover accepted sources in the current Quest by research clues. Follow each reader with research_memory.content.read. Continue next_offset with the returned query_revision and unchanged filters/limit; research_query_changed requires restarting at offset=0. An empty page_pending is an unfinished scan, not no_match. Literature also links accepted Question-specific judgments to their exact content.",
+            description="Discover accepted sources by research clues. For questions.page, Companion can first select entry_kind=quests to page current HC-authorized Quest identities. Companion may set source_quest_ref for another currently HC-authorized Quest; other roots retain the current Quest. Follow each reader with research_memory.content.read. Continue next_offset with the returned query_revision and unchanged filters/limit; research_query_changed requires restarting at offset=0. An empty page_pending is an unfinished scan, not no_match. Literature also links accepted Question-specific judgments to their exact content.",
             input_schema={"type":"object","properties":properties,"additionalProperties":False},output_schema={"type":"object"},handler=discover))
     return (*operations, *asset_lifecycle_operations(
         research_graph, research_memory, agent_runtime, target_run_agent, human_collaboration

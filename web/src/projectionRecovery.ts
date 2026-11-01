@@ -123,7 +123,7 @@ export function useProjectionRecovery(snapshot: PublicSnapshot | null,
       && snapshot.query_warnings?.some(warning => warning.section === `${stage}_stage`);
     const loaded = matchesScope && !failedStage && (!sections.includeAssets || snapshot.research_assets.loaded !== false)
       && (!sections.includeHistory || (snapshot.question_tree.loaded !== false
-        && snapshot.question_tree.status === "ready" && snapshot.writing.loaded !== false));
+        && snapshot.question_tree.status === "ready" && snapshot.human_collaboration?.companion.loaded !== false));
     if (loaded) acknowledged.current = { scope, revision: snapshot.revision };
     const behind = !loaded || snapshot.revision < target.current.revision;
     setUpdating(behind);

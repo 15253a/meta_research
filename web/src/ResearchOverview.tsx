@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import type { PublicSnapshot, WritingReportView } from "./api";
+import type { PublicSnapshot } from "./api";
 import "./research-overview.css";
 import { SpectrumStages, spectrumStage } from "./Spectrum";
 import { StageRootSessions, RootConversations, useRootConversations, rootSessionStatus, type RootConversationsModel } from "./RootConversations";
@@ -174,16 +174,6 @@ function scopedOverview(snapshot: PublicSnapshot, overview?: ResearchOverviewDat
     && (!foreground || (overview?.cycle_ref === foreground.cycle_ref && overview?.question_ref === foreground.question_ref)) ? overview : null;
 }
 
-export function acceptedWritingRuns(snapshot: PublicSnapshot, questRef: string | null): WritingReportView[] {
-  const unique = new Map<string, WritingReportView>();
-  for (const item of snapshot.writing.runs) {
-    if (!questRef || item.snapshot.quest_ref !== questRef || !item.deliverable.version_ref) continue;
-    if (item.deliverable.acceptance_status !== "accepted" && item.deliverable.status !== "accepted") continue;
-    unique.set(item.run?.run_ref ?? item.intent_id, item);
-  }
-  return [...unique.values()];
-}
-
 function latestFinding(items: OverviewFinding[]) {
   // The authenticated projection returns newest-first, retaining its source order.
   return items.find(item => typeof item.text === "string" && item.text.trim());
@@ -222,16 +212,6 @@ export function cycleRuntime(snapshot: PublicSnapshot): { state: ResearchRuntime
   return { state: "idle", label: `${stage} · 暂无新的执行状态`, running: false };
 }
 
-function writingProgress(snapshot: PublicSnapshot, questRef: string | null): string | null {
-  const runs = snapshot.writing.runs.filter(item => questRef && item.snapshot.quest_ref === questRef);
-  const active = runs.filter(item => item.status === "running" && item.run?.status === "active").length;
-  if (active) return `${active} 项写作正在进行`;
-  const blocked = runs.filter(item => item.status === "blocked" || item.run?.status === "blocked").length;
-  if (blocked) return `${blocked} 项写作等待继续条件`;
-  const paused = runs.filter(item => item.status === "paused" || item.run?.status === "paused").length;
-  return paused ? `${paused} 项写作已暂停` : null;
-}
-
 type OverviewProps = {
   snapshot: PublicSnapshot;
   overview?: ResearchOverviewData | null;
@@ -260,8 +240,6 @@ export function ResearchOverview({ snapshot, overview, error, onRetry, onOpenWri
   const milestoneCopy = latestMilestone
     ? `${cycleOrdinalLabel(latestMilestone.cycle.ordinal)}已形成${stageNames[latestMilestone.stage]}结果`
     : null;
-  const writing = acceptedWritingRuns(snapshot, overviewQuestRef(snapshot));
-  const writingState = writingProgress(snapshot, overviewQuestRef(snapshot));
   const currentStage = spectrumStage(snapshot.research_control.foreground?.stage);
   const runtime = currentStage ? currentStageStatus(currentStage, snapshot, rootConversations) : cycleRuntime(snapshot);
   const motion = useResearchMotion<HTMLElement>(connected && runtime.state === "running");
@@ -274,7 +252,7 @@ export function ResearchOverview({ snapshot, overview, error, onRetry, onOpenWri
       <button className="research-overview-item" onClick={() => setDetail("quest")}><span>研究进展 <i aria-hidden="true">↗</i></span><strong>{quest?.text ?? milestoneCopy ?? empty}</strong><small>{quest ? "整个研究 · 最近进展" : milestoneCopy ? "阶段产物已形成 · 尚无研究结论" : "整个研究 · 最近进展"}</small></button>
       <button className="research-overview-item" onClick={() => setDetail("question")}><span>本题发现 <i aria-hidden="true">↗</i></span><strong>{question?.text ?? empty}</strong><small>当前问题 · 已接纳的研究判断</small></button>
       <button className="research-overview-item research-overview-cycle" onClick={() => setDetail("cycle")}><span><i className={`research-overview-dot${motion.active ? " is-running" : ""}`} aria-hidden="true" />{cycleOrdinalLabel(data?.cycle_ordinal)} <i aria-hidden="true">↗</i></span><strong>{runtimeLabel}</strong><small className="research-overview-finding">{cycle?.text ?? (error || data?.status === "limited" ? "本轮发现暂不可确认" : data ? "本轮发现尚未形成" : "本轮发现待载入")}</small></button>
-      <button className="research-overview-item" onClick={onOpenWriting}><span>写作产物 <i aria-hidden="true">↗</i></span><strong>{writing.length ? `${writing.length} 份写作产物` : "暂无写作产物"}</strong><small>{writingState ? `${connected ? "" : "上次确认："}${writingState}` : writing.length ? writing.at(-1)?.intent.title : "查看报告、论文与演示稿"}</small></button>
+      <button className="research-overview-item" onClick={onOpenWriting}><span>研究写作 <i aria-hidden="true">↗</i></span><strong>报告、论文与演示稿</strong><small>在研究助手中制作和接续稿件</small></button>
     </section>
     {error && <p className="research-overview-availability" role="status">{data ? "发现更新暂不可用，保留已收到的结果。" : "研究发现暂不可用；对话与日志仍可阅读。"}{onRetry && <button onClick={onRetry}>重试</button>}</p>}
     {detail && <OverviewDialog title={labels[detail]} subtitle={detail === "quest" ? "整个研究的已接纳进展" : detail === "question" ? "当前问题的已接纳发现" : `${cycleOrdinalLabel(data?.cycle_ordinal)} · ${runtimeLabel}`} onClose={() => setDetail(null)}>

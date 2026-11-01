@@ -22,6 +22,13 @@ async function workspace(page: Page, busy = false) {
     const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     if (url.pathname === "/api/v1/snapshot") return json(snapshot);
     if (url.pathname === "/api/v1/preferences") return json({ output_language: "zh" });
+    if (url.pathname === "/api/v1/companion/files") {
+      expect(url.searchParams.get("scope_ref")).toBe(companion.scope_ref);
+      const offset = Number(url.searchParams.get("offset"));
+      const path = offset === 0 ? "reports/draft.docx" : "reports/deck.pptx";
+      return json({ files: [{ workspace_ref: "workspace-companion", path, sha256: "a".repeat(64), bytes: 1234, readable: true,
+        download_url: `/api/v1/companion/files/content?scope_ref=${encodeURIComponent(companion.scope_ref)}&workspace_ref=workspace-companion&path=${encodeURIComponent(path)}&sha256=${"a".repeat(64)}` }], next_offset: offset === 0 ? 50 : null });
+    }
     if (url.pathname === "/api/v1/companion/sessions/new") {
       writes.push({ path: url.pathname, body: request.postDataJSON() });
       expect(request.headers()["idempotency-key"]).toBeTruthy();
@@ -155,4 +162,21 @@ test("busy session switching explains queued work and retains the command withou
   await expect(assistant).toContainText("还有消息在执行或排队；等待结束后再输入 /new。");
   await expect(assistant.getByLabel("给研究助手发消息")).toHaveValue("/new");
   expect(state.writes).toEqual([]);
+});
+
+
+test("assistant files stay available after new conversation and paginate exact downloads", async ({ page }) => {
+  await workspace(page);
+  await page.goto("http://127.0.0.1:18768/?workspace=1&companion=1");
+  const assistant = page.getByRole("complementary", { name: "研究助手", exact: true });
+  await assistant.getByText("助手文件", { exact: true }).click();
+  const draft = assistant.getByRole("link", { name: "reports/draft.docx" });
+  await expect(draft).toHaveAttribute("href", /sha256=a{64}$/);
+  await assistant.getByRole("button", { name: "更多文件" }).click();
+  await expect(assistant.getByRole("link", { name: "reports/deck.pptx" })).toBeVisible();
+  await expect(assistant.getByRole("button", { name: "更多文件" })).toHaveCount(0);
+  await assistant.getByLabel("给研究助手发消息").fill("/new");
+  await assistant.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(draft).toBeVisible();
+  await expect(draft).toHaveAttribute("download", "");
 });
