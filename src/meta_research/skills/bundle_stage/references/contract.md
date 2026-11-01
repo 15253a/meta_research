@@ -90,6 +90,8 @@ AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据�
 
 ## Bundle 收口
 
+普通 Literature 登记、用途关联及 Target 阅读判断索引尚待 #270 接通。接口缺失不是无候选：BundleReport 如实保留未完成的整理步骤、已有文献来源与阅读判断及具体阻塞，不能以空候选或阶段交接冒充文献整理完成。
+
 | disposition | 依据 |
 | --- | --- |
 | `realized` | 已安排 Brief 的所需 cells 有 current accepted TargetCommit，结果方向不限；不据此宣布 Plan 中未安排的 gap 已履行。 |

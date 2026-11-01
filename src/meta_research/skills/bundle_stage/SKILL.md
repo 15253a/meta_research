@@ -55,7 +55,7 @@ Bundle 统一保留并筛选 Target 发现的建题线索。跨 Target 合并同
 
 Target 正式接纳后，按[资源整理与正式登记](../references/materials-and-custody.md#资源整理与正式登记)读取候选、核验真实工作与精确内容，并整理值得复用的 Dataset／Environment／Literature。Target 过程中发现、取得或阅读的文献同样进入整理范围，保留外部文献来源、本次阅读判断与研究用途。
 
-可委派明确范围的整理，根在本轮交接前查回必要记录、用途关系及适用的精确内容。完成条件：值得复用且当前可登记的候选已登记并读回；空候选或无保留价值时说明判断，不制造资源记录；未接纳、阻塞和未完成步骤按实际状态说明。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物按[交接与工作区收尾](../references/materials-and-custody.md#交接与工作区收尾)处理。现成资源的直接登记及适配关系沿[研究导航](../references/research-navigation.md)的 Environment 分支判断。
+可委派明确范围的整理，根在本轮交接前查回必要记录、用途关系及适用的精确内容。完成条件：值得复用且当前可登记的候选已登记并读回；空候选或无保留价值时说明判断，不制造资源记录；未接纳、阻塞和未完成步骤按实际状态说明。普通 Literature 登记、用途关联及 Target 阅读判断索引尚待 #270 接通；接口缺失不是无候选，须保留具体受阻步骤、已有文献来源与阅读判断及其影响，不能据此声称文献整理已经完成。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物按[交接与工作区收尾](../references/materials-and-custody.md#交接与工作区收尾)处理。现成资源的直接登记及适配关系沿[研究导航](../references/research-navigation.md)的 Environment 分支判断。
 
 ## 4. 复核与收口
 
