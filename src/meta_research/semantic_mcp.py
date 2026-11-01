@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Callable, Literal
 
 from meta_research.human_guidance import FrozenGuidanceBinding
@@ -42,7 +42,12 @@ ROOT_AGENT_ENVIRONMENT_OPERATION_IDS = (
     "research_graph.environments.reference",
     "research_graph.environments.reference.reconcile",
 )
+TOOL_DISCOVERY_OPERATION_IDS = (
+    "tools.catalog.page",
+    "tools.contracts.read",
+)
 ROOT_AGENT_COMMON_OPERATION_IDS = (
+    *TOOL_DISCOVERY_OPERATION_IDS,
     *RUNTIME_MATERIAL_OPERATION_IDS,
     "research_workspace.discover",
     "research_workspace.read",
@@ -91,6 +96,8 @@ class SemanticCallContext:
     phase: str
     operation_id: str
     guidance_binding: FrozenGuidanceBinding | None = None
+    authorized_operation_ids: tuple[str, ...] = ()
+    channel_grant_ref: str = ""
 
     def effect_key(self, effect_id: str) -> str:
         if not effect_id or len(effect_id) > 128:
@@ -179,6 +186,9 @@ class SemanticOperation:
     access_mode: Literal["read", "effect", "reconcile", "verify"] = "read"
     reconciliation_operation_id: str | None = None
     operation_contract_version: str = "v1"
+    unavailable_reason: Callable[[SemanticCallContext], str | None] | None = None
+    return_description: str = ""
+    error_descriptions: dict[str, str] = field(default_factory=dict)
 
     def tool(self) -> dict[str, object]:
         return {
@@ -199,6 +209,9 @@ class SemanticOperation:
             "output_schema_hash": canonical_hash(self.output_schema),
             "reconciliation_operation_id": self.reconciliation_operation_id,
             "discovered_tool_name": self.semantic_operation_id,
+            "contract_documentation_hash": canonical_hash({
+                "description": self.description, "returns": self.return_description,
+                "errors": self.error_descriptions}),
         }
 
 
@@ -262,7 +275,8 @@ class SemanticMcpGateway:
     def __init__(self, operations: tuple[SemanticOperation, ...]) -> None:
         if not operations:
             raise SemanticMcpError("semantic_operation_catalog_empty")
-        ordered = tuple(sorted(operations, key=lambda item: item.semantic_operation_id))
+        ordered = tuple(sorted((*operations, *self._discovery_operations()),
+                               key=lambda item: item.semantic_operation_id))
         if len({item.semantic_operation_id for item in ordered}) != len(ordered):
             raise SemanticMcpError("semantic_operation_id_duplicate")
         self._operations = {item.semantic_operation_id: item for item in ordered}
@@ -383,7 +397,8 @@ class SemanticMcpGateway:
         self._grants.pop(_token_hash(token), None)
 
     def dispatch(
-        self, token: str | None, message: object
+        self, token: str | None, message: object, *,
+        allowed_operation_ids: tuple[str, ...] | None = None,
     ) -> tuple[int, dict[str, object] | None]:
         grant = self._grants.get(_token_hash(token or ""))
         if grant is None:
@@ -401,6 +416,14 @@ class SemanticMcpGateway:
         ):
             return 400, _jsonrpc_error(request_id, -32600, "invalid_request")
         method = message["method"]
+        operation_ids = tuple(item for item in grant.operation_ids
+                              if allowed_operation_ids is None or item in allowed_operation_ids)
+        context = SemanticCallContext(
+            run_ref=grant.run_ref, attempt_ref=grant.attempt_ref,
+            root_session_ref=grant.root_session_ref, fence_ref=grant.fence_ref,
+            capability_binding_hash=grant.capability_binding_hash, root_kind=grant.root_kind,
+            phase=grant.phase, operation_id="", guidance_binding=grant.guidance_binding,
+            authorized_operation_ids=operation_ids, channel_grant_ref=grant.grant_ref)
         if method == "notifications/initialized":
             return 202, None
         if method == "initialize":
@@ -418,7 +441,8 @@ class SemanticMcpGateway:
                         "通过本服务的高层语义操作读取或改变 Owner 权威状态；其他研究工作按当前授予的原生工具和阶段规则进行。"
                         "以对应 Owner 验证的接纳事实与真实回执确认结果；工具可见或普通执行成功不扩大授权，也不替代领域接纳。"
                         "工具调用失败以 isError=true 和 structuredContent.code 为准，可选 details 保留具体诊断与原操作对账信息；正常 Owner status 仍是业务状态。"
-                        "capability_unavailable 仅表示操作未注册或未获授；content_version_unbound 表示本次精确版本在当前范围未绑定，不表示全库不存在。"
+                        "按需使用 tools.catalog.page 与 tools.contracts.read；已知 reader 可直接调用，无需先发现。"
+                        "capability_unavailable 表示操作未注册、未获授或当前服务不可用；content_version_unbound 表示本次精确版本在当前范围未绑定，不表示全库不存在。"
                     ),
                 },
             }
@@ -430,7 +454,8 @@ class SemanticMcpGateway:
                 "id": request_id,
                 "result": {
                     "tools": [
-                        self._operations[item].tool() for item in grant.operation_ids
+                        self._operations[item].tool() for item in operation_ids
+                        if self._unavailable_reason(item, context) is None
                     ]
                 },
             }
@@ -444,12 +469,16 @@ class SemanticMcpGateway:
         if not isinstance(arguments, dict):
             return 200, _jsonrpc_error(request_id, -32602, "invalid_params")
         operation = self._operations.get(operation_id)
-        if operation is None or operation_id not in grant.operation_ids:
+        if operation is None or operation_id not in operation_ids:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": _tool_error("capability_unavailable"),
             }
+        unavailable = self._unavailable_reason(operation_id, context)
+        if unavailable is not None:
+            return 200, {"jsonrpc": "2.0", "id": request_id,
+                         "result": _tool_error("capability_unavailable", {"reason": unavailable})}
         if not _matches_schema(
             arguments, operation.input_schema
         ) and not _matches_bound_target_human_request(
@@ -461,17 +490,7 @@ class SemanticMcpGateway:
                 "result": _tool_error("semantic_input_schema_mismatch"),
             }
         try:
-            context = SemanticCallContext(
-                run_ref=grant.run_ref,
-                attempt_ref=grant.attempt_ref,
-                root_session_ref=grant.root_session_ref,
-                fence_ref=grant.fence_ref,
-                capability_binding_hash=grant.capability_binding_hash,
-                root_kind=grant.root_kind,
-                phase=grant.phase,
-                operation_id=operation_id,
-                guidance_binding=grant.guidance_binding,
-            )
+            context = replace(context, operation_id=operation_id)
             result = operation.handler(context, arguments)
         except SemanticMcpError as error:
             return 200, {
@@ -504,6 +523,104 @@ class SemanticMcpGateway:
             },
         }
 
+    def _unavailable_reason(self, operation_id: str, context: SemanticCallContext) -> str | None:
+        operation = self._operations.get(operation_id)
+        if operation is None:
+            return "not_registered"
+        if operation_id not in context.authorized_operation_ids:
+            return "not_granted"
+        if operation.unavailable_reason is not None:
+            try:
+                return operation.unavailable_reason(replace(context, operation_id=operation_id))
+            except Exception:
+                return "availability_check_failed"
+        return None
+
+    def _discovery_operations(self) -> tuple[SemanticOperation, ...]:
+        return (
+            SemanticOperation(
+                "tools.catalog.page", "harness",
+                "Page currently granted, available semantic operations. Use query or owning_module to narrow the list. "
+                "Continue using next_offset and catalog_hash from this page; tool_catalog_changed requires restarting at offset 0. "
+                "Discovery grants no permission and is never required before a known reader call.",
+                self._catalog_page,
+                {"type": "object", "additionalProperties": False, "properties": {
+                    "offset": {"type": "integer", "minimum": 0, "default": 0,
+                               "description": "Entry offset. A nonzero offset requires this filtered page's catalog_hash."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20,
+                              "description": "Maximum operations returned per page."},
+                    "query": {"type": "string", "maxLength": 1024, "default": "",
+                              "description": "Case-insensitive substring of operation id, owner or description."},
+                    "owning_module": {"type": "string", "minLength": 1, "maxLength": 256,
+                                      "description": "Exact registered owning_module; omitted means all granted owners."},
+                    "catalog_hash": {"type": "string", "minLength": 64, "maxLength": 64,
+                                     "description": "Hash from the preceding page, bound to this grant, filters and available contracts; never an authorization."},
+                }},
+                {"type": "object", "required": ["items", "offset", "next_offset", "total", "catalog_hash"],
+                 "properties": {"items": {"type": "array", "items": {"type": "object"}},
+                    "offset": {"type": "integer"}, "next_offset": {"type": ["integer", "null"]},
+                    "total": {"type": "integer"}, "catalog_hash": {"type": "string"}}},
+                return_description="items are compact summaries ordered by operation_id. next_offset=null ends this filtered catalog; total counts available operations only.",
+                error_descriptions={"tool_catalog_changed": "A continuation omitted its hash or the grant, filters or available contracts changed. Restart from offset 0."}),
+            SemanticOperation(
+                "tools.contracts.read", "harness",
+                "Read the live schema, return and error contract for one exact currently granted operation_id. "
+                "Unknown, ungranted or unavailable operations return capability_unavailable with a reason. "
+                "The contract is descriptive; tools/call rechecks current authority and service availability.",
+                self._contract_read,
+                {"type": "object", "additionalProperties": False, "required": ["operation_id"],
+                 "properties": {"operation_id": {"type": "string", "minLength": 1, "maxLength": 256}}},
+                {"type": "object", "required": ["operation_id", "name", "inputSchema", "outputSchema", "returns", "errors"]},
+                return_description="Returns the same live tool schema and description as tools/list plus operation ownership, mode, reconciliation, return and error documentation.",
+                error_descriptions={"capability_unavailable": "details.reason distinguishes not_registered, not_granted and the current service's unavailable reason; no hidden contract is returned."}),
+        )
+
+    def _catalog_page(self, context: SemanticCallContext, arguments: dict[str, object]) -> dict[str, object]:
+        query = str(arguments.get("query", "")).casefold()
+        module = arguments.get("owning_module")
+        operations = [operation for name, operation in self._operations.items()
+                      if self._unavailable_reason(name, context) is None
+                      and (module is None or operation.owning_module == module)
+                      and query in (name + " " + operation.owning_module + " " + operation.description).casefold()]
+        catalog_hash = canonical_hash({"grant": context.channel_grant_ref, "query": query, "owning_module": module,
+            "operations": [{**operation.binding(), "description": operation.description,
+                            "returns": operation.return_description, "errors": operation.error_descriptions}
+                           for operation in operations]})
+        offset, limit = int(arguments.get("offset", 0)), int(arguments.get("limit", 20))
+        if offset < 0 or not 1 <= limit <= 100:
+            raise SemanticMcpError("semantic_input_schema_mismatch")
+        expected = arguments.get("catalog_hash")
+        if (offset > 0 and expected is None) or (expected is not None and expected != catalog_hash):
+            raise SemanticMcpError("tool_catalog_changed", {"restart_offset": 0})
+        return {"items": [{"operation_id": operation.semantic_operation_id,
+                           "owning_module": operation.owning_module,
+                           "access_mode": operation.access_mode,
+                           "summary": operation.description.split(". ", 1)[0]}
+                          for operation in operations[offset:offset + limit]],
+                "offset": offset, "next_offset": offset + limit if offset + limit < len(operations) else None,
+                "total": len(operations), "catalog_hash": catalog_hash}
+
+    def _contract_read(self, context: SemanticCallContext, arguments: dict[str, object]) -> dict[str, object]:
+        operation_id = str(arguments["operation_id"])
+        reason = self._unavailable_reason(operation_id, context)
+        if reason is not None:
+            raise SemanticMcpError("capability_unavailable", {"reason": reason})
+        operation = self._operations[operation_id]
+        return {**operation.tool(), "operation_id": operation_id,
+                "owning_module": operation.owning_module, "access_mode": operation.access_mode,
+                "operation_contract_version": operation.operation_contract_version,
+                "reconciliation_operation_id": operation.reconciliation_operation_id,
+                "returns": "Success: isError=false; structuredContent matches outputSchema. content contains the same JSON. "
+                           "Operation-specific pagination, units and acceptance semantics are in description and schemas. "
+                           + operation.return_description,
+                "errors": {"description": "Failure: isError=true with structuredContent.code and optional details. "
+                           "Owner codes/details remain intact; normal Owner status is business state, not a transport failure. "
+                           "A revoked or stale channel returns HTTP 401 mcp_channel_authentication_required. "
+                           "For an uncertain effect result, use reconciliation_operation_id with the original effect identity.",
+                           "operation_codes": operation.error_descriptions,
+                           "gateway_codes": ["capability_unavailable", "semantic_input_schema_mismatch",
+                                             "semantic_output_schema_mismatch", "semantic_operation_failed"]}}
+
     def _validate_catalog(
         self, operations: tuple[SemanticOperation, ...]
     ) -> None:
@@ -512,6 +629,11 @@ class SemanticMcpGateway:
                 not operation.semantic_operation_id
                 or not operation.owning_module
                 or not operation.description
+                or not isinstance(operation.return_description, str)
+                or not isinstance(operation.error_descriptions, dict)
+                or any(not isinstance(code, str) or not code or not isinstance(description, str)
+                       or not description for code, description in operation.error_descriptions.items())
+                or (operation.unavailable_reason is not None and not callable(operation.unavailable_reason))
                 or not _valid_schema_contract(operation.input_schema)
                 or not _valid_schema_contract(operation.output_schema)
                 or operation.input_schema.get("type") != "object"

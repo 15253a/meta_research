@@ -254,7 +254,13 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
     operations=[SemanticOperation(semantic_operation_id="research_memory.content.read",owning_module="research_memory",
-        description="Read an exact source found in this Quest's six research entries. Pass the returned source_ref/version_ref. Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Asset file pages use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. content_version_unbound rejects this exact version binding within the authorized scope, not all research content. A hash names complete digital content, not a physical resource or its verified condition. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
+        description="Read an exact authorized source using its returned source_ref/version_ref. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
+        return_description="Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Asset file pages use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. A hash names complete digital content, not a physical resource or its verified condition. Preserve returned exact source bindings and readers.",
+        error_descriptions={
+            "content_version_unbound": "This exact source/version is not bound within the authorized scope; this does not mean all research content is absent.",
+            "content_source_unbound": "The supplied source has no readable binding in the current scope.",
+            "content_receipt_invalid": "The stored stage source does not match its accepted receipt; do not substitute latest content.",
+        },
         input_schema={"type":"object","properties":{
             "source_ref":{"type":"string","minLength":1,"maxLength":1024},
             "version_ref":{"type":"string","minLength":1,"maxLength":1024},

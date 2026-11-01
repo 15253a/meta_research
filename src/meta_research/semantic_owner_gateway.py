@@ -1101,7 +1101,9 @@ def _root_agent_acquisition_operations(
             description=(
                 "Request one bounded full-text batch through the Quest's existing "
                 "Acquisition Session. Provider, route, Session and private storage "
-                "are selected by the server."
+                "are selected by the server. New or waiting batches require a configured Provider; "
+                "otherwise acquisition_provider_unavailable is returned. An already recorded result "
+                "can still be replayed without a Provider; reconcile never invokes one."
             ),
             input_schema=_root_acquisition_request_input_schema(),
             output_schema=_root_acquisition_output_schema(),

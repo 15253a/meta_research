@@ -73,6 +73,10 @@ HC 保存协作原记录与流程，RG 组织研究关联。HC、系统工作和
 
 ## 当前获授工具与准确入口
 
+需要寻找操作时，调用 `tools.catalog.page`，可按 `query` 或 `owning_module` 筛选当前根获授且当前可用的操作摘要。按返回的 `next_offset` 与同一 `catalog_hash` 续页，保留原筛选；`next_offset=null` 才表示本次目录已读完。收到 `tool_catalog_changed` 时从首条重新读取，目录不冻结后续许可。
+
+需要核对参数、返回或错误时，以准确 `operation_id` 调 `tools.contracts.read`，读取现行 `inputSchema`、`outputSchema`、返回说明及错误合同。目录、合同与 `tools/list`、`tools/call` 使用同一注册及当前授权；不存在的、未接通的、被禁用的或当前未获授的操作按真实原因反馈，不能当作合法空结果。已知准确 operation、参数与 reader 可直接调用，无须先发现或重复读取合同。原生文件、shell、子 Agent 和外部 MCP 沿宿主实际提供的工具合同使用。
+
 先读当前研究交接。当前 Quest 内可跨 Question、跨 Cycle 检索已接纳材料，包括暂放问题的历史；按实际研究需要选择入口，不要求每轮遍历全部入口。Question 用 research_graph.questions.page 从名称/关键词发现，再用 question_history.read 分页看已有认识；Baseline 用 research_graph.baselines.page/read 展开方法、Variant、Run 和评价；Dataset 用 research_graph.datasets.page/read 查含义、版本与派生关系；Environment 用 research_graph.environments.page/read 查环境、设备设施及现实资源的含义、来源、条件和精确内容引用；Literature 用 research_memory.literature.page 查原文和不同 Question 的阅读判断；人类输入用 human_request.read 查看请求、回复与主动提交。每页沿 next_offset/next_cursor 继续。reader 含 operation 时调用其指明的工具及参数，如 history_reader／formal_results reader；共用正文 reader 的 source_ref／version_ref 才交给 research_memory.content.read，并沿返回的字节偏移读取精确原件。大文件与 linked_local 直接使用受控原位置，不为参考阅读复制全份材料；发现与读取限于当前 Quest 可见范围，已知 Environment 的显式跨 Quest 引用按下文规则办理，其他资产仍沿原 Owner 权限与接纳边界。结论摘要、结果 JSON 或 hash 不等于可继续实施的完整材料：复用时核对实际需要的数据、划分、预测、方法实现和协议，经现有 Owner 引用与执行输入流程交接精确资产。六入口按查看或复用目的组织：Question 汇总研究进展，Baseline 展开真实方法与实施，人类输入保留协作过程与经验，Literature、Dataset、Environment 便于复用已有资源；入口不是互斥分类，同一原件可关联多个入口。只带入本阶段需要的内容与来源，保留完整历史的按需读取入口。
 
 正文、目录与阶段上下文的分页和错误处理见[准确读取与错误](materials-and-custody.md#准确读取与错误)。正式采用集合与五类来源绑定沿[Plan 的 Owner 操作](../plan_stage/references/owner-operations.md#发现读取和精确引用)处理；可读与正式采用分别判断。

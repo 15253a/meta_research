@@ -454,6 +454,7 @@ def _operation_binding(operation_id: str) -> dict[str, object]:
         "output_schema_hash": "5" * 64,
         "reconciliation_operation_id": None,
         "discovered_tool_name": operation_id,
+        "contract_documentation_hash": "6" * 64,
     }
 
 

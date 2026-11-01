@@ -4,13 +4,13 @@
 
 ## 当前工具入口
 
-当前 Semantic MCP 的 `tools/list` 返回本根获授的操作与完整 schema。原生文件、shell、子 Agent 及外部 MCP 沿宿主提供的合同使用。RG、RM、RW、WF、HC 是研究用途分组，不构成新的 Owner。按组检索工具、分页工具目录及按需注册 schema 由 #269 接通；当前不调用设计期的 `tools.catalog.page` 或 `tools.contracts.read`。
+按需用 `tools.catalog.page` 发现本根当前可用的操作，以 `tools.contracts.read(operation_id)` 读取准确 schema、返回及错误说明；分页和授权变化的处理见[当前获授工具与准确入口](../../references/research-navigation.md#当前获授工具与准确入口)。`tools/list` 仍提供本根当前可用的操作与 schema；已知 reader 可直接调用。RG、RM、RW、WF、HC 是研究用途分组，不构成新的 Owner。下面保留研究用途与读取语义，参数范围以当前合同为准。
 
 | 需要 | 当前入口和边界 |
 | --- | --- |
 | 当前 Question、IdeaSet、前驱与 focus | 首包直接给准确完整正文；必要恢复使用 `research_memory.stage_context.read` 的冻结输入及返回的精确 reader。输入来源与原始 IdeaSet 生产轮次分别保留。 |
-| 同 Quest 的候选证据 | `research_graph.plan_evidence.page(offset, limit)`，limit 为 1–256，按页提供候选身份和来源；没有首次必读页，页长不是科学采用上限。 |
-| 选中的 Target 证据正文 | `research_memory.plan_evidence.read(target_commit_ref, asset_version_ref, content_hash, role_ref, offset, limit)`，limit 为 1–32768；准确身份取工具返回值，按返回的 next_offset 继续。返回的 `selected_evidence_binding` 原样用于采用集合。该专用 reader 的正文偏移按其 `total_characters` 字符范围处理，不套用通用 reader 的 UTF-8 字节规则。 |
+| 同 Quest 的候选证据 | `research_graph.plan_evidence.page` 按页提供候选身份和来源；没有首次必读页，页长不是科学采用上限。 |
+| 选中的 Target 证据正文 | `research_memory.plan_evidence.read` 的准确身份取工具返回值，按返回的 next_offset 继续。返回的 `selected_evidence_binding` 原样用于采用集合。该专用 reader 的正文偏移按其 `total_characters` 字符范围处理，不套用通用 reader 的 UTF-8 字节规则。 |
 | 问题及已有综合 | `research_graph.questions.page`、`research_graph.question_history.read`、`research_graph.question_relations.read`，按返回的范围、分页和准确正文入口展开。问题历史当前列已接纳 Reasoning，完整 Question／Cycle 历史阶段发现由 #267 承接。 |
 | 方法、方案、运行及评价 | `research_graph.baselines.page`、`research_graph.baselines.read`、`research_graph.formal_results.read`、`research_graph.target_formal_results.read`；当前匹配范围与展开关系以真实返回为准，执行及产物研究文字的增强发现、独立关系分页由 #267 承接。 |
 | 文献 | `research_memory.literature.page` 与返回的准确修订 reader。当前目录依据 Question 文献修订，不代表全部历史全文或任意取得材料已入索引；空 items 仍检查 next_offset。已知旧修订按精确 reader 读取。 |
