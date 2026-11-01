@@ -253,7 +253,7 @@ class WorkMaterialSubmissionRequest(BaseModel):
     @model_serializer(mode="wrap")
     def serialize_submission(self, handler):
         value = handler(self)
-        if not self.uploads:
+        if 'uploads' not in self.model_fields_set:
             value.pop("uploads", None)
         return value
 
