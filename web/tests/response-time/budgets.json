@@ -1,0 +1,10 @@
+{
+  "warmups": 2,
+  "samples": 20,
+  "p95_ms": {
+    "workspace": 5000,
+    "stage_switch": 1000,
+    "status": 1000,
+    "snapshot": 3000
+  }
+}

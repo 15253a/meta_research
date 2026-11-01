@@ -81,3 +81,6 @@ browser UI scenario above works in native Windows. Changing the backend's
 platform support is outside this verification setup.
 
 The #170 baseline on 2026-10-07 recorded a Linux ManualCreation focus-restoration failure. This documentation cleanup does not establish whether that failure persists; record current results when running the affected checks.
+
+For workspace and public API response-time budgets, the dedicated Linux CI,
+and `npm run test:response-time`, see [response-time CI](../docs/response-time-ci.md).
