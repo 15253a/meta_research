@@ -69,10 +69,14 @@ def test_linked_original_keeps_ancestors_but_releases_unrelated_workspace_bytes(
             report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
         finally:
             event.remove(runtime._database._engine, 'before_cursor_execute', count_queries)
+        observation = {'scans': scans, 'candidates': len(report),
+            'released_bytes': sum(item['bytes'] for item in report if item['action'] in {'removed', 'pruned'}),
+            'outcomes': [{'root_kind': item['root_kind'], 'action': item['action'], 'reason': item['reason']}
+                for item in report]}
+        (tmp_path / 'original-protection-observation.json').write_text(json.dumps(observation), encoding='utf-8')
         assert sum(item['action'] in {'removed', 'pruned'} for item in report) >= 2
         assert scans == {'custodies': 1, 'human_originals': 1, 'pending_intakes': 1}
-        print('ORIGINAL_PROTECTION_BATCH ' + json.dumps({'scans': scans, 'candidates': len(report),
-            'released_bytes': sum(item['bytes'] for item in report if item['action'] in {'removed', 'pruned'})}))
+        print('ORIGINAL_PROTECTION_BATCH ' + json.dumps(observation))
         row = next(item for item in report if item['path'] == str(workspace))
         assert original.read_bytes() == b'\x00\xfforiginal'
         assert not sibling.exists()
