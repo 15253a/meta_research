@@ -538,11 +538,35 @@ class RootWorkspaces:
         return {**source.source(), "path": path, "sha256": digest, "offset": offset,
                 "total_bytes": len(content), "next_offset": next_offset, "content": chunk}
 
+    def deliver_current_material(self, receiver, *, delivery_ref, files):
+        """Deliver selected uploads to the exact current receiving works."""
+        current = self.current_material_receiver(receiver.get('quest_ref'), receiver.get('question_ref'))
+        if current != receiver:
+            raise SemanticMcpError('material_receiver_stale')
+        for root in receiver['roots']:
+            location = (self._target_location(root['target_ref']) if root['root_kind'] == 'target'
+                        else self._runtime_location(root['work_ref']))
+            if location.source() != root:
+                raise SemanticMcpError('material_receiver_stale')
+            self._ensure_directory(location.directory)
+            self.deliver(WorkspaceDestination(location, 'human_collaboration', canonical_hash(receiver),
+                root['root_session_ref'], 'current_material'), delivery_ref=delivery_ref, files=files)
+
     def deliver(self, destination: WorkspaceDestination, *, delivery_ref: str,
                 files: tuple[tuple[str, bytes], ...]) -> dict[str, object]:
         if not isinstance(delivery_ref, str) or not delivery_ref or len(delivery_ref) > 256:
             raise SemanticMcpError("workspace_delivery_ref_invalid")
-        if destination.creation_context_kind == "quest_initialization":
+        if destination.creation_context_kind == 'current_material':
+            receiver = self.current_material_receiver(destination.location.quest_ref)
+            if (canonical_hash(receiver) != destination.request_ref
+                    or destination.location.source() not in receiver['roots']):
+                raise SemanticMcpError('material_receiver_stale')
+            location = (self._target_location(destination.location.target_ref)
+                        if destination.location.root_kind == 'target'
+                        else self._runtime_location(destination.location.work_ref))
+            fresh = WorkspaceDestination(location, 'human_collaboration', destination.request_ref,
+                                         destination.waiter_ref, 'current_material')
+        elif destination.creation_context_kind == "quest_initialization":
             fresh = self.destination_for_initialization(destination.request_ref, destination.waiter_ref)
         elif destination.creation_context_kind == "manual_question_creation":
             fresh = self.destination_for_manual_creation(destination.request_ref, destination.waiter_ref,

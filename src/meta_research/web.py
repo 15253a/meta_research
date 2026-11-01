@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer
 from sqlalchemy.exc import SQLAlchemyError
 
 from meta_research.auth import AuthSession
@@ -236,11 +236,26 @@ class ServerSelectionRequest(BaseModel):
     availability: Literal["available"]
 
 
+class WorkMaterialUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    relative_path: str = Field(min_length=1, max_length=1024)
+    media_type: str = Field(min_length=1, max_length=256)
+    content_base64: str = Field(max_length=12 * 1024 * 1024)
+
+
 class WorkMaterialSubmissionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     receiver: dict[str, object]
-    selections: list[ServerSelectionRequest] = Field(min_length=1, max_length=100)
+    selections: list[ServerSelectionRequest] = Field(default_factory=list, max_length=100)
     description: str = Field(default="", max_length=4000)
+    uploads: list[WorkMaterialUploadRequest] = Field(default_factory=list, max_length=20)
+
+    @model_serializer(mode="wrap")
+    def serialize_submission(self, handler):
+        value = handler(self)
+        if not self.uploads:
+            value.pop("uploads", None)
+        return value
 
 
 class CreationMaterialFileRequest(BaseModel):

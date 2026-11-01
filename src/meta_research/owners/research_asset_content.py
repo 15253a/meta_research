@@ -10,19 +10,17 @@ from meta_research.owners.verified_content_pages import VerifiedContentPages
 
 
 class AssetContentPageReader:
-    """Cache only stable verified file signatures, never source bytes or receipts.
+    """Read each page from bytes verified against the accepted manifest.
 
     Every page revalidates RM metadata and receipts and opens the actual source.
-    Its first unchanged signature is hashed in full on that descriptor. Later
-    pages read only their byte range, checking fstat before and after the read.
-    Inode replacement and same-size writes (including restored mtime) therefore
-    require a fresh whole-file verification. The cache dies with this RM Owner.
+    Verification and page collection share one read of the selected file on
+    that descriptor. No metadata signature authorizes reuse of old checks.
     """
 
-    def __init__(self, object_store: Path, receipt_verifier, *, max_verified_files=256):
+    def __init__(self, object_store: Path, receipt_verifier):
         self._object_store = object_store
         self._receipt_verifier = receipt_verifier
-        self._pages = VerifiedContentPages(max_verified_files=max_verified_files)
+        self._pages = VerifiedContentPages()
 
     def read_page(self, memory_ref: str, *, entry_path=None, offset=0, limit=8192):
         from meta_research.owners.research_memory import (
@@ -47,7 +45,13 @@ class AssetContentPageReader:
             raise OwnerConflict("content_entry_invalid")
         entry = selected[0]
         drifted = False
+        attempted = set()
         for candidate in _asset_entry_sources(self._object_store, row, custodies, manifest, entry):
+            # A receipt and a custody row can name the same original. Once it
+            # drifts, reopening it in this read must not hide that observation.
+            if candidate in attempted:
+                continue
+            attempted.add(candidate)
             try:
                 with _open_asset_regular_file(candidate, "content_unavailable") as source:
                     data = self._pages.read_page(source, candidate, entry, offset, limit)

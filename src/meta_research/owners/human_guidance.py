@@ -95,6 +95,7 @@ class HumanGuidanceMixin:
                 replay = self._material_replay(connection, idempotency_key, work_materials)
             if replay is None:
                 self._prepare_material_submission(work_materials)
+            self._prepare_material_upload_delivery(work_materials, idempotency_key, 'guidance')
             def commit(connection, constraint_ref):
                 self._insert_material_submission(connection, command=work_materials, key=idempotency_key,
                     anchor_kind="guidance", anchor_ref=constraint_ref)
