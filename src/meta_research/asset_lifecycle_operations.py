@@ -168,10 +168,8 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     from meta_research.asset_intake_sources import resolve_intake_source, reconcile_intake_source
                     _reject_target_note_provenance(values.get("provenance"))
                     if reconcile:
-                        replay = reconcile_intake_source(memory, effect_key=effect_key,
+                        return reconcile_intake_source(memory, effect_key=effect_key,
                             quest_ref=quest, selector=source_selector, values=values)
-                        if replay is not None:
-                            return replay
                     selected_source = resolve_intake_source(human_collaboration, context, source_selector)
                     values["source_locator"] = selected_source.locator
                     values["provenance"] = {**selected_source.provenance,

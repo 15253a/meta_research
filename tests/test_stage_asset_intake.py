@@ -195,7 +195,8 @@ def test_intake_rechecks_source_and_fence_before_accepting_prepared_bytes(tmp_pa
 
 
 @pytest.mark.parametrize('source_kind', ['workspace', 'material'])
-def test_lost_intake_ack_reconciles_exact_operation_while_suspended_without_original(tmp_path, monkeypatch, source_kind):
+@pytest.mark.parametrize('outcome', ['accepted', 'failed', 'exhausted', 'queued'])
+def test_lost_intake_ack_reconciles_exact_operation_while_suspended_without_original(tmp_path, monkeypatch, source_kind, outcome):
     from dataclasses import replace
     from test_root_workspace import _channel, _call, _accepted
     from test_root_human_request_lifecycle import _open_arguments
@@ -210,13 +211,21 @@ def test_lost_intake_ack_reconciles_exact_operation_while_suspended_without_orig
         context, call = channel(runtime, question)
         location = runtime.root_workspaces.bind_runtime(context).location
         original = location.directory / 'original.bin'
-        original.write_bytes(b'\xfforiginal identity')
+        if outcome == 'failed':
+            original.mkdir()
+            outside = location.directory / 'outside.bin'
+            outside.write_bytes(b'original identity')
+            (original / 'unsupported-link').symlink_to(outside)
+        else:
+            original.write_bytes(b'\xfforiginal identity')
+        if outcome == 'exhausted':
+            monkeypatch.setattr('meta_research.owners.research_memory.ASSET_INTAKE_MAX_ATTEMPTS', 1)
         source = {'kind':'workspace', 'workspace_ref':location.workspace_ref, 'path':'original.bin'}
         if source_kind == 'material':
             registered = runtime.owners.human_collaboration.acquire_work_material(context=context,
                 effect_id='acquired', absolute_path=str(original), description='Material used for exact reconciliation.')
             source = {'kind':'material', 'reference_ref':registered['references'][0]['reference_ref'], 'path':''}
-        args = {'effect_id':'lost-ack', 'intake': {'source_kind':'local_path', 'custody_mode':'linked_local',
+        args = {'effect_id':'lost-ack', 'intake': {'source_kind':'directory' if outcome in {'exhausted', 'queued'} else 'local_path', 'custody_mode':'linked_local',
             'display_name':'original.bin', 'source':source}}
         memory = runtime.owners.research_memory
         submit = memory.submit_asset_intake
@@ -229,14 +238,21 @@ def test_lost_intake_ack_reconciles_exact_operation_while_suspended_without_orig
             fault.setattr(memory, 'submit_asset_intake', lose_ack)
             with pytest.raises(LostAck):
                 call('research_memory.assets.intake', **args)
-        assert committed[0]['status'] == 'accepted'
+        expected_status = outcome if outcome in {'accepted', 'queued'} else 'failed'
+        assert committed[0]['status'] == expected_status
+        if outcome in {'failed', 'exhausted'}:
+            assert committed[0]['failure']['code'] == ('asset_intake_retry_exhausted' if outcome == 'exhausted' else 'asset_source_symlink_unsupported')
         _accepted(_call(runtime, _channel(runtime, context), 'human_request.open',
             **_open_arguments('wait-after-lost-ack', 'offline_action')))
         assert runtime.owners.agent_runtime.query_managed_run(context.run_ref)['status'] == 'suspended'
-        original.unlink()
+        if original.is_dir():
+            (original / 'unsupported-link').unlink()
+            original.rmdir()
+        else:
+            original.unlink()
         reconciled = call('research_memory.assets.intake.reconcile', **args)
         assert not reconciled['isError'], reconciled
-        assert reconciled['structuredContent'] == {'status':'accepted', 'result':committed[0]}
+        assert reconciled['structuredContent'] == {'status':expected_status, 'result':committed[0]}
         changed = call('research_memory.assets.intake.reconcile', **{**args,
             'intake':{**args['intake'], 'display_name':'different.bin'}})
         assert changed['structuredContent']['code'] == 'asset_intake_idempotency_conflict'

@@ -58,7 +58,7 @@ Idea、Plan、Bundle 和 Reasoning 可在本阶段调查、推导和综合，工
 
 正式整理时保留实际生产来路：调用 intake 的根只确定本次提交绑定，不自动证明实际接收者或生产者。执行或接纳绑定已能核验的工作身份及研究关联，由相应 Owner/adapter 沿既有事实给出；尚不能核验的关联如实保留为来源说明，不升级成系统已核事实；角色如实说明科研内容、真实生产与接收来路、处理派生、用途及限制。后继沿该 Question 的阶段产物或资产研究关系取得正式身份与准确 reader。阶段正文沿已经交付的准确交接与 reader 使用；独立 Stage 资产生产关系及按 Question 的完整发现以实际提供的能力为准，当前 `query_question_research_notes` 只查 Target notes。
 
-已获授权的非 Target 文件、二进制和目录可直接通过 `research_memory.assets.intake` 选择：`source_kind:"local_path"`（文件或目录）或 `"directory"`，`custody_mode:"managed"` 或 `"linked_local"`，并提供 `display_name`。工作区来源为 `source:{kind:"workspace",workspace_ref,path}`；原始材料来源为 `source:{kind:"material",reference_ref,path}`，其中 path 为安全相对路径，材料引用的空路径表示所选原件。仅所选内容进入保管，不因登记而扫描、复制全部工作区；二进制无须转成 UTF-8。原有 `text` 与 `target_workspace_note` 分支保持，Target 笔记继续使用其专门来源核验。返回的 `AssetIntakeResult.reader` 指向准确版本，按其中 operation 调用，不能把 intake 成功当作原件永远可用。重复提交与未知结果对账使用同一 effect_id 和相同参数；`.intake.reconcile` 可在原件已离线时返回原接纳身份，实际正文可用性仍由 reader 当次核验。工具记录来源工作或原接收关系，调用方额外 provenance 仅保留为 `declared_provenance`，不视为已核验生产关系。
+已获授权的非 Target 文件、二进制和目录可直接通过 `research_memory.assets.intake` 选择：`source_kind:"local_path"`（文件或目录）或 `"directory"`，`custody_mode:"managed"` 或 `"linked_local"`，并提供 `display_name`。工作区来源为 `source:{kind:"workspace",workspace_ref,path}`；原始材料来源为 `source:{kind:"material",reference_ref,path}`，其中 path 为安全相对路径，材料引用的空路径表示所选原件。仅所选内容进入保管，不因登记而扫描、复制全部工作区；二进制无须转成 UTF-8。原有 `text` 与 `target_workspace_note` 分支保持，Target 笔记继续使用其专门来源核验。返回的 `AssetIntakeResult.reader` 指向准确版本，按其中 operation 调用，不能把 intake 成功当作原件永远可用。重复提交与未知结果对账使用同一 effect_id 和相同参数；`.intake.reconcile` 在当前对账权限内，可于原件已离线或原根因求助而暂停时返回原接纳或失败结果，实际正文可用性仍由 reader 当次核验。工具记录来源工作或原接收关系，调用方额外 provenance 仅保留为 `declared_provenance`，不视为已核验生产关系。
 
 ### Target 过程中积累的资源
 

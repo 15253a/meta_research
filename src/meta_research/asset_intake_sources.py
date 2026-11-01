@@ -42,14 +42,7 @@ def reconcile_intake_source(memory, *, effect_key, quest_ref, selector, values):
     still matches RM's existing immutable operation hash.
     """
     _selector_parts(selector)
-    try:
-        record = memory.query_asset_intake_effect_record(effect_key)
-    except OwnerConflict as error:
-        if error.code != "asset_intake_effect_payload_unavailable":
-            raise
-        # Failed jobs deliberately scrub their payload. Preserve the existing
-        # request reconstruction/check path when no stored source facts remain.
-        return None
+    record = memory.query_asset_intake_effect_record(effect_key)
     if record is None:
         return {"status": "not_found", "result": None}
     stored = record["request"]
