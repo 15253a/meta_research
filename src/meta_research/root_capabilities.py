@@ -160,8 +160,6 @@ class RootCapabilityProfile:
                 "prompt": RESEARCH_SYSTEM_PROMPT,
                 "references": shared_reference_bundle_hash(),
                 "index": _shared_reference_index_hash(),
-                "role_method": cycle_role_instructions(self.root_kind),
-                "target_references": target_role_reference_hash() if self.root_kind == "target" else None,
             }),
             "model_ref": CODEX_MODEL_REF,
             "cli_reasoning_preset": CODEX_ROOT_REASONING_PRESET,
@@ -379,7 +377,11 @@ class RootCapabilityProfile:
 def _shared_reference_index_hash() -> str:
     # The capability floor is common to all roots; role-specific navigation is
     # part of that shared installation identity, not a new authorization.
-    return canonical_hash({kind: shared_reference_instructions(kind) for kind in ROOT_AGENT_KINDS})
+    return canonical_hash({
+        "navigation": {kind: shared_reference_instructions(kind) for kind in ROOT_AGENT_KINDS},
+        "role_methods": {kind: cycle_role_instructions(kind) for kind in ROOT_AGENT_KINDS},
+        "target_references": target_role_reference_hash(),
+    })
 
 
 def root_capability_profile(root_kind: RootAgentKind) -> RootCapabilityProfile:

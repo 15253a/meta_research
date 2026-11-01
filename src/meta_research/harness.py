@@ -4110,9 +4110,12 @@ def _turn_invocation_material(
         )
     if isinstance(request, TargetHarnessRequest):
         profile = root_capability_profile("target")
-        material["multi_agent_enabled"] = profile.multi_agent_enabled
-        material["root_capability_profile"] = profile.as_dict()
-        material["root_capability_profile_hash"] = profile.digest
+        try:
+            material["multi_agent_enabled"] = profile.multi_agent_enabled
+            material["root_capability_profile"] = profile.as_dict()
+            material["root_capability_profile_hash"] = profile.digest
+        except (OSError, UnicodeError, ModuleNotFoundError) as error:
+            raise HarnessAdmissionError("provider_resource_unavailable") from error
     return material
 
 
