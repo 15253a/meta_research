@@ -1,4 +1,6 @@
 from dataclasses import replace
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -62,4 +64,9 @@ def test_target_prompt_has_complete_selected_science_without_unrelated_briefs():
     assert prompt.startswith('cycle_position=')
     assert '"execution_input_binding_receipt"' not in prompt
     assert 'Skill source:' in prompt
-    assert '"required_metric_keys":["f1"]' in prompt
+    context = json.loads(prompt.split('Exact Owner context:\n', 1)[1])
+    assert context['execution_contract']['measurement_contract']['protocol_version']['required_metric_keys'] == ['f1']
+    source = Path(prompt.split('Skill source: ', 1)[1].splitlines()[0])
+    method = source.read_text(encoding='utf-8')
+    assert '初始 `result_schema` 是表达指导' in method
+    assert 'Protocol 指标集合、来源、合法 JSON 与有限数值检查仍有效' in method
