@@ -6830,7 +6830,6 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             ).first()
         if row is None:
             return None
-        _verify_object(self._object_store, row)
         accepted = _accepted_manual_content(row)
         quest_query = getattr(self._reference_reader, "query_quest_by_ref", None)
         if not callable(quest_query):

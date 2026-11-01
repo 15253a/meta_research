@@ -368,7 +368,11 @@ class AssetLifecycleOwnerMixin:
                 return verified[row.change_ref]
             if latest is not None:
                 fact(latest)
-            if head is None or head.revision != (latest.revision if latest else 0):
+            # Owner-managed scientific contents join the asset inventory
+            # without an explicit lifecycle selection. A missing head is only
+            # valid when there are no lifecycle changes, as in the full reader.
+            if (head is None and latest is not None
+                or head is not None and head.revision != (latest.revision if latest else 0)):
                 raise OwnerConflict('asset_lifecycle_state_invalid')
             current = None
             if creation is not None:
@@ -379,7 +383,7 @@ class AssetLifecycleOwnerMixin:
                     fact(retirement)
                 else:
                     current = creation.version_ref
-            if head.current_version_ref != current:
+            if head is not None and head.current_version_ref != current:
                 raise OwnerConflict('asset_lifecycle_state_invalid')
             if version_ref is None:
                 version_ref = current
@@ -401,7 +405,7 @@ class AssetLifecycleOwnerMixin:
                     state = 'superseded'
             if row.state != state:
                 raise OwnerConflict('asset_lifecycle_state_invalid')
-            return {'asset_ref': asset_ref, 'revision': head.revision,
+            return {'asset_ref': asset_ref, 'revision': head.revision if head else 0,
                 'current_version_ref': current, 'version_ref': version_ref,
                 'state': 'current' if current == version_ref else state,
                 'applicability': [{key: change[key] for key in
