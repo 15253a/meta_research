@@ -966,6 +966,8 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_asset_lifecycle(self, asset_ref: str) -> dict[str, object]: ...
 
+    def query_asset_status(self, asset_ref: str, version_ref: str | None = None) -> dict[str, object]: ...
+
     def query_current_asset(self, asset_ref: str) -> AcceptedAssetVersion | None: ...
 
     def query_retirement_by_idempotency_key(
@@ -3156,6 +3158,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         self._asset_handoff_lock = threading.RLock()
         from meta_research.owners.research_asset_content import AssetContentPageReader
         self._asset_content_pages = AssetContentPageReader(object_store, receipt_verifier)
+        from meta_research.context_presentation import ExactContextPages
+        self._json_content_pages = ExactContextPages()
         self._literature_content_pages = LiteratureContentPageReader(self._object_store)
         from meta_research.creation_basis import CreationBasisMemory
         self.creation_bases = CreationBasisMemory(self)
@@ -5024,8 +5028,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         """Read an exact bounded page in original custody after receipt verification."""
         page = self._asset_content_pages.read_page(
             memory_ref, entry_path=entry_path, offset=offset, limit=limit)
-        version = self.query_asset_version(memory_ref)
-        return {**page, "lifecycle": self.query_asset_lifecycle(version.asset_ref)}
+        return {**page, "lifecycle": self.query_asset_status(page['asset_binding']['asset_ref'], memory_ref)}
 
     def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
         return self._receipt_verifier.describe_asset_export(memory_ref)
@@ -6606,10 +6609,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         )
         if row is None or stored_hash != expected_hash:
             raise OwnerConflict("question_content_not_found")
-        if autonomous:
-            _verify_autonomous_question_content_object(self._object_store, row)
-        else:
-            _verify_object(self._object_store, row)
+        # The selected receipt path below checks the actual file against this
+        # exact accepted JSON. Do not open and verify it a second time first.
         if autonomous:
             accepted = self.query_autonomous_question_content(content_ref)
             if accepted is None:
@@ -9475,7 +9476,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 if evidence_basis_ref not in {None, record_ref}:
                     raise OwnerConflict("content_source_unbound")
                 return {
-                    **context_read_page(paper, path=[], offset=offset, limit=min(limit, 16384)),
+                    **context_read_page(paper, path=[], offset=offset, limit=min(limit, 16384),
+                        cache=self._json_content_pages, identity=(snapshot_ref, record_ref, 'paper-metadata')),
                     "paper": paper,
                 }
             if evidence_basis_ref is not None and evidence_basis_ref != selected["content_hash"]:

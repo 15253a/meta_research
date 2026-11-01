@@ -5,7 +5,7 @@ import json
 
 from sqlalchemy import text
 
-from meta_research.context_presentation import context_read_page
+from meta_research.context_presentation import ExactContextPages, context_read_page
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 
@@ -48,7 +48,10 @@ def adopted_source_binding(graph, *, quest_ref, source_ref, leaf=None):
                        "args": {"source_ref": source_ref, "version_ref": version_ref}}}
 
 
-def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, offset=0, limit=8192, human_collaboration=None):
+def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, offset=0, limit=8192, human_collaboration=None, page_cache=None):
+    def exact_page(value):
+        return context_read_page(value, path=[], offset=offset, limit=min(limit, 16384),
+            cache=page_cache, identity=(quest_ref, source_ref, version_ref, 'canonical-json'))
     if source_ref.startswith("target_commit_"):
         # The same accurate reader remains usable by downstream roles. The
         # accepting Owners resolve the actual commit and exact retained version.
@@ -84,7 +87,7 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
             if request is None or request.get("quest_ref")!=quest_ref:raise OwnerConflict("content_version_unbound")
             value=next((x for x in request.get("responses",[]) if x["response_ref"]==source_ref),None)
             if value is None or canonical_hash(value)!=version_ref:raise OwnerConflict("content_version_unbound")
-            return {**context_read_page(value,path=[],offset=offset,limit=min(limit,16384)),"source_ref":source_ref,"version_ref":version_ref}
+            return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
     if source_ref == version_ref and memory.query_asset_version(version_ref) is not None:
         graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
         return memory.read_asset_content_page(version_ref, entry_path=entry_path, offset=offset, limit=limit)
@@ -105,7 +108,7 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
         if question.quest_ref != quest_ref or version_ref != question.content_ref:
             raise OwnerConflict("content_version_unbound")
         value=memory.read_question_content(question.content_ref,question.content_hash)
-        return {**context_read_page(value,path=[],offset=offset,limit=min(limit,16384)),
+        return {**exact_page(value),
                 "source_ref":source_ref,"version_ref":version_ref}
     with memory._database.read_snapshot() as connection:
         outcome=connection.execute(text("SELECT outcome_ref,transition_json FROM rg_reasoning_outcome_decisions WHERE (outcome_ref=:ref OR scientific_outcome_ref=:ref) AND decision='accepted'"),{"ref":source_ref}).first()
@@ -115,7 +118,7 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
             if version_ref != source_ref or transition.get("source_quest_ref") != quest_ref:
                 raise OwnerConflict("content_version_unbound")
             value=graph.read_question_scientific_outcome(quest_ref=quest_ref,question_ref=transition["source_question_ref"],outcome_ref=source_ref)
-            return {**context_read_page(value,path=[],offset=offset,limit=min(limit,16384)),"source_ref":source_ref,"version_ref":version_ref}
+            return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
         revision=connection.execute(text("SELECT question_ref,quest_ref FROM rm_question_literature_revisions WHERE revision_ref=:ref"),{"ref":version_ref}).first()
         if revision is not None:
             if revision.quest_ref != quest_ref:raise OwnerConflict("content_version_unbound")
@@ -136,7 +139,7 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
                                     "note":"For article sections or page numbers, use locators present in the retrieved source; do not invent them."}}}
     value = read_stage_content(memory, quest_ref=quest_ref, source_ref=source_ref, version_ref=version_ref)
     if value is not None:
-        return {**context_read_page(value,path=[],offset=offset,limit=min(limit,16384)),"source_ref":source_ref,"version_ref":version_ref}
+        return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
     raise OwnerConflict("content_source_unbound")
 
 
@@ -225,6 +228,7 @@ def discover_literature(graph, memory, *, quest_ref, query="", offset=0, limit=1
 def research_content_operations(*, research_graph, research_memory, agent_runtime, human_collaboration=None,
                                 target_run_agent=None):
     from meta_research.asset_lifecycle_operations import asset_lifecycle_operations
+    page_cache = ExactContextPages()
     def invoke(context, arguments):
         try:
             if context.phase == "creation_materials":
@@ -250,7 +254,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
                     raise OwnerConflict("content_source_unbound")
                 return research_memory.read_asset_content_page(version, **page_arguments)
             quest_ref=_quest(agent_runtime,context)
-            return read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,**arguments)
+            return read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,page_cache=page_cache,**arguments)
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
     operations=[SemanticOperation(semantic_operation_id="research_memory.content.read",owning_module="research_memory",

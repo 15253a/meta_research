@@ -84,18 +84,11 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     )
                 items = []
                 for asset_ref in refs[:limit]:
-                    lifecycle = memory.query_asset_lifecycle(asset_ref)
-                    version_ref = (
-                        lifecycle["current_version_ref"]
-                        or lifecycle["versions"][-1]["version_ref"]
-                    )
+                    lifecycle = memory.query_asset_status(asset_ref)
+                    version_ref = lifecycle['version_ref']
                     scope(context, version_ref)
                     asset = memory.query_asset_version(version_ref)
-                    lifecycle_state = next(
-                        version["state"]
-                        for version in lifecycle["versions"]
-                        if version["version_ref"] == version_ref
-                    )
+                    lifecycle_state = lifecycle['state']
                     items.append(
                         {
                             "asset": {
@@ -113,10 +106,11 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
             version_ref = arguments["version_ref"]
             scope(context, version_ref)
             asset = memory.query_asset_version(version_ref)
-            lifecycle = memory.query_asset_lifecycle(asset.asset_ref)
-            lifecycle["reference_revision"] = graph.query_asset_reference_revision()
             if action == "lifecycle":
+                lifecycle = memory.query_asset_lifecycle(asset.asset_ref)
+                lifecycle["reference_revision"] = graph.query_asset_reference_revision()
                 return lifecycle
+            lifecycle = memory.query_asset_status(asset.asset_ref)
             current = memory.query_current_asset(asset.asset_ref)
             return {
                 "lifecycle": lifecycle,

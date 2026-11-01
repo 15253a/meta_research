@@ -347,6 +347,69 @@ def _retirement_payload(
 
 
 class AssetLifecycleOwnerMixin:
+    def query_asset_status(self, asset_ref, version_ref=None):
+        """Read the selected version's present applicability, without full history.
+
+        Lifecycle writes still verify the complete chain. Ordinary reads verify
+        the head and the accepted facts affecting this version; the detailed
+        endpoint remains available for the entire historical chain.
+        """
+        with self._database.read_snapshot() as connection:
+            head = connection.execute(text('SELECT * FROM rm_asset_lifecycle WHERE asset_ref=:ref'),
+                {'ref': asset_ref}).first()
+            latest = connection.execute(text('SELECT * FROM rm_asset_changes WHERE asset_ref=:ref ORDER BY revision DESC LIMIT 1'),
+                {'ref': asset_ref}).first()
+            creation = connection.execute(text("SELECT * FROM rm_asset_changes WHERE asset_ref=:ref AND kind!='retirement' ORDER BY revision DESC LIMIT 1"),
+                {'ref': asset_ref}).first()
+            verified = {}
+            def fact(row):
+                if row.change_ref not in verified:
+                    verified[row.change_ref] = _accepted_change(row)
+                return verified[row.change_ref]
+            if latest is not None:
+                fact(latest)
+            if head is None or head.revision != (latest.revision if latest else 0):
+                raise OwnerConflict('asset_lifecycle_state_invalid')
+            current = None
+            if creation is not None:
+                fact(creation)
+                retirement = connection.execute(text("SELECT * FROM rm_asset_changes WHERE asset_ref=:asset AND version_ref=:version AND kind='retirement' ORDER BY revision DESC LIMIT 1"),
+                    {'asset': asset_ref, 'version': creation.version_ref}).first()
+                if retirement is not None:
+                    fact(retirement)
+                else:
+                    current = creation.version_ref
+            if head.current_version_ref != current:
+                raise OwnerConflict('asset_lifecycle_state_invalid')
+            if version_ref is None:
+                version_ref = current
+                if version_ref is None:
+                    version_ref = connection.execute(text('SELECT version_ref FROM rm_asset_versions WHERE asset_ref=:ref ORDER BY version_number DESC LIMIT 1'),
+                        {'ref': asset_ref}).scalar()
+            row = connection.execute(text("SELECT v.version_ref,COALESCE(l.state,'unselected') AS state FROM rm_asset_versions v LEFT JOIN rm_asset_version_lifecycle l USING(version_ref) WHERE v.asset_ref=:asset AND v.version_ref=:version"),
+                {'asset': asset_ref, 'version': version_ref}).first()
+            if row is None:
+                raise OwnerConflict('asset_not_found')
+            rows = connection.execute(text('SELECT * FROM rm_asset_changes WHERE asset_ref=:asset AND (version_ref=:version OR predecessor_version_ref=:version) ORDER BY revision'),
+                {'asset': asset_ref, 'version': version_ref}).all()
+            changes = [fact(item) for item in rows]
+            state = 'unselected'
+            for change in changes:
+                if change['kind'] == 'retirement' and change['version_ref'] == version_ref:
+                    state = 'retired'
+                elif change['predecessor_version_ref'] == version_ref:
+                    state = 'superseded'
+            if row.state != state:
+                raise OwnerConflict('asset_lifecycle_state_invalid')
+            return {'asset_ref': asset_ref, 'revision': head.revision,
+                'current_version_ref': current, 'version_ref': version_ref,
+                'state': 'current' if current == version_ref else state,
+                'applicability': [{key: change[key] for key in
+                    ('kind', 'explanation', 'error', 'scope', 'change_ref', 'version_ref', 'predecessor_version_ref') if key in change}
+                    for change in changes],
+                'history_reader': {'operation': 'research_memory.assets.lifecycle',
+                    'args': {'version_ref': version_ref}}}
+
     def query_asset_lifecycle(self, asset_ref):
         with self._database.read_snapshot() as connection:
             head, changes, states = _verified_lifecycle(connection, asset_ref)
@@ -363,6 +426,17 @@ class AssetLifecycleOwnerMixin:
                 ),
                 {"ref": asset_ref},
             ).all()
+            by_version = {v.version_ref: [] for v in versions}
+            predecessors, successors = {}, {}
+            for change in changes:
+                by_version[change['version_ref']].append(change)
+                predecessor = change['predecessor_version_ref']
+                if predecessor is not None and predecessor != change['version_ref']:
+                    by_version[predecessor].append(change)
+                if change['kind'] != 'retirement':
+                    predecessors.setdefault(change['version_ref'], predecessor)
+                    if predecessor is not None:
+                        successors.setdefault(predecessor, []).append(change['version_ref'])
             return {
                 "asset_ref": asset_ref,
                 "revision": head.revision if head else 0,
@@ -374,27 +448,9 @@ class AssetLifecycleOwnerMixin:
                         "state": "current"
                         if head and head.current_version_ref == v.version_ref
                         else states[v.version_ref],
-                        "predecessor_version_ref": next(
-                            (
-                                c["predecessor_version_ref"]
-                                for c in changes
-                                if c["version_ref"] == v.version_ref
-                                and c["kind"] != "retirement"
-                            ),
-                            None,
-                        ),
-                        "successor_version_refs": [
-                            c["version_ref"]
-                            for c in changes
-                            if c["predecessor_version_ref"] == v.version_ref
-                            and c["kind"] != "retirement"
-                        ],
-                        "changes": [
-                            c
-                            for c in changes
-                            if c["version_ref"] == v.version_ref
-                            or c["predecessor_version_ref"] == v.version_ref
-                        ],
+                        "predecessor_version_ref": predecessors.get(v.version_ref),
+                        "successor_version_refs": successors.get(v.version_ref, []),
+                        "changes": by_version[v.version_ref],
                     }
                     for v in versions
                 ],
@@ -402,7 +458,7 @@ class AssetLifecycleOwnerMixin:
 
     def query_current_asset(self, asset_ref):
         with self._database.read_snapshot():
-            state = self.query_asset_lifecycle(asset_ref)
+            state = self.query_asset_status(asset_ref)
             ref = state["current_version_ref"]
             return None if ref is None else self.query_asset_version(ref)
 
