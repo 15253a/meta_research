@@ -65,8 +65,11 @@ def test_frozen_schema_owns_nullable_and_categorical_semantics():
         assert "$.metrics" in caught.value.feedback
 
 
-def test_prompt_contains_complete_frozen_contract_and_scope_checks():
+def test_prompt_contains_complete_frozen_contract_and_scope_checks(tmp_path):
+    from pathlib import Path
     from types import SimpleNamespace
+    from test_public_guidance_delivery import _developer
+    from test_root_capability_floor import _invoke_root_without_tool_activity
     from test_target_run_owner import _records
     from test_target_root_runtime import SOURCE_SPEC_HASH, _measurement_authority
     from meta_research.target_execution_contract import target_execution_context
@@ -91,7 +94,13 @@ def test_prompt_contains_complete_frozen_contract_and_scope_checks():
     assert limits["artifact_set_bytes"] is None
     assert limits["result_document_bytes"] == 256 * 1024
     assert limits["legacy_implementation_bundle"]["directory_file_bytes"] == 16 * 1024 * 1024
-    assert "合同允许的未测量值为 `null`" in prompt
+    source = Path(prompt.split("Skill source: ", 1)[1].splitlines()[0])
+    skill = source.read_text(encoding="utf-8")
+    _, argv = _invoke_root_without_tool_activity(tmp_path, root_kind="target")
+    developer = _developer(argv)
+    assert skill.strip() in developer
+    assert "合同允许的未测量值为 `null`" in developer
+    assert skill not in prompt
     assert context["execution_contract"]["target_spec_hash"] == SOURCE_SPEC_HASH
     assert context["target_spec_binding"]["content_hash_ref"] == request.target_spec_binding.content_hash_ref
     for target_ref, graph_ref, spec_hash in (

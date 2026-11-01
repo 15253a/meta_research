@@ -273,22 +273,33 @@ def _result(
     )
 
 
-def test_packaged_plan_skill_is_the_runtime_authority() -> None:
-    package = files("meta_research.skills.plan_stage")
-    skill = (package / "SKILL.md").read_text(encoding="utf-8")
-    contract = (package / "references" / "contract.md").read_text(
-        encoding="utf-8"
-    )
-    operations = (package / "references" / "owner-operations.md").read_text(
-        encoding="utf-8"
-    )
+def test_packaged_plan_skill_is_the_runtime_authority(tmp_path) -> None:
+    from meta_research.plan_skill import _plan_skill_instructions
+    from test_public_guidance_delivery import _developer
+    from test_root_capability_floor import _invoke_root_without_tool_activity
 
-    assert "StageCommit" in skill and "Owner" in skill
+    package = files("meta_research.skills.plan_stage")
+    source = Path(_plan_skill_instructions().split("Role skill source: ", 1)[1].splitlines()[0])
+    assert source.resolve() == Path(str(package / "SKILL.md")).resolve()
+    skill = source.read_text(encoding="utf-8")
+    contract = (source.parent / "references" / "contract.md").read_text(
+        encoding="utf-8"
+    )
+    operations = (source.parent / "references" / "owner-operations.md").read_text(
+        encoding="utf-8"
+    )
+    _, argv = _invoke_root_without_tool_activity(tmp_path, root_kind="plan")
+    developer = _developer(argv)
+
+    assert skill.strip() in developer
+    assert "references/contract.md" in skill and "references/owner-operations.md" in skill
+    assert contract not in developer and operations not in developer
+    assert "StageCommit" in contract and "Owner" in contract
     assert "AnswerContract" in contract
-    assert "每项义务恰出现一次" in contract
+    assert "每项义务有一个判断" in contract
     assert "experiment_key" in contract and "Brief" in contract
     assert "TODO-IMPL" not in operations
-    assert "RM 管内容保管" in operations
+    assert "RM 保管内容，AE 推进阶段，AR 维护运行和根 Session" in operations
 
 
 def test_adapter_preserves_the_complete_adopted_set_and_derives_skip_from_empty_briefs():

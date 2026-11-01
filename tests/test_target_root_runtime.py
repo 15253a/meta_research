@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from meta_research.harness import HarnessAdmissionError
@@ -189,16 +190,16 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
         assert runtime.query_status(handle.target_ref).phase == expected_phase  # type: ignore[union-attr]
 
     assert len(harnesses.root_calls) == 2
-    assert all(
-        "进行研究、检查与局部修订" in values["prompt"]
-        and "最终交接前完成独立子智能体审阅" in values["prompt"]
-        and "普通检索、实施和整理按需要委派" in values["prompt"]
-        and "子智能体使用当前任务授予的工具与权限" in values["prompt"]
-        and "根负责整体判断" in values["prompt"]
-        and "/var/lib/meta-research/target-frozen-inputs/manifest.json"
-        in values["prompt"]
-        for _request_ref, values in harnesses.root_calls
-    )
+    for _request_ref, values in harnesses.root_calls:
+        prompt = values["prompt"]
+        source = Path(prompt.split("Skill source: ", 1)[1].splitlines()[0])
+        method = source.read_text(encoding="utf-8")
+        assert "实施、观察和修订" in method
+        assert "最终交接前委派原生独立子智能体" in method
+        assert "将聚焦检索、比较、实施、评价或整理委派给原生子智能体" in method
+        assert "根负责最终研究判断" in method
+        assert method not in prompt  # Harness maintains the method; this is turn data.
+        assert "/var/lib/meta-research/target-frozen-inputs/manifest.json" in prompt
     assert finalizer.calls == [(handle, harnesses.evidence)]
     assert finalizer.materialize_calls == 3
     assert agent_runtime.publications == [

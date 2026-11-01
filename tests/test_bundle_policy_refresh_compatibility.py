@@ -26,8 +26,14 @@ def test_later_policy_edits_resume_existing_run_without_hash_registration(adapte
     monkeypatch.setattr(bundle_skill, "_bundle_skill_resources", lambda: dict(resources))
     current = provider.runtime_binding()
     assert frozen != current
-    assert frozen.instruction_set_hash != current.instruction_set_hash
+    # Business instructions now disclose stable paths; policy bytes are bound
+    # separately and the role method is maintained by the Harness.
+    assert frozen.instruction_set_hash == current.instruction_set_hash
     assert frozen.packaged_skill_bundle_hash != current.packaged_skill_bundle_hash
+    resource_prefix = f"package:meta_research.skills.bundle_stage/{name}@sha256:"
+    assert next(entry for entry in frozen.resource_bindings if entry.startswith(resource_prefix)) != next(
+        entry for entry in current.resource_bindings if entry.startswith(resource_prefix)
+    )
     assert bundle_bindings_compatible(frozen, current)
     assert bundle_bindings_compatible(current, frozen)
     worker = object.__new__(BundleStageWorker)

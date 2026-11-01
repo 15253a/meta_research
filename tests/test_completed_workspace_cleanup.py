@@ -139,14 +139,30 @@ def test_actual_provider_instructions_preserve_cycle_dependencies_before_cleanup
     assert '单个 Target 结束不能证明整个 Cycle 或目录已可回收' in custody
     assert '实际执行、恢复、待接纳及后继读取依赖继续保护' in custody
     assert '精确保管原件不作为临时材料删除' in custody
+    assert '已由 RM 正式以 `linked_local` 保管的原件留在原位置' in custody
+    assert '出窗且工作已结束、没有续接、恢复、未决对账或必要读取依赖时才释放' in custody
     target = target_execution_skill_text()
     source = Path(target.split('Skill source: ', 1)[1].splitlines()[0])
-    preservation = (source.parent / 'references/data-preservation.md').read_text()
-    assert 'Cycle 业务完成且必要交接结束后' in preservation
-    assert 'linked_local' in preservation and 'RM' in preservation and '恢复' in preservation
+    assert source.read_text(encoding='utf-8').strip() in visible
+    preservation_path = source.parent / 'references/data-preservation.md'
+    preservation = preservation_path.read_text(encoding='utf-8')
+    assert '(../../references/materials-and-custody.md#交接与工作区收尾)' in preservation
+    assert (preservation_path.parent / '../../references/materials-and-custody.md').resolve() == (root / 'references/materials-and-custody.md').resolve()
+    assert 'Target 交接只结束当前工作，后续 Bundle／Reasoning 仍可按授权使用本轮资料' in preservation
+    assert 'linked_local' in preservation and '恢复' in preservation
     reasoning = _reasoning_skill_instructions()
-    assert 'Cycle 业务完成且必要交接结束后' in reasoning
-    assert '后续' in reasoning and '恢复' in reasoning
+    reasoning_source = Path(reasoning.split('Role skill source: ', 1)[1].splitlines()[0])
+    reasoning_skill = reasoning_source.read_text(encoding='utf-8')
+    _, reasoning_argv = _invoke_root_without_tool_activity(tmp_path, root_kind='reasoning')
+    setting = next(reasoning_argv[i+1] for i, value in enumerate(reasoning_argv[:-1])
+        if value == '--config' and reasoning_argv[i+1].startswith('developer_instructions='))
+    reasoning_visible = tomllib.loads(setting)['developer_instructions']
+    assert reasoning_skill.strip() in reasoning_visible
+    assert '(../references/materials-and-custody.md#交接与工作区收尾)' in reasoning_skill
+    assert (reasoning_source.parent / '../references/materials-and-custody.md').resolve() == (root / 'references/materials-and-custody.md').resolve()
+    assert custody not in reasoning_visible
+    assert 'ScientificOutcome 草稿或单个 Target 完成不代表本轮已可清理' in reasoning_skill
+    assert '后继读取' in reasoning_skill and '执行、恢复、待接纳等依赖' in reasoning_skill
 
 
 def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_readable(tmp_path):
