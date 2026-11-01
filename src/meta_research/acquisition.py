@@ -84,6 +84,7 @@ class AcquisitionPreflightRequest:
     private_state_dir: str
     previous_browser_context_ref: str | None = None
     generation: int = 1
+    root_runtime_scope: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -368,7 +369,7 @@ class NatureDownloaderAdapter:
                 30.0,
             )
             health = self._run_json(
-                ["python3", str(configure_script), "health", "--force"],
+                ["python3", str(configure_script), "health"],
                 root,
                 environment,
                 60.0,

@@ -819,7 +819,7 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
                 "quest_ref": quest_ref,
                 "run_ref": f"{root_kind}-caller-{suffix}",
                 "attempt_ref": f"{root_kind}-attempt-{suffix}",
-                "root_session_ref": f"{root_kind}-session-{suffix}",
+                "root_session_ref": session_ref,
                 "fence_ref": f"{root_kind}-fence-{suffix}",
                 "runtime_binding_hash": suffix * 64,
                 "generation": 1,

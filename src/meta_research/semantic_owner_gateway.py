@@ -6,6 +6,7 @@ from meta_research.stage_context_access import stage_context_operations
 from meta_research.root_workspace import workspace_operations
 from meta_research.work_materials import material_operations
 from meta_research.environment_operations import environment_operations
+from meta_research.literature_operations import literature_operations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -319,6 +320,7 @@ def create_semantic_owner_gateway(
         ),
         *_dataset_operations(research_graph, agent_runtime, human_collaboration),
         *environment_operations(research_graph, agent_runtime, human_collaboration),
+        *literature_operations(research_graph, agent_runtime, human_collaboration),
         *_baseline_operations(research_graph, agent_runtime, human_collaboration),
         *_root_agent_human_request_operations(
             agent_runtime=agent_runtime,
@@ -1827,7 +1829,7 @@ def _root_human_request_operation_binding(
     if context.root_kind is None:
         raise SemanticMcpError("root_agent_human_request_effect_unauthorized")
     quest_ref = scope.get("quest_ref")
-    if not isinstance(quest_ref, str) or not quest_ref:
+    if not (context.root_kind == "acquisition" and quest_ref is None) and (not isinstance(quest_ref, str) or not quest_ref):
         raise SemanticMcpError("root_agent_human_request_scope_invalid")
     return {
         "quest_ref": quest_ref,
@@ -2945,7 +2947,7 @@ def _workspace_reply_schema() -> dict[str, object]:
 def _root_human_request_output_schema() -> dict[str, object]:
     operation_binding = _closed_object(
         {
-            "quest_ref": _string(max_length=256),
+            "quest_ref": {"type": ["string", "null"], "maxLength": 256},
             "task_ref": _string(max_length=256),
             "root_session_ref": _string(max_length=256),
             "operation_id": _string(

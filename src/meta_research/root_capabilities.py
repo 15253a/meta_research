@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -60,6 +62,14 @@ ROOT_CAPABILITY_DIAGNOSTIC_SCHEMA = (
     "meta-research/root-capability-diagnostic/v1"
 )
 CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS = 2.0
+
+ACQUISITION_SYSTEM_PROMPT = (
+    "你负责指定文献的获取与文件核实。按本请求明确的访问模式、论文线索、保存位置和必要身份工作。"
+    "使用实际获取工具，逐篇交付真实状态、准确路径、格式与失败原因；获取成功不代表科学理解。"
+    "复用持久工作区及已验证路径，当前权限仍须有效；仅修复失效环节。"
+    "需要人协助时通过正式 HumanRequest 发出请求，以正式回执确认投递；沿原效果对账、读取回应后接续。"
+    "结果未知先对账，已取得文件不重复下载。普通笔记保存适用条件与失败弯路，凭据不进入笔记。"
+)
 
 # This is an availability floor, not a per-turn usage checklist.  A Root may
 # choose none of these tools in a turn and still have a conforming launch.
@@ -156,6 +166,7 @@ class RootCapabilityProfile:
             "web_search_mode": self.web_search_mode,
             "research_system_prompt_hash": canonical_hash({
                 "prompt": RESEARCH_SYSTEM_PROMPT,
+                "acquisition_prompt": ACQUISITION_SYSTEM_PROMPT,
                 "references": shared_reference_bundle_hash(),
                 "index": _shared_reference_index_hash(),
             }),
@@ -184,6 +195,8 @@ class RootCapabilityProfile:
 
         if entry_path not in ROOT_CAPABILITY_ENTRY_PATHS:
             raise ValueError("root_capability_entry_path_invalid")
+        if output_language not in {"zh", "en"}:
+            raise ValueError("output_language_invalid")
         return tuple(
             value
             for feature in _CODEX_ROOT_FEATURES
@@ -193,7 +206,11 @@ class RootCapabilityProfile:
             'web_search="live"',
             "--config",
             "developer_instructions=" + json.dumps(
-                research_system_prompt(output_language) + "\n\n"
+                (ACQUISITION_SYSTEM_PROMPT + f"\n本回合输出语言：{output_language}。"
+                 + ("直接使用英文" if output_language == "en" else "直接使用中文")
+                 + "说明获取结果与待办；委派时传递同一语言要求，保留原文、代码和准确标识。"
+                 if self.root_kind == "acquisition"
+                 else research_system_prompt(output_language)) + "\n\n"
                 + shared_reference_instructions(self.root_kind) + "\n\n"
                 + cycle_role_instructions(self.root_kind), ensure_ascii=False
             ),
@@ -994,4 +1011,34 @@ __all__ = [
     "merge_root_capability_bindings",
     "root_capability_profile",
     "root_operation_catalog",
+    "provided_only_cli_arguments",
 ]
+
+
+def provided_only_cli_arguments(
+    argv: list[str], *, writable_root: Path, resident_mcp: bool,
+) -> list[str]:
+    # Never fall back to unrestricted execution on hosts lacking sandbox support.
+    # Auth belongs to the CLI; model-generated commands inherit no user secrets.
+    result = list(argv)
+    result[result.index("--sandbox") + 1] = "workspace-write"
+    denied_features = {"hooks", "plugins", "remote_plugin", "apps", "browser_use",
+                       "browser_use_external", "browser_use_full_cdp_access",
+                       "in_app_browser", "computer_use", "image_generation", "shell_snapshot"}
+    for feature in denied_features:
+        for index in range(len(result) - 1):
+            if result[index:index + 2] == ["--enable", feature]:
+                result[index] = "--disable"
+    overlay = ["--ignore-user-config", "--ignore-rules", "--add-dir", str(writable_root),
+               "--config", 'web_search="disabled"',
+               "--config", "sandbox_workspace_write.network_access=false",
+               "--config", 'shell_environment_policy.inherit="none"']
+    for feature in sorted(denied_features):
+        if ["--disable", feature] not in [result[index:index + 2] for index in range(len(result) - 1)]:
+            overlay.extend(["--disable", feature])
+    if not resident_mcp:
+        overlay.extend(["--config", "mcp_servers={}"])
+    # Options precede the resume subcommand / stdin marker.
+    position = result.index("resume") if "resume" in result else (len(result) - 1 if result[-1] == "-" else len(result))
+    result[position:position] = overlay
+    return result

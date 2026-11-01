@@ -18,13 +18,17 @@ def test_real_root_adapter_passes_human_request_instructions(tmp_path, root_kind
     instructions = [setting for setting in settings if setting.startswith("developer_instructions=")]
     assert len(instructions) == 1
     actual = tomllib.loads(instructions[0])["developer_instructions"]
-    assert actual.startswith(RESEARCH_SYSTEM_PROMPT)
+    if root_kind == "acquisition":
+        assert "指定文献的获取与文件核实" in actual
+        assert "Cycle" not in actual
+    else:
+        assert actual.startswith(RESEARCH_SYSTEM_PROMPT)
     assert "Shared reference root:" in actual
     assert "references/human-guidance.md" in actual
     assert "references/materials-and-custody.md" in actual
     from meta_research.research_guidance import shared_reference_resources
     assert all(body not in actual for body in shared_reference_resources().values())
-    language_instructions = actual[len(RESEARCH_SYSTEM_PROMPT):]
+    language_instructions = actual if root_kind == "acquisition" else actual[len(RESEARCH_SYSTEM_PROMPT):]
     assert "本回合输出语言：zh。" in language_instructions
     assert "直接使用中文" in language_instructions
     assert "委派时传递同一语言要求" in language_instructions

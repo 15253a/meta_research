@@ -4590,7 +4590,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 and target.get("schema_ref")
                 == "meta-research/root-agent-human-request-target/v1"
                 and isinstance(operation_binding, dict)
-                and isinstance(operation_binding.get("quest_ref"), str)
+                and (isinstance(operation_binding.get("quest_ref"), str)
+                     or operation_binding.get("root_kind") == "acquisition")
                 and operation_binding.get("quest_ref") == request.get("quest_ref")
             )
             if (
@@ -4613,8 +4614,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     )
                     if legacy_acquisition_target
                     else self._agent_runtime.query_acquisition_session(
-                        quest_ref=cast(str, operation_binding["quest_ref"])
-                    )
+                        session_ref=cast(str, operation_binding["root_session_ref"]))
+                    if operation_binding.get("root_kind") == "acquisition"
+                    else self._agent_runtime.query_acquisition_session(
+                        quest_ref=cast(str, operation_binding["quest_ref"]))
                 )
                 if (
                     session is not None

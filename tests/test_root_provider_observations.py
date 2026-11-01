@@ -30,6 +30,7 @@ def setup(tmp_path):
         "hc_deepfetch_requests": "request_ref TEXT,initialization_id TEXT,scope_json TEXT,scope_hash TEXT,draft_hash TEXT,created_at REAL",
         "hc_manual_deepfetch_requests": "request_ref TEXT,quest_ref TEXT,scope_json TEXT,scope_hash TEXT,quest_draft_hash TEXT,parent_question_ref TEXT,context_ref TEXT,created_at REAL",
         "ae_autonomous_deepfetch_requests": "request_ref TEXT,quest_ref TEXT,request_json TEXT,cycle_ref TEXT,reasoning_stage_run_request_ref TEXT,context_ref TEXT,created_at REAL",
+        "ar_run_controls": "run_ref TEXT,run_kind TEXT,quest_ref TEXT,root_session_ref TEXT,attempt_ref TEXT,attempt_generation INTEGER,runtime_binding_hash TEXT,status TEXT,updated_at REAL",
         "ar_stage_runs": "request_ref TEXT,root_session_ref TEXT",
         "ar_deepfetch_runs": "run_ref TEXT,request_ref TEXT,correlation_ref TEXT,status TEXT,runtime_binding_hash TEXT,provider_operation_ref TEXT,provider_operation_generation INTEGER,created_at REAL,updated_at REAL",
         "ar_deepfetch_sessions": "run_ref TEXT,root_session_ref TEXT,native_session_ref TEXT",
@@ -112,7 +113,7 @@ def acquisition(setup):
         req = f"request{i}"
         insert(db, "ar_acquisition_requests", {"request_id": req, "session_ref": "acq1", "status": "obtained",
             "created_at": i, "updated_at": i + 1, "completed_at": i + 1})
-        job = f"acquisition:acq1:batch:{req}"
+        job = f"acquisition:acq1:batch:{req}:acquisition_attempt_1"
         write_transport_envelope(receipts / f"turn-{i:08d}.json", {"schema_ref": "meta-research/acquisition-root-session/v1",
             "session_ref": "acq1", "generation": i, "native_session_ref": "acq-native",
             "previous_native_session_ref": None if i == 1 else "acq-native", "job_ref": job, "phase": "batch"}, key)
@@ -226,7 +227,10 @@ def test_acquisition_chain_cannot_jump_native_session(setup):
     path.unlink()
     write_transport_envelope(path, {**payload, "native_session_ref": "unrelated"}, key)
     result = setup[2].query("q1")
-    assert result["limited"] and not result["sessions"]
+    assert result["limited"]
+    assert {"code": "acquisition_session_chain_invalid"} in result["reasons"]
+    assert result["sessions"][0]["native_session_ref"] == "acq-native"
+    assert len(result["sessions"][0]["operations"]) == 1
 
 
 def test_nonterminal_deepfetch_without_bound_process_is_waiting(setup):
@@ -272,3 +276,58 @@ def test_terminal_stdout_hash_prevents_replaced_content(setup):
     path.write_text(stdout(label="modified"), encoding="utf-8")
     with pytest.raises(ValueError, match="root_session_output_integrity_invalid"):
         reader.query_output("q1", "df1", operation_ref=operation)
+
+
+@pytest.mark.parametrize("phase,initial", [("preflight", False), ("batch", False), ("preflight", True)])
+def test_acquisition_current_signed_attempt_is_visible_before_session_receipt(setup, phase, initial):
+    receipts, _ = acquisition(setup)
+    if initial:
+        for path in receipts.glob("turn-*.json"):
+            path.unlink()
+    historical_count = 0 if initial else 2
+    native = "initial-native" if initial else "acq-native"
+    db, base, reader = setup
+    generation = 4
+    if phase == "preflight":
+        run = "acquisition_preflight_" + canonical_hash({"session_ref": "acq1", "generation": generation})
+        attempt = f"acquisition_preflight_{generation}"
+        job = f"acquisition:acq1:preflight:{'c' * 64}:{generation}"
+    else:
+        run, attempt = "current-request", "acquisition_attempt_4"
+        job = f"acquisition:acq1:batch:{run}:{attempt}"
+        insert(db, "ar_acquisition_requests", {"request_id": run, "session_ref": "acq1", "status": "running",
+            "created_at": 4, "updated_at": 4})
+    with db.engine.begin() as conn:
+        conn.execute(text("UPDATE ar_acquisition_sessions SET preflight_generation=4,status=:status,current_request_id=:run"),
+            {"status": "probing" if phase == "preflight" else "acquiring", "run": run})
+    insert(db, "ar_run_controls", {"run_ref": run, "run_kind": "acquisition", "quest_ref": "q1",
+        "root_session_ref": "acq1", "attempt_ref": attempt, "attempt_generation": generation,
+        "runtime_binding_hash": "a" * 64, "status": "running", "updated_at": 4})
+    workspace = base / "acquisition-root-provider/codex-root"
+    directory = workspace / "provider-operations" / canonical_hash({"job_ref": job}) / "acquisition-root-turn"
+    directory.mkdir(parents=True)
+    key = (workspace / "provider-operations/.transport-seal.key").read_bytes()
+    write_transport_envelope(directory / "invocation.json", {"job_ref": job, "operation_name": "acquisition-root-turn",
+        "native_session_ref": None if initial else native}, key)
+    (directory / "stdout.jsonl").write_text(stdout(native, "CURRENT_OUTPUT"), encoding="utf-8")
+    observed = reader.query("q1")
+    assert not observed["limited"]
+    operations = observed["sessions"][0]["operations"]
+    assert len(operations) == historical_count + 1
+    assert any("CURRENT_OUTPUT" in reader.query_output("q1", "acq1", operation_ref=op["operation_ref"])["text"]
+        for op in operations)
+    # A signed spool is insufficient when the registered AR scope belongs elsewhere.
+    with db.engine.begin() as conn:
+        conn.execute(text("UPDATE ar_run_controls SET quest_ref='q2'"))
+    assert len(reader.query("q1")["sessions"][0]["operations"]) == historical_count
+    with db.engine.begin() as conn:
+        conn.execute(text("UPDATE ar_run_controls SET quest_ref='q1',root_session_ref='another-session'"))
+    assert len(reader.query("q1")["sessions"][0]["operations"]) == historical_count
+    with db.engine.begin() as conn:
+        conn.execute(text("UPDATE ar_run_controls SET root_session_ref='acq1',runtime_binding_hash='another-runtime'"))
+    result = reader.query("q1")
+    assert result["limited"] and len(result["sessions"][0]["operations"]) == historical_count
+    # Without matching AR scope, do not guess a latest operation from the spool.
+    with db.engine.begin() as conn:
+        conn.execute(text("DELETE FROM ar_run_controls"))
+    assert len(reader.query("q1")["sessions"][0]["operations"]) == historical_count

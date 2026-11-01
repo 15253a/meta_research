@@ -5,7 +5,7 @@ import stat
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.research_memory import AssetIntakeRequest
-from meta_research.research_content import _quest, _reading_quest
+from meta_research.research_content import _quest, _reading_quest, _reader
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from sqlalchemy import text
 
@@ -65,6 +65,11 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
         try:
             quest = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
                 human_collaboration=human_collaboration)
+            def status(asset_ref):
+                value = memory.query_asset_status(asset_ref)
+                history = value["history_reader"]
+                return {**value, "history_reader": {**history,
+                    "args": _reader(history["args"], arguments.get("source_quest_ref"))}}
             if action == "page":
                 offset, limit = arguments.get("offset", 0), arguments.get("limit", 20)
                 with memory._database.read() as connection:
@@ -85,7 +90,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     )
                 items = []
                 for asset_ref in refs[:limit]:
-                    lifecycle = memory.query_asset_status(asset_ref)
+                    lifecycle = status(asset_ref)
                     version_ref = lifecycle['version_ref']
                     graph.verify_asset_quest_scope(version_ref, quest_ref=quest)
                     asset = memory.query_asset_version(version_ref)
@@ -111,7 +116,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                 lifecycle = memory.query_asset_lifecycle(asset.asset_ref)
                 lifecycle["reference_revision"] = graph.query_asset_reference_revision()
                 return lifecycle
-            lifecycle = memory.query_asset_status(asset.asset_ref)
+            lifecycle = status(asset.asset_ref)
             current = memory.query_current_asset(asset.asset_ref)
             return {
                 "lifecycle": lifecycle,

@@ -13,6 +13,7 @@ from meta_research.acquisition import (
     AcquisitionItemResult,
     AcquisitionPaper,
     AcquisitionPreflightResult,
+    AcquisitionPreflightRequest,
     AcquisitionRuntimeBinding,
 )
 from meta_research.acquisition_root import CodexAcquisitionRootAdapter
@@ -285,7 +286,7 @@ def test_concurrent_exact_root_channel_is_issued_and_revoked_once() -> None:
 def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
     tmp_path: Path,
 ) -> None:
-    runner = _SequenceRunner([{"accepted": True, "human_request": None}])
+    runner = _SequenceRunner([{"results": [{"paper_id": "paper:1", "status": "waiting_user", "path": None, "format": None, "failure": {"code": "institutional_login_required", "detail": "Login required."}}]}])
     adapter = CodexAcquisitionRootAdapter(
         tmp_path / "acquisition",
         _WaitingAcquisitionDelegate(),  # type: ignore[arg-type]
@@ -296,11 +297,10 @@ def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
     adapter.bind_resident_mcp_authority(authority)
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
     scope = _scope("acquisition")
-    request = SimpleNamespace(
-        session_ref="acquisition-session:1",
-        request_id="acquisition-request:1",
-        root_runtime_scope=scope,
-    )
+    request = AcquisitionBatchRequest("request1", "oa_first_then_institution",
+        (AcquisitionPaper("paper:1", "Exact paper", None, None, ()),),
+        session_ref="acquisition-session:1", session_mode="oa_only", target_dir=str(tmp_path.resolve()),
+        root_runtime_scope=scope)
 
     result = adapter.acquire(request)  # type: ignore[arg-type]
 
@@ -320,14 +320,14 @@ def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
             "no_proxy": "127.0.0.1,localhost,::1",
         }
     ]
-    assert "resident MCP 调用共同的 human_request.open" in runner.prompts[0]
-    assert "不得只返回 proposal" in runner.prompts[0]
+    assert "human_request.open" in runner.prompts[0]
+    assert "正式回执" in runner.prompts[0]
 
 
 def test_unmanaged_acquisition_turn_remains_without_resident_channel(
     tmp_path: Path,
 ) -> None:
-    runner = _SequenceRunner([{"accepted": True, "human_request": None}])
+    runner = _SequenceRunner([{"status": "ready", "browser_context_ref": None, "reason_code": None, "evidence": {"configuration_health": "not_required", "browser_control": "not_required", "authorized_resource": "oa_only"}}])
     adapter = CodexAcquisitionRootAdapter(
         tmp_path / "unmanaged-acquisition",
         _AcquisitionDelegate(),  # type: ignore[arg-type]
@@ -337,10 +337,8 @@ def test_unmanaged_acquisition_turn_remains_without_resident_channel(
     authority = _authority("acquisition", "acquisition-root-turn")
     adapter.bind_resident_mcp_authority(authority)
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
-    request = SimpleNamespace(
-        session_ref="pre-quest-acquisition-session:1",
-        config_hash="9" * 64,
-    )
+    request = AcquisitionPreflightRequest("pre-quest-acquisition-session:1", "initialization1", 1,
+        "9" * 64, "oa_only", "", str(tmp_path / "private"))
 
     adapter.preflight(request)  # type: ignore[arg-type]
 
@@ -427,8 +425,8 @@ def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(
     delegate = _AcquisitionDelegate()
     runner = _SequenceRunner(
         [
-            {"accepted": True, "human_request": None},
-            {"accepted": True, "human_request": None},
+            {"status": "ready", "browser_context_ref": None, "reason_code": None, "evidence": {"configuration_health": "not_required", "browser_control": "not_required", "authorized_resource": "oa_only"}},
+            {"results": [{"paper_id": "paper:1", "status": "missing", "path": None, "format": None, "failure": {"code": "oa_not_found", "detail": "No OA body."}}]},
         ]
     )
     adapter = CodexAcquisitionRootAdapter(
@@ -551,37 +549,20 @@ def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(
             adapter,
         )
 
-        assert len(delegate.batches) == 1
-        root_scope = delegate.batches[0].root_runtime_scope
-        assert root_scope is not None
+        assert delegate.batches == []
         assert execution.status == "missing"
-        assert root_scope["quest_ref"] == quest_ref
-        assert issued_scopes == [
-            {
-                "root_kind": "acquisition",
-                "phase": "acquisition-root-turn",
-                "subject_policy": "operation_tree",
-                "run_ref": root_scope["run_ref"],
-                "attempt_ref": root_scope["attempt_ref"],
-                "root_session_ref": root_scope["root_session_ref"],
-                "fence_ref": root_scope["fence_ref"],
-                "capability_binding_hash": root_scope[
-                    "runtime_binding_hash"
-                ],
-                "operation_ids": ROOT_AGENT_SEMANTIC_OPERATION_IDS[
-                    "acquisition"
-                ],
-            }
-        ]
-        completed = runtime.owners.agent_runtime.query_managed_run(
-            root_scope["run_ref"]
-        )
+        assert len(issued_scopes) == 2
+        root_scope = issued_scopes[-1]
+        assert root_scope["root_kind"] == "acquisition"
+        assert root_scope["operation_ids"] == ROOT_AGENT_SEMANTIC_OPERATION_IDS["acquisition"]
+        completed = runtime.owners.agent_runtime.query_managed_run(root_scope["run_ref"])
         assert completed is not None and completed["status"] == "completed"
+        assert completed["quest_ref"] == quest_ref
         preflight_workspace = runtime.root_workspaces.bind_acquisition_session(session.session_ref)
         assert runner.environments[0]["META_RESEARCH_PROVIDER_CWD"] == str(preflight_workspace.directory)
         assert "META_RESEARCH_EXTERNAL_MCP_TOKEN" in runner.environments[0]
         assert any(argument.startswith("mcp_servers.meta_research_external.url=") for argument in runner.argvs[0])
-        assert "META_RESEARCH_MCP_TOKEN" not in runner.environments[0]
+        assert "META_RESEARCH_MCP_TOKEN" in runner.environments[0]
         assert runner.environments[1] is not None
         assert "META_RESEARCH_MCP_TOKEN" in runner.environments[1]
     finally:

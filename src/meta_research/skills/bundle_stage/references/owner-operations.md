@@ -8,7 +8,7 @@
 
 AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan、Target／依赖／frontier、方法、Run／评价及领域接纳；RM 管不可变内容、AssetVersion、保管和完整性；AR 管执行、根会话、Fence、single-flight 和恢复；Harness 运行原生工具与子智能体。Bundle 管候选、范围、顺序和跨 Target 依赖，Target 根管实际实施与最终交接。
 
-子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授资源接口登记 Dataset／Environment。普通 Literature 登记、用途关联及 Target 阅读判断索引尚待 #270 接通；目前保留真实文献来源、保管状态、阅读判断和具体受阻步骤，不能把缺少入口当作无候选或已完成登记。入口实际接通并获授后，再沿相应合同登记或关联。未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
+子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授资源接口登记 Dataset／Environment。普通 Literature 沿 research_memory.literature.register／reference 登记来源、原件及阅读用途，再用 .read 与 content.read 查回准确记录和内容。遵循共享研究导航的 Literature 合同；接口不可用或失败保留具体受阻步骤，不算无候选或已完成。未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
 
 确需改变 Quest 整体目标或完成标准时，读[正式目标演化流程](../../references/cycle-work.md)，判断实际变化并沿有效基准继承未变内容。本阶段仍核对本操作冻结的 Goal／条件／工作切面，不确定效果沿原操作对账。新工作使切面 stale 时，由新逻辑根操作取得新切面；不改写已接纳 FormalPlan 或旧调用。
 

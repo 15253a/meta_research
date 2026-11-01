@@ -51,9 +51,10 @@ def bind_live_guidance(authority, scope, binding):
         state.update(authority=authority, scope=scope, binding=binding)
 
 
-def live_native_argv(argv, directory, *, enabled=True):
+def live_native_argv(argv, directory, *, enabled=True, force_transport=False):
     state = _operation.get()
-    if not enabled or state is None or state["binding"] is None:
+    has_guidance = state is not None and state["binding"] is not None
+    if not enabled or not (has_guidance or force_transport):
         return argv
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -64,9 +65,10 @@ def live_native_argv(argv, directory, *, enabled=True):
             raise OSError("native_provider_identity_conflict")
     else:
         write_transport_envelope(original, {"argv": argv}, key)
-    pump = _GuidancePump(state["authority"], state["scope"], state["binding"], directory, key)
-    state["pumps"].append(pump)
-    pump.start()
+    if has_guidance:
+        pump = _GuidancePump(state["authority"], state["scope"], state["binding"], directory, key)
+        state["pumps"].append(pump)
+        pump.start()
     wrapped = [sys.executable, "-m", "meta_research.native_codex_bridge",
                "--provider-argv", str(original), "--operation-directory", str(directory)]
     # The mature supervisor binds these exact paths before launching any

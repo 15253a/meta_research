@@ -41,7 +41,12 @@ python3 "$DEEPFETCH_ROOT/scripts/papers.py" apply-reader \
 主智能体写完 `summary.md` 后运行：
 
 ```bash
-python3 "$DEEPFETCH_ROOT/scripts/papers.py" finalize --out-dir "$OUTPUT_DIR"
+python3 "$DEEPFETCH_ROOT/scripts/papers.py" finalize --out-dir "$OUTPUT_DIR" \
+  --literature-access-mode "$LITERATURE_ACCESS_MODE"
 ```
 
 `validate` 检查进行中的稀疏台账；`validate --final` 只检查最终门槛，不清理。仅调试或需恢复时给 `finalize` 添加 `--keep-debug-state`。完成条件是公开文件与阅读状态一致、引用可解析，工具校验通过；命令成功不替代综述内容核查。
+
+`LITERATURE_ACCESS_MODE` 使用本请求宿主确认的有效模式。`provided_only` 校验要求 `dimensions_used=[]`、`active_search_elapsed_seconds=0`，不要求不存在的外部检索概念或发现维度；外部发现模式仍保持三维检索要求。宿主导入独立使用已核验模式，不信任模型自行选择校验模式。
+
+主动检索截止或有据提前停止时，调用 `update-run --stopping-reason "实际理由"`，用重复的 `--freeze-paper-id` 指明仍在获取的目标；工具同时冻结已登记全文及已分配 Reader 的论文。到达所选预算的 `--elapsed` 也触发冻结。此后只允许冻结目标完成获取／阅读或同文重试，不允许扩展冻结集合、晋升候补或新增发现条目。纯等人不增加 `--elapsed`。

@@ -90,3 +90,11 @@ Environment 保存可复用研究资源的含义、来源与使用知识，可�
 采用资源时用 research_graph.environments.reference 关联当前 question_ref、适用 research_ref 和 purpose，并读回用途。已知另一 Quest 的精确 environment_ref 时，可显式 reference 到当前 Question；Owner 核验来源快照及每个数字 binding 在目标 Quest 的正式接纳，无数字材料的设备按真实来源引用。接纳引用后才从当前 Quest 的 page/read 读取，不据此遍历其他 Quest 或相邻目录。未知效果用同一 effect_id reconcile。登记和用途记录不改变本次运行条件、使用权限或资源实际状态；本轮选卡、预算与文献范围以当前运行条件为准，使用前按任务需要核实资源可用性。说明文件 hash 只标识说明，不证明实体被冻结或已核验。
 
 本 Target 新建或改动的资源先沿真实 Baseline／Variant／VariantRun 保存并正式接纳，再由 Bundle／Reasoning 与 Dataset 在同一整理核验环节登记；接纳前交接 environment_candidates，暂存产物留在工作区。已有资源的直接登记记录其既有来源，不能代替本次成果的正式交接。换机器所需适配或修复作为新 Target 保存并关联原环境，不影响原环境的入库资格；未完成 Target 的中间产物不提前发布或消费。
+
+### 普通 Literature 的登记与阅读用途
+
+整理选中可复用的普通文献时，先沿既有 RM intake／Target 正式交接保管所需原件，再调用 research_memory.literature.register。record_ref 保留准确 DOI 或 URL 身份，title／source 写外部作者、出版及实际获取来源，asset_bindings 只填当前 Quest 已接纳的准确原件；fulltext_status=obtained 需要原件 binding，未取得填 missing／waiting_user，metadata 说明限制与失败。登记不制造 DeepFetch Run，不表示读懂或科学接纳。
+
+用 .reference 将 literature_ref 与 question_ref、purpose、适用 research_ref 关联。reading_summary 记录实际阅读判断、主张、反证与限制；reading_bindings 引用本次分析的已接纳 RM 版本，与外部原文绑定分开。Target 阅读用其真实 target_ref 或 target_commit_ref 及该 Target 已接纳的 research_notes，不能把同 Quest 无关笔记归给它。无需改写原件生产者；普通文献沿 AssetVersion 采用来源进入统一 reader，DeepFetch 文献继续沿 LiteratureSnapshot。
+
+登记／关联用同一 effect_id 的 .reconcile 处理未知效果。用 .read(literature_ref) 查回文献或用途记录，.page 联合发现普通及 DeepFetch 文献；原件在 readers、阅读判断在 judgments，逐个按返回 source_ref／version_ref／entry_path 调 content.read，沿 next_offset 读完。缺原件、失效授权、内容漂移和技术失败按实际错误交接，不解释成无候选。空候选或无保留价值可无记录；已成功步骤读回后继续未完成部分，不重复研究或复制原件。

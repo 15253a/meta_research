@@ -16,7 +16,7 @@ from sqlalchemy import text
 from meta_research.owners.common import canonical_hash
 from meta_research.child_session_observations import read_child_sessions, append_child_sessions
 from meta_research.provider_supervisor import (
-    ProviderSupervisorError, provider_operation_ref, read_transport_envelope,
+    ProviderSupervisorError, provider_operation_ref, read_transport_envelope, read_verified_exit_receipt,
 )
 
 _MAX_RECORDS = 512
@@ -77,7 +77,7 @@ class ProviderRootObservations:
                 source_bytes, mtime = stat.st_size, stat.st_mtime
                 if source_bytes > _MAX_SOURCE_BYTES:
                     raise ValueError("root_session_output_source_too_large")
-                native = self._native(path, operation["native"])
+                native = operation["native"] if operation.get("native_rejected") else self._native(path, operation["native"])
                 if native is None:
                     visible, projected_bytes, limited = b"", 0, bool(source_bytes)
                 else:
@@ -304,60 +304,163 @@ class ProviderRootObservations:
         key = self._key(workspace)
         receipts_dir = workspace / "root-sessions" / hashlib.sha256(row["session_ref"].encode()).hexdigest()
         jobs, native = {}, None
+        codex_workspace = workspace / "codex-root"
+        if not codex_workspace.exists():
+            return session, {}
+        op_key = self._key(codex_workspace)
+
+        def directory_for(job):
+            if not isinstance(job,str) or not job.startswith(f"acquisition:{row['session_ref']}:"):
+                raise ValueError("acquisition_operation_identity_invalid")
+            return codex_workspace / "provider-operations" / canonical_hash({"job_ref":job}) / "acquisition-root-turn"
+
+        chain_valid = True
         if receipts_dir.exists():
             self._safe(receipts_dir)
             markers = sorted(receipts_dir.glob("turn-*.json"))
             if len(markers) > _MAX_RECORDS:
                 reasons.add("root_session_operations_limited")
+                chain_valid = False
             for generation, path in enumerate(markers[:_MAX_RECORDS], 1):
-                self._safe(path, file=True)
-                receipt = read_transport_envelope(path, key)
-                if (path.name != f"turn-{generation:08d}.json" or
-                    receipt.get("schema_ref") != _ACQ_SCHEMA or
-                    receipt.get("session_ref") != row["session_ref"] or
-                    receipt.get("generation") != generation or
-                    receipt.get("previous_native_session_ref") != native or
-                    not isinstance(receipt.get("native_session_ref"), str) or
-                    not receipt["native_session_ref"]):
-                    raise ValueError("acquisition_session_chain_invalid")
-                if native is not None and native != receipt["native_session_ref"]:
-                    raise ValueError("acquisition_native_session_changed")
-                native = receipt["native_session_ref"]
-                jobs[receipt["job_ref"]] = (receipt["phase"], "completed")
-        generation = row["preflight_generation"]
-        preflight = f"acquisition:{row['session_ref']}:preflight:{row['config_hash']}"
-        if generation > 1:
-            preflight += f":generation:{generation}"
-        jobs.setdefault(preflight, ("preflight", status if row["status"] == "probing" else "completed"))
-        for request in requests:
-            active = row["current_request_id"] == request["request_id"] and row["status"] == "acquiring"
-            op_status = "executing" if active else _status(request["status"])
-            for phase in ("batch", "reconcile"):
-                job = f"acquisition:{row['session_ref']}:{phase}:{request['request_id']}"
-                jobs.setdefault(job, (phase, op_status))
+                try:
+                    self._safe(path,file=True)
+                    receipt = read_transport_envelope(path,key)
+                    previous = native
+                    if (path.name != f"turn-{generation:08d}.json" or receipt.get("schema_ref") != _ACQ_SCHEMA
+                            or receipt.get("session_ref") != row["session_ref"] or receipt.get("generation") != generation
+                            or receipt.get("previous_native_session_ref") != previous
+                            or not isinstance(receipt.get("native_session_ref"),str) or not receipt["native_session_ref"]
+                            or receipt.get("phase") not in {"preflight","batch"}):
+                        raise ValueError("acquisition_session_chain_invalid")
+                    job = receipt["job_ref"]
+                    directory_for(job)
+                    replacement = receipt.get("replacement")
+                    if replacement is not None:
+                        if not isinstance(replacement,dict) or set(replacement) != {"job_ref","recovery_checkpoint"}:
+                            raise ValueError("acquisition_replacement_invalid")
+                        failed_job = replacement["job_ref"]
+                        checkpoint = self._acquisition_replacement_checkpoint(directory_for(failed_job),op_key,failed_job,previous)
+                        if (checkpoint is None or receipt["native_session_ref"] == previous
+                                or checkpoint != replacement["recovery_checkpoint"] or job != (
+                                failed_job + ":replacement:" + canonical_hash(checkpoint))):
+                            raise ValueError("acquisition_replacement_invalid")
+                        jobs[failed_job] = (receipt["phase"],"failed",previous,previous,True,True)
+                        input_native = None
+                    else:
+                        if previous is not None and receipt["native_session_ref"] != previous:
+                            raise ValueError("acquisition_native_session_changed")
+                        input_native = previous
+                    native = receipt["native_session_ref"]
+                    jobs[job] = (receipt["phase"],"completed",native,input_native,False,True)
+                except (OSError,ValueError,KeyError,TypeError,ProviderSupervisorError):
+                    # Keep verified history visible while explicitly reporting
+                    # the broken continuation; never guess the next identity.
+                    reasons.add("acquisition_session_chain_invalid")
+                    chain_valid = False
+                    break
+
+        if chain_valid:
+            with self._database.read() as connection:
+                controls = connection.execute(text("SELECT run_ref,attempt_ref,status,attempt_generation,runtime_binding_hash "
+                    "FROM ar_run_controls WHERE run_kind='acquisition' AND root_session_ref=:session "
+                    "AND (quest_ref=:quest OR quest_ref IS NULL) ORDER BY updated_at LIMIT :limit"),
+                    {"session":row["session_ref"],"quest":quest_ref,"limit":_MAX_RECORDS+1}).mappings().all()
+            if len(controls)>_MAX_RECORDS:
+                reasons.add("root_session_operations_limited")
+            requests_by_id = {r["request_id"]:r for r in requests}
+            current_generation = row["preflight_generation"]
+            preflight_run = "acquisition_preflight_" + canonical_hash({"session_ref":row["session_ref"],"generation":current_generation})
+            for control in controls[:_MAX_RECORDS]:
+                if control["runtime_binding_hash"] != row["runtime_binding_hash"]:
+                    reasons.add("acquisition_root_operation_unavailable")
+                    continue
+                if control["run_ref"] == preflight_run:
+                    phase = "preflight"
+                    if control["attempt_ref"] != f"acquisition_preflight_{current_generation}" or control["attempt_generation"] != current_generation:
+                        reasons.add("acquisition_root_operation_unavailable")
+                        continue
+                    job = f"acquisition:{row['session_ref']}:preflight:{row['config_hash']}:{current_generation}"
+                elif control["run_ref"] in requests_by_id:
+                    phase = "batch"
+                    job = f"acquisition:{row['session_ref']}:batch:{control['run_ref']}:{control['attempt_ref']}"
+                else:
+                    continue
+                if job in jobs:
+                    continue
+                directory = directory_for(job)
+                if not directory.exists():
+                    continue
+                try:
+                    checkpoint = self._acquisition_replacement_checkpoint(directory,op_key,job,native)
+                    jobs[job] = (phase,_status(control["status"]),native,native,checkpoint is not None,False)
+                    if checkpoint is not None:
+                        replacement_job = job + ":replacement:" + canonical_hash(checkpoint)
+                        if replacement_job not in jobs:
+                            jobs[replacement_job] = (phase,_status(control["status"]),None,None,False,False)
+                except (OSError,ValueError,KeyError,TypeError,ProviderSupervisorError):
+                    reasons.add("acquisition_root_operation_unavailable")
+
         discovered = {}
-        codex_workspace = workspace / "codex-root"
-        if not codex_workspace.exists():
-            session["native_session_ref"] = native
-            return session, discovered
-        op_key = self._key(codex_workspace)
-        for job, (phase, op_status) in jobs.items():
-            if not job.startswith(f"acquisition:{row['session_ref']}:"):
-                raise ValueError("acquisition_operation_identity_invalid")
-            directory = codex_workspace / "provider-operations" / canonical_hash({"job_ref": job}) / "acquisition-root-turn"
+        for job,(phase,op_status,expected_native,input_native,native_rejected,required) in jobs.items():
+            directory = directory_for(job)
             if not directory.exists():
+                if required:
+                    reasons.add("acquisition_root_operation_unavailable")
                 continue
             try:
-                operation = self._operation(directory, op_key, {
-                    "job_ref": job, "operation_name": "acquisition-root-turn"},
-                    native, "Acquisition", phase, op_status)
-                if operation is not None:
-                    native = operation["native"] or native
-                    self._append(session, operation, discovered)
-            except (OSError, ValueError, ProviderSupervisorError):
+                operation = self._operation(directory,op_key,{"job_ref":job,
+                    "operation_name":"acquisition-root-turn","native_session_ref":input_native},
+                    expected_native,"Acquisition",phase,op_status,native_rejected=native_rejected)
+                if operation is None:
+                    if required:
+                        reasons.add("acquisition_root_operation_unavailable")
+                    continue
+                native = operation["native"] or native
+                self._append(session,operation,discovered)
+            except (OSError,ValueError,ProviderSupervisorError):
                 reasons.add("acquisition_root_operation_unavailable")
         session["native_session_ref"] = native
-        return session, discovered
+        return session,discovered
+
+    def _acquisition_replacement_checkpoint(self,directory,key,job,native):
+        """Read the same exact no-rollout proof as the adapter, without writing."""
+        from meta_research.idea_skill import (
+            _provider_native_session_unavailable, _verified_operation_inputs, IdeaSkillUnavailable,
+        )
+        if native is None or not (directory / "native-resume-rejected.json").exists():
+            return None
+        self._safe(directory)
+        for filename in ("invocation.json","supervisor-exit.json","prompt.txt","output-schema.json",
+                         "stdout.jsonl","native-resume-rejected.json","native-provider-argv.json"):
+            self._safe(directory / filename,file=True)
+        self._safe(directory / "last-message.json",file=True,optional=True)
+        self._safe(directory / "business-input.json",file=True,optional=True)
+        if (directory / "stdout.jsonl").stat().st_size > _MAX_SOURCE_BYTES:
+            raise ValueError("root_session_output_source_too_large")
+        invocation = read_transport_envelope(directory / "invocation.json",key)
+        if (invocation.get("job_ref") != job or invocation.get("operation_name") != "acquisition-root-turn"
+                or invocation.get("native_session_ref") != native):
+            raise ValueError("acquisition_replacement_invalid")
+        digest = canonical_hash(invocation)
+        try:
+            prompt_hash, schema_hash, _ = _verified_operation_inputs(directory,invocation_hash=digest)
+        except IdeaSkillUnavailable as error:
+            raise ValueError("acquisition_replacement_invalid") from error
+        receipt,envelope = read_verified_exit_receipt(directory / "supervisor-exit.json",key=key,
+            invocation_hash=digest,prompt_path=directory / "prompt.txt",schema_path=directory / "output-schema.json",
+            stdout_path=directory / "stdout.jsonl",result_path=directory / "last-message.json")
+        marker = {"invocation_hash":digest,"returncode":receipt["returncode"],"termination_reason":receipt["termination_reason"],
+            "prompt_hash":prompt_hash,"output_schema_hash":schema_hash,
+            "stdout_hash":canonical_hash((directory / "stdout.jsonl").read_text(encoding="utf-8")),
+            "result_file_hash":receipt["result_file_hash"],"supervisor_receipt_hash":canonical_hash(envelope)}
+        try:
+            unavailable = _provider_native_session_unavailable(directory,marker,native)
+        except IdeaSkillUnavailable as error:
+            raise ValueError("acquisition_replacement_invalid") from error
+        if unavailable is None:
+            raise ValueError("acquisition_replacement_invalid")
+        return unavailable.recovery_checkpoint
+
 
     def _append(self, session, operation, discovered):
         public = operation["public"]
@@ -366,7 +469,7 @@ class ProviderRootObservations:
         discovered[(session["session_ref"], public["operation_ref"])] = operation
         session["updated_at"] = max(session["updated_at"], public["updated_at"])
 
-    def _operation(self, directory, key, expected, native, label, phase, default_status):
+    def _operation(self, directory, key, expected, native, label, phase, default_status, *, native_rejected=False):
         self._safe(directory)
         invocation_path = directory / "invocation.json"
         if not invocation_path.exists():
@@ -385,7 +488,7 @@ class ProviderRootObservations:
         source_mtime = invocation_path.stat().st_mtime
         if path.exists():
             self._safe(path, file=True)
-            observed_native = self._native(path, observed_native)
+            observed_native = observed_native if native_rejected else self._native(path, observed_native)
             source_mtime = max(source_mtime, path.stat().st_mtime)
         invocation_hash = canonical_hash(invocation)
         status, terminal_hash = default_status, None
@@ -409,7 +512,7 @@ class ProviderRootObservations:
                 status = "waiting"
         operation_ref = "provider-root-operation:" + canonical_hash({
             "directory": str(directory.relative_to(self._root)), "invocation_hash": invocation_hash})
-        return {"directory": directory, "native": observed_native,
+        return {"directory": directory, "native": observed_native, "native_rejected": native_rejected,
                 "invocation_hash": invocation_hash, "terminal_hash": terminal_hash,
                 "public": {"operation_ref": operation_ref, "label": f"{label} · {phase}",
                     "phase": phase, "status": status,

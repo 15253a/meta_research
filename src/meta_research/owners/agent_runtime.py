@@ -2102,7 +2102,7 @@ def _acquisition_preflight_runtime_effect(
 
 def _acquisition_root_runtime_scope(
     *,
-    quest_ref: str,
+    quest_ref: str | None,
     session_ref: str,
     runtime_binding_hash: str,
     generation: int,
@@ -7525,10 +7525,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or not isinstance(generation, int)
                 or isinstance(generation, bool)
                 or generation < 1
-                or not isinstance(quest_ref, str)
-                or not quest_ref
+                or (not (run_kind == "acquisition" and quest_ref is None)
+                    and (not isinstance(quest_ref, str) or not quest_ref))
             ):
                 raise OwnerConflict("root_agent_human_request_scope_stale")
+            if run_kind == "acquisition":
+                session = self.query_acquisition_session(session_ref=root_session_ref)
+                if session is None or session.quest_ref != quest_ref:
+                    raise OwnerConflict("root_agent_human_request_scope_stale")
             return {
                 "run_kind": run_kind,
                 "quest_ref": quest_ref,
@@ -11880,6 +11884,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             session_ref=session_ref,
             generation=generation,
         )
+        root_scope = _acquisition_root_runtime_scope(
+            quest_ref=None if existing_session is None else existing_session.quest_ref,
+            session_ref=session_ref, runtime_binding_hash=runtime_binding_hash,
+            generation=generation, effect=protection_effect)
+        self.register_external_root_task_scope(root_kind="acquisition", root_runtime_scope=root_scope)
+        provider_request = replace(provider_request, root_runtime_scope=root_scope)
         protection_ready = True
         if self._runtime_protection is not None:
             try:
@@ -12043,6 +12053,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         session = self.query_acquisition_session(session_ref=session_ref)
         assert session is not None
         self._reconcile_acquisition_human_requests(session_ref)
+        if final_status == "ready":
+            self.complete_external_root_task_scope(root_kind="acquisition", root_runtime_scope=root_scope)
         return session
 
     def query_acquisition_session(
@@ -13012,10 +13024,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
             if (
                 facts.get("route") != "institutional_browser_reconnected"
-                or not isinstance(quest_ref, str)
+                or not isinstance(operation_binding, dict)
             ):
                 return None
-            session = self.query_acquisition_session(quest_ref=quest_ref)
+            session = (
+                self.query_acquisition_session(session_ref=str(operation_binding["root_session_ref"]))
+                if operation_binding.get("root_kind") == "acquisition"
+                else self.query_acquisition_session(quest_ref=quest_ref)
+                if isinstance(quest_ref, str) else None)
             if session is None:
                 return None
             preflight_ref = _acquisition_preflight_runtime_effect(
@@ -14022,9 +14038,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             attempt_count=attempt_count,
         )
         root_runtime_scope: dict[str, object] | None = None
-        if isinstance(session_row.quest_ref, str) and session_row.quest_ref:
+        if session_row.quest_ref is None or isinstance(session_row.quest_ref, str):
             root_runtime_scope = _acquisition_root_runtime_scope(
-                quest_ref=str(session_row.quest_ref),
+                quest_ref=session_row.quest_ref,
                 session_ref=session_ref,
                 runtime_binding_hash=runtime_binding_hash,
                 generation=attempt_count,
@@ -15143,6 +15159,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             creation_context_ref=request.creation_context_ref,
             quest_ref=request.quest_ref,
             literature_access_mode=verified_acquisition_session.mode,
+            previous_job_ref=(
+                str(existing.provider_operation_ref)
+                if existing is not None and not reconcile_only
+                and existing.provider_operation_ref != job_ref
+                and existing.runtime_binding_hash == runtime_binding_hash
+                else None
+            ),
         )
         try:
             self.begin_provider_unit(
@@ -29827,6 +29850,8 @@ def _validated_external_root_task_scope(
         raise OwnerConflict("external_root_task_scope_invalid")
     for name in ("quest_ref", "attempt_ref", "root_session_ref", "fence_ref"):
         value = root_runtime_scope.get(name)
+        if name == "quest_ref" and root_kind == "acquisition" and value is None:
+            continue
         if (
             not isinstance(value, str)
             or not value.strip()
@@ -29898,7 +29923,7 @@ def _external_root_task_scope_document(row) -> dict[str, object]:
     return {
         "root_kind": str(row.run_kind),
         "root_runtime_scope": {
-            "quest_ref": str(row.quest_ref),
+            "quest_ref": row.quest_ref,
             "run_ref": str(row.run_ref),
             "attempt_ref": str(row.attempt_ref),
             "root_session_ref": str(row.root_session_ref),
