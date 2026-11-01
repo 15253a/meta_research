@@ -112,8 +112,6 @@ def test_three_committed_targets_allow_next_batch_without_rebinding(tmp_path, mo
         "required_measurement_unit_keys"
     ] = cells
     template = target_plan["initial_strategy_update"]["candidates"][0]
-    # This shared fixture predates the removal of TargetCandidate.reuse_trace.
-    template["candidate"].pop("reuse_trace")
     specs = []
     for index, cell in enumerate(cells):
         spec = deepcopy(template)
