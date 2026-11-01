@@ -14,6 +14,52 @@ from test_public_manual_question_lifecycle import _build_runtime, _accept_root_q
 from test_public_human_collaboration_web import _authenticated_client
 
 
+def test_assistant_files_read_only_the_requested_page(tmp_path, monkeypatch):
+    import meta_research.root_workspace as module
+    runtime = _build_runtime(tmp_path / "runtime")
+    client, headers = _authenticated_client(runtime)
+    try:
+        quest_ref, _ = _accept_root_question(runtime, "paged-files")
+        scope = "quest:" + quest_ref
+        session = runtime.owners.human_collaboration.query_companion(scope)
+        assert session["session_ref"] is not None
+        workspace = runtime.root_workspaces.bind_companion_session(scope, session["session_ref"]).directory
+        for index in range(8):
+            (workspace / f"result-{index}.txt").write_text(str(index))
+        reads = []
+        original = module._read_bytes
+        def read(root, path):
+            reads.append(path)
+            return original(root, path)
+        monkeypatch.setattr(module, "_read_bytes", read)
+        # A later subtree is beyond the page and must not be walked at all.
+        later = workspace / "z-later"
+        later.mkdir()
+        for index in range(8):
+            (later / f"ignored-{index}.txt").write_text("not requested")
+        monkeypatch.setattr(module, "_MAX_SCAN_FILES", 7)
+        response = client.get("/api/v1/companion/files", params={
+            "scope_ref": scope, "offset": 2, "limit": 2}, headers=headers)
+        assert response.status_code == 200, response.text
+        assert reads == ["result-2.txt", "result-3.txt"]
+        assert response.json()["next_offset"] == 4
+        def disappearing(root, path):
+            if path == "result-0.txt":
+                raise module.SemanticMcpError("workspace_file_unsafe")
+            return original(root, path)
+        monkeypatch.setattr(module, "_read_bytes", disappearing)
+        first = client.get("/api/v1/companion/files", params={
+            "scope_ref": scope, "limit": 2}, headers=headers).json()
+        assert [item["path"] for item in first["files"]] == ["result-1.txt", "result-2.txt"]
+        assert first["next_offset"] == 3
+        second = client.get("/api/v1/companion/files", params={
+            "scope_ref": scope, "offset": first["next_offset"], "limit": 2}, headers=headers).json()
+        assert [item["path"] for item in second["files"]] == ["result-3.txt", "result-4.txt"]
+    finally:
+        client.close()
+        runtime.close()
+
+
 def test_writing_enters_new_ordinary_conversation_once_and_keeps_editable_files(tmp_path):
     provider = DeterministicDraftingAdapter()
     runtime = _build_runtime(tmp_path / "runtime", drafting=provider)

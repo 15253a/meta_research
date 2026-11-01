@@ -71,3 +71,75 @@ def test_assistant_catalog_does_not_grant_research_writes():
     assert "research_memory.assets.retire" not in catalog
     assert "research_graph.artifact_roles.adjust" not in catalog
     assert "acquisition.request" not in catalog
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_configured_model_does_not_follow_redirects(tmp_path, status):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    received = []
+    class Endpoint(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append((self.path, self.headers.get("Authorization")))
+            self.send_response(status)
+            self.send_header("Location", f"http://localhost:{self.server.server_port}/unconfigured")
+            self.end_headers()
+
+        do_GET = do_POST
+
+        def log_message(self, *_):
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), Endpoint) as server:
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            config = tmp_path / "private.json"
+            config.write_text(json.dumps({"selected": {
+                "endpoint": f"http://127.0.0.1:{server.server_port}/configured",
+                "model": "chosen", "api_key_env": "PRIVATE_TEST_KEY"}}))
+            with pytest.raises(ValueError, match="^content_model_call_failed$"):
+                generate("selected", {"messages": [{"role": "user", "content": "selected"}]},
+                    environment={"META_RESEARCH_CONTENT_MODELS": str(config),
+                        "PRIVATE_TEST_KEY": "private-test-key"})
+            assert received == [("/configured", "Bearer private-test-key")]
+        finally:
+            server.shutdown()
+            worker.join()
+
+
+def test_configured_model_is_callable_through_the_actual_assistant_grant(tmp_path, monkeypatch):
+    from test_public_manual_question_lifecycle import _build_runtime, _accept_root_question
+    from test_dataset_effect_scope_recovery import _scope
+    from test_root_workspace import _channel, _external_context, _call, _accepted
+    runtime = _build_runtime(tmp_path / "runtime")
+    try:
+        quest_ref, _ = _accept_root_question(runtime, "external-content")
+        scope = _scope(runtime, quest_ref=quest_ref, run_ref="content-call", root_ref="assistant-content")
+        channel = _channel(runtime, _external_context(scope))
+        config = tmp_path / "content-models.json"
+        config.write_text(json.dumps({"selected": {"endpoint": "https://model.example/v1/chat/completions",
+            "model": "explicit-model", "api_key_env": "CONTENT_TEST_KEY"}}))
+        monkeypatch.setenv("META_RESEARCH_CONTENT_MODELS", str(config))
+        monkeypatch.setenv("CONTENT_TEST_KEY", "test-private-key")
+        calls = []
+        def provider(request, timeout):
+            calls.append(json.loads(request.data))
+            return BytesIO(b'{"choices":[{"message":{"content":"Selected model content."}}]}')
+        monkeypatch.setattr("meta_research.writing_content._open_content_model", provider)
+        messages = [{"role": "user", "content": "Selected evidence only."}]
+        before = runtime.owners.research_graph.query_snapshot()
+        reply = _accepted(_call(runtime, channel, "assistant.content.generate",
+            config_ref="selected", messages=messages))
+        assert reply == {"config_ref": "selected", "content": "Selected model content."}
+        assert calls == [{"model": "explicit-model", "messages": messages}]
+        assert runtime.owners.research_graph.query_snapshot() == before
+        failure = _call(runtime, channel, "assistant.content.generate",
+            config_ref="unknown", messages=messages)
+        assert failure["isError"] is True
+        assert "content_model_configuration_unavailable" in str(failure)
+        assert len(calls) == 1
+        assert "test-private-key" not in str(reply) + str(failure)
+    finally:
+        runtime.close()

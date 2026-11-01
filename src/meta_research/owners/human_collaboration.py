@@ -388,10 +388,6 @@ class HumanCollaborationInterface(Protocol):
         self, idempotency_key: str, *, command_kind: str
     ) -> dict[str, object] | None: ...
 
-    def query_commands(
-        self, *, command_kind: str
-    ) -> tuple[dict[str, object], ...]: ...
-
     def decide_capability_authorization(
         self,
         scope_ref: str,
@@ -3343,13 +3339,6 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
     ) -> dict[str, object] | None:
         return self._collaboration_ladder.query_command_by_idempotency_key(
             idempotency_key, command_kind=command_kind
-        )
-
-    def query_commands(
-        self, *, command_kind: str
-    ) -> tuple[dict[str, object], ...]:
-        return self._collaboration_ladder.query_commands(
-            command_kind=command_kind
         )
 
     def decide_capability_authorization(

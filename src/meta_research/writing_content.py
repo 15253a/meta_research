@@ -15,9 +15,19 @@ import urllib.request
 from urllib.parse import urlsplit
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        # A configured endpoint never delegates its credential to another URL.
+        return None
+
+
+def _open_content_model(request, *, timeout):
+    return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
+
+
 def generate(config_ref: str, request: dict, *, environment=None, opener=None) -> str:
     env = os.environ if environment is None else environment
-    opener = urllib.request.urlopen if opener is None else opener
+    opener = _open_content_model if opener is None else opener
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", config_ref):
         raise ValueError("content_model_configuration_invalid")
     config_path = env.get("META_RESEARCH_CONTENT_MODELS")

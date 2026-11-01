@@ -3056,7 +3056,7 @@ export type CompanionFile = {
   workspace_ref: string;
   path: string;
   sha256: string;
-  bytes: number;
+  bytes: number | null;
   readable: boolean;
   download_url: string;
 };

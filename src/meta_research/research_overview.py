@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.accepted_research import AcceptedResearchReader
 
 
@@ -20,8 +20,8 @@ class ResearchOverviewReader(AcceptedResearchReader):
     def writing_context(self, quest_ref: str, *, question_ref=None):
         """Read the selected question's current work and last synthesis once.
 
-        Exact accepted scientific bodies are direct input; older history stays
-        behind the existing readers. This does not create a research snapshot.
+        Scientific fields are exact excerpts, not generated summaries. Large
+        fields and full records stay behind their existing accurate readers.
         """
         quest = self._research_graph.query_quest_by_ref(quest_ref)
         if quest is None:
@@ -42,11 +42,47 @@ class ResearchOverviewReader(AcceptedResearchReader):
                 if commit is not None:
                     artifact = self._artifact(quest_ref, cycle, requests.get(commit.request_ref), commit)
                     if artifact is not None:
-                        artifacts.append(artifact)
+                        artifacts.append(self._writing_artifact(artifact, commit))
         return {"quest_ref": quest_ref, "question_ref": question_ref,
             "goal": quest.draft.get("goal"), "scientific_artifacts": artifacts,
-            "availability": "accepted_scientific_content" if artifacts else "no_accepted_scientific_result",
-            "instruction": "保持正文的科学结论、实际结果、反证和限制。未完成日志不当作已完成结果；其他完整材料沿准确reader按需读取。"}
+            "availability": ("accepted_scientific_content" if any(
+                artifact["status"] == "accepted" for artifact in artifacts) else "no_accepted_scientific_result"),
+            "instruction": "scientific_fields 是原文的完整字段，非全文或生成摘要；deferred_fields 尚未展开，成稿前沿 reader 读取所需内容，不能把未展开解释为没有反证或限制。保持实际结论、结果与适用范围；未完成日志不当作已完成结果。"}
+
+    @staticmethod
+    def _writing_artifact(artifact, commit):
+        result = {key: value for key, value in artifact.items() if key != "content"}
+        content = artifact["content"]
+        if content is None:
+            return result
+        source = artifact["source"]
+        # Bundle's accepted report is retained in its immutable StageCommit
+        # closure; Plan and Reasoning already have exact RM content readers.
+        result["reader"] = {"operation": "research_memory.content.read", "args": {
+            "source_ref": commit.commit_ref if artifact["stage"] == "bundle" else source["content_ref"],
+            "version_ref": commit.receipt.payload_hash if artifact["stage"] == "bundle" else source["content_hash"],
+        }}
+        fields = {
+            "plan": ("bundle_disposition", "evidence_reuse_set", "coverage"),
+            "bundle": ("disposition", "remaining_experiment_keys", "blocker_refs",
+                "semantic_change_required", "accepted_target_commit_refs", "metric_result_refs", "evidence_refs"),
+            "reasoning": ("disposition", "claim", "support_scope", "limitations", "missing_evidence",
+                "uncertainty_basis", "causal_interpretation", "research_synthesis", "evidence"),
+        }[artifact["stage"]]
+        result.update(scientific_fields={}, deferred_fields=[], content_delivery="selected_fields")
+        # A display budget never rejects an accepted scientific record or cuts
+        # prose/JSON. Oversized semantic fields remain whole in the exact reader.
+        remaining = 16 * 1024
+        for field in fields:
+            if field not in content:
+                continue
+            size = len(canonical_json(content[field]))
+            if size <= remaining:
+                result["scientific_fields"][field] = content[field]
+                remaining -= size
+            else:
+                result["deferred_fields"].append(field)
+        return result
 
     def query(self, quest_ref: str) -> dict[str, Any]:
         for _attempt in range(3):

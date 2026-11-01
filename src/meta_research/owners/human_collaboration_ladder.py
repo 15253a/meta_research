@@ -394,47 +394,51 @@ class SQLiteHumanCollaborationLadder:
         """Switch only at an idle boundary; retries return the original switch."""
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")
         _idempotency_key(idempotency_key)
-        command_hash = canonical_hash({"command": "start_new_companion_session", "scope_ref": scope_ref})
         with self._database.fenced_write() as connection:
-            switch_ref = _collaboration_command(connection, idempotency_key, "companion_session_new", command_hash)
-            if switch_ref is None:
-                session_ref, created = self._ensure_companion_session_row(connection, scope_ref)
-                session = connection.execute(text(
-                    "SELECT * FROM hc_companion_sessions WHERE session_ref=:session_ref"),
-                    {"session_ref": session_ref}).one()
-                pending = connection.execute(text(
-                    "SELECT COUNT(*) FROM hc_companion_turns WHERE session_ref=:session_ref "
-                    "AND assistant_status IN ('queued','processing')"), {"session_ref": session_ref}).scalar_one()
-                if pending:
-                    raise OwnerConflict("companion_session_busy")
-                generation = int(session.native_session_generation) + 1
-                now = time.time()
-                switch_ref = new_ref("companion_switch")
-                connection.execute(text(
-                    "INSERT INTO hc_companion_native_sessions (session_ref,generation,created_at) "
-                    "VALUES (:session_ref,:generation,:now)"),
-                    {"session_ref": session_ref, "generation": generation, "now": now})
-                connection.execute(text(
-                    "INSERT INTO hc_companion_session_switches "
-                    "(switch_ref,scope_ref,session_ref,generation,previous_native_session_ref,created_at) "
-                    "VALUES (:switch_ref,:scope_ref,:session_ref,:generation,:previous,:now)"),
-                    {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
-                        "generation": generation, "previous": session.native_session_ref, "now": now})
-                connection.execute(text(
-                    "UPDATE hc_companion_sessions SET native_session_ref=NULL, "
-                    "native_session_generation=:generation,updated_at=:now WHERE session_ref=:session_ref"),
-                    {"session_ref": session_ref, "generation": generation, "now": now})
-                _record_collaboration_command(connection, idempotency_key, "companion_session_new", command_hash, switch_ref)
-                connection.execute(text(
-                    "UPDATE human_collaboration_state SET revision=revision+1, "
-                    "companion_session_count=companion_session_count+:created WHERE singleton='owner'"),
-                    {"created": int(created)})
-                self._feed.record(connection, "human_collaboration.companion_session_switched",
-                    {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
-                        "native_session_generation": generation})
-            switch = connection.execute(text(
-                "SELECT * FROM hc_companion_session_switches WHERE switch_ref=:switch_ref"),
-                {"switch_ref": switch_ref}).one()
+            return self._switch_companion_session(connection, scope_ref, idempotency_key)
+
+    def _switch_companion_session(self, connection, scope_ref: str, idempotency_key: str) -> dict[str, object]:
+        """Reuse /new inside a caller's writer transaction when enqueueing Writing."""
+        command_hash = canonical_hash({"command": "start_new_companion_session", "scope_ref": scope_ref})
+        switch_ref = _collaboration_command(connection, idempotency_key, "companion_session_new", command_hash)
+        if switch_ref is None:
+            session_ref, created = self._ensure_companion_session_row(connection, scope_ref)
+            session = connection.execute(text(
+                "SELECT * FROM hc_companion_sessions WHERE session_ref=:session_ref"),
+                {"session_ref": session_ref}).one()
+            pending = connection.execute(text(
+                "SELECT COUNT(*) FROM hc_companion_turns WHERE session_ref=:session_ref "
+                "AND assistant_status IN ('queued','processing')"), {"session_ref": session_ref}).scalar_one()
+            if pending:
+                raise OwnerConflict("companion_session_busy")
+            generation = int(session.native_session_generation) + 1
+            now = time.time()
+            switch_ref = new_ref("companion_switch")
+            connection.execute(text(
+                "INSERT INTO hc_companion_native_sessions (session_ref,generation,created_at) "
+                "VALUES (:session_ref,:generation,:now)"),
+                {"session_ref": session_ref, "generation": generation, "now": now})
+            connection.execute(text(
+                "INSERT INTO hc_companion_session_switches "
+                "(switch_ref,scope_ref,session_ref,generation,previous_native_session_ref,created_at) "
+                "VALUES (:switch_ref,:scope_ref,:session_ref,:generation,:previous,:now)"),
+                {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
+                    "generation": generation, "previous": session.native_session_ref, "now": now})
+            connection.execute(text(
+                "UPDATE hc_companion_sessions SET native_session_ref=NULL, "
+                "native_session_generation=:generation,updated_at=:now WHERE session_ref=:session_ref"),
+                {"session_ref": session_ref, "generation": generation, "now": now})
+            _record_collaboration_command(connection, idempotency_key, "companion_session_new", command_hash, switch_ref)
+            connection.execute(text(
+                "UPDATE human_collaboration_state SET revision=revision+1, "
+                "companion_session_count=companion_session_count+:created WHERE singleton='owner'"),
+                {"created": int(created)})
+            self._feed.record(connection, "human_collaboration.companion_session_switched",
+                {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
+                    "native_session_generation": generation})
+        switch = connection.execute(text(
+            "SELECT * FROM hc_companion_session_switches WHERE switch_ref=:switch_ref"),
+            {"switch_ref": switch_ref}).one()
         return {"scope_ref": switch.scope_ref, "session_ref": switch.session_ref, "status": "switched",
             "switch_ref": switch.switch_ref, "native_session_generation": int(switch.generation),
             "native_session_ref": None, "previous_native_session_ref": switch.previous_native_session_ref}
@@ -505,10 +509,6 @@ class SQLiteHumanCollaborationLadder:
             message = prepare_writing()
             _text(message, "companion_message_required", 256 * 1024)
             _reject_secret_content(message)
-            # Reuse the ordinary /new command. A retry after a lost response
-            # returns the sealed turn above and never rotates the session again.
-            self.start_new_companion_session(scope_ref,
-                "writing-session:" + canonical_hash({"key": idempotency_key}))
         with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
@@ -532,6 +532,11 @@ class SQLiteHumanCollaborationLadder:
                 )
                 if pending_count >= _MAX_PENDING_COMPANION_TURNS:
                     raise OwnerConflict("companion_queue_full")
+                # The idle check, /new and its first Writing turn must commit
+                # together. A concurrent chat can only follow this first turn.
+                if writing_request is not None:
+                    self._switch_companion_session(connection, scope_ref,
+                        "writing-session:" + canonical_hash({"key": idempotency_key}))
                 now = time.time()
                 session_ref, created_session = self._ensure_companion_session_row(
                     connection,
@@ -2573,31 +2578,6 @@ class SQLiteHumanCollaborationLadder:
         if row.command_kind != command_kind:
             raise OwnerConflict("idempotency_conflict")
         return self.query_command(str(row.result_ref))
-
-    def query_commands(self, *, command_kind: str) -> tuple[dict[str, object], ...]:
-        if command_kind not in {
-        }:
-            raise OwnerConflict("command_kind_invalid")
-        with self._database.read() as connection:
-            refs = connection.execute(
-                text(
-                    "SELECT intents.intent_id FROM hc_command_intents AS intents "
-                    "JOIN hc_command_drafts AS drafts ON drafts.intent_id = "
-                    "intents.intent_id AND drafts.draft_revision = "
-                    "intents.current_revision WHERE json_extract("
-                    "drafts.draft_json, '$.command_kind') = :command_kind "
-                    "ORDER BY intents.created_at DESC, intents.intent_id DESC"
-                ),
-                {"command_kind": command_kind},
-            ).scalars().all()
-        commands = tuple(self.query_command(str(ref)) for ref in refs)
-        if any(
-            cast(dict[str, object], command["draft"]).get("command_kind")
-            != command_kind
-            for command in commands
-        ):
-            raise OwnerConflict("command_kind_integrity_invalid")
-        return commands
 
     def _validate_command(self, value: dict[str, object]) -> dict[str, object]:
         command = _document(value, "command_draft_invalid")

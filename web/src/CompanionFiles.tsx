@@ -10,6 +10,7 @@ export function CompanionFiles({ scopeRef, refreshKey }: { scopeRef: string; ref
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestRef = useRef<AbortController | null>(null);
+  useEffect(() => { setFiles([]); setNextOffset(null); }, [scopeRef]);
   const read = async (offset: number) => {
     requestRef.current?.abort();
     const controller = new AbortController();
@@ -41,7 +42,7 @@ export function CompanionFiles({ scopeRef, refreshKey }: { scopeRef: string; ref
         {file.readable && file.download_url.startsWith("/api/v1/companion/files/content?")
           ? <a href={file.download_url} download>{file.path}</a>
           : <span>{file.path} · 暂不可读</span>}
-        <small>{file.bytes.toLocaleString()} 字节</small>
+        <small>{typeof file.bytes === "number" ? `${file.bytes.toLocaleString()} 字节` : "大小暂不可读"}</small>
       </li>)}</ul>
       {nextOffset !== null && <button type="button" disabled={loading} onClick={() => void read(nextOffset)}>更多文件</button>}
     </div>}
