@@ -149,6 +149,7 @@ from meta_research.owners.quest_goals import (
     verify_goal_revision_ancestry_in_transaction,
 )
 from meta_research.owners.research_datasets import ResearchDatasetOwnerInterface, ResearchDatasetOwnerMixin
+from meta_research.owners.research_literature import ResearchLiteratureOwnerInterface, ResearchLiteratureOwnerMixin
 from meta_research.owners.research_environments import ResearchEnvironmentOwnerInterface, ResearchEnvironmentOwnerMixin
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.target_execution_legacy import (
@@ -1398,7 +1399,7 @@ class TargetCandidateOwnerProofVerifier(Protocol):
         receipt: ReceiptProof,
     ) -> None: ...
 
-class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetOwnerInterface, HumanRequestOwnerInterface, Protocol):
+class ResearchGraphInterface(ResearchLiteratureOwnerInterface, ResearchEnvironmentOwnerInterface, ResearchDatasetOwnerInterface, HumanRequestOwnerInterface, Protocol):
     def query_target_result_handoff(
         self, target_ref: str, *, quest_ref: str
     ) -> dict[str, object]: ...
@@ -6739,7 +6740,7 @@ class SQLiteResearchGraphReceiptVerifier:
 
 
 
-class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
+class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,

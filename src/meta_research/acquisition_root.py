@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -14,6 +13,8 @@ from meta_research.acquisition import (
     AcquisitionProvider,
     AcquisitionRuntimeBinding,
     AcquisitionUnavailable,
+    validate_item_results,
+    validate_preflight_result,
 )
 from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
@@ -36,12 +37,10 @@ _ROOT_SESSION_RECEIPT_SCHEMA = "meta-research/acquisition-root-session/v1"
 
 
 class CodexAcquisitionRootAdapter(AcquisitionProvider):
-    """Long-lived Acquisition Root around a typed download adapter.
+    """Durable download worker using the packaged Nature Downloader tools.
 
-    Nature Downloader remains the effect adapter.  The Codex Root resumes one
-    native Session per durable Acquisition session and accepts each typed
-    adapter result before it crosses the provider boundary.  Its session
-    receipts live in the provider's private spool and survive daemon restarts.
+    The native root chooses and executes the lawful route. Owner custody still
+    verifies the returned files; a second model acceptance pass is unnecessary.
     """
 
     def __init__(
@@ -80,7 +79,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                 "meta_research.acquisition_root.CodexAcquisitionRootAdapter"
             ),
             provider_version=(
-                "v3+delegate-sha256:"
+                "v4+tools-sha256:"
                 + delegate_hash
                 + "+root-sha256:"
                 + root_binding_hash
@@ -90,7 +89,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                     "acquisition-root-session-durable",
                     "acquisition-codex-root-binding:sha256:"
                     + root_binding_hash,
-                    "nature-downloader-effect-adapter:sha256:" + delegate_hash,
+                    "nature-downloader-tools:sha256:" + delegate_hash,
                     *delegate.capability_bindings,
                 ),
                 "acquisition",
@@ -120,77 +119,73 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
     ) -> AcquisitionPreflightResult:
         if type(request.generation) is not int or request.generation < 1:
             raise AcquisitionUnavailable("acquisition_preflight_generation_invalid")
-        # Preserve the first generation's deployed identity for exact recovery.
-        # A later Owner-admitted preflight must not replay its terminal failure.
-        job_ref = f"acquisition:{request.session_ref}:preflight:{request.config_hash}"
-        if request.generation > 1:
-            job_ref += f":generation:{request.generation}"
-        result = self._delegate.preflight(request)
-        decision = self._accept_result(
-            session_ref=request.session_ref,
-            job_ref=job_ref,
-            phase="preflight",
-            observed={
-                "status": result.status,
-                "reason_code": result.reason_code,
-                "evidence": result.evidence,
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "status": {"enum": ["ready", "waiting_user", "unavailable"]},
+                "browser_context_ref": {"type": ["string", "null"]},
+                "reason_code": {"type": ["string", "null"]},
+                "evidence": {"type": "object", "additionalProperties": False,
+                    "properties": {key: {"type": "string"} for key in
+                        ("configuration_health", "browser_control", "authorized_resource")},
+                    "required": ["configuration_health", "browser_control", "authorized_resource"]},
             },
-            allow_human_request=result.status == "waiting_user",
-            root_runtime_scope=None,
-        )
-        evidence = dict(result.evidence)
-        evidence["acquisition_root"] = {
-            "status": "accepted",
-            "native_session_ref_hash": hashlib.sha256(
-                decision["native_session_ref"].encode("utf-8")
-            ).hexdigest(),
-            "human_request_proposed": decision["human_request"] is not None,
+            "required": ["status", "browser_context_ref", "reason_code", "evidence"],
         }
-        if decision["human_request"] is not None:
-            # This is explicit Root output, not a formal HumanRequest side
-            # effect.  The authenticated effect interface remains authoritative.
-            evidence["root_human_request_proposal"] = decision["human_request"]
-        return replace(result, evidence=evidence)
-
-    def acquire(
-        self, request: AcquisitionBatchRequest
-    ) -> tuple[AcquisitionItemResult, ...]:
-        results = tuple(self._delegate.acquire(request))
-        self._accept_result(
+        raw = self._work(
             session_ref=request.session_ref,
-            job_ref=(
-                f"acquisition:{request.session_ref}:batch:{request.request_id}"
-            ),
-            phase="batch",
-            observed={
-                "request_id": request.request_id,
-                "results": [item.as_dict() for item in results],
-            },
-            allow_human_request=any(
-                item.status == "waiting_user" for item in results
-            ),
-            root_runtime_scope=getattr(request, "root_runtime_scope", None),
+            job_ref=f"acquisition:{request.session_ref}:preflight:{request.config_hash}:{request.generation}",
+            phase="preflight", schema=schema,
+            task={"session_mode": request.mode, "library_entry_url": request.library_entry_url,
+                  "provider_state_dir": request.private_state_dir,
+                  "previous_browser_context_ref": request.previous_browser_context_ref},
+            root_runtime_scope=request.root_runtime_scope,
         )
-        return results
+        try:
+            result = AcquisitionPreflightResult(**raw)
+        except TypeError as error:
+            raise AcquisitionUnavailable("acquisition_root_result_invalid") from error
+        return validate_preflight_result(request, result)
 
-    def reconcile(
-        self, request: AcquisitionBatchRequest
-    ) -> tuple[AcquisitionItemResult, ...]:
-        results = tuple(self._delegate.reconcile(request))
-        self._accept_result(
-            session_ref=request.session_ref,
-            job_ref=(
-                f"acquisition:{request.session_ref}:reconcile:{request.request_id}"
-            ),
-            phase="reconcile",
-            observed={
-                "request_id": request.request_id,
-                "results": [item.as_dict() for item in results],
-            },
-            allow_human_request=False,
-            root_runtime_scope=getattr(request, "root_runtime_scope", None),
-        )
-        return results
+    def acquire(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:
+        return self._acquire(request)
+
+    def reconcile(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:
+        # The same durable operation inspects its prior spool before dispatch.
+        # Never create a second download just because the response was lost.
+        return self._acquire(request)
+
+    def _acquire(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:
+        if (request.session_mode not in {"oa_only", "provided_only", "oa_then_institution"}
+            or not request.session_ref or not Path(request.target_dir).is_absolute()):
+            raise AcquisitionUnavailable("acquisition_provider_binding_invalid")
+        failure = {"type": "object", "additionalProperties": False,
+                   "properties": {"code": {"type": "string"}, "detail": {"type": "string"}},
+                   "required": ["code", "detail"]}
+        item = {"type": "object", "additionalProperties": False,
+                "properties": {"paper_id": {"type": "string"},
+                    "status": {"enum": ["obtained", "waiting_user", "missing"]},
+                    "path": {"type": ["string", "null"]},
+                    "format": {"enum": ["pdf", "html", "xml", None]},
+                    "failure": {"anyOf": [{"type": "null"}, failure]}},
+                "required": ["paper_id", "status", "path", "format", "failure"]}
+        schema = {"type": "object", "additionalProperties": False,
+                  "properties": {"results": {"type": "array", "items": item}}, "required": ["results"]}
+        scope = request.root_runtime_scope
+        attempt = "unmanaged" if scope is None else str(scope["attempt_ref"])
+        raw = self._work(session_ref=request.session_ref,
+            job_ref=f"acquisition:{request.session_ref}:batch:{request.request_id}:{attempt}",
+            phase="batch", schema=schema, root_runtime_scope=scope,
+            task={"request_id": request.request_id, "session_mode": request.session_mode,
+                  "route_policy": request.route_policy, "target_dir": request.target_dir,
+                  "provider_state_dir": request.provider_state_dir,
+                  "browser_context_ref": request.browser_context_ref,
+                  "papers": [paper.as_dict() for paper in request.papers]})
+        try:
+            results = tuple(AcquisitionItemResult(**item) for item in raw["results"])
+        except (KeyError, TypeError) as error:
+            raise AcquisitionUnavailable("acquisition_root_result_invalid") from error
+        return validate_item_results(request, results)
 
     def request_stop(self) -> None:
         self._root.request_stop()
@@ -203,16 +198,9 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
     ) -> None:
         self._root.bind_root_operation_diagnostics_recorder(recorder)
 
-    def _accept_result(
-        self,
-        *,
-        session_ref: str,
-        job_ref: str,
-        phase: str,
-        observed: dict[str, object],
-        allow_human_request: bool,
-        root_runtime_scope: object,
-    ) -> dict[str, object]:
+    def _work(self, *, session_ref: str, job_ref: str, phase: str,
+              task: dict[str, object], schema: dict[str, object],
+              root_runtime_scope: object) -> dict[str, object]:
         previous_native_session_ref = self._latest_native_session_ref(session_ref)
         invocation_path = (
             self._root._workspace / "provider-operations"
@@ -235,98 +223,112 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                 previous_native_session_ref = previous
             except (OSError, ProviderSupervisorError) as error:
                 raise AcquisitionUnavailable("acquisition_root_session_invalid") from error
-        formal_human_request_available = (
-            allow_human_request and root_runtime_scope is not None
-        )
-        human_request_schema: dict[str, object] = {
-            "anyOf": [
-                {"type": "null"},
-                {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "kind": {
-                            "type": "string",
-                            "enum": [
-                                "clarification",
-                                "authorization",
-                                "resource",
-                                "ethical_legal",
-                            ],
-                        },
-                        "obligation": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["kind", "obligation"],
-                },
-            ]
-        }
-        if not allow_human_request or formal_human_request_available:
-            human_request_schema = {"type": "null"}
-        schema = {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "accepted": {"const": True},
-                "human_request": human_request_schema,
-            },
-            "required": ["accepted", "human_request"],
-        }
-        if formal_human_request_available:
-            human_request_instruction = (
-                "provider 的 waiting_user 本身不等于正式请求。若你独立判断当前任务"
-                "确有人的义务，必须在返回前通过 resident MCP 调用共同的 "
-                "human_request.open；随后返回 human_request=null，不得只返回 proposal。"
-            )
-        elif allow_human_request:
-            human_request_instruction = (
-                "只有在确实需要用户提供访问、资源、澄清或伦理法律决定时，才返回"
-                "一个明确的 human_request proposal；provider 的 waiting_user 本身"
-                "不等于请求。该 proposal 只供 initialization inline 展示，不是 "
-                "formal HumanRequest。"
-            )
-        else:
-            human_request_instruction = "本轮返回 human_request=null。"
-        prompt = (
-            "你是长期存在的 Acquisition 根智能体。Nature Downloader 是你的下载"
-            " effect adapter；下面是它对当前精确任务返回的 typed observation。"
-            "复核其状态并在可接受时返回 accepted=true。不要伪造下载结果。"
-            f"{human_request_instruction}\n\n"
-            f"phase={phase}\n"
-            f"session_ref={session_ref}\n"
-            f"observation={canonical_json(observed)}"
-        )
+        prompt = self._prompt(phase, task, initial=previous_native_session_ref is None)
+        replacement = None
         try:
-            raw, native_session_ref, _stdout = (
-                self._root._invoke_optional_root_task_operation(
-                    operation_name="acquisition-root-turn",
-                    prompt=prompt,
-                    schema=schema,
-                    native_session_ref=previous_native_session_ref,
-                    job_ref=job_ref,
-                    root_runtime_scope=root_runtime_scope,
-                    workspace_binding=(self._root._session_workspace(session_ref)
-                        if root_runtime_scope is None else None),
-                )
-            )
+            raw, native_session_ref, _stdout = self._invoke_turn(
+                session_ref=session_ref, job_ref=job_ref, prompt=prompt, schema=schema,
+                native_session_ref=previous_native_session_ref, task=task,
+                root_runtime_scope=root_runtime_scope)
         except IdeaSkillUnavailable as error:
-            raise AcquisitionUnavailable(error.code) from error
-        if (
-            native_session_ref is None
-            or raw.get("accepted") is not True
-            or set(raw) != {"accepted", "human_request"}
+            checkpoint = error.recovery_checkpoint
+            if (error.code != "codex_native_session_unavailable"
+                or previous_native_session_ref is None
+                or not isinstance(checkpoint, dict)
+                or checkpoint.get("schema_ref") != "meta-research/provider-native-session-unavailable/v1"
+                or checkpoint.get("native_session_ref") != previous_native_session_ref
+                or checkpoint.get("error_code") != -32600):
+                raise AcquisitionUnavailable(error.code) from error
+            # Only the native bridge's signed, exact no-rollout rejection proves
+            # this turn never started. Unknown effects stay on their old spool.
+            replacement = {"job_ref": job_ref, "recovery_checkpoint": checkpoint}
+            job_ref += ":replacement:" + canonical_hash(checkpoint)
+            context = self._replacement_context(session_ref, job_ref, phase, task, replacement)
+            prompt = self._prompt(phase, task, initial=True) + (
+                "\n\n这是原native已确证永久不可用后的替代Session，不是连续resume。"
+                "沿原工作区先读下载笔记与已有manifest，核实下列已存在文件；它们不是新的下载授权。"
+                "只完成当前请求尚缺项，保留已完成文件，不重放任何未知效果。\n"
+                "replacement_context=" + canonical_json(context))
+            try:
+                raw, native_session_ref, _stdout = self._invoke_turn(
+                    session_ref=session_ref, job_ref=job_ref, prompt=prompt, schema=schema,
+                    native_session_ref=None, task=task, root_runtime_scope=root_runtime_scope)
+            except IdeaSkillUnavailable as replacement_error:
+                # One bounded replacement job; reconciliation reads this same
+                # invocation rather than recursively replacing a failed start.
+                raise AcquisitionUnavailable(replacement_error.code) from replacement_error
+        if native_session_ref is None or (
+            replacement is not None and native_session_ref == previous_native_session_ref
         ):
             raise AcquisitionUnavailable("acquisition_root_result_invalid")
-        self._append_session_receipt(
-            session_ref=session_ref,
-            native_session_ref=native_session_ref,
-            previous_native_session_ref=previous_native_session_ref,
-            job_ref=job_ref,
-            phase=phase,
+        self._append_session_receipt(session_ref=session_ref, native_session_ref=native_session_ref,
+            previous_native_session_ref=previous_native_session_ref, job_ref=job_ref, phase=phase,
+            replacement=replacement)
+        return raw
+
+    def _invoke_turn(self, *, session_ref, job_ref, prompt, schema, native_session_ref,
+                     task, root_runtime_scope):
+        return self._root._invoke_optional_root_task_operation(
+            operation_name="acquisition-root-turn", prompt=prompt, schema=schema,
+            native_session_ref=native_session_ref, job_ref=job_ref,
+            root_runtime_scope=root_runtime_scope,
+            execution_access_mode=str(task["session_mode"]),
+            execution_write_root=Path(str(task.get("target_dir") or task["provider_state_dir"])),
+            workspace_binding=(self._root._session_workspace(session_ref)
+                               if root_runtime_scope is None else None))
+
+    def _replacement_context(self, session_ref, job_ref, phase, task, replacement):
+        # Freeze the handoff once. A completed replacement may add artifacts;
+        # those must not change the sealed original input on reconciliation.
+        path = self._session_directory(session_ref) / ("replacement-" + canonical_hash({"job_ref": job_ref}) + ".json")
+        identity = {"session_ref": session_ref, "job_ref": job_ref, "phase": phase,
+                    "task_hash": canonical_hash(task), "replacement": replacement}
+        try:
+            if path.exists():
+                context = read_transport_envelope(path, self._transport_key)
+                if any(context.get(key) != value for key, value in identity.items()):
+                    raise ProviderSupervisorError("acquisition_replacement_context_invalid")
+                return context
+            artifacts = []
+            truncated = False
+            if task.get("target_dir"):
+                target = Path(str(task["target_dir"])).resolve()
+                for artifact in target.rglob("*"):
+                    if artifact.is_file() and not artifact.is_symlink() and artifact.resolve().is_relative_to(target):
+                        if len(artifacts) == 128:
+                            truncated = True
+                            break
+                        artifacts.append({"path": str(artifact.resolve()), "size_bytes": artifact.stat().st_size})
+            context = {**identity, "existing_artifacts": sorted(artifacts, key=lambda item: item["path"]),
+                       "artifacts_truncated": truncated}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_transport_envelope(path, context, self._transport_key)
+            return context
+        except (OSError, ProviderSupervisorError) as error:
+            raise AcquisitionUnavailable("acquisition_root_session_invalid") from error
+
+    @staticmethod
+    def _prompt(phase, task, *, initial):
+        provider_root = Path(__file__).with_name("skills") / "deepfetch_v4" / "providers" / "nature-downloader"
+        skill_path = provider_root / "SKILL.md"
+        prompt = (
+            "你是长期专用 Acquisition 下载 Session。按本请求明确模式自主使用真实工具，"
+            "取得并核实指定论文；逐篇交回实际状态。先查看本工作区已有记录，复用有效快捷路径，"
+            "失效时仅修相关环节。普通笔记保留路径、适用条件与失败弯路，凭据留受控配置；"
+            "笔记不建立跨账号授权。已完成文件不重新下载。\n"
+            "若需要人处理访问，调用 human_request.open 并核对正式回执；waiting_user"
+            "或求助文本不代表已投递。收到回应先沿原 effect 调用 human_request.open.reconcile，"
+            "读取回应并复验连接，再接续未完成项。未知效果先检查既有 manifest／产物／操作。\n"
+            f"Nature Downloader installed source: {skill_path.resolve()}\n"
+            "脚本与相对链接均相对此目录；原生 shell/file 工具可直接运行脚本。"
+            "压缩后若缺少获取规则，从该source重读完整Skill及触发的参考，保留同一工作区及现有产物。"
+            "调用所有下载和配置脚本时将 LIT_DL_CONFIG_DIR 设为本请求 provider_state_dir/nature-downloader-config，"
+            "使用这份私有配置；本次 provided_only 仅核实已提供正文，oa_only 传 --no-institutional-access。\n"
+            f"phase={phase}\nrequest={canonical_json(task)}"
         )
-        return {
-            "native_session_ref": native_session_ref,
-            "human_request": raw["human_request"],
-        }
+        if initial:
+            prompt += "\n\n" + skill_path.read_text(encoding="utf-8")
+        return prompt
 
     def _session_directory(self, session_ref: str) -> Path:
         return (
@@ -364,6 +366,22 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                 )
             ):
                 raise AcquisitionUnavailable("acquisition_root_session_invalid")
+            replacement = receipt.get("replacement")
+            if replacement is not None:
+                if (not isinstance(replacement, dict)
+                    or set(replacement) != {"job_ref", "recovery_checkpoint"}
+                    or not isinstance(replacement["job_ref"], str)
+                    or not isinstance(replacement["recovery_checkpoint"], dict)):
+                    raise AcquisitionUnavailable("acquisition_root_session_invalid")
+                checkpoint = replacement["recovery_checkpoint"]
+                if (generation == 1 or receipt["native_session_ref"] == receipt["previous_native_session_ref"]
+                    or checkpoint.get("schema_ref") != "meta-research/provider-native-session-unavailable/v1"
+                    or checkpoint.get("native_session_ref") != receipt["previous_native_session_ref"]
+                    or checkpoint.get("error_code") != -32600
+                    or receipt.get("job_ref") != replacement["job_ref"] + ":replacement:" + canonical_hash(checkpoint)):
+                    raise AcquisitionUnavailable("acquisition_root_session_invalid")
+            elif generation > 1 and receipt["native_session_ref"] != receipt["previous_native_session_ref"]:
+                raise AcquisitionUnavailable("acquisition_root_session_invalid")
             receipts.append(receipt)
         return tuple(receipts)
 
@@ -379,6 +397,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         previous_native_session_ref: str | None,
         job_ref: str,
         phase: str,
+        replacement: dict[str, object] | None = None,
     ) -> None:
         existing = self._session_receipts(session_ref)
         replay = next((item for item in existing if item.get("job_ref") == job_ref), None)
@@ -387,9 +406,14 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                 replay.get("native_session_ref") != native_session_ref
                 or replay.get("previous_native_session_ref") != previous_native_session_ref
                 or replay.get("phase") != phase
+                or replay.get("replacement") != replacement
             ):
                 raise AcquisitionUnavailable("acquisition_root_session_conflict")
             return
+        latest = None if not existing else existing[-1]["native_session_ref"]
+        if (previous_native_session_ref != latest
+            or replacement is None and latest is not None and native_session_ref != latest):
+            raise AcquisitionUnavailable("acquisition_root_session_conflict")
         directory = self._session_directory(session_ref)
         directory.mkdir(parents=True, exist_ok=True)
         generation = len(existing) + 1
@@ -401,6 +425,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             "previous_native_session_ref": previous_native_session_ref,
             "job_ref": job_ref,
             "phase": phase,
+            **({} if replacement is None else {"replacement": replacement}),
         }
         try:
             write_transport_envelope(

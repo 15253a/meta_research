@@ -61,7 +61,7 @@ description: 分析本轮工作，经 RG 审视整体路线与关键关系，交
 
 本轮 TargetCommit 身份从 context pack 的 `accepted_target_commit_closures` 读取，其中的闭包概要不代替候选正文；`predecessor_closure` 用于 `prior_accepted_bindings` 中的前序交接。候选读取、真实工作核验、精确内容与正式登记按[资源整理与正式登记](../references/materials-and-custody.md#资源整理与正式登记)执行。Target 已正式接纳即满足这些原件的发布前提，形成综合草稿时即可整理，不等本次 ScientificOutcome 接纳。
 
-最后一个 Target 后 Bundle 若不再运行，由 Reasoning 承接。整理也包括 Target 过程中发现、取得或阅读的 Literature：沿用已有文献的准确身份，保留原文入口或尚未取得全文的状态、本次阅读判断及其研究用途，外部原作与本次分析各自保持来源。可委派明确资源范围的子智能体整理，根在交接前查回必要的资源记录、用途、精确内容及真实派生关系。无保留价值时说明判断；外部条件阻塞时记录未完成步骤和继续条件，未知登记效果沿原操作对账。现成资源的直接登记沿[研究导航](../references/research-navigation.md)的 Environment 分支判断；普通取得文献的导入和 Target 阅读判断索引尚待接通，按 Owner 操作注明实际能力。
+最后一个 Target 后 Bundle 若不再运行，由 Reasoning 承接。整理也包括 Target 过程中发现、取得或阅读的 Literature：沿用已有文献的准确身份，保留原文入口或尚未取得全文的状态、本次阅读判断及其研究用途，外部原作与本次分析各自保持来源。可委派明确资源范围的子智能体整理，根在交接前查回必要的资源记录、用途、精确内容及真实派生关系。无保留价值时说明判断；外部条件阻塞时记录未完成步骤和继续条件，未知登记效果沿原操作对账。现成资源的直接登记沿[研究导航](../references/research-navigation.md)的 Environment 分支判断；普通取得文献与 Target 阅读判断按共享研究导航的 Literature 登记、用途和准确原件 reader 处理，沿 Owner 操作查回结果。
 
 收尾或向后继交接文件时，读[交接与工作区收尾](../references/materials-and-custody.md#交接与工作区收尾)，按共享生命周期安排后继读取、正式保管与清理。ScientificOutcome 草稿或单个 Target 完成不代表本轮已可清理，业务完成与执行、恢复、待接纳等依赖由正式职责方核对。
 

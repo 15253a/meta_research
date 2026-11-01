@@ -85,7 +85,14 @@ def shared_reference_instructions(root_kind: str) -> str:
     cycle_roles = {"idea", "plan", "bundle", "target", "reasoning"}
     names = SHARED_REFERENCE_NAMES
     if root_kind == "acquisition":
-        names = ("human-guidance.md", "materials-and-custody.md")
+        return (
+            f"Shared reference root: {shared_reference_root()}\n"
+            "公共参考中的 references/... 相对此安装目录；文件内链接相对该文件。"
+            "已有完整且有效的正文直接使用；按需读取与指定获取有关的部分。"
+            "原件不可读时如实报告，不以其他版本替代。\n"
+            "- 需要人协助访问或收到回应时，读取 references/human-guidance.md 的正式求助、回执与回应部分。\n"
+            "- 接收全文、核实文件、交付或整理持久工作区时，读取 references/materials-and-custody.md 的材料保管部分。"
+        )
     elif root_kind not in cycle_roles:
         names = tuple(name for name in names if name != "cycle-work.md")
     return (

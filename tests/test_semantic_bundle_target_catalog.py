@@ -460,12 +460,17 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
             "register_version.reconcile", "reference", "reference.reconcile",
             "derive", "derive.reconcile",
         )),
+        *("research_memory.literature." + action for action in (
+            "read", "register", "register.reconcile", "reference", "reference.reconcile",
+        )),
         *("research_graph.environments." + action for action in (
             "page", "read", "register", "register.reconcile", "reference",
             "reference.reconcile",
         )),
     }
     opaque_inputs = {
+        "research_memory.literature.register": (("metadata",), ("asset_bindings", "items")),
+        "research_memory.literature.reference": (("reading_bindings", "items"),),
         "research_graph.datasets.register": (("metadata",),),
         "research_graph.datasets.register_version": (
             ("metadata",), ("asset_bindings", "items"),

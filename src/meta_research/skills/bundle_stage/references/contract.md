@@ -90,7 +90,7 @@ AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据�
 
 ## Bundle 收口
 
-普通 Literature 登记、用途关联及 Target 阅读判断索引尚待 #270 接通。接口缺失不是无候选：BundleReport 如实保留未完成的整理步骤、已有文献来源与阅读判断及具体阻塞，不能以空候选或阶段交接冒充文献整理完成。
+普通 Literature 沿共享研究导航的 register／reference／read 及准确原件 reader 整理。BundleReport 如实保留未完成步骤、已有来源和阅读判断及具体阻塞，接口错误、部分失败不算无候选，不以阶段交接冒充整理完成。
 
 | disposition | 依据 |
 | --- | --- |

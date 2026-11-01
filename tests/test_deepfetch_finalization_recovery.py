@@ -268,7 +268,13 @@ def test_other_verified_terminal_failure_still_starts_new_operation(
         assert final is not None and final.status == "executed"
         assert final.provider_operation_generation == 2
         assert final.provider_operation_ref != first.provider_operation_ref
-        assert int(executable.with_suffix(".count").read_text()) == invocations + 2
+        # The new native receives the full Skill and exact prior paths. The
+        # successful Gate and existing public evidence belong to this same Run.
+        assert int(executable.with_suffix(".count").read_text()) == invocations + 1
+        protocol_paths = list((data_root.run / "deepfetch-provider" / "runs").glob("*/private/protocol.json"))
+        assert len(protocol_paths) == 2
+        checkpoints = [json.loads(path.read_text()) for path in protocol_paths]
+        assert {value["public_root_job_ref"] for value in checkpoints} == {first.provider_operation_ref}
         assert not any(
             event.event_type == "agent_runtime.deepfetch_result_reconciliation_started"
             for event in runtime.feed.read_after(0).events

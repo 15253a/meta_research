@@ -55,7 +55,7 @@ def test_provided_only_never_discovers_selected_mcp_and_scope_cannot_be_substitu
     adapter = CodexDeepFetchAdapter(tmp_path / "provider")
     adapter.bind_search_sources(registry)
     request = bound_request(adapter, registry, source)
-    assert adapter._source_manifest(replace(request, scope=request.scope | {"literature_mode": "provided_only"})) is None
+    assert adapter._source_manifest(replace(request, literature_access_mode="provided_only", scope=request.scope | {"literature_mode": "provided_only"})) is None
     with pytest.raises(SearchSourceError, match="source_manifest_missing"):
         registry.manifest_for_run(request.run_ref)
     quest_scope = QuestScope("autonomous-quest")

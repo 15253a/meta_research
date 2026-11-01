@@ -1,6 +1,6 @@
 # `papers.json` 台账契约
 
-创建或修改公开台账前读取本文件；新运行使用 `deepfetch.papers.v4.1`。历史 `deepfetch.papers.v4` 保持原字段和解释，不补造来源回执。
+创建或修改公开台账前读取本文件；新版任务使用 `deepfetch.papers.v4.1`。历史台账仅作冻结证据，不为旧任务提供解析、转换或兼容路径，不补造来源回执。
 
 ## 顶层
 
@@ -29,7 +29,7 @@
 }
 ```
 
-`paper_order` 恰好包含 `papers` 的每个 key 一次。`missing_fulltexts` 按此顺序列出全部 `fulltext_path=null` 的论文。最终 `dimensions_used` 包含 `text_queries`、`literature_roles`、`citation_graph`；它们是语义维度，OpenAlex 和 Web 均可参与，引文方向和深度由 Agent 选择。`limitations` 记录简短运行级证据／覆盖限制。未知标量为 `null`，未知、空或不适用集合为 `[]`。
+`paper_order` 恰好包含 `papers` 的每个 key 一次。`missing_fulltexts` 按此顺序列出全部 `fulltext_path=null` 的论文。外部发现完成时 `dimensions_used` 包含实际开展的 `text_queries`、`literature_roles`、`citation_graph`；它们是语义维度，OpenAlex 和 Web 均可参与，引文方向和深度由 Agent 选择。`provided_only` 没有外部发现，`dimensions_used=[]`，主动检索耗时为 0，停止理由和限制说明只处理提供材料；故障或部分工作不补造未完成维度。`limitations` 记录简短运行级证据／覆盖限制。未知标量为 `null`，未知、空或不适用集合为 `[]`。
 
 ## 论文身份与元数据
 

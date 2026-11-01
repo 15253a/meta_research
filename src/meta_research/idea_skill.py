@@ -1382,6 +1382,8 @@ class CodexIdeaSkillAdapter:
                 *({"guidance_binding"} if "guidance_binding" in invocation else ()),
                 *({"external_mcp"} if "external_mcp" in invocation else ()),
                 *({"provider_execution_binding"} if "provider_execution_binding" in invocation else ()),
+                *({"execution_access_mode"} if "execution_access_mode" in invocation else ()),
+                *({"execution_write_root"} if "execution_write_root" in invocation else ()),
                 *({"operation_input_hash"} if "operation_input_hash" in invocation else ()),
                 }
                 if (
@@ -1663,6 +1665,8 @@ class CodexIdeaSkillAdapter:
                 *({"guidance_binding"} if "guidance_binding" in invocation else ()),
                 *({"external_mcp"} if "external_mcp" in invocation else ()),
                 *({"provider_execution_binding"} if "provider_execution_binding" in invocation else ()),
+                *({"execution_access_mode"} if "execution_access_mode" in invocation else ()),
+                *({"execution_write_root"} if "execution_write_root" in invocation else ()),
                 *({"operation_input_hash"} if "operation_input_hash" in invocation else ()),
                 *transport_limits.as_dict(),
             }
@@ -1944,6 +1948,8 @@ class CodexIdeaSkillAdapter:
         runtime_binding_hash: str | None = None,
         sandbox_read_root: Path | None = None,
         operation_input: dict[str, object] | None = None,
+        execution_access_mode: str | None = None,
+        execution_write_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         if runtime_binding_hash is None and runtime_binding is not None:
             runtime_binding_hash = canonical_hash(runtime_binding)
@@ -1955,6 +1961,8 @@ class CodexIdeaSkillAdapter:
         )
         if not self._root_resident_mcp.enabled:
             return self._invoke(
+                execution_access_mode=execution_access_mode,
+                execution_write_root=execution_write_root,
                 operation_name=operation_name,
                 prompt=prompt,
                 schema=schema,
@@ -1982,6 +1990,8 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable(error.code) from error
         try:
             result = self._invoke(
+                execution_access_mode=execution_access_mode,
+                execution_write_root=execution_write_root,
                 operation_name=operation_name,
                 prompt=prompt,
                 schema=schema,
@@ -2028,11 +2038,15 @@ class CodexIdeaSkillAdapter:
         root_runtime_scope: object,
         sandbox_read_root: Path | None = None,
         workspace_binding: WorkspaceBinding | None = None,
+        execution_access_mode: str | None = None,
+        execution_write_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         """Use a server-derived external Root scope when one is present."""
 
         if root_runtime_scope is None:
             return self._invoke(
+                execution_access_mode=execution_access_mode,
+                execution_write_root=execution_write_root,
                 operation_name=operation_name,
                 prompt=prompt,
                 schema=schema,
@@ -2056,7 +2070,9 @@ class CodexIdeaSkillAdapter:
             or any(
                 not isinstance(root_runtime_scope.get(field), str)
                 or not root_runtime_scope[field]
-                for field in required_fields - {"generation"}
+                for field in required_fields - ({"generation", "quest_ref"}
+                    if self._root_agent_kind == "acquisition" and root_runtime_scope.get("quest_ref") is None
+                    else {"generation"})
             )
             or not isinstance(root_runtime_scope.get("generation"), int)
             or isinstance(root_runtime_scope.get("generation"), bool)
@@ -2065,6 +2081,8 @@ class CodexIdeaSkillAdapter:
         ):
             raise IdeaSkillUnavailable("semantic_mcp_scope_invalid")
         return self._invoke_root_operation(
+            execution_access_mode=execution_access_mode,
+            execution_write_root=execution_write_root,
             operation_name=operation_name,
             prompt=prompt,
             schema=schema,
@@ -2100,6 +2118,8 @@ class CodexIdeaSkillAdapter:
         invocation_runner: object | None = None,
         provider_execution_binding: dict[str, object] | None = None,
         operation_input: dict[str, object] | None = None,
+        execution_access_mode: str | None = None,
+        execution_write_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
@@ -2137,7 +2157,7 @@ class CodexIdeaSkillAdapter:
         )
         with ExitStack() as external_channels:
             external_mcp_access = None
-            if self._external_mcp is not None:
+            if self._external_mcp is not None and execution_access_mode != "provided_only":
                 directory = self._workspace / "provider-operations" / canonical_hash({"job_ref": job_ref}) / operation_name
                 binding = None
                 legacy = False
@@ -2166,6 +2186,8 @@ class CodexIdeaSkillAdapter:
                     / operation_name
                 )
                 result = self._invoke_durable(
+                    execution_access_mode=execution_access_mode,
+                    execution_write_root=execution_write_root,
                     directory=directory,
                     operation_name=operation_name,
                     job_ref=job_ref,
@@ -2203,6 +2225,8 @@ class CodexIdeaSkillAdapter:
                     prefix="idea-provider-", dir=self._workspace
                 ) as raw_directory:
                     invoked = self._invoke_once(
+                        execution_access_mode=execution_access_mode,
+                        execution_write_root=execution_write_root,
                         directory=Path(raw_directory),
                         prompt=prompt,
                         schema=schema,
@@ -2272,6 +2296,8 @@ class CodexIdeaSkillAdapter:
         invocation_runner: object | None = None,
         provider_execution_binding: dict[str, object] | None = None,
         operation_input: dict[str, object] | None = None,
+        execution_access_mode: str | None = None,
+        execution_write_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str, dict[str, object]]:
         runner = self._runner if invocation_runner is None else invocation_runner
         directory.mkdir(parents=True, exist_ok=True)
@@ -2340,6 +2366,8 @@ class CodexIdeaSkillAdapter:
             "mcp_url": mcp_url,
             "mcp_scope_binding_hash": mcp_scope_binding_hash,
             **({} if provider_execution_binding is None else {"provider_execution_binding": provider_execution_binding}),
+            **({} if execution_access_mode is None else {"execution_access_mode": execution_access_mode}),
+            **({} if execution_write_root is None else {"execution_write_root": str(execution_write_root)}),
             **({} if external_mcp_access is None else {"external_mcp": external_mcp_access.binding()}),
             **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
             **({} if operation_input is None else {"operation_input_hash": canonical_hash(operation_input)}),
@@ -2424,6 +2452,8 @@ class CodexIdeaSkillAdapter:
         _ensure_durable_text(directory / "prompt.txt", prompt)
         try:
             result = self._invoke_once(
+                execution_access_mode=execution_access_mode,
+                execution_write_root=execution_write_root,
                 directory=directory,
                 prompt=prompt,
                 schema=schema,
@@ -2485,6 +2515,8 @@ class CodexIdeaSkillAdapter:
         workspace_binding: WorkspaceBinding | None = None,
         external_mcp_access: ExternalMcpAccess | None = None,
         invocation_runner: object | None = None,
+        execution_access_mode: str | None = None,
+        execution_write_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         runner = self._runner if invocation_runner is None else invocation_runner
         working_directory = workspace_binding.directory if workspace_binding else self._agent_workspace.resolve()
@@ -2573,13 +2605,18 @@ class CodexIdeaSkillAdapter:
             "--output-last-message",
             str(result_path),
         ]
+        if execution_access_mode == "provided_only":
+            from meta_research.root_capabilities import provided_only_cli_arguments
+            argv = provided_only_cli_arguments(argv, writable_root=execution_write_root or working_directory,
+                                               resident_mcp=semantic_mcp_enabled)
         if native_session_ref is None:
             argv.append("-")
         else:
             argv.extend(["resume", native_session_ref, "-"])
         try:
             try:
-                argv = live_native_argv(argv, directory, enabled=isinstance(runner, _CancellableProcessRunner))
+                argv = live_native_argv(argv, directory, enabled=isinstance(runner, _CancellableProcessRunner),
+                    force_transport=self._root_agent_kind == "acquisition" and execution_access_mode != "provided_only")
             except (OSError, ValueError, KeyError, TypeError, ProviderSupervisorError) as error:
                 raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
             environment = (
