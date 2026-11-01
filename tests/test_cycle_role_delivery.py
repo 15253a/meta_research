@@ -293,3 +293,48 @@ def test_missing_target_role_resource_fails_before_native_model_delivery(tmp_pat
     with pytest.raises(HarnessAdapterUnavailable, match="provider_resource_unavailable"):
         CodexHarnessAdapter(tmp_path / "target", runner=runner).invoke(invocation)
     assert all("--cd" not in argv and "features" not in argv for argv in runner.calls)
+
+
+def test_admitted_target_records_missing_role_resource_as_pending(tmp_path, monkeypatch):
+    from meta_research.harness_adapters import CodexHarnessAdapter
+    from test_harness_adapters import _RecordedRunner
+    from test_target_root_finalizer import _current_bundle_runtime
+    from test_target_launch_admission import _ready_launch
+    probes = _RecordedRunner("codex", ())
+    model_calls = []
+
+    def runner(argv, prompt, timeout, environment):
+        if "--cd" in argv:
+            model_calls.append(argv)
+            raise AssertionError("unavailable role resource must prevent model delivery")
+        return probes(argv, prompt, timeout, environment)
+
+    runtime = _current_bundle_runtime(tmp_path / "runtime", harness_adapters=(
+        CodexHarnessAdapter(tmp_path / "harness", runner=runner),))
+    try:
+        _graph, target, _bundle, dispatch, launch = _ready_launch(runtime)
+        runtime.owners.agent_runtime.admit_target_launch(launch, dispatch_decision_ref=dispatch.decision_ref,
+            idempotency_key="target-missing-role-resource")
+        for _ in range(16):
+            runtime.target_run_runtime.process_once(target.target_ref)
+            status = runtime.target_run_runtime.query_status(target.target_ref)
+            if status is not None and status.phase == "root_pending":
+                break
+        assert status.phase == "root_pending"
+        runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+        runtime.target_run_runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+        original_open = Path.open
+
+        def missing(path, *args, **kwargs):
+            if path.as_posix().endswith("/target-execution/references/formal-work.md"):
+                raise FileNotFoundError("Target reference is unavailable")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", missing)
+        assert runtime.target_run_runtime.process_once(target.target_ref) is False
+        status = runtime.target_run_runtime.query_status(target.target_ref)
+        assert status.phase == "root_pending"
+        assert status.pending_code == "provider_resource_unavailable"
+        assert model_calls == []
+    finally:
+        runtime.close()

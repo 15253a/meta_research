@@ -18,6 +18,12 @@ CYCLE_ROLE_DIRECTORIES = {
 
 
 @prepared_resource
+def cycle_role_skill_text(root_kind: str) -> str:
+    """Share one prepared read between adapter binding and Harness delivery."""
+    return (shared_reference_root() / CYCLE_ROLE_DIRECTORIES[root_kind] / "SKILL.md").read_text(encoding="utf-8")
+
+
+@prepared_resource
 def cycle_role_instructions(root_kind: str) -> str:
     """Maintain the selected role method in Harness instructions, not turn data."""
     directory = CYCLE_ROLE_DIRECTORIES.get(root_kind)
@@ -26,7 +32,7 @@ def cycle_role_instructions(root_kind: str) -> str:
     source = shared_reference_root() / directory / "SKILL.md"
     return (f"Role skill source: {source}\n"
             "Resolve role reference links relative to this source directory.\n"
-            + source.read_text(encoding="utf-8"))
+            + cycle_role_skill_text(root_kind))
 
 
 @prepared_resource

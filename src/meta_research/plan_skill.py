@@ -29,7 +29,7 @@ from meta_research.idea_skill import (
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources
+from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text
 from meta_research.plan_contract import (
     MAX_PLAN_EXPERIMENT_BRIEFS,
     MAX_PLAN_OBLIGATIONS,
@@ -630,7 +630,7 @@ def _plan_skill_resources() -> dict[str, str]:
         return {
             **shared_reference_resources(),
             **{
-                name: resource.read_text(encoding="utf-8")
+                name: cycle_role_skill_text("plan") if name == "SKILL.md" else resource.read_text(encoding="utf-8")
                 for name, resource in resources
             },
         }
