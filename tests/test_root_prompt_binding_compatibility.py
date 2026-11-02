@@ -121,7 +121,8 @@ def test_handoff_profiles_change_only_research_text_for_every_root(root_kind):
     # The current model upgrade has its own full-profile fixture and tests.
     reviewed_profile = document["current_profile"]
     reviewed_hash = canonical_hash(reviewed_profile)
-    assert document["reviewed_root_kinds"] == list(root_capabilities.ROOT_AGENT_KINDS)
+    # The frozen review still records the now-retired standalone Writing root.
+    assert [kind for kind in document["reviewed_root_kinds"] if kind != "writing"] == list(root_capabilities.ROOT_AGENT_KINDS)
     assert root_kind in document["reviewed_root_kinds"]
     assert reviewed_hash == document["current_profile_hash"]
     historical_hashes = set()
