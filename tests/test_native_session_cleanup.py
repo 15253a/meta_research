@@ -103,14 +103,18 @@ def test_open_grandchild_or_retained_child_prevents_cli_cascade(tmp_path):
                                     protected_paths=[paths[grandchild]])
     assert all(r["action"] == "skipped" for r in records)
     assert all(path.is_file() for path in paths.values())
-    records = delete_codex_sessions(root, str(executable), [parent], dry_run=False)
-    assert {r["session_ref"] for r in records if r["action"] == "removed"} == set(ids)
+    for _ in range(5):
+        delete_codex_sessions(root, str(executable), [parent], dry_run=False)
+        if not any(path.exists() for path in paths.values()):
+            break
     assert not any(path.exists() for path in paths.values())
+    with sqlite3.connect(state) as db:
+        assert not list(db.execute("SELECT id FROM threads"))
 
 
 def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool_history(tmp_path):
     from meta_research.provider_supervisor import ensure_transport_key, write_transport_envelope, write_exit_receipt
-    from meta_research.owners.common import canonical_hash
+    from meta_research.owners.common import canonical_hash, canonical_json
     from dataclasses import replace
     from test_completed_workspace_cleanup import _complete, _cleanup_runtime, _WorkspaceIdea
     from meta_research.timeline_summaries import TimelineSummaryStore
@@ -124,8 +128,8 @@ def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool
     try:
         root = runtime.data_root
         exe = _vendor()
-        ids = _saved_threads(exe, root, ["Stage", "old Companion", "Companion", "old Recorder", "Recorder"])
-        retired_stage, retired_companion, current, retired_recorder, current_recorder = ids
+        ids = _saved_threads(exe, root, ["Stage", "old Companion", "Companion", "old Recorder", "Recorder", "previous Target", "final Target"])
+        retired_stage, retired_companion, current, retired_recorder, current_recorder, previous_target, final_target = ids
         _, handle, *_ = _complete(tmp_path, runtime=runtime)
         store = TimelineSummaryStore(root.root / "research-recorder" / "summaries.sqlite3")
         for i, native in enumerate((retired_recorder, current_recorder)):
@@ -174,10 +178,13 @@ def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool
         # binding/profile. The transport must reconstruct a signed receipt from
         # the still-readable argv, prompt, schema, result, and stdout.
         from meta_research.harness_adapters import HarnessSupervisorTransport
-        with runtime._database.read() as c:
-            target_op, owner_hash = c.exec_driver_sql(
-                "SELECT operation_ref,invocation_hash FROM ar_harness_provider_operations "
-                "WHERE run_ref=? ORDER BY generation LIMIT 1", (handle.target_run_ref,)).one()
+        target_op = handle.target_run_ref + ":harness_turn:1"
+        owner_hash = canonical_hash({"operation": target_op})
+        with runtime._database.fenced_write() as c:
+            c.exec_driver_sql("INSERT INTO ar_harness_provider_operations "
+                "(operation_ref, run_ref, generation, invocation_hash, status, outcome_code, created_at, completed_at) "
+                "VALUES (?, ?, 1, ?, 'executed','target_root_human_request_wait',1,2)",
+                (target_op, handle.target_run_ref, owner_hash))
         transport = HarnessSupervisorTransport(root.run / "harness-supervisor")
         environment = {"META_RESEARCH_MCP_TOKEN": "fixture-token", "META_RESEARCH_HARNESS_FAMILY": "codex",
             "META_RESEARCH_HARNESS_WORKSPACE": str(root.root), "META_RESEARCH_PROVIDER_OPERATION_REF": target_op,
@@ -185,12 +192,68 @@ def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool
             "NO_PROXY": "", "no_proxy": "", "META_RESEARCH_OWNER_INVOCATION_HASH": owner_hash}
         result = transport(["/bin/cat"], raw.decode(), 10, environment)
         assert result.returncode == 0
-        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
+        # Construct a retired lease in the same Run, carrying an independently
+        # allocated native root. Only its historical observation binds the ID.
+        from test_target_root_observations import _event
+        lease = "retired-target-fixture"
+        name = canonical_hash({"workspace_ref": lease})
+        old_directory = runtime.target_run_runtime._target_agent._workspace_root / name
+        old_directory.mkdir()
+        pending = old_directory / ".target-completion-intakes"
+        pending.mkdir()
+        with runtime._database.fenced_write() as c:
+            from meta_research.owners.target_run_runtime import _receipt, AR_TARGET_RUN_WORKSPACE_RECEIPT_KIND
+            payload = {"target_ref": handle.target_ref, "target_run_ref": handle.target_run_ref,
+                "root_session_ref": "prior-logical-root", "target_attempt_ref": "prior-attempt",
+                "target_fence_ref": "prior-fence", "implementation_relative_path": "implementation",
+                "inputs_relative_path": "inputs"}
+            receipt = _receipt("agent_runtime", AR_TARGET_RUN_WORKSPACE_RECEIPT_KIND, "prior-receipt", lease,
+                {**payload, "workspace_ref": lease, "ordinal": 2, "root_name": name, "payload_hash": canonical_hash(payload)})
+            c.exec_driver_sql("INSERT INTO ar_target_run_workspaces SELECT ?,target_ref,target_run_ref,"
+                "'prior-logical-root','prior-attempt','prior-fence',2,?,'retired',?,?,"
+                "'older-lease',?,'prior-receipt',?,created_at FROM ar_target_run_workspaces WHERE target_run_ref=?",
+                (lease, name, canonical_json(payload), canonical_hash(payload),
+                 canonical_hash({"command": "reserve_target_run_workspace", **payload}), receipt.payload_hash, handle.target_run_ref))
+            event_scope = {"schema_ref": "meta-research/target-root-observation-scope/v2",
+                "target_run_ref": handle.target_run_ref, "attempt_ref": "prior-attempt", "attempt_generation": 1,
+                "root_session_ref": "prior-logical-root", "fence_ref": "prior-fence", "native_session_ref": None,
+                "target_workspace_ref": lease}
+            event = _event(1, "historical run", scope=event_scope)
+            event["target_root_observation"]["root_native_session_ref"] = previous_target
+            c.exec_driver_sql("INSERT INTO ar_harness_evidence_events VALUES (?,?,?,?,?,1)",
+                (event["event_ref"], target_op, event["sequence"], canonical_json(event), canonical_hash(event)))
+            c.exec_driver_sql("UPDATE ar_harness_runs SET native_session_ref=? WHERE run_ref=?",
+                              (final_target, handle.target_run_ref))
+        # Page size one: even the page containing only the other lease must
+        # respect this intake before deleting either thread or either spool.
+        seen = set()
+        for _ in range(8):
+            page = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=True, limit=1)
+            for item in page:
+                if item["root_kind"] == "target":
+                    seen.add(item["workspace_ref"])
+                    assert item.get("native_cleanup_reason", item["reason"]) == "pending_finalizer_intake"
+                    assert all(r["root_kind"] != "provider_spool" for r in page)
+            if len(seen) == 2:
+                break
+        assert len(seen) == 2
+        assert paths[previous_target].exists() and paths[final_target].exists()
+        pending.rmdir()
+        retired = {retired_stage, retired_companion, retired_recorder, previous_target, final_target}
+        report = ()
+        for _ in range(6):
+            report += runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, limit=100)
+            with sqlite3.connect(root.codex_home / "state_5.sqlite") as db:
+                saved = {r[0] for r in db.execute("SELECT id FROM threads")}
+            if not retired.intersection(saved) and not any(paths[ref].exists() for ref in retired):
+                break
+        assert not retired.intersection(saved)
+        assert not any(paths[ref].exists() for ref in retired)
+        assert retired <= {r["session_ref"] for r in report if r["root_kind"] == "native_session"
+                           and r["reason"] in {"retired_native_session", "native_cleanup_deferred"}}
         recovered = HarnessSupervisorTransport(root.run / "harness-supervisor").recover_transport_receipt(
             target_op, family="codex")
         assert recovered == result.meta_research_transport_receipt
-        assert {r["session_ref"] for r in report if r["root_kind"] == "native_session" and r["action"] == "removed"} == {
-            retired_stage, retired_companion, retired_recorder}
         assert paths[current_recorder].is_file() and not paths[retired_recorder].exists()
         assert not paths[retired_stage].exists() and not paths[retired_companion].exists()
         assert paths[current].is_file()

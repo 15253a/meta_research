@@ -95,9 +95,10 @@ def _next_foreground(runtime, *, resume=False):
         return cycle
 
 
-def _complete(tmp_path, *, publish=True, finish_cycle=True, out_of_window=True, runtime=None):
+def _complete(tmp_path, *, publish=True, finish_cycle=True, out_of_window=True, runtime=None, quest=None):
     seeded = runtime or _cleanup_runtime(tmp_path / "cleanup-root")
-    quest = _confirm_deepfetch_quest(seeded)
+    if quest is None:
+        quest = _confirm_deepfetch_quest(seeded)
     _finish_stage(seeded, 'idea')
     _finish_plan_stage(seeded)
     ready = _ready_existing(seeded)

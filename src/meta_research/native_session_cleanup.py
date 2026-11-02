@@ -7,11 +7,13 @@ import re
 from pathlib import Path
 import sqlite3
 import subprocess
+import time
 from uuid import UUID
 
 from sqlalchemy import bindparam, text
 
 from meta_research.owners.common import canonical_hash
+from meta_research.stage_session_retirement import retired_stage_ids
 from meta_research.provider_supervisor import (ProviderSupervisorError, read_transport_envelope,
     read_transport_key_for_operation, SUPERVISOR_EXIT_SCHEMA, SUPERVISOR_EXIT_SCHEMA_V2)
 
@@ -21,6 +23,12 @@ def _uuid(value):
         return isinstance(value, str) and str(UUID(value)) == value
     except ValueError:
         return False
+
+
+# A single sweep holds the research Owner writer while it revalidates and
+# deletes. Share the CLI wait allowance across the whole fenced batch; a
+# slow Harness must yield to research instead of blocking once per thread.
+_NATIVE_DELETE_BATCH_SECONDS = 2.0
 
 
 def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_paths=()):
@@ -90,6 +98,7 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
         except (ValueError, KeyError, AttributeError, TypeError, OSError):
             continue
 
+    deadline = time.monotonic() + _NATIVE_DELETE_BATCH_SECONDS
     cleared = set()
     while planned:
         leaves = [ref for ref in planned if not children.get(ref, set()) - cleared]
@@ -102,6 +111,9 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
             try:
                 size = path.stat().st_size
                 if not dry_run:
+                    if time.monotonic() >= deadline:
+                        record["reason"] = "native_cleanup_deferred"
+                        continue
                     # Prevent the recursive CLI from acting on a newly attached child,
                     # changed locator, or a missing binding that would trigger a rescan.
                     with sqlite3.connect(state.as_uri() + "?mode=ro", uri=True, timeout=2) as db:
@@ -114,15 +126,32 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
                     if not leaf or path.resolve(strict=True) != path:
                         record["reason"] = "native_binding_changed"
                         continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        record["reason"] = "native_cleanup_deferred"
+                        continue
                     subprocess.run([executable, "delete", "--force", ref], check=True,
                                    cwd=root.root, env={**os.environ, **root.codex_environment},
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, timeout=30)
+                                   stderr=subprocess.DEVNULL, timeout=remaining)
                     if path.exists():
                         continue
                 cleared.add(ref)
                 record.update(bytes=size, action="candidate" if dry_run else "removed",
                               reason="retired_native_session")
+            except subprocess.TimeoutExpired:
+                # The CLI can finish the deletion before its process exits.
+                # Report only a verified effect; otherwise recheck next sweep.
+                record["reason"] = "native_cleanup_deferred"
+                if not path.exists():
+                    try:
+                        with sqlite3.connect(state.as_uri() + "?mode=ro", uri=True, timeout=0) as db:
+                            absent = db.execute("SELECT 1 FROM threads WHERE id=?", (ref,)).fetchone() is None
+                    except sqlite3.Error:
+                        absent = False
+                    if absent:
+                        cleared.add(ref)
+                        record.update(bytes=size, action="removed", reason="retired_native_session")
             except (OSError, sqlite3.Error, subprocess.SubprocessError):
                 record["reason"] = "native_delete_unavailable"
     return reports
@@ -131,6 +160,52 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
 def _query_runs(connection, sql, work):
     return connection.execute(text(sql).bindparams(bindparam("runs", expanding=True)),
                               {"runs": tuple(work)})
+
+
+def _replaced_target_sessions(connection, work, target_agent):
+    # Read one representative event for each unambiguous native identity, only
+    # for operations of the eligible runs. The AR workspace lease supplies the
+    # authoritative attempt, root and fence of the old generation.
+    from meta_research.owners.common import OwnerConflict
+    from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError, _validated_target_root_event
+    ids = set()
+    targets = {run for run, kind in work.items() if kind == "target"}
+    if not targets:
+        return ids
+    for row in _query_runs(connection, """
+        WITH bindings AS (
+            SELECT p.run_ref, e.event_ref, e.sequence, e.summary_json, e.summary_hash,
+                json_extract(e.summary_json, '$.target_root_observation.scope') AS scope,
+                json_extract(e.summary_json, '$.target_root_observation.root_native_session_ref') AS native
+            FROM ar_harness_evidence_events e JOIN ar_harness_provider_operations p USING(operation_ref)
+            JOIN ar_harness_runs h ON h.run_ref=p.run_ref AND h.harness_family='codex'
+            WHERE p.run_ref IN :runs AND p.status IN ('executed','failed')
+              AND json_type(e.summary_json, '$.target_root_observation')='object'
+            GROUP BY p.operation_ref
+            HAVING count(json_extract(e.summary_json, '$.target_root_observation.scope'))=count(*)
+               AND count(json_extract(e.summary_json, '$.target_root_observation.root_native_session_ref'))=count(*)
+               AND count(DISTINCT json_extract(e.summary_json, '$.target_root_observation.scope'))=1
+               AND count(DISTINCT json_extract(e.summary_json, '$.target_root_observation.root_native_session_ref'))=1
+        )
+        SELECT b.*, w.*
+        FROM bindings b JOIN ar_target_run_workspaces w
+          ON w.target_run_ref=b.run_ref AND w.root_session_ref=json_extract(b.scope,'$.root_session_ref')
+           AND w.target_attempt_ref=json_extract(b.scope,'$.attempt_ref')
+           AND w.target_fence_ref=json_extract(b.scope,'$.fence_ref')
+        """, targets):
+        try:
+            target_agent._stored_target_workspace(row, require_current=False)
+            scope = json.loads(row.scope)
+            if (scope.get("target_run_ref") != row.run_ref or type(scope.get("attempt_generation")) is not int
+                    or scope["attempt_generation"] < 1 or scope.get("target_workspace_ref") not in (None, row.workspace_ref)):
+                continue
+            event = _validated_target_root_event(json.loads(row.summary_json),
+                expected_scope=scope, expected_native_session_ref=row.native)
+            if event[:4] == (row.event_ref, row.sequence, row.summary_json, row.summary_hash):
+                ids.add(row.native)
+        except (AgentRuntimeHarnessError, OwnerConflict, KeyError, TypeError, ValueError):
+            continue
+    return ids
 
 
 def cleanup_cycle_sessions(runtime, connection, candidates, *, dry_run, protected_paths=()):
@@ -148,7 +223,9 @@ def cleanup_cycle_sessions(runtime, connection, candidates, *, dry_run, protecte
         JOIN ar_harness_runs h ON h.run_ref=c.target_run_ref AND h.harness_family='codex'
         WHERE c.target_run_ref IN :runs AND c.completion_evidence_ref IS NOT NULL
     """, work).scalars().all()
-    reports = cleanup.delete(native, dry_run, protected_paths)
+    retired = (set(native) | retired_stage_ids(connection, work)
+               | _replaced_target_sessions(connection, work, runtime._target_agent))
+    reports = cleanup.delete(retired, dry_run, protected_paths)
     reports.extend(_clean_spools(cleanup.root, connection, work, dry_run, protected_paths))
     return reports
 
@@ -257,15 +334,11 @@ class NativeSessionCleanup:
                 SELECT n.native_session_ref FROM hc_companion_native_sessions n
                  JOIN hc_companion_sessions s USING (session_ref)
                 WHERE n.generation < s.native_session_generation AND n.native_session_ref IS NOT NULL
-                  AND NOT EXISTS (SELECT 1 FROM hc_companion_turns t WHERE t.session_ref=n.session_ref
-                    AND t.native_session_generation=n.generation AND t.assistant_status IN ('queued','processing'))
                 UNION
-                SELECT n.native_session_ref FROM hc_intent_native_sessions n JOIN hc_intent_drafting_sessions s USING (session_ref)
-                WHERE n.generation < s.native_session_generation AND n.native_session_ref IS NOT NULL
-                  AND NOT EXISTS (SELECT 1 FROM hc_intent_drafting_turns t WHERE t.session_ref=n.session_ref
-                    AND t.native_session_generation=n.generation AND t.assistant_status IN ('queued','running','unavailable'))
-                  AND NOT EXISTS (SELECT 1 FROM hc_proposal_generation_attempts a WHERE a.initialization_id=s.initialization_id
-                    AND a.native_session_generation=n.generation AND a.status IN ('queued','running'))
+                SELECT n.native_session_ref FROM hc_intent_native_sessions n
+                 JOIN hc_intent_drafting_sessions s USING (session_ref)
+                WHERE (n.generation < s.native_session_generation OR s.status='closed')
+                  AND n.native_session_ref IS NOT NULL
                 ORDER BY 1
             """, limit))
             if self.acquisition:
@@ -283,9 +356,36 @@ class NativeSessionCleanup:
                         continue
             # Intent and Companion can hand the same live native thread across scopes.
             if ids:
-                ids -= set(_query_runs(connection, """
+                ids -= set(_query_runs(connection, r"""
+                    WITH intent AS (
+                        SELECT n.native_session_ref, n.generation, s.session_ref, s.initialization_id,
+                               s.status, s.native_session_generation, i.status AS initialization_status
+                          FROM hc_intent_native_sessions n JOIN hc_intent_drafting_sessions s USING (session_ref)
+                          JOIN hc_quest_initializations i USING (initialization_id)
+                         WHERE n.native_session_ref IN :runs
+                    ), unfinished AS (
+                        SELECT operation_ref,root_run_ref FROM ar_execution_responsibilities
+                         WHERE owner_scope='human_collaboration' AND effect_kind='drafting_claim' AND status!='finished'
+                    )
                     SELECT native_session_ref FROM hc_companion_sessions WHERE native_session_ref IN :runs
-                    UNION SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE native_session_ref IN :runs
+                    UNION SELECT n.native_session_ref FROM hc_companion_native_sessions n
+                      JOIN hc_companion_turns t ON t.session_ref=n.session_ref AND t.native_session_generation=n.generation
+                     WHERE n.native_session_ref IN :runs AND t.assistant_status IN ('queued','processing')
+                    UNION SELECT i.native_session_ref FROM intent i
+                     WHERE i.generation=i.native_session_generation AND (i.status!='closed' OR
+                        (i.initialization_status NOT IN ('cancelled','completed') AND NOT EXISTS (
+                            SELECT 1 FROM rg_quests q JOIN hc_companion_sessions c ON c.scope_ref='quest:'||q.quest_ref
+                             JOIN hc_companion_native_sessions n ON n.session_ref=c.session_ref AND n.generation=1
+                             WHERE q.initialization_id=i.initialization_id AND n.native_session_ref=i.native_session_ref)))
+                    UNION SELECT i.native_session_ref FROM intent i JOIN hc_intent_drafting_turns t
+                         ON t.session_ref=i.session_ref AND t.native_session_generation=i.generation
+                      LEFT JOIN unfinished f ON f.root_run_ref=i.initialization_id AND f.operation_ref=t.turn_ref||'\:intent-reply'
+                     WHERE t.assistant_status IN ('queued','running') OR
+                        (t.assistant_status='unavailable' AND i.status='open') OR f.operation_ref IS NOT NULL
+                    UNION SELECT i.native_session_ref FROM intent i JOIN hc_proposal_generation_attempts a
+                         ON a.initialization_id=i.initialization_id AND a.native_session_generation=i.generation
+                      LEFT JOIN unfinished f ON f.root_run_ref=i.initialization_id AND f.operation_ref=a.generation_ref||'\:proposal'
+                     WHERE a.status IN ('queued','running') OR f.operation_ref IS NOT NULL
                 """, ids).scalars())
             recorder = self.root.root / "research-recorder" / "summaries.sqlite3"
             if not ids and not recorder.exists():

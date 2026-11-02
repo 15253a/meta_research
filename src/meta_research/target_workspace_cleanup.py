@@ -135,6 +135,18 @@ def _cycle_dependencies(connection, cycle_refs):
             SELECT cycle_ref, 'cycle_handoff_incomplete' AS reason FROM ae_stage_run_requests r
               WHERE cycle_ref IN :cycles AND NOT EXISTS (
                 SELECT 1 FROM ae_stage_commits c WHERE c.request_ref=r.request_ref)
+              -- A revoked attempt has no commit of its own. Its responsibility
+              -- is settled only by a later commit of this same Cycle and Stage.
+              AND NOT EXISTS (
+                SELECT 1 FROM ae_foreground_grants g
+                JOIN ae_stage_run_requests newer ON newer.cycle_ref=r.cycle_ref
+                  AND newer.stage=r.stage AND newer.epoch>r.epoch
+                JOIN ae_stage_commits accepted ON accepted.request_ref=newer.request_ref
+                WHERE g.quest_ref=r.quest_ref AND g.cycle_ref=r.cycle_ref
+                  AND g.epoch=r.epoch AND g.status='revoked'
+                  AND NOT EXISTS (SELECT 1 FROM ar_stage_runs s LEFT JOIN ar_run_controls ctl USING(run_ref)
+                    WHERE s.request_ref=r.request_ref AND
+                      (ctl.status IS NOT 'terminated' OR ctl.cleanup_status IS NOT 'completed')))
             UNION ALL
             SELECT r.cycle_ref, 'handoff_incomplete' FROM ar_target_launches a
               JOIN ae_stage_run_requests r ON r.request_ref=a.stage_request_ref
@@ -163,6 +175,37 @@ def _cycle_dependencies(connection, cycle_refs):
         SELECT cycle_ref, reason FROM pending GROUP BY cycle_ref, reason ORDER BY cycle_ref, reason
         """).bindparams(bindparam("cycles", expanding=True)), {"cycles": sorted(cycle_refs)})
     return {cycle: reason for cycle, reason in rows}
+
+
+def _path_dependency(workspace, path, pending_uploads, pending_intakes):
+    if workspace in pending_uploads:
+        return 'pending_human_upload'
+    if (path / '.target-completion-intakes').exists():
+        return 'pending_finalizer_intake'
+    if any(_paths_overlap(source, path) for source in pending_intakes):
+        return 'pending_asset_intake'
+    return None
+
+
+def _blocked_session_runs(connection, candidates, target_root, pending_uploads, pending_intakes):
+    """Session/spool ownership spans every workspace lease of a recovered Target."""
+    runs = {candidate['work_ref'] for candidate in candidates if candidate['root_kind'] == 'target'}
+    if not runs:
+        return {}
+    blocked = {}
+    leases = connection.execute(text("""SELECT target_run_ref,workspace_ref,root_name
+        FROM ar_target_run_workspaces WHERE target_run_ref IN :runs""").bindparams(
+            bindparam("runs", expanding=True)), {"runs": sorted(runs)})
+    for run, workspace, name in leases:
+        path = target_root / name
+        try:
+            if name != canonical_hash({'workspace_ref': workspace}) or path.resolve(strict=False) != path:
+                blocked[run] = 'workspace_cleanup_unsafe_boundary'
+            elif reason := _path_dependency(workspace, path, pending_uploads, pending_intakes):
+                blocked[run] = reason
+        except (OSError, RuntimeError):
+            blocked[run] = 'workspace_cleanup_unsafe_boundary'
+    return blocked
 
 
 def _window_reason(connection, candidate, windows):
@@ -400,12 +443,7 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
                 # Hold BEGIN IMMEDIATE through the deletion. Re-read the foreground and
                 # all mutable Owner dependencies in this cut, after public handoff readback.
                 reason = _window_reason(connection, candidate, fenced_windows) or deps.get(candidate['cycle_ref'])
-                if not reason and candidate['workspace_ref'] in pending_uploads:
-                    reason = 'pending_human_upload'
-                if not reason and (path / '.target-completion-intakes').exists():
-                    reason = 'pending_finalizer_intake'
-                if not reason and any(_paths_overlap(source, path) for source in pending_intakes):
-                    reason = 'pending_asset_intake'
+                reason = reason or _path_dependency(candidate['workspace_ref'], path, pending_uploads, pending_intakes)
                 if reason:
                     record['reason'] = reason
                     blocked_runs.add(candidate['work_ref'])
@@ -449,6 +487,11 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
                 record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
         if native_candidates:
             from meta_research.native_session_cleanup import cleanup_cycle_sessions
+            sibling_dependencies = _blocked_session_runs(connection, native_candidates, target_root, pending_uploads, pending_intakes)
+            blocked_runs.update(sibling_dependencies)
+            for candidate, _, _, record in eligible:
+                if candidate['work_ref'] in sibling_dependencies:
+                    record['native_cleanup_reason'] = sibling_dependencies[candidate['work_ref']]
             report.extend(cleanup_cycle_sessions(runtime, connection,
                 [c for c in native_candidates if c['work_ref'] not in blocked_runs],
                 dry_run=dry_run, protected_paths=(*protected_originals, *pending_intakes)))
