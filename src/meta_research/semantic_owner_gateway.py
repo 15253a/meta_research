@@ -1839,7 +1839,18 @@ def _root_human_request_operation_binding(
     if context.root_kind is None:
         raise SemanticMcpError("root_agent_human_request_effect_unauthorized")
     quest_ref = scope.get("quest_ref")
-    if not (context.root_kind == "acquisition" and quest_ref is None) and (not isinstance(quest_ref, str) or not quest_ref):
+    initialized_deepfetch = (
+        context.root_kind == "deepfetch"
+        and scope.get("run_kind") == "deepfetch"
+        and isinstance(scope.get("initialization_id"), str)
+        and bool(scope["initialization_id"])
+        and isinstance(scope.get("acquisition_session_ref"), str)
+        and bool(scope["acquisition_session_ref"])
+    )
+    pre_quest = quest_ref is None and (
+        context.root_kind == "acquisition" or initialized_deepfetch
+    )
+    if not pre_quest and (not isinstance(quest_ref, str) or not quest_ref):
         raise SemanticMcpError("root_agent_human_request_scope_invalid")
     return {
         "quest_ref": quest_ref,

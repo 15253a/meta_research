@@ -7591,6 +7591,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 raise OwnerConflict("deepfetch_acquisition_binding_invalid")
             verified_scope["acquisition_session_ref"] = session.session_ref
             verified_scope["literature_access_mode"] = session.mode
+            # The HC request binding above proves this initialization, including
+            # before a Quest exists. It is runtime authority, not Agent input.
+            verified_scope["initialization_id"] = session.initialization_id
         return verified_scope
 
     def _yield_operation_for_human_request(
@@ -13566,11 +13569,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
             self._finish_recorded_acquisition_boundary(terminal_effect)
             managed = self.query_managed_run(request.request_id)
-            if (
-                managed is not None
-                and isinstance(waiting.quest_ref, str)
-                and waiting.quest_ref
-            ):
+            if managed is not None:
                 terminal_scope = _acquisition_root_runtime_scope(
                     quest_ref=waiting.quest_ref,
                     session_ref=session_ref,
@@ -13605,8 +13604,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if (
             waiting is not None
             and waiting.status == "waiting_user"
-            and isinstance(waiting.quest_ref, str)
-            and waiting.quest_ref
         ):
             suspended = self.query_managed_run(request.request_id)
             if suspended is not None and suspended.get("status") == "suspended":

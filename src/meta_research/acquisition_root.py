@@ -151,8 +151,8 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         return self._acquire(request)
 
     def reconcile(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:
-        # The same durable operation inspects its prior spool before dispatch.
-        # Never create a second download just because the response was lost.
+        # The same Owner request may resume this native in a new bounded attempt.
+        # Its prior spool and files are reconciled before any download repeats.
         return self._acquire(request)
 
     def _acquire(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:

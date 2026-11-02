@@ -1711,7 +1711,9 @@ def _validate_operation_binding(
             or not cast(str, binding[name]).strip()
             or len(cast(str, binding[name])) > 256
             for name in required_text
-            if not (name == "quest_ref" and binding.get("root_kind") == "acquisition" and quest_ref is None and binding.get(name) is None)
+            if not (name == "quest_ref" and quest_ref is None and binding.get(name) is None
+                    and (binding.get("root_kind") == "acquisition"
+                         or issuer == "agent_runtime" and binding.get("root_kind") == "deepfetch"))
         )
         or not isinstance(binding.get("generation"), int)
         or isinstance(binding.get("generation"), bool)
