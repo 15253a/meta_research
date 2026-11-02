@@ -15,7 +15,8 @@ from test_codex_shell_environment import _vendor
 @contextmanager
 def _server(executable, data_root):
     # No model is invoked. inject_items persists a local saved thread.
-    process = subprocess.Popen([executable, "app-server"], cwd=data_root.root,
+    args = [executable, "app-server", "-c", 'cli_auth_credentials_store="ephemeral"']
+    process = subprocess.Popen(args, cwd=data_root.root,
         env={**os.environ, **data_root.codex_environment},
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, text=True)
     responses = queue.Queue()
@@ -49,7 +50,6 @@ def _server(executable, data_root):
 
 
 def _saved_threads(executable, root, messages):
-    (root.codex_home / "auth.json").unlink(missing_ok=True)
     with _server(executable, root) as call:
         ids = []
         for message in messages:

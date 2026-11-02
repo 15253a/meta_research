@@ -138,7 +138,10 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
                         record["reason"] = "native_cleanup_deferred"
                         continue
                     last_attempted = ref
-                    subprocess.run([executable, "delete", "--force", ref], check=True,
+                    # Local housekeeping uses the same thread DB without
+                    # refreshing or writing the research account's credentials.
+                    subprocess.run([executable, "delete", "--force", "-c",
+                                    'cli_auth_credentials_store="ephemeral"', ref], check=True,
                                    cwd=root.root, env={**os.environ, **root.codex_environment},
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, timeout=remaining)

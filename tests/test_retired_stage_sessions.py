@@ -38,9 +38,6 @@ def test_cleanup_recovers_replaced_stage_thread_only_from_verified_owner_binding
             attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, failure_code="codex_native_session_unavailable",
             provider_exit=_unavailable_proof(previous))
         _complete(tmp_path, runtime=runtime, quest=quest)
-        # The Quest fixture can install test credentials. The local delete
-        # needs no remote account in this disposable Codex home.
-        (root.codex_home / "auth.json").unlink(missing_ok=True)
         completed = owner.query_idea_stage_run(request.request_ref)
         assert completed.status == "completed" and completed.native_session_ref == replacement
 
