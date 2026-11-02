@@ -13016,7 +13016,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     binding = request["open_effect"]["operation_binding"]
                     if (delivery["root_session_ref"] == binding["root_session_ref"]
                         and (delivery["work_ref"] == binding["task_ref"] or delivery["request_ref"] == binding["task_ref"])
-                        and (delivery["uploaded_readers"] or delivery["linked_locators"])):
+                        and (delivery["uploaded_files"] or delivery["linked_locators"])):
                         return "workspace_material_delivery_verified", (delivery["delivery_ref"],), None
                 except OwnerConflict:
                     return None

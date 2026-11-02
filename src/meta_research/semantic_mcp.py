@@ -56,8 +56,6 @@ TOOL_DISCOVERY_OPERATION_IDS = (
 ROOT_AGENT_COMMON_OPERATION_IDS = (
     *TOOL_DISCOVERY_OPERATION_IDS,
     *RUNTIME_MATERIAL_OPERATION_IDS,
-    "research_workspace.discover",
-    "research_workspace.read",
     "research_memory.assets.page",
     "research_memory.assets.lifecycle",
     "research_memory.assets.current",

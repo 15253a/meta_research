@@ -2,7 +2,6 @@
 from pathlib import Path
 import os
 import json
-import time
 
 from meta_research.owners.research_memory import AssetIntakeRequest
 from test_completed_workspace_cleanup import _complete, _cleanup_runtime, _WorkspaceIdea
@@ -44,7 +43,7 @@ def test_linked_original_keeps_ancestors_but_releases_unrelated_workspace_bytes(
         human = runtime.owners.human_collaboration
         manual = human.open_manual_question_creation(quest_ref=idea.quest_ref,
             parent_question_ref=idea.question_ref, idempotency_key='cleanup-human-directory')
-        human.register_work_materials(anchor_kind='manual', anchor_ref=manual['context_ref'],
+        submission = human.register_work_materials(anchor_kind='manual', anchor_ref=manual['context_ref'],
             command={'receiver': human.material_receiver('manual', manual['context_ref']),
                 'selections': [runtime.root_workspaces.server_files.inspect(str(human_directory))],
                 'description': 'Original directory is neither scratch nor an adopted asset.'},
@@ -66,7 +65,7 @@ def test_linked_original_keeps_ancestors_but_releases_unrelated_workspace_bytes(
                 scans['pending_intakes'] += 1
         event.listen(runtime._database._engine, 'before_cursor_execute', count_queries)
         try:
-            report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+            report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         finally:
             event.remove(runtime._database._engine, 'before_cursor_execute', count_queries)
         observation = {'scans': scans, 'candidates': len(report),
@@ -96,7 +95,7 @@ def test_linked_original_keeps_ancestors_but_releases_unrelated_workspace_bytes(
             low_value=True, obsolete=True, incorrect=True, impact_understood=True,
             has_explanation_value=False, idempotency_key='retire-protected-original')
         # A second pass may remove nothing, but must never remove the original.
-        runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         assert original.read_bytes() == b'\x00\xfforiginal'
         # Construct the durable pending submission left by a failed human upload
         # acceptance (the public failure/retry path is covered separately).
@@ -110,9 +109,35 @@ def test_linked_original_keeps_ancestors_but_releases_unrelated_workspace_bytes(
         with runtime._database.fenced_write() as connection:
             human._insert_material_submission(connection, command=command, key='pending-protection',
                 anchor_kind='guidance', anchor_ref='pending:protection', state='pending', validate_receiver=False)
-        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         row = next(item for item in report if item['path'] == str(workspace))
         assert (row['action'], row['reason']) == ('skipped', 'pending_human_upload')
         assert pending.read_bytes() == b'pending human upload'
+
+        # The directory is no longer a fourth workspace. Only the registered
+        # human original remains readable, under a current grant in this Quest.
+        from test_dataset_effect_scope_recovery import _scope
+        from test_root_workspace import _external_context
+        scope = _scope(runtime, quest_ref=idea.quest_ref, run_ref='later-reader', root_ref='later-root')
+        context = _external_context(scope)
+        channel = _channel(runtime, context)
+        registered = submission['references'][0]['reference_ref']
+        listed = _accepted(_call(runtime, channel, 'research_workspace.materials.discover',
+                                 reference_ref=registered))
+        entry, = listed['entries']
+        args = {'reference_ref': registered, 'path': entry['path'],
+                'observation_ref': entry['observation']['observation_ref']}
+        read = 'research_workspace.materials.read'
+        assert _accepted(_call(runtime, channel, read, **args))['text'] == '\x00human original'
+        foreign = _external_context(_scope(runtime, quest_ref='another-quest',
+                                           run_ref='foreign-reader', root_ref='foreign-root'))
+        assert _call(runtime, _channel(runtime, foreign), read, **args)['structuredContent']['code'] == 'material_not_visible'
+        human_directory.rename(human_directory.with_name('offline-source'))
+        assert _call(runtime, channel, read, **args)['structuredContent']['code'] == 'material_missing'
+        runtime.owners.agent_runtime.complete_external_root_task_scope(root_kind='companion', root_runtime_scope=scope)
+        status, response, _ = runtime.harnesses.dispatch_mcp_http(channel.connection.token, {
+            'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+            'params': {'name': read, 'arguments': args}}, mcp_session_id=None)
+        assert status != 200 or response.get('error') or response['result'].get('isError')
     finally:
         runtime.close()

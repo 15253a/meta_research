@@ -56,9 +56,9 @@ def test_guidance_binary_upload_keeps_receiving_work_and_exact_replay(tmp_path, 
                 delivery = material['uploads'][0]
                 assert delivery['work_ref'] == request.run_ref
                 assert delivery['root_session_ref'] == receiver['roots'][0]['root_session_ref']
-                reader = delivery['reader']
+                file = delivery['file']
                 location = human._root_workspaces._runtime_location(request.run_ref)
-                assert (location.directory / reader['path']).read_bytes() == literal
+                assert (location.directory / file['path']).read_bytes() == literal
                 again = client.post('/api/v1/human-collaboration/guidance', json=body,
                     headers={**headers, 'Idempotency-Key': 'confirm-binary-guidance'})
                 assert again.json() == response.json()

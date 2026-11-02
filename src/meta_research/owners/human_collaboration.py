@@ -4508,15 +4508,15 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 probe = _probe_linked_reply(saved["locator"])
                 if any(saved[name] != probe[name] for name in ("device", "inode", "observed_kind")):
                     raise OwnerConflict("human_response_linked_path_changed")
-            readers = {item["path"].split("/", 2)[-1]: {"workspace_ref": published["workspace_ref"],
-                "path": item["path"], "expected_sha256": item["sha256"]} for item in published["files"]}
+            workspace_files = {item["path"].split("/", 2)[-1]: {"workspace_ref": published["workspace_ref"],
+                "path": item["path"], "sha256": item["sha256"]} for item in published["files"]}
             delivery = {"schema_ref": "meta-research/workspace-reply-receipt/v1",
                 "delivery_ref": row.delivery_ref, "manifest_hash": row.manifest_hash,
                 "human_request_ref": row.request_ref, "response_ref": row.response_ref,
-                **destination.location.source(), "reply_reader": readers["reply.json"],
+                **destination.location.source(), "reply_file": workspace_files["reply.json"],
                 "stage_request_ref": (destination.location.request_ref
                     if destination.location.root_kind in {"idea", "plan", "bundle", "reasoning", "target"} else None),
-                "uploaded_readers": [readers[item["relative_path"]] for item in command["materials"] if item["kind"] == "upload"],
+                "uploaded_files": [workspace_files[item["relative_path"]] for item in command["materials"] if item["kind"] == "upload"],
                 "linked_locators": linked,
                 **({"work_materials": material_readers, "receiving_identity": material_command["receiver"]} if material_command is not None else {})}
             return self.respond_to_human_request(row.request_ref, decision=command["decision"],

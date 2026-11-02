@@ -95,12 +95,14 @@ class TargetRunRuntime:
         root_workspaces=None,
         advancement_engine: AdvancementEngineInterface | None = None,
         protected_storage_roots: tuple[Path, ...] = (),
+        native_cleanup=None,
     ) -> None:
         self._agent_runtime = agent_runtime
         self._database = database
         self._root_workspaces = root_workspaces
         self._advancement_engine = advancement_engine
         self._protected_storage_roots = protected_storage_roots
+        self._native_cleanup = native_cleanup
         self._research_graph = research_graph
         self._target_graph = target_graph
         self._target_agent = target_agent
@@ -120,10 +122,12 @@ class TargetRunRuntime:
         return self._status_by_target.get(target_ref)
 
     @resource_preparation
-    def cleanup_completed_workspaces(self, *, dry_run=True, now=None, limit=10, retention_seconds=None):
+    def cleanup_completed_workspaces(self, *, dry_run=True, limit=10):
         from meta_research.target_workspace_cleanup import cleanup_completed_workspaces
-        return cleanup_completed_workspaces(self, dry_run=dry_run, now=now,
-            limit=limit, retention_seconds=retention_seconds)
+        report = cleanup_completed_workspaces(self, dry_run=dry_run, limit=limit)
+        if self._native_cleanup is not None:
+            report += tuple(self._native_cleanup.long_lived(self._database, dry_run=dry_run, limit=limit))
+        return report
 
     def has_pending_cancel(self, target_ref: str) -> bool:
         """Expose only the mechanical wake bit, never the operator's reason."""

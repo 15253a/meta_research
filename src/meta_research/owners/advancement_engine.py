@@ -334,12 +334,35 @@ def _bundle_stage_report_closure(
     }
 
 
+def recent_workspace_cycles(connection, quest_ref: str) -> tuple[str, ...]:
+    """Last three distinct foreground Cycles, including reactivations across Questions."""
+    rows = connection.execute(text(
+        "SELECT g.cycle_ref, g.epoch, h.cycle_ref AS head_cycle, h.epoch AS head_epoch "
+        "FROM ae_foreground_heads h JOIN ae_foreground_grants g "
+        "ON g.quest_ref=h.quest_ref AND g.epoch<=h.epoch "
+        "WHERE h.quest_ref=:quest ORDER BY g.epoch DESC"), {"quest": quest_ref})
+    cycles = []
+    try:
+        for row in rows:
+            if not cycles and (row.cycle_ref, row.epoch) != (row.head_cycle, row.head_epoch):
+                raise OwnerConflict("workspace_cycle_window_unavailable")
+            if row.cycle_ref not in cycles:
+                cycles.append(row.cycle_ref)
+                if len(cycles) == 3:
+                    break
+    finally:
+        rows.close()
+    return tuple(cycles)
+
+
 class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for Cycle, Stage, and Foreground authority."""
 
     def bind_search_sources(self, registry: SearchSourceRegistry) -> None: ...
 
     def query_cycle_position(self, cycle_ref: str) -> dict[str, object]: ...
+
+    def query_recent_workspace_cycles(self, quest_ref: str) -> tuple[str, ...]: ...
 
     def query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest: ...
 
@@ -2402,6 +2425,10 @@ class SQLiteAdvancementEngine(
             "pending_operation_ref": row.pending_operation_ref,
             "owner_revision": int(row.owner_revision),
         }
+
+    def query_recent_workspace_cycles(self, quest_ref: str) -> tuple[str, ...]:
+        with self._database.read() as connection:
+            return recent_workspace_cycles(connection, quest_ref)
 
     def query_cycle_position(self, cycle_ref: str) -> dict[str, object]:
         """Read activation-time focus, never the mutable current Question/Goal."""

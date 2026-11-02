@@ -1101,7 +1101,7 @@ class CodexIdeaSkillAdapter:
         try:
             return self._workspaces.bind_runtime(SemanticCallContext(run_ref, attempt_ref,
                 root_session_ref, fence_ref, runtime_binding_hash, self._root_agent_kind,
-                "primary", "research_workspace.read"))
+                "primary", ""))
         except SemanticMcpError as error:
             raise IdeaSkillUnavailable(error.code) from error
 
@@ -2098,6 +2098,13 @@ class CodexIdeaSkillAdapter:
             sandbox_read_root=sandbox_read_root,
         )
 
+    def _turn_conditions(self, runner, run_ref, workspace_binding):
+        conditions = (getattr(runner, "runtime_conditions", None)
+                      or render_runtime_conditions(self._workspace, run_ref=run_ref))
+        if workspace_binding is not None and workspace_binding.location.cycle_ref and self._workspaces is not None:
+            conditions += self._workspaces.native_directory_prompt(workspace_binding.location)
+        return conditions
+
     def _invoke(
         self,
         *,
@@ -2124,14 +2131,11 @@ class CodexIdeaSkillAdapter:
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
         )
-        if workspace_binding is not None:
-            prompt += "\n\nYour working directory is " + str(workspace_binding.directory) + ". " + (
-                "Use the granted research_workspace.materials.discover/read/copy operations for registered external inputs. "
-                if provider_execution_binding is not None else
-                "Use research_workspace.discover and research_workspace.read for pending material "
-                "from this actual work and eligible earlier work."
-                if mcp_url is not None else "Read pending files only within this actual work, including its inbox.")
-            prompt += " File presence does not admit a formal asset."
+        if workspace_binding is not None and not workspace_binding.location.cycle_ref:
+            prompt += ("\n\nYour working directory is " + str(workspace_binding.directory)
+                       + ". Use native tools for your work files and inbox. "
+                       "Use granted material operations for registered external inputs. "
+                       "File presence does not admit a formal asset.")
         raw_schema = schema
         if isinstance(raw_schema.get("oneOf"), list):
             prompt = (
@@ -2213,7 +2217,7 @@ class CodexIdeaSkillAdapter:
                 )
             else:
                 prompt = compose_runtime_prompt(
-                    prompt, (getattr(invocation_runner, "runtime_conditions", None) or render_runtime_conditions(self._workspace, run_ref=run_ref))
+                    prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding)
                 )
                 _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
                 pre_turn_diagnostics = self._root_capability_diagnostics(
@@ -2339,7 +2343,7 @@ class CodexIdeaSkillAdapter:
             prompt = persisted_prompt
         else:
             prompt = compose_runtime_prompt(
-                prompt, (getattr(invocation_runner, "runtime_conditions", None) or render_runtime_conditions(self._workspace, run_ref=run_ref))
+                prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding)
             )
         _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
         capability_profile = root_capability_profile(self._root_agent_kind)

@@ -92,7 +92,7 @@ HumanRequest 答复始终由原请求根处理；软指导附带材料、主动�
 
 由接收根先完成当前可做的初读、判断和处理，用 `research_workspace.materials.feedback` 声明 understanding、disposition（adopted／considered／deferred／not_used）、changes、continuing_work、reasons 和 limitations。采用必须有该根实际读取记录；反馈仍是根的声明，不是科学支持、目标完成或独立核验证明。说明对当前安排或判断的实际影响、依据与未采用理由，保留未读范围和未决事项。可分次补充，以不同稳定 effect_id 表达真实后续处理；未知结果先 `.feedback.reconcile`。
 
-selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保管。每项写实际 purpose 和 managed／linked_local custody：原件 source 为 `{kind:"original_file",path,observation_ref}`；处理结果从工作区发现页取得 `{kind:"workspace_file",workspace_ref,path,expected_sha256}`。选中项沿既有 RM 内容接纳及 RG source-material 用途关系保存，返回 asset_binding、role_ref 和精确 reader。linked_local 留在实际位置，后续来源变化如实报告漂移；未选副本与输出不会因反馈或 Target 收尾自动入库。真实 Target 实施、评价和产物仍沿正式结果交接，不由材料反馈虚构 Run、MetricResult、Evidence、Dataset 或 Environment。
+selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保管。每项写实际 purpose 和 managed／linked_local custody：原件 source 为 `{kind:"original_file",path,observation_ref}`；处理结果按宿主提供的工作目录定位文件，核对其 SHA-256 后填写 `{kind:"workspace_file",workspace_ref,path,expected_sha256}`。选中项沿既有 RM 内容接纳及 RG source-material 用途关系保存，返回 asset_binding、role_ref 和精确 reader。linked_local 留在实际位置，后续来源变化如实报告漂移；未选副本与输出不会因反馈或 Target 收尾自动入库。真实 Target 实施、评价和产物仍沿正式结果交接，不由材料反馈虚构 Run、MetricResult、Evidence、Dataset 或 Environment。
 
 后继根在本 Quest 的 `materials.discover.retained_treatments` 检索真正选中的内容、原始 receiver、实际处理根、用途与影响，沿 next_offset 分页，再把 selection.reader 交给 `research_memory.content.read` 精确读回；原投递不重新绑定。材料较多时可委派聚焦工作，根负责当前初读、影响判断及必要交接。需重做上游或下一轮投入时，由现有交接经 Reasoning 安排后继 Cycle；不因收到材料强制新建 Cycle，也不在同轮回退阶段。
 
@@ -112,12 +112,12 @@ selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保
 
 reader 指针只把 operation 以外的参数交给指定工具；summary_only 是外层展示标志，不是 research_notes_reader 的调用参数。序列化 JSON 的 offset/limit 按 UTF-8 字节计，以 next_offset=null 结束；complete 仅说明单页是否包含全部来源，尾页仍可能为 false。资产文件页按字节计，以 complete=true 结束；目录页按 entries 计，以 next_offset=null 结束。不要混用这三种结束条件。公共 MCP 工具错误按 isError 和 structuredContent.code 判断，保留 details 中的原操作与对账信息；正常 Owner status 仍表达业务状态。capability_unavailable 表示操作未注册或未获 grant；content_version_unbound 表示本次 source/version 在授权范围内未绑定，应核对精确引用或重新发现适用版本，不能据此断言全库不存在。重试或对账继续使用原 operation/effect 身份。
 
-当前获授目录若仍提供普通 `research_workspace.discover/read`，按其现有合同发现和读取临时工作材料；原生目录替代尚未提供时不虚构替代路径。待整理的本地文件用 research_workspace.discover 发现，沿 next_offset 分页；按返回的 workspace_ref、相对 path 和 sha256 调用 research_workspace.read，用 expected_sha256 核对实际观察，再沿字节 next_offset 读完正文。正文返回 UTF-8 text 或 base64 二进制。发现页的 limits 给出单文件、每次读取及扫描上限；readable=false 的大文件仍有来源、大小和 read_error，按已授权原工作或正式资产入口继续处理。文件存在、读取成功和人类交付分别只是工作材料事实，需经既有 RM／RG 接纳才能成为正式证据、Dataset、Environment 或冻结输入。
-
 ## 当前工作目录与回复材料
 
-当前工作目录沿实际工作保持稳定，技术 turn 或 job 更换后继续使用原目录。Idea 读取本工作；Plan 可读本 Cycle 的 Idea；Bundle 可读 Idea、Plan 和自己启用的 Target；Target 可读自己与前序 Idea、Plan；Reasoning 可读本 Cycle 的阶段和 Target。可见范围由实际 Owner 绑定确定，跨 Cycle 历史继续沿正式研究入口阅读。正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle，不随当前前台切换。用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read 读取精确回复；无 Quest 时须传精确 request_ref 与 response_ref。delivery.reply_reader 与 uploaded_readers 的 workspace_ref、path、expected_sha256 直接交给 research_workspace.read，沿字节 next_offset 读完 reply.json 和需要的上传原件。linked_locators 保留所选原件的位置说明；其目录或文件也进入 delivery.work_materials 的既有授权材料引用，按当前授权及实际可用性读取，先展开必要条目，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
+宿主给出同一 Quest 当前与前两轮实际可用的工作目录、工作归属与读写范围；每轮可能有多个目录。用原生文件工具或 shell 在获授目录内按需查找。本工作可写，读取其他工作时不修改其内容，也不沿符号链接越出获授范围。目录表说明本次工作的授权用途，原生执行仍沿实例已有 Harness 权限；父目录、私有 spool 和内部数据库不因给出路径而获授权。正式研究历史沿 RG／RM 的准确入口读取。技术 turn 或 job 更换后继续使用原工作目录。
 
-现有按工作授权的可见性与后续三轮原生目录窗口分别核验；本轮不因共享说明迁入而扩大目录授权。清理的执行仍由系统负责，单个 Target 结束不能证明整个 Cycle 或目录已可回收；实际执行、恢复、待接纳及后继读取依赖继续保护，精确保管原件不作为临时材料删除。
+正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle。用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read；无 Quest 时须传精确 request_ref 与 response_ref。delivery.reply_file 与 uploaded_files 给出 workspace_ref、相对 path 与 sha256，在该工作实际目录用原生工具读取 reply.json 和需要的上传文件；核对字节后再作为准确依据。linked_locators 保留所选原件的位置说明；其目录或文件也进入 delivery.work_materials 的既有授权材料引用，按当前授权及实际可用性读取，先展开必要条目，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
 
-主动指导可随 work_materials 上传小文件（uploads），与所选外部目录分开处理。上传文件投递到已确认 receiver 的实际工作空间，回执 uploads 保留接收 work/root 与准确 reader；二进制无需转换为文本。外部原目录保持只读原位引用。投递失败或结果未知保留原提交身份重试；pending 投递不表示正式指导已接纳，也不自动生成正式资产或生产关联。
+宿主使用同一研究序列窗口判定目录可见和回收时机。清理的执行仍由系统负责，单个 Target 结束不能证明整个 Cycle 或目录已可回收；实际执行、恢复、待接纳及后继读取依赖继续保护，精确保管原件不作为临时材料删除。
+
+主动指导可随 work_materials 上传小文件（uploads），与所选外部目录分开处理。上传文件投递到已确认 receiver 的实际工作空间，回执 uploads 保留接收 work/root、相对路径及 SHA-256；二进制无需转换为文本。外部原目录保持只读原位引用。投递失败或结果未知保留原提交身份重试；pending 投递不表示正式指导已接纳，也不自动生成正式资产或生产关联。

@@ -1,6 +1,7 @@
 import base64
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 from pathlib import Path
 from threading import Barrier, Event
 
@@ -34,13 +35,9 @@ class SourceIntakingUnderstandingProvider(ExistingWorkAdapter):
         for entry in request.manifest["entries"]:
             if entry["material_key"] not in selected:
                 continue
-            content = self.workspaces.read_initialization(
-                request.initialization_id,
-                request.root_session_ref,
-                workspace_ref=entry["workspace_ref"],
-                path=entry["path"],
-                expected_sha256=entry["sha256"],
-            )["content"]
+            binding = self.workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
+            content = (binding.directory / entry["path"]).read_bytes()
+            assert hashlib.sha256(content).hexdigest() == entry["sha256"]
             accepted = self.memory.submit_asset_intake(
                 AssetIntakeRequest(
                     source_kind="file",

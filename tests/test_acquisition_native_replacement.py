@@ -58,7 +58,8 @@ for line in sys.stdin:
  result={}
  if method=='thread/start':
   number=int(count.read_text())+1 if count.exists() else 1;count.write_text(str(number))
-  thread='00000000-0000-4000-8000-'+str(number).zfill(12)
+  saved=root.with_suffix('.threads')
+  thread=json.loads(saved.read_text())[number-1] if saved.exists() else '00000000-0000-4000-8000-'+str(number).zfill(12)
   result={'thread':{'id':thread}}
  if method=='turn/start':
   if root.with_suffix('.behavior').exists() and root.with_suffix('.behavior').read_text()=='unknown':sys.exit(0)
@@ -84,7 +85,7 @@ for line in sys.stdin:
 
 
 @pytest.fixture
-def native_session(tmp_path):
+def native_session(tmp_path, request):
     if os.name != 'posix':
         pytest.skip('The production signed provider supervisor runs on Linux')
     server = _server(tmp_path / 'native-codex')
@@ -92,6 +93,9 @@ def native_session(tmp_path):
         'browser_context_ref': None, 'reason_code': None, 'evidence': {
             'configuration_health': 'ready', 'browser_control': 'not_required', 'authorized_resource': 'oa_only'}}))
     data_root = prepare_data_root(tmp_path / 'data')
+    if getattr(request, 'param', None) == 'saved-threads':
+        from test_native_session_cleanup import _saved_threads, _vendor
+        server.with_suffix('.threads').write_text(json.dumps(_saved_threads(_vendor(), data_root, ['old download', 'current download'])))
     provider = tmp_path / 'data' / 'acquisition-root-provider'
     adapter = CodexAcquisitionRootAdapter(provider, _AcquisitionDelegate(), executable=str(server))
     drafter = _QuestDrafter()
@@ -140,6 +144,7 @@ def test_signed_missing_native_replacement_preserves_workspace_and_reconciles_or
     assert replacement['recovery_checkpoint']['native_session_ref'] == receipts[0]['native_session_ref']
     assert receipts[1]['previous_native_session_ref'] == receipts[0]['native_session_ref']
     assert receipts[1]['native_session_ref'] != receipts[0]['native_session_ref']
+    assert adapter.retired_native_sessions(request.session_ref) == {receipts[0]["native_session_ref"]}
     prompts = list((provider / 'codex-root' / 'provider-operations').glob('*/acquisition-root-turn/prompt.txt'))
     replacement_prompt = next(path.read_text() for path in prompts if 'replacement_context=' in path.read_text())
     assert 'Unfinished exact title' in replacement_prompt
@@ -217,3 +222,23 @@ def test_provided_only_missing_native_replaces_with_same_strict_policy_and_recon
     assert len(server.with_suffix('.exec-calls').read_text().splitlines()) == 2
     assert len(server.with_suffix('.copies').read_text().splitlines()) == 1
     assert server.with_suffix('.requests').read_bytes() == before
+
+@pytest.mark.parametrize("native_session", ["saved-threads"], indirect=True)
+def test_cleanup_retires_replaced_acquisition_after_replay_and_keeps_current_download(native_session):
+    from test_native_session_cleanup import _server as saved_server, _vendor
+    import sqlite3
+
+    runtime, adapter, server, request, workspace, _provider = native_session
+    result = adapter.acquire(request)
+    retired, current = json.loads(server.with_suffix(".threads").read_text())
+    state = runtime.data_root.codex_home / "state_5.sqlite"
+    with sqlite3.connect(state) as db:
+        paths = {ref: Path(path) for ref, path in db.execute("SELECT id,rollout_path FROM threads")}
+    report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
+    assert {item["session_ref"] for item in report if item["root_kind"] == "native_session"
+            and item["action"] == "removed"} == {retired}
+    assert not paths[retired].exists()
+    assert paths[current].is_file() and (workspace / "downloads" / "new.html").is_file()
+    assert adapter.reconcile(request) == result
+    with saved_server(_vendor(), runtime.data_root) as call:
+        assert call("thread/resume", {"threadId": current})["thread"]["id"] == current

@@ -434,8 +434,6 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
         "human_guidance.feedback.reconcile",
         "research_workspace.materials.discover",
         "research_workspace.materials.read",
-        "research_workspace.discover",
-        "research_workspace.read",
         "research_memory.research_notes.read",
         "research_memory.stage_context.read",
         "research_memory.content.read",

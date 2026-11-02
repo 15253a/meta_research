@@ -1,7 +1,7 @@
 """Bounded reclamation of completed Cycle scratch workspaces.
 
-Owner completion, publication, verified formal readback and quiescence are all
-required. Content custody and native Session storage remain outside this scope.
+The recent foreground window and all outstanding consumers protect a root.
+Formal originals survive in place when the remaining scratch is reclaimed.
 """
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ import secrets
 from pathlib import Path
 import shutil
 import stat
-import time
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
+from meta_research.owners.advancement_engine import recent_workspace_cycles
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 
 
@@ -115,46 +115,67 @@ def _cleanup_scope(candidate, path: Path, journal_root: Path, *, dry_run: bool, 
     return None, journal, scope
 
 
-def _pending_dependency(connection, candidate, path, *, pending_uploads=(), pending_intakes=()):
-    if candidate['workspace_ref'] in pending_uploads:
-        return 'pending_human_upload'
-    cycle = connection.execute(text("SELECT status FROM ae_cycles WHERE cycle_ref=:ref"),
-        {'ref': candidate['cycle_ref']}).first()
-    if cycle is None or cycle.status != 'completed':
-        return 'cycle_incomplete'
-    missing = connection.execute(text("SELECT 1 FROM ae_stage_run_requests r LEFT JOIN "
-        "ae_stage_commits c ON c.request_ref=r.request_ref WHERE r.cycle_ref=:ref "
-        "AND c.commit_ref IS NULL LIMIT 1"), {'ref': candidate['cycle_ref']}).first()
-    if missing:
-        return 'cycle_handoff_incomplete'
-    if candidate['root_kind'] == 'target':
-        row = connection.execute(text("SELECT status FROM ar_target_root_lifecycles WHERE target_ref=:ref"),
-                                 {'ref': candidate['target_ref']}).first()
-        if row is None or row.status != 'completed':
-            return 'handoff_incomplete'
-    # Any live work in this shared Cycle can still read its earlier stage roots.
-    cycle_runs = ("SELECT run_ref FROM ar_stage_runs WHERE cycle_ref=:cycle UNION "
-        "SELECT a.target_run_ref FROM ar_target_launches a JOIN ae_stage_run_requests r "
-        "ON r.request_ref=a.stage_request_ref WHERE r.cycle_ref=:cycle")
-    parameters = {'cycle': candidate['cycle_ref']}
-    active = connection.execute(text("SELECT 1 FROM ar_harness_provider_operations "
-        "WHERE run_ref IN (" + cycle_runs + ") AND status IN ('running','unknown_outcome') LIMIT 1"),
-        parameters).first()
-    children = connection.execute(text("SELECT 1 FROM ar_target_harness_child_sessions "
-        "WHERE target_run_ref IN (" + cycle_runs + ") AND completion_evidence_ref IS NULL LIMIT 1"),
-        parameters).first()
-    stage = connection.execute(text("SELECT 1 FROM ar_provider_units WHERE run_ref IN (" + cycle_runs + ") "
-        "AND status IN ('active','revocation_pending') LIMIT 1"), parameters).first()
-    controls = connection.execute(text("SELECT 1 FROM ar_run_controls WHERE run_ref IN (" + cycle_runs + ") "
-        "AND status IN ('running','suspended','suspended_fenced','reconciliation_required') LIMIT 1"), parameters).first()
-    sessions = connection.execute(text("SELECT 1 FROM ar_stage_sessions WHERE run_ref IN (" + cycle_runs + ") "
-        "AND status='active' LIMIT 1"), parameters).first()
-    if active or children or stage or controls or sessions:
-        return 'active_or_recoverable_session'
-    if (path / '.target-completion-intakes').exists():
-        return 'pending_finalizer_intake'
-    if any(_paths_overlap(source, path) for source in pending_intakes):
-        return 'pending_asset_intake'
+def _cycle_dependencies(connection, cycle_refs):
+    """Read current Owner dependencies once per fenced batch, across every run of each Cycle."""
+    rows = connection.execute(text("""
+        WITH runs AS (
+            SELECT cycle_ref, run_ref, NULL AS target_ref FROM ar_stage_runs WHERE cycle_ref IN :cycles
+            UNION
+            SELECT r.cycle_ref, a.target_run_ref, a.target_ref FROM ar_target_launches a
+              JOIN ae_stage_run_requests r ON r.request_ref=a.stage_request_ref WHERE r.cycle_ref IN :cycles
+        ), pending AS (
+            SELECT cycle_ref, 'cycle_incomplete' AS reason FROM ae_cycles
+              WHERE cycle_ref IN :cycles AND status!='completed'
+            UNION ALL
+            SELECT c.cycle_ref, 'workspace_cycle_lineage_unavailable' FROM ae_cycles c
+              WHERE c.cycle_ref IN :cycles AND NOT EXISTS (
+                SELECT 1 FROM ae_foreground_grants g JOIN ae_foreground_heads h USING (quest_ref)
+                WHERE g.quest_ref=c.quest_ref AND g.cycle_ref=c.cycle_ref AND g.epoch<=h.epoch)
+            UNION ALL
+            SELECT cycle_ref, 'cycle_handoff_incomplete' AS reason FROM ae_stage_run_requests r
+              WHERE cycle_ref IN :cycles AND NOT EXISTS (
+                SELECT 1 FROM ae_stage_commits c WHERE c.request_ref=r.request_ref)
+            UNION ALL
+            SELECT r.cycle_ref, 'handoff_incomplete' FROM ar_target_launches a
+              JOIN ae_stage_run_requests r ON r.request_ref=a.stage_request_ref
+              LEFT JOIN ar_target_root_lifecycles l ON l.target_ref=a.target_ref
+              WHERE r.cycle_ref IN :cycles AND (l.status IS NULL OR l.status NOT IN ('completed','cancelled'))
+            UNION ALL
+            SELECT cycle_ref, 'pending_human_request' FROM runs JOIN owner_human_request_waiters w
+              ON (w.waiter_ref='root_run:'||run_ref OR w.waiter_ref=runs.target_ref)
+              WHERE w.status IN ('blocked','released')
+            UNION ALL
+            SELECT cycle_ref, 'active_or_recoverable_session' FROM runs r WHERE
+              EXISTS (SELECT 1 FROM ar_harness_provider_operations p WHERE p.run_ref=r.run_ref
+                      AND status IN ('running','unknown_outcome'))
+              OR EXISTS (SELECT 1 FROM ar_target_harness_child_sessions s WHERE s.target_run_ref=r.run_ref
+                         AND s.completion_evidence_ref IS NULL)
+              OR EXISTS (SELECT 1 FROM ar_provider_units u WHERE u.run_ref=r.run_ref
+                         AND u.status IN ('active','revocation_pending'))
+              OR EXISTS (SELECT 1 FROM ar_run_controls c WHERE c.run_ref=r.run_ref AND
+                         (c.status IN ('running','suspended','suspended_fenced','reconciliation_required')
+                          OR c.cleanup_status='pending'))
+              OR EXISTS (SELECT 1 FROM ar_execution_fences f WHERE f.run_ref=r.run_ref
+                         AND f.status IN ('current','submitted'))
+              OR EXISTS (SELECT 1 FROM ar_stage_sessions s WHERE s.run_ref=r.run_ref AND s.status='active')
+              OR EXISTS (SELECT 1 FROM ar_harness_runs h WHERE h.run_ref=r.run_ref AND h.status='suspended')
+        )
+        SELECT cycle_ref, reason FROM pending GROUP BY cycle_ref, reason ORDER BY cycle_ref, reason
+        """).bindparams(bindparam("cycles", expanding=True)), {"cycles": sorted(cycle_refs)})
+    return {cycle: reason for cycle, reason in rows}
+
+
+def _window_reason(connection, candidate, windows):
+    quest = candidate['quest_ref']
+    if quest not in windows:
+        try:
+            windows[quest] = recent_workspace_cycles(connection, quest)
+        except OwnerConflict:
+            windows[quest] = ()
+    if not windows[quest]:
+        return 'workspace_cycle_window_unavailable'
+    if candidate['cycle_ref'] in windows[quest]:
+        return 'recent_cycle_window'
     return None
 
 
@@ -199,7 +220,12 @@ def _protected_originals(connection):
             raise OwnerConflict('workspace_cleanup_material_reference_invalid')
         original = Path(selection['absolute_path'])
         paths.add(original)
-    return tuple(paths)
+    # A selected locator can reach the same original through a parent alias.
+    # Match the recorded name and the actual file while walking scratch.
+    try:
+        return tuple(paths | {path.resolve(strict=False) for path in paths})
+    except RuntimeError as error:  # symlink loop in a changed locator
+        raise OwnerConflict('workspace_cleanup_material_reference_invalid') from error
 
 
 def _pending_human_uploads(connection):
@@ -255,15 +281,9 @@ def _prune_workspace(path, protected, entries):
         os.close(descriptor)
 
 
-def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, retention_seconds=None):
+def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ValueError('workspace_cleanup_limit_invalid')
-    retention = float(os.environ.get('META_RESEARCH_TARGET_WORKSPACE_RETENTION_SECONDS', '86400')
-                      if retention_seconds is None else retention_seconds)
-    import math
-    if not math.isfinite(retention) or retention < 0:
-        raise ValueError('workspace_cleanup_retention_invalid')
-    now = time.time() if now is None else now
     database = runtime._database
     target_root = runtime._target_agent._workspace_root
     if database is None or target_root is None:
@@ -275,9 +295,9 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
     # workspaces (including writing files after /new) never enter
     # this candidate set and must not be added as finished provider scratch.
     with database.read() as connection:
-        candidates = connection.execute(text("SELECT w.workspace_ref,w.root_name,w.target_ref, "
-            "w.target_run_ref AS work_ref, 'target' AS root_kind, r.cycle_ref, l.status AS lifecycle_status, "
-            "MAX(l.updated_at,cycle.updated_at) AS completed_at, l.completion_ref,m.manifest_ref,c.commit_ref "
+        candidates = connection.execute(text("SELECT w.workspace_ref AS workspace_ref,w.root_name,w.target_ref, "
+            "w.target_run_ref AS work_ref, 'target' AS root_kind, r.cycle_ref, cycle.quest_ref, cycle.status AS cycle_status, l.status AS lifecycle_status, "
+            "l.completion_ref,m.manifest_ref,c.commit_ref "
             "FROM ar_target_run_workspaces w JOIN ar_target_root_lifecycles l USING(target_ref) "
             "JOIN ar_target_launches a USING(target_ref) "
             "JOIN ae_stage_run_requests r ON r.request_ref=a.stage_request_ref "
@@ -285,12 +305,14 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
             "LEFT JOIN rm_target_root_completion_manifests m ON m.completion_ref=l.completion_ref "
             "LEFT JOIN rg_target_commits c ON c.target_ref=w.target_ref "
             "WHERE l.status IN ('completed','cancelled') UNION ALL "
-            "SELECT NULL,NULL,NULL,s.run_ref,s.stage,s.cycle_ref,s.status, "
-            "MAX(s.updated_at,cycle.updated_at),NULL,NULL,c.commit_ref FROM ar_stage_runs s "
+            "SELECT NULL,NULL,NULL,s.run_ref,s.stage,s.cycle_ref,cycle.quest_ref,cycle.status,s.status, "
+            "NULL,NULL,c.commit_ref FROM ar_stage_runs s "
             "JOIN ae_cycles cycle USING(cycle_ref) JOIN ae_stage_commits c ON c.request_ref=s.request_ref "
             "WHERE cycle.status='completed' AND s.status='completed' "
-            "ORDER BY completed_at,work_ref LIMIT :limit OFFSET :offset"),
+            "ORDER BY work_ref,workspace_ref LIMIT :limit OFFSET :offset"),
             {'limit': limit, 'offset': offset}).mappings().all()
+        windows = {}
+        window_reasons = {c['work_ref']: _window_reason(connection, c, windows) for c in candidates}
     runtime._workspace_cleanup_offset = offset + len(candidates) if len(candidates) == limit else 0
     report = []
     eligible = []
@@ -303,8 +325,14 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
         else:
             if runtime._root_workspaces is None:
                 continue
-            locations = runtime._root_workspaces.read_cycle_stage_workspace_locations(candidate['cycle_ref'])
-            location = next(item for item in locations if item.work_ref == candidate['work_ref'])
+            try:
+                location = runtime._root_workspaces.read_stage_workspace_location(
+                    candidate['work_ref'], candidate['cycle_ref'], candidate['root_kind'])
+            except OwnerConflict as error:
+                report.append({'workspace_ref': None, 'cycle_ref': candidate['cycle_ref'],
+                    'root_kind': candidate['root_kind'], 'path': None, 'bytes': 0,
+                    'action': 'skipped', 'reason': error.code})
+                continue
             path = location.directory
             root = path.parent
             candidate['workspace_ref'] = location.workspace_ref
@@ -318,14 +346,14 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
             if (candidate['root_name'] != expected or root.is_symlink() or root.resolve() != root
                     or path.parent != root or path.is_symlink() or path.resolve(strict=False) != path):
                 raise OwnerConflict('workspace_cleanup_unsafe_boundary')
-            if not path.exists():
-                record['reason'] = 'already_removed'
+            if candidate['cycle_status'] != 'completed':
+                record['reason'] = 'cycle_incomplete'
                 continue
             if candidate['lifecycle_status'] != 'completed' or not candidate['commit_ref']:
                 record['reason'] = 'handoff_incomplete'
                 continue
-            if now - candidate['completed_at'] < retention:
-                record['reason'] = 'retention_period'
+            if window_reasons[candidate['work_ref']]:
+                record['reason'] = window_reasons[candidate['work_ref']]
                 continue
             # Public Owner readbacks authenticate the immutable handoff and all
             # retained manifest bindings without exporting another whole copy.
@@ -356,6 +384,10 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
             protected_originals = _protected_originals(connection)
             pending_uploads = _pending_human_uploads(connection)
             pending_intakes = _pending_intake_paths(connection)
+            deps = _cycle_dependencies(connection, {c['cycle_ref'] for c, *_ in eligible})
+            fenced_windows = {}
+            native_candidates = []
+            blocked_runs = set()
         except (OwnerConflict, OSError) as error:
             for _, _, _, record in eligible:
                 record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
@@ -365,10 +397,22 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
                 if (root.is_symlink() or root.resolve() != root or path.is_symlink()
                         or path.resolve(strict=False) != path):
                     raise OwnerConflict('workspace_cleanup_unsafe_boundary')
-                reason = _pending_dependency(connection, candidate, path,
-                    pending_uploads=pending_uploads, pending_intakes=pending_intakes)
+                # Hold BEGIN IMMEDIATE through the deletion. Re-read the foreground and
+                # all mutable Owner dependencies in this cut, after public handoff readback.
+                reason = _window_reason(connection, candidate, fenced_windows) or deps.get(candidate['cycle_ref'])
+                if not reason and candidate['workspace_ref'] in pending_uploads:
+                    reason = 'pending_human_upload'
+                if not reason and (path / '.target-completion-intakes').exists():
+                    reason = 'pending_finalizer_intake'
+                if not reason and any(_paths_overlap(source, path) for source in pending_intakes):
+                    reason = 'pending_asset_intake'
                 if reason:
                     record['reason'] = reason
+                    blocked_runs.add(candidate['work_ref'])
+                    continue
+                native_candidates.append(candidate)
+                if not path.exists():
+                    record['reason'] = 'already_removed'
                     continue
                 originals = tuple(original for original in protected_originals if _paths_overlap(original, path))
                 if any(path == original or original in path.parents for original in originals):
@@ -403,4 +447,9 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, now=None, limit=10, r
                         record['action'] = 'removed'
             except (OwnerConflict, OSError) as error:
                 record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
+        if native_candidates:
+            from meta_research.native_session_cleanup import cleanup_cycle_sessions
+            report.extend(cleanup_cycle_sessions(runtime, connection,
+                [c for c in native_candidates if c['work_ref'] not in blocked_runs],
+                dry_run=dry_run, protected_paths=(*protected_originals, *pending_intakes)))
     return tuple(report)

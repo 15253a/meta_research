@@ -1505,8 +1505,8 @@ def create_app(
         if session.get("session_ref") is None:
             return {"files": [], "offset": offset, "next_offset": None}
         try:
-            page = runtime.root_workspaces.discover_companion_session(scope, session["session_ref"],
-                prefix="", offset=offset, limit=limit)
+            page = runtime.root_workspaces.list_companion_files(scope, session["session_ref"],
+                offset=offset, limit=limit)
         except SemanticMcpError as error:
             raise OwnerConflict(error.code) from error
         for item in page["files"]:

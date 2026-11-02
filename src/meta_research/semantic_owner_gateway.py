@@ -3,7 +3,6 @@ from __future__ import annotations
 from meta_research.deepfetch_sources import source_operations
 
 from meta_research.stage_context_access import stage_context_operations
-from meta_research.root_workspace import workspace_operations
 from meta_research.work_materials import material_operations
 from meta_research.environment_operations import environment_operations
 from meta_research.literature_operations import literature_operations
@@ -246,7 +245,6 @@ def create_semantic_owner_gateway(
     human_collaboration_snapshot: Callable[[], OwnerSnapshot],
     human_collaboration=None,
     target_run_agent: SQLiteTargetRunAgentAuthority | None = None,
-    root_workspaces=None,
     search_sources=None,
 ) -> SemanticMcpGateway:
     """Bind semantic operations to public Owner interfaces only.
@@ -272,7 +270,6 @@ def create_semantic_owner_gateway(
 
     operations = [
         *source_operations(agent_runtime, search_sources),
-        *workspace_operations(root_workspaces),
         *(material_operations(human_collaboration) if human_collaboration is not None else ()),
         *(
             _snapshot_operation(owner_name, query_snapshot)
@@ -2948,21 +2945,33 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
 
 
 def _workspace_reply_schema() -> dict[str, object]:
-    reader = _closed_object({"workspace_ref": _string(max_length=256),
-        "path": _string(max_length=1024), "expected_sha256": _string(max_length=64)},
-        required=("workspace_ref", "path", "expected_sha256"))
-    properties = {name: _string(max_length=256) for name in (
-        "delivery_ref", "manifest_hash", "human_request_ref", "response_ref", "workspace_ref",
-        "root_kind", "root_session_ref", "work_ref", "status", "schema_ref")}
-    properties.update({name: {"type": ["string", "null"], "maxLength": 256} for name in (
-        "quest_ref", "cycle_ref", "request_ref", "stage_request_ref", "target_ref", "initialization_id")})
-    properties.update({"context_generation": {"type": "integer", "minimum": 1},
-        "reply_reader": reader, "uploaded_readers": {"type": "array", "maxItems": 99, "items": reader},
+    workspace_file = _closed_object({"workspace_ref": _string(max_length=256),
+        "path": _string(max_length=1024), "sha256": _hash_schema()},
+        required=("workspace_ref", "path", "sha256"))
+    location = {name: _string(max_length=256) for name in (
+        "workspace_ref", "root_kind", "root_session_ref", "work_ref", "status")}
+    location.update({name: {"type": ["string", "null"], "maxLength": 256} for name in (
+        "quest_ref", "cycle_ref", "request_ref", "target_ref", "initialization_id")})
+    location_schema = _closed_object({**location, "context_generation": {"type": "integer", "minimum": 1}},
+                                     required=tuple(location))
+    properties = {**location, **{name: _string(max_length=256) for name in (
+        "delivery_ref", "manifest_hash", "human_request_ref", "response_ref", "schema_ref")},
+        "stage_request_ref": {"type": ["string", "null"], "maxLength": 256},
+        "reply_file": workspace_file, "uploaded_files": {"type": "array", "maxItems": 99, "items": workspace_file},
         "linked_locators": {"type": "array", "maxItems": 100, "items": _closed_object({
             "kind": _string(enum=("linked_local",)), "locator": _string(max_length=16000),
             "description": _string(max_length=4000), "observed_kind": _string(enum=("file", "directory"))},
-            required=("kind", "locator", "description", "observed_kind"))}})
-    return _closed_object(properties, required=tuple(name for name in properties if name != "context_generation"))
+            required=("kind", "locator", "description", "observed_kind"))}}
+    required = tuple(properties)
+    properties["context_generation"] = {"type": "integer", "minimum": 1}
+    properties["work_materials"] = {"type": "array", "items": _closed_object(
+        {"reference_ref": _string(max_length=256)}, required=("reference_ref",))}
+    receiver = {"kind": _string(enum=("request",)), "request_ref": _string(max_length=256),
+        "issuer": _string(max_length=256), "request_revision": {"type": "integer"},
+        "waiter_ref": _string(max_length=256),
+        "roots": {"type": "array", "minItems": 1, "maxItems": 1, "items": location_schema}}
+    properties["receiving_identity"] = _closed_object(receiver, required=tuple(receiver))
+    return _closed_object(properties, required=required)
 
 
 def _root_human_request_output_schema() -> dict[str, object]:

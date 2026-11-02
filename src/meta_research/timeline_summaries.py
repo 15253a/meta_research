@@ -72,13 +72,15 @@ class TimelineSummaryStore:
                             job_ref TEXT PRIMARY KEY, quest_ref TEXT NOT NULL,
                             request_json TEXT NOT NULL, status TEXT NOT NULL,
                             created_at REAL NOT NULL, error_code TEXT,
-                            retry_at REAL NOT NULL DEFAULT 0
+                            retry_at REAL NOT NULL DEFAULT 0, native_session_ref TEXT
                         );
                         CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_quest
                             ON jobs(quest_ref) WHERE status='active';
                     """)
                     if 'retry_at' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
                         db.execute('ALTER TABLE jobs ADD COLUMN retry_at REAL NOT NULL DEFAULT 0')
+                    if 'native_session_ref' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
+                        db.execute('ALTER TABLE jobs ADD COLUMN native_session_ref TEXT')
                     if 'summary_kind' not in {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}:
                         db.execute("ALTER TABLE nodes ADD COLUMN summary_kind TEXT NOT NULL DEFAULT 'process'")
                     columns = {row['name'] for row in db.execute('PRAGMA table_info(quests)')}
@@ -167,7 +169,7 @@ class TimelineSummaryStore:
                 native, jobs, input_bytes = None, 0, 0
             # Count claims (including failed calls), never recovery reads. Each
             # job carries the complete current basis and prior summary, so a new
-            # session loses no research evidence. Old native logs remain intact.
+            # session loses no research evidence. The completed job retains its native identity for later retirement.
             db.execute('UPDATE quests SET native_session_ref=?,session_jobs=?,session_input_bytes=? WHERE quest_ref=?',
                        (native, jobs + 1, input_bytes + size, quest_ref))
             request = {'nodes': selected, 'native_session_ref': native,
@@ -238,7 +240,7 @@ class TimelineSummaryStore:
             db.execute('''UPDATE quests SET native_session_ref=?,scan_interval_seconds=?,next_scan_at=?,
                 scan_decision_observed_at=? WHERE quest_ref=?''',
                 (native_session_ref, seconds, deadline, decision_cut, job['quest_ref']))
-            db.execute("UPDATE jobs SET status='completed',request_json='{}' WHERE job_ref=?", (job['job_ref'],))
+            db.execute("UPDATE jobs SET status='completed',request_json='{}',native_session_ref=? WHERE job_ref=?", (native_session_ref, job['job_ref']))
             self._bump(db, job['quest_ref'])
 
     def fail(self, job: dict, code: str, now: float, native_session_ref: str | None = None):
@@ -257,7 +259,7 @@ class TimelineSummaryStore:
                     (failures, now + min(MAX_SCAN_SECONDS, DEFAULT_SCAN_SECONDS * 2 ** min(failures - 1, 5)), job['quest_ref'], node['node_key']))
             if native_session_ref:
                 db.execute("UPDATE quests SET native_session_ref=? WHERE quest_ref=?", (native_session_ref, job['quest_ref']))
-            db.execute("UPDATE jobs SET status='failed',error_code=?,request_json='{}' WHERE job_ref=?", (code, job['job_ref']))
+            db.execute("UPDATE jobs SET status='failed',error_code=?,request_json='{}',native_session_ref=? WHERE job_ref=?", (code, native_session_ref, job['job_ref']))
             self._bump(db, job['quest_ref'])
 
     def query(self, quest_ref: str) -> dict:

@@ -9,6 +9,7 @@ from meta_research.semantic_mcp import SemanticCallContext
 from meta_research.web import create_app
 from test_public_acquisition_session import RecordingAcquisitionProvider
 from test_public_plan_stage import _confirm_direct_quest
+from test_root_workspace import _native_file
 from test_root_workspace import _make, _external_context, _channel, _call, _accepted
 from test_dataset_effect_scope_recovery import _scope
 from test_root_human_request_lifecycle import _open_arguments
@@ -106,13 +107,12 @@ def test_explicit_upload_and_linked_directory_deliver_exact_original_root_withou
             assert client.post(f"/api/v1/human-requests/{opened['request_ref']}/responses", headers=headers, json=body).json() == response
             body["note"] = "Changed after lost ACK."
             assert client.post(f"/api/v1/human-requests/{opened['request_ref']}/responses", headers=headers, json=body).status_code == 409
-        reader = delivery["reply_reader"]
-        value = _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read", **reader))
-        envelope = json.loads(value["text"])
+        file = delivery["reply_file"]
+        envelope = json.loads(_native_file(runtime, context, file).read_bytes())
         assert envelope["note"] == "Exact reply. Read the uploaded folder and host originals."
         assert envelope["facts"] == {"temperature": 17}
-        upload = delivery["uploaded_readers"][0]
-        assert _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read", **upload))["text"] == "x,y\n1,7\n"
+        upload = delivery["uploaded_files"][0]
+        assert _native_file(runtime, context, upload).read_text() == "x,y\n1,7\n"
         request = runtime.owners.human_collaboration.query_human_request(opened["request_ref"])
         assert len(request["responses"]) == 1
         assert request["responses"][0]["delivery"] == delivery
@@ -203,8 +203,8 @@ def test_pending_reply_is_private_and_crash_recovery_resumes_library_material(tm
         assert recovered["status"] == "satisfied"
         assert recovered["direct_waiters"][0]["status"] == "consumed"
         assert len(recovered["responses"]) == 1
-        recovered_reader = recovered["responses"][0]["delivery"]["uploaded_readers"][0]
-        assert _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read", **recovered_reader))["text"] == "Exact lawful fulltext.\n"
+        recovered_reader = recovered["responses"][0]["delivery"]["uploaded_files"][0]
+        assert _native_file(runtime, context, recovered_reader).read_text() == "Exact lawful fulltext.\n"
         response = runtime.owners.human_collaboration.respond_to_human_request(opened["request_ref"], reply=reply, idempotency_key="crash-submit")
         request = runtime.owners.human_collaboration.query_human_request(opened["request_ref"])
         assert request["status"] == "satisfied"
@@ -216,9 +216,8 @@ def test_pending_reply_is_private_and_crash_recovery_resumes_library_material(tm
         exact = _accepted(_call(runtime, _channel(runtime, context), "human_request.read",
                                request_ref=opened["request_ref"], response_ref=response["response_ref"], limit=16384))
         assert json.loads(exact["text"])["response"]["delivery"] == response["delivery"]
-        value = _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read", **response["delivery"]["uploaded_readers"][0]))
-        assert value["text"] == "Exact lawful fulltext.\n"
-        assert value["root_session_ref"] == scope["root_session_ref"]
+        assert _native_file(runtime, context, response["delivery"]["uploaded_files"][0]).read_text() == "Exact lawful fulltext.\n"
+        assert response["delivery"]["root_session_ref"] == scope["root_session_ref"]
         assert runtime.owners.research_memory.query_snapshot() == before
     finally:
         runtime.close()

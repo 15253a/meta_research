@@ -17,8 +17,8 @@ def test_assistant_and_cycle_roots_can_discover_and_read_exact_materials(root_ki
     catalog = ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind]
     assert {"tools.catalog.page", "tools.contracts.read", "research_memory.assets.page",
         "research_memory.assets.lifecycle", "research_memory.content.read",
-        "research_memory.creation_basis.read", "research_workspace.discover",
-        "research_workspace.read", "assistant.content.generate"} <= set(catalog)
+        "research_memory.creation_basis.read", "assistant.content.generate"} <= set(catalog)
+    assert not {"research_workspace.discover", "research_workspace.read"} & set(catalog)
     assert len(catalog) == len(set(catalog))
 
 

@@ -175,7 +175,7 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
                      "精确回复同时提供 request_ref 和 response_ref，携带 reader 的 version_ref 并省略 cursor。offset／limit 按 UTF-8 字节重建原文与 hash。"
                      "请求目录只附最新回复；沿 responses_reader 的 entry_kind=responses 及 request_ref 查询全部历史回复，"
                      "以 response_offset 和 query_revision 独立续页。每条回复提供准确 reader，目录不准备请求的完整执行生命周期。"
-                     "正式回复的 delivery.reply_reader／uploaded_readers 参数交给 research_workspace.read，linked_locators 用原生工具按原 locator 有界读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
+                     "正式回复的 delivery.reply_file／uploaded_files 给出原工作区的相对路径与 SHA-256，用原生文件工具从获授目录读取；外部原目录沿当前获授的工作材料引用读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
         input_schema={"type": "object", "properties": {"source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
             "entry_kind": {"type": "string", "enum": ["guidance", "responses"]},
             "guidance_offset": {"type": "integer", "minimum": 0},

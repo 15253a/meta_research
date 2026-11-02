@@ -554,7 +554,7 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("runtime_incarnation_binding_invalid")
         self._resident_channel_scopes: dict[str, _ResidentMcpScope] = {}
-        self._creation_channels = None
+        self._root_workspaces = None
         self._recovered_target_requests: dict[str, int] = {}
         if runtime_protection is not None:
             self._recover_committed_runtime_boundaries()
@@ -2029,6 +2029,16 @@ class HarnessRuntime:
             raise HarnessAdmissionError("target_run_workspace_unavailable")
         return workspace_ref, path
 
+    def _target_work_prompt(self, prompt, admission, request, workspace_ref, directory):
+        conditions = render_runtime_conditions(directory, run_ref=admission.run.run_ref, target_ref=request.target_ref)
+        if self._root_workspaces is not None:
+            try:
+                conditions += self._root_workspaces.target_directory_prompt(
+                    request.target_ref, workspace_ref, directory)
+            except Exception as error:
+                raise HarnessAdmissionError(str(getattr(error, "code", "target_run_workspace_unavailable"))) from error
+        return compose_runtime_prompt(prompt, conditions)
+
     def _operation_requires_resume(self, request_ref: str) -> bool:
         try:
             record = self._owner.query_run(request_ref)
@@ -2107,10 +2117,7 @@ class HarnessRuntime:
         if isinstance(request, TargetHarnessRequest) and working_directory is not None:
             # Only a new operation gets current conditions. Reconciliation below
             # verifies and replays the original sealed prompt, including its conditions.
-            prompt = compose_runtime_prompt(prompt, render_runtime_conditions(
-                working_directory, run_ref=admission.run.run_ref,
-                target_ref=request.target_ref,
-            ))
+            prompt = self._target_work_prompt(prompt, admission, request, workspace_ref, working_directory)
         external_snapshot = None
         if isinstance(request, TargetHarnessRequest) and self._external_mcp is not None:
             try:
@@ -2277,10 +2284,7 @@ class HarnessRuntime:
                 # A crash may precede transport spool creation. Reconstruct
                 # only a candidate; the complete original Owner hash below
                 # must match before continuing this same operation.
-                frozen_prompt = compose_runtime_prompt(prompt, render_runtime_conditions(
-                    working_directory, run_ref=admission.run.run_ref,
-                    target_ref=request.target_ref,
-                ))
+                frozen_prompt = self._target_work_prompt(prompt, admission, request, workspace_ref, working_directory)
             if not isinstance(frozen_prompt, str) or not frozen_prompt:
                 raise HarnessAdmissionError("harness_operation_conflict")
             frozen_hash = canonical_hash(_turn_invocation_material(
@@ -3233,7 +3237,7 @@ class HarnessRuntime:
             current = self._owner.channel_is_current(token_hash)
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error
-        if self._creation_channels is not None and self._creation_channels.creation_channel_is_current(token):
+        if self._root_workspaces is not None and self._root_workspaces.creation_channel_is_current(token):
             current = True
         resident_scope = self._resident_channel_scopes.get(token_hash)
         allowed_operation_ids = None
@@ -3318,7 +3322,7 @@ class HarnessRuntime:
         return status, payload, response_session_id
 
     def external_mcp_scope_is_current(self, token: str) -> bool:
-        if self._creation_channels is not None and self._creation_channels.creation_channel_is_current(token):
+        if self._root_workspaces is not None and self._root_workspaces.creation_channel_is_current(token):
             return True
         token_hash = _token_hash(token)
         resident_scope = self._resident_channel_scopes.get(token_hash)
@@ -3336,8 +3340,8 @@ class HarnessRuntime:
         except Exception:
             return False
 
-    def bind_creation_channels(self, workspaces):
-        self._creation_channels = workspaces
+    def bind_root_workspaces(self, workspaces):
+        self._root_workspaces = workspaces
 
     def _full_conformance_request_ref(
         self, token: str, family: HarnessFamily

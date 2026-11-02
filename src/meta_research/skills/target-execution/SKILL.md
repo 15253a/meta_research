@@ -22,7 +22,7 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 先从已给出的冻结输入 manifest、准确正文或 reader 取得实际需要的数据、划分、预测、方法实现与协议。参考材料引用不是全量使用要求；如实选择与记录实际采用的准确版本，保持明确的 held-fixed 科学比较条件。需要查找或复用更多已有工作、资源时，读[研究导航](../references/research-navigation.md)，从 RG 对应入口展开。摘要或 hash 不替代原件；缺少材料时指出精确来源和缺口，沿既有输入交接处理。既有结果只按适用范围复用，不因新 Target 或空工作区重复已完成研究。采用 Environment 时核对当前使用条件；需要适配或修复时，在已接纳 Target 范围内保存实际工作与原环境关系。
 
-本 Target 与本 Cycle 的 Idea、Plan 暂存材料及本工作已交付文件沿获授 Workspace reader 核对；加工、副本和保管读[材料与保管](../references/materials-and-custody.md)。成为正式执行输入时仍需原交接流程，`implementation/`、`inputs/`、`outputs/` 保持原合同用途。
+本 Target 与本 Cycle 的 Idea、Plan 暂存材料及本工作已交付文件在宿主提供的目录用原生文件工具核对；加工、副本和保管读[材料与保管](../references/materials-and-custody.md)。成为正式执行输入时仍需原交接流程，`implementation/`、`inputs/`、`outputs/` 保持原合同用途。
 
 查找方法、方案或评价时按[研究导航](../references/research-navigation.md#baseline复用方法实施与评价)从相关命中或准确引用展开，复用前读完整相关方法。Bundle 的 Baseline 是初始建议；在科学目的与明确固定边界内，普通实现建议可有理由调整，按实际工作复用精确 Baseline／Variant（含跨 Baseline），或在正式交接中声明真实新方法。数据版本、上游 Commit、临时路径和研究说明属于本次输入或分析，不改变方法身份；相似方法需人工判断式的明确选择，不自动合并。
 

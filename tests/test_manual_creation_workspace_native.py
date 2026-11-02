@@ -105,13 +105,10 @@ def test_real_manual_creation_dispatch_preserves_its_actual_work_across_restart(
         assert human.query_manual_question_creation(context_ref)["drafting_session"]["turns"][-1]["assistant_status"] == "completed"
         assert adapter.requests[-1].native_session_ref == "local-native-root"
         assert (location.directory / "native-marker.txt").read_text().splitlines() == [str(location.directory)] * 3
-        observed = runtime.root_workspaces.read_manual_creation(context_ref, root_ref, generation,
-            workspace_ref=location.workspace_ref, path="native-observed-human.txt")
-        assert observed["content"] == b"Manual context pending observation: settle for 23 minutes."
-        assert observed["work_ref"] == context_ref
-        assert observed["context_generation"] == generation
-        page = runtime.root_workspaces.discover_manual_creation(context_ref, root_ref, generation)
-        assert any(item["path"] == delivered["files"][0]["path"] for item in page["files"])
+        assert (location.directory / "native-observed-human.txt").read_bytes() == b"Manual context pending observation: settle for 23 minutes."
+        assert location.work_ref == context_ref
+        assert location.context_generation == generation
+        assert (location.directory / delivered["files"][0]["path"]).is_file()
         assert not (adapter.research_workspace_root / "native-marker.txt").exists()
         requests = list((provider_root / "provider-operations").glob("*/*/supervisor-request.json"))
         assert len(requests) == 3
@@ -168,17 +165,12 @@ def test_manual_creation_rejects_foreign_execution_and_preserves_closed_original
         assert successor.location.directory != destination.location.directory
         with pytest.raises(DraftingUnavailable, match="workspace_manual_creation_scope_invalid"):
             adapter.reply(request)
-        historical = runtime.root_workspaces.read_manual_creation(context_ref, root_ref, generation,
-            workspace_ref=destination.location.workspace_ref, path="native-marker.txt")
-        assert historical["content"] == (str(destination.location.directory) + "\n").encode()
-        assert historical["work_ref"] == context_ref
-        page = runtime.root_workspaces.discover_manual_creation(context_ref, root_ref, generation)
-        assert any(item["path"] == "native-marker.txt" for item in page["files"])
+        assert (destination.location.directory / "native-marker.txt").read_bytes() == (str(destination.location.directory) + "\n").encode()
+        assert destination.location.work_ref == context_ref
         late = runtime.root_workspaces.deliver(destination, delivery_ref="late-manual-answer",
             files=(("human.txt", b"Keep this late answer in the original manual work."),))
         assert late["work_ref"] == context_ref
-        assert runtime.root_workspaces.read_manual_creation(context_ref, root_ref, generation,
-            workspace_ref=destination.location.workspace_ref, path=late["files"][0]["path"])["content"] == b"Keep this late answer in the original manual work."
+        assert (destination.location.directory / late["files"][0]["path"]).read_bytes() == b"Keep this late answer in the original manual work."
         assert not (successor.location.directory / "inbox").exists()
     finally:
         runtime.close()

@@ -300,7 +300,7 @@ class RootResidentMcpChannels:
                     operation_ids=self._operation_ids,
                     workspace_binding=(None if self._workspaces is None else self._workspaces.bind_runtime(
                         SemanticCallContext(run_ref, attempt_ref, root_session_ref, fence_ref,
-                            capability_binding_hash, self._root_kind, phase, "research_workspace.read", guidance_binding))),
+                            capability_binding_hash, self._root_kind, phase, "", guidance_binding))),
                 )
             except SemanticMcpError as error:
                 self.release(key)

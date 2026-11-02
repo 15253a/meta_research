@@ -986,7 +986,6 @@ def build_production_runtime(
         from meta_research.accepted_materials import DeepFetchAcceptedMaterials
         bind_materials(DeepFetchAcceptedMaterials(agent_runtime, human_collaboration, research_memory))
     semantic_gateway = create_semantic_owner_gateway(
-        root_workspaces=root_workspaces,
         research_graph=owners.research_graph,
         advancement_engine=owners.advancement_engine,
         research_memory=owners.research_memory,
@@ -1036,7 +1035,7 @@ def build_production_runtime(
         root_operation_diagnostic_recorder=root_operation_diagnostics,
     )
     harnesses.bind_resident_mcp_scope_verifier(owners.agent_runtime)
-    harnesses.bind_creation_channels(root_workspaces)
+    harnesses.bind_root_workspaces(root_workspaces)
     harnesses.bind_human_guidance_authority(owners.human_collaboration)
     for provider in (idea_skill_provider, plan_skill_provider, bundle_skill_provider, reasoning_skill_provider):
         bind_guidance = getattr(provider, "bind_human_guidance_authority", None)
@@ -1125,6 +1124,7 @@ def build_production_runtime(
         research_memory,
         deepfetch_provider,
     )
+    from meta_research.native_session_cleanup import NativeSessionCleanup
     target_run_runtime = TargetRunRuntime(
         agent_runtime=owners.agent_runtime,
         research_graph=owners.research_graph,
@@ -1136,6 +1136,7 @@ def build_production_runtime(
         database=database,
         root_workspaces=root_workspaces,
         advancement_engine=owners.advancement_engine,
+        native_cleanup=NativeSessionCleanup(data_root, codex_executable, acquisition_provider),
         protected_storage_roots=(data_root.objects, data_root.provider_homes,
             data_root.run / 'harness-supervisor', data_root.database),
     )

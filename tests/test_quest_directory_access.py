@@ -99,9 +99,12 @@ def test_reply_directory_and_upload_keep_actual_receiver_and_later_quest_access(
         assert delivery['human_request_ref'] == opened['request_ref']
         assert delivery['root_session_ref'] == scope['root_session_ref']
         assert delivery['work_ref'] == scope['root_session_ref']
-        upload = delivery['uploaded_readers'][0]
-        page = _accepted(_call(runtime, _channel(runtime, context), 'research_workspace.read', **upload))
-        assert base64.b64decode(page['base64']) == b'\x00\xffanswer'
+        from test_root_workspace import _native_file
+        reconciled = _accepted(_call(runtime, _channel(runtime, context), 'human_request.open.reconcile',
+                                    effect_id='reply-observations'))
+        assert reconciled['resolution']['delivery'] == delivery
+        upload = delivery['uploaded_files'][0]
+        assert _native_file(runtime, context, upload).read_bytes() == b'\x00\xffanswer'
         reference = delivery['work_materials'][0]['reference_ref']
         receiver = runtime.owners.human_collaboration.query_work_material(reference)['receiver']
         _complete_receiving_batch(runtime, scope)
