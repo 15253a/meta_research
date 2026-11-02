@@ -1022,7 +1022,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
       response_ref: `response-retry-${item.revision}`,
       decision: "provided",
       facts: { action: "retry", effect_id: "companion-effect-70" },
-      note: "",
+      note: route.request().postDataJSON()?.note ?? "",
     }];
     const retryStatus = requestRef === "companion:HR-70:r2" ? "succeeded" : "processing";
     await fulfillJson(route, {
@@ -1323,15 +1323,18 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog).toContainText("只重试上述同一操作，不展开根因分析。");
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(1);
   await expect(dialog.getByRole("button", { name: /提交|接受|拒绝/ })).toHaveCount(0);
+  const retryNote = "已恢复工作目录读写，GPU 操作仍待原任务复核。";
+  await dialog.getByLabel("处理说明（可选）").fill(retryNote);
   await dialog.getByRole("button", { name: "重试", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/companion%3AHR-70%3Ar1/retry",
-    body: {},
+    body: { note: retryNote },
   });
   await expect(dialog).toContainText("重试进行中");
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(dialog).toContainText("重试进行中");
+  await expect(dialog).toContainText(retryNote);
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 
   const humanRequests = (collaboration.human_requests as JsonRecord);
@@ -1358,7 +1361,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     .toBeVisible();
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "重试", exact: true }).click();
-  await expect(dialog.locator(".hc-response-boundary b")).toHaveText("重试已完成");
+  await expect(dialog.locator(".hc-response-boundary b")).toHaveText("原任务已收到重试请求");
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 });
 

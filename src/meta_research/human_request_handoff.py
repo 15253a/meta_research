@@ -36,7 +36,7 @@ def build_human_request_handoff(request: dict[str, Any]) -> dict[str, Any]:
     if system_help:
         return_instructions = [
             f"本材料绑定请求 {request['request_ref']}（修订 {request['revision']}）。",
-            "请回到本求助页面确认当前修订，然后点击“重试”以恢复当前精确操作；无需填写答复表单或上传材料。",
+            "请在本求助页面核对当前请求，可填写已做的处理和核验结果，然后点击“重试”。原任务收到回执后继续核验恢复条件。",
             "生成、预览和下载材料不会执行重试；无需启动研究助手。",
         ]
     elif capability_authorization:

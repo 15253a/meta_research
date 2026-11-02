@@ -1445,6 +1445,19 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     _assert_codex_schema_types(primary_schema)
 
 
+@pytest.mark.parametrize("scientific_outcome", [_idea_set, _no_viable_candidate])
+def test_primary_result_tag_survives_signed_replay_without_changing_domain_fields(tmp_path, scientific_outcome):
+    outcome = scientific_outcome()
+    workspace = tmp_path / "tagged-provider"
+    runner = _SequenceRunner([{"outcome": outcome}])
+    adapter = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    request = _request(runtime_binding=adapter.runtime_binding(), job_ref="idea:tagged")
+    first = adapter.generate_draft(request)
+    assert first.draft == outcome
+    restored = CodexIdeaSkillAdapter(workspace, process_runner=_SequenceRunner([]))
+    assert restored.generate_draft(request) == first
+
+
 def test_idea_root_invocation_uses_and_revokes_its_operation_tree_channel(
     tmp_path: Path,
 ) -> None:

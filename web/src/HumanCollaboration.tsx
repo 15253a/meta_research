@@ -2943,6 +2943,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   useEffect(() => { onReviewChange(review !== null); return () => onReviewChange(false); }, [review, onReviewChange]);
   const [recorded, setRecorded] = useState(() => humanResponseDeliveryState(request.request_ref)?.status === "recorded");
   const [retryStatus, setRetryStatus] = useState<"processing" | "succeeded" | null>(null);
+  const [submittedRetry, setSubmittedRetry] = useState<Record<string, unknown>>();
   const [error, setError] = useState<string | null>(null);
   const currentRequestRef = useRef(request.request_ref);
   const mounted = useRef(true);
@@ -3061,7 +3062,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     setPending(true);
     setError(null);
     try {
-      const result = await retryHumanRequest(request.request_ref);
+      const result = await retryHumanRequest(request.request_ref, note);
       if (result.retry.status === "failed") {
         setRetryStatus(null);
         setError(result.retry.reason.code);
@@ -3069,6 +3070,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         return;
       }
       setRetryStatus(result.retry.status);
+      setSubmittedRetry(result.responses?.at(-1));
       onChanged();
     } catch (caught) {
       setError(reasonCode(caught));
@@ -3078,10 +3080,18 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   };
 
   const unresolvedResponse = !recorded && Boolean(sealedResponse || pendingHumanRequestResponse(request.request_ref));
+  const latestResponse = request.responses?.at(-1);
+  const retryReceipt = request.kind === "system_operation_help"
+    ? submittedRetry ?? latestResponse : undefined;
+  const retryDetails = retryReceipt && isRecord(retryReceipt.facts) && retryReceipt.facts.action === "retry" ? <div>
+    {typeof retryReceipt.note === "string" && retryReceipt.note && <p>已提交的处理说明：{retryReceipt.note}</p>}
+    <details><summary>查看重试回执</summary><code>{String(retryReceipt.response_ref ?? "")}</code></details>
+  </div> : null;
   if (recoveryReady && !unresolvedResponse && (request.status !== "open" || retryStatus === "succeeded")) {
     return (
       <div className="hc-response-boundary" role="status">
-        <b>{retryStatus === "succeeded" ? "重试已完成" : `${recorded || request.responses?.length ? "回应已提交" : "请求状态已更新"} · ${requestStatusLabel(request.status)}`}</b><br />
+        <b>{retryStatus === "succeeded" ? "原任务已收到重试请求" : `${recorded || request.responses?.length ? "回应已提交" : "请求状态已更新"} · ${requestStatusLabel(request.status)}`}</b><br />
+        {retryDetails}
         <p>本请求的回执与后继状态保留在此。提交不表示原根已恢复，也不表示科学问题已解决。</p>
         <p>原根核验：{evaluationDecision ?? "尚无确认"}；后续处理：{String(request.disposition?.decision ?? "尚无确认")}。</p>
         <code>{String(humanResponseDeliveryState(request.request_ref)?.result?.response_ref ?? "")}</code>
@@ -3090,7 +3100,6 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     );
   }
 
-  const latestResponse = request.responses?.at(-1);
   const projectedRetryProcessing = request.kind === "system_operation_help"
     && isRecord(latestResponse)
     && latestResponse.decision === "provided"
@@ -3191,16 +3200,21 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
             <span aria-hidden="true">↻</span>
             <div>
               <h3>重试进行中</h3>
-              <p>正在执行当前绑定的同一操作；失败会显示新修订，成功后会显示完成。</p>
+              <p>重试请求已提交，正在等待原任务接续。</p>
+              {retryDetails}
             </div>
           </section>
         ) : (
-          <button
+          <><label className="hc-optional-note"><span><b>处理说明（可选）</b></span>
+            <textarea value={note} maxLength={4000} disabled={pending || !!sealedResponse || !recoveryReady}
+              placeholder="说明你实际做了什么、核验结果和仍未解决的问题。"
+              onChange={event => setNote(event.currentTarget.value)} />
+          </label><button
             className="hc-submit"
             type="button"
             disabled={pending || !!sealedResponse || !recoveryReady}
             onClick={() => void retry()}
-          >重试</button>
+          >重试</button></>
         )
       ) : null}
       {error || !["library_reconnect", "capability_authorization"].includes(request.kind) ? (
@@ -3210,7 +3224,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
           <><b>正式提交将回应交回请求原根</b><br />负责当前请求的 Agent 会解释回应、核验材料并决定下一步。</>
         ) : request.kind === "system_operation_help" ? (
-          <><b>只重试当前绑定的失败操作</b><br />成功后只恢复它的精确依赖；失败会保留同一操作链并显示新修订。</>
+          <><b>重试当前请求对应的操作</b><br />处理说明随本次重试保存。环境是否恢复，由原任务继续核验。</>
         ) : (
           <><b>提交回应不会立即代表条件已经满足</b><br />系统会核对当前任务、材料和授权；只有核对通过且没有其他阻碍，相关工作才会继续。</>
         )}

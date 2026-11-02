@@ -3146,11 +3146,12 @@ function observeHumanResponseDelivery(requestRef: string, state: HumanResponseDe
 
 export function retryHumanRequest(
   requestRef: string,
+  note = "",
 ): Promise<HumanRequestRetryResult> {
   return writeJson<HumanRequestRetryResult>(
     `/api/v1/human-requests/${encodeURIComponent(requestRef)}/retry`,
     "POST",
-    {},
+    note ? { note } : {},
   );
 }
 

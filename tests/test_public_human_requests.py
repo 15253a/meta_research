@@ -1588,7 +1588,8 @@ def test_agent_issued_system_operation_help_retry_resumes_exact_agent(
                 "Idempotency-Key": "root-system-operation-help-retry",
             }
             retry_url = f"/api/v1/human-requests/{request['request_ref']}/retry"
-            processing = client.post(retry_url, headers=headers, json={})
+            note = "实现者代填：已恢复工作目录读写，请原任务重新核验计算环境。"
+            processing = client.post(retry_url, headers=headers, json={"note": note})
             assert processing.status_code == 200, processing.json()
             assert processing.json()["retry"] == {"status": "processing"}
 
@@ -1596,16 +1597,19 @@ def test_agent_issued_system_operation_help_retry_resumes_exact_agent(
             assert pending is not None
             assert pending["status"] == "open"
             assert pending["direct_waiters"][0]["status"] == "blocked"
+            assert pending["responses"][-1]["note"] == note
+            assert pending["responses"][-1]["facts"] == {"action": "retry"}
             assert owner.query_managed_run(str(binding["task_ref"]))[
                 "status"
             ] == "suspended"
 
-            processing_replay = client.post(retry_url, headers=headers, json={})
+            processing_replay = client.post(retry_url, headers=headers, json={"note": note})
             assert processing_replay.status_code == 200, processing_replay.json()
             assert processing_replay.json()["retry"] == {"status": "processing"}
             assert len(
                 owner.query_human_request(str(request["request_ref"]))["responses"]
             ) == 1
+            assert client.post(retry_url, headers=headers, json={"note": "不同的说明"}).status_code == 409
 
             other_headers = {
                 **headers,
