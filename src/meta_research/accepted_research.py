@@ -405,4 +405,3 @@ class AcceptedResearchReader:
             ),
             "receipt": commit.receipt.as_public_dict(),
         }
-

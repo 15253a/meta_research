@@ -99,5 +99,3 @@ def content_model_operation(agent_runtime):
                 "required": ["role", "content"], "additionalProperties": False}}},
             "required": ["config_ref", "messages"], "additionalProperties": False},
         output_schema={"type": "object"}, handler=call)
-
-
