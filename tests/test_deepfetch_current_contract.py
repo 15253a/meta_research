@@ -45,7 +45,10 @@ def test_provided_materials_finalize_without_fabricating_external_search(tmp_pat
     assert "--ignore-user-config" in argv and "--ignore-rules" in argv
     assert 'web_search="disabled"' in argv
     assert "sandbox_workspace_write.network_access=false" in argv
-    assert 'shell_environment_policy.inherit="none"' in argv
+    assert 'shell_environment_policy.inherit="all"' in argv
+    allowlist = next(value.split('=', 1)[1] for value in argv
+                     if value.startswith('shell_environment_policy.include_only='))
+    assert 'PATH' in json.loads(allowlist) and 'META_RESEARCH_MCP_TOKEN' not in json.loads(allowlist)
     assert "literature_access_mode=provided_only" in prompt
 
 

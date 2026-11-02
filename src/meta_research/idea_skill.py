@@ -2609,6 +2609,10 @@ class CodexIdeaSkillAdapter:
             from meta_research.root_capabilities import provided_only_cli_arguments
             argv = provided_only_cli_arguments(argv, writable_root=execution_write_root or working_directory,
                                                resident_mcp=semantic_mcp_enabled)
+        if (semantic_mcp_protected_environment or external_mcp_access is not None
+                or self._shell_environment_inherit == "none" or execution_access_mode == "provided_only"):
+            from meta_research.quest_drafting import protected_codex_shell_arguments
+            argv = protected_codex_shell_arguments(argv, self._runner)
         if native_session_ref is None:
             argv.append("-")
         else:

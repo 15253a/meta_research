@@ -364,6 +364,41 @@ def provider_working_directory(argv: list[str], environment: dict[str, str] | No
         raise OSError(error.code) from error
 
 
+def protected_codex_shell_arguments(argv: list[str], runner: object) -> list[str]:
+    """Keep required tools and managed paths, never the provider's auth environment.
+
+    Codex applies include_only after inherited variables AND config.set. Merely
+    inheriting none both loses PATH and still permits secrets from config.set.
+    Proxy values stay in the process environment; they never enter sealed argv.
+    """
+    environment = (runner._subprocess_environment(None)
+                   if isinstance(runner, _CancellableProcessRunner) else None) or os.environ
+    paths = ("PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR",
+             "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+             "PIP_CACHE_DIR", "npm_config_cache", "UV_CACHE_DIR", "NODE_PATH",
+             "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
+    allowed = (*paths, "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+    # Values explicitly protected by DataRoot win over an inherited config.set.
+    # Codex compares the include patterns case-insensitively, including proxies.
+    values = {name: environment[name] for name in paths if name in environment}
+    values.setdefault("PATH", os.defpath)
+    configs = ('shell_environment_policy.inherit="all"',
+        'shell_environment_policy.ignore_default_excludes=false',
+        'shell_environment_policy.experimental_use_profile=false',
+        'shell_environment_policy.include_only=' + json.dumps(allowed),
+        'shell_environment_policy.set={' + ','.join(
+            json.dumps(name) + '=' + json.dumps(value) for name, value in values.items()) + '}')
+    result, index = [], 0
+    while index < len(argv):
+        if (argv[index] in {"--config", "-c"} and index + 1 < len(argv)
+                and argv[index + 1].startswith("shell_environment_policy.inherit=")):
+            index += 2
+        else:
+            result.append(argv[index])
+            index += 1
+    return [*result[:2], *(part for config in configs for part in ("--config", config)), *result[2:]]
+
+
 class _CancellableProcessRunner:
     def __init__(
         self,
