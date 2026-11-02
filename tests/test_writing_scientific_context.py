@@ -1,6 +1,7 @@
 """Writing carries scientific fields and exact readers without whole stage bodies."""
 from copy import deepcopy
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from meta_research.bundle_protocol import BundleReport, projection_plain_value, validate_bundle_report
@@ -75,10 +76,21 @@ def test_large_accepted_plan_queues_writing_and_exact_reader_keeps_full_document
         assert turn["assistant_status"] == "queued"
         task, _ = json.JSONDecoder().raw_decode(turn["message"].split("写作任务（普通助手会话）：\n", 1)[1])
         artifact = task["scientific_context"]["scientific_artifacts"][0]
+        basis = task["scientific_context"]
+        assert task["materials"] == []  # Manual selection is optional.
+        assert datetime.fromisoformat(basis["basis_observed_at"]).utcoffset() == timezone.utc.utcoffset(None)
         assert len(turn["message"]) < 256 * 1024
         assert "content" not in artifact
         assert artifact["scientific_fields"]["coverage"] == accepted["content"]["coverage"]
         assert read_exact(runtime, quest["quest_ref"], artifact["reader"]) == accepted["content"]
+        # An enqueue replay must not reconstruct the basis from newer research.
+        def changed_context(*args, **kwargs):
+            raise AssertionError("queued writing must keep its original research basis")
+        from unittest.mock import patch
+        with patch.object(ResearchOverviewReader, "writing_context", changed_context):
+            replay = human.send_companion_message("quest:" + quest["quest_ref"], "Write an outline.",
+                "large-plan-writing", writing_request={"requirements": "Write an outline.", "task_scope": "outline"})
+        assert replay["message"] == turn["message"]
     finally:
         runtime.close()
 

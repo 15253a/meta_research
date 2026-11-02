@@ -85,7 +85,7 @@ export function WritingRequestForm({ assets, scopeRef, workspacePath, onClose, o
 
   return <dialog ref={dialogRef} className="writing-request" aria-label="交给研究助手写作" onCancel={event => { event.preventDefault(); if (!sending) onClose(); }}>
     <header><div><p>研究助手</p><h1>写作与演示</h1></div><button type="button" onClick={onClose} disabled={sending} aria-label="关闭写作">关闭</button></header>
-    <p className="writing-request-intro">说明你要交付的内容、读者和要求。助手会在本研究的持久目录中制作文件，你可以在同一对话中继续修改。</p>
+    <p className="writing-request-intro">说明你要交付的内容、读者和要求。助手会从你有权访问的全部研究材料中按需取材，尽量依据开始写作时的研究状态完成文件，并保留文件供后续修改。</p>
     <form onSubmit={event => void submit(event)}>
       <fieldset disabled={sending}>
         <div className="writing-request-row">
@@ -95,15 +95,15 @@ export function WritingRequestForm({ assets, scopeRef, workspacePath, onClose, o
         {draft.document_type !== "presentation" && <label className="writing-request-check"><input type="checkbox" checked={draft.include_presentation} onChange={event => change({ include_presentation: event.target.checked })} />同时制作配套 PPT</label>}
         <label>写作要求<textarea required rows={5} value={draft.requirements} onChange={event => change({ requirements: event.target.value })} placeholder="需要表达什么、给谁阅读、篇幅与格式、保留哪些结论或限制……" /></label>
         <section aria-label="本次写作材料">
-          <h2>材料与模板</h2>
-          <p>选择本次使用的准确版本；已选前稿会保持该版本。模板需要的图表、字体和书目可作为依赖一起选择。</p>
+          <h2>材料与模板（可选）</h2>
+          <p>需要指定前稿、模板或重点材料时，可在这里选入具体版本。已选版本会保留；模板需要的图表、字体和书目可一起加入。</p>
           <div className="writing-request-row">
             <label>材料用途<select value={materialRole} onChange={event => setMaterialRole(event.target.value as CompanionWritingMaterial["role"])}>{Object.entries(materialRoles).map(([role, label]) => <option key={role} value={role}>{label}</option>)}</select></label>
             <label>选择材料版本<select value={materialRef} onChange={event => setMaterialRef(event.target.value)}><option value="">请选择</option>{inventory.items.map(item => <option key={item.version_ref} value={item.version_ref}>{item.display_name} · 版本 {item.version_number}</option>)}</select></label>
             <button type="button" disabled={!materialRef} onClick={addMaterial}>加入本次写作</button>
           </div>
           {inventory.has_more && <button type="button" disabled={loading} onClick={() => void moreMaterials()}>{loading ? "正在读取…" : "更多材料"}</button>}
-          {draft.materials.length ? <ul className="writing-request-materials">{draft.materials.map(item => <li key={`${item.role}:${item.version_ref}`}><span>{materialRoles[item.role]} · {item.name} · 版本 {item.version_number}</span><button type="button" aria-label={`移除 ${item.name} ${materialRoles[item.role]}`} onClick={() => change({ materials: draft.materials.filter(candidate => candidate !== item) })}>移除</button></li>)}</ul> : <p>尚未指定材料。也可在要求中说明需要助手查找的已有资料。</p>}
+          {draft.materials.length ? <ul className="writing-request-materials">{draft.materials.map(item => <li key={`${item.role}:${item.version_ref}`}><span>{materialRoles[item.role]} · {item.name} · 版本 {item.version_number}</span><button type="button" aria-label={`移除 ${item.name} ${materialRoles[item.role]}`} onClick={() => change({ materials: draft.materials.filter(candidate => candidate !== item) })}>移除</button></li>)}</ul> : <p>未手动指定材料，助手将按写作要求查找和选用相关研究资料。</p>}
         </section>
         <div className="writing-request-row">
           <label>内容模型<select value={draft.model.kind} onChange={event => change({ model: event.target.value === "current" ? { kind: "current" } : { kind: "configured_api", config_ref: "" } })}><option value="current">当前 Codex 模型</option><option value="configured_api">已配置的 API 模型</option></select></label>

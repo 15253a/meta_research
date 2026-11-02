@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
@@ -18,14 +19,22 @@ class ResearchOverviewReader(AcceptedResearchReader):
     """
 
     def writing_context(self, quest_ref: str, *, question_ref=None):
-        """Read the selected question's current work and last synthesis once.
+        """Keep the initial writing basis in one existing Owner read snapshot.
 
         Scientific fields are exact excerpts, not generated summaries. Large
         fields and full records stay behind their existing accurate readers.
+        Later discovery is still live; this is not an as-of query for all assets.
         """
+        with self._research_graph._database.read_snapshot():
+            return self._writing_context(quest_ref, question_ref=question_ref)
+
+    def _writing_context(self, quest_ref: str, *, question_ref=None):
         quest = self._research_graph.query_quest_by_ref(quest_ref)
         if quest is None:
             raise OwnerConflict("research_overview_quest_not_found")
+        # The first Owner read establishes the WAL snapshot. Persist this
+        # observation with the exact sources in the ordinary queued message.
+        basis_observed_at = datetime.now(timezone.utc).isoformat()
         foreground = self._advancement_engine.query_foreground(quest_ref)
         if question_ref is None and foreground is not None:
             question_ref = foreground["question_ref"]
@@ -44,6 +53,7 @@ class ResearchOverviewReader(AcceptedResearchReader):
                     if artifact is not None:
                         artifacts.append(self._writing_artifact(artifact, commit))
         return {"quest_ref": quest_ref, "question_ref": question_ref,
+            "basis_observed_at": basis_observed_at,
             "goal": quest.draft.get("goal"), "scientific_artifacts": artifacts,
             "availability": ("accepted_scientific_content" if any(
                 artifact["status"] == "accepted" for artifact in artifacts) else "no_accepted_scientific_result"),
