@@ -446,7 +446,7 @@ def test_confirmed_quest_material_binding_becomes_a_separate_rg_role(
             }
         )
         assert any(
-            "1 个精确 Quest Source Material 角色" in item
+            "已选的 1 份材料登记为本任务的研究资料" in item
             for item in previewed["confirmation_preview"]["will_happen"]
         )
         original_projection_verifier = (

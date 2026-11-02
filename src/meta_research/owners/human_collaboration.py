@@ -10695,32 +10695,33 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         )
         assertions_hash = canonical_hash(assertions)
         owner_revisions = self._public_owner_revisions()
+        budget = str(envelope_value["time_budget"])
+        duration = "不设硬截止" if budget == "open" else (
+            budget[:-1] + (" 天" if budget.endswith("d") else " 小时")
+        )
+        card_count = len(cast(list[str], envelope_value["selected_device_uuids"]))
         will_happen = [
-            "记录一次 Human Collaboration 最终确认",
-            "在 Quest 接纳后独立签发精确默认策略的宽研究授权",
-            "依次请求 Quest、Question 内容、根 Question 与初始 Cycle 的 Owner 接受",
-            "按 Resource Envelope 使用时间预算 "
-            f"{envelope_value['time_budget']} 与计算卡 "
-            f"{', '.join(cast(list[str], envelope_value['selected_device_uuids']))}",
+            "记录你的确认，创建研究任务",
+            "任务创建后，系统按默认权限授予自主研究所需的访问和操作权限",
+            "保存并建立第一个研究问题，然后启动第一轮研究",
+            f"整个研究任务的时间预算为{duration}，可用计算卡 {card_count} 张",
         ]
         if material_bindings:
             will_happen.insert(
                 2,
-                "由 Research Graph 接纳 "
-                f"{len(material_bindings)} 个精确 Quest Source Material 角色",
+                f"将已选的 {len(material_bindings)} 份材料登记为本任务的研究资料",
             )
         if literature_snapshot is not None:
             will_happen.insert(
                 2,
-                "仅使用已由 Research Memory 接纳的精确 LiteratureSnapshot "
-                f"{literature_snapshot.snapshot_ref}",
+                "起步文献使用本次已保存的检索结果",
             )
         summary = {
             "will_happen": will_happen,
             "will_not_happen": [
-                "不会在确认前创建 Quest、Question 或 Cycle",
-                "不会把草稿、预览或模型回复当作 Owner receipt",
-                "宽研究授权不会扩大 Resource Envelope 的 hard ceiling，也不替代后续 Owner receipt",
+                "确认前不会建立任务、问题或启动第一轮研究",
+                "草稿、预览和助手回复不能代替正式创建记录",
+                "自主研究权限不会提高资源上限，每一步仍需取得相应回执",
             ],
         }
         with self._database.write() as connection:
