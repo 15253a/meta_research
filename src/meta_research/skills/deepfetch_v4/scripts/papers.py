@@ -1468,6 +1468,9 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
                         errors.append("%s: identity.%s is not canonical" % (prefix, field))
                 if source_schema:
                     item = normalized_intake({"identity": identity, "paper_version": paper.get("paper_version"), "discovery_origins": paper.get("discovery_origins")})
+                    if literature_access_mode == "provided_only" and item["discovery_origins"]:
+                        errors.append("%s: provided_only requires discovery_origins=[]; "
+                                      "retain material receipts in the accepted input binding" % prefix)
                     identity_prefix = paper_id.partition(":")[0]
                     identity_field = {"doi": "doi", "arxiv": "arxiv_id", "openalex": "openalex_id"}.get(identity_prefix)
                     version_hash = hashlib.sha256(item["paper_version"].encode("utf-8")).hexdigest()[:12]

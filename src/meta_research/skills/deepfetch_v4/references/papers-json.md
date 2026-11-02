@@ -33,7 +33,7 @@
 
 ## 论文身份与元数据
 
-每个新 `papers[paper_id]` 恰含 `identity`、`metadata`、`pre_understanding`、`fulltext_path`、`reading`、`paper_version`、`discovery_origins`。`paper_version` 是已核实的明确版本，如 `published`、`v2`；未知时为 `unverified`。`discovery_origins` 输入为宿主回执引用数组；宿主验证实际返回身份与版本后在 RM 中保留安全来源证明。
+每个新 `papers[paper_id]` 恰含 `identity`、`metadata`、`pre_understanding`、`fulltext_path`、`reading`、`paper_version`、`discovery_origins`。`paper_version` 是已核实的明确版本，如 `published`、`v2`；未知时为 `unverified`。`discovery_origins` 仅填写 `deepfetch_source_action` 实际返回的补充发现回执；宿主验证同一论文身份与版本后在 RM 中保留来源证明。`provided_only` 的该字段为 `[]`。材料接纳回执保留在宿主提供的准确输入文件及 accepted binding 中；Acquisition 获取回执用于全文证明，两者均不属于补充发现回执。
 
 新记录由工具按最强已核实 DOI、arXiv 或 OpenAlex 标识及版本生成 `paper_id`，后续补全更强标识保留原 ID。跨源只按相同稳定身份与相同确认版本合并，并保留全部回执。相似标题不合并；标题级或网页线索在论文身份核实前保留在研究笔记。arXiv 标识保存基础 ID，vN 保存在 `paper_version`；与正式版分开。版本未知不能自动合并，再次更新须明确指定现有 `paper_id`。DOI 不带 URL 前缀，OpenAlex token 为 `W...`，标题保持已核实原文。
 

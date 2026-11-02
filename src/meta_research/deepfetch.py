@@ -2723,7 +2723,8 @@ class CodexDeepFetchAdapter:
                "Each path is a verified native copy of this request's exact accepted version. "
                "Use its supplied version/version reader when needed; do not reconstruct binary files from tool pages. "
                "For Acquisition, pass only the selected paper's exact clues and its local path as a file:// source URL. "
-               "Retain the binding and source receipt; keep input copies unchanged.\n" if materials else "")
+               "Keep the accepted binding and its material receipt in exact_scientific_input_path, with input copies unchanged. "
+               "Apply references/papers-json.md to discovery_origins; provided_only uses an empty array.\n" if materials else "")
             + basis + self._context_reference(request, materials=materials)
         )
 
