@@ -1276,6 +1276,13 @@ class ReasoningStageWorker:
             job_ref = self._agent_runtime.record_reasoning_continuation_rejection(checkpoint_ref=run.autonomous_checkpoint.checkpoint_ref, phase=continuation_phase, unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=native_session_ref, candidate=candidate, failure_code=failure_code, detail_code=detail_code)
             self._finish_provider_job(job_ref)
             return
+        detail = detail_code
+        # This contract error carries field/supplied/expected evidence after
+        # its stable code. Preserve that evidence in feedback, not in the
+        # Owner's bounded machine-code field.
+        metadata_conflict = "scientific_outcome_authoritative_metadata_conflict"
+        if detail_code.startswith(metadata_conflict + ":"):
+            detail_code = metadata_conflict
         self._agent_runtime.reject_stage_completion_candidate(
             unit_ref=unit_ref,
             run_ref=run.run_ref,
@@ -1287,7 +1294,7 @@ class ReasoningStageWorker:
             detail_code=detail_code,
             feedback=(
                 "Return a corrected structured completion that satisfies "
-                f"{detail_code}, then resubmit it in this Root Session.",
+                f"{detail}, then resubmit it in this Root Session.",
             ),
         )
 

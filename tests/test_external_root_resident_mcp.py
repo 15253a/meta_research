@@ -371,6 +371,7 @@ def test_quest_bound_companion_turn_uses_exact_resident_operation_tree(
         creation_context_ref=None,
         context_generation=None,
         root_runtime_scope=scope,
+        inputs=None,
     )
 
     result = adapter.reply(request)  # type: ignore[arg-type]
@@ -411,6 +412,7 @@ def test_pre_quest_companion_turn_remains_without_resident_channel(
         creation_context_kind="quest_initialization",
         creation_context_ref=None,
         context_generation=None,
+        inputs=None,
     )
 
     adapter.reply(request)  # type: ignore[arg-type]
