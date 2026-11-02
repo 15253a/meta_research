@@ -565,7 +565,9 @@ def _confirm_question(runtime, suffix: str = "") -> dict[str, object]:
         preview_hash=previewed["confirmation_preview"]["hash"],
         idempotency_key=key("confirm"),
     )
-    for _step in range(5):
+    for _step in range(8):
+        if human.query_quest_creation(opened["initialization_id"])["status"] == "completed":
+            break
         if not human.reconcile_once():
             break
     completed = human.query_quest_creation(opened["initialization_id"])

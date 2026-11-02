@@ -1,5 +1,6 @@
 """Independent Companion consumption through the existing scoped material tools."""
 from meta_research.composition import build_production_runtime
+from meta_research.acquisition import AcquisitionBatchRequest, AcquisitionPaper
 from meta_research.paths import prepare_data_root
 from meta_research.semantic_mcp import SemanticCallContext
 from test_companion_workspace_native import _conversation_executable
@@ -13,6 +14,17 @@ from test_root_human_request_lifecycle import _open_arguments
 
 
 def test_quest_companion_reads_original_request_materials_without_rebinding_or_foreign_quest_access(tmp_path):
+    class MaterialRequester(RecordingAcquisitionProvider):
+        def acquire(self, request):
+            self.scope = request.root_runtime_scope
+            scope = self.scope
+            context = SemanticCallContext(scope["run_ref"], scope["attempt_ref"], scope["root_session_ref"],
+                scope["fence_ref"], scope["runtime_binding_hash"], "acquisition", "batch", "human_request.open")
+            channel = _channel(self.runtime, context)
+            self.opened = _accepted(_call(self.runtime, channel, "human_request.open",
+                **_open_arguments(request.request_id, "offline_action")))
+            return super().acquire(request)
+
     class Reader(RecordingCompanion):
         def reply(self, request):
             scope = request.root_runtime_scope
@@ -34,9 +46,11 @@ def test_quest_companion_reads_original_request_materials_without_rebinding_or_f
             return super().reply(request)
 
     adapter = Reader(tmp_path / "provider", executable=str(_conversation_executable(tmp_path / "local-codex")))
+    acquisition = MaterialRequester()
     runtime = build_production_runtime(prepare_data_root(tmp_path / "runtime"),
         proposal_drafter=DeterministicDraftingAdapter(), intent_drafting_provider=adapter,
-        acquisition_provider=RecordingAcquisitionProvider(), host_compute_probe=DeterministicProbe())
+        acquisition_provider=acquisition, host_compute_probe=DeterministicProbe())
+    acquisition.runtime = runtime
     client, headers = _authenticated_client(runtime)
     try:
         quest, _ = _accept_root_question(runtime, "material-consumer")
@@ -44,15 +58,18 @@ def test_quest_companion_reads_original_request_materials_without_rebinding_or_f
         references = []
         for index, selected_quest in enumerate((quest, foreign_quest)):
             # Original Acquisition work requests the observations; Companion only reads them.
-            scope = dict(quest_ref=selected_quest, run_ref=f"original-work-{index}",
-                attempt_ref=f"original-attempt-{index}", root_session_ref=f"original-root-{index}",
-                fence_ref=f"original-fence-{index}", runtime_binding_hash="b" * 64, generation=1)
-            runtime.owners.agent_runtime.register_external_root_task_scope(root_kind="acquisition", root_runtime_scope=scope)
-            context = SemanticCallContext(scope["run_ref"], scope["attempt_ref"], scope["root_session_ref"],
-                scope["fence_ref"], scope["runtime_binding_hash"], "acquisition", "primary", "human_request.open")
-            original = _channel(runtime, context)
-            opened = _accepted(_call(runtime, original, "human_request.open",
-                **_open_arguments(f"material-request-{index}", "offline_action")))
+            accepted_quest = runtime.owners.research_graph.query_quest_by_ref(selected_quest)
+            owner = runtime.owners.agent_runtime
+            session = owner.prepare_acquisition_session(initialization_id=accepted_quest.initialization_id,
+                draft_revision=accepted_quest.draft_revision,
+                config={key: accepted_quest.draft["literature"][key] for key in ("mode", "library_entry_url")},
+                provider=acquisition)
+            owner.bind_acquisition_session_to_quest(accepted_quest.initialization_id, selected_quest)
+            owner.acquire_literature(session.session_ref, AcquisitionBatchRequest(
+                request_id=f"original-work-{index}", route_policy="oa_first_then_institution",
+                papers=(AcquisitionPaper(paper_id=f"paper:observation-{index}", title="Field observation",
+                    doi=None, arxiv_id=None, source_urls=()),)), acquisition)
+            scope, opened = acquisition.scope, acquisition.opened
             source = tmp_path / f"original-{index}"
             source.mkdir()
             (source / "observation.txt").write_text("Original observation: 17 degrees.")
@@ -62,7 +79,9 @@ def test_quest_companion_reads_original_request_materials_without_rebinding_or_f
                     "materials": [{"kind": "server_reference", "selection": _source(client, source)}]})
             assert response.status_code == 201, response.text
             reference = response.json()["delivery"]["work_materials"][0]["reference_ref"]
-            references.append((reference, opened["request_ref"], scope["run_ref"]))
+            # Acquisition's durable material receiver is its real Session;
+            # the HumanRequest retains this exact batch's request identity.
+            references.append((reference, opened["request_ref"], scope["root_session_ref"]))
         adapter.runtime, adapter.reference, adapter.foreign_reference = runtime, references[0][0], references[1][0]
         human = runtime.owners.human_collaboration
         before_rm = runtime.owners.research_memory.query_snapshot()

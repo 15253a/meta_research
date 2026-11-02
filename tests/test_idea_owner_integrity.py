@@ -85,7 +85,9 @@ def _confirm_question_with_prefix(runtime, prefix: str) -> dict[str, object]:
         preview_hash=previewed["confirmation_preview"]["hash"],
         idempotency_key=f"{prefix}-confirm",
     )
-    for _boundary in range(5):
+    for _boundary in range(8):
+        if human.query_quest_creation(opened["initialization_id"])["status"] == "completed":
+            break
         if not human.reconcile_once():
             break
     completed = human.query_quest_creation(opened["initialization_id"])
