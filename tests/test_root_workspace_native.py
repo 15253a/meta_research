@@ -33,6 +33,26 @@ def _native_executable(path):
         "if sys.argv[-2:] == ['features', 'list']:\n"
         "    print('hooks stable true\\nmulti_agent stable true\\nplugins stable true\\nremote_plugin stable true\\nshell_tool stable true\\nskill_search stable true\\nunified_exec stable true')\n"
         "    raise SystemExit(0)\n"
+        "if 'app-server' in sys.argv:\n"
+        "    for line in sys.stdin:\n"
+        "        message = json.loads(line); method = message.get('method'); params = message.get('params', {})\n"
+        "        if method == 'initialized': continue\n"
+        "        result = {'thread': {'id': 'local-native-root'}} if method in ('thread/start', 'thread/resume') else {}\n"
+        "        if method == 'turn/start': result = {'turn': {'id': 'local-turn', 'status': 'inProgress'}}\n"
+        "        print(json.dumps({'id': message['id'], 'result': result}), flush=True)\n"
+        "        if method == 'turn/start':\n"
+        "            prompt = params['input'][0]['text']; marker = Path('native-marker.txt')\n"
+        "            previous = marker.read_text() if marker.exists() else ''\n"
+        "            marker.write_text(previous + os.getcwd() + '\\n')\n"
+        "            if 'phase=preflight' in prompt:\n"
+        "                Path('preflight-nonce.txt').write_text('Acquisition preflight pending nonce')\n"
+        "                value = dict(status='ready', browser_context_ref=None, reason_code=None, evidence={'configuration_health':'not_required','browser_control':'not_required','authorized_resource':'oa_only'})\n"
+        "            else:\n"
+        "                Path('native-observed-preflight.txt').write_text(Path('preflight-nonce.txt').read_text())\n"
+        "                value = {'results': [{'paper_id':'paper:1','status':'missing','path':None,'format':None,'failure':{'code':'oa_not_found','detail':'No OA body.'}}]}\n"
+        "            print(json.dumps({'method':'item/completed','params':{'threadId':'local-native-root','turnId':'local-turn','item':{'type':'agentMessage','id':'final','text':json.dumps(value)}}}), flush=True)\n"
+        "            print(json.dumps({'method':'turn/completed','params':{'threadId':'local-native-root','turn':{'id':'local-turn','status':'completed'}}}), flush=True)\n"
+        "    raise SystemExit(0)\n"
         "prompt = sys.stdin.read()\n"
         "marker = Path('native-marker.txt')\n"
         "previous = marker.read_text() if marker.exists() else ''\n"
@@ -45,6 +65,10 @@ def _native_executable(path):
         "if human:\n"
         "    Path('native-observed-human.txt').write_text('\\n'.join(human))\n"
         "value = {'cwd': os.getcwd(), 'previous': bool(previous), 'human': human, 'reply': 'Checked pending observations.', 'accepted': True, 'human_request': None}\n"
+        "if 'phase=preflight' in prompt:\n"
+        "    value.update(status='ready', browser_context_ref=None, reason_code=None, evidence={'configuration_health':'not_required','browser_control':'not_required','authorized_resource':'oa_only'})\n"
+        "elif 'phase=batch' in prompt:\n"
+        "    value['results'] = [{'paper_id':'paper:1','status':'missing','path':None,'format':None,'failure':{'code':'oa_not_found','detail':'No OA body.'}}]\n"
         "if '--output-last-message' in sys.argv:\n"
         "    schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema')+1]).read_text())\n"
         "    value = {key: value[key] for key in schema['properties'] if key in value}\n"
@@ -121,7 +145,7 @@ def test_real_idea_dispatch_native_initial_resume_and_public_plan_read(tmp_path,
         runtime.close()
 
 
-def test_shared_companion_adapter_interleaves_roots_and_rotates_human_request_job(tmp_path):
+def test_shared_companion_adapter_interleaves_roots_and_resumes_distinct_jobs(tmp_path):
     from test_root_human_request_lifecycle import _open_arguments
     runtime = _make(tmp_path / "runtime")
     adapter = CodexCompanionAdapter(tmp_path / "companion-transport",
@@ -146,23 +170,33 @@ def test_shared_companion_adapter_interleaves_roots_and_rotates_human_request_jo
             values = list(pool.map(lambda pair: invoke(*pair), ((a, "native-job-a"), (b, "native-job-b"))))
         assert [value["cwd"] for value in values] == [str(item.directory) for item in locations]
         assert [value["previous"] for value in values] == [False, False]
-        opened = _accepted(_call(runtime, _channel(runtime, a), "human_request.open",
-            **_open_arguments("native-human-material", "offline_action")))
-        destination = runtime.root_workspaces.destination_for_human_request(
-            request_ref=opened["request_ref"], waiter_ref=opened["waiter"]["waiter_ref"])
-        delivered = runtime.root_workspaces.deliver(destination, delivery_ref="native-human-answer",
-            files=(("human.txt", b"measurement requires a 15 minute settling time"),))
-        runtime.owners.human_collaboration.respond_to_human_request(opened["request_ref"],
-            decision="provided", facts={"material_delivered": True}, note="Material ready.",
-            idempotency_key="native-human-answer")
-        resumed = invoke(a, "native-job-a-after-human", "local-native-root")
+        denied = _call(runtime, _channel(runtime, a), "human_request.open",
+            **_open_arguments("native-human-material", "offline_action"))
+        assert denied["isError"]
+        assert denied["structuredContent"]["code"] == "capability_unavailable"
+        resumed = invoke(a, "native-job-a-resume", "local-native-root")
         assert resumed["cwd"] == str(locations[0].directory)
         assert resumed["previous"] is True
-        assert resumed["human"] == ["measurement requires a 15 minute settling time"]
-        assert _accepted(_call(runtime, _channel(runtime, a), "research_workspace.read",
-            workspace_ref=locations[0].workspace_ref, path=delivered["files"][0]["path"]))["text"] == resumed["human"][0]
+        assert resumed["human"] == []
+        assert invoke(a, "native-job-a-resume", "local-native-root") == resumed
+        # A replay retains its operation identity and does not execute again;
+        # the other root's file has only its own initial invocation so far.
+        assert (locations[0].directory / "native-marker.txt").read_text().splitlines() == [str(locations[0].directory)] * 2
+        assert (locations[1].directory / "native-marker.txt").read_text().splitlines() == [str(locations[1].directory)]
+        other_resumed = invoke(b, "native-job-b-resume", "local-native-root")
+        assert other_resumed["cwd"] == str(locations[1].directory)
+        assert other_resumed["previous"] is True
+        for context, location in zip((a, b), locations):
+            read = _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read",
+                workspace_ref=location.workspace_ref, path="native-marker.txt"))
+            assert read["text"] == (str(location.directory) + "\n") * 2
+            assert read["work_ref"] == context.run_ref
+            assert read["root_session_ref"] == context.root_session_ref
+        foreign = _call(runtime, _channel(runtime, b), "research_workspace.read",
+            workspace_ref=locations[0].workspace_ref, path="native-marker.txt")
+        assert foreign["structuredContent"]["code"] == "workspace_not_visible"
         assert Path.cwd() == original_cwd
-        assert not (locations[1].directory / "inbox").exists()
+        assert not (adapter.research_workspace_root / "native-marker.txt").exists()
     finally:
         runtime.close()
 

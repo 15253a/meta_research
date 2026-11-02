@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from meta_research.deepfetch_sources import source_action
@@ -40,7 +42,9 @@ class SourceAttemptProvider(DeterministicManualDeepFetchProvider):
         with pytest.raises(SemanticMcpError, match="^deepfetch_source_action_provided_only$"):
             source_action(self.runtime.owners.agent_runtime, self.runtime.search_sources,
                 context, {"source_id": "forbidden-source", "operation": "api_search", "query": "evidence"})
-        return super().execute(request)
+        result = super().execute(request)
+        return replace(result, web_evidence={**result.web_evidence,
+            "search_event_count": 0, "fetch_event_count": 0})
 
 
 def _provided_creation(runtime, tmp_path, kind):

@@ -24,6 +24,7 @@ class RecordingCompanion(CodexCompanionAdapter):
         super().__init__(*args, **kwargs)
         self.requests = []
         self.proposal_requests = []
+        self.synthesis_requests = []
 
     def reply(self, request):
         self.requests.append(request)
@@ -32,6 +33,10 @@ class RecordingCompanion(CodexCompanionAdapter):
     def draft(self, request):
         self.proposal_requests.append(request)
         return super().draft(request)
+
+    def synthesize_first_question(self, request):
+        self.synthesis_requests.append(request)
+        return super().synthesize_first_question(request)
 
 
 def test_real_manual_creation_dispatch_preserves_its_actual_work_across_restart(tmp_path):
@@ -42,6 +47,7 @@ def test_real_manual_creation_dispatch_preserves_its_actual_work_across_restart(
     runtime = build_production_runtime(data_root,
         proposal_drafter=DeterministicDraftingAdapter(), intent_drafting_provider=adapter,
         host_compute_probe=DeterministicProbe())
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     try:
         quest_ref, parent_ref = _accept_root_question(runtime, "native-manual")
         human = runtime.owners.human_collaboration
@@ -84,6 +90,7 @@ def test_real_manual_creation_dispatch_preserves_its_actual_work_across_restart(
         runtime = build_production_runtime(data_root,
             proposal_drafter=DeterministicDraftingAdapter(), intent_drafting_provider=adapter,
             host_compute_probe=DeterministicProbe())
+        runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
         human = runtime.owners.human_collaboration
         restarted = human.query_manual_question_creation(context_ref)
         assert restarted["drafting_session"]["ref"] == root_ref
@@ -125,6 +132,7 @@ def test_manual_creation_rejects_foreign_execution_and_preserves_closed_original
     runtime = build_production_runtime(prepare_data_root(tmp_path / "runtime"),
         proposal_drafter=DeterministicDraftingAdapter(), intent_drafting_provider=adapter,
         host_compute_probe=DeterministicProbe())
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     try:
         quest_ref, parent_ref = _accept_root_question(runtime, "manual-boundary")
         human = runtime.owners.human_collaboration
@@ -180,17 +188,18 @@ def test_real_proposal_dispatch_keeps_quest_initialization_work_distinct(tmp_pat
     executable = _native_executable(tmp_path / "local-codex")
     executable.write_text(executable.read_text().replace(
         "if '--output-last-message' in sys.argv:\n",
-        "if 'BEGIN_PROPOSAL_DRAFTER_MESSAGE' in prompt:\n"
-        "    value = {'proposal_fork_native_session_ref': 'local-proposal-child', 'content': "
-        + repr(QUESTION) + "}\n"
+        "if 'BEGIN_FIRST_QUESTION_TASK' in prompt:\n"
+        "    value = {'proposal_fork_native_session_ref': 'local-proposal-child', 'result': {'content': "
+        + repr(QUESTION) + ", 'revision': None}}\n"
         "if '--output-last-message' in sys.argv:\n"))
     adapter = RecordingCompanion(tmp_path / "companion-provider", executable=str(executable))
     runtime = build_production_runtime(prepare_data_root(tmp_path / "runtime"),
         proposal_drafter=adapter, intent_drafting_provider=adapter,
         host_compute_probe=DeterministicProbe())
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     try:
         quest_ref, _parent_ref = _accept_root_question(runtime, "native-proposal")
-        proposal_request, = adapter.proposal_requests
+        proposal_request, = adapter.synthesis_requests
         creation = runtime.owners.human_collaboration.query_quest_creation(proposal_request.initialization_id)
         assert creation["quest_ref"] == quest_ref
         binding = runtime.root_workspaces.bind_initialization(creation["initialization_id"],

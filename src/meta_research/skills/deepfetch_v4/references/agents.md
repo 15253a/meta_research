@@ -6,7 +6,7 @@
 
 ## 预检与 Acquisition
 
-Quest 级 Acquisition Root 负责当前访问模式、合法路线、浏览器状态和私有存储。沿宿主固定的有效配置预检：`oa_only` 无需机构浏览器，`provided_only` 仅核实已提供材料，`oa_then_institution` 核实所需机构路线。未配置机构且访问可选时，宿主使用 `oa_only`；明确要求机构访问时保留求助。每次请求使用该 Session 固定模式，不继承上回合的临时判断。
+本次获授权范围绑定的共用 Acquisition Root 负责当前访问模式、合法路线、浏览器状态和私有存储；创建请求与已有 Quest 请求保留各自真实归属。沿宿主固定的有效配置预检：`oa_only` 无需机构浏览器，`provided_only` 仅核实已提供材料，`oa_then_institution` 核实所需机构路线。未配置机构且访问可选时，宿主使用 `oa_only`；明确要求机构访问时保留求助。本请求以宿主确认的 `request.literature_access_mode` 为准，不继承上回合的临时判断，也不以请求偏好覆盖已确认的有效模式。
 
 通过共用 `agent_runtime.acquisition.request` effect 提交 1–10 个目标的有界批次；请求结果不明时以同一 `effect_id` 对账，再判断是否重试。当前适配器的 `action=acquire` 请求体形状为：
 
@@ -25,9 +25,13 @@ Quest 级 Acquisition Root 负责当前访问模式、合法路线、浏览器�
 
 已知 DOI、arXiv ID 或 URL 时一并传入。获取服务逐目标返回 typed 结果：`obtained` 带已核实路径、格式与内容证明；`waiting_user`／`missing` 说明状态和原因。Reader 只能接收同一 `paper_id` 的核实正文。provider 等待只是获取结果，具体人类义务需显式提出 HumanRequest。
 
+`provided_only` 中的书目或版本冲突也只在获授提供集合内核实，不以核实身份为由联网。稳定论文身份未核实时保留工作笔记；身份已核实但明确版本未知时沿台账合同记 `unverified`，不自动合并。无法由提供材料解决的冲突保留具体限制，必要时按实际需要提出 HumanRequest，不自行扩大访问模式。
+
+同根接收批次返回时保留准确 effect／request 身份、逐目标状态与原因、实际 artifact path 和证明，以及本次变化。沿宿主提供的核实正文登记与阅读，不以同名文件或同一 paper_id 自造替代正文。结果未知先对账原 effect，查明已发生的事实后决定继续等待、使用结果或重试；当前授权仍按当前事实判断。正式人工回应按原 HumanRequest 读取 resolution，再判断是否足够，原根继续未完成部分。
+
 未决获取项不超过当前精读目标的空余容量。截止前、首次 Reader 分配前的 `missing` 或明确放弃可释放预留并替补；截止后不晋升候补。`waiting_user` 保留预留直至解决或放弃。登录过期时及时返回受影响论文，同时推进独立的 OpenAlex、OA 与阅读；给出重新登录后重试、用户提供正文或放弃该文的选项。没有其他检索活动的纯等待不计时。
 
-外部 MCP 的发现或调用失败按本回合外部 MCP 上下文中的[故障协作与恢复](../../external-mcp-recovery.md)核对所属服务与受影响工作。所需外部服务的修复或替代由人正式文本答复选择，发起请求的原根读取答复并核验可行性；其余获授权的检索、获取和 Reader 工作继续。机构登录仍沿既有 `library_reconnect` 路线处理。
+外部 MCP 的发现或调用失败按本回合外部 MCP 上下文中的[故障协作与恢复](../../external-mcp-recovery.md)核对所属服务与受影响工作。所需外部服务的修复或替代由人正式文本答复选择，发起请求的原根恢复后读取答复并核验可行性；未受阻且获授权的检索、获取和 Reader 工作继续。机构登录仍沿既有 `library_reconnect` 路线处理。
 
 ## Reader
 
@@ -40,6 +44,8 @@ readers_to_start = min(queued jobs, max(0, 10 - active Readers), runtime slots c
 10 是上限，不是必须达到的峰值；空闲 Acquisition Root 不预留 Reader 槽位。宿主容量不足时按波次处理已接纳论文或其重试，不新增第 11 篇。
 
 Reader 输入必须包括研究任务、论文记录、单篇全文绝对路径与 SHA-256、`papers-json.md` 的绝对路径、单次 assignment ID 和 patch 模板。先打开任务，完整读取 `reading_contract_path` 的阅读部分，再读取指定正文。依据全文填写理解、方法、实验设置、主张、材料、局限和可信度；不另行检索、下载、读其他论文、修元数据或写总报告。
+
+研究任务保留理解该文所需的目标、关键条件与限制，标明本次阅读为何重要。具体上下文由主根按任务组织，不预定所有 Reader 的统一 fork 模式；无论如何创建子会话，都必须获得本 assignment 的准确材料和合同。主根综合中对 Reader 意见的核查与修订不改变单篇全文阅读责任。
 
 通过 `scripts/papers.py apply-reader` 提交自身 patch，仅向主智能体返回 `paper_id`、assignment ID、终态和简短错误。正文未读到的内容保持未知。
 

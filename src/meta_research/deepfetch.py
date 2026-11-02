@@ -14,7 +14,6 @@ import secrets
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,7 +22,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from meta_research.acquisition import DEEPFETCH_PROTOTYPE_COMMIT
 from meta_research.system_prompt import read_output_language
@@ -61,6 +60,7 @@ from meta_research.quest_drafting import (
     _text_exceeds_limit,
 )
 from meta_research.root_capabilities import (
+    provided_only_cli_arguments,
     CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS,
     RootCapabilityEntryPath,
     codex_feature_diagnostics,
@@ -80,6 +80,7 @@ from meta_research.root_resident_mcp import (
     semantic_mcp_environment,
 )
 from meta_research.semantic_mcp import ROOT_AGENT_ACQUISITION_OPERATION_IDS
+from meta_research.owners.common import OwnerConflict
 
 if TYPE_CHECKING:
     from meta_research.owners.common import AcceptanceReceipt
@@ -459,6 +460,8 @@ class DeepFetchProviderRequest:
     creation_context_ref: str | None = None
     quest_ref: str | None = None
     literature_access_mode: str | None = None
+    # Exact predecessor authorized by the Owner for this same logical Run.
+    previous_job_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -486,6 +489,8 @@ class _DeepFetchProtocolCheckpoint:
     pending_acquisition: dict[str, object] | None
     next_prompt: str | None
     final_envelope: dict[str, object] | None
+    turn_sources: tuple[dict[str, str], ...] = ()
+    public_root_job_ref: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -500,6 +505,8 @@ class _DeepFetchProtocolCheckpoint:
             "pending_acquisition": self.pending_acquisition,
             "next_prompt": self.next_prompt,
             "final_envelope": self.final_envelope,
+            "turn_sources": list(self.turn_sources),
+            "public_root_job_ref": self.public_root_job_ref,
         }
 
 
@@ -544,6 +551,13 @@ def validate_runtime_binding(binding: DeepFetchRuntimeBinding) -> str:
     ):
         raise DeepFetchUnavailable("deepfetch_runtime_capability_unavailable")
     return canonical_hash(binding.as_dict())
+
+
+def _effective_access_mode(request: DeepFetchProviderRequest) -> str:
+    mode = request.literature_access_mode
+    if mode not in {"oa_only", "oa_then_institution", "provided_only"}:
+        raise DeepFetchUnavailable("deepfetch_literature_access_mode_missing")
+    return mode
 
 
 def validate_deepfetch_result(
@@ -626,7 +640,8 @@ def validate_deepfetch_result(
     if result.completion == "limited" and not papers:
         raise DeepFetchUnavailable("deepfetch_limited_result_empty")
 
-    web_evidence = _validated_web_evidence(result.web_evidence)
+    web_evidence = _validated_web_evidence(result.web_evidence,
+        provided_only=request.literature_access_mode == "provided_only")
     production_adapter = (
         request.runtime_binding.provider_ref
         == "meta_research.deepfetch.CodexDeepFetchAdapter"
@@ -704,14 +719,17 @@ class CodexDeepFetchAdapter:
         self._root_resident_mcp = RootResidentMcpChannels("deepfetch")
         self._external_mcp: ExternalMcpRuntime | None = None
         self._search_sources: SearchSourceRegistry | None = None
+        self._accepted_materials = None
+
+    def bind_accepted_materials(self, materials) -> None:
+        self._accepted_materials = materials
 
     def bind_search_sources(self, registry: SearchSourceRegistry) -> None:
         self._search_sources = registry
 
     def _source_manifest(self, request: DeepFetchProviderRequest, *, recovery: bool = False) -> dict | None:
         raw_basis = request.scope.get("search_source_basis")
-        if (raw_basis is None or request.literature_access_mode == "provided_only"
-                or request.scope.get("literature_mode") == "provided_only"):
+        if (raw_basis is None or request.literature_access_mode == "provided_only"):
             return None
         if self._search_sources is None:
             raise DeepFetchUnavailable("deepfetch_search_source_runtime_missing")
@@ -1253,8 +1271,8 @@ class CodexDeepFetchAdapter:
         return tuple(dict.fromkeys(job_refs))
 
     @staticmethod
-    def _remove_owned_execution_tree(path: Path, *, parent: Path) -> None:
-        """Delete one exact provider-owned child without following symlinks."""
+    def _validate_owned_execution_tree(path: Path, *, parent: Path) -> None:
+        """Validate an exact predecessor without deleting retained evidence."""
 
         if path.parent != parent:
             raise DeepFetchUnavailable("deepfetch_provider_retry_cleanup_invalid")
@@ -1270,7 +1288,6 @@ class CodexDeepFetchAdapter:
                 != parent.resolve(strict=True)
             ):
                 raise OSError("unsafe provider retry cleanup target")
-            shutil.rmtree(path)
         except OSError as error:
             raise DeepFetchUnavailable(
                 "deepfetch_provider_retry_cleanup_invalid"
@@ -1284,7 +1301,11 @@ class CodexDeepFetchAdapter:
         previous_run_ref: str,
         previous_runtime_binding: DeepFetchRuntimeBinding,
     ) -> None:
-        """Remove one verified-terminal predecessor's exact physical state."""
+        """Validate the predecessor; new operation identity isolates its retry.
+
+        Acquired bytes, Reader state and signed receipts remain available for
+        exact recovery. Their eventual retention belongs to the lifecycle Owner.
+        """
 
         expected_prefix = f"{previous_run_ref}:deepfetch:"
         generation = previous_job_ref.removeprefix(expected_prefix)
@@ -1349,16 +1370,16 @@ class CodexDeepFetchAdapter:
         )
 
         for protocol_root in existing_protocol_roots:
-            self._remove_owned_execution_tree(
+            self._validate_owned_execution_tree(
                 protocol_root,
                 parent=run_parent,
             )
         for operation_root in operation_roots:
-            self._remove_owned_execution_tree(
+            self._validate_owned_execution_tree(
                 operation_root,
                 parent=self._workspace / "provider-operations",
             )
-        self._remove_owned_execution_tree(
+        self._validate_owned_execution_tree(
             operation_workspace,
             parent=self._agent_workspace_root,
         )
@@ -1406,6 +1427,7 @@ class CodexDeepFetchAdapter:
         )
 
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        _effective_access_mode(request)
         runtime_binding_hash = canonical_hash(request.runtime_binding.as_dict())
         logical_run_key = self._logical_run_key(request)
         root_job_ref = request.job_ref or f"{request.run_ref}:direct"
@@ -1437,6 +1459,21 @@ class CodexDeepFetchAdapter:
             runtime_binding_hash,
         )
         public_root = run_root / "public"
+        previous = None
+        previous_job = request.previous_job_ref
+        if previous_job is not None:
+            if not isinstance(previous_job, str) or not previous_job or previous_job == root_job_ref:
+                raise DeepFetchUnavailable("deepfetch_human_request_resume_invalid")
+            previous_root = self._protocol_run_root(self._provider_execution_key(previous_job), runtime_binding_hash)
+            previous_path = previous_root / "private" / "protocol.json"
+            previous = (_read_protocol_checkpoint(previous_path, _deepfetch_protocol_identity(request))
+                        if previous_path.exists() or previous_path.is_symlink() else None)
+            if previous is not None and (previous.phase == "finalized" or request.native_session_ref is not None
+                and previous.native_session_ref not in {None, request.native_session_ref}):
+                raise DeepFetchUnavailable("deepfetch_human_request_resume_invalid")
+            if previous is not None:
+                original_job = previous.public_root_job_ref or previous_job
+                public_root = self._protocol_run_root(self._provider_execution_key(original_job), runtime_binding_hash) / "public"
         private_root = run_root / "private"
         public_root.mkdir(parents=True, exist_ok=True)
         private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1450,13 +1487,25 @@ class CodexDeepFetchAdapter:
                     private_root=private_root,
                 )
                 if request.human_request_resume is not None
-                else self._web_evidence_gate_prompt(request)
+                else (self._initial_prompt(request, public_root=public_root, private_root=private_root)
+                      if request.literature_access_mode == "provided_only" or previous is not None
+                         and any(source["kind"] == "gate" for source in previous.turn_sources)
+                      else self._web_evidence_gate_prompt(request))
             )
+            if previous is not None:
+                initial_prompt += (
+                    f"\nprevious_private_work_root={previous_root / 'private'}\n"
+                    f"existing_papers_path={public_root / 'papers.json'}\n"
+                    "先沿上述准确路径对账已有全文、Reader assignment/patch、检索维度和截止状态；"
+                    "保留有效文件与已完成阅读，不重新初始化 ledger，不重复获取或占用 Reader 名额。\n"
+                )
             checkpoint = _load_or_create_protocol_checkpoint(
                 checkpoint_path,
                 identity_hash=identity_hash,
                 native_session_ref=request.native_session_ref,
                 initial_prompt=initial_prompt,
+                previous=previous,
+                public_root_job_ref=(previous.public_root_job_ref or previous_job) if previous is not None else root_job_ref,
             )
             return self._execute_protocol(
                 request,
@@ -1533,6 +1582,9 @@ class CodexDeepFetchAdapter:
             public_root = run_root / "public"
             private_root = run_root / "private"
             checkpoint_path = private_root / "protocol.json"
+            checkpoint = _read_protocol_checkpoint(checkpoint_path, _deepfetch_protocol_identity(request))
+            if checkpoint.public_root_job_ref is not None:
+                public_root = self._protocol_run_root(self._provider_execution_key(checkpoint.public_root_job_ref), runtime_binding_hash) / "public"
             if (
                 run_root.is_symlink()
                 or public_root.is_symlink()
@@ -1650,27 +1702,32 @@ class CodexDeepFetchAdapter:
         acquisition_effects: list[tuple[str, dict[str, object]]] = []
         observed_evidence: list[dict[str, object]] = []
         previous_native_session_ref: str | None = None
+        previous_operation_ref: str | None = None
         enforce_previous_native = False
         for turn_number in range(checkpoint.next_turn_number):
+            source = checkpoint.turn_sources[turn_number]
+            operation_ref = source["job_ref"].rsplit(":v4-turn:", 1)[0]
+            if operation_ref != previous_operation_ref:
+                # A host-authorized successor operation can start a new native
+                # session. Continuity remains mandatory within each operation.
+                enforce_previous_native = False
             raw, native_session_ref, evidence, native_effects = self._read_existing_turn(
                 request,
                 public_root=public_root,
-                provider_job_ref=f"{request.job_ref}:v4-turn:{turn_number}",
+                provider_job_ref=checkpoint.turn_sources[turn_number]["job_ref"],
                 runtime_binding_hash=runtime_binding_hash,
                 expected_native_session_ref=previous_native_session_ref,
                 enforce_native_session_ref=enforce_previous_native,
-                expected_web_gate=(
-                    "web-evidence-gate:v1"
-                    in request.runtime_binding.capability_bindings
-                    and turn_number == 0
-                ),
+                expected_web_gate=checkpoint.turn_sources[turn_number]["kind"] == "gate",
+                resident_phase=source["phase"],
             )
             observed_evidence.append(evidence)
             acquisition_effects.extend(
-                (_resident_mcp_phase(request, f"turn-{turn_number}"), effect)
+                (checkpoint.turn_sources[turn_number]["phase"], effect)
                 for effect in native_effects
             )
             previous_native_session_ref = native_session_ref
+            previous_operation_ref = operation_ref
             enforce_previous_native = True
             if raw.get("status") == "web_evidence_ready":
                 if turn_number != 0:
@@ -1737,18 +1794,12 @@ class CodexDeepFetchAdapter:
             final_raw, final_native, _final_evidence, _native_effects = self._read_existing_turn(
                 request,
                 public_root=public_root,
-                provider_job_ref=(
-                    f"{request.job_ref}:v4-turn:"
-                    f"{checkpoint.next_turn_number - 1}"
-                ),
+                provider_job_ref=checkpoint.turn_sources[-1]["job_ref"],
                 runtime_binding_hash=runtime_binding_hash,
                 expected_native_session_ref=None,
                 enforce_native_session_ref=False,
-                expected_web_gate=(
-                    "web-evidence-gate:v1"
-                    in request.runtime_binding.capability_bindings
-                    and checkpoint.next_turn_number - 1 == 0
-                ),
+                expected_web_gate=checkpoint.turn_sources[-1]["kind"] == "gate",
+                resident_phase=checkpoint.turn_sources[-1]["phase"],
             )
             if (
                 final_raw != _with_host_finalized_at(
@@ -1807,13 +1858,10 @@ class CodexDeepFetchAdapter:
             ),
             runtime_binding_hash=runtime_binding_hash,
             expected_native_session_ref=previous_native_session_ref,
-            enforce_native_session_ref=enforce_previous_native,
+            enforce_native_session_ref=enforce_previous_native and previous_operation_ref == request.job_ref,
             allow_missing_operation=True,
-            expected_web_gate=(
-                "web-evidence-gate:v1"
-                in request.runtime_binding.capability_bindings
-                and checkpoint.next_turn_number == 0
-            ),
+            expected_web_gate=bool(checkpoint.next_prompt and checkpoint.next_prompt.startswith("web_evidence_gate=v1\n")),
+            resident_phase=_resident_mcp_phase(request, f"turn-{checkpoint.next_turn_number}"),
         )
         if raw.get("status") == "web_evidence_ready":
             _validate_web_evidence_gate_result(raw)
@@ -1849,6 +1897,8 @@ class CodexDeepFetchAdapter:
             native_session_ref=native_session_ref,
             next_turn_number=checkpoint.next_turn_number + 1,
             evidence_parts=(*checkpoint.evidence_parts, evidence),
+            turn_sources=(*checkpoint.turn_sources, {"job_ref": f"{request.job_ref}:v4-turn:{checkpoint.next_turn_number}",
+                "phase": _resident_mcp_phase(request, f"turn-{checkpoint.next_turn_number}"), "kind": "work"}),
             next_prompt=None,
             final_envelope=raw,
         )
@@ -1863,6 +1913,7 @@ class CodexDeepFetchAdapter:
         expected_native_session_ref: str | None,
         enforce_native_session_ref: bool,
         expected_web_gate: bool,
+        resident_phase: str,
         allow_missing_operation: bool = False,
     ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
         """Verify one old durable turn without publishing any new files."""
@@ -1976,6 +2027,7 @@ class CodexDeepFetchAdapter:
                     expected_invocation_keys |= {"mcp_url", "mcp_scope_binding_hash"}
                     self._verify_existing_mcp_invocation(
                         request, invocation, provider_job_ref=provider_job_ref,
+                        phase=resident_phase,
                     )
                 capability_profile = root_capability_profile("deepfetch")
                 if enforce_native and invocation_native != native_session_ref:
@@ -2027,6 +2079,7 @@ class CodexDeepFetchAdapter:
                         str | None, invocation_native
                     ),
                     runtime_binding=request.runtime_binding,
+                    literature_access_mode=request.literature_access_mode,
                     transport_key=transport_key,
                 )
                 if not (directory / "supervisor-exit.json").is_file():
@@ -2077,13 +2130,14 @@ class CodexDeepFetchAdapter:
                         raise ValueError("deepfetch reconciliation result invalid")
                     try:
                         evidence = _verified_turn_evidence("\n".join(traces))
+                        native_effects = _native_acquisition_effects("\n".join(traces))
                     except DeepFetchUnavailable as error:
                         raise error.as_verified_terminal(
                             observed_native
                         ) from error
                     return (
                         outcome[1], observed_native, evidence,
-                        _native_acquisition_effects("\n".join(traces)),
+                        native_effects,
                     )
                 if not isinstance(observed_native, str) or not observed_native:
                     raise DeepFetchUnavailable(
@@ -2119,6 +2173,7 @@ class CodexDeepFetchAdapter:
         invocation_hash: str,
         invocation_native_session_ref: str | None,
         runtime_binding: DeepFetchRuntimeBinding,
+        literature_access_mode: str | None,
         transport_key: bytes,
     ) -> None:
         request_path = directory / "supervisor-request.json"
@@ -2189,6 +2244,11 @@ class CodexDeepFetchAdapter:
             in runtime_binding.capability_bindings
             else "workspace-write"
         )
+        if literature_access_mode == "provided_only":
+            expected_sandbox = "workspace-write"
+            if not {"--ignore-user-config", "--ignore-rules", 'web_search="disabled"',
+                    "sandbox_workspace_write.network_access=false"}.issubset(arguments):
+                raise ValueError("deepfetch provided-only execution boundary missing")
         if (
             "agent-workspace-policy:provider-operation-scoped-v2"
             in runtime_binding.capability_bindings
@@ -2233,11 +2293,9 @@ class CodexDeepFetchAdapter:
         invocation: dict[str, object],
         *,
         provider_job_ref: str,
+        phase: str,
     ) -> None:
         """Bind signed historical MCP metadata to this run's resident catalog."""
-        phase = _resident_mcp_phase(
-            request, "turn-" + provider_job_ref.rsplit(":v4-turn:", 1)[-1]
-        )
         try:
             channel_key, access = self._root_resident_mcp.acquire(
                 run_ref=request.run_ref, attempt_ref=request.attempt_ref,
@@ -2316,15 +2374,20 @@ class CodexDeepFetchAdapter:
                         native_session_ref=checkpoint.native_session_ref,
                     ) from error
                 checkpoint = _append_acquisition_proofs(checkpoint, item_proofs)
+                acquisition_prompt = self._acquisition_result_prompt(
+                    public_root, execution, item_proofs,
+                    literature_access_mode=_effective_access_mode(request),
+                    scientific_context=self._context_reference(request),
+                )
+                if checkpoint.native_session_ref is None:
+                    acquisition_prompt = self._initial_prompt(
+                        request, public_root=public_root, private_root=checkpoint_path.parent,
+                    ) + "\n" + acquisition_prompt
                 checkpoint = replace(
                     checkpoint,
                     phase="ready_for_turn",
                     pending_acquisition=None,
-                    next_prompt=self._acquisition_result_prompt(
-                        public_root,
-                        execution,
-                        item_proofs,
-                    ),
+                    next_prompt=acquisition_prompt,
                 )
                 _write_protocol_checkpoint(checkpoint_path, checkpoint)
                 continue
@@ -2376,6 +2439,8 @@ class CodexDeepFetchAdapter:
             elif checkpoint.native_session_ref != native_session_ref:
                 raise DeepFetchUnavailable("deepfetch_native_session_changed")
             evidence_parts = (*checkpoint.evidence_parts, turn_evidence)
+            turn_sources = (*checkpoint.turn_sources, {"job_ref": provider_job_ref or f"{request.run_ref}:direct:v4-turn:{turn_number}",
+                "phase": _resident_mcp_phase(request, f"turn-{turn_number}"), "kind": "gate" if web_gate else "work"})
             checkpoint = self._collect_native_acquisition_proofs(
                 request, checkpoint, native_effects,
                 phase=f"turn-{turn_number}",
@@ -2390,10 +2455,12 @@ class CodexDeepFetchAdapter:
                     native_session_ref=native_session_ref,
                     next_turn_number=turn_number + 1,
                     evidence_parts=evidence_parts,
+                    turn_sources=turn_sources,
                     next_prompt=self._initial_prompt(
                         request,
                         public_root=public_root,
                         private_root=checkpoint_path.parent,
+                        include_scope=False,
                     ),
                 )
                 _write_protocol_checkpoint(checkpoint_path, checkpoint)
@@ -2406,6 +2473,7 @@ class CodexDeepFetchAdapter:
                     native_session_ref=native_session_ref,
                     next_turn_number=turn_number + 1,
                     evidence_parts=evidence_parts,
+                    turn_sources=turn_sources,
                     next_prompt=None,
                     final_envelope=raw,
                 )
@@ -2419,6 +2487,7 @@ class CodexDeepFetchAdapter:
                 native_session_ref=native_session_ref,
                 next_turn_number=turn_number + 1,
                 evidence_parts=evidence_parts,
+                turn_sources=turn_sources,
                 pending_acquisition=effect,
                 next_prompt=None,
             )
@@ -2427,7 +2496,8 @@ class CodexDeepFetchAdapter:
 
         assert checkpoint.final_envelope is not None
         assert checkpoint.native_session_ref is not None
-        web_evidence = _merge_web_evidence(list(checkpoint.evidence_parts))
+        web_evidence = _merge_web_evidence(list(checkpoint.evidence_parts),
+            provided_only=request.literature_access_mode == "provided_only")
         authoritative_acquisition_proofs = (
             self._query_authoritative_acquisition_proofs(
                 request,
@@ -2443,7 +2513,8 @@ class CodexDeepFetchAdapter:
                 "deepfetch_hosted_acquisition_proof_mismatch"
             )
         _precheck_public_artifact_resource_limits(public_root)
-        _run_exact_papers_validator(self._skill_root, public_root)
+        _run_exact_papers_validator(self._skill_root, public_root,
+            literature_access_mode=_effective_access_mode(request))
         imported = _import_v4_public_artifacts(
             public_root,
             checkpoint.final_envelope,
@@ -2451,6 +2522,7 @@ class CodexDeepFetchAdapter:
             acquisition_item_proofs=authoritative_acquisition_proofs,
             search_sources=self._search_sources,
             source_manifest=self._source_manifest(request),
+            literature_access_mode=_effective_access_mode(request),
         )
         web_evidence = {**web_evidence, "prototype": imported[6]}
         result = DeepFetchResult(
@@ -2592,61 +2664,107 @@ class CodexDeepFetchAdapter:
         except RootResidentMcpError as error:
             raise DeepFetchUnavailable(error.code) from error
 
+    def _provided_materials(self, request: DeepFetchProviderRequest) -> list[dict]:
+        if request.creation_context_kind != "quest_initialization" or not request.accepted_material_bindings:
+            return []
+        if self._accepted_materials is None:
+            raise DeepFetchUnavailable("deepfetch_material_runtime_missing")
+        try:
+            return self._accepted_materials.prepare(request, self._agent_workspace_for(
+                request.job_ref, canonical_hash(request.runtime_binding.as_dict())))
+        except OwnerConflict as error:
+            raise DeepFetchUnavailable(error.code) from error
+
+    def _context_reference(self, request: DeepFetchProviderRequest, *, materials=None) -> str:
+        if materials is None:
+            materials = self._provided_materials(request)
+        # Preserve an earlier context file on same-session upgrades. The new
+        # exact input view adds verified native paths without changing HC facts.
+        suffix = ("-materials-" + self._provider_execution_key(request.job_ref) + ".json"
+                  if materials else ".json")
+        path = self._workspace / "research-inputs" / (_deepfetch_protocol_identity(request) + suffix)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        value = canonical_json({"request_ref": request.request_ref, "scope": request.scope,
+            "accepted_material_bindings": list(request.accepted_material_bindings),
+            "creation_context_kind": request.creation_context_kind,
+            "creation_context_ref": request.creation_context_ref, "quest_ref": request.quest_ref,
+            "literature_access_mode": _effective_access_mode(request),
+            **({"provided_materials": materials} if materials else {})})
+        _ensure_durable_text(path, value)
+        return (f"exact_scientific_input_path={path}\n"
+            f"exact_scientific_input_sha256={hashlib.sha256(value.encode('utf-8')).hexdigest()}\n"
+            "压缩或缺材时从此准确文件恢复完整原文；路径缺失时报告缺失，不以 latest/摘要重造。\n")
+
+    def _scientific_input(self, request: DeepFetchProviderRequest) -> str:
+        mode = _effective_access_mode(request)
+        materials = self._provided_materials(request)
+        basis = ""
+        if request.scope.get("creation_basis") is not None:
+            basis = (
+                "Before the first query or provided-material selection, read references/creation-basis.md "
+                "and scope.creation_basis with its exact basis_ref and expected_basis_hash via "
+                "research_memory.creation_basis.read. Follow next_offset to the end; read the necessary "
+                "source originals. Read view=literature only for an explicitly retained prior snapshot; "
+                "retain its original identity and do not count it as this request's new acquisition or reading.\n"
+            )
+        return (
+            f"request_ref={request.request_ref}\n"
+            f"creation_context_kind={request.creation_context_kind}\n"
+            f"creation_context_ref={request.creation_context_ref}\n"
+            f"quest_ref={request.quest_ref}\n"
+            f"draft_revision={request.draft_revision}\n"
+            f"draft_hash={request.draft_hash}\n"
+            f"literature_access_mode={mode}\n"
+            "The host-confirmed literature_access_mode governs this request; scope.literature_mode "
+            "is the preference, not authority. Quest identity, creation basis and Cycle identity are independent.\n"
+            f"scope={canonical_json(request.scope)}\n"
+            f"accepted_material_bindings={canonical_json(list(request.accepted_material_bindings))}\n"
+            + (f"provided_materials={canonical_json(materials)}\n"
+               "Each path is a verified native copy of this request's exact accepted version. "
+               "Use its supplied version/version reader when needed; do not reconstruct binary files from tool pages. "
+               "For Acquisition, pass only the selected paper's exact clues and its local path as a file:// source URL. "
+               "Keep the accepted binding and its material receipt in exact_scientific_input_path, with input copies unchanged. "
+               "Apply references/papers-json.md to discovery_origins; provided_only uses an empty array.\n" if materials else "")
+            + basis + self._context_reference(request, materials=materials)
+        )
+
     def _initial_prompt(
         self,
         request: DeepFetchProviderRequest,
         *,
         public_root: Path,
         private_root: Path,
+        include_scope: bool = True,
     ) -> str:
-        skill_entrypoint = self._skill_root / "SKILL.md"
-        route_contract = ""
-        creation_contract = ""
-        if request.scope.get("creation_basis") is not None:
-            creation_contract = (
-                "Before Radar read scope.creation_basis through research_memory.creation_basis.read with its exact basis_ref and expected_basis_hash. "
-                "Read relevant originals and use claim conditions, conflicts, gaps, and unfinished questions to guide search, acquisition, and independent Readers. "
-                "Inspect existing_work_applicability and inherited_literature. Reuse only their explicit applicable scope and keep unresolved limits. "
-                "Read a prior accepted snapshot through the same basis Reader with view=literature and its snapshot_ref. "
-                "Focus this requested new search on affected questions; preserve the v4 workflow and bind only this run's actual output as the new snapshot. "
-                "This initialization has no Quest. Keep imported results external. New evidence may qualify or contradict the old understanding.\n"
-            )
-        if request.scope.get("literature_mode") == "oa_only":
-            route_contract = (
-                "本请求的 oa_only 是用户明确选择的主路线；跳过 "
-                "institution/browser preflight，不得探测或评价机构访问可用性，"
-                "如实说明所选 OA 路线的覆盖范围与限制，"
-                "不得虚构机构访问失败或由此被迫降级到 OA。\n"
-            )
+        mode = _effective_access_mode(request)
+        scientific_input = (self._scientific_input(request) if include_scope else
+            f"request_ref={request.request_ref}\nliterature_access_mode={mode}\n"
+            "Continue the same native root using the complete scientific scope and exact creation basis "
+            "already supplied at Gate. Gate success proves route availability only.\n"
+            + self._context_reference(request))
+        route = ""
+        if mode == "oa_only":
+            route = ("本请求的 oa_only 是用户明确选择的主路线；跳过 institution/browser preflight，"
+                     "不得探测或评价机构访问可用性，不因无机构登录等待；如实说明 OA 覆盖限制，"
+                     "不得虚构机构访问失败或由此被迫降级到 OA。\n")
+        elif mode == "provided_only":
+            route = ("仅核实和阅读 accepted_material_bindings 内提供的材料；不进行外部发现或 Web Gate，"
+                     "不调用 OpenAlex、Web 或补充来源，不伪造 Web 成功、发现维度或主动检索耗时。\n")
         return (
-            "你是绑定 fixed commit "
-            f"{DEEPFETCH_PROTOTYPE_COMMIT} 的 DeepFetch v4 main agent。"
-            f"开始前必须完整读取 {skill_entrypoint}，以及它直接链接的所有 reference；"
-            "把该固定 bundle 作为行为规范，不得改写它。必须执行 Radar、Ledger、"
-            "Quest-scoped Acquisition、independent Readers、Synthesis 与 "
-            "scripts/papers.py finalize 闭环；不得把它扁平化成单体 Web Search/Fetch "
-            "回答。主 Agent 负责发现、选择、ledger 和 summary，Acquisition 只负责"
-            "合法获取；需要全文时返回只含 effect_id 和 1 至 10 个 targets 的 "
-            "action=acquire，"
-            "并且只把共同 Acquisition effect 返回为 obtained 的同一 paper_id "
-            "交给 Reader。每份已注册全文必须用原生 spawn_agent 启动一个独立 Reader，"
-            "并 wait 到终态。最终 workflow.reader_assignments 的 reader_agent_ref "
-            "填写 spawn_agent 返回的 task_name。"
-            "不得声称创建 Quest/Question/Cycle、接纳 Evidence 或签发 receipt；"
-            "不得把 Cookie、凭据、浏览器 profile、私有 manifest 或恢复状态写入"
-            "公开目录。最终公开目录必须且只能包含 papers.json、summary.md、fulltext/。\n"
+            "你是 DeepFetch v4 main agent。以下内联的是本次正式安装的完整 Skill；无需重复读取正文，"
+            "长参考按 Skill 指定时机从 deepfetch_skill_root 读取。\n"
+            f"{self._skill_root.joinpath('SKILL.md').read_text(encoding='utf-8')}\n"
             f"{_DEEPFETCH_COMPLETION_RULES}\n"
             f"deepfetch_skill_root={self._skill_root}\n"
             f"public_output_root={public_root}\n"
             f"private_work_root={private_root}\n"
-            f"request_ref={request.request_ref}\n"
-            f"draft_revision={request.draft_revision}\n"
-            f"draft_hash={request.draft_hash}\n"
-            f"scope={canonical_json(request.scope)}\n"
-            f"{route_contract}"
-            f"{creation_contract}"
-            "accepted_material_bindings="
-            f"{canonical_json(list(request.accepted_material_bindings))}"
+            f"phase=substantive\n{scientific_input}{route}"
+            "Acquisition 的公开请求只传 effect_id/targets；action=acquire 仅属于 Provider 输出信封。"
+            "Reader 的 assignment 由 papers.py prepare-readers 产生，输入含研究任务和条件、论文记录、"
+            "准确路径和 SHA-256、reading_contract_path 与 patch 模板。原生 spawn_agent 的 task_name "
+            "写入 workflow.reader_assignments.reader_agent_ref，等待真实终态。获取不等于全文理解。\n"
+            "最终调用 scripts/papers.py finalize --literature-access-mode " + mode + "；"
+            "公开目录只交付 papers.json、summary.md、fulltext/。不得把 Cookie、凭据、浏览器 profile 或私有恢复状态写入公开产物。"
         )
 
     def _human_request_resume_prompt(
@@ -2664,7 +2782,7 @@ class CodexDeepFetchAdapter:
         ):
             raise DeepFetchUnavailable("deepfetch_human_request_resume_invalid")
         return (
-            "human_request_resume=v1\n"
+            "human_request_resume=v1\nphase=human_response\n"
             "这是同一逻辑 DeepFetch Session 在人工回应后的恢复 Attempt。先调用 "
             "human_request.open.reconcile，使用下列 exact effect_id，"
             "读取 resolution 后再判断回应是否足够；不得把旧 open receipt 当作新"
@@ -2672,11 +2790,14 @@ class CodexDeepFetchAdapter:
             "HumanRequest。\n"
             f"human_request_effect_id={resume['effect_id']}\n"
             f"human_request_ref={resume['request_ref']}\n"
-            + self._initial_prompt(
-                request,
-                public_root=public_root,
-                private_root=private_root,
-            )
+            + (self._initial_prompt(request, public_root=public_root, private_root=private_root,
+                    include_scope=request.native_session_ref is None)
+               if (request.native_session_ref is None or
+                   resume.get("phase") == "turn-0" and request.literature_access_mode != "provided_only") else
+               f"request_ref={request.request_ref}\nliterature_access_mode={_effective_access_mode(request)}\n"
+               f"deepfetch_skill_root={self._skill_root}\npublic_output_root={public_root}\n"
+               "沿原已冻结科学输入继续；缺材时读取原准确来源，不取 latest 或从摘要重建。"
+               "先对账已有获取与 Reader，已完成工作不重做。" + self._context_reference(request))
         )
 
     def _web_evidence_gate_prompt(
@@ -2696,10 +2817,8 @@ class CodexDeepFetchAdapter:
             "使用 system_operation_help。缺少成功证据时不得返回 web_evidence_ready，"
             "也不能以记录 Web 不可用代替通过 Gate。"
             "完成 Search 与 Open/Fetch 后，只返回 schema 要求的 web_evidence_ready。\n"
-            f"request_ref={request.request_ref}\n"
-            f"draft_revision={request.draft_revision}\n"
-            f"draft_hash={request.draft_hash}\n"
-            f"scope={canonical_json(request.scope)}"
+            f"deepfetch_skill_root={self._skill_root}\n"
+            + self._scientific_input(request)
         )
 
     def _acquisition_result_prompt(
@@ -2707,6 +2826,7 @@ class CodexDeepFetchAdapter:
         public_root: Path,
         execution: dict[str, object],
         item_proofs: tuple[dict[str, object], ...],
+        *, literature_access_mode: str, scientific_context: str,
     ) -> str:
         return (
             "继续同一 DeepFetch v4 main agent Session。以下是共同 Acquisition effect "
@@ -2720,11 +2840,13 @@ class CodexDeepFetchAdapter:
             f"{_DEEPFETCH_COMPLETION_RULES}\n"
             f"deepfetch_skill_root={self._skill_root}\n"
             f"public_output_root={public_root}\n"
-            f"acquisition_request_id={execution['request_id']}\n"
+            f"literature_access_mode={literature_access_mode}\n"
+            f"finalize 使用 --literature-access-mode {literature_access_mode}。\n"
+            f"phase=acquisition_result\nacquisition_request_id={execution['request_id']}\n"
             "acquisition_artifact_proofs="
             f"{canonical_json(list(item_proofs))}\n"
             "acquisition_result="
-            f"{canonical_json(execution['results'])}"
+            f"{canonical_json(execution['results'])}\n{scientific_context}"
         )
 
     def _invoke(
@@ -2798,7 +2920,7 @@ class CodexDeepFetchAdapter:
         with ExitStack() as external_channels:
             external_mcp_access = None
             external_mcp_binding = None
-            if self._external_mcp is not None:
+            if self._external_mcp is not None and request.literature_access_mode != "provided_only":
                 identity = canonical_json({"workspace": str(self._workspace.resolve()), "job_ref": request.job_ref,
                     "runtime_binding_hash": canonical_hash(request.runtime_binding.as_dict()),
                     "call_ref": None if request.job_ref is not None else secrets.token_hex(16)})
@@ -2929,6 +3051,11 @@ class CodexDeepFetchAdapter:
                     "--output-last-message",
                     str(result_path),
                 ]
+                if request.literature_access_mode == "provided_only":
+                    argv = provided_only_cli_arguments(argv, writable_root=self._workspace, resident_mcp=access is not None)
+                if access is not None or external_mcp_access is not None or request.literature_access_mode == "provided_only":
+                    from meta_research.quest_drafting import protected_codex_shell_arguments
+                    argv = protected_codex_shell_arguments(argv, self._runner)
                 if request.native_session_ref is None:
                     argv.append("-")
                 else:
@@ -3071,11 +3198,12 @@ class CodexDeepFetchAdapter:
                 assert isinstance(completed_session, str)
                 try:
                     evidence = _verified_turn_evidence("\n".join(trace_parts))
+                    native_effects = _native_acquisition_effects("\n".join(trace_parts))
                 except DeepFetchUnavailable as error:
                     raise error.as_verified_terminal(completed_session) from error
                 return (
                     decoded, completed_session, evidence,
-                    _native_acquisition_effects("\n".join(trace_parts)),
+                    native_effects,
                 )
             recovered_session = outcome[3]
             if not isinstance(recovered_session, str) or not recovered_session:
@@ -3218,6 +3346,11 @@ class CodexDeepFetchAdapter:
                 if access is not None
                 else self._durable_argv(**durable_argv_kwargs)
             )
+            if request.literature_access_mode == "provided_only":
+                argv = provided_only_cli_arguments(argv, writable_root=self._workspace, resident_mcp=access is not None)
+            if access is not None or external_mcp_access is not None or request.literature_access_mode == "provided_only":
+                from meta_research.quest_drafting import protected_codex_shell_arguments
+                argv = protected_codex_shell_arguments(argv, self._runner)
             supervisor_request_path = directory / "supervisor-request.json"
             try:
                 write_supervisor_request(
@@ -3493,6 +3626,7 @@ def _deepfetch_skill_root() -> Path:
         root / "references" / "papers-json.md",
         root / "references" / "summary.md",
         root / "references" / "creation-basis.md",
+        root / "references" / "search-sources.md",
         root / "scripts" / "papers.py",
         root / "scripts" / "openalex.py",
     )
@@ -3549,6 +3683,7 @@ def _deepfetch_protocol_identity(request: DeepFetchProviderRequest) -> str:
             ),
             "run_ref": request.run_ref,
             "root_session_ref": request.root_session_ref,
+            "literature_access_mode": request.literature_access_mode,
         }
     )
 
@@ -3559,6 +3694,8 @@ def _load_or_create_protocol_checkpoint(
     identity_hash: str,
     native_session_ref: str | None,
     initial_prompt: str,
+    previous: _DeepFetchProtocolCheckpoint | None = None,
+    public_root_job_ref: str | None = None,
 ) -> _DeepFetchProtocolCheckpoint:
     if path.exists():
         checkpoint = _read_protocol_checkpoint(path, identity_hash)
@@ -3577,15 +3714,17 @@ def _load_or_create_protocol_checkpoint(
         return checkpoint
     checkpoint = _DeepFetchProtocolCheckpoint(
         identity_hash=identity_hash,
-        phase="ready_for_turn",
+        phase="pending_acquisition" if previous is not None and previous.phase == "pending_acquisition" else "ready_for_turn",
         native_session_ref=native_session_ref,
-        next_turn_number=0,
-        evidence_parts=(),
-        acquisition_request_ids=(),
-        acquisition_item_proofs=(),
-        pending_acquisition=None,
-        next_prompt=initial_prompt,
+        next_turn_number=0 if previous is None else previous.next_turn_number,
+        evidence_parts=() if previous is None else previous.evidence_parts,
+        acquisition_request_ids=() if previous is None else previous.acquisition_request_ids,
+        acquisition_item_proofs=() if previous is None else previous.acquisition_item_proofs,
+        pending_acquisition=None if previous is None else previous.pending_acquisition,
+        next_prompt=initial_prompt if previous is None or previous.phase != "pending_acquisition" else None,
         final_envelope=None,
+        turn_sources=() if previous is None else previous.turn_sources,
+        public_root_job_ref=public_root_job_ref,
     )
     _write_protocol_checkpoint(path, checkpoint)
     return checkpoint
@@ -3613,6 +3752,8 @@ def _read_protocol_checkpoint(
         "pending_acquisition",
         "next_prompt",
         "final_envelope",
+        "turn_sources",
+        "public_root_job_ref",
     }
     if not isinstance(value, dict):
         raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
@@ -3644,6 +3785,11 @@ def _read_protocol_checkpoint(
             for item in acquisition_request_ids
         )
         or len(set(acquisition_request_ids)) != len(acquisition_request_ids)
+        or not isinstance(value.get("turn_sources"), list)
+        or len(value["turn_sources"]) != next_turn_number
+        or any(not isinstance(item, dict) or set(item) != {"job_ref", "phase", "kind"} or item.get("kind") not in {"gate", "work"}
+               or any(not isinstance(v, str) or not v for v in item.values()) for item in value["turn_sources"])
+        or (value.get("public_root_job_ref") is not None and (not isinstance(value["public_root_job_ref"], str) or not value["public_root_job_ref"]))
         or not isinstance(acquisition_item_proofs, list)
     ):
         raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
@@ -3705,6 +3851,8 @@ def _read_protocol_checkpoint(
         pending_acquisition=cast(dict[str, object] | None, pending),
         next_prompt=cast(str | None, prompt),
         final_envelope=cast(dict[str, object] | None, final),
+        turn_sources=tuple(value["turn_sources"]),
+        public_root_job_ref=value["public_root_job_ref"],
     )
 
 
@@ -4063,7 +4211,7 @@ def _validate_final_envelope_shape(value: dict[str, object]) -> None:
         raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
 
 
-def _run_exact_papers_validator(skill_root: Path, public_root: Path) -> None:
+def _run_exact_papers_validator(skill_root: Path, public_root: Path, *, literature_access_mode: str = "oa_then_institution") -> None:
     try:
         completed = subprocess.run(
             [
@@ -4073,6 +4221,7 @@ def _run_exact_papers_validator(skill_root: Path, public_root: Path) -> None:
                 "--out-dir",
                 str(public_root),
                 "--final",
+                "--literature-access-mode", literature_access_mode,
             ],
             cwd=skill_root,
             text=True,
@@ -4239,9 +4388,7 @@ def _validated_v4_acquisition_effect(
             "paper_id": paper_id,
             "title": title,
             "source_urls": [
-                _validated_public_url(
-                    url, "deepfetch_acquisition_source_url_invalid"
-                )
+                _validated_acquisition_source_url(url)
                 for url in urls
             ],
         }
@@ -4253,8 +4400,37 @@ def _validated_v4_acquisition_effect(
     return {"effect_id": effect_id, "targets": normalized_targets}
 
 
+def _validated_acquisition_source_url(url: str) -> str:
+    """Retain private local clues; only Owner attestation authorizes fulltext."""
+
+    code = "deepfetch_acquisition_source_url_invalid"
+    if not url.startswith("file:"):
+        return _validated_public_url(url, code)
+    try:
+        parsed = urlsplit(url)
+        path = unquote(parsed.path, errors="strict")
+    except (ValueError, UnicodeError) as error:
+        raise DeepFetchUnavailable(code) from error
+    if (
+        not url.startswith("file:///")
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or not path.startswith("/")
+        or path.startswith("//")
+        or "\\" in path
+        or any(part in {".", ".."} for part in path.split("/"))
+        or url != url.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in url + path)
+    ):
+        raise DeepFetchUnavailable(code)
+    # Do not read or resolve this untrusted path here. The existing Acquisition
+    # scope/custody checks and exact-target reattestation remain authoritative.
+    return url
+
+
 def _merge_web_evidence(
-    evidence_parts: list[dict[str, object]],
+    evidence_parts: list[dict[str, object]], *, provided_only: bool = False,
 ) -> dict[str, object]:
     if not evidence_parts:
         raise DeepFetchUnavailable("deepfetch_web_evidence_invalid")
@@ -4270,7 +4446,7 @@ def _merge_web_evidence(
             [value["trace_hash"] for value in evidence_parts]
         ),
     }
-    validated = _validated_web_evidence(evidence)
+    validated = _validated_web_evidence(evidence, provided_only=provided_only)
     assert validated is not None
     return validated
 
@@ -4283,6 +4459,7 @@ def _import_v4_public_artifacts(
     acquisition_item_proofs: tuple[dict[str, object], ...],
     search_sources: SearchSourceRegistry | None = None,
     source_manifest: dict | None = None,
+    literature_access_mode: str = "oa_then_institution",
 ) -> tuple[
     Literal["complete", "limited", "honest_empty"],
     str,
@@ -4375,8 +4552,10 @@ def _import_v4_public_artifacts(
         or isinstance(run.get("active_search_elapsed_seconds"), bool)
         or cast(float, run.get("active_search_elapsed_seconds")) < 0
         or not isinstance(dimensions, list)
-        or not {"text_queries", "literature_roles", "citation_graph"}.issubset(
-            set(dimensions)
+        or (
+            (dimensions != [] or run.get("active_search_elapsed_seconds") != 0)
+            if literature_access_mode == "provided_only" else
+            not {"text_queries", "literature_roles", "citation_graph"}.issubset(set(dimensions))
         )
         or not isinstance(run.get("stopping_reason"), str)
         or not run.get("stopping_reason")
@@ -4913,7 +5092,7 @@ def _thread_id(stdout: str) -> str | None:
 
 
 def _validated_web_evidence(
-    value: dict[str, object] | None,
+    value: dict[str, object] | None, *, provided_only: bool = False,
 ) -> dict[str, object] | None:
     if value is None:
         return None
@@ -4935,10 +5114,10 @@ def _validated_web_evidence(
         value.get("schema_ref") != DEEPFETCH_WEB_EVIDENCE_SCHEMA
         or not isinstance(search_count, int)
         or isinstance(search_count, bool)
-        or search_count < 1
+        or (search_count != 0 if provided_only else search_count < 1)
         or not isinstance(fetch_count, int)
         or isinstance(fetch_count, bool)
-        or fetch_count < 1
+        or (fetch_count != 0 if provided_only else fetch_count < 1)
         or not isinstance(trace_hash, str)
         or len(trace_hash) != 64
     ):

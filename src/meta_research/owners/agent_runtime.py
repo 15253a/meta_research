@@ -201,10 +201,6 @@ from meta_research.owners.human_requests import (
     HumanResponseVerifier,
     _insert_disposition,
 )
-from meta_research.owners.writing_delivery_runtime import (
-    SQLiteWritingDeliveryRuntime,
-    WritingDeliveryAuthority,
-)
 from meta_research.owners.advancement_engine import StageRunRequest
 from meta_research.bundle_protocol import StageRunRequest as BundleCompletionRequest
 from meta_research.provider_supervisor import (
@@ -223,21 +219,6 @@ from meta_research.runtime_protection import (
     RuntimeProtection,
     RuntimeProtectionUnavailable,
     record_runtime_boundary,
-)
-from meta_research.writing_contract import (
-    WRITING_MAX_OUTPUT_BYTES,
-    WritingCitationDecisionVerifier,
-    WritingIntentBinding,
-    WritingRuntimeBinding,
-    normalize_writing_intent,
-    validate_writing_document,
-    validate_writing_execution_budget,
-    writing_advisory_review_task_hash,
-    writing_child_review_task_hash,
-)
-from meta_research.writing_delivery import (
-    WritingDeliveryProviderRegistry,
-    default_writing_delivery_registry,
 )
 
 
@@ -870,58 +851,6 @@ class DeepFetchRun:
         }
 
 
-@dataclass(frozen=True)
-class WritingCheckpoint:
-    checkpoint_ref: str
-    attempt_ref: str
-    markdown: str
-    markdown_hash: str
-    citations: tuple[dict[str, str], ...]
-    citations_hash: str
-    native_session_ref: str
-
-
-@dataclass(frozen=True)
-class WritingExecution:
-    execution_ref: str
-    attempt_ref: str
-    reviewed_markdown: str
-    final_markdown: str
-    final_markdown_hash: str
-    citations: tuple[dict[str, str], ...]
-    citations_hash: str
-    review: dict[str, object]
-    review_hash: str
-    receipt: AcceptanceReceipt
-
-
-@dataclass(frozen=True)
-class WritingRun:
-    run_ref: str
-    intent_id: str
-    quest_ref: str
-    document_type: str
-    status: str
-    attempt_ref: str
-    attempt_generation: int
-    root_session_ref: str
-    native_session_ref: str | None
-    fence_ref: str
-    provider_job_ref: str
-    runtime_binding: WritingRuntimeBinding
-    runtime_binding_hash: str
-    execution_budget: dict[str, object]
-    output_bytes: int
-    failure_code: str | None = None
-    checkpoint: WritingCheckpoint | None = None
-    execution: WritingExecution | None = None
-    predecessor_version_ref: str | None = None
-    predecessor_markdown_hash: str | None = None
-    feedback: tuple[str, ...] = ()
-    decision_status: str | None = None
-    decision_receipt: AcceptanceReceipt | None = None
-
-
 class HostComputeObservationReader(Protocol):
     """Read-only AR seam for already persisted host observations."""
 
@@ -946,8 +875,6 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     @property
     def harness_runs(self) -> AgentRuntimeHarnessInterface: ...
 
-    @property
-    def writing_delivery(self) -> WritingDeliveryAuthority: ...
 
     def query_snapshot(self) -> OwnerSnapshot: ...
 
@@ -1085,15 +1012,6 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         unit_kind: str,
     ) -> None: ...
 
-    def record_writing_provider_not_started(
-        self,
-        *,
-        unit_ref: str,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        reason_code: str,
-    ) -> None: ...
 
     def acknowledge_provider_safe_point(
         self,
@@ -1183,9 +1101,6 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, resolver: ResearchMaterialResolver
     ) -> None: ...
 
-    def bind_writing_citation_verifier(
-        self, verifier: WritingCitationDecisionVerifier
-    ) -> None: ...
 
     def observe_host_compute(self, idempotency_key: str) -> HostComputeObservation: ...
 
@@ -1794,7 +1709,6 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     def verify_deepfetch_execution_receipt(self, **values) -> None: ...
 
-    def verify_writing_execution_receipt(self, **values) -> dict[str, object]: ...
 
     def admit_target_launch(
         self,
@@ -1951,95 +1865,6 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, handoff_manifest_ref: str
     ) -> TargetRunHandoff: ...
 
-    def admit_writing_report(
-        self,
-        binding: WritingIntentBinding,
-        *,
-        runtime_binding: WritingRuntimeBinding,
-        idempotency_key: str,
-    ) -> WritingRun: ...
-
-    def query_writing_report(self, run_ref: str) -> WritingRun | None: ...
-
-    def query_writing_report_by_intent(self, intent_id: str) -> WritingRun | None: ...
-
-    def query_active_writing_reports(self) -> tuple[WritingRun, ...]: ...
-
-    def query_writing_reports(self) -> tuple[WritingRun, ...]: ...
-
-    def verify_current_writing_attempt(
-        self, *, run_ref: str, attempt_ref: str, fence_ref: str
-    ) -> dict[str, object]: ...
-
-    def query_writing_revision_replay(
-        self,
-        *,
-        run_ref: str,
-        feedback: tuple[str, ...],
-        idempotency_key: str,
-    ) -> WritingRun | None: ...
-
-    def fail_writing_report(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        failure_code: str,
-        recoverable_contract: bool = False,
-    ) -> WritingRun: ...
-
-    def record_writing_checkpoint(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        native_session_ref: str,
-        markdown: str,
-        citations: tuple[dict[str, str], ...],
-        runtime_binding: WritingRuntimeBinding,
-        idempotency_key: str,
-    ) -> WritingRun: ...
-
-    def record_writing_execution(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        reviewed_markdown: str,
-        final_markdown: str,
-        citations: tuple[dict[str, str], ...],
-        review: dict[str, object],
-        runtime_binding: WritingRuntimeBinding,
-        idempotency_key: str,
-    ) -> WritingRun: ...
-
-    def begin_writing_revision(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        predecessor_version_ref: str,
-        feedback: tuple[str, ...],
-        decision_receipt: AcceptanceReceipt,
-        decision_status: str,
-        idempotency_key: str,
-    ) -> WritingRun: ...
-
-    def control_writing_report(
-        self,
-        run_ref: str,
-        *,
-        action: str,
-        idempotency_key: str,
-        expected_attempt_ref: str | None = None,
-        expected_fence_ref: str | None = None,
-        cancellation_confirmation: dict[str, object] | None = None,
-    ) -> WritingRun: ...
-
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=AR_OWNER,
@@ -2052,10 +1877,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "deepfetch_session_count, acquisition_session_count, "
         "acquisition_request_count, acquisition_active_slot_count, "
         "human_request_count, control_operation_count, safe_point_count, "
-        "fenced_attempt_count, writing_run_count, writing_attempt_count, "
-        "writing_session_count, "
-        "active_writing_run_count, writing_delivery_operation_count, "
-        "writing_delivery_completed_count, writing_delivery_reconciliation_count "
+        "fenced_attempt_count "
         "FROM agent_runtime_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -2078,13 +1900,6 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "control_operation_count",
         "safe_point_count",
         "fenced_attempt_count",
-        "writing_run_count",
-        "writing_attempt_count",
-        "writing_session_count",
-        "active_writing_run_count",
-        "writing_delivery_operation_count",
-        "writing_delivery_completed_count",
-        "writing_delivery_reconciliation_count",
     ),
 )
 
@@ -2106,8 +1921,6 @@ _PROVIDER_UNIT_KINDS = frozenset(
         "reasoning_primary",
         "reasoning_review",
         "deepfetch",
-        "writing_primary",
-        "writing_review",
     }
 )
 _PROVIDER_UNIT_RUN_KINDS = {
@@ -2120,8 +1933,6 @@ _PROVIDER_UNIT_RUN_KINDS = {
     "reasoning_primary": "reasoning_stage",
     "reasoning_review": "reasoning_stage",
     "deepfetch": "deepfetch",
-    "writing_primary": "writing",
-    "writing_review": "writing",
 }
 _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES = frozenset(
     {
@@ -2183,34 +1994,6 @@ _STAGE_PROVIDER_TERMINAL_CONTRACT_FAILURES = {
     "reasoning_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
     | {"reasoning_review_result_contract_invalid"},
 }
-_WRITING_PROVIDER_TERMINAL_CONTRACT_FAILURES = frozenset(
-    {
-        "writing_adapter_kind_invalid",
-        "writing_child_review_result_invalid",
-        "writing_child_review_result_missing",
-        "writing_child_review_trace_invalid",
-        "writing_citation_source_unaccepted",
-        "writing_citations_invalid",
-        "writing_markdown_invalid",
-        "writing_native_session_invalid",
-        "writing_paper_structure_invalid",
-        "writing_presentation_structure_invalid",
-        "writing_review_invalid",
-        "writing_review_mode_invalid",
-        "writing_review_not_independent",
-        "writing_review_revision_not_material",
-        "writing_review_task_invalid",
-        "writing_reviewed_checkpoint_mismatch",
-        "writing_reviewer_invalid",
-    }
-)
-
-
-def _is_writing_provider_terminal_contract_failure(value: object) -> bool:
-    return isinstance(value, str) and (
-        value in _WRITING_PROVIDER_TERMINAL_CONTRACT_FAILURES
-        or value.startswith("codex_child_review_")
-    )
 
 
 def _provider_runtime_effect(
@@ -2319,7 +2102,7 @@ def _acquisition_preflight_runtime_effect(
 
 def _acquisition_root_runtime_scope(
     *,
-    quest_ref: str,
+    quest_ref: str | None,
     session_ref: str,
     runtime_binding_hash: str,
     generation: int,
@@ -6549,9 +6332,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             BundleReportDispositionReceiptVerifier | None
         ) = None,
         reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
-        writing_delivery_provider_registry: (
-            WritingDeliveryProviderRegistry | None
-        ) = None,
         runtime_protection: RuntimeProtection | None = None,
         receipt_verifier: SQLiteAgentRuntimeReceiptVerifier | None = None,
     ) -> None:
@@ -6578,7 +6358,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._deepfetch_request_verifier = deepfetch_request_verifier
         self._authorization_verifier = human_response_verifier
         self._research_material_resolver: ResearchMaterialResolver | None = None
-        self._writing_citation_verifier: WritingCitationDecisionVerifier | None = None
         self._acquisition_private_root = (
             acquisition_private_root
             if acquisition_private_root is not None
@@ -6587,21 +6366,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._configure_human_request_owner(
             database, feed, AR_OWNER, human_response_verifier
         )
-        self._writing_delivery = SQLiteWritingDeliveryRuntime(
-            database,
-            feed,
-            human_response_verifier,
-            (
-                writing_delivery_provider_registry
-                or default_writing_delivery_registry()
-            ),
-            runtime_protection=runtime_protection,
-        )
         self._acquisition_private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._receipt_verifier = receipt_verifier or SQLiteAgentRuntimeReceiptVerifier(
             database,
             stage_request_verifier,
-            human_response_verifier,
             bundle_report_evidence_verifier,
             bundle_exhaustion_verifier,
             bundle_report_disposition_verifier,
@@ -6617,22 +6385,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._deepfetch_providers: dict[str, DeepFetchProvider] = {}
         self._provider_quiescence_lock = threading.Lock()
         self._provider_quiescence_drivers: dict[str, object] = {}
-        self._recover_completed_writing_provider_units()
         self._recover_completed_bundle_rolling_provider_units()
         self._recover_interrupted_provider_units()
         self._recover_daemon_stopped_stage_runs()
         self._recover_interrupted_acquisition()
         self._recover_acquisition_human_requests()
         self._recover_interrupted_deepfetch()
-        self._recover_interrupted_writing()
 
     @property
     def harness_runs(self) -> AgentRuntimeHarnessInterface:
         return self._harness_runs
 
-    @property
-    def writing_delivery(self) -> WritingDeliveryAuthority:
-        return self._writing_delivery
 
     def bind_operator_stop_reader(
         self, reader: Callable[[str], dict[str, object] | None]
@@ -6719,44 +6482,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> None:
         self._research_material_resolver = resolver
 
-    def _recover_completed_writing_provider_units(self) -> None:
-        """Close lost safe ACKs before generic startup fencing runs.
-
-        A Writing checkpoint or execution is an Agent Runtime-owned durable
-        boundary.  If the daemon died after committing that boundary but
-        before acknowledging its provider unit, revoking the same Fence would
-        turn a completed review into an unrecoverable historical result.
-        Reuse the normal acknowledgement path so explicit stop/revocation and
-        cleanup semantics remain identical.
-        """
-
-        with self._database.read() as connection:
-            units = connection.execute(
-                text(
-                    "SELECT unit.unit_ref, unit.run_ref, unit.attempt_ref, "
-                    "unit.fence_ref FROM ar_provider_units AS unit JOIN "
-                    "ar_run_controls AS control ON control.run_ref = unit.run_ref "
-                    "WHERE control.run_kind = 'writing' AND unit.status IN "
-                    "('active', 'revocation_pending') AND unit.attempt_ref IS NOT "
-                    "NULL AND unit.fence_ref IS NOT NULL AND ((unit.unit_kind = "
-                    "'writing_primary' AND EXISTS (SELECT 1 FROM "
-                    "ar_writing_checkpoints AS checkpoint WHERE "
-                    "checkpoint.run_ref = unit.run_ref AND checkpoint.attempt_ref = "
-                    "unit.attempt_ref AND checkpoint.fence_ref = unit.fence_ref)) OR "
-                    "(unit.unit_kind = 'writing_review' AND EXISTS (SELECT 1 FROM "
-                    "ar_writing_executions AS execution WHERE execution.run_ref = "
-                    "unit.run_ref AND execution.attempt_ref = unit.attempt_ref AND "
-                    "execution.fence_ref = unit.fence_ref))) ORDER BY "
-                    "unit.started_at, unit.unit_ref"
-                )
-            ).all()
-        for unit in units:
-            self.acknowledge_provider_safe_point(
-                unit_ref=unit.unit_ref,
-                run_ref=unit.run_ref,
-                attempt_ref=unit.attempt_ref,
-                fence_ref=unit.fence_ref,
-            )
 
     def _recover_completed_bundle_rolling_provider_units(self) -> None:
         """ACK only dynamic Bundle turns with an exact durable Owner result.
@@ -7166,1784 +6891,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 except RuntimeProtectionUnavailable as error:
                     raise OwnerConflict(error.code) from error
 
-    def bind_writing_citation_verifier(
-        self, verifier: WritingCitationDecisionVerifier
-    ) -> None:
-        if (
-            self._writing_citation_verifier is not None
-            and self._writing_citation_verifier is not verifier
-        ):
-            raise OwnerConflict("writing_citation_verifier_already_bound")
-        self._writing_citation_verifier = verifier
-
-    def admit_writing_report(
-        self,
-        binding: WritingIntentBinding,
-        *,
-        runtime_binding: WritingRuntimeBinding,
-        idempotency_key: str,
-    ) -> WritingRun:
-        _validate_stage_idempotency_key(idempotency_key)
-        binding.validate()
-        runtime_binding.validate()
-        runtime_document = runtime_binding.as_dict()
-        runtime_hash = canonical_hash(runtime_document)
-        request_document = {
-            "command": "admit_writing_report",
-            "binding": binding.as_dict(),
-            "runtime_binding": runtime_document,
-        }
-        request_hash = canonical_hash(request_document)
-        # A completed admission is a durable fact. Return it before consulting
-        # mutable authorization/provider state so a lost response remains
-        # replayable after a later revocation or provider upgrade.
-        with self._database.read() as connection:
-            replay = _writing_command_replay(
-                connection,
-                idempotency_key,
-                "admit_writing_report",
-                request_hash,
-            )
-        if replay is not None:
-            result = self.query_writing_report(replay)
-            if result is None:
-                raise OwnerConflict("writing_run_missing_after_admission")
-            return result
-        if self._authorization_verifier is None:
-            raise OwnerConflict("writing_confirmation_verifier_unavailable")
-        self._authorization_verifier.verify_broad_research_authorization(
-            quest_ref=binding.quest_ref
-        )
-        confirmed_draft = self._authorization_verifier.verify_command_confirmation(
-            intent_id=binding.intent_id,
-            command_kind="writing_report_start",
-            draft_revision=binding.draft_revision,
-            draft_hash=binding.draft_hash,
-            preview_ref=binding.preview_ref,
-            preview_hash=binding.preview_hash,
-            receipt=binding.confirmation,
-        )
-        expected_draft = {
-            "command_kind": "writing_report_start",
-            "payload": {
-                "document_type": binding.document_type,
-                "quest_ref": binding.quest_ref,
-                "intent": binding.intent,
-                "intent_hash": binding.intent_hash,
-                "snapshot": binding.snapshot,
-                "snapshot_ref": binding.snapshot_ref,
-                "snapshot_hash": binding.snapshot_hash,
-                "execution_budget": binding.execution_budget,
-            },
-        }
-        if confirmed_draft != expected_draft:
-            raise OwnerConflict("writing_confirmation_binding_mismatch")
-        with self._database.write() as connection:
-            command = connection.execute(
-                text(
-                    "SELECT * FROM ar_writing_commands WHERE idempotency_key = "
-                    ":idempotency_key AND command_kind = 'admit_writing_report'"
-                ),
-                {"idempotency_key": idempotency_key},
-            ).first()
-            if command is not None:
-                if (
-                    command.request_hash != request_hash
-                ):
-                    raise OwnerConflict("idempotency_conflict")
-                run_ref = command.result_ref
-            else:
-                existing = connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_runs WHERE intent_id = :intent_id"
-                    ),
-                    {"intent_id": binding.intent_id},
-                ).first()
-                if existing is not None:
-                    if (
-                        existing.document_type != binding.document_type
-                        or existing.intent_hash != binding.intent_hash
-                        or existing.snapshot_ref != binding.snapshot_ref
-                        or existing.snapshot_hash != binding.snapshot_hash
-                        or existing.confirmation_ref
-                        != binding.confirmation.receipt_ref
-                        or existing.confirmation_hash
-                        != binding.confirmation.payload_hash
-                        or existing.runtime_binding_hash != runtime_hash
-                    ):
-                        raise OwnerConflict("writing_admission_conflict")
-                    run_ref = existing.run_ref
-                else:
-                    run_ref = new_ref("writing_run")
-                    attempt_ref = new_ref("writing_attempt")
-                    root_session_ref = new_ref("writing_root_session")
-                    fence_ref = new_ref("writing_fence")
-                    provider_job_ref = new_ref("writing_job")
-                    now = time.time()
-                    connection.execute(
-                        text(
-                            "INSERT INTO ar_writing_runs (run_ref, intent_id, "
-                            "quest_ref, document_type, intent_json, intent_hash, "
-                            "snapshot_ref, snapshot_json, snapshot_hash, "
-                            "confirmation_ref, confirmation_hash, status, "
-                            "failure_code, execution_budget_json, "
-                            "execution_budget_hash, output_bytes, "
-                            "attempt_ref, attempt_generation, root_session_ref, "
-                            "native_session_ref, fence_ref, runtime_binding_json, "
-                            "runtime_binding_hash, created_at, updated_at) VALUES "
-                            "(:run_ref, :intent_id, :quest_ref, :document_type, "
-                            ":intent_json, :intent_hash, :snapshot_ref, "
-                            ":snapshot_json, :snapshot_hash, :confirmation_ref, "
-                            ":confirmation_hash, 'active', NULL, "
-                            ":execution_budget_json, :execution_budget_hash, "
-                            "0, :attempt_ref, 1, "
-                            ":root_session_ref, :native_session_ref, :fence_ref, "
-                            ":runtime_binding_json, :runtime_binding_hash, :now, :now)"
-                        ),
-                        {
-                            "run_ref": run_ref,
-                            "intent_id": binding.intent_id,
-                            "quest_ref": binding.quest_ref,
-                            "document_type": binding.document_type,
-                            "intent_json": canonical_json(binding.intent),
-                            "intent_hash": binding.intent_hash,
-                            "snapshot_ref": binding.snapshot_ref,
-                            "snapshot_json": canonical_json(binding.snapshot),
-                            "snapshot_hash": binding.snapshot_hash,
-                            "confirmation_ref": binding.confirmation.receipt_ref,
-                            "confirmation_hash": binding.confirmation.payload_hash,
-                            "execution_budget_json": canonical_json(
-                                binding.execution_budget
-                            ),
-                            "execution_budget_hash": canonical_hash(
-                                binding.execution_budget
-                            ),
-                            "attempt_ref": attempt_ref,
-                            "root_session_ref": root_session_ref,
-                            "native_session_ref": None,
-                            "fence_ref": fence_ref,
-                            "runtime_binding_json": canonical_json(runtime_document),
-                            "runtime_binding_hash": runtime_hash,
-                            "now": now,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "INSERT INTO ar_writing_attempts (attempt_ref, run_ref, "
-                            "generation, root_session_ref, native_session_ref, "
-                            "fence_ref, provider_job_ref, status, created_at) VALUES (:attempt_ref, "
-                            ":run_ref, 1, :root_session_ref, :native_session_ref, "
-                            ":fence_ref, :provider_job_ref, 'admitted', :now)"
-                        ),
-                        {
-                            "attempt_ref": attempt_ref,
-                            "run_ref": run_ref,
-                            "root_session_ref": root_session_ref,
-                            "native_session_ref": None,
-                            "fence_ref": fence_ref,
-                            "provider_job_ref": provider_job_ref,
-                            "now": now,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "INSERT INTO ar_run_controls (run_ref, run_kind, "
-                            "quest_ref, cycle_ref, epoch, status, attempt_ref, "
-                            "root_session_ref, fence_ref, control_revision, "
-                            "safe_point_ref, terminal_reason, cleanup_status, "
-                            "updated_at) VALUES (:run_ref, 'writing', NULL, NULL, "
-                            "NULL, 'running', :attempt_ref, :root_session_ref, "
-                            ":fence_ref, 1, NULL, NULL, 'none', :now)"
-                        ),
-                        {
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "root_session_ref": root_session_ref,
-                            "fence_ref": fence_ref,
-                            "now": now,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE agent_runtime_state SET revision = revision + 1, "
-                            "writing_run_count = writing_run_count + 1, "
-                            "writing_attempt_count = writing_attempt_count + 1, "
-                            "writing_session_count = writing_session_count + 1, "
-                            "active_writing_run_count = active_writing_run_count + 1 "
-                            "WHERE singleton = 'owner'"
-                        )
-                    )
-                    self._feed.record(
-                        connection,
-                        "agent_runtime.writing_report_admitted",
-                        {
-                            "run_ref": run_ref,
-                            "intent_id": binding.intent_id,
-                            "quest_ref": binding.quest_ref,
-                            "document_type": binding.document_type,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                        },
-                    )
-                connection.execute(
-                    text(
-                        "INSERT INTO ar_writing_commands (idempotency_key, "
-                        "command_kind, request_hash, result_ref, recorded_at) VALUES "
-                        "(:idempotency_key, 'admit_writing_report', :request_hash, "
-                        ":result_ref, :recorded_at)"
-                    ),
-                    {
-                        "idempotency_key": idempotency_key,
-                        "request_hash": request_hash,
-                        "result_ref": run_ref,
-                        "recorded_at": time.time(),
-                    },
-                )
-        run = self.query_writing_report(run_ref)
-        if run is None:
-            raise OwnerConflict("writing_run_missing_after_admission")
-        return run
-
-    def query_writing_report(self, run_ref: str) -> WritingRun | None:
-        return self._query_writing_report("run_ref", run_ref)
-
-    def query_writing_report_by_intent(self, intent_id: str) -> WritingRun | None:
-        return self._query_writing_report("intent_id", intent_id)
-
-    def query_active_writing_reports(self) -> tuple[WritingRun, ...]:
-        with self._database.read() as connection:
-            refs = connection.execute(
-                text(
-                    "SELECT run_ref FROM ar_writing_runs WHERE status IN "
-                    "('active', 'blocked') "
-                    "ORDER BY updated_at, run_ref"
-                )
-            ).scalars().all()
-        runs = tuple(self.query_writing_report(str(run_ref)) for run_ref in refs)
-        return tuple(
-            run
-            for run in runs
-            if run is not None
-            and (
-                run.status == "active"
-                or _is_writing_provider_terminal_contract_failure(
-                    run.failure_code
-                )
-            )
-        )
-
-    def query_writing_reports(self) -> tuple[WritingRun, ...]:
-        with self._database.read() as connection:
-            refs = connection.execute(
-                text(
-                    "SELECT run_ref FROM ar_writing_runs ORDER BY created_at DESC, "
-                    "run_ref DESC"
-                )
-            ).scalars().all()
-        runs = tuple(self.query_writing_report(str(run_ref)) for run_ref in refs)
-        return tuple(run for run in runs if run is not None)
-
-    def verify_current_writing_attempt(
-        self, *, run_ref: str, attempt_ref: str, fence_ref: str
-    ) -> dict[str, object]:
-        with self._database.read() as connection:
-            row = _current_writing_run_row(
-                connection, run_ref, attempt_ref, fence_ref
-            )
-        if self._authorization_verifier is None:
-            raise OwnerConflict("writing_authorization_verifier_unavailable")
-        authorization = (
-            self._authorization_verifier.verify_broad_research_authorization(
-                quest_ref=row.quest_ref
-            )
-        )
-        return {
-            "run_ref": row.run_ref,
-            "attempt_ref": row.attempt_ref,
-            "fence_ref": row.fence_ref,
-            "quest_ref": row.quest_ref,
-            "authorization": authorization,
-        }
-
-    def query_writing_revision_replay(
-        self,
-        *,
-        run_ref: str,
-        feedback: tuple[str, ...],
-        idempotency_key: str,
-    ) -> WritingRun | None:
-        _validate_stage_idempotency_key(idempotency_key)
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM ar_writing_commands WHERE command_kind = "
-                    "'begin_writing_revision' AND idempotency_key = "
-                    ":idempotency_key"
-                ),
-                {"idempotency_key": idempotency_key},
-            ).first()
-            attempt = (
-                None
-                if row is None or row.result_attempt_ref is None
-                else connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": row.result_attempt_ref},
-                ).first()
-            )
-        if row is None:
-            return None
-        if row.result_ref != run_ref or attempt is None:
-            raise OwnerConflict("idempotency_conflict")
-        try:
-            recorded_feedback = json.loads(attempt.feedback_json)
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise OwnerConflict("writing_revision_lineage_invalid") from error
-        if (
-            recorded_feedback != list(feedback)
-            or canonical_hash(recorded_feedback) != attempt.feedback_hash
-            or attempt.decision_status not in {"accepted", "rejected"}
-        ):
-            raise OwnerConflict("idempotency_conflict")
-        return self.query_writing_report(run_ref)
-
-    def fail_writing_report(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        failure_code: str,
-        recoverable_contract: bool = False,
-    ) -> WritingRun:
-        if (
-            not isinstance(failure_code, str)
-            or not failure_code
-            or len(failure_code) > 128
-        ):
-            raise OwnerConflict("writing_failure_code_invalid")
-        if recoverable_contract and not (
-            _is_writing_provider_terminal_contract_failure(failure_code)
-        ):
-            raise OwnerConflict("writing_contract_correction_invalid")
-        timeout_interruption = failure_code == "writing_operation_timeout"
-        recover_timeout_without_provider = False
-        with self._database.write() as connection:
-            row = connection.execute(
-                text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
-                {"run_ref": run_ref},
-            ).first()
-            control = connection.execute(
-                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                {"run_ref": run_ref},
-            ).first()
-            if (
-                row is not None
-                and (
-                    row.status == "blocked"
-                    or (
-                        timeout_interruption
-                        and row.status == "active"
-                        and control is not None
-                        and control.status == "reconciliation_required"
-                    )
-                )
-                and row.attempt_ref == attempt_ref
-                and row.fence_ref == fence_ref
-                and row.failure_code == failure_code
-            ):
-                pass
-            else:
-                row = _current_writing_run_row(
-                    connection, run_ref, attempt_ref, fence_ref
-                )
-                now = time.time()
-                if timeout_interruption:
-                    # A watchdog only proves that this technical Attempt exceeded
-                    # its operation ceiling.  Keep the logical Writing Run alive;
-                    # revoke the Fence and wait for physical provider cleanup
-                    # before installing its successor Attempt.
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_runs SET failure_code = "
-                            ":failure_code, updated_at = :now WHERE run_ref = "
-                            ":run_ref AND attempt_ref = :attempt_ref AND fence_ref "
-                            "= :fence_ref AND status = 'active'"
-                        ),
-                        {
-                            "failure_code": failure_code,
-                            "now": now,
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_attempts SET failure_code = "
-                            ":failure_code WHERE attempt_ref = :attempt_ref AND "
-                            "status IN ('admitted', 'running')"
-                        ),
-                        {
-                            "failure_code": failure_code,
-                            "attempt_ref": attempt_ref,
-                        },
-                    )
-                else:
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_runs SET status = 'blocked', "
-                            "failure_code = :failure_code, updated_at = :now WHERE "
-                            "run_ref = :run_ref AND attempt_ref = :attempt_ref AND "
-                            "fence_ref = :fence_ref"
-                        ),
-                        {
-                            "failure_code": failure_code,
-                            "now": now,
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_attempts SET status = CASE WHEN status "
-                            "IN ('admitted', 'running', 'paused') THEN 'failed' ELSE "
-                            "status END, failure_code = :failure_code, completed_at = "
-                            "CASE WHEN status IN ('admitted', 'running', 'paused') THEN "
-                            "COALESCE(completed_at, :now) ELSE completed_at END WHERE "
-                            "attempt_ref = :attempt_ref"
-                        ),
-                        {
-                            "failure_code": failure_code,
-                            "now": now,
-                            "attempt_ref": attempt_ref,
-                        },
-                    )
-                if recoverable_contract:
-                    active_unit = connection.execute(
-                        text(
-                            "SELECT unit_ref FROM ar_provider_units WHERE run_ref = "
-                            ":run_ref AND attempt_ref IS :attempt_ref AND fence_ref "
-                            "IS :fence_ref AND status IN ('active', "
-                            "'revocation_pending') LIMIT 1"
-                        ),
-                        {
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                        },
-                    ).first()
-                    if active_unit is not None:
-                        raise OwnerConflict("writing_contract_correction_not_safe")
-                    connection.execute(
-                        text(
-                            "UPDATE ar_execution_fences SET status = 'rejected', "
-                            "closed_at = COALESCE(closed_at, :now) WHERE fence_ref = "
-                            ":fence_ref AND status IN ('current', 'submitted')"
-                        ),
-                        {"now": now, "fence_ref": fence_ref},
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_run_controls SET status = "
-                            "'reconciliation_required', safe_point_ref = NULL, "
-                            "terminal_reason = :failure_code, cleanup_status = "
-                            "'none', control_revision = control_revision + 1, "
-                            "updated_at = :now WHERE run_ref = :run_ref"
-                        ),
-                        {
-                            "failure_code": failure_code,
-                            "now": now,
-                            "run_ref": run_ref,
-                        },
-                    )
-                else:
-                    _retire_writing_managed_attempt(
-                        connection,
-                        run=row,
-                        managed_status="reconciliation_required",
-                        reason_code=failure_code,
-                        now=now,
-                    )
-                if timeout_interruption:
-                    recover_timeout_without_provider = (
-                        connection.execute(
-                            text(
-                                "SELECT cleanup_status FROM ar_run_controls WHERE "
-                                "run_ref = :run_ref"
-                            ),
-                            {"run_ref": run_ref},
-                        ).scalar_one()
-                        != "pending"
-                    )
-                connection.execute(
-                    text(
-                        "UPDATE agent_runtime_state SET revision = revision + 1, "
-                        "active_writing_run_count = active_writing_run_count - "
-                        ":retired WHERE singleton = 'owner' AND "
-                        "active_writing_run_count >= :retired"
-                    ),
-                    {"retired": 0 if timeout_interruption else 1},
-                )
-                self._feed.record(
-                    connection,
-                    (
-                        "agent_runtime.writing_attempt_interrupted"
-                        if timeout_interruption
-                        else (
-                            "agent_runtime.writing_contract_correction_retained"
-                            if recoverable_contract
-                            else "agent_runtime.writing_report_blocked"
-                        )
-                    ),
-                    {
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "failure_code": failure_code,
-                    },
-                )
-        if recover_timeout_without_provider:
-            # The watchdog fenced an admitted technical Attempt before any
-            # provider unit existed.  There is no physical responsibility to
-            # reconcile, so install the successor immediately instead of
-            # leaving the logical Run stuck behind a fictional cleanup.
-            self._recover_interrupted_writing(run_ref=run_ref)
-        result = self.query_writing_report(run_ref)
-        if result is None:
-            raise OwnerConflict("writing_run_not_found")
-        return result
-
-    def record_writing_checkpoint(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        native_session_ref: str,
-        markdown: str,
-        citations: tuple[dict[str, str], ...],
-        runtime_binding: WritingRuntimeBinding,
-        idempotency_key: str,
-    ) -> WritingRun:
-        _validate_stage_idempotency_key(idempotency_key)
-        runtime_binding.validate()
-        if (
-            not native_session_ref
-            or len(native_session_ref) > 128
-            or not markdown.strip()
-        ):
-            raise OwnerConflict("writing_checkpoint_invalid")
-        runtime_binding_hash = canonical_hash(runtime_binding.as_dict())
-        if self.park_root_provider_session_for_human_request(
-            root_kind="writing",
-            phase="writing-primary",
-            run_ref=run_ref,
-            attempt_ref=attempt_ref,
-            fence_ref=fence_ref,
-            native_session_ref=native_session_ref,
-            runtime_binding_hash=runtime_binding_hash,
-        ):
-            raise OwnerConflict("runtime_run_suspended")
-        markdown_hash = _writing_markdown_hash(markdown)
-        citations_hash = canonical_hash(list(citations))
-        output_bytes = len(markdown.encode("utf-8")) + len(
-            canonical_json(list(citations)).encode("utf-8")
-        )
-        request_hash = canonical_hash(
-            {
-                "command": "record_writing_checkpoint",
-                "run_ref": run_ref,
-                "attempt_ref": attempt_ref,
-                "fence_ref": fence_ref,
-                "native_session_ref": native_session_ref,
-                "markdown_hash": markdown_hash,
-                "citations_hash": citations_hash,
-                "runtime_binding_hash": runtime_binding_hash,
-            }
-        )
-        with self._database.write() as connection:
-            replay = _writing_command_replay(
-                connection,
-                idempotency_key,
-                "record_writing_checkpoint",
-                request_hash,
-            )
-            if replay is None:
-                run = _current_writing_run_row(
-                    connection, run_ref, attempt_ref, fence_ref
-                )
-                if self._authorization_verifier is None:
-                    raise OwnerConflict("writing_authorization_verifier_unavailable")
-                self._authorization_verifier.verify_broad_research_authorization(
-                    quest_ref=run.quest_ref
-                )
-                snapshot = decoded_object(run.snapshot_json)
-                if (
-                    not isinstance(snapshot, dict)
-                    or _validate_writing_citations_for_snapshot(
-                        citations, snapshot
-                    )
-                    != citations_hash
-                ):
-                    raise OwnerConflict("writing_citations_invalid")
-                if run.runtime_binding_hash != canonical_hash(
-                    runtime_binding.as_dict()
-                ):
-                    raise OwnerConflict("writing_runtime_binding_drift")
-                validate_writing_execution_budget(
-                    decoded_object(run.execution_budget_json)
-                )
-                if run.native_session_ref not in {None, native_session_ref}:
-                    raise OwnerConflict("writing_native_session_changed")
-                session_owner = connection.execute(
-                    text(
-                        "SELECT run_ref FROM ar_writing_runs WHERE "
-                        "native_session_ref = :native_session_ref AND run_ref != "
-                        ":run_ref"
-                    ),
-                    {
-                        "native_session_ref": native_session_ref,
-                        "run_ref": run_ref,
-                    },
-                ).first()
-                if session_owner is not None:
-                    raise OwnerConflict("writing_native_session_conflict")
-                checkpoint = connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_checkpoints WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": attempt_ref},
-                ).first()
-                if checkpoint is not None:
-                    if (
-                        checkpoint.markdown_hash != markdown_hash
-                        or checkpoint.citations_hash != citations_hash
-                        or checkpoint.native_session_ref != native_session_ref
-                    ):
-                        raise OwnerConflict("writing_checkpoint_conflict")
-                else:
-                    checkpoint_ref = new_ref("writing_checkpoint")
-                    now = time.time()
-                    connection.execute(
-                        text(
-                            "INSERT INTO ar_writing_checkpoints (checkpoint_ref, "
-                            "run_ref, attempt_ref, fence_ref, native_session_ref, "
-                            "markdown, markdown_hash, citations_json, citations_hash, "
-                            "created_at) VALUES (:checkpoint_ref, :run_ref, "
-                            ":attempt_ref, :fence_ref, :native_session_ref, :markdown, "
-                            ":markdown_hash, :citations_json, :citations_hash, :now)"
-                        ),
-                        {
-                            "checkpoint_ref": checkpoint_ref,
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                            "native_session_ref": native_session_ref,
-                            "markdown": markdown,
-                            "markdown_hash": markdown_hash,
-                            "citations_json": canonical_json(list(citations)),
-                            "citations_hash": citations_hash,
-                            "now": now,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_runs SET native_session_ref = "
-                            ":native_session_ref, output_bytes = output_bytes + "
-                            ":output_bytes, updated_at = :now WHERE run_ref = "
-                            ":run_ref"
-                        ),
-                        {
-                            "native_session_ref": native_session_ref,
-                            "output_bytes": output_bytes,
-                            "now": now,
-                            "run_ref": run_ref,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_attempts SET native_session_ref = "
-                            ":native_session_ref, status = 'running', started_at = "
-                            "COALESCE(started_at, :now) WHERE attempt_ref = "
-                            ":attempt_ref"
-                        ),
-                        {
-                            "native_session_ref": native_session_ref,
-                            "now": now,
-                            "attempt_ref": attempt_ref,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE agent_runtime_state SET revision = revision + 1 "
-                            "WHERE singleton = 'owner'"
-                        )
-                    )
-                    self._feed.record(
-                        connection,
-                        "agent_runtime.writing_checkpoint_recorded",
-                        {
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "checkpoint_ref": checkpoint_ref,
-                        },
-                    )
-                _record_writing_command(
-                    connection,
-                    idempotency_key,
-                    "record_writing_checkpoint",
-                    request_hash,
-                    run_ref,
-                )
-        result = self.query_writing_report(run_ref)
-        if result is None:
-            raise OwnerConflict("writing_run_missing_after_checkpoint")
-        return result
-
-    def record_writing_execution(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        reviewed_markdown: str,
-        final_markdown: str,
-        citations: tuple[dict[str, str], ...],
-        review: dict[str, object],
-        runtime_binding: WritingRuntimeBinding,
-        idempotency_key: str,
-    ) -> WritingRun:
-        _validate_stage_idempotency_key(idempotency_key)
-        runtime_binding.validate()
-        reviewed_hash = _writing_markdown_hash(reviewed_markdown)
-        final_hash = _writing_markdown_hash(final_markdown)
-        citations_hash = canonical_hash(list(citations))
-        review_hash = canonical_hash(review)
-        output_bytes = (
-            len(reviewed_markdown.encode("utf-8"))
-            + len(final_markdown.encode("utf-8"))
-            + len(canonical_json(list(citations)).encode("utf-8"))
-            + len(canonical_json(review).encode("utf-8"))
-        )
-        if (
-            review.get("reviewed_markdown_hash") != reviewed_hash
-            or review.get("final_markdown_hash") != final_hash
-            or review.get("citations_hash") != citations_hash
-            or review.get("review_mode") != "advisory_unobserved"
-            or review.get("reviewer_agent_ref") is not None
-        ):
-            raise OwnerConflict("writing_review_invalid")
-        execution_payload = {
-            "schema_ref": "meta-research/writing-execution/v1",
-            "run_ref": run_ref,
-            "attempt_ref": attempt_ref,
-            "fence_ref": fence_ref,
-            "final_markdown_hash": final_hash,
-            "citations_hash": citations_hash,
-            "review_hash": review_hash,
-            "runtime_binding_hash": canonical_hash(runtime_binding.as_dict()),
-        }
-        payload_hash = canonical_hash(execution_payload)
-        request_hash = canonical_hash(
-            {"command": "record_writing_execution", **execution_payload}
-        )
-        with self._database.write() as connection:
-            replay = _writing_command_replay(
-                connection,
-                idempotency_key,
-                "record_writing_execution",
-                request_hash,
-            )
-            if replay is None:
-                run = _current_writing_run_row(
-                    connection, run_ref, attempt_ref, fence_ref
-                )
-                if self._authorization_verifier is None:
-                    raise OwnerConflict("writing_authorization_verifier_unavailable")
-                self._authorization_verifier.verify_broad_research_authorization(
-                    quest_ref=run.quest_ref
-                )
-                if run.runtime_binding_hash != canonical_hash(
-                    runtime_binding.as_dict()
-                ):
-                    raise OwnerConflict("writing_runtime_binding_drift")
-                validate_writing_execution_budget(
-                    decoded_object(run.execution_budget_json)
-                )
-                checkpoint = connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_checkpoints WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": attempt_ref},
-                ).first()
-                if (
-                    checkpoint is None
-                    or checkpoint.markdown_hash != reviewed_hash
-                    or checkpoint.fence_ref != fence_ref
-                ):
-                    raise OwnerConflict("writing_checkpoint_stale")
-                snapshot = decoded_object(run.snapshot_json)
-                checkpoint_value = _writing_checkpoint_from_row(checkpoint)
-                attempt = connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": attempt_ref},
-                ).first()
-                if (
-                    not isinstance(snapshot, dict)
-                    or checkpoint_value is None
-                    or attempt is None
-                    or _validate_writing_citations_for_snapshot(
-                        citations, snapshot
-                    )
-                    != citations_hash
-                ):
-                    raise OwnerConflict("writing_execution_invalid")
-                if run.document_type != "report":
-                    validate_writing_document(
-                        run.document_type,
-                        final_markdown,
-                        citations,
-                    )
-                _validate_writing_review_contract(
-                    review=review,
-                    run=run,
-                    attempt=attempt,
-                    checkpoint=checkpoint_value,
-                    reviewed_markdown=reviewed_markdown,
-                    final_markdown=final_markdown,
-                    citations=citations,
-                    final_hash=final_hash,
-                    citations_hash=citations_hash,
-                    allow_legacy_child=False,
-                )
-                existing = connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_executions WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": attempt_ref},
-                ).first()
-                if existing is not None:
-                    if existing.payload_hash != payload_hash:
-                        raise OwnerConflict("writing_execution_conflict")
-                else:
-                    execution_ref = new_ref("writing_execution")
-                    receipt_ref = new_ref("writing_execution_receipt")
-                    receipt_hash = canonical_hash(
-                        {
-                            "schema_ref": RECEIPT_SCHEMA,
-                            "issuer": AR_OWNER,
-                            "kind": "writing_execution_completed",
-                            "subject_ref": execution_ref,
-                            "payload_hash": payload_hash,
-                        }
-                    )
-                    now = time.time()
-                    connection.execute(
-                        text(
-                            "INSERT INTO ar_writing_executions (execution_ref, "
-                            "run_ref, attempt_ref, fence_ref, reviewed_markdown, "
-                            "reviewed_markdown_hash, final_markdown, "
-                            "final_markdown_hash, citations_json, citations_hash, "
-                            "review_json, review_hash, payload_hash, receipt_ref, "
-                            "receipt_hash, runtime_binding_hash, completed_at) VALUES (:execution_ref, "
-                            ":run_ref, :attempt_ref, :fence_ref, :reviewed_markdown, "
-                            ":reviewed_hash, :final_markdown, :final_hash, "
-                            ":citations_json, :citations_hash, :review_json, "
-                            ":review_hash, :payload_hash, :receipt_ref, "
-                            ":receipt_hash, :runtime_binding_hash, :now)"
-                        ),
-                        {
-                            "execution_ref": execution_ref,
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                            "reviewed_markdown": reviewed_markdown,
-                            "reviewed_hash": reviewed_hash,
-                            "final_markdown": final_markdown,
-                            "final_hash": final_hash,
-                            "citations_json": canonical_json(list(citations)),
-                            "citations_hash": citations_hash,
-                            "review_json": canonical_json(review),
-                            "review_hash": review_hash,
-                            "payload_hash": payload_hash,
-                            "receipt_ref": receipt_ref,
-                            "receipt_hash": receipt_hash,
-                            "runtime_binding_hash": canonical_hash(
-                                runtime_binding.as_dict()
-                            ),
-                            "now": now,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_attempts SET status = 'completed', "
-                            "completed_at = :now WHERE attempt_ref = :attempt_ref"
-                        ),
-                        {"now": now, "attempt_ref": attempt_ref},
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_runs SET output_bytes = output_bytes + "
-                            ":output_bytes, updated_at = :now WHERE "
-                            "run_ref = :run_ref"
-                        ),
-                        {
-                            "output_bytes": output_bytes,
-                            "now": now,
-                            "run_ref": run_ref,
-                        },
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE agent_runtime_state SET revision = revision + 1 "
-                            "WHERE singleton = 'owner'"
-                        )
-                    )
-                    self._feed.record(
-                        connection,
-                        "agent_runtime.writing_execution_completed",
-                        {
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "execution_ref": execution_ref,
-                            "receipt_ref": receipt_ref,
-                        },
-                    )
-                _record_writing_command(
-                    connection,
-                    idempotency_key,
-                    "record_writing_execution",
-                    request_hash,
-                    run_ref,
-                )
-        result = self.query_writing_report(run_ref)
-        if result is None:
-            raise OwnerConflict("writing_run_missing_after_execution")
-        return result
-
-    def begin_writing_revision(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        predecessor_version_ref: str,
-        feedback: tuple[str, ...],
-        decision_receipt: AcceptanceReceipt,
-        decision_status: str,
-        idempotency_key: str,
-    ) -> WritingRun:
-        _validate_stage_idempotency_key(idempotency_key)
-        if (
-            self._writing_citation_verifier is None
-            or not predecessor_version_ref
-            or not feedback
-            or any(not item.strip() or len(item) > 4000 for item in feedback)
-            or contains_secret(feedback)
-            or decision_status not in {"accepted", "rejected"}
-        ):
-            if contains_secret(feedback):
-                raise OwnerConflict("writing_revision_secret_forbidden")
-            raise OwnerConflict("writing_revision_feedback_invalid")
-        self._writing_citation_verifier.verify_writing_citation_decision(
-            run_ref=run_ref,
-            attempt_ref=attempt_ref,
-            version_ref=predecessor_version_ref,
-            feedback=feedback,
-            receipt=decision_receipt,
-            expected_decision=decision_status,
-        )
-        if self._research_material_resolver is None:
-            raise OwnerConflict("research_material_resolver_unavailable")
-        predecessor = self._research_material_resolver.query_asset_version(
-            predecessor_version_ref
-        )
-        materialized = self._research_material_resolver.materialize_asset(
-            predecessor_version_ref
-        )
-        try:
-            predecessor_markdown = materialized.content.decode("utf-8")
-        except (AttributeError, UnicodeDecodeError) as error:
-            raise OwnerConflict("writing_predecessor_version_invalid") from error
-        if (
-            predecessor is None
-            or getattr(predecessor, "version_ref", None) != predecessor_version_ref
-            or getattr(materialized, "memory_ref", None) != predecessor_version_ref
-        ):
-            raise OwnerConflict("writing_predecessor_version_invalid")
-        predecessor_markdown_hash = _writing_markdown_hash(predecessor_markdown)
-        decision_receipt_value = decision_receipt.as_public_dict()
-        decision_receipt_hash = canonical_hash(decision_receipt_value)
-        request_hash = canonical_hash(
-            {
-                "command": "begin_writing_revision",
-                "run_ref": run_ref,
-                "attempt_ref": attempt_ref,
-                "fence_ref": fence_ref,
-                "predecessor_version_ref": predecessor_version_ref,
-                "predecessor_markdown_hash": predecessor_markdown_hash,
-                "feedback": list(feedback),
-                "decision_receipt": decision_receipt.as_public_dict(),
-                "decision_status": decision_status,
-            }
-        )
-        with self._database.write() as connection:
-            replay = _writing_command_replay(
-                connection,
-                idempotency_key,
-                "begin_writing_revision",
-                request_hash,
-            )
-            if replay is None:
-                run = _current_writing_run_row(
-                    connection, run_ref, attempt_ref, fence_ref
-                )
-                execution = connection.execute(
-                    text(
-                        "SELECT execution_ref FROM ar_writing_executions WHERE "
-                        "attempt_ref = :attempt_ref"
-                    ),
-                    {"attempt_ref": attempt_ref},
-                ).first()
-                if execution is None or run.native_session_ref is None:
-                    raise OwnerConflict("writing_revision_predecessor_incomplete")
-                validate_writing_execution_budget(
-                    decoded_object(run.execution_budget_json)
-                )
-                generation = int(run.attempt_generation) + 1
-                replacement_ref = new_ref("writing_attempt")
-                replacement_fence = new_ref("writing_fence")
-                replacement_job_ref = new_ref("writing_job")
-                now = time.time()
-                connection.execute(
-                    text(
-                        "INSERT INTO ar_writing_attempts (attempt_ref, run_ref, "
-                        "generation, root_session_ref, native_session_ref, fence_ref, "
-                        "provider_job_ref, status, predecessor_version_ref, "
-                        "predecessor_markdown_hash, feedback_json, feedback_hash, "
-                        "decision_status, decision_receipt_json, "
-                        "decision_receipt_hash, created_at) VALUES (:attempt_ref, :run_ref, "
-                        ":generation, :root_session_ref, :native_session_ref, "
-                        ":fence_ref, :provider_job_ref, 'admitted', :predecessor_version_ref, "
-                        ":predecessor_markdown_hash, :feedback_json, "
-                        ":feedback_hash, :decision_status, "
-                        ":decision_receipt_json, :decision_receipt_hash, :now)"
-                    ),
-                    {
-                        "attempt_ref": replacement_ref,
-                        "run_ref": run_ref,
-                        "generation": generation,
-                        "root_session_ref": run.root_session_ref,
-                        "native_session_ref": run.native_session_ref,
-                        "fence_ref": replacement_fence,
-                        "provider_job_ref": replacement_job_ref,
-                        "predecessor_version_ref": predecessor_version_ref,
-                        "predecessor_markdown_hash": predecessor_markdown_hash,
-                        "feedback_json": canonical_json(list(feedback)),
-                        "feedback_hash": canonical_hash(list(feedback)),
-                        "decision_status": decision_status,
-                        "decision_receipt_json": canonical_json(
-                            decision_receipt_value
-                        ),
-                        "decision_receipt_hash": decision_receipt_hash,
-                        "now": now,
-                    },
-                )
-                connection.execute(
-                    text(
-                        "UPDATE ar_writing_runs SET attempt_ref = :attempt_ref, "
-                        "attempt_generation = :generation, fence_ref = :fence_ref, "
-                        "predecessor_version_ref = :predecessor_version_ref, "
-                        "feedback_json = :feedback_json, feedback_hash = "
-                        ":feedback_hash, updated_at = :now WHERE run_ref = :run_ref"
-                    ),
-                    {
-                        "attempt_ref": replacement_ref,
-                        "generation": generation,
-                        "fence_ref": replacement_fence,
-                        "predecessor_version_ref": predecessor_version_ref,
-                        "feedback_json": canonical_json(list(feedback)),
-                        "feedback_hash": canonical_hash(list(feedback)),
-                        "now": now,
-                        "run_ref": run_ref,
-                    },
-                )
-                _sync_writing_managed_attempt(
-                    connection,
-                    run_ref=run_ref,
-                    old_attempt_ref=run.attempt_ref,
-                    old_fence_ref=run.fence_ref,
-                    new_attempt_ref=replacement_ref,
-                    new_fence_ref=replacement_fence,
-                    root_session_ref=run.root_session_ref,
-                    preserve_cleanup=False,
-                    now=now,
-                )
-                connection.execute(
-                    text(
-                        "UPDATE agent_runtime_state SET revision = revision + 1, "
-                        "writing_attempt_count = writing_attempt_count + 1 WHERE "
-                        "singleton = 'owner'"
-                    )
-                )
-                self._feed.record(
-                    connection,
-                    "agent_runtime.writing_revision_admitted",
-                    {
-                        "run_ref": run_ref,
-                        "predecessor_attempt_ref": attempt_ref,
-                        "attempt_ref": replacement_ref,
-                        "attempt_generation": generation,
-                        "fence_ref": replacement_fence,
-                        "predecessor_version_ref": predecessor_version_ref,
-                        "decision_receipt_ref": decision_receipt.receipt_ref,
-                    },
-                )
-                _record_writing_command(
-                    connection,
-                    idempotency_key,
-                    "begin_writing_revision",
-                    request_hash,
-                    run_ref,
-                    replacement_ref,
-                )
-        result = self.query_writing_report(run_ref)
-        if result is None:
-            raise OwnerConflict("writing_revision_missing_after_admission")
-        return result
-
-    def control_writing_report(
-        self,
-        run_ref: str,
-        *,
-        action: str,
-        idempotency_key: str,
-        expected_attempt_ref: str | None = None,
-        expected_fence_ref: str | None = None,
-        cancellation_confirmation: dict[str, object] | None = None,
-    ) -> WritingRun:
-        _validate_stage_idempotency_key(idempotency_key)
-        if action not in {"pause", "resume", "cancel"}:
-            raise OwnerConflict("writing_control_action_invalid")
-        request_hash = canonical_hash(
-            {
-                "command": "control_writing_report",
-                "run_ref": run_ref,
-                "action": action,
-                "expected_attempt_ref": expected_attempt_ref,
-                "expected_fence_ref": expected_fence_ref,
-                "cancellation_confirmation": cancellation_confirmation,
-            }
-        )
-        with self._database.write() as connection:
-            replay = _writing_command_replay(
-                connection,
-                idempotency_key,
-                "control_writing_report",
-                request_hash,
-            )
-            if replay is None:
-                run = connection.execute(
-                    text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
-                    {"run_ref": run_ref},
-                ).first()
-                if run is None:
-                    raise OwnerConflict("writing_run_not_found")
-                control = connection.execute(
-                    text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                    {"run_ref": run_ref},
-                ).first()
-                if (
-                    control is None
-                    or control.run_kind != "writing"
-                    or control.attempt_ref != run.attempt_ref
-                    or control.fence_ref != run.fence_ref
-                    or control.root_session_ref != run.root_session_ref
-                ):
-                    raise OwnerConflict("writing_runtime_control_integrity_invalid")
-                if (
-                    expected_attempt_ref is not None
-                    and expected_fence_ref is not None
-                    and (
-                        run.attempt_ref != expected_attempt_ref
-                        or run.fence_ref != expected_fence_ref
-                    )
-                ):
-                    raise OwnerConflict("writing_control_stale")
-                if (expected_attempt_ref is None) != (expected_fence_ref is None):
-                    raise OwnerConflict("writing_control_target_invalid")
-                if action == "cancel":
-                    if (
-                        self._authorization_verifier is None
-                        or not isinstance(cancellation_confirmation, dict)
-                    ):
-                        raise OwnerConflict("writing_cancel_confirmation_required")
-                    try:
-                        confirmation = AcceptanceReceipt(
-                            issuer=cast(str, cancellation_confirmation["issuer"]),
-                            kind=cast(str, cancellation_confirmation["kind"]),
-                            receipt_ref=cast(
-                                str, cancellation_confirmation["receipt_ref"]
-                            ),
-                            subject_ref=cast(
-                                str, cancellation_confirmation["subject_ref"]
-                            ),
-                            payload_hash=cast(
-                                str, cancellation_confirmation["payload_hash"]
-                            ),
-                        )
-                        intent_id = cast(
-                            str, cancellation_confirmation["intent_id"]
-                        )
-                        draft_revision = int(
-                            cancellation_confirmation["draft_revision"]
-                        )
-                        draft_hash = cast(
-                            str, cancellation_confirmation["draft_hash"]
-                        )
-                        preview_ref = cast(
-                            str, cancellation_confirmation["preview_ref"]
-                        )
-                        preview_hash = cast(
-                            str, cancellation_confirmation["preview_hash"]
-                        )
-                    except (KeyError, TypeError, ValueError) as error:
-                        raise OwnerConflict(
-                            "writing_cancel_confirmation_invalid"
-                        ) from error
-                    confirmed = self._authorization_verifier.verify_command_confirmation(
-                        intent_id=intent_id,
-                        command_kind="writing_report_cancel",
-                        draft_revision=draft_revision,
-                        draft_hash=draft_hash,
-                        preview_ref=preview_ref,
-                        preview_hash=preview_hash,
-                        receipt=confirmation,
-                    )
-                    expected = {
-                        "command_kind": "writing_report_cancel",
-                        "payload": {
-                            "quest_ref": run.quest_ref,
-                            "run_ref": run.run_ref,
-                            "attempt_ref": run.attempt_ref,
-                            "fence_ref": run.fence_ref,
-                            "effect": "terminal_cancel_preserve_history",
-                        },
-                    }
-                    if confirmed != expected:
-                        raise OwnerConflict("writing_cancel_confirmation_stale")
-                transitions = {
-                    ("active", "pause"): "paused",
-                    ("paused", "resume"): "active",
-                    ("blocked", "resume"): "active",
-                    ("active", "cancel"): "cancelled",
-                    ("paused", "cancel"): "cancelled",
-                    ("blocked", "cancel"): "cancelled",
-                }
-                target = transitions.get((run.status, action))
-                if target is None:
-                    if (
-                        (run.status == "paused" and action == "pause")
-                        or (run.status == "active" and action == "resume")
-                        or (run.status == "cancelled" and action == "cancel")
-                    ):
-                        target = run.status
-                    elif run.status in {"cancelled", "completed"}:
-                        raise OwnerConflict("writing_run_terminal")
-                    else:
-                        raise OwnerConflict("writing_control_transition_invalid")
-                if target == "active" and control.cleanup_status == "pending":
-                    raise OwnerConflict("runtime_quiescence_pending")
-                now = time.time()
-                if run.status in {"blocked", "paused"} and target == "active":
-                    attempt = connection.execute(
-                        text(
-                            "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
-                            ":attempt_ref"
-                        ),
-                        {"attempt_ref": run.attempt_ref},
-                    ).first()
-                    if attempt is None:
-                        raise OwnerConflict("writing_attempt_integrity_invalid")
-                    if attempt.status in {"failed", "retired"}:
-                        checkpoint = connection.execute(
-                            text(
-                                "SELECT * FROM ar_writing_checkpoints WHERE "
-                                "attempt_ref = :attempt_ref"
-                            ),
-                            {"attempt_ref": run.attempt_ref},
-                        ).first()
-                        replacement_ref = new_ref("writing_attempt")
-                        replacement_fence = new_ref("writing_fence")
-                        replacement_job_ref = new_ref("writing_job")
-                        generation = int(run.attempt_generation) + 1
-                        replacement_status = (
-                            "running" if checkpoint is not None else "admitted"
-                        )
-                        connection.execute(
-                            text(
-                                "INSERT INTO ar_writing_attempts (attempt_ref, "
-                                "run_ref, generation, root_session_ref, "
-                                "native_session_ref, fence_ref, provider_job_ref, status, "
-                                "predecessor_version_ref, predecessor_markdown_hash, "
-                                "feedback_json, feedback_hash, decision_status, "
-                                "decision_receipt_json, decision_receipt_hash, "
-                                "created_at, started_at) VALUES (:attempt_ref, "
-                                ":run_ref, :generation, :root_session_ref, "
-                                ":native_session_ref, :fence_ref, :provider_job_ref, :status, "
-                                ":predecessor_version_ref, "
-                                ":predecessor_markdown_hash, :feedback_json, "
-                                ":feedback_hash, :decision_status, "
-                                ":decision_receipt_json, :decision_receipt_hash, "
-                                ":now, :started_at)"
-                            ),
-                            {
-                                "attempt_ref": replacement_ref,
-                                "run_ref": run_ref,
-                                "generation": generation,
-                                "root_session_ref": run.root_session_ref,
-                                "native_session_ref": run.native_session_ref,
-                                "fence_ref": replacement_fence,
-                                "provider_job_ref": replacement_job_ref,
-                                "status": replacement_status,
-                                "predecessor_version_ref": (
-                                    attempt.predecessor_version_ref
-                                ),
-                                "predecessor_markdown_hash": (
-                                    attempt.predecessor_markdown_hash
-                                ),
-                                "feedback_json": attempt.feedback_json,
-                                "feedback_hash": attempt.feedback_hash,
-                                "decision_status": attempt.decision_status,
-                                "decision_receipt_json": (
-                                    attempt.decision_receipt_json
-                                ),
-                                "decision_receipt_hash": (
-                                    attempt.decision_receipt_hash
-                                ),
-                                "now": now,
-                                "started_at": now if checkpoint is not None else None,
-                            },
-                        )
-                        if checkpoint is not None:
-                            connection.execute(
-                                text(
-                                    "INSERT INTO ar_writing_checkpoints "
-                                    "(checkpoint_ref, run_ref, attempt_ref, "
-                                    "fence_ref, native_session_ref, markdown, "
-                                    "markdown_hash, citations_json, citations_hash, "
-                                    "created_at) VALUES (:checkpoint_ref, :run_ref, "
-                                    ":attempt_ref, :fence_ref, :native_session_ref, "
-                                    ":markdown, :markdown_hash, :citations_json, "
-                                    ":citations_hash, :now)"
-                                ),
-                                {
-                                    "checkpoint_ref": new_ref("writing_checkpoint"),
-                                    "run_ref": run_ref,
-                                    "attempt_ref": replacement_ref,
-                                    "fence_ref": replacement_fence,
-                                    "native_session_ref": checkpoint.native_session_ref,
-                                    "markdown": checkpoint.markdown,
-                                    "markdown_hash": checkpoint.markdown_hash,
-                                    "citations_json": checkpoint.citations_json,
-                                    "citations_hash": checkpoint.citations_hash,
-                                    "now": now,
-                                },
-                            )
-                        connection.execute(
-                            text(
-                                "UPDATE ar_writing_runs SET status = 'active', "
-                                "failure_code = NULL, attempt_ref = :attempt_ref, "
-                                "attempt_generation = :generation, fence_ref = "
-                                ":fence_ref, updated_at = :now WHERE run_ref = "
-                                ":run_ref"
-                            ),
-                            {
-                                "attempt_ref": replacement_ref,
-                                "generation": generation,
-                                "fence_ref": replacement_fence,
-                                "now": now,
-                                "run_ref": run_ref,
-                            },
-                        )
-                        _sync_writing_managed_attempt(
-                            connection,
-                            run_ref=run_ref,
-                            old_attempt_ref=run.attempt_ref,
-                            old_fence_ref=run.fence_ref,
-                            new_attempt_ref=replacement_ref,
-                            new_fence_ref=replacement_fence,
-                            root_session_ref=run.root_session_ref,
-                            preserve_cleanup=False,
-                            now=now,
-                        )
-                        connection.execute(
-                            text(
-                                "UPDATE agent_runtime_state SET revision = revision "
-                                "+ 1, writing_attempt_count = writing_attempt_count "
-                                "+ 1, active_writing_run_count = "
-                                "active_writing_run_count + 1 WHERE singleton = "
-                                "'owner'"
-                            )
-                        )
-                        self._feed.record(
-                            connection,
-                            "agent_runtime.writing_report_resumed",
-                            {
-                                "run_ref": run_ref,
-                                "attempt_ref": replacement_ref,
-                                "fence_ref": replacement_fence,
-                            },
-                        )
-                        target = run.status
-                    else:
-                        connection.execute(
-                            text(
-                                "UPDATE ar_writing_runs SET status = 'active', "
-                                "failure_code = NULL, updated_at = :now WHERE "
-                                "run_ref = :run_ref"
-                            ),
-                            {"now": now, "run_ref": run_ref},
-                        )
-                        connection.execute(
-                            text(
-                                "UPDATE ar_writing_attempts SET failure_code = NULL "
-                                "WHERE attempt_ref = :attempt_ref"
-                            ),
-                            {"attempt_ref": run.attempt_ref},
-                        )
-                        _sync_writing_managed_attempt(
-                            connection,
-                            run_ref=run_ref,
-                            old_attempt_ref=run.attempt_ref,
-                            old_fence_ref=run.fence_ref,
-                            new_attempt_ref=run.attempt_ref,
-                            new_fence_ref=run.fence_ref,
-                            root_session_ref=run.root_session_ref,
-                            preserve_cleanup=False,
-                            now=now,
-                        )
-                        connection.execute(
-                            text(
-                                "UPDATE agent_runtime_state SET revision = revision "
-                                "+ 1, active_writing_run_count = "
-                                "active_writing_run_count + 1 WHERE singleton = "
-                                "'owner'"
-                            )
-                        )
-                        self._feed.record(
-                            connection,
-                            "agent_runtime.writing_report_resumed",
-                            {"run_ref": run_ref, "attempt_ref": run.attempt_ref},
-                        )
-                        target = run.status
-                if target != run.status:
-                    connection.execute(
-                        text(
-                            "UPDATE ar_writing_runs SET status = :status, updated_at = "
-                            ":now WHERE run_ref = :run_ref"
-                        ),
-                        {"status": target, "now": now, "run_ref": run_ref},
-                    )
-                    if target == "cancelled":
-                        connection.execute(
-                            text(
-                                "UPDATE ar_writing_attempts SET status = 'retired', "
-                                "completed_at = COALESCE(completed_at, :now) WHERE "
-                                "attempt_ref = :attempt_ref AND status IN "
-                                "('admitted', 'running', 'paused')"
-                            ),
-                            {"now": now, "attempt_ref": run.attempt_ref},
-                        )
-                    elif target == "paused":
-                        # Pausing retires the execution Fence. A subsequent
-                        # resume creates a successor Attempt so a provider call
-                        # that returns late can never cross RM/RG boundaries.
-                        connection.execute(
-                            text(
-                                "UPDATE ar_writing_attempts SET status = 'retired', "
-                                "completed_at = COALESCE(completed_at, :now) WHERE "
-                                "attempt_ref = :attempt_ref AND status IN "
-                                "('admitted', 'running', 'paused')"
-                            ),
-                            {"now": now, "attempt_ref": run.attempt_ref},
-                        )
-                    _retire_writing_managed_attempt(
-                        connection,
-                        run=run,
-                        managed_status=(
-                            "terminated"
-                            if target == "cancelled"
-                            else "suspended_fenced"
-                        ),
-                        reason_code=(
-                            "writing_cancelled"
-                            if target == "cancelled"
-                            else "writing_paused"
-                        ),
-                        now=now,
-                    )
-                    connection.execute(
-                        text(
-                            "UPDATE agent_runtime_state SET revision = revision + 1, "
-                            "active_writing_run_count = active_writing_run_count - "
-                            ":retired WHERE singleton = 'owner' AND "
-                            "active_writing_run_count >= :retired"
-                        ),
-                        {
-                            "retired": (
-                                1
-                                if target in {"paused", "cancelled"}
-                                and run.status == "active"
-                                else 0
-                            )
-                        },
-                    )
-                    self._feed.record(
-                        connection,
-                        f"agent_runtime.writing_report_{target}",
-                        {"run_ref": run_ref, "attempt_ref": run.attempt_ref},
-                    )
-                _record_writing_command(
-                    connection,
-                    idempotency_key,
-                    "control_writing_report",
-                    request_hash,
-                    run_ref,
-                )
-        result = self.query_writing_report(run_ref)
-        if result is None:
-            raise OwnerConflict("writing_run_not_found")
-        return result
-
-    def _query_writing_report(self, key: str, value: str) -> WritingRun | None:
-        if key not in {"run_ref", "intent_id"} or not value or len(value) > 128:
-            raise OwnerConflict("writing_run_ref_invalid")
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(f"SELECT * FROM ar_writing_runs WHERE {key} = :value"),
-                {"value": value},
-            ).first()
-            attempt_row = (
-                None
-                if row is None
-                else connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": row.attempt_ref},
-                ).first()
-            )
-            checkpoint_row = (
-                None
-                if row is None
-                else connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_checkpoints WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": row.attempt_ref},
-                ).first()
-            )
-            execution_row = (
-                None
-                if row is None
-                else connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_executions WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": row.attempt_ref},
-                ).first()
-            )
-        if row is None:
-            return None
-        try:
-            runtime_value = decoded_object(row.runtime_binding_json)
-            runtime_binding = WritingRuntimeBinding(
-                packaged_skill_bundle_hash=cast(
-                    str, runtime_value["packaged_skill_bundle_hash"]
-                ),
-                instruction_set_hash=cast(str, runtime_value["instruction_set_hash"]),
-                model_ref=cast(str, runtime_value["model_ref"]),
-                harness_adapter_ref=cast(str, runtime_value["harness_adapter_ref"]),
-                mcp_bindings=tuple(cast(list[str], runtime_value["mcp_bindings"])),
-                capability_bindings=tuple(
-                    cast(list[str], runtime_value["capability_bindings"])
-                ),
-                resource_bindings=tuple(
-                    cast(list[str], runtime_value["resource_bindings"])
-                ),
-            )
-            runtime_binding.validate()
-            execution_budget = validate_writing_execution_budget(
-                decoded_object(row.execution_budget_json)
-            )
-        except (KeyError, TypeError, OwnerConflict) as error:
-            raise OwnerConflict("writing_runtime_binding_invalid") from error
-        if canonical_json(runtime_binding.as_dict()) != row.runtime_binding_json:
-            raise OwnerConflict("writing_runtime_binding_invalid")
-        if canonical_hash(runtime_binding.as_dict()) != row.runtime_binding_hash:
-            raise OwnerConflict("writing_runtime_binding_invalid")
-        if (
-            canonical_json(execution_budget) != row.execution_budget_json
-            or canonical_hash(execution_budget) != row.execution_budget_hash
-            or int(row.output_bytes) < 0
-        ):
-            raise OwnerConflict("writing_execution_budget_invalid")
-        try:
-            intent = decoded_object(row.intent_json)
-            snapshot = decoded_object(row.snapshot_json)
-            normalized_intent = normalize_writing_intent(
-                row.document_type, intent
-            )
-            snapshot_without_hash = dict(snapshot)
-            embedded_snapshot_hash = snapshot_without_hash.pop(
-                "snapshot_hash", None
-            )
-        except (TypeError, ValueError, OwnerConflict) as error:
-            raise OwnerConflict("writing_run_integrity_invalid") from error
-        if (
-            normalized_intent != intent
-            or canonical_hash(intent) != row.intent_hash
-            or snapshot.get("quest_ref") != row.quest_ref
-            or snapshot.get("snapshot_ref") != row.snapshot_ref
-            or embedded_snapshot_hash != row.snapshot_hash
-            or canonical_hash(snapshot_without_hash) != row.snapshot_hash
-        ):
-            raise OwnerConflict("writing_run_integrity_invalid")
-        allowed_attempt_statuses = {
-            "active": {"admitted", "running", "completed"},
-            "paused": {"retired", "completed"},
-            "blocked": {"failed", "completed"},
-            "completed": {"completed"},
-            "cancelled": {"retired", "completed", "failed"},
-        }
-        if (
-            attempt_row is None
-            or row.status not in allowed_attempt_statuses
-            or attempt_row.status not in allowed_attempt_statuses[row.status]
-            or attempt_row.run_ref != row.run_ref
-            or int(attempt_row.generation) != int(row.attempt_generation)
-            or attempt_row.root_session_ref != row.root_session_ref
-            or attempt_row.native_session_ref != row.native_session_ref
-            or attempt_row.fence_ref != row.fence_ref
-            or not isinstance(attempt_row.provider_job_ref, str)
-            or not attempt_row.provider_job_ref
-            or len(attempt_row.provider_job_ref) > 96
-        ):
-            raise OwnerConflict("writing_attempt_integrity_invalid")
-        if checkpoint_row is not None and (
-            checkpoint_row.run_ref != row.run_ref
-            or checkpoint_row.attempt_ref != row.attempt_ref
-            or checkpoint_row.fence_ref != row.fence_ref
-            or checkpoint_row.native_session_ref != row.native_session_ref
-        ):
-            raise OwnerConflict("writing_checkpoint_integrity_invalid")
-        if execution_row is not None and (
-            execution_row.run_ref != row.run_ref
-            or execution_row.attempt_ref != row.attempt_ref
-            or execution_row.fence_ref != row.fence_ref
-        ):
-            raise OwnerConflict("writing_execution_integrity_invalid")
-        if (
-            (attempt_row.status == "admitted" and checkpoint_row is not None)
-            or (attempt_row.status == "running" and checkpoint_row is None)
-            or (attempt_row.status == "completed" and execution_row is None)
-            or (execution_row is not None and checkpoint_row is None)
-        ):
-            raise OwnerConflict("writing_attempt_integrity_invalid")
-        checkpoint = _writing_checkpoint_from_row(checkpoint_row)
-        execution = _writing_execution_from_row(execution_row)
-        if checkpoint is not None:
-            _validate_writing_citations_for_snapshot(checkpoint.citations, snapshot)
-        if execution is not None:
-            if checkpoint is None:
-                raise OwnerConflict("writing_attempt_integrity_invalid")
-            _validate_writing_citations_for_snapshot(execution.citations, snapshot)
-            _validate_writing_review_contract(
-                review=execution.review,
-                run=row,
-                attempt=attempt_row,
-                checkpoint=checkpoint,
-                reviewed_markdown=execution.reviewed_markdown,
-                final_markdown=execution.final_markdown,
-                citations=execution.citations,
-                final_hash=execution.final_markdown_hash,
-                citations_hash=execution.citations_hash,
-                allow_legacy_child=True,
-            )
-        try:
-            feedback_value = json.loads(attempt_row.feedback_json)
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise OwnerConflict("writing_feedback_integrity_invalid") from error
-        if not isinstance(feedback_value, list) or any(
-            not isinstance(item, str) for item in feedback_value
-        ) or canonical_hash(feedback_value) != attempt_row.feedback_hash:
-            raise OwnerConflict("writing_feedback_integrity_invalid")
-        decision_receipt = None
-        if attempt_row.decision_receipt_json is not None:
-            try:
-                receipt_value = decoded_object(attempt_row.decision_receipt_json)
-                if (
-                    canonical_hash(receipt_value)
-                    != attempt_row.decision_receipt_hash
-                ):
-                    raise OwnerConflict("writing_revision_lineage_invalid")
-                decision_receipt = _writing_receipt_from_value(receipt_value)
-            except (TypeError, KeyError, OwnerConflict) as error:
-                raise OwnerConflict("writing_revision_lineage_invalid") from error
-        if (
-            row.predecessor_version_ref != attempt_row.predecessor_version_ref
-            or row.feedback_json != attempt_row.feedback_json
-            or row.feedback_hash != attempt_row.feedback_hash
-            or bool(attempt_row.predecessor_version_ref)
-            != bool(feedback_value)
-            or bool(attempt_row.predecessor_version_ref)
-            != bool(attempt_row.predecessor_markdown_hash)
-            or bool(attempt_row.predecessor_version_ref)
-            != bool(decision_receipt)
-            or (
-                attempt_row.decision_status is not None
-                and attempt_row.decision_status not in {"accepted", "rejected"}
-            )
-        ):
-            raise OwnerConflict("writing_revision_lineage_invalid")
-        return WritingRun(
-            run_ref=row.run_ref,
-            intent_id=row.intent_id,
-            quest_ref=row.quest_ref,
-            document_type=row.document_type,
-            status=row.status,
-            attempt_ref=row.attempt_ref,
-            attempt_generation=int(row.attempt_generation),
-            root_session_ref=row.root_session_ref,
-            native_session_ref=row.native_session_ref,
-            fence_ref=row.fence_ref,
-            provider_job_ref=attempt_row.provider_job_ref,
-            runtime_binding=runtime_binding,
-            runtime_binding_hash=row.runtime_binding_hash,
-            execution_budget=execution_budget,
-            output_bytes=int(row.output_bytes),
-            failure_code=row.failure_code,
-            checkpoint=checkpoint,
-            execution=execution,
-            predecessor_version_ref=row.predecessor_version_ref,
-            predecessor_markdown_hash=attempt_row.predecessor_markdown_hash,
-            feedback=tuple(feedback_value),
-            decision_status=attempt_row.decision_status,
-            decision_receipt=decision_receipt,
-        )
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
@@ -9217,125 +7164,140 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> dict[str, object]:
         """Register one server-derived Acquisition or Companion provider task."""
 
+        with self._database.fenced_write() as connection:
+            return self._register_external_root_task_scope(
+                connection,
+                root_kind=root_kind,
+                root_runtime_scope=root_runtime_scope,
+            )
+
+    def _register_external_root_task_scope(
+        self,
+        connection,
+        *,
+        root_kind: RootAgentKind,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]:
+        """Register the same scope inside the caller's fenced transaction."""
+
         scope = _validated_external_root_task_scope(
             root_kind=root_kind,
             root_runtime_scope=root_runtime_scope,
         )
         now = time.time()
-        with self._database.fenced_write() as connection:
-            registration_status = "running"
-            terminal_reason = None
-            if root_kind == "acquisition":
-                acquisition = connection.execute(
-                    text(
-                        "SELECT sessions.status AS session_status, "
-                        "sessions.reason_code AS session_reason_code, "
-                        "requests.status AS request_status, "
-                        "requests.attempt_count FROM ar_acquisition_sessions AS "
-                        "sessions JOIN ar_acquisition_requests AS requests ON "
-                        "requests.session_ref = sessions.session_ref WHERE "
-                        "sessions.session_ref = :session_ref AND "
-                        "requests.request_id = :request_id"
-                    ),
-                    {
-                        "session_ref": scope["root_session_ref"],
-                        "request_id": scope["run_ref"],
-                    },
-                ).first()
-                if (
-                    acquisition is not None
-                    and acquisition.session_status == "cancelled"
-                    and acquisition.session_reason_code == "quest_deleted"
-                    and acquisition.request_status == "missing"
-                    and int(acquisition.attempt_count) == scope["generation"]
-                ):
-                    registration_status = "terminated"
-                    terminal_reason = "acquisition_session_cancelled"
-            existing = connection.execute(
-                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                {"run_ref": scope["run_ref"]},
-            ).first()
-            if existing is not None:
-                try:
-                    _assert_external_root_task_scope_row(
-                        existing,
-                        root_kind=root_kind,
-                        scope=scope,
-                    )
-                except OwnerConflict:
-                    if not _external_root_task_scope_can_advance(
-                        existing,
-                        root_kind=root_kind,
-                        scope=scope,
-                    ):
-                        raise
-                    advanced = connection.execute(
-                        text(
-                            "UPDATE ar_run_controls SET status = 'running', "
-                            "attempt_ref = :attempt_ref, fence_ref = :fence_ref, "
-                            "attempt_generation = :generation, control_revision = "
-                            "control_revision + 1, safe_point_ref = NULL, "
-                            "terminal_reason = NULL, updated_at = :now WHERE "
-                            "run_ref = :run_ref AND run_kind = :run_kind AND "
-                            "status IN ('running', 'completed') AND "
-                            "attempt_generation = :prior_generation"
-                        ),
-                        {
-                            **scope,
-                            "run_kind": root_kind,
-                            "prior_generation": int(scope["generation"]) - 1,
-                            "now": now,
-                        },
-                    )
-                    if int(advanced.rowcount or 0) != 1:
-                        raise OwnerConflict("external_root_task_scope_conflict")
-                    self._feed.record(
-                        connection,
-                        "agent_runtime.external_root_task_advanced",
-                        {
-                            "root_kind": root_kind,
-                            "root_runtime_scope": scope,
-                        },
-                    )
-                    existing = connection.execute(
-                        text(
-                            "SELECT * FROM ar_run_controls WHERE run_ref = "
-                            ":run_ref"
-                        ),
-                        {"run_ref": scope["run_ref"]},
-                    ).one()
-                return _external_root_task_scope_document(existing)
-            connection.execute(
+        registration_status = "running"
+        terminal_reason = None
+        if root_kind == "acquisition":
+            acquisition = connection.execute(
                 text(
-                    "INSERT INTO ar_run_controls (run_ref, run_kind, quest_ref, "
-                    "cycle_ref, epoch, status, attempt_ref, root_session_ref, "
-                    "fence_ref, control_revision, safe_point_ref, terminal_reason, "
-                    "cleanup_status, runtime_binding_hash, attempt_generation, "
-                    "updated_at) VALUES (:run_ref, :run_kind, :quest_ref, NULL, "
-                    "NULL, :status, :attempt_ref, :root_session_ref, :fence_ref, "
-                    "1, NULL, :terminal_reason, 'none', :runtime_binding_hash, "
-                    ":generation, :now)"
+                    "SELECT sessions.status AS session_status, "
+                    "sessions.reason_code AS session_reason_code, "
+                    "requests.status AS request_status, "
+                    "requests.attempt_count FROM ar_acquisition_sessions AS "
+                    "sessions JOIN ar_acquisition_requests AS requests ON "
+                    "requests.session_ref = sessions.session_ref WHERE "
+                    "sessions.session_ref = :session_ref AND "
+                    "requests.request_id = :request_id"
                 ),
                 {
-                    **scope,
-                    "run_kind": root_kind,
-                    "status": registration_status,
-                    "terminal_reason": terminal_reason,
-                    "now": now,
+                    "session_ref": scope["root_session_ref"],
+                    "request_id": scope["run_ref"],
                 },
-            )
-            self._feed.record(
-                connection,
-                "agent_runtime.external_root_task_registered",
-                {
-                    "root_kind": root_kind,
-                    "root_runtime_scope": scope,
-                },
-            )
-            row = connection.execute(
-                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                {"run_ref": scope["run_ref"]},
-            ).one()
+            ).first()
+            if (
+                acquisition is not None
+                and acquisition.session_status == "cancelled"
+                and acquisition.session_reason_code == "quest_deleted"
+                and acquisition.request_status == "missing"
+                and int(acquisition.attempt_count) == scope["generation"]
+            ):
+                registration_status = "terminated"
+                terminal_reason = "acquisition_session_cancelled"
+        existing = connection.execute(
+            text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+            {"run_ref": scope["run_ref"]},
+        ).first()
+        if existing is not None:
+            try:
+                _assert_external_root_task_scope_row(
+                    existing,
+                    root_kind=root_kind,
+                    scope=scope,
+                )
+            except OwnerConflict:
+                if not _external_root_task_scope_can_advance(
+                    existing,
+                    root_kind=root_kind,
+                    scope=scope,
+                ):
+                    raise
+                advanced = connection.execute(
+                    text(
+                        "UPDATE ar_run_controls SET status = 'running', "
+                        "attempt_ref = :attempt_ref, fence_ref = :fence_ref, "
+                        "attempt_generation = :generation, control_revision = "
+                        "control_revision + 1, safe_point_ref = NULL, "
+                        "terminal_reason = NULL, updated_at = :now WHERE "
+                        "run_ref = :run_ref AND run_kind = :run_kind AND "
+                        "status IN ('running', 'completed') AND "
+                        "attempt_generation = :prior_generation"
+                    ),
+                    {
+                        **scope,
+                        "run_kind": root_kind,
+                        "prior_generation": int(scope["generation"]) - 1,
+                        "now": now,
+                    },
+                )
+                if int(advanced.rowcount or 0) != 1:
+                    raise OwnerConflict("external_root_task_scope_conflict")
+                self._feed.record(
+                    connection,
+                    "agent_runtime.external_root_task_advanced",
+                    {
+                        "root_kind": root_kind,
+                        "root_runtime_scope": scope,
+                    },
+                )
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM ar_run_controls WHERE run_ref = "
+                        ":run_ref"
+                    ),
+                    {"run_ref": scope["run_ref"]},
+                ).one()
+            return _external_root_task_scope_document(existing)
+        connection.execute(
+            text(
+                "INSERT INTO ar_run_controls (run_ref, run_kind, quest_ref, "
+                "cycle_ref, epoch, status, attempt_ref, root_session_ref, "
+                "fence_ref, control_revision, safe_point_ref, terminal_reason, "
+                "cleanup_status, runtime_binding_hash, attempt_generation, "
+                "updated_at) VALUES (:run_ref, :run_kind, :quest_ref, NULL, "
+                "NULL, :status, :attempt_ref, :root_session_ref, :fence_ref, "
+                "1, NULL, :terminal_reason, 'none', :runtime_binding_hash, "
+                ":generation, :now)"
+            ),
+            {
+                **scope,
+                "run_kind": root_kind,
+                "status": registration_status,
+                "terminal_reason": terminal_reason,
+                "now": now,
+            },
+        )
+        self._feed.record(
+            connection,
+            "agent_runtime.external_root_task_registered",
+            {
+                "root_kind": root_kind,
+                "root_runtime_scope": scope,
+            },
+        )
+        row = connection.execute(
+            text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+            {"run_ref": scope["run_ref"]},
+        ).one()
         return _external_root_task_scope_document(row)
 
     def complete_external_root_task_scope(
@@ -9569,14 +7531,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "attempts.attempt_ref = runs.current_attempt_ref WHERE "
                 "runs.run_ref = :run_ref"
             )
-        elif run_kind == "writing":
-            source_query = (
-                "SELECT runs.runtime_binding_hash, runs.attempt_ref, "
-                "runs.root_session_ref, runs.fence_ref, attempts.generation, "
-                "runs.quest_ref FROM ar_writing_runs AS runs JOIN "
-                "ar_writing_attempts AS attempts ON attempts.attempt_ref = "
-                "runs.attempt_ref WHERE runs.run_ref = :run_ref"
-            )
         elif run_kind in {"acquisition", "companion"}:
             generation = managed.get("attempt_generation")
             quest_ref = managed.get("quest_ref")
@@ -9586,10 +7540,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or not isinstance(generation, int)
                 or isinstance(generation, bool)
                 or generation < 1
-                or not isinstance(quest_ref, str)
-                or not quest_ref
+                or (not (run_kind == "acquisition" and quest_ref is None)
+                    and (not isinstance(quest_ref, str) or not quest_ref))
             ):
                 raise OwnerConflict("root_agent_human_request_scope_stale")
+            if run_kind == "acquisition":
+                session = self.query_acquisition_session(session_ref=root_session_ref)
+                if session is None or session.quest_ref != quest_ref:
+                    raise OwnerConflict("root_agent_human_request_scope_stale")
             return {
                 "run_kind": run_kind,
                 "quest_ref": quest_ref,
@@ -9617,11 +7575,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or int(source.generation) < 1
         ):
             raise OwnerConflict("root_agent_human_request_scope_stale")
-        quest_ref = (
-            source.quest_ref
-            if run_kind == "writing"
-            else managed.get("quest_ref")
-        )
+        quest_ref = managed.get("quest_ref")
         verified_scope = {
             "run_kind": run_kind,
             "quest_ref": quest_ref,
@@ -9652,6 +7606,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 raise OwnerConflict("deepfetch_acquisition_binding_invalid")
             verified_scope["acquisition_session_ref"] = session.session_ref
             verified_scope["literature_access_mode"] = session.mode
+            # The HC request binding above proves this initialization, including
+            # before a Quest exists. It is runtime authority, not Agent input.
+            verified_scope["initialization_id"] = session.initialization_id
         return verified_scope
 
     def _yield_operation_for_human_request(
@@ -9670,7 +7627,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             "reasoning",
             "target",
             "deepfetch",
-            "writing",
             "acquisition",
             "companion",
         }:
@@ -10134,146 +8090,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             except RuntimeProtectionUnavailable as error:
                 raise OwnerConflict(error.code) from error
 
-    def record_writing_provider_not_started(
-        self,
-        *,
-        unit_ref: str,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        reason_code: str,
-    ) -> None:
-        """Close an exact Writing claim whose OS hold failed before invocation."""
-
-        if not _is_runtime_protection_blocker(reason_code):
-            raise OwnerConflict("writing_runtime_protection_wait_invalid")
-        now = time.time()
-        effect: RuntimeEffectIdentity | None = None
-        checkpoint_ref: str | None = None
-        with self._database.write() as connection:
-            run = connection.execute(
-                text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
-                {"run_ref": run_ref},
-            ).first()
-            attempt = connection.execute(
-                text(
-                    "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
-                    ":attempt_ref"
-                ),
-                {"attempt_ref": attempt_ref},
-            ).first()
-            control = connection.execute(
-                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                {"run_ref": run_ref},
-            ).first()
-            unit = connection.execute(
-                text("SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"),
-                {"unit_ref": unit_ref},
-            ).first()
-            if (
-                run is None
-                or attempt is None
-                or control is None
-                or unit is None
-                or run.status != "active"
-                or run.attempt_ref != attempt_ref
-                or run.fence_ref != fence_ref
-                or attempt.run_ref != run_ref
-                or attempt.fence_ref != fence_ref
-                or attempt.status not in {"admitted", "running"}
-                or control.run_kind != "writing"
-                or control.status != "running"
-                or control.attempt_ref != attempt_ref
-                or control.fence_ref != fence_ref
-                or unit.run_ref != run_ref
-                or unit.attempt_ref != attempt_ref
-                or unit.fence_ref != fence_ref
-                or unit.unit_kind not in _PROVIDER_UNIT_KINDS
-                or _PROVIDER_UNIT_RUN_KINDS[unit.unit_kind] != "writing"
-                or unit.operation_ref != attempt.provider_job_ref
-                or unit.status != "active"
-            ):
-                raise OwnerConflict("writing_runtime_protection_wait_stale")
-            effect = _provider_runtime_effect(
-                unit_ref=str(unit.unit_ref),
-                operation_ref=str(unit.operation_ref),
-                run_ref=run_ref,
-                attempt_ref=attempt_ref,
-                fence_ref=fence_ref,
-                claim_started_at=float(unit.started_at),
-            )
-            responsibility = connection.execute(
-                text(
-                    "SELECT status, reason_code FROM ar_execution_responsibilities "
-                    "WHERE responsibility_ref = :responsibility_ref"
-                ),
-                {"responsibility_ref": effect.responsibility_ref},
-            ).first()
-            if (
-                responsibility is None
-                or responsibility.status != "waiting"
-                or responsibility.reason_code != reason_code
-            ):
-                raise OwnerConflict("writing_runtime_protection_wait_unverified")
-            checkpoint_ref = "writing_not_started_" + canonical_hash(
-                {
-                    "unit_ref": unit.unit_ref,
-                    "operation_ref": unit.operation_ref,
-                    "attempt_ref": attempt_ref,
-                    "fence_ref": fence_ref,
-                    "claim_started_at": float(unit.started_at),
-                    "reason_code": reason_code,
-                }
-            )
-            connection.execute(
-                text(
-                    "UPDATE ar_provider_units SET status = 'completed', "
-                    "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
-                    "'active'"
-                ),
-                {"now": now, "unit_ref": unit_ref},
-            )
-            try:
-                record_runtime_boundary(
-                    connection,
-                    identity=effect,
-                    boundary="checkpoint",
-                    checkpoint_ref=checkpoint_ref,
-                    owner_evidence_ref="writing_provider_not_started_"
-                    + canonical_hash(
-                        {
-                            "run_ref": run_ref,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                            "unit_ref": unit_ref,
-                            "reason_code": reason_code,
-                        }
-                    ),
-                )
-            except RuntimeProtectionUnavailable as error:
-                raise OwnerConflict(error.code) from error
-            self._feed.record(
-                connection,
-                "agent_runtime.writing_runtime_protection_waiting",
-                {
-                    "run_ref": run_ref,
-                    "attempt_ref": attempt_ref,
-                    "fence_ref": fence_ref,
-                    "unit_ref": unit_ref,
-                    "reason_code": reason_code,
-                },
-            )
-        assert effect is not None and checkpoint_ref is not None
-        if self._runtime_protection is None:
-            raise OwnerConflict("runtime_protection_unavailable")
-        try:
-            self._runtime_protection.finish(
-                effect.responsibility_ref,
-                boundary="checkpoint",
-                checkpoint_ref=checkpoint_ref,
-            )
-        except RuntimeProtectionUnavailable as error:
-            raise OwnerConflict(error.code) from error
 
     def record_stage_provider_hard_ceiling(
         self,
@@ -11553,7 +9369,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         protected_boundaries: list[
             tuple[RuntimeEffectIdentity, str, str | None]
         ] = []
-        recover_interrupted_writing = False
         with self._database.write() as connection:
             unit = connection.execute(
                 text(
@@ -11695,12 +9510,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     ),
                     {"run_ref": run_ref},
                 ).first()
-                recover_interrupted_writing = bool(
-                    control is not None
-                    and control.run_kind == "writing"
-                    and control.status == "reconciliation_required"
-                    and control.terminal_reason == "writing_operation_timeout"
-                )
             if self._runtime_protection is not None:
                 effect = _provider_runtime_effect(
                     unit_ref=str(unit.unit_ref),
@@ -11839,8 +9648,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     )
                 except RuntimeProtectionUnavailable as error:
                     raise OwnerConflict(error.code) from error
-        if recover_interrupted_writing:
-            self._recover_interrupted_writing(run_ref=run_ref)
 
     def reconcile_pending_provider_cleanup(
         self,
@@ -14095,6 +11902,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             session_ref=session_ref,
             generation=generation,
         )
+        root_scope = _acquisition_root_runtime_scope(
+            quest_ref=None if existing_session is None else existing_session.quest_ref,
+            session_ref=session_ref, runtime_binding_hash=runtime_binding_hash,
+            generation=generation, effect=protection_effect)
+        self.register_external_root_task_scope(root_kind="acquisition", root_runtime_scope=root_scope)
+        provider_request = replace(provider_request, root_runtime_scope=root_scope)
         protection_ready = True
         if self._runtime_protection is not None:
             try:
@@ -14258,6 +12071,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         session = self.query_acquisition_session(session_ref=session_ref)
         assert session is not None
         self._reconcile_acquisition_human_requests(session_ref)
+        if final_status == "ready":
+            self.complete_external_root_task_scope(root_kind="acquisition", root_runtime_scope=root_scope)
         return session
 
     def query_acquisition_session(
@@ -14844,8 +12659,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if waiter.get("status") == "consumed":
             open_effect = cast(dict[str, object], request["open_effect"])
             consumed_binding = open_effect.get("operation_binding")
-            if isinstance(consumed_binding, dict):
-                self._recover_writing_after_human_request(consumed_binding)
             return request
 
         binding = self._verify_root_human_request_operation_binding(request, waiter)
@@ -14988,7 +12801,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     operation_binding=binding,
                     request_ref=request_ref,
                 )
-            self._recover_writing_after_human_request(binding)
         return self.query_human_request(request_ref)
 
     def consume_system_operation_help_waiter(
@@ -15063,44 +12875,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             and operation.outcome_code == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
         )
 
-    def _recover_writing_after_human_request(
-        self, operation_binding: dict[str, object]
-    ) -> None:
-        """Rotate only a Writing Fence proven dead while its HR was open."""
-
-        if operation_binding.get("root_kind") != "writing":
-            return
-        required = ("task_ref", "attempt_ref", "fence_ref")
-        if any(
-            not isinstance(operation_binding.get(name), str)
-            or not operation_binding.get(name)
-            for name in required
-        ):
-            raise OwnerConflict("root_human_request_operation_binding_invalid")
-        with self._database.read() as connection:
-            interrupted = connection.execute(
-                text(
-                    "SELECT units.unit_ref FROM ar_provider_units AS units JOIN "
-                    "ar_run_controls AS controls ON controls.run_ref = units.run_ref "
-                    "JOIN ar_fence_revocations AS revocations ON "
-                    "revocations.fence_ref = units.fence_ref AND "
-                    "revocations.run_ref = units.run_ref WHERE units.run_ref = "
-                    ":run_ref AND units.attempt_ref = :attempt_ref AND "
-                    "units.fence_ref = :fence_ref AND units.status = "
-                    "'revocation_pending' AND controls.status = 'running' AND "
-                    "controls.attempt_ref = units.attempt_ref AND "
-                    "controls.fence_ref = units.fence_ref LIMIT 1"
-                ),
-                {
-                    "run_ref": operation_binding["task_ref"],
-                    "attempt_ref": operation_binding["attempt_ref"],
-                    "fence_ref": operation_binding["fence_ref"],
-                },
-            ).first()
-        if interrupted is not None:
-            self._recover_interrupted_writing(
-                run_ref=cast(str, operation_binding["task_ref"])
-            )
 
     def recover_root_human_requests(self) -> None:
         """Replay durable Responses whose operation-scoped lifecycle is incomplete."""
@@ -15161,7 +12935,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             "reasoning",
             "target",
             "deepfetch",
-            "writing",
             "acquisition",
             "companion",
         }:
@@ -15269,10 +13042,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
             if (
                 facts.get("route") != "institutional_browser_reconnected"
-                or not isinstance(quest_ref, str)
+                or not isinstance(operation_binding, dict)
             ):
                 return None
-            session = self.query_acquisition_session(quest_ref=quest_ref)
+            session = (
+                self.query_acquisition_session(session_ref=str(operation_binding["root_session_ref"]))
+                if operation_binding.get("root_kind") == "acquisition"
+                else self.query_acquisition_session(quest_ref=quest_ref)
+                if isinstance(quest_ref, str) else None)
             if session is None:
                 return None
             preflight_ref = _acquisition_preflight_runtime_effect(
@@ -15807,11 +13584,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
             self._finish_recorded_acquisition_boundary(terminal_effect)
             managed = self.query_managed_run(request.request_id)
-            if (
-                managed is not None
-                and isinstance(waiting.quest_ref, str)
-                and waiting.quest_ref
-            ):
+            if managed is not None:
                 terminal_scope = _acquisition_root_runtime_scope(
                     quest_ref=waiting.quest_ref,
                     session_ref=session_ref,
@@ -15846,8 +13619,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if (
             waiting is not None
             and waiting.status == "waiting_user"
-            and isinstance(waiting.quest_ref, str)
-            and waiting.quest_ref
         ):
             suspended = self.query_managed_run(request.request_id)
             if suspended is not None and suspended.get("status") == "suspended":
@@ -15995,7 +13766,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         previous_results: tuple[AcquisitionItemResult, ...] = ()
         reconcile_only = False
         new_request = False
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             session_row = connection.execute(
                 text(
                     "SELECT * FROM ar_acquisition_sessions WHERE "
@@ -16230,6 +14001,29 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "route_policy": request.route_policy,
                 },
             )
+            # The durable claim and its scope must commit together. A binding
+            # rejection or interrupted registration must not consume an attempt.
+            protection_effect = _acquisition_runtime_effect(
+                session_ref=session_ref,
+                request_id=request.request_id,
+                attempt_count=attempt_count,
+            )
+            root_runtime_scope: dict[str, object] | None = None
+            if session_row.quest_ref is None or isinstance(session_row.quest_ref, str):
+                root_runtime_scope = _acquisition_root_runtime_scope(
+                    quest_ref=session_row.quest_ref,
+                    session_ref=session_ref,
+                    runtime_binding_hash=runtime_binding_hash,
+                    generation=attempt_count,
+                    effect=protection_effect,
+                )
+                registered_root = self._register_external_root_task_scope(
+                    connection,
+                    root_kind="acquisition",
+                    root_runtime_scope=root_runtime_scope,
+                )
+                if registered_root["status"] != "running":
+                    raise OwnerConflict("acquisition_request_fence_stale")
             browser_context_ref = (
                 None
                 if session_row.browser_context_ref is None
@@ -16273,26 +14067,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             for paper in provider_request.papers
             if new_request or paper.paper_id in affected_ids
         )
-        protection_effect = _acquisition_runtime_effect(
-            session_ref=session_ref,
-            request_id=request.request_id,
-            attempt_count=attempt_count,
-        )
-        root_runtime_scope: dict[str, object] | None = None
-        if isinstance(session_row.quest_ref, str) and session_row.quest_ref:
-            root_runtime_scope = _acquisition_root_runtime_scope(
-                quest_ref=str(session_row.quest_ref),
-                session_ref=session_ref,
-                runtime_binding_hash=runtime_binding_hash,
-                generation=attempt_count,
-                effect=protection_effect,
-            )
-            registered_root = self.register_external_root_task_scope(
-                root_kind="acquisition",
-                root_runtime_scope=root_runtime_scope,
-            )
-            if registered_root["status"] != "running":
-                raise OwnerConflict("acquisition_request_fence_stale")
         attempt_request = replace(
             provider_request,
             papers=affected_papers,
@@ -16329,6 +14103,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         outcome_resolved = False
         operation_terminal = False
         try:
+            # Cancellation can arrive after the atomic claim while the runtime
+            # hold is being acquired. Reuse the exact scope fence before effects.
+            if root_runtime_scope is not None:
+                self.verify_root_agent_runtime_scope(
+                    root_kind="acquisition",
+                    run_ref=cast(str, root_runtime_scope["run_ref"]),
+                    attempt_ref=cast(str, root_runtime_scope["attempt_ref"]),
+                    root_session_ref=cast(
+                        str, root_runtime_scope["root_session_ref"]
+                    ),
+                    fence_ref=cast(str, root_runtime_scope["fence_ref"]),
+                    runtime_binding_hash=cast(
+                        str, root_runtime_scope["runtime_binding_hash"]
+                    ),
+                )
             reconcile = getattr(provider, "reconcile", None)
             if (
                 resume_route is not None
@@ -17400,6 +15189,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             creation_context_ref=request.creation_context_ref,
             quest_ref=request.quest_ref,
             literature_access_mode=verified_acquisition_session.mode,
+            previous_job_ref=(
+                str(existing.provider_operation_ref)
+                if existing is not None and not reconcile_only
+                and existing.provider_operation_ref != job_ref
+                and existing.runtime_binding_hash == runtime_binding_hash
+                else None
+            ),
         )
         try:
             self.begin_provider_unit(
@@ -17815,7 +15611,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> bool:
         """Keep only a native Session checkpoint after an explicit HR yield."""
 
-        if root_kind not in FORMAL_STAGES | {"writing"}:
+        if root_kind not in FORMAL_STAGES:
             return False
         now = time.time()
         with self._database.write() as connection:
@@ -17873,188 +15669,94 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             if len(matches) != 1:
                 return False
 
-            if root_kind == "writing":
-                if phase not in {"writing-primary", "writing-review"}:
-                    return False
-                run = connection.execute(
-                    text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
-                    {"run_ref": run_ref},
-                ).first()
-                attempt = connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
-                        ":attempt_ref AND run_ref = :run_ref"
-                    ),
-                    {"attempt_ref": attempt_ref, "run_ref": run_ref},
-                ).first()
-                checkpoint = connection.execute(
-                    text(
-                        "SELECT checkpoint_ref FROM ar_writing_checkpoints WHERE "
-                        "attempt_ref = :attempt_ref"
-                    ),
-                    {"attempt_ref": attempt_ref},
-                ).first()
-                execution = connection.execute(
-                    text(
-                        "SELECT execution_ref FROM ar_writing_executions WHERE "
-                        "attempt_ref = :attempt_ref"
-                    ),
-                    {"attempt_ref": attempt_ref},
-                ).first()
-                unit = connection.execute(
-                    text(
-                        "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref "
-                        "AND attempt_ref = :attempt_ref AND fence_ref = "
-                        ":fence_ref AND unit_kind = :unit_kind AND status = 'active'"
-                    ),
-                    {
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "fence_ref": fence_ref,
-                        "unit_kind": phase.replace("-", "_"),
-                    },
-                ).first()
-                primary_pending = phase == "writing-primary" and checkpoint is None
-                review_pending = phase == "writing-review" and checkpoint is not None
-                if (
-                    run is None
-                    or attempt is None
-                    or execution is not None
-                    or unit is None
-                    or not (primary_pending or review_pending)
-                    or control.run_kind != "writing"
-                    or run.status != "active"
-                    or run.attempt_ref != attempt_ref
-                    or run.root_session_ref != control.root_session_ref
-                    or run.fence_ref != fence_ref
-                    or run.runtime_binding_hash != runtime_binding_hash
-                    or run.native_session_ref not in {None, native_session_ref}
-                    or attempt.status not in {"admitted", "running"}
-                    or attempt.root_session_ref != run.root_session_ref
-                    or attempt.fence_ref != fence_ref
-                    or attempt.native_session_ref not in {None, native_session_ref}
-                    or (
-                        unit.operation_ref != attempt.provider_job_ref
-                        and not _is_root_human_request_continuation_ref(
-                            unit.operation_ref
-                        )
+            autonomous_resume = (
+                root_kind == "reasoning" and phase == "autonomous-resume"
+            )
+            if phase not in {"primary", "review"} and not autonomous_resume:
+                return False
+            provider_phase = "review" if autonomous_resume else phase
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref
+            )
+            invocation = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_provider_invocations WHERE "
+                    "attempt_ref = :attempt_ref AND phase = :phase"
+                ),
+                {"attempt_ref": attempt_ref, "phase": provider_phase},
+            ).first()
+            unit = connection.execute(
+                text(
+                    "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref "
+                    "AND attempt_ref = :attempt_ref AND fence_ref = :fence_ref "
+                    "AND unit_kind = :unit_kind AND status = 'active'"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "unit_kind": f"{root_kind}_{provider_phase}",
+                },
+            ).first()
+            primary_pending = (
+                phase == "primary" and attempt.primary_draft_json is None
+            )
+            review_pending = (
+                phase == "review"
+                and attempt.primary_draft_json is not None
+                and attempt.submission_ref is None
+            )
+            autonomous_resume_pending = (
+                autonomous_resume
+                and attempt.submission_ref is None
+                and _reasoning_autonomous_checkpoint(run, attempt, session)
+                is not None
+            )
+            if (
+                control.run_kind != f"{root_kind}_stage"
+                or run.stage != root_kind
+                or run.status != "running"
+                or run.current_attempt_ref != attempt_ref
+                or run.current_fence_ref != fence_ref
+                or run.runtime_binding_hash != runtime_binding_hash
+                or attempt.status != "running"
+                or not (
+                    primary_pending
+                    or review_pending
+                    or autonomous_resume_pending
+                )
+                or fence.status != "current"
+                or session.status != "active"
+                or session.native_session_ref not in {None, native_session_ref}
+                or invocation is None
+                or invocation.status != "prepared"
+                or invocation.response_hash is not None
+                or unit is None
+                or (
+                    unit.operation_ref != invocation.operation_ref
+                    and not _is_root_human_request_continuation_ref(
+                        unit.operation_ref
                     )
-                ):
-                    return False
+                )
+                or unit.unit_kind != f"{root_kind}_{provider_phase}"
+                or unit.status != "active"
+            ):
+                return False
+            try:
                 connection.execute(
                     text(
-                        "UPDATE ar_writing_runs SET native_session_ref = "
-                        ":native_session_ref, updated_at = :now WHERE run_ref = "
-                        ":run_ref"
+                        "UPDATE ar_stage_sessions SET native_session_ref = "
+                        ":native_session_ref, updated_at = :now WHERE "
+                        "session_ref = :session_ref"
                     ),
                     {
                         "native_session_ref": native_session_ref,
                         "now": now,
-                        "run_ref": run_ref,
+                        "session_ref": session.session_ref,
                     },
                 )
-                connection.execute(
-                    text(
-                        "UPDATE ar_writing_attempts SET native_session_ref = "
-                        ":native_session_ref, status = 'running', started_at = "
-                        "COALESCE(started_at, :now) WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {
-                        "native_session_ref": native_session_ref,
-                        "now": now,
-                        "attempt_ref": attempt_ref,
-                    },
-                )
-            else:
-                autonomous_resume = (
-                    root_kind == "reasoning" and phase == "autonomous-resume"
-                )
-                if phase not in {"primary", "review"} and not autonomous_resume:
-                    return False
-                provider_phase = "review" if autonomous_resume else phase
-                run, attempt, session, fence = _load_stage_fence(
-                    connection, run_ref, attempt_ref, fence_ref
-                )
-                invocation = connection.execute(
-                    text(
-                        "SELECT * FROM ar_stage_provider_invocations WHERE "
-                        "attempt_ref = :attempt_ref AND phase = :phase"
-                    ),
-                    {"attempt_ref": attempt_ref, "phase": provider_phase},
-                ).first()
-                unit = connection.execute(
-                    text(
-                        "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref "
-                        "AND attempt_ref = :attempt_ref AND fence_ref = :fence_ref "
-                        "AND unit_kind = :unit_kind AND status = 'active'"
-                    ),
-                    {
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "fence_ref": fence_ref,
-                        "unit_kind": f"{root_kind}_{provider_phase}",
-                    },
-                ).first()
-                primary_pending = (
-                    phase == "primary" and attempt.primary_draft_json is None
-                )
-                review_pending = (
-                    phase == "review"
-                    and attempt.primary_draft_json is not None
-                    and attempt.submission_ref is None
-                )
-                autonomous_resume_pending = (
-                    autonomous_resume
-                    and attempt.submission_ref is None
-                    and _reasoning_autonomous_checkpoint(run, attempt, session)
-                    is not None
-                )
-                if (
-                    control.run_kind != f"{root_kind}_stage"
-                    or run.stage != root_kind
-                    or run.status != "running"
-                    or run.current_attempt_ref != attempt_ref
-                    or run.current_fence_ref != fence_ref
-                    or run.runtime_binding_hash != runtime_binding_hash
-                    or attempt.status != "running"
-                    or not (
-                        primary_pending
-                        or review_pending
-                        or autonomous_resume_pending
-                    )
-                    or fence.status != "current"
-                    or session.status != "active"
-                    or session.native_session_ref not in {None, native_session_ref}
-                    or invocation is None
-                    or invocation.status != "prepared"
-                    or invocation.response_hash is not None
-                    or unit is None
-                    or (
-                        unit.operation_ref != invocation.operation_ref
-                        and not _is_root_human_request_continuation_ref(
-                            unit.operation_ref
-                        )
-                    )
-                    or unit.unit_kind != f"{root_kind}_{provider_phase}"
-                    or unit.status != "active"
-                ):
-                    return False
-                try:
-                    connection.execute(
-                        text(
-                            "UPDATE ar_stage_sessions SET native_session_ref = "
-                            ":native_session_ref, updated_at = :now WHERE "
-                            "session_ref = :session_ref"
-                        ),
-                        {
-                            "native_session_ref": native_session_ref,
-                            "now": now,
-                            "session_ref": session.session_ref,
-                        },
-                    )
-                except IntegrityError as error:
-                    raise OwnerConflict("native_session_conflict") from error
+            except IntegrityError as error:
+                raise OwnerConflict("native_session_conflict") from error
             connection.execute(
                 text(
                     "UPDATE agent_runtime_state SET revision = revision + 1 "
@@ -19634,12 +17336,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> dict[str, object] | None:
         """Read accepted report text without rebuilding undisplayed inputs.
 
-        This projection cannot authorize completion or advancement. Writing
-        and execution continue to use the full Bundle report verifier.
+        This projection cannot authorize completion or advancement. Formal
+        execution continues to use the full Bundle report verifier.
         """
         plan = request.accepted_formal_plan
         if request.stage != "bundle" or plan is None:
-            raise OwnerConflict("writing_bundle_request_invalid")
+            raise OwnerConflict("research_bundle_request_invalid")
         with self._database.read_snapshot() as connection:
             run = connection.execute(
                 text("SELECT * FROM ar_stage_runs WHERE request_ref = :request_ref "
@@ -19656,7 +17358,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or run.context_pack_ref != request.context_pack_ref
                 or run.context_pack_hash != request.context_pack_hash
             ):
-                raise OwnerConflict("writing_bundle_result_invalid")
+                raise OwnerConflict("research_bundle_result_invalid")
             row = connection.execute(
                 text("SELECT * FROM ar_bundle_reports WHERE run_ref = :run_ref "
                      "ORDER BY ordinal DESC LIMIT 1"),
@@ -19710,7 +17412,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     decision_receipt_issuer=AR_OWNER,
                     decision_receipt_kind=BUNDLE_REPORT_RECEIPT_KIND)
                 if completion.outcome_ref != row.report_ref or completion.decision_receipt != receipt:
-                    raise OwnerConflict("writing_bundle_result_invalid")
+                    raise OwnerConflict("research_bundle_result_invalid")
             return {"run_ref": row.run_ref, "report_ref": row.report_ref,
                     "report_hash": row.report_hash, "report": projection_plain_value(report),
                     "receipt": receipt, "completion": completion}
@@ -21345,7 +19047,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         authoritative Run/Completion verifiers still replay execution inputs.
         """
         if request.stage != "reasoning":
-            raise OwnerConflict("writing_reasoning_result_invalid")
+            raise OwnerConflict("research_reasoning_result_invalid")
         with self._database.read_snapshot() as connection:
             run = connection.execute(
                 text("SELECT * FROM ar_stage_runs WHERE request_ref = :ref "
@@ -21361,7 +19063,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or run.context_pack_ref != request.context_pack_ref
                 or run.context_pack_hash != request.context_pack_hash
             ):
-                raise OwnerConflict("writing_reasoning_result_invalid")
+                raise OwnerConflict("research_reasoning_result_invalid")
             attempt = connection.execute(
                 text("SELECT * FROM ar_stage_attempts WHERE attempt_ref = :ref"),
                 {"ref": run.current_attempt_ref},
@@ -24447,217 +22149,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             raise OwnerConflict("stage_run_not_found")
         return cast(str, row.run_ref)
 
-    def _recover_interrupted_writing(self, *, run_ref: str | None = None) -> None:
-        """Rotate a crashed Writing Fence while carrying its durable checkpoint."""
-
-        with self._database.write() as connection:
-            runs = connection.execute(
-                text(
-                    "SELECT run.*, attempt.provider_job_ref AS provider_job_ref FROM "
-                    "ar_writing_runs AS run JOIN "
-                    "ar_writing_attempts AS attempt ON attempt.attempt_ref = "
-                    "run.attempt_ref JOIN ar_run_controls AS control ON "
-                    "control.run_ref = run.run_ref AND control.run_kind = 'writing' "
-                    "WHERE run.status = 'active' AND attempt.status IN "
-                    "('admitted', 'running') AND control.status IN "
-                    "('running', 'reconciliation_required') AND "
-                    "control.cleanup_status != 'pending' "
-                    "AND (NOT EXISTS (SELECT 1 FROM "
-                    "ar_provider_units pending WHERE pending.run_ref = run.run_ref "
-                    "AND pending.status = 'revocation_pending') OR EXISTS (SELECT 1 "
-                    "FROM ar_provider_units pending WHERE pending.run_ref = "
-                    "run.run_ref AND pending.attempt_ref IS run.attempt_ref AND "
-                    "pending.fence_ref IS run.fence_ref AND pending.status = "
-                    "'revocation_pending')) AND (:run_ref IS NULL OR run.run_ref = "
-                    ":run_ref) ORDER BY run.run_ref"
-                )
-                ,
-                {"run_ref": run_ref},
-            ).all()
-            for run in runs:
-                checkpoint = connection.execute(
-                    text(
-                        "SELECT * FROM ar_writing_checkpoints WHERE attempt_ref = "
-                        ":attempt_ref"
-                    ),
-                    {"attempt_ref": run.attempt_ref},
-                ).first()
-                if checkpoint is not None:
-                    _writing_checkpoint_from_row(checkpoint)
-                    if (
-                        checkpoint.run_ref != run.run_ref
-                        or checkpoint.fence_ref != run.fence_ref
-                        or checkpoint.native_session_ref != run.native_session_ref
-                    ):
-                        raise OwnerConflict("writing_checkpoint_integrity_invalid")
-
-                now = time.time()
-                generation = int(run.attempt_generation) + 1
-                attempt_ref = new_ref("writing_attempt")
-                fence_ref = new_ref("writing_fence")
-                attempt_status = "running" if checkpoint is not None else "admitted"
-                _revoke_writing_fence(
-                    connection,
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    reason_code="daemon_restart_inflight",
-                    now=now,
-                )
-                connection.execute(
-                    text(
-                        "UPDATE ar_writing_attempts SET status = 'retired', "
-                        "completed_at = COALESCE(completed_at, :now) WHERE "
-                        "attempt_ref = :attempt_ref AND status IN "
-                        "('admitted', 'running')"
-                    ),
-                    {"now": now, "attempt_ref": run.attempt_ref},
-                )
-                connection.execute(
-                    text(
-                        "INSERT INTO ar_writing_attempts (attempt_ref, run_ref, "
-                        "generation, root_session_ref, native_session_ref, fence_ref, "
-                        "provider_job_ref, status, predecessor_version_ref, "
-                        "predecessor_markdown_hash, feedback_json, feedback_hash, "
-                        "decision_status, decision_receipt_json, "
-                        "decision_receipt_hash, created_at, started_at) VALUES (:attempt_ref, "
-                        ":run_ref, :generation, :root_session_ref, "
-                        ":native_session_ref, :fence_ref, :provider_job_ref, :status, "
-                        ":predecessor_version_ref, :predecessor_markdown_hash, "
-                        ":feedback_json, :feedback_hash, :decision_status, "
-                        ":decision_receipt_json, :decision_receipt_hash, :now, "
-                        ":started_at)"
-                    ),
-                    {
-                        "attempt_ref": attempt_ref,
-                        "run_ref": run.run_ref,
-                        "generation": generation,
-                        "root_session_ref": run.root_session_ref,
-                        "native_session_ref": run.native_session_ref,
-                        "fence_ref": fence_ref,
-                        "provider_job_ref": run.provider_job_ref,
-                        "status": attempt_status,
-                        "predecessor_version_ref": run.predecessor_version_ref,
-                        "predecessor_markdown_hash": (
-                            connection.execute(
-                                text(
-                                    "SELECT predecessor_markdown_hash FROM "
-                                    "ar_writing_attempts WHERE attempt_ref = "
-                                    ":attempt_ref"
-                                ),
-                                {"attempt_ref": run.attempt_ref},
-                            ).scalar_one_or_none()
-                        ),
-                        "feedback_json": run.feedback_json,
-                        "feedback_hash": run.feedback_hash,
-                        "decision_status": (
-                            connection.execute(
-                                text(
-                                    "SELECT decision_status FROM ar_writing_attempts "
-                                    "WHERE attempt_ref = :attempt_ref"
-                                ),
-                                {"attempt_ref": run.attempt_ref},
-                            ).scalar_one_or_none()
-                        ),
-                        "decision_receipt_json": (
-                            connection.execute(
-                                text(
-                                    "SELECT decision_receipt_json FROM "
-                                    "ar_writing_attempts WHERE attempt_ref = "
-                                    ":attempt_ref"
-                                ),
-                                {"attempt_ref": run.attempt_ref},
-                            ).scalar_one_or_none()
-                        ),
-                        "decision_receipt_hash": (
-                            connection.execute(
-                                text(
-                                    "SELECT decision_receipt_hash FROM "
-                                    "ar_writing_attempts WHERE attempt_ref = "
-                                    ":attempt_ref"
-                                ),
-                                {"attempt_ref": run.attempt_ref},
-                            ).scalar_one_or_none()
-                        ),
-                        "now": now,
-                        "started_at": now if checkpoint is not None else None,
-                    },
-                )
-                checkpoint_ref = None
-                if checkpoint is not None:
-                    checkpoint_ref = new_ref("writing_checkpoint")
-                    connection.execute(
-                        text(
-                            "INSERT INTO ar_writing_checkpoints (checkpoint_ref, "
-                            "run_ref, attempt_ref, fence_ref, native_session_ref, "
-                            "markdown, markdown_hash, citations_json, citations_hash, "
-                            "created_at) VALUES (:checkpoint_ref, :run_ref, "
-                            ":attempt_ref, :fence_ref, :native_session_ref, :markdown, "
-                            ":markdown_hash, :citations_json, :citations_hash, :now)"
-                        ),
-                        {
-                            "checkpoint_ref": checkpoint_ref,
-                            "run_ref": run.run_ref,
-                            "attempt_ref": attempt_ref,
-                            "fence_ref": fence_ref,
-                            "native_session_ref": checkpoint.native_session_ref,
-                            "markdown": checkpoint.markdown,
-                            "markdown_hash": checkpoint.markdown_hash,
-                            "citations_json": checkpoint.citations_json,
-                            "citations_hash": checkpoint.citations_hash,
-                            "now": now,
-                        },
-                    )
-                connection.execute(
-                    text(
-                        "UPDATE ar_writing_runs SET attempt_ref = :attempt_ref, "
-                        "attempt_generation = :generation, fence_ref = :fence_ref, "
-                        "failure_code = NULL, updated_at = :now WHERE run_ref = "
-                        ":run_ref AND "
-                        "attempt_ref = :retired_attempt_ref"
-                    ),
-                    {
-                        "attempt_ref": attempt_ref,
-                        "generation": generation,
-                        "fence_ref": fence_ref,
-                        "now": now,
-                        "run_ref": run.run_ref,
-                        "retired_attempt_ref": run.attempt_ref,
-                    },
-                )
-                _sync_writing_managed_attempt(
-                    connection,
-                    run_ref=run.run_ref,
-                    old_attempt_ref=run.attempt_ref,
-                    old_fence_ref=run.fence_ref,
-                    new_attempt_ref=attempt_ref,
-                    new_fence_ref=fence_ref,
-                    root_session_ref=run.root_session_ref,
-                    preserve_cleanup=False,
-                    now=now,
-                )
-                self._feed.record(
-                    connection,
-                    "agent_runtime.writing_recovered",
-                    {
-                        "run_ref": run.run_ref,
-                        "retired_attempt_ref": run.attempt_ref,
-                        "attempt_ref": attempt_ref,
-                        "attempt_generation": generation,
-                        "fence_ref": fence_ref,
-                        "checkpoint_ref": checkpoint_ref,
-                        "native_session_ref": run.native_session_ref,
-                    },
-                )
-            if runs:
-                connection.execute(
-                    text(
-                        "UPDATE agent_runtime_state SET revision = revision + 1, "
-                        "writing_attempt_count = writing_attempt_count + :count "
-                        "WHERE singleton = 'owner'"
-                    ),
-                    {"count": len(runs)},
-                )
 
     def verify_attempt_execution_receipt(self, **values) -> str:
         return self._receipt_verifier.verify_attempt_execution_receipt(**values)
@@ -24683,9 +22174,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     def verify_deepfetch_execution_receipt(self, **values) -> None:
         self._receipt_verifier.verify_deepfetch_execution_receipt(**values)
 
-    def verify_writing_execution_receipt(self, **values) -> dict[str, object]:
-        return self._receipt_verifier.verify_writing_execution_receipt(**values)
-
 
 class SQLiteAgentRuntimeReceiptVerifier:
     """Narrow AR issuer verifier with optional AE provenance verification."""
@@ -24694,7 +22182,6 @@ class SQLiteAgentRuntimeReceiptVerifier:
         self,
         database: Database,
         stage_request_verifier: StageRunRequestVerifier | None = None,
-        writing_authorization_verifier: HumanResponseVerifier | None = None,
         bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
         bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
         bundle_report_disposition_verifier: (
@@ -24703,7 +22190,6 @@ class SQLiteAgentRuntimeReceiptVerifier:
     ) -> None:
         self._database = database
         self._stage_request_verifier = stage_request_verifier
-        self._writing_authorization_verifier = writing_authorization_verifier
         self._bundle_report_evidence_verifier = bundle_report_evidence_verifier
         self._bundle_exhaustion_verifier = bundle_exhaustion_verifier
         self._bundle_report_disposition_verifier = (
@@ -25208,107 +22694,6 @@ class SQLiteAgentRuntimeReceiptVerifier:
                     fence_ref=fence_ref,
                 )
 
-    def verify_writing_execution_receipt(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        final_markdown_hash: str,
-        citations_hash: str,
-        receipt: AcceptanceReceipt,
-        quest_ref: str | None = None,
-        snapshot_ref: str | None = None,
-        snapshot_hash: str | None = None,
-        allowed_source_version_refs: tuple[str, ...] | None = None,
-        require_current: bool = False,
-        require_authorized: bool = False,
-    ) -> dict[str, object]:
-        if (
-            receipt.issuer != AR_OWNER
-            or receipt.kind != "writing_execution_completed"
-        ):
-            raise OwnerConflict("writing_execution_receipt_issuer_invalid")
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT executions.*, runs.runtime_binding_hash, "
-                    "runs.quest_ref, runs.snapshot_ref, runs.snapshot_hash, "
-                    "runs.snapshot_json, runs.status AS run_status, "
-                    "runs.attempt_ref AS current_attempt_ref, "
-                    "runs.fence_ref AS current_fence_ref FROM "
-                    "ar_writing_executions AS executions JOIN ar_writing_runs AS "
-                    "runs ON runs.run_ref = executions.run_ref WHERE "
-                    "executions.receipt_ref = :receipt_ref"
-                ),
-                {"receipt_ref": receipt.receipt_ref},
-            ).first()
-        execution = _writing_execution_from_row(row)
-        try:
-            snapshot = decoded_object(row.snapshot_json) if row is not None else None
-            source_rows = (
-                snapshot.get("accepted_sources", [])
-                if isinstance(snapshot, dict)
-                else []
-            )
-            authoritative_sources = tuple(
-                sorted(
-                    {
-                        cast(str, source["version_ref"])
-                        for source in source_rows
-                        if isinstance(source, dict)
-                        and isinstance(source.get("version_ref"), str)
-                    }
-                )
-            )
-        except (KeyError, TypeError) as error:
-            raise OwnerConflict("writing_execution_receipt_invalid") from error
-        if (
-            execution is None
-            or row.run_ref != run_ref
-            or row.attempt_ref != attempt_ref
-            or row.fence_ref != fence_ref
-            or row.final_markdown_hash != final_markdown_hash
-            or row.citations_hash != citations_hash
-            or receipt.subject_ref != row.execution_ref
-            or receipt.payload_hash != row.receipt_hash
-            or (quest_ref is not None and row.quest_ref != quest_ref)
-            or (snapshot_ref is not None and row.snapshot_ref != snapshot_ref)
-            or (snapshot_hash is not None and row.snapshot_hash != snapshot_hash)
-            or (
-                allowed_source_version_refs is not None
-                and authoritative_sources != allowed_source_version_refs
-            )
-            or (
-                require_current
-                and (
-                    row.run_status != "active"
-                    or row.current_attempt_ref != attempt_ref
-                    or row.current_fence_ref != fence_ref
-                )
-            )
-        ):
-            raise OwnerConflict("writing_execution_receipt_invalid")
-        if require_authorized:
-            if self._writing_authorization_verifier is None:
-                raise OwnerConflict("writing_authorization_verifier_unavailable")
-            self._writing_authorization_verifier.verify_broad_research_authorization(
-                quest_ref=row.quest_ref
-            )
-        return {
-            "run_ref": row.run_ref,
-            "attempt_ref": row.attempt_ref,
-            "fence_ref": row.fence_ref,
-            "quest_ref": row.quest_ref,
-            "snapshot_ref": row.snapshot_ref,
-            "snapshot_hash": row.snapshot_hash,
-            "allowed_source_version_refs": authoritative_sources,
-            "final_markdown": execution.final_markdown,
-            "final_markdown_hash": execution.final_markdown_hash,
-            "citations": execution.citations,
-            "citations_hash": execution.citations_hash,
-            "execution_ref": execution.execution_ref,
-        }
 
     @snapshot_cached
     def verify_bundle_report_receipt(
@@ -27906,7 +25291,6 @@ def _load_stage_fence(connection, run_ref: str, attempt_ref: str, fence_ref: str
     return run, attempt, session, fence
 
 
-
 _CORRECTION_ANCESTRY_SQL = (
     "WITH RECURSIVE correction_ancestors(attempt_ref,run_ref,root_session_ref,fence_ref,generation,depth) AS ("
     "SELECT attempt_ref,run_ref,root_session_ref,fence_ref,generation,0 FROM ar_stage_attempts "
@@ -28086,547 +25470,6 @@ def _require_current_fence(
 def _validate_stage_idempotency_key(value: str) -> None:
     if not value or len(value) > 128:
         raise OwnerConflict("idempotency_key_invalid")
-
-
-def _writing_markdown_hash(markdown: str) -> str:
-    if not isinstance(markdown, str) or not markdown.strip() or len(markdown) > 2 * 1024 * 1024:
-        raise OwnerConflict("writing_markdown_invalid")
-    return canonical_hash(
-        {"media_type": "text/markdown; charset=utf-8", "content": markdown}
-    )
-
-
-def _writing_receipt_from_value(value: object) -> AcceptanceReceipt:
-    if not isinstance(value, dict) or set(value) != {
-        "status",
-        "issuer",
-        "kind",
-        "receipt_ref",
-        "subject_ref",
-        "payload_hash",
-    } or value.get("status") != "accepted":
-        raise OwnerConflict("writing_revision_lineage_invalid")
-    receipt = AcceptanceReceipt(
-        issuer=cast(str, value["issuer"]),
-        kind=cast(str, value["kind"]),
-        receipt_ref=cast(str, value["receipt_ref"]),
-        subject_ref=cast(str, value["subject_ref"]),
-        payload_hash=cast(str, value["payload_hash"]),
-    )
-    if any(
-        not isinstance(item, str) or not item or len(item) > 128
-        for item in (
-            receipt.issuer,
-            receipt.kind,
-            receipt.receipt_ref,
-            receipt.subject_ref,
-        )
-    ) or not isinstance(receipt.payload_hash, str) or len(receipt.payload_hash) != 64:
-        raise OwnerConflict("writing_revision_lineage_invalid")
-    return receipt
-
-
-def _validate_writing_citations_for_snapshot(
-    citations: tuple[dict[str, str], ...], snapshot: dict[str, object]
-) -> str:
-    sources = snapshot.get("accepted_sources")
-    if not isinstance(citations, tuple) or not isinstance(sources, list) or len(
-        citations
-    ) > 512:
-        raise OwnerConflict("writing_citations_invalid")
-    allowed = {
-        source.get("version_ref")
-        for source in sources
-        if isinstance(source, dict) and isinstance(source.get("version_ref"), str)
-    }
-    if len(allowed) > 512:
-        raise OwnerConflict("writing_citations_invalid")
-    seen: set[str] = set()
-    for citation in citations:
-        if not isinstance(citation, dict) or set(citation) != {
-            "citation_ref",
-            "source_version_ref",
-            "locator",
-            "claim",
-            "source_quote",
-        }:
-            raise OwnerConflict("writing_citations_invalid")
-        citation_ref = citation.get("citation_ref")
-        source_ref = citation.get("source_version_ref")
-        locator = citation.get("locator")
-        claim = citation.get("claim")
-        source_quote = citation.get("source_quote")
-        if (
-            not isinstance(citation_ref, str)
-            or not citation_ref.strip()
-            or len(citation_ref) > 128
-            or citation_ref in seen
-            or not isinstance(source_ref, str)
-            or source_ref not in allowed
-            or not isinstance(locator, str)
-            or not locator.strip()
-            or len(locator) > 2000
-            or not isinstance(claim, str)
-            or not claim.strip()
-            or len(claim) > 8000
-            or not isinstance(source_quote, str)
-            or not source_quote.strip()
-            or len(source_quote) > 8000
-        ):
-            raise OwnerConflict("writing_citations_invalid")
-        seen.add(citation_ref)
-    return canonical_hash(list(citations))
-
-
-def _validate_writing_review_contract(
-    *,
-    review: dict[str, object],
-    run,
-    attempt,
-    checkpoint: WritingCheckpoint,
-    reviewed_markdown: str,
-    final_markdown: str,
-    citations: tuple[dict[str, str], ...],
-    final_hash: str,
-    citations_hash: str,
-    allow_legacy_child: bool,
-) -> None:
-    if set(review) != {
-        "review_mode",
-        "reviewer_agent_ref",
-        "review_task_hash",
-        "reviewed_markdown_hash",
-        "findings",
-        "dispositions",
-        "final_markdown_hash",
-        "citations_hash",
-        "review_hash",
-    }:
-        raise OwnerConflict("writing_review_invalid")
-    reviewer = review.get("reviewer_agent_ref")
-    findings = review.get("findings")
-    dispositions = review.get("dispositions")
-    claimed_review_hash = review.get("review_hash")
-    review_mode = review.get("review_mode")
-    task_hash_factory = (
-        writing_child_review_task_hash
-        if allow_legacy_child and review_mode == "harness_child_agent"
-        else writing_advisory_review_task_hash
-    )
-    expected_review_task_hash = task_hash_factory(
-        run_ref=run.run_ref,
-        provider_job_ref=attempt.provider_job_ref,
-        root_session_ref=run.root_session_ref,
-        primary_session_ref=checkpoint.native_session_ref,
-        intent_hash=run.intent_hash,
-        snapshot_hash=run.snapshot_hash,
-        predecessor_version_ref=attempt.predecessor_version_ref,
-        predecessor_markdown_hash=attempt.predecessor_markdown_hash,
-        feedback_hash=attempt.feedback_hash,
-        reviewed_markdown_hash=checkpoint.markdown_hash,
-        reviewed_citations_hash=checkpoint.citations_hash,
-        document_type=run.document_type,
-    )
-    review_basis = dict(review)
-    review_basis.pop("review_hash")
-    if (
-        (
-            review_mode == "advisory_unobserved"
-            and reviewer is not None
-            or review_mode == "harness_child_agent"
-            and (
-                not allow_legacy_child
-                or not isinstance(reviewer, str)
-                or not reviewer.strip()
-                or len(reviewer) > 128
-                or reviewer in {run.root_session_ref, run.native_session_ref}
-            )
-            or review_mode not in {
-                "advisory_unobserved",
-                "harness_child_agent",
-            }
-        )
-        or review.get("review_task_hash") != expected_review_task_hash
-        or review.get("reviewed_markdown_hash") != checkpoint.markdown_hash
-        or reviewed_markdown != checkpoint.markdown
-        or review.get("final_markdown_hash") != final_hash
-        or review.get("citations_hash") != citations_hash
-        or claimed_review_hash != canonical_hash(review_basis)
-        or not isinstance(findings, list)
-        or not isinstance(dispositions, list)
-        or len(findings) > 128
-        or len(dispositions) != len(findings)
-    ):
-        raise OwnerConflict("writing_review_invalid")
-    for finding, disposition in zip(findings, dispositions, strict=True):
-        if (
-            not isinstance(finding, dict)
-            or not isinstance(disposition, dict)
-            or set(finding) != {"category", "finding"}
-            or set(disposition) != {"category", "action", "reason"}
-            or finding.get("category") != disposition.get("category")
-            or disposition.get("action") not in {"revised", "not_adopted"}
-            or any(
-                not isinstance(value, str) or not value.strip()
-                for value in (
-                    finding.get("category"),
-                    finding.get("finding"),
-                    disposition.get("reason"),
-                )
-            )
-        ):
-            raise OwnerConflict("writing_review_invalid")
-    if any(
-        disposition.get("action") == "revised" for disposition in dispositions
-    ) and final_hash == checkpoint.markdown_hash and citations == checkpoint.citations:
-        raise OwnerConflict("writing_review_revision_not_material")
-    if (
-        attempt.predecessor_markdown_hash is not None
-        and final_hash == attempt.predecessor_markdown_hash
-    ):
-        raise OwnerConflict("writing_feedback_revision_not_material")
-
-
-def _revoke_writing_fence(
-    connection,
-    *,
-    run_ref: str,
-    attempt_ref: str,
-    fence_ref: str,
-    reason_code: str,
-    now: float,
-) -> None:
-    revocation_reason = reason_code[:96]
-    operation_ref = (
-        "writing-control-"
-        + canonical_hash(
-            {
-                "run_ref": run_ref,
-                "attempt_ref": attempt_ref,
-                "fence_ref": fence_ref,
-                "reason_code": revocation_reason,
-            }
-        )[:48]
-    )
-    inserted = connection.execute(
-        text(
-            "INSERT INTO ar_fence_revocations (fence_ref, operation_ref, "
-            "run_ref, attempt_ref, reason_code, revoked_at) VALUES "
-            "(:fence_ref, :operation_ref, :run_ref, :attempt_ref, "
-            ":reason_code, :now) ON CONFLICT(fence_ref) DO NOTHING"
-        ),
-        {
-            "fence_ref": fence_ref,
-            "operation_ref": operation_ref,
-            "run_ref": run_ref,
-            "attempt_ref": attempt_ref,
-            "reason_code": revocation_reason,
-            "now": now,
-        },
-    )
-    if inserted.rowcount:
-        connection.execute(
-            text(
-                "UPDATE agent_runtime_state SET fenced_attempt_count = "
-                "fenced_attempt_count + 1 WHERE singleton = 'owner'"
-            )
-        )
-
-
-def _retire_writing_managed_attempt(
-    connection,
-    *,
-    run,
-    managed_status: str,
-    reason_code: str | None,
-    now: float,
-) -> None:
-    """Fence one Writing Attempt and expose any physical cleanup still owed."""
-
-    control = connection.execute(
-        text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-        {"run_ref": run.run_ref},
-    ).first()
-    attempt = connection.execute(
-        text("SELECT status FROM ar_writing_attempts WHERE attempt_ref = :attempt_ref"),
-        {"attempt_ref": run.attempt_ref},
-    ).first()
-    if (
-        control is None
-        or control.run_kind != "writing"
-        or control.attempt_ref != run.attempt_ref
-        or control.root_session_ref != run.root_session_ref
-        or control.fence_ref != run.fence_ref
-        or attempt is None
-    ):
-        raise OwnerConflict("writing_runtime_control_integrity_invalid")
-    pending_before = connection.execute(
-        text(
-            "SELECT 1 FROM ar_provider_units WHERE run_ref = :run_ref AND "
-            "attempt_ref IS :attempt_ref AND fence_ref IS :fence_ref AND status IN "
-            "('active', 'revocation_pending') LIMIT 1"
-        ),
-        {
-            "run_ref": run.run_ref,
-            "attempt_ref": run.attempt_ref,
-            "fence_ref": run.fence_ref,
-        },
-    ).first()
-    if attempt.status != "completed" or pending_before is not None:
-        _revoke_writing_fence(
-            connection,
-            run_ref=run.run_ref,
-            attempt_ref=run.attempt_ref,
-            fence_ref=run.fence_ref,
-            reason_code=reason_code or "writing_controlled",
-            now=now,
-        )
-    connection.execute(
-        text(
-            "UPDATE ar_provider_units SET status = 'revocation_pending' WHERE "
-            "run_ref = :run_ref AND attempt_ref IS :attempt_ref AND fence_ref IS "
-            ":fence_ref AND status = 'active'"
-        ),
-        {
-            "run_ref": run.run_ref,
-            "attempt_ref": run.attempt_ref,
-            "fence_ref": run.fence_ref,
-        },
-    )
-    pending = connection.execute(
-        text(
-            "SELECT 1 FROM ar_provider_units WHERE run_ref = :run_ref AND status "
-            "IN ('active', 'revocation_pending') LIMIT 1"
-        ),
-        {"run_ref": run.run_ref},
-    ).first()
-    cleanup_status = (
-        "pending"
-        if pending is not None
-        else ("completed" if managed_status == "terminated" else "none")
-    )
-    terminal_reason = None if reason_code is None else reason_code[:96]
-    connection.execute(
-        text(
-            "UPDATE ar_run_controls SET status = :status, safe_point_ref = NULL, "
-            "terminal_reason = :reason_code, cleanup_status = :cleanup_status, "
-            "control_revision = control_revision + 1, updated_at = :now WHERE "
-            "run_ref = :run_ref"
-        ),
-        {
-            "status": managed_status,
-            "reason_code": terminal_reason,
-            "cleanup_status": cleanup_status,
-            "now": now,
-            "run_ref": run.run_ref,
-        },
-    )
-
-
-def _sync_writing_managed_attempt(
-    connection,
-    *,
-    run_ref: str,
-    old_attempt_ref: str,
-    old_fence_ref: str,
-    new_attempt_ref: str,
-    new_fence_ref: str,
-    root_session_ref: str,
-    preserve_cleanup: bool,
-    now: float,
-) -> None:
-    control = connection.execute(
-        text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-        {"run_ref": run_ref},
-    ).first()
-    if (
-        control is None
-        or control.run_kind != "writing"
-        or control.attempt_ref != old_attempt_ref
-        or control.fence_ref != old_fence_ref
-        or control.root_session_ref != root_session_ref
-    ):
-        raise OwnerConflict("writing_runtime_control_integrity_invalid")
-    if control.cleanup_status == "pending" and not preserve_cleanup:
-        raise OwnerConflict("runtime_quiescence_pending")
-    cleanup_status = (
-        "pending"
-        if preserve_cleanup and control.cleanup_status == "pending"
-        else "none"
-    )
-    connection.execute(
-        text(
-            "UPDATE ar_run_controls SET status = 'running', attempt_ref = "
-            ":attempt_ref, root_session_ref = :root_session_ref, fence_ref = "
-            ":fence_ref, safe_point_ref = NULL, terminal_reason = NULL, "
-            "cleanup_status = :cleanup_status, control_revision = "
-            "control_revision + 1, updated_at = :now WHERE run_ref = :run_ref"
-        ),
-        {
-            "attempt_ref": new_attempt_ref,
-            "root_session_ref": root_session_ref,
-            "fence_ref": new_fence_ref,
-            "cleanup_status": cleanup_status,
-            "now": now,
-            "run_ref": run_ref,
-        },
-    )
-
-
-def _current_writing_run_row(connection, run_ref: str, attempt_ref: str, fence_ref: str):
-    row = connection.execute(
-        text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
-        {"run_ref": run_ref},
-    ).first()
-    attempt = connection.execute(
-        text(
-            "SELECT * FROM ar_writing_attempts WHERE attempt_ref = :attempt_ref"
-        ),
-        {"attempt_ref": attempt_ref},
-    ).first()
-    if (
-        row is None
-        or attempt is None
-        or row.status != "active"
-        or row.attempt_ref != attempt_ref
-        or row.fence_ref != fence_ref
-        or attempt.run_ref != run_ref
-        or int(attempt.generation) != int(row.attempt_generation)
-        or attempt.root_session_ref != row.root_session_ref
-        or attempt.native_session_ref != row.native_session_ref
-        or attempt.fence_ref != fence_ref
-        or attempt.status not in {"admitted", "running", "completed"}
-    ):
-        raise OwnerConflict("writing_fence_stale")
-    _assert_runtime_control_allows(connection, run_ref, fence_ref)
-    return row
-
-
-def _writing_command_replay(
-    connection, idempotency_key: str, command_kind: str, request_hash: str
-) -> str | None:
-    row = connection.execute(
-        text(
-            "SELECT * FROM ar_writing_commands WHERE idempotency_key = "
-            ":idempotency_key AND command_kind = :command_kind"
-        ),
-        {"idempotency_key": idempotency_key, "command_kind": command_kind},
-    ).first()
-    if row is None:
-        return None
-    if row.request_hash != request_hash:
-        raise OwnerConflict("idempotency_conflict")
-    return row.result_ref
-
-
-def _record_writing_command(
-    connection,
-    idempotency_key: str,
-    command_kind: str,
-    request_hash: str,
-    result_ref: str,
-    result_attempt_ref: str | None = None,
-) -> None:
-    connection.execute(
-        text(
-            "INSERT INTO ar_writing_commands (idempotency_key, command_kind, "
-            "request_hash, result_ref, result_attempt_ref, recorded_at) VALUES "
-            "(:idempotency_key, :command_kind, :request_hash, :result_ref, "
-            ":result_attempt_ref, :recorded_at)"
-        ),
-        {
-            "idempotency_key": idempotency_key,
-            "command_kind": command_kind,
-            "request_hash": request_hash,
-            "result_ref": result_ref,
-            "result_attempt_ref": result_attempt_ref,
-            "recorded_at": time.time(),
-        },
-    )
-
-
-def _writing_checkpoint_from_row(row) -> WritingCheckpoint | None:
-    if row is None:
-        return None
-    try:
-        citations_value = json.loads(row.citations_json)
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
-        raise OwnerConflict("writing_checkpoint_integrity_invalid") from error
-    if (
-        not isinstance(citations_value, list)
-        or any(not isinstance(item, dict) for item in citations_value)
-        or canonical_hash(citations_value) != row.citations_hash
-        or _writing_markdown_hash(row.markdown) != row.markdown_hash
-    ):
-        raise OwnerConflict("writing_checkpoint_integrity_invalid")
-    return WritingCheckpoint(
-        checkpoint_ref=row.checkpoint_ref,
-        attempt_ref=row.attempt_ref,
-        markdown=row.markdown,
-        markdown_hash=row.markdown_hash,
-        citations=tuple(cast(dict[str, str], item) for item in citations_value),
-        citations_hash=row.citations_hash,
-        native_session_ref=row.native_session_ref,
-    )
-
-
-def _writing_execution_from_row(row) -> WritingExecution | None:
-    if row is None:
-        return None
-    try:
-        citations_value = json.loads(row.citations_json)
-        review = decoded_object(row.review_json)
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
-        raise OwnerConflict("writing_execution_integrity_invalid") from error
-    payload = {
-        "schema_ref": "meta-research/writing-execution/v1",
-        "run_ref": row.run_ref,
-        "attempt_ref": row.attempt_ref,
-        "fence_ref": row.fence_ref,
-        "final_markdown_hash": row.final_markdown_hash,
-        "citations_hash": row.citations_hash,
-        "review_hash": row.review_hash,
-        "runtime_binding_hash": row.runtime_binding_hash,
-    }
-    expected_receipt_hash = canonical_hash(
-        {
-            "schema_ref": RECEIPT_SCHEMA,
-            "issuer": AR_OWNER,
-            "kind": "writing_execution_completed",
-            "subject_ref": row.execution_ref,
-            "payload_hash": row.payload_hash,
-        }
-    )
-    if (
-        not isinstance(citations_value, list)
-        or any(not isinstance(item, dict) for item in citations_value)
-        or canonical_hash(citations_value) != row.citations_hash
-        or canonical_hash(review) != row.review_hash
-        or _writing_markdown_hash(row.reviewed_markdown)
-        != row.reviewed_markdown_hash
-        or _writing_markdown_hash(row.final_markdown) != row.final_markdown_hash
-        or canonical_hash(payload) != row.payload_hash
-        or expected_receipt_hash != row.receipt_hash
-    ):
-        raise OwnerConflict("writing_execution_integrity_invalid")
-    return WritingExecution(
-        execution_ref=row.execution_ref,
-        attempt_ref=row.attempt_ref,
-        reviewed_markdown=row.reviewed_markdown,
-        final_markdown=row.final_markdown,
-        final_markdown_hash=row.final_markdown_hash,
-        citations=tuple(cast(dict[str, str], item) for item in citations_value),
-        citations_hash=row.citations_hash,
-        review=review,
-        review_hash=row.review_hash,
-        receipt=AcceptanceReceipt(
-            issuer=AR_OWNER,
-            kind="writing_execution_completed",
-            receipt_ref=row.receipt_ref,
-            subject_ref=row.execution_ref,
-            payload_hash=row.receipt_hash,
-        ),
-    )
 
 
 def _validated_runtime_binding(
@@ -33037,6 +29880,8 @@ def _validated_external_root_task_scope(
         raise OwnerConflict("external_root_task_scope_invalid")
     for name in ("quest_ref", "attempt_ref", "root_session_ref", "fence_ref"):
         value = root_runtime_scope.get(name)
+        if name == "quest_ref" and root_kind == "acquisition" and value is None:
+            continue
         if (
             not isinstance(value, str)
             or not value.strip()
@@ -33108,7 +29953,7 @@ def _external_root_task_scope_document(row) -> dict[str, object]:
     return {
         "root_kind": str(row.run_kind),
         "root_runtime_scope": {
-            "quest_ref": str(row.quest_ref),
+            "quest_ref": row.quest_ref,
             "run_ref": str(row.run_ref),
             "attempt_ref": str(row.attempt_ref),
             "root_session_ref": str(row.root_session_ref),
@@ -33749,15 +30594,6 @@ def _provider_operation_for_unit(connection, *, unit_ref: str, run_ref: str) -> 
             ),
             {"run_ref": run_ref},
         ).scalar_one_or_none()
-    elif control is not None and control.run_kind == "writing":
-        operation_ref = connection.execute(
-            text(
-                "SELECT attempts.provider_job_ref FROM ar_writing_runs runs JOIN "
-                "ar_writing_attempts attempts ON attempts.attempt_ref = "
-                "runs.attempt_ref WHERE runs.run_ref = :run_ref"
-            ),
-            {"run_ref": run_ref},
-        ).scalar_one_or_none()
     if operation_ref is None:
         raise OwnerConflict("runtime_provider_operation_invalid")
     return str(operation_ref)
@@ -33899,7 +30735,6 @@ def create_agent_runtime_interface(
     target_run_harness_verifier: TargetRunHarnessVerifier | None = None,
     bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
     reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
-    writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
     runtime_protection: RuntimeProtection | None = None,
     receipt_verifier: SQLiteAgentRuntimeReceiptVerifier | None = None,
 ) -> AgentRuntimeInterface:
@@ -33918,7 +30753,6 @@ def create_agent_runtime_interface(
         target_run_harness_verifier=target_run_harness_verifier,
         bundle_exhaustion_verifier=bundle_exhaustion_verifier,
         reasoning_outcome_verifier=reasoning_outcome_verifier,
-        writing_delivery_provider_registry=writing_delivery_provider_registry,
         runtime_protection=runtime_protection,
         receipt_verifier=receipt_verifier,
     )
@@ -33927,14 +30761,12 @@ def create_agent_runtime_interface(
 def create_agent_runtime_receipt_verifier(
     database: Database,
     stage_request_verifier: StageRunRequestVerifier | None = None,
-    writing_authorization_verifier: HumanResponseVerifier | None = None,
     bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
     bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
 ) -> SQLiteAgentRuntimeReceiptVerifier:
     return SQLiteAgentRuntimeReceiptVerifier(
         database,
         stage_request_verifier,
-        writing_authorization_verifier,
         bundle_report_evidence_verifier,
         bundle_exhaustion_verifier,
     )

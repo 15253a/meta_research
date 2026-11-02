@@ -100,6 +100,6 @@ Target 新建或改动的数据与环境先沿 Baseline → Variant → VariantR
 
 Target 过程中发现、取得或阅读的 Literature 同样需要交接。记录准确文献身份与真实来源、已取得原文的准确入口或尚未取得全文的状态、本次实际阅读判断、相关主张及限制、与当前 Question／Target 的用途关系。已有正式文献复用其准确引用；新取得原文与新写的阅读分析按各自真实来源选择保管，本次整理或阅读不改变原作者与外部出版来源。Bundle／Reasoning 按共享整理流程核对、登记或关联值得保留的文献，后继可继续阅读与采用。
 
-文献线索与阅读说明可沿现有研究说明交接，选中保存的数字材料沿实际保管路径处理；结构化 Literature 候选与正式登记的工具装配属于待接通设计，不假定现行结果 schema 已有 `literature_candidates`。
+文献线索与阅读说明沿现有研究说明交接，选中保存的数字材料沿实际保管路径处理；本次判断写入实际 research_notes。接纳后 Bundle／Reasoning 沿共享研究导航的 Literature register／reference／read 关联该 Target／TargetCommit 和准确 note binding，读回原文与分析。现行结果 schema 没有 `literature_candidates`，无需新增候选字段；未选中或无价值的线索不强制登记。
 
 把需保留的科学产物完整选入交接，后续使用正式精确版本。工作区引用期限、`linked_local` 与外部原件的保管条件按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理；系统仅在正式发布已核实、保留期已过且执行、恢复、待接纳等真实依赖解除后回收完成的临时工作区。

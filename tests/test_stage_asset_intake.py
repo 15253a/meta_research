@@ -27,8 +27,8 @@ def context_channel(runtime, context):
     gateway = SemanticMcpGateway(operations)
     token, _ = gateway.issue_channel(run_ref=context.run_ref, attempt_ref=context.attempt_ref,
         root_session_ref=context.root_session_ref, fence_ref=context.fence_ref,
-        capability_binding_hash=context.capability_binding_hash, root_kind='companion',
-        phase='primary', operation_ids=tuple(op.semantic_operation_id for op in operations))
+        capability_binding_hash=context.capability_binding_hash, root_kind=context.root_kind,
+        phase=context.phase, operation_ids=tuple(op.semantic_operation_id for op in operations))
 
     def call(operation, **arguments):
         _, result = gateway.dispatch(token.token, {'jsonrpc':'2.0', 'id':1, 'method':'tools/call',
@@ -229,9 +229,14 @@ def test_lost_intake_ack_reconciles_exact_operation_while_suspended_without_orig
 
     runtime = _make(tmp_path / 'runtime')
     try:
-        confirmed = _confirm_direct_quest(runtime)
-        question = SimpleNamespace(quest_ref=confirmed['quest_ref'], question_ref=confirmed['question_ref'])
-        context, call = channel(runtime, question)
+        _confirm_direct_quest(runtime)
+        admitted = runtime.idea_stage.start('intake-lost-ack')
+        run = runtime.owners.agent_runtime.query_idea_stage_run(admitted['stage_run_request']['request_ref'])
+        assert run is not None
+        context = SemanticCallContext(run.run_ref, run.attempt_ref, run.root_session_ref,
+            run.fence_ref, run.runtime_binding_hash, 'idea', 'primary', 'research_memory.assets.intake')
+        resident = _channel(runtime, context)
+        call = context_channel(runtime, context)
         location = runtime.root_workspaces.bind_runtime(context).location
         original = location.directory / 'original.bin'
         if outcome == 'failed':
@@ -265,7 +270,7 @@ def test_lost_intake_ack_reconciles_exact_operation_while_suspended_without_orig
         assert committed[0]['status'] == expected_status
         if outcome in {'failed', 'exhausted'}:
             assert committed[0]['failure']['code'] == ('asset_intake_retry_exhausted' if outcome == 'exhausted' else 'asset_source_symlink_unsupported')
-        _accepted(_call(runtime, _channel(runtime, context), 'human_request.open',
+        _accepted(_call(runtime, resident, 'human_request.open',
             **_open_arguments('wait-after-lost-ack', 'offline_action')))
         assert runtime.owners.agent_runtime.query_managed_run(context.run_ref)['status'] == 'suspended'
         if original.is_dir():

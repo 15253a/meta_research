@@ -26,7 +26,7 @@
 
 `cycle_focus` 已由 Reasoning 的输出 schema、原接纳及后继装配接通；正文随 transition 保存与读取，各根沿实际前驱或首轮来源取得同一重心。恢复仍在原根、原目录和准确冻结输入上进行。按[语义契约](contract.md)修正缺失或冲突，不能补造首轮前驱。
 
-Target 文献整理继承共享材料保管与导航合同。现有正式 DeepFetch → LiteratureSnapshot → QuestionLiteratureRevision 路径可以读取；Target 资源候选专用链提供 Dataset／Environment。普通取得文献的导入、关联以及 Target research_notes 阅读判断进入文献索引尚待文献能力接通。当前只沿真实可用工具读取与保留说明，不能虚构 `literature_candidates`、登记接口或成功回执。需要这些入口时记录具体未完成步骤；接口缺失不是无候选，完整文献整理验收仍待完成。
+Target 文献整理继承共享材料保管与导航合同。DeepFetch → LiteratureSnapshot → QuestionLiteratureRevision 保持；普通文献沿 research_memory.literature.register 保存外部来源和已接纳原件 binding，再用 .reference 关联 Question、research_ref、用途和真实 research_notes binding。用 .read 查回记录、content.read 取得原件与分析，文献原作与本次阅读各自保留来源。未取得全文如实登记 missing／waiting_user，不虚构 DeepFetch Run 或专用 literature_candidates。接口不可用、部分失败和未完成按实际步骤交接，不当成无候选；空候选或无保留价值可不登记。
 
 历史跨轮发现、三轮目录和回收、材料保管及工具目录的新增能力分别按实际目录和 reader 可用性使用；文件中的设计语义不授予额外权限。
 

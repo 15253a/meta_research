@@ -409,11 +409,11 @@ def test_companion_provider_receives_authorized_work_and_formal_response_boundar
     assert result.reply == "The copied trial is ready for your review."
     prompt = runner.calls[0][1]
     assert "<!-- bundled resource: companion-work.md -->" in prompt
-    assert "research_workspace.materials.discover" in prompt
-    assert "research_workspace.materials.copy" in prompt
-    assert "explicitly selects and formally submits" in prompt
+    assert "tool discovery is not permission to execute every operation" in prompt
+    assert "human's click on the corresponding formal action with the chosen content" in prompt
+    assert "does not invoke research-control writes" in prompt
     assert "outside research Cycles" in prompt
-    assert "same Quest workspace" in prompt
+    assert "same Quest folder" in prompt
     assert "Read the registered input, run a small copied trial" in prompt
 
 

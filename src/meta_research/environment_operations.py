@@ -1,4 +1,5 @@
 """Environment indexing through the existing scoped Root owner gateway."""
+from meta_research.research_content import _reading_quest
 from meta_research.owners.common import OwnerConflict
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 
@@ -16,7 +17,7 @@ def _scope(agent_runtime, context, *, reconcile=False):
     return scope
 
 
-def environment_operations(graph, agent_runtime):
+def environment_operations(graph, agent_runtime, human_collaboration=None):
     string = {"type": "string", "minLength": 1, "maxLength": 1024}
     schemas = {
         "register": ({"semantic_key": string, "name": string, "source": string,
@@ -63,7 +64,9 @@ def environment_operations(graph, agent_runtime):
 
     def read(context, arguments, page):
         try:
-            quest_ref = _scope(agent_runtime, context)["quest_ref"]
+            arguments = dict(arguments)
+            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.pop("source_quest_ref", None),
+                human_collaboration=human_collaboration)
             if page:
                 return graph.query_environments(**arguments, quest_ref=quest_ref)
             if len(arguments) != 1:
@@ -92,16 +95,16 @@ def environment_operations(graph, agent_runtime):
             output_schema={"type": "object"},
             handler=lambda context, arguments, action=action: effect(context, arguments, action, True)))
     operations.append(SemanticOperation(semantic_operation_id="research_graph.environments.page", owning_module="research_graph",
-        description="分页发现本 Quest 登记或使用的 Environment。query 搜索含义/来源，semantic_key 查看同资源不可变快照，environment_ref 或 question_ref 查看用途（过滤模式互斥）。数字原件用 content.read，source_ref=environment_ref，version_ref 取 asset_bindings。用 next_offset/query_revision 续页并保持过滤与limit；research_query_changed 后从0重开，research_query_revision_required 表示缺修订。result_state/scan_complete 区分空结果与扫描结束。物理设备、服务或现成目录可仅有资源说明，hash不证明实体状态。",
-        input_schema={"type": "object", "properties": {"query": {"type": "string", "maxLength": 1024},
+        description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 分页发现本 Quest 登记或使用的 Environment。query 搜索含义/来源，semantic_key 查看同资源不可变快照，environment_ref 或 question_ref 查看用途（过滤模式互斥）。数字原件用 content.read，source_ref=environment_ref，version_ref 取 asset_bindings。用 next_offset/query_revision 续页并保持过滤与limit；research_query_changed 后从0重开，research_query_revision_required 表示缺修订。result_state/scan_complete 区分空结果与扫描结束。物理设备、服务或现成目录可仅有资源说明，hash不证明实体状态。",
+        input_schema={"type": "object", "properties": {"source_quest_ref": string, "query": {"type": "string", "maxLength": 1024},
             "semantic_key": string, "environment_ref": string, "question_ref": string,
             "query_revision": {"type":"string","pattern":"^[0-9a-f]{64}$"},
             "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
             "additionalProperties": False}, output_schema={"type": "object"},
         handler=lambda context, arguments: read(context, arguments, True)))
     operations.append(SemanticOperation(semantic_operation_id="research_graph.environments.read", owning_module="research_graph",
-        description="Read an exact Environment index snapshot or its research reference in this Quest; supply exactly one ref.",
-        input_schema={"type": "object", "properties": {"environment_ref": string, "environment_reference_ref": string},
+        description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. Read an exact Environment index snapshot or its research reference in this Quest; supply exactly one ref.",
+        input_schema={"type": "object", "properties": {"source_quest_ref": string, "environment_ref": string, "environment_reference_ref": string},
             "additionalProperties": False}, output_schema={"type": "object"},
         handler=lambda context, arguments: read(context, arguments, False)))
     return tuple(operations)

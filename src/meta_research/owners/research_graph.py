@@ -149,6 +149,7 @@ from meta_research.owners.quest_goals import (
     verify_goal_revision_ancestry_in_transaction,
 )
 from meta_research.owners.research_datasets import ResearchDatasetOwnerInterface, ResearchDatasetOwnerMixin
+from meta_research.owners.research_literature import ResearchLiteratureOwnerInterface, ResearchLiteratureOwnerMixin
 from meta_research.owners.research_environments import ResearchEnvironmentOwnerInterface, ResearchEnvironmentOwnerMixin
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.target_execution_legacy import (
@@ -169,7 +170,6 @@ from meta_research.target_run_runtime_contract import (
     TargetGenericExecutionBinding,
     receipt_proof,
 )
-from meta_research.writing_contract import validate_writing_claim_inventory
 
 if TYPE_CHECKING:
     from meta_research.owners.advancement_engine import StageCommit, StageRunRequest
@@ -266,8 +266,6 @@ _AR_TARGET_ROOT_COMPLETION_RECEIPT_KIND = "target_root_completion_accepted"
 _RM_TARGET_ROOT_COMPLETION_MANIFEST_RECEIPT_KIND = (
     "target_root_completion_manifest_accepted"
 )
-WRITING_CITATIONS_ACCEPTED_RECEIPT_KIND = "writing_citations_accepted"
-WRITING_CITATIONS_REJECTED_RECEIPT_KIND = "writing_citations_rejected"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 MAX_ASSET_ROLES_PER_VERSION = 100
 ASSET_ROLE_PROJECTION_HISTORY_PER_VERSION = 20
@@ -419,35 +417,6 @@ class AcceptedAssetRole:
             receipt=self.asset_receipt,
         )
 
-
-@dataclass(frozen=True)
-class WritingCitationDecision:
-    decision_ref: str
-    run_ref: str
-    attempt_ref: str
-    quest_ref: str
-    snapshot_ref: str
-    snapshot_hash: str
-    asset: AcceptedAssetBinding
-    citations: tuple[dict[str, str], ...]
-    decision: str
-    feedback: tuple[str, ...]
-    receipt: AcceptanceReceipt
-
-    def as_public_dict(self) -> dict[str, object]:
-        return {
-            "decision_ref": self.decision_ref,
-            "run_ref": self.run_ref,
-            "attempt_ref": self.attempt_ref,
-            "quest_ref": self.quest_ref,
-            "snapshot_ref": self.snapshot_ref,
-            "snapshot_hash": self.snapshot_hash,
-            "version_ref": self.asset.version_ref,
-            "citations": list(self.citations),
-            "status": self.decision,
-            "feedback": list(self.feedback),
-            "receipt": self.receipt.as_public_dict(),
-        }
 
 class AcceptedIdeaContent(Protocol):
     request_ref: str
@@ -1398,7 +1367,7 @@ class TargetCandidateOwnerProofVerifier(Protocol):
         receipt: ReceiptProof,
     ) -> None: ...
 
-class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetOwnerInterface, HumanRequestOwnerInterface, Protocol):
+class ResearchGraphInterface(ResearchLiteratureOwnerInterface, ResearchEnvironmentOwnerInterface, ResearchDatasetOwnerInterface, HumanRequestOwnerInterface, Protocol):
     def query_target_result_handoff(
         self, target_ref: str, *, quest_ref: str
     ) -> dict[str, object]: ...
@@ -2048,31 +2017,6 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
         self, quest_ref: str, *, target_commit_refs: tuple[str, ...] | None = None
     ) -> tuple[TargetCommit, ...]: ...
 
-    def decide_writing_citations(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        quest_ref: str,
-        snapshot_ref: str,
-        snapshot_hash: str,
-        allowed_source_version_refs: tuple[str, ...],
-        binding: AcceptedAssetBinding,
-        citations: tuple[dict[str, str], ...],
-        final_markdown_hash: str,
-        citations_hash: str,
-        execution_receipt: AcceptanceReceipt,
-    ) -> WritingCitationDecision: ...
-
-    def query_writing_citation_decision(
-        self, *, run_ref: str, attempt_ref: str | None = None
-    ) -> WritingCitationDecision | None: ...
-
-    def query_writing_citation_history(
-        self, run_ref: str
-    ) -> tuple[WritingCitationDecision, ...]: ...
-
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=RG_OWNER,
@@ -2093,8 +2037,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "experiment_asset_role_count, formal_measurement_count, "
         "target_graph_count, target_graph_rejection_count, target_count, "
         "target_measurement_domain_authority_count, "
-        "target_commit_count, "
-        "writing_citation_decision_count, writing_citation_rejection_count "
+        "target_commit_count "
         "FROM research_graph_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -2132,8 +2075,6 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "target_count",
         "target_measurement_domain_authority_count",
         "target_commit_count",
-        "writing_citation_decision_count",
-        "writing_citation_rejection_count",
     ),
 )
 
@@ -2625,135 +2566,6 @@ class SQLiteResearchGraphReceiptVerifier:
             ),
         )
 
-    def verify_writing_citation_decision(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        version_ref: str,
-        feedback: tuple[str, ...],
-        receipt: AcceptanceReceipt,
-        expected_decision: str,
-    ) -> None:
-        if expected_decision not in {"accepted", "rejected"}:
-            raise OwnerConflict("writing_citation_decision_receipt_invalid")
-        expected_kind = (
-            WRITING_CITATIONS_ACCEPTED_RECEIPT_KIND
-            if expected_decision == "accepted"
-            else WRITING_CITATIONS_REJECTED_RECEIPT_KIND
-        )
-        if receipt.issuer != RG_OWNER or receipt.kind != expected_kind:
-            raise OwnerConflict("writing_citation_decision_receipt_invalid")
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM rg_writing_citation_decisions WHERE "
-                    "receipt_ref = :receipt_ref"
-                ),
-                {"receipt_ref": receipt.receipt_ref},
-            ).first()
-        if row is None:
-            raise OwnerConflict("writing_citation_decision_receipt_invalid")
-        try:
-            allowed = json.loads(row.allowed_sources_json)
-            citations = json.loads(row.citations_json)
-            stored_feedback = json.loads(row.feedback_json)
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise OwnerConflict(
-                "writing_citation_decision_receipt_invalid"
-            ) from error
-        asset_receipt = AcceptanceReceipt(
-            issuer="research_memory",
-            kind="asset_acceptance",
-            receipt_ref=row.asset_receipt_ref,
-            subject_ref=row.version_ref,
-            payload_hash=row.asset_receipt_hash,
-        )
-        execution_receipt = AcceptanceReceipt(
-            issuer="agent_runtime",
-            kind="writing_execution_completed",
-            receipt_ref=row.execution_receipt_ref,
-            subject_ref=row.execution_ref,
-            payload_hash=row.execution_receipt_hash,
-        )
-        binding = AcceptedAssetBinding(
-            asset_ref=row.asset_ref,
-            version_ref=row.version_ref,
-            content_hash=row.content_hash,
-            manifest_hash=row.manifest_hash,
-            receipt=asset_receipt,
-        )
-        decision_payload = {
-            "schema_ref": "meta-research/writing-citation-decision/v1",
-            "run_ref": row.run_ref,
-            "attempt_ref": row.attempt_ref,
-            "fence_ref": row.fence_ref,
-            "quest_ref": row.quest_ref,
-            "snapshot_ref": row.snapshot_ref,
-            "snapshot_hash": row.snapshot_hash,
-            "allowed_source_version_refs": allowed,
-            "asset": binding.as_dict(),
-            "citations": citations,
-            "citations_hash": row.citations_hash,
-            "final_markdown_hash": row.final_markdown_hash,
-            "execution_receipt": execution_receipt.as_public_dict(),
-            "decision": row.decision,
-            "feedback": stored_feedback,
-        }
-        expected_receipt_hash = canonical_hash(
-            {
-                "schema_ref": RECEIPT_SCHEMA,
-                "issuer": RG_OWNER,
-                "kind": expected_kind,
-                "subject_ref": row.decision_ref,
-                "payload_hash": row.decision_hash,
-            }
-        )
-        if (
-            row.run_ref != run_ref
-            or row.attempt_ref != attempt_ref
-            or row.version_ref != version_ref
-            or row.decision != expected_decision
-            or receipt.subject_ref != row.decision_ref
-            or receipt.payload_hash != row.receipt_hash
-            or canonical_hash(allowed) != row.allowed_sources_hash
-            or canonical_hash(citations) != row.citations_hash
-            or canonical_hash(stored_feedback) != row.feedback_hash
-            or canonical_hash(decision_payload) != row.decision_hash
-            or expected_receipt_hash != row.receipt_hash
-        ):
-            raise OwnerConflict("writing_citation_decision_receipt_invalid")
-        self._asset_verifier.verify_asset_receipt(
-            asset_ref=binding.asset_ref,
-            version_ref=binding.version_ref,
-            content_hash=binding.content_hash,
-            manifest_hash=binding.manifest_hash,
-            receipt=binding.receipt,
-        )
-        if self._execution_verifier is None:
-            raise OwnerConflict("writing_execution_verifier_unavailable")
-        self._execution_verifier.verify_writing_execution_receipt(
-            run_ref=row.run_ref,
-            attempt_ref=row.attempt_ref,
-            fence_ref=row.fence_ref,
-            final_markdown_hash=row.final_markdown_hash,
-            citations_hash=row.citations_hash,
-            receipt=execution_receipt,
-        )
-        self._asset_verifier.verify_writing_deliverable(
-            binding=binding,
-            run_ref=row.run_ref,
-            attempt_ref=row.attempt_ref,
-            fence_ref=row.fence_ref,
-            quest_ref=row.quest_ref,
-            snapshot_ref=row.snapshot_ref,
-            snapshot_hash=row.snapshot_hash,
-            allowed_source_version_refs=tuple(allowed),
-            final_markdown_hash=row.final_markdown_hash,
-            citations_hash=row.citations_hash,
-            execution_receipt=execution_receipt,
-            require_current=False,
-        )
 
     def verify_root_question_receipt(
         self,
@@ -6703,7 +6515,7 @@ class SQLiteResearchGraphReceiptVerifier:
     def query_reasoning_result_display(self, submission_ref: str) -> dict[str, object] | None:
         """Project accepted text through the existing immutable history reader.
 
-        This is not a verified execution receipt or a Writing input closure.
+        This observation does not issue a verified execution receipt.
         """
         with self._database.read_snapshot() as connection:
             row = connection.execute(text(
@@ -6738,8 +6550,7 @@ class SQLiteResearchGraphReceiptVerifier:
         return {"items":[row.question_ref for row in rows],"total_count":total,"shown_count":len(rows),"offset":offset,"next_offset":offset+len(rows) if offset+len(rows)<total else None,"summary_only":True}
 
 
-
-class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
+class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -8774,475 +8585,6 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
                 {"operation_ref": operation_ref},
             ).one()
         return _question_control_receipt(row)
-
-
-    def decide_writing_citations(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        quest_ref: str,
-        snapshot_ref: str,
-        snapshot_hash: str,
-        allowed_source_version_refs: tuple[str, ...],
-        binding: AcceptedAssetBinding,
-        citations: tuple[dict[str, str], ...],
-        final_markdown_hash: str,
-        citations_hash: str,
-        execution_receipt: AcceptanceReceipt,
-    ) -> WritingCitationDecision:
-        if self._execution_verifier is None:
-            raise OwnerConflict("writing_execution_verifier_unavailable")
-        if (
-            not run_ref
-            or not attempt_ref
-            or not fence_ref
-            or not quest_ref
-            or not snapshot_ref
-            or len(snapshot_hash) != 64
-            or len(final_markdown_hash) != 64
-            or tuple(sorted(set(allowed_source_version_refs)))
-            != allowed_source_version_refs
-            or canonical_hash(list(citations)) != citations_hash
-        ):
-            raise OwnerConflict("writing_citation_input_invalid")
-        execution = self._execution_verifier.verify_writing_execution_receipt(
-            run_ref=run_ref,
-            attempt_ref=attempt_ref,
-            fence_ref=fence_ref,
-            final_markdown_hash=final_markdown_hash,
-            citations_hash=citations_hash,
-            receipt=execution_receipt,
-            require_current=True,
-            require_authorized=True,
-        )
-        if tuple(execution.get("citations", ())) != citations:
-            raise OwnerConflict("writing_execution_receipt_invalid")
-        if execution.get("quest_ref") != quest_ref or (
-            execution.get("snapshot_ref") != snapshot_ref
-            or execution.get("snapshot_hash") != snapshot_hash
-        ):
-            raise OwnerConflict("writing_citation_admission_binding_mismatch")
-        if (
-            tuple(execution.get("allowed_source_version_refs", ()))
-            != allowed_source_version_refs
-        ):
-            raise OwnerConflict("writing_citation_source_unaccepted")
-        final_markdown = self._asset_verifier.verify_writing_deliverable(
-            binding=binding,
-            run_ref=run_ref,
-            attempt_ref=attempt_ref,
-            fence_ref=fence_ref,
-            quest_ref=quest_ref,
-            snapshot_ref=snapshot_ref,
-            snapshot_hash=snapshot_hash,
-            allowed_source_version_refs=allowed_source_version_refs,
-            final_markdown_hash=final_markdown_hash,
-            citations_hash=citations_hash,
-            execution_receipt=execution_receipt,
-            require_current=True,
-        )
-        accepted_source_refs = {
-            role.version_ref
-            for role in self.query_asset_roles(
-                quest_ref=quest_ref,
-                version_refs=allowed_source_version_refs,
-            )
-        }
-        if accepted_source_refs != set(allowed_source_version_refs):
-            raise OwnerConflict("writing_citation_source_unaccepted")
-        feedback: list[str] = []
-        allowed = set(allowed_source_version_refs)
-        seen: set[str] = set()
-        try:
-            validate_writing_claim_inventory(final_markdown, citations)
-        except OwnerConflict as error:
-            feedback.append(f"report:{error}")
-        for index, citation in enumerate(citations):
-            if set(citation) != {
-                "citation_ref",
-                "source_version_ref",
-                "locator",
-                "claim",
-                "source_quote",
-            }:
-                feedback.append(f"citation[{index}]:schema_invalid")
-                continue
-            citation_ref = citation.get("citation_ref", "")
-            source_ref = citation.get("source_version_ref", "")
-            locator = citation.get("locator", "")
-            claim = citation.get("claim", "")
-            source_quote = citation.get("source_quote", "")
-            if not all(
-                isinstance(value, str) and value.strip()
-                for value in (
-                    citation_ref,
-                    source_ref,
-                    locator,
-                    claim,
-                    source_quote,
-                )
-            ):
-                feedback.append(f"citation[{index}]:field_missing")
-            elif citation_ref in seen:
-                feedback.append(f"citation[{index}]:duplicate_ref")
-            elif source_ref not in allowed:
-                feedback.append(f"citation[{index}]:source_outside_snapshot")
-            else:
-                try:
-                    source_excerpt = self._asset_verifier.verify_writing_source_locator(
-                        version_ref=source_ref,
-                        locator=locator,
-                    )
-                except OwnerConflict:
-                    feedback.append(f"citation[{index}]:locator_unverifiable")
-                else:
-                    normalized_claim = " ".join(claim.casefold().split())
-                    normalized_quote = " ".join(source_quote.casefold().split())
-                    normalized_excerpt = " ".join(
-                        source_excerpt.casefold().split()
-                    )
-                    if normalized_claim != normalized_quote:
-                        feedback.append(
-                            f"citation[{index}]:claim_not_exact_source_quote"
-                        )
-                    elif normalized_quote not in normalized_excerpt:
-                        feedback.append(
-                            f"citation[{index}]:source_quote_not_at_locator"
-                        )
-            seen.add(citation_ref)
-        decision = "accepted" if not feedback else "rejected"
-        decision_payload = {
-            "schema_ref": "meta-research/writing-citation-decision/v1",
-            "run_ref": run_ref,
-            "attempt_ref": attempt_ref,
-            "fence_ref": fence_ref,
-            "quest_ref": quest_ref,
-            "snapshot_ref": snapshot_ref,
-            "snapshot_hash": snapshot_hash,
-            "allowed_source_version_refs": list(allowed_source_version_refs),
-            "asset": binding.as_dict(),
-            "citations": list(citations),
-            "citations_hash": citations_hash,
-            "final_markdown_hash": final_markdown_hash,
-            "execution_receipt": execution_receipt.as_public_dict(),
-            "decision": decision,
-            "feedback": feedback,
-        }
-        decision_hash = canonical_hash(decision_payload)
-        with self._database.write() as connection:
-            # Re-verify the complete AR -> RM chain while holding the shared
-            # write lock. Pause/cancel/revoke cannot slip between verification
-            # and this RG decision commit.
-            current_execution = self._execution_verifier.verify_writing_execution_receipt(
-                run_ref=run_ref,
-                attempt_ref=attempt_ref,
-                fence_ref=fence_ref,
-                final_markdown_hash=final_markdown_hash,
-                citations_hash=citations_hash,
-                receipt=execution_receipt,
-                require_current=True,
-                require_authorized=True,
-            )
-            if (
-                current_execution.get("quest_ref") != quest_ref
-                or current_execution.get("snapshot_ref") != snapshot_ref
-                or current_execution.get("snapshot_hash") != snapshot_hash
-            ):
-                raise OwnerConflict("writing_citation_admission_binding_mismatch")
-            if (
-                tuple(
-                    current_execution.get("allowed_source_version_refs", ())
-                )
-                != allowed_source_version_refs
-            ):
-                raise OwnerConflict("writing_citation_source_unaccepted")
-            self._asset_verifier.verify_writing_deliverable(
-                binding=binding,
-                run_ref=run_ref,
-                attempt_ref=attempt_ref,
-                fence_ref=fence_ref,
-                quest_ref=quest_ref,
-                snapshot_ref=snapshot_ref,
-                snapshot_hash=snapshot_hash,
-                allowed_source_version_refs=allowed_source_version_refs,
-                final_markdown_hash=final_markdown_hash,
-                citations_hash=citations_hash,
-                execution_receipt=execution_receipt,
-                require_current=True,
-            )
-            row = connection.execute(
-                text(
-                    "SELECT * FROM rg_writing_citation_decisions WHERE run_ref = "
-                    ":run_ref AND attempt_ref = :attempt_ref"
-                ),
-                {"run_ref": run_ref, "attempt_ref": attempt_ref},
-            ).first()
-            if row is None:
-                decision_ref = new_ref("writing_citation_decision")
-                receipt_ref = new_ref("writing_citation_receipt")
-                receipt_kind = (
-                    WRITING_CITATIONS_ACCEPTED_RECEIPT_KIND
-                    if decision == "accepted"
-                    else WRITING_CITATIONS_REJECTED_RECEIPT_KIND
-                )
-                receipt_hash = canonical_hash(
-                    {
-                        "schema_ref": RECEIPT_SCHEMA,
-                        "issuer": RG_OWNER,
-                        "kind": receipt_kind,
-                        "subject_ref": decision_ref,
-                        "payload_hash": decision_hash,
-                    }
-                )
-                now = time.time()
-                connection.execute(
-                    text(
-                        "INSERT INTO rg_writing_citation_decisions (decision_ref, "
-                        "run_ref, attempt_ref, fence_ref, quest_ref, snapshot_ref, "
-                        "snapshot_hash, allowed_sources_json, allowed_sources_hash, "
-                        "asset_ref, version_ref, content_hash, manifest_hash, "
-                        "asset_receipt_ref, asset_receipt_hash, citations_json, "
-                        "citations_hash, final_markdown_hash, execution_ref, "
-                        "execution_receipt_ref, "
-                        "execution_receipt_hash, decision, feedback_json, "
-                        "feedback_hash, decision_hash, receipt_ref, receipt_hash, "
-                        "decided_at) VALUES (:decision_ref, :run_ref, :attempt_ref, "
-                        ":fence_ref, :quest_ref, :snapshot_ref, :snapshot_hash, "
-                        ":allowed_sources_json, :allowed_sources_hash, :asset_ref, "
-                        ":version_ref, :content_hash, :manifest_hash, "
-                        ":asset_receipt_ref, :asset_receipt_hash, :citations_json, "
-                        ":citations_hash, :final_markdown_hash, "
-                        ":execution_ref, :execution_receipt_ref, "
-                        ":execution_receipt_hash, :decision, "
-                        ":feedback_json, :feedback_hash, :decision_hash, :receipt_ref, "
-                        ":receipt_hash, :now)"
-                    ),
-                    {
-                        "decision_ref": decision_ref,
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "fence_ref": fence_ref,
-                        "quest_ref": quest_ref,
-                        "snapshot_ref": snapshot_ref,
-                        "snapshot_hash": snapshot_hash,
-                        "allowed_sources_json": canonical_json(
-                            list(allowed_source_version_refs)
-                        ),
-                        "allowed_sources_hash": canonical_hash(
-                            list(allowed_source_version_refs)
-                        ),
-                        "asset_ref": binding.asset_ref,
-                        "version_ref": binding.version_ref,
-                        "content_hash": binding.content_hash,
-                        "manifest_hash": binding.manifest_hash,
-                        "asset_receipt_ref": binding.receipt.receipt_ref,
-                        "asset_receipt_hash": binding.receipt.payload_hash,
-                        "citations_json": canonical_json(list(citations)),
-                        "citations_hash": citations_hash,
-                        "final_markdown_hash": final_markdown_hash,
-                        "execution_ref": execution_receipt.subject_ref,
-                        "execution_receipt_ref": execution_receipt.receipt_ref,
-                        "execution_receipt_hash": execution_receipt.payload_hash,
-                        "decision": decision,
-                        "feedback_json": canonical_json(feedback),
-                        "feedback_hash": canonical_hash(feedback),
-                        "decision_hash": decision_hash,
-                        "receipt_ref": receipt_ref,
-                        "receipt_hash": receipt_hash,
-                        "now": now,
-                    },
-                )
-                connection.execute(
-                    text(
-                        "UPDATE research_graph_state SET revision = revision + 1, "
-                        "writing_citation_decision_count = "
-                        "writing_citation_decision_count + 1, "
-                        "writing_citation_rejection_count = "
-                        "writing_citation_rejection_count + :rejected WHERE "
-                        "singleton = 'owner'"
-                    ),
-                    {"rejected": 1 if decision == "rejected" else 0},
-                )
-                self._feed.record(
-                    connection,
-                    "research_graph.writing_citations_decided",
-                    {
-                        "decision_ref": decision_ref,
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "version_ref": binding.version_ref,
-                        "decision": decision,
-                        "receipt_ref": receipt_ref,
-                    },
-                )
-            elif row.decision_hash != decision_hash:
-                raise OwnerConflict("writing_citation_decision_conflict")
-        result = self.query_writing_citation_decision(
-            run_ref=run_ref, attempt_ref=attempt_ref
-        )
-        if result is None:
-            raise OwnerConflict("writing_citation_decision_missing_after_commit")
-        return result
-
-    def query_writing_citation_decision(
-        self, *, run_ref: str, attempt_ref: str | None = None
-    ) -> WritingCitationDecision | None:
-        clauses = "run_ref = :run_ref"
-        parameters: dict[str, object] = {"run_ref": run_ref}
-        if attempt_ref is not None:
-            clauses += " AND attempt_ref = :attempt_ref"
-            parameters["attempt_ref"] = attempt_ref
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM rg_writing_citation_decisions WHERE "
-                    + clauses
-                    + " ORDER BY decided_at DESC, decision_ref DESC LIMIT 1"
-                ),
-                parameters,
-            ).first()
-        return self._writing_citation_decision_from_row(row)
-
-    def query_writing_citation_history(
-        self, run_ref: str
-    ) -> tuple[WritingCitationDecision, ...]:
-        with self._database.read() as connection:
-            rows = connection.execute(
-                text(
-                    "SELECT * FROM rg_writing_citation_decisions WHERE run_ref = "
-                    ":run_ref ORDER BY decided_at, decision_ref"
-                ),
-                {"run_ref": run_ref},
-            ).all()
-        return tuple(self._writing_citation_decision_from_row(row) for row in rows)
-
-    def _writing_citation_decision_from_row(
-        self, row
-    ) -> WritingCitationDecision | None:
-        if row is None:
-            return None
-        try:
-            allowed = json.loads(row.allowed_sources_json)
-            citations = json.loads(row.citations_json)
-            feedback = json.loads(row.feedback_json)
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise OwnerConflict("writing_citation_decision_integrity_invalid") from error
-        binding = AcceptedAssetBinding(
-            asset_ref=row.asset_ref,
-            version_ref=row.version_ref,
-            content_hash=row.content_hash,
-            manifest_hash=row.manifest_hash,
-            receipt=AcceptanceReceipt(
-                issuer="research_memory",
-                kind="asset_acceptance",
-                receipt_ref=row.asset_receipt_ref,
-                subject_ref=row.version_ref,
-                payload_hash=row.asset_receipt_hash,
-            ),
-        )
-        execution_receipt = AcceptanceReceipt(
-            issuer="agent_runtime",
-            kind="writing_execution_completed",
-            receipt_ref=row.execution_receipt_ref,
-            subject_ref=row.execution_ref,
-            payload_hash=row.execution_receipt_hash,
-        )
-        decision_payload = {
-            "schema_ref": "meta-research/writing-citation-decision/v1",
-            "run_ref": row.run_ref,
-            "attempt_ref": row.attempt_ref,
-            "fence_ref": row.fence_ref,
-            "quest_ref": row.quest_ref,
-            "snapshot_ref": row.snapshot_ref,
-            "snapshot_hash": row.snapshot_hash,
-            "allowed_source_version_refs": allowed,
-            "asset": binding.as_dict(),
-            "citations": citations,
-            "citations_hash": row.citations_hash,
-            "final_markdown_hash": row.final_markdown_hash,
-            "execution_receipt": execution_receipt.as_public_dict(),
-            "decision": row.decision,
-            "feedback": feedback,
-        }
-        receipt_kind = (
-            WRITING_CITATIONS_ACCEPTED_RECEIPT_KIND
-            if row.decision == "accepted"
-            else WRITING_CITATIONS_REJECTED_RECEIPT_KIND
-        )
-        expected_receipt_hash = canonical_hash(
-            {
-                "schema_ref": RECEIPT_SCHEMA,
-                "issuer": RG_OWNER,
-                "kind": receipt_kind,
-                "subject_ref": row.decision_ref,
-                "payload_hash": row.decision_hash,
-            }
-        )
-        if (
-            not isinstance(allowed, list)
-            or not isinstance(citations, list)
-            or not isinstance(feedback, list)
-            or canonical_hash(allowed) != row.allowed_sources_hash
-            or canonical_hash(citations) != row.citations_hash
-            or canonical_hash(feedback) != row.feedback_hash
-            or canonical_hash(decision_payload) != row.decision_hash
-            or expected_receipt_hash != row.receipt_hash
-        ):
-            raise OwnerConflict("writing_citation_decision_integrity_invalid")
-        # This is an immutable RG history read. Current custody availability is
-        # projected separately and must not erase a valid historical receipt.
-        self._asset_verifier.verify_asset_receipt(
-            asset_ref=binding.asset_ref,
-            version_ref=binding.version_ref,
-            content_hash=binding.content_hash,
-            manifest_hash=binding.manifest_hash,
-            receipt=binding.receipt,
-        )
-        if self._execution_verifier is None:
-            raise OwnerConflict("writing_execution_verifier_unavailable")
-        self._execution_verifier.verify_writing_execution_receipt(
-            run_ref=row.run_ref,
-            attempt_ref=row.attempt_ref,
-            fence_ref=row.fence_ref,
-            final_markdown_hash=row.final_markdown_hash,
-            citations_hash=row.citations_hash,
-            receipt=execution_receipt,
-        )
-        self._asset_verifier.verify_writing_deliverable(
-            binding=binding,
-            run_ref=row.run_ref,
-            attempt_ref=row.attempt_ref,
-            fence_ref=row.fence_ref,
-            quest_ref=row.quest_ref,
-            snapshot_ref=row.snapshot_ref,
-            snapshot_hash=row.snapshot_hash,
-            allowed_source_version_refs=tuple(allowed),
-            final_markdown_hash=row.final_markdown_hash,
-            citations_hash=row.citations_hash,
-            execution_receipt=execution_receipt,
-            require_current=False,
-        )
-        return WritingCitationDecision(
-            decision_ref=row.decision_ref,
-            run_ref=row.run_ref,
-            attempt_ref=row.attempt_ref,
-            quest_ref=row.quest_ref,
-            snapshot_ref=row.snapshot_ref,
-            snapshot_hash=row.snapshot_hash,
-            asset=binding,
-            citations=tuple(citations),
-            decision=row.decision,
-            feedback=tuple(feedback),
-            receipt=AcceptanceReceipt(
-                issuer=RG_OWNER,
-                kind=receipt_kind,
-                receipt_ref=row.receipt_ref,
-                subject_ref=row.decision_ref,
-                payload_hash=row.receipt_hash,
-            ),
-        )
 
 
     def preview_quest_acceptance(
@@ -12463,7 +11805,7 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
     ) -> IdeaOutcomeDecision | FormalPlanDecision | None:
         """Read an accepted Idea/Plan fact without re-authorizing its inputs."""
         if request.stage not in {'idea', 'plan'}:
-            raise OwnerConflict('writing_stage_result_invalid')
+            raise OwnerConflict('research_stage_result_invalid')
         idea = request.stage == 'idea'
         table = 'rg_idea_outcome_decisions' if idea else 'rg_formal_plan_decisions'
         with self._database.read() as connection:
@@ -12502,7 +11844,7 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
             or row.reviewed_draft_hash != content.reviewed_draft_hash
             or row.review_hash != content.review_hash
         ):
-            raise OwnerConflict('writing_stage_result_invalid')
+            raise OwnerConflict('research_stage_result_invalid')
         return decision
 
     def query_idea_outcome_decision(
@@ -17444,7 +16786,6 @@ class SQLiteResearchGraph(QuestGoalOwnerMixin, BaselineIdentityQueries, Research
 
     def query_active_question_page(self, *args, **kwargs):
         return self._receipt_verifier.query_active_question_page(*args, **kwargs)
-
 
 
 def _accepted_experiment_input_binding(row) -> AcceptedExperimentInputBinding:

@@ -135,10 +135,6 @@ from meta_research.telemetry import (
     OtlpHttpTelemetryExporter,
     validate_otlp_http_endpoint,
 )
-from meta_research.writing import WritingReportService
-from meta_research.writing_delivery import WritingDeliveryProviderRegistry
-from meta_research.writing_renderer import WritingRendererRegistry
-from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 from meta_research.root_workspace import RootWorkspaces
 from meta_research.external_mcp import ExternalMcpRuntime
@@ -290,7 +286,6 @@ class ProductionRuntime:
     autonomous_creation: AutonomousCreationService
     quest_completion: QuestCompletionService
     deepfetch: FirstQuestionDeepFetchWorker
-    writing: WritingReportService
     harnesses: HarnessRuntime
     external_mcp: ExternalMcpRuntime
     search_sources: SearchSourceRegistry
@@ -557,9 +552,6 @@ def build_production_runtime(
     target_commit_evidence_authority: TargetCommitEvidenceAuthority | None = None,
     deepfetch_provider: DeepFetchProvider | None = None,
     acquisition_provider: AcquisitionProvider | None = None,
-    writing_skill_provider: WritingSkillProvider | None = None,
-    writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
-    writing_renderer_registry: WritingRendererRegistry | None = None,
     harness_adapters: tuple[HarnessAdapter, ...] | None = None,
     target_root_timeout_seconds: float | None = (
         TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS
@@ -655,11 +647,6 @@ def build_production_runtime(
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
     )
-    writing_skill_provider = writing_skill_provider or CodexWritingSkillAdapter(
-        data_root.root / "writing-skill-provider",
-        executable=codex_executable,
-        process_runner=codex_provider_runner,
-    )
 
     host_compute_reader = create_host_compute_observation_reader(database)
     human_response_verifier = create_human_response_verifier(database)
@@ -676,7 +663,6 @@ def build_production_runtime(
     attempt_receipts = create_agent_runtime_receipt_verifier(
         database=database,
         stage_request_verifier=stage_request_receipts,
-        writing_authorization_verifier=human_response_verifier,
     )
     research_memory_receipts = create_research_memory_receipt_verifier(
         database=database,
@@ -716,7 +702,6 @@ def build_production_runtime(
         human_response_verifier=human_response_verifier,
         bundle_report_evidence_verifier=research_graph_receipts,
         reasoning_outcome_verifier=research_graph_receipts,
-        writing_delivery_provider_registry=writing_delivery_provider_registry,
         runtime_protection=runtime_protection,
         receipt_verifier=attempt_receipts,
     )
@@ -736,7 +721,6 @@ def build_production_runtime(
         reasoning_skill_provider,
         deepfetch_provider,
         acquisition_provider,
-        writing_skill_provider,
     ):
         if any(provider is bound for bound in diagnostic_bound_providers):
             continue
@@ -766,10 +750,6 @@ def build_production_runtime(
         deepfetch_provider,
         unit_kinds=("deepfetch",),
     )
-    agent_runtime.bind_provider_quiescence_driver(
-        writing_skill_provider,
-        unit_kinds=("writing_primary", "writing_review"),
-    )
     research_graph = create_research_graph_interface(
         database=database,
         feed=feed,
@@ -786,7 +766,6 @@ def build_production_runtime(
         runtime_control_verifier=attempt_receipts,
         reasoning_content_verifier=research_memory_receipts,
     )
-    agent_runtime.bind_writing_citation_verifier(research_graph_receipts)
     research_memory = create_research_memory_interface(
         database=database,
         object_store=data_root.objects,
@@ -976,7 +955,6 @@ def build_production_runtime(
         "idea": idea_skill_provider, "plan": plan_skill_provider,
         "bundle": bundle_skill_provider, "reasoning": reasoning_skill_provider,
         "companion": intent_drafting_provider, "acquisition": acquisition_provider,
-        "writing": writing_skill_provider,
     }
     root_workspaces = RootWorkspaces(
         advancement_engine=advancement_engine, agent_runtime=agent_runtime,
@@ -1003,6 +981,10 @@ def build_production_runtime(
     bind_sources = getattr(deepfetch_provider, "bind_search_sources", None)
     if callable(bind_sources):
         bind_sources(search_sources)
+    bind_materials = getattr(deepfetch_provider, "bind_accepted_materials", None)
+    if callable(bind_materials):
+        from meta_research.accepted_materials import DeepFetchAcceptedMaterials
+        bind_materials(DeepFetchAcceptedMaterials(agent_runtime, human_collaboration, research_memory))
     semantic_gateway = create_semantic_owner_gateway(
         root_workspaces=root_workspaces,
         research_graph=owners.research_graph,
@@ -1089,7 +1071,6 @@ def build_production_runtime(
         plan_skill_provider,
         deepfetch_provider,
         acquisition_provider,
-        writing_skill_provider,
     ):
         if any(provider is bound for bound in resident_mcp_providers):
             continue
@@ -1170,19 +1151,6 @@ def build_production_runtime(
         stopped_provider_checkpoint=StoppedStageProviderRecovery(stage_root_observations),
         database=database,
     )
-    writing = WritingReportService(
-        research_graph,
-        advancement_engine,
-        research_memory,
-        agent_runtime,
-        human_collaboration,
-        writing_skill_provider,
-        writing_renderer_registry,
-    )
-    human_collaboration.bind_writing_delivery_binding_validator(
-        writing.verify_writing_delivery_binding
-    )
-    agent_runtime.writing_delivery.bind_binding_verifier(writing)
     projection = PublicProjection(
         feed,
         data_root.objects,
@@ -1197,7 +1165,6 @@ def build_production_runtime(
         reasoning_stage=reasoning_stage,
         autonomous_creation=autonomous_creation,
         quest_completion=quest_completion,
-        writing=writing,
         harnesses=harnesses,
         database=database,
     )
@@ -1212,7 +1179,6 @@ def build_production_runtime(
         reasoning_skill_provider,
         deepfetch_provider,
         acquisition_provider,
-        writing_skill_provider,
     ):
         if callable(getattr(provider, "request_stop", None)) and not any(
             provider is lifecycle for lifecycle in provider_lifecycles
@@ -1220,7 +1186,7 @@ def build_production_runtime(
             provider_lifecycles.append(provider)
     external_mcp.bind_scope_authority(harnesses)
     for provider in (intent_drafting_provider, idea_skill_provider, plan_skill_provider,
-        bundle_skill_provider, reasoning_skill_provider, deepfetch_provider, acquisition_provider, writing_skill_provider):
+        bundle_skill_provider, reasoning_skill_provider, deepfetch_provider, acquisition_provider):
         bind_external = getattr(provider, "bind_external_mcp", None)
         if callable(bind_external):
             bind_external(external_mcp)
@@ -1240,7 +1206,6 @@ def build_production_runtime(
         autonomous_creation=autonomous_creation,
         quest_completion=quest_completion,
         deepfetch=deepfetch,
-        writing=writing,
         harnesses=harnesses,
         target_run_authorities=TargetRunAuthorities(
             research_memory=target_run_memory,

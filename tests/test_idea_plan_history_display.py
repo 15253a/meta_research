@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from meta_research.owners.common import OwnerConflict
 from meta_research.research_overview import ResearchOverviewReader
-from meta_research.writing_snapshot import WritingResearchSnapshotReader
+from meta_research.accepted_research import AcceptedResearchReader
 from test_bundle_history_display import _changed
 from test_research_overview import (
     _DeterministicIdeaSkill, _DeterministicPlanSkill, _runtime,
@@ -17,9 +17,9 @@ from test_research_overview import (
 
 
 class _StrictOverview(ResearchOverviewReader):
-    """Keep the same output assembly but use Writing's authoritative reads."""
+    """Keep the same output assembly but use authoritative accepted research reads."""
 
-    _stage_value = WritingResearchSnapshotReader._stage_value
+    _stage_value = AcceptedResearchReader._stage_value
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ def accepted_idea_and_plan(tmp_path):
             quest=quest, cycle=cycle, stages=stages,
             overview=ResearchOverviewReader(*readers),
             strict=_StrictOverview(*readers),
-            writing=WritingResearchSnapshotReader(*readers),
+            accepted=AcceptedResearchReader(*readers),
         )
     finally:
         runtime.close()
@@ -134,7 +134,7 @@ def test_idea_plan_display_matches_strict_overview_without_deep_decision_replay(
         for stage in ("idea", "plan"):
             value = fixture.stages[stage]
             with pytest.raises(OwnerConflict, match="test_.*_admission_replayed"):
-                fixture.writing._stage_value(value.request, value.commit)
+                fixture.accepted._stage_value(value.request, value.commit)
     assert _owner_revisions(fixture.runtime) == revisions
     assert database._read_cut.get() is None and database._read_cache.get() is None
 

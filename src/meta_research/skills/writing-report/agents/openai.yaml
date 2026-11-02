@@ -1,4 +1,4 @@
 interface:
   display_name: "研究文档写作"
-  short_description: "根据冻结来源起草、独立审阅并修订研究文档"
-  default_prompt: "使用 $writing-report 根据冻结 Quest Snapshot 起草研究文档，组织独立审阅并在原根会话定稿。"
+  short_description: "按用户模板完成论文、研究报告与配套 PPT 的正式交付"
+  default_prompt: "使用 $writing-report，根据本次任务、研究材料与模板完成所需论文、报告、配套 PPT 或局部写作。拒绝防御性写作，形成证据支持的科学表达；在当前助手或研究任务中完成要求的内容与文件。"

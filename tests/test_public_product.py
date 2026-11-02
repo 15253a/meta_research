@@ -124,7 +124,6 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "quest_drafting_worker",
             "first_question_deepfetch_worker",
             "quest_reconciliation_worker",
-            "writing_worker",
         }
         assert "experiment" not in snapshot
         assert anonymous.get("/api/v1/experiments/current").status_code == 404

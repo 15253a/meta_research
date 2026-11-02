@@ -195,7 +195,7 @@ def test_persistence_freezes_config_and_checks_signed_snapshot(tmp_path):
 
 def test_optional_scope_defaults_to_all_and_explicit_none_is_preserved(tmp_path):
     runtime = configured(tmp_path)
-    snapshot = runtime.operation_snapshot(operation_identity="writing-a", root_kind="writing", task_prompt="write")
+    snapshot = runtime.operation_snapshot(operation_identity="companion-a", root_kind="companion", task_prompt="write")
     assert len(snapshot.services) == 1
     assert snapshot.services[0].service.research_instructions == ""
     with pytest.raises(ExternalMcpError, match="external_mcp_transport_unsupported"):

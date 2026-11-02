@@ -56,7 +56,7 @@ def test_original_request_root_records_actual_read_and_declared_influence_withou
             public = client.get(f"/api/v1/work-materials/{reference}").json()
             assert public["read_ranges"][0]["actor"] == context.run_ref
             assert public["treatments"] == [treated]
-            assert treated["processed_by"]["run_ref"] == "reply-work"
+            assert treated["processed_by"]["run_ref"] == context.run_ref
             assert treated["receiver"]["request_ref"] == opened["request_ref"]
             assert treated["declared_by_root"] is True
             assert treated["selections"] == []

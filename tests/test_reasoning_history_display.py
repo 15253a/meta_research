@@ -9,7 +9,7 @@ from meta_research.composition import build_production_runtime
 from meta_research.owners.common import OwnerConflict, canonical_json
 from meta_research.paths import prepare_data_root
 from meta_research.research_overview import ResearchOverviewReader
-from meta_research.writing_snapshot import WritingResearchSnapshotReader
+from meta_research.accepted_research import AcceptedResearchReader
 from test_bundle_history_display import _changed
 from test_research_overview import (
     CurrentReasoningSkill, DeterministicDeepFetchProvider, DeterministicProbe,
@@ -57,10 +57,10 @@ def test_reasoning_history_keeps_text_without_replaying_execution(accepted_reaso
     owners, database = runtime.owners, runtime._database
     readers = (owners.research_graph, owners.advancement_engine,
                owners.research_memory, owners.agent_runtime)
-    overview, writing = ResearchOverviewReader(*readers), WritingResearchSnapshotReader(*readers)
+    overview, accepted = ResearchOverviewReader(*readers), AcceptedResearchReader(*readers)
     with database.read_snapshot():
         expected = overview._query_once(quest["quest_ref"])
-        original = writing._reasoning_stage_value(request, commit)["result"]
+        original = accepted._reasoning_stage_value(request, commit)["result"]
     strict = Mock(side_effect=OwnerConflict("test_execution_proof_unavailable"))
     with monkeypatch.context() as patch:
         patch.setattr(owners.research_memory._receipt_verifier,
@@ -76,7 +76,7 @@ def test_reasoning_history_keeps_text_without_replaying_execution(accepted_reaso
         strict.assert_not_called()
         write.assert_not_called()
         with pytest.raises(OwnerConflict, match="test_execution_proof_unavailable"):
-            writing._reasoning_stage_value(request, commit)
+            accepted._reasoning_stage_value(request, commit)
     assert database._read_cut.get() is None and database._read_cache.get() is None
 
 

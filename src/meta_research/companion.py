@@ -43,6 +43,7 @@ from meta_research.quest_drafting import (
     _validated_question,
 )
 from meta_research.root_capabilities import RootCapabilityProfile, root_capability_profile
+from meta_research.resource_preparation import resource_preparation
 from meta_research.creation_basis import (
     InitializationUnderstandingRequest, InitializationUnderstandingResult,
     FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult,
@@ -97,20 +98,25 @@ class CodexCompanionAdapter(
     def capability_profile(self) -> RootCapabilityProfile:
         return root_capability_profile("companion")
 
+    @resource_preparation
     def runtime_binding(self):
         binding = super().runtime_binding()
+        creation = first_creation_instructions()
         guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
         source_hash = _file_sha256(Path(__file__).resolve())
         return replace(binding,
             packaged_skill_bundle_hash=canonical_hash({
                 "inherited": binding.packaged_skill_bundle_hash, "companion-work.md": guidance,
+                "first_creation": creation["bundle_hash"],
             }),
             instruction_set_hash=canonical_hash({
                 "inherited": binding.instruction_set_hash,
                 "companion-work.md": guidance, "companion_source": source_hash,
+                "first_creation": creation["bundle_hash"],
             }),
             resource_bindings=(*binding.resource_bindings,
                 "package:meta_research.skills/companion-work.md@sha256:" + canonical_hash(guidance),
+                "package:meta_research.skills/first_creation@sha256:" + creation["bundle_hash"],
                 "adapter-source:meta_research.companion@sha256:" + source_hash),
         )
 
@@ -157,10 +163,10 @@ class CodexCompanionAdapter(
         elif getattr(request, "reassessment", None) is not None:
             work.bind_reassessment_readers(request.reassessment)
             extra = ("research_memory.creation_basis.read", "research_memory.content.read")
-        guidance_root = Path(__file__).parent / "skills" / "first_creation"
-        names = ("SKILL.md", "references/source-evidence.md", "references/literature-corrections.md")
-        guidance = {name: str(guidance_root / name) for name in names}
+        from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_root
+        guidance = first_creation_instructions()["paths"]
         files = [Path(value) for value in guidance.values()]
+        files.extend(shared_reference_root() / name for name in SHARED_REFERENCE_PATHS)
         context = getattr(request, "context", None)
         if context is not None:
             original_binding = self._creation_workspace(request)
@@ -494,8 +500,21 @@ class CodexCompanionAdapter(
             f"user_message={request.message}"
         )
         if companion:
-            guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
-            prompt += "\n\n<!-- bundled resource: companion-work.md -->\n" + guidance
+            source = Path(__file__).parent / "skills" / "companion-work.md"
+            prompt += "\n\nCompanion role source: " + str(source.resolve())
+            if request.native_session_ref is None:
+                prompt += "\n<!-- bundled resource: companion-work.md -->\n" + source.read_text(encoding="utf-8")
+        else:
+            instructions = first_creation_instructions()
+            prompt += "\n\nCreation guidance paths: " + _canonical_json(instructions["paths"])
+            if request.native_session_ref is None:
+                prompt += "\n" + instructions["instructions"]
+        reply_schema = _reply_schema(include_agent_proposal=companion)
+        if request.inputs is not None and request.literature_snapshot is not None:
+            reply_schema["properties"]["revision"] = revision_schema(references=True)
+            reply_schema["required"].append("revision")
+            prompt += "\nRead the accepted literature through the exact scoped Reader. Return a complete understanding revision and honest source-backed corrections; keep the Seed and source selection immutable."
+        prompt += "\ndrafting_response_schema=" + _canonical_json(reply_schema)
         if request.job_ref is not None:
             prompt = preserve_existing_reply_prompt(
                 prompt,
@@ -511,11 +530,6 @@ class CodexCompanionAdapter(
         try:
             identity, work = None, None
             if request.inputs is not None:
-                reply_schema = _reply_schema(include_agent_proposal=companion)
-                if request.literature_snapshot is not None:
-                    reply_schema["properties"]["revision"] = revision_schema(references=True)
-                    reply_schema["required"].append("revision")
-                    prompt += "\nRead the accepted literature through the exact scoped Reader. Return a complete understanding revision and honest source-backed corrections; keep the Seed and source selection immutable."
                 raw, native_session_ref, _stdout, identity, work = self._protected_creation_invoke(request,
                     operation_name="companion-turn", prompt=prompt,
                     schema=reply_schema, native_session_ref=request.native_session_ref,
@@ -525,7 +539,7 @@ class CodexCompanionAdapter(
                     self._invoke_optional_root_task_operation(
                         operation_name="companion-turn",
                         prompt=prompt,
-                        schema=_reply_schema(include_agent_proposal=companion),
+                        schema=reply_schema,
                         native_session_ref=request.native_session_ref,
                         job_ref=request.job_ref,
                         workspace_binding=(self._creation_workspace(request)

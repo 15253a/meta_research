@@ -5,7 +5,31 @@ description: 当任务明确调用 DeepFetch、系统性多论文文献梳理或
 
 # DeepFetch v4：文献证据梳理
 
-主智能体负责发现、取舍和综合，获取服务负责合法取得全文，独立 Reader 负责全文科学阅读。按当前根 Session 的 `zh`／`en` 偏好直接撰写用户可见内容并传递给子智能体；未提供偏好时采用输入语言。原文、标识和引用保持原貌。
+输入一段研究内容，输出 `summary.md` 和装有实际取得全文的 `fulltext/` 文件夹，配套 `papers.json` 记录论文、文件与阅读情况。后续自主建题由 Reasoning 组织输入，成果回到同一 Reasoning Session，由它继续判断是否建题及怎样组织问题。
+
+主智能体负责发现、取舍和综合，获取服务负责合法取得全文，独立 Reader 负责全文科学阅读。用户可见内容沿当前语言偏好，原文、标识和引用保持原貌。
+
+## 阶段、输入与读取
+
+每次业务输入先说明本次请求身份、当前 phase 和宿主确认的有效访问模式。创建期按实际 `creation_context_kind`、`quest_ref` 和请求范围定位；有 `creation_basis` 不表示一定没有 Quest，有 Quest 也不表示正在 Cycle。研究内请求若确有上游 Cycle、阶段或研究重心，保留其原文和来源，不补造轮次或获得调度权限。
+
+新 native 根收到完整科学 scope：研究目标、条件、已有认识、失败、争议、未决问题和适用边界，以及准确材料入口。`scope.literature_mode` 是请求偏好，执行沿宿主确认的 `literature_access_mode`；两者的实际关系需明确。没有准确可达的同一输入原文时，保留完整正文。
+
+有效模式或其绑定缺失时，如实说明运行条件缺失，沿现有运行错误与协作路径处理；模型不自行补成默认模式或宣称路线已就绪。Gate 首次查询需要的关键原文应在当轮准确可读，不能以实质轮稍后会收到代替当前可读。
+
+需要外部发现的请求先进行短 Web Evidence Gate：按完整 scope 做真实 Search 并 Open/Fetch 一个结果，成功只证明本轮 Web 路线可用。Gate 不作全文阅读或研究交付；无法完成时保留真实故障和需要人的事项。`provided_only` 直接进入提供材料核实和阅读，Web Gate 不适用，不生成 Web 成功记录，也不开展 OpenAlex、Web 或补充来源发现。
+
+首次进入实质工作完整接收或读取本 Skill；正文已经内联时不重复加载同一份。各参考使用本次固定 bundle 的准确入口，按以下时机全文读取：
+
+- 开始访问预检或派工前：`references/agents.md`。
+- 本次存在 `creation_basis`，首次查询或提供材料取舍前：`references/creation-basis.md` 及其准确依据；仅在明确保留 prior snapshot 时读取该 snapshot。
+- 首次外部发现前：`references/openalex.md`；首次创建或修改台账前：`references/papers-json.md` 与 `references/ledger-tools.md`。
+- 本次补充来源清单非空且确需调用时：`references/search-sources.md`；清单为空无须展开。
+- 综合前：`references/summary.md`。每个 Reader 在读正文前完整读取其任务指定的阅读合同。
+
+Gate 与实质工作沿同一 native 根连续推进时，实质轮只增当前任务、角色正文、准确材料导航及新条件，沿用已收到的完整 scope。Acquisition 返回和正式人工回应也只补本次结果、变化和接续任务。缺材或压缩后按既有准确入口恢复必要原文；实际启动新 native 根时重新完整装配。运行时继续维持适用指令、工具、权限、schema 和有效历史，业务增量不等于整个模型请求只有增量。
+
+需要复用已有问题、方法、数据、环境或文献认识时，按 [研究导航](../references/research-navigation.md) 从获授范围发现；本次已有准确来源可直接读取。需要人补足访问条件、专业判断、材料、授权或协助恢复操作时，按 [人类协作](../references/human-guidance.md#主动发起与接续-humanrequest) 选择实际求助类型及接续方式；处理文件、保管或交接时查 [材料与保管](../references/materials-and-custody.md)。共享指导不扩大本次检索范围和能力，外部学术发现仍按本 Skill 的来源与访问模式执行。
 
 交付 `papers.json`、`summary.md` 和 `fulltext/`。检索强度仅决定主动检索时钟：`low` 8 分钟、`medium` 13 分钟、`high` 20 分钟，默认 `medium`。预检完成后计时；纯等待用户登录或上传不计入。到时停止新发现和候补晋升，冻结正在获取、已取得待分配 Reader 及已获 Reader 分配的当前目标；仅排空这些工作，排空时间在主动检索时钟之外。
 
@@ -13,7 +37,7 @@ description: 当任务明确调用 DeepFetch、系统性多论文文献梳理或
 
 ## 1. 预检
 
-首题创建存在 `scope.creation_basis` 时，先完整读取[已有课题依据](references/creation-basis.md)，再经其精确入口读已有理解及关键原材料。旧认识、条件、冲突和未完成问题指导后续检索、获取和独立阅读。
+存在 `scope.creation_basis` 时，先完整读取[已有课题依据](references/creation-basis.md)，再经其精确入口读已有理解及关键原材料。旧认识、条件、冲突和未完成问题指导后续检索、获取和独立阅读；仅有摘要或理解说明的材料保持其证据边界。
 
 读取[角色契约](references/agents.md)的预检与获取部分。使用宿主 Acquisition 已固定的有效模式。`oa_only` 沿公开全文主路线继续，不探测机构登录；`provided_only` 仅使用提供材料。机构入口未配置且机构访问可选时，宿主使用公开全文路线，不仅因此等待用户。明确要求机构访问或已配置路线不可用时，保留具体人类待办并沿现有 HumanRequest 处理。用户取消则结束。
 
@@ -21,13 +45,15 @@ description: 当任务明确调用 DeepFetch、系统性多论文文献梳理或
 
 ## 2. 发现
 
-首轮查询前完整读取[发现入口](references/openalex.md)与[台账契约](references/papers-json.md)，初始化台账。把任意研究输入转成检索概念，从文本查询、文献角色与引文结构三个维度发现。OpenAlex 是结构化主入口；Web Search 用于术语、综述、基准、命名方法、近期工作和索引缺口。宿主注入本次 Run 已冻结的补充来源清单时，读取[补充来源](references/search-sources.md)，按需要调用 `deepfetch_source_action`；允许集合不要求每次全部调用。`provided_only` 仅处理提供材料，不发现或调用补充来源。查询、锚点、方向、深度与停止由主智能体判断。
+首次外部查询前完整读取[发现入口](references/openalex.md)；所有模式首次台账工作前完整读取[台账契约](references/papers-json.md)，初始化台账。外部发现时把研究输入转成检索概念，从文本查询、文献角色与引文结构三个维度发现。OpenAlex 是结构化主入口；Web Search 用于术语、综述、基准、命名方法、近期工作和索引缺口。宿主注入本次 Run 已冻结的补充来源清单时，读取[补充来源](references/search-sources.md)，按需要调用 `deepfetch_source_action`；允许集合不要求每次全部调用。`provided_only` 仅处理提供材料，不发现或调用补充来源。查询、锚点、方向、深度与停止由主智能体判断。
 
 每批宽检索先筛选、核实身份并登记重要条目，再扩展下一批。标题级占位也可以保留相关已核实论文；合并明确重复、移除无关线索。访问容易、引用量、机构或期刊名不直接证明研究价值。
 
 冻结精读集合前，对现有台账和已见候选做一次有界覆盖检查：重要任务设置、方法族、经典到近期脉络、综述或基准，以及反证和边界是否有代表性条目；重看相关却尚未登记的候选，针对关键缺口使用 Web Search。Web 结果先核实学术身份；摘要片段不是全文证据，OpenAlex 无记录也不是丢弃理由。
 
-完成条件：三个发现维度均有实际工作，使用 OpenAlex 和 Web 完成覆盖检查，并已有真实 Web Search 与 Open/Fetch 成功证据；预算耗尽或已有可辩护的提前停止理由。Web 不可用时保留真实阻塞，如实说明具体故障，按已有 HumanRequest 与恢复机制处理，需要人工帮助时使用 `system_operation_help`；不能仅记录 Web 不可用便宣称完成，也不能伪造 Gate 的 ready 状态。
+外部发现的完成条件：三个发现维度均有实际工作，使用 OpenAlex 和 Web 完成覆盖检查，并已有真实 Web Search 与 Open/Fetch 成功证据；预算耗尽或已有可辩护的提前停止理由。Web 不可用时保留具体故障及其所属服务，按共享人类协作指导选择求助路径。本次原生 Web Evidence Gate 的 Meta Research 运行或操作故障需要人介入时用 `system_operation_help`；机构访问和外部服务问题分别沿角色契约的相应路径处理。不能仅记录 Web 不可用便宣称完成，也不能伪造 Gate 的 ready 状态。
+
+`provided_only` 的对应完成条件是已在授权提供集合内核实材料、选择有价值的阅读对象并说明未覆盖范围；不填写未发生的发现维度、渠道或主动检索耗时，不把有限材料综述写成系统性外部检索完成。
 
 ## 3. 维护台账并选择全文
 
@@ -45,7 +71,7 @@ description: 当任务明确调用 DeepFetch、系统性多论文文献梳理或
 
 ## 5. 综合并验证
 
-Reader 汇合后重载 `papers.json`，按[综述契约](references/summary.md)形成文献图景、边界和建议。主智能体不替 Reader 直接完成全文科学阅读；需补读时明确委派原文任务并核对其结果。建议不替代 Reasoning 的正式科学判断或创建问题决定。
+Reader 汇合后重载 `papers.json`，按[综述契约](references/summary.md)形成文献图景、边界和建议。主智能体不替 Reader 直接完成全文科学阅读；需补读时明确委派原文任务并核对其结果。Quest 初始化和人发起的手动建题，其理解与问题建议交回 Companion 供人确认；自主建题交回发起它的同一 Reasoning Session，由 Reasoning 判断是否建题和组织问题；其他研究请求沿原调用关系交回，正式后继判断仍由相应研究根承担。DeepFetch 不自行创建 Quest、Question、Cycle 或接纳研究证据。
 
 用 `scripts/papers.py finalize` 校验并清理；仅调试或需恢复时保留私有状态。完成条件：适用报告部分齐全，论文主张／跨论文综合／暂定推断区分清楚，引用 ID 均在同一台账，缺失证据明示，公开产物通过校验且没有过期全文。
 

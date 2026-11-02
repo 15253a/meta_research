@@ -254,15 +254,15 @@ def test_each_root_catalog_routes_one_common_human_request_through_owner(
         ) as client:
             headers = _initialized_child(client, channel.connection.token)
             effect_id = f"{root_kind}-canonical-offline-action"
-            opened = _structured(
-                _tool_call(
-                    client,
-                    headers,
-                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
-                    arguments=_open_arguments(effect_id, "offline_action"),
-                    request_id=10,
-                )
-            )
+            before_requests = owner.query_human_requests(quest_ref=managed["quest_ref"])
+            response = _tool_call(client, headers,
+                operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                arguments=_open_arguments(effect_id, "offline_action"), request_id=10)
+            if root_kind == "companion":
+                assert response["isError"] is True
+                assert owner.query_human_requests(quest_ref=managed["quest_ref"]) == before_requests
+                return
+            opened = _structured(response)
             assert opened["operation_binding"]["root_kind"] == root_kind
             assert opened["task_yield"]["status"] == "yielded"
             assert opened["receipt"]["kind"] == "human_request_open"

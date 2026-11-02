@@ -548,17 +548,14 @@ def test_plan_stage_keeps_five_fact_layers_with_a_real_gap(
             committed["stage_run_request"]["request_ref"]
         )
         assert plan_run is not None and plan_run.execution is not None
-        writing = runtime.writing.create_report_intent(
-            quest_ref=quest["quest_ref"],
-            title="Plan 后阶段报告",
-            audience="研究负责人",
-            purpose="验证 Writing Snapshot 接收 FormalPlan",
-            instructions="保留已接纳 Plan 的精确内容与 receipt。",
-            idempotency_key="plan-committed-writing-snapshot",
-        )
-        accepted_plan = writing["snapshot"]["advancement"]["stages"]["plan"][
-            "accepted"
-        ]
+        from meta_research.accepted_research import AcceptedResearchReader
+        owners = runtime.owners
+        reader = AcceptedResearchReader(owners.research_graph, owners.advancement_engine,
+                                        owners.research_memory, owners.agent_runtime)
+        request = owners.advancement_engine.query_plan_stage_request(quest["cycle_ref"])
+        commit = owners.advancement_engine.query_plan_stage_commit(request.request_ref)
+        with runtime._database.read_snapshot():
+            accepted_plan = reader._stage_value(request, commit)
         assert accepted_plan["commit_ref"] == committed["stage_commit"][
             "commit_ref"
         ]

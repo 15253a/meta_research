@@ -169,7 +169,6 @@ def retained_asset_references(connection, version_ref):
         ("rm_target_implementation_bundles", "implementation_revision_ref"),
         ("rm_target_input_asset_proofs", "proof_ref"),
         ("rm_target_research_notes", "note_ref"),
-        ("rg_writing_citation_decisions", "decision_ref"),
     )
     for table, key in direct:
         rows = (
@@ -184,6 +183,7 @@ def retained_asset_references(connection, version_ref):
         )
         references.extend(f"{table}:{ref}" for ref in rows)
     structured = (
+        ("rg_literature_facts", "ref", "payload_json"),
         ("rm_creation_bases", "basis_ref", "body_json"),
         ("rm_target_generic_result_manifests", "manifest_ref", "payload_json"),
         ("rm_asset_changes", "change_ref", "payload_json"),

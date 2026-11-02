@@ -193,8 +193,12 @@ def test_human_delivery_and_native_files_use_same_original_root_reader(tmp_path)
     from test_root_human_request_lifecycle import _open_arguments
     runtime = _make(tmp_path / "runtime")
     try:
-        scope = _scope(runtime, run_ref="human-material-work", root_ref="human-material-root")
-        context = _external_context(scope)
+        _confirm_direct_quest(runtime)
+        admitted = runtime.idea_stage.start("human-material-idea")
+        run = runtime.owners.agent_runtime.query_idea_stage_run(admitted["stage_run_request"]["request_ref"])
+        assert run is not None
+        context = SemanticCallContext(run.run_ref, run.attempt_ref, run.root_session_ref,
+            run.fence_ref, run.runtime_binding_hash, "idea", "primary", "research_workspace.read")
         location = runtime.root_workspaces.bind_runtime(context).location
         (location.directory / "agent.txt").write_bytes(b"native observations")
         channel = _channel(runtime, context)
@@ -210,7 +214,7 @@ def test_human_delivery_and_native_files_use_same_original_root_reader(tmp_path)
         runtime.owners.human_collaboration.respond_to_human_request(opened["request_ref"],
             decision="provided", facts={"material_delivered": True}, note="Material is ready.",
             idempotency_key="human-material-answer")
-        resumed = runtime.owners.agent_runtime.query_managed_run(scope["run_ref"])
+        resumed = runtime.owners.agent_runtime.query_managed_run(run.run_ref)
         assert resumed["status"] == "running"
         page = _accepted(_call(runtime, _channel(runtime, context), "research_workspace.discover"))
         assert {item["path"] for item in page["files"]} == {"agent.txt", receipt["files"][0]["path"]}
@@ -218,7 +222,7 @@ def test_human_delivery_and_native_files_use_same_original_root_reader(tmp_path)
             content = _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read",
                 workspace_ref=entry["workspace_ref"], path=entry["path"]))
             assert content["text"] == ("native observations" if entry["path"] == "agent.txt" else "operator observations")
-            assert content["work_ref"] == scope["run_ref"]
+            assert content["work_ref"] == run.run_ref
         assert runtime.owners.research_memory.query_snapshot() == before_rm
         assert runtime.owners.research_graph.query_snapshot() == before_rg
     finally:

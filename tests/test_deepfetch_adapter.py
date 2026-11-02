@@ -1105,7 +1105,7 @@ class DurableSegmentSequenceRunner:
     ) -> subprocess.CompletedProcess[str]:
         del pid_path, supervisor_request_path, timeout
         self.calls.append(job_ref)
-        thread_ref = "native-many-durable-segments"
+        thread_ref = getattr(self, "thread_ref", "native-many-durable-segments")
         events = [{"type": "thread.started", "thread_id": thread_ref}]
         result_path = Path(argv[argv.index("--output-last-message") + 1])
         if len(self.calls) > self.stopped_segments:
@@ -1400,6 +1400,7 @@ def _request() -> DeepFetchProviderRequest:
         attempt_ref="deepfetch_attempt_1",
         attempt_generation=1,
         fence_ref="deepfetch_fence_1",
+        literature_access_mode="oa_then_institution",
     )
 
 
@@ -1512,7 +1513,7 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
     assert agent_workspace.is_dir()
     assert "DeepFetch v4 main agent" in prompt
     assert "Acquisition" in prompt
-    assert "independent Readers" in prompt
+    assert "独立 Reader" in prompt
     assert "scripts/papers.py finalize" in prompt
     assert len(acquisition.calls) == 1
     assert set((tmp_path / "provider").glob("runs/*/public/*"))
@@ -1680,6 +1681,7 @@ def test_codex_deepfetch_retires_signed_gate_ack_loss_without_new_effect(
             "native_session_ref": None,
             "next_turn_number": 0,
             "evidence_parts": [],
+            "turn_sources": [],
             "acquisition_request_ids": [],
             "acquisition_item_proofs": [],
             "pending_acquisition": None,
@@ -1778,6 +1780,7 @@ def test_codex_deepfetch_treats_selected_oa_as_the_primary_route(
         adapter,
         replace(
             _request(),
+            literature_access_mode="oa_only",
             scope={
                 "goal": "核查证据边界",
                 "literature_mode": "oa_only",
@@ -1790,8 +1793,8 @@ def test_codex_deepfetch_treats_selected_oa_as_the_primary_route(
     assert "oa_only 是用户明确选择的主路线" in prompt
     assert "跳过 institution/browser preflight" in prompt
     assert "不得虚构机构访问失败或由此被迫降级到 OA" in prompt
-    assert "Quest-scoped Acquisition" in prompt
-    assert "只含 effect_id 和 1 至 10 个 targets 的 action=acquire" in prompt
+    assert "Acquisition 的公开请求只传 effect_id/targets" in prompt
+    assert "action=acquire 仅属于 Provider 输出信封" in prompt
     assert result.completion == "honest_empty"
     assert result.limitations == ("检索未形成可纳入的精确论文。",)
 
@@ -1941,6 +1944,7 @@ def test_codex_deepfetch_preserves_prose_without_changing_selected_oa_policy(
         adapter,
         replace(
             _request(),
+            literature_access_mode="oa_only",
             scope={
                 "goal": "核查证据边界",
                 "literature_mode": "oa_only",
@@ -1987,6 +1991,7 @@ def test_codex_deepfetch_accepts_honest_oa_only_scope_limitations(
         adapter,
         replace(
             _request(),
+            literature_access_mode="oa_only",
             scope={
                 "goal": "核查证据边界",
                 "literature_mode": "oa_only",
@@ -3402,7 +3407,7 @@ def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
     assert 'model_reasoning_effort="ultra"' in gate_config_values
     assert "mcp_servers={}" not in gate_config_values
     assert argv[-3:] == ["resume", result.native_session_ref, "-"]
-    assert "draft_revision=3" in prompt
+    assert "draft_revision=3" in runner.calls[0][1]
     assert "不得把 Cookie、凭据、浏览器 profile" in prompt
     assert timeout is None
     schema = runner.schemas[1]

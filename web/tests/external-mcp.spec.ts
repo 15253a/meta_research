@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import type { ExternalMcpConfiguration, ExternalMcpConnection, ExternalMcpService } from "../src/api";
 
-const rootKinds = ["idea", "plan", "bundle", "reasoning", "target", "writing", "companion", "deepfetch", "acquisition"];
+const rootKinds = ["idea", "plan", "bundle", "reasoning", "target", "companion", "deepfetch", "acquisition"];
 
 async function workspace(page: Page, preQuest = false) {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
@@ -66,7 +66,7 @@ test("pre-Quest settings default to all Roots, save blank instructions and persi
   await settings(page).getByRole("button", { name: "添加服务", exact: true }).click();
   await settings(page).getByRole("textbox", { name: "服务名称", exact: true }).fill("Lab instruments");
   await settings(page).getByRole("textbox", { name: "启动命令", exact: true }).fill("python");
-  await expect(settings(page).getByRole("checkbox")).toHaveCount(9);
+  await expect(settings(page).getByRole("checkbox")).toHaveCount(8);
   for (const root of rootKinds) await expect(settings(page).getByRole("checkbox", { name: root, exact: true })).toBeChecked();
   await settings(page).getByRole("button", { name: "测试连接", exact: true }).click();
   await expect(settings(page).getByRole("status")).toContainText("发现 2 个工具；未执行业务操作");

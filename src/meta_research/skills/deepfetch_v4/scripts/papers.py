@@ -63,7 +63,7 @@ PATCH_KEYS = (
     "schema_version", "assignment_id", "paper_id", "expected_fulltext_sha256",
     "status", "reading", "error",
 )
-STATE_KEYS = ("schema_version", "fulltexts", "failures", "assignments")
+STATE_KEYS = ("schema_version", "fulltexts", "failures", "assignments", "frozen_paper_ids")
 FULLTEXT_STATE_KEYS = ("path", "sha256", "format")
 ASSIGNMENT_KEYS = (
     "assignment_id", "paper_id", "fulltext_path", "fulltext_sha256",
@@ -544,7 +544,7 @@ def merge_intake(paper: Dict[str, Any], item: Dict[str, Any]) -> None:
 
 
 def empty_state() -> Dict[str, Any]:
-    return {"schema_version": STATE_SCHEMA, "fulltexts": {}, "failures": [], "assignments": {}}
+    return {"schema_version": STATE_SCHEMA, "fulltexts": {}, "failures": [], "assignments": {}, "frozen_paper_ids": None}
 
 
 def validate_state_shape(value: Any) -> Dict[str, Any]:
@@ -555,6 +555,8 @@ def validate_state_shape(value: Any) -> Dict[str, Any]:
         raise PapersError("private fulltexts and assignments must be objects")
     if not isinstance(value["failures"], list):
         raise PapersError("private failures must be an array")
+    if value["frozen_paper_ids"] is not None:
+        string_list(value["frozen_paper_ids"], "frozen_paper_ids")
     for paper_id, record in value["fulltexts"].items():
         nonempty_string(paper_id, "private fulltext paper_id")
         record = exact_object(record, FULLTEXT_STATE_KEYS, "private fulltext record")
@@ -809,6 +811,7 @@ def command_update_run(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).resolve()
     with ledger_lock(out_dir):
         ledger = load_ledger(out_dir)
+        state = load_state(out_dir)
         run = ledger.get("run")
         exact_object(run, RUN_KEYS, "run")
         if args.elapsed is not None:
@@ -820,6 +823,18 @@ def command_update_run(args: argparse.Namespace) -> None:
         run["dimensions_used"] = merge_unique(run["dimensions_used"], args.dimensions)
         if args.stopping_reason is not None:
             run["stopping_reason"] = nonempty_string(args.stopping_reason, "run.stopping_reason")
+        freezing = run["stopping_reason"] is not None or run["active_search_elapsed_seconds"] >= run["active_search_budget_minutes"] * 60
+        if args.freeze_paper_ids and not freezing:
+            raise PapersError("freeze targets only when stopping discovery")
+        if freezing:
+            targets = set(args.freeze_paper_ids) | set(registered_fulltext_ids(ledger)) | reader_admitted_ids(state)
+            if targets - set(ledger["papers"]):
+                raise PapersError("frozen target must already be in the ledger")
+            if state["frozen_paper_ids"] is None:
+                state["frozen_paper_ids"] = sorted(targets)
+            elif targets - set(state["frozen_paper_ids"]):
+                raise PapersError("discovery is stopped; frozen targets cannot expand")
+        save_state(out_dir, state)
         atomic_write_json(out_dir / "papers.json", ledger)
     output(run)
 
@@ -861,11 +876,14 @@ def command_upsert(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).resolve()
     with ledger_lock(out_dir):
         ledger = load_ledger(out_dir)
+        state = load_state(out_dir)
         changed = []
         for raw in items:
             item = normalized_intake(raw)
             paper_id = find_existing_id(ledger, item)
             if paper_id is None:
+                if state["frozen_paper_ids"] is not None:
+                    raise PapersError("discovery is stopped; cannot add new candidates")
                 paper_id = generated_paper_id(item, source_schema=ledger["schema_version"] == LEDGER_SCHEMA)
                 if paper_id in ledger["papers"]:
                     raise PapersError("paper_id collision")
@@ -890,6 +908,8 @@ def command_register_fulltext(args: argparse.Namespace) -> None:
         ledger = load_ledger(out_dir)
         state = load_state(out_dir)
         paper_id = resolve_paper_id(ledger, paper_id=args.paper_id, title=args.title)
+        if state["frozen_paper_ids"] is not None and paper_id not in state["frozen_paper_ids"]:
+            raise PapersError("discovery is stopped; only frozen targets may be drained")
         already_registered = ledger["papers"][paper_id]["fulltext_path"] is not None
         if not already_registered and len(registered_fulltext_ids(ledger)) >= MAX_FULLTEXT_PAPERS:
             raise PapersError(
@@ -1320,7 +1340,7 @@ def command_apply_reader(args: argparse.Namespace) -> None:
     })
 
 
-def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[str, Any], *, final: bool) -> List[str]:
+def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[str, Any], *, final: bool, literature_access_mode: str = "oa_then_institution") -> List[str]:
     errors: List[str] = []
 
     def check(function, prefix: str) -> None:
@@ -1343,7 +1363,7 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
             check(lambda: nullable_string(topic["interpretation"], "topic.interpretation"), "topic")
         check(lambda: string_list(topic["search_concepts"], "topic.search_concepts"), "topic")
         check(lambda: string_list(topic["scope_notes"], "topic.scope_notes"), "topic")
-        if final and not topic["search_concepts"]:
+        if final and literature_access_mode != "provided_only" and not topic["search_concepts"]:
             errors.append("topic: final output requires at least one search concept")
 
     run = ledger.get("run")
@@ -1366,7 +1386,9 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
                 errors.append("run: unknown search dimensions: %s" % ", ".join(unknown))
             if len(dimensions) != len(set(dimensions)):
                 errors.append("run: duplicate search dimensions")
-            if final and not set(SEARCH_DIMENSIONS).issubset(dimensions):
+            if literature_access_mode == "provided_only" and (dimensions or elapsed != 0):
+                errors.append("run: provided_only must not claim external discovery or active search time")
+            if final and literature_access_mode != "provided_only" and not set(SEARCH_DIMENSIONS).issubset(dimensions):
                 errors.append("run: final output must record all three search dimensions")
         if final:
             check(lambda: nonempty_string(run["stopping_reason"], "run.stopping_reason"), "run")
@@ -1446,6 +1468,9 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
                         errors.append("%s: identity.%s is not canonical" % (prefix, field))
                 if source_schema:
                     item = normalized_intake({"identity": identity, "paper_version": paper.get("paper_version"), "discovery_origins": paper.get("discovery_origins")})
+                    if literature_access_mode == "provided_only" and item["discovery_origins"]:
+                        errors.append("%s: provided_only requires discovery_origins=[]; "
+                                      "retain material receipts in the accepted input binding" % prefix)
                     identity_prefix = paper_id.partition(":")[0]
                     identity_field = {"doi": "doi", "arxiv": "arxiv_id", "openalex": "openalex_id"}.get(identity_prefix)
                     version_hash = hashlib.sha256(item["paper_version"].encode("utf-8")).hexdigest()[:12]
@@ -1606,10 +1631,10 @@ def final_artifact_errors(out_dir: Path, ledger: Dict[str, Any], state: Dict[str
     return errors
 
 
-def collect_validation_errors(out_dir: Path, *, final: bool) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+def collect_validation_errors(out_dir: Path, *, final: bool, literature_access_mode: str = "oa_then_institution") -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     ledger = load_ledger(out_dir)
     state = load_state(out_dir)
-    errors = validate_public_ledger(out_dir, ledger, state, final=final)
+    errors = validate_public_ledger(out_dir, ledger, state, final=final, literature_access_mode=literature_access_mode)
     if final:
         errors.extend(final_artifact_errors(out_dir, ledger, state))
     return ledger, state, errors
@@ -1618,7 +1643,7 @@ def collect_validation_errors(out_dir: Path, *, final: bool) -> Tuple[Dict[str, 
 def command_validate(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).resolve()
     with validation_lock(out_dir):
-        ledger, _, errors = collect_validation_errors(out_dir, final=args.final)
+        ledger, _, errors = collect_validation_errors(out_dir, final=args.final, literature_access_mode=args.literature_access_mode)
     if errors:
         raise PapersError("validation failed:\n- " + "\n- ".join(errors))
     output({"valid": True, "final": bool(args.final), "paper_count": len(ledger["paper_order"])})
@@ -1627,7 +1652,7 @@ def command_validate(args: argparse.Namespace) -> None:
 def command_finalize(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).resolve()
     with ledger_lock(out_dir):
-        ledger, _, errors = collect_validation_errors(out_dir, final=True)
+        ledger, _, errors = collect_validation_errors(out_dir, final=True, literature_access_mode=args.literature_access_mode)
         if errors:
             raise PapersError("validation failed:\n- " + "\n- ".join(errors))
     if not args.keep_debug_state:
@@ -1667,6 +1692,7 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--elapsed", type=int)
     update.add_argument("--dimension", action="append", dest="dimensions", choices=SEARCH_DIMENSIONS, default=[])
     update.add_argument("--stopping-reason")
+    update.add_argument("--freeze-paper-id", action="append", dest="freeze_paper_ids", default=[])
     update.set_defaults(function=command_update_run)
 
     upsert = commands.add_parser("upsert")
@@ -1702,11 +1728,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate")
     validate.add_argument("--out-dir", required=True)
     validate.add_argument("--final", action="store_true")
+    validate.add_argument("--literature-access-mode", choices=("oa_only", "oa_then_institution", "provided_only"), default="oa_then_institution")
     validate.set_defaults(function=command_validate)
 
     finalize = commands.add_parser("finalize")
     finalize.add_argument("--out-dir", required=True)
     finalize.add_argument("--keep-debug-state", action="store_true")
+    finalize.add_argument("--literature-access-mode", choices=("oa_only", "oa_then_institution", "provided_only"), default="oa_then_institution")
     finalize.set_defaults(function=command_finalize)
     return parser
 

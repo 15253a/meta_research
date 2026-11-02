@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import secrets
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
@@ -326,7 +326,7 @@ class RootWorkspaces:
     def _save_conversation(self, binding: WorkspaceBinding, generation: int,
                            document: dict[str, object]) -> dict[str, object]:
         root = binding.directory
-        filename = f"native-session-{generation}.json"
+        filename = f"{canonical_hash(binding.location.root_session_ref)}-native-session-{generation}.json"
         path = "companion-history/" + filename
         content = canonical_json(document).encode("utf-8")
         temporary = ".conversation-" + secrets.token_hex(16)
@@ -361,9 +361,18 @@ class RootWorkspaces:
             or facts["scope_ref"] != scope_ref or require_open and facts["status"] != "open"):
             raise SemanticMcpError("workspace_companion_scope_invalid")
         identity = {"companion_session_ref": root_session_ref}
-        location = WorkspaceLocation("workspace:" + canonical_hash(identity), "companion",
-            root_session_ref, root_session_ref, self._bases["companion"] / canonical_hash(identity),
-            quest_ref=facts["quest_ref"], request_ref=scope_ref)
+        workspace_ref = "workspace:" + canonical_hash(identity)
+        directory = self._bases["companion"] / canonical_hash(identity)
+        initialization_id = None
+        if facts["quest_ref"] is not None:
+            initialization_id = facts["initialization_id"]
+            prepared = self._initialization_location(initialization_id, facts["preparation_root_session_ref"])
+            # The Quest keeps its preparation folder. Session rotation changes
+            # conversation identity, never file identity or original bytes.
+            workspace_ref, directory = prepared.workspace_ref, prepared.directory
+        location = WorkspaceLocation(workspace_ref, "companion",
+            root_session_ref, root_session_ref, directory,
+            quest_ref=facts["quest_ref"], request_ref=scope_ref, initialization_id=initialization_id)
         self._ensure_directory(location.directory)
         return WorkspaceBinding(location, canonical_hash({"owner": "human_collaboration",
             **identity, "scope_ref": scope_ref}))
@@ -471,20 +480,22 @@ class RootWorkspaces:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
             raise SemanticMcpError("workspace_page_invalid")
         files = []
-        scanned = 0
-        for location in locations:
+        seen = 0
+        next_offset = None
+        for location in sorted(locations, key=lambda item: item.workspace_ref):
             if not location.directory.exists():
                 continue
-            for directory, children, names in os.walk(location.directory, followlinks=False):
-                scanned += len(children) + len(names)
-                if scanned > _MAX_SCAN_FILES:
-                    raise SemanticMcpError("workspace_scan_limit_exceeded", {"maximum_entries": _MAX_SCAN_FILES})
-                children[:] = sorted(child for child in children if not child.startswith(".delivery-") and child not in {".delivery.json", ".creation-context"}
-                    and not (location.root_kind == "target" and Path(directory) == location.directory and child == "inputs"))
-                for name in sorted(names):
-                    path = (Path(directory) / name).relative_to(location.directory).as_posix()
-                    if name.startswith(".delivery-") or name == ".delivery.json" or not path.startswith(prefix):
+            # Enumerate only through the requested page and one look-ahead entry.
+            # Skipped pages and look-ahead paths never read or hash file content.
+            with closing(_workspace_paths(location, prefix)) as paths:
+                for path in paths:
+                    if seen < offset:
+                        seen += 1
                         continue
+                    if len(files) == limit:
+                        next_offset = seen
+                        break
+                    seen += 1
                     try:
                         content = _read_bytes(location.directory, path)
                     except SemanticMcpError as error:
@@ -499,9 +510,9 @@ class RootWorkspaces:
                         raise
                     files.append({**location.source(), "path": path, "bytes": len(content),
                                   "sha256": hashlib.sha256(content).hexdigest(), "readable": True})
-        files.sort(key=lambda item: (item["workspace_ref"], item["path"]))
-        return {"files": files[offset:offset + limit], "offset": offset,
-                "next_offset": offset + limit if offset + limit < len(files) else None,
+            if next_offset is not None:
+                break
+        return {"files": files, "offset": offset, "next_offset": next_offset,
                 "limits": {"maximum_file_bytes": _MAX_FILE_BYTES,
                     "maximum_chunk_bytes": 65536, "maximum_scan_entries": _MAX_SCAN_FILES}}
 
@@ -519,6 +530,21 @@ class RootWorkspaces:
     def read_companion_session(self, scope_ref: str, root_session_ref: str, **arguments):
         return self._read((self._companion_session_binding(scope_ref, root_session_ref,
             require_open=False).location,), **arguments)
+
+    def download_companion_session(self, scope_ref: str, root_session_ref: str, *,
+                                   workspace_ref: str, path: str, expected_sha256: str):
+        """Return one exact file from the authorized persistent assistant folder."""
+        source = self._companion_session_binding(scope_ref, root_session_ref, require_open=False).location
+        if source.workspace_ref != workspace_ref:
+            raise SemanticMcpError("workspace_not_visible")
+        parts = _relative_parts(path)
+        if any(part.startswith(".") for part in parts):
+            raise SemanticMcpError("workspace_file_unsafe")
+        content = _read_bytes(source.directory, path)
+        digest = hashlib.sha256(content).hexdigest()
+        if expected_sha256 != digest:
+            raise SemanticMcpError("workspace_content_changed")
+        return {**source.source(), "path": path, "sha256": digest, "total_bytes": len(content), "content": content}
 
     def _read(self, locations, *, workspace_ref, path, expected_sha256=None, offset=0, max_bytes=65536):
         if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
@@ -630,6 +656,38 @@ class RootWorkspaces:
             if current.is_symlink() or (current.exists() and not current.is_dir()):
                 raise SemanticMcpError("workspace_file_unsafe")
             current.mkdir(exist_ok=True, mode=0o700)
+
+
+def _workspace_paths(location: WorkspaceLocation, prefix: str):
+    scanned = 0
+
+    def visit(parent: int, relative: str):
+        nonlocal scanned
+        with os.scandir(parent) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name + ("/" if entry.is_dir(follow_symlinks=False) else ""))
+        for entry in ordered:
+            scanned += 1
+            if scanned > _MAX_SCAN_FILES:
+                raise SemanticMcpError("workspace_scan_limit_exceeded", {"maximum_entries": _MAX_SCAN_FILES})
+            if entry.name.startswith(".delivery-") or entry.name in {".delivery.json", ".creation-context"}:
+                continue
+            path = relative + entry.name
+            if entry.is_dir(follow_symlinks=False):
+                if not relative and location.root_kind == "target" and entry.name == "inputs":
+                    continue
+                if prefix and not (path.startswith(prefix) or prefix.startswith(path + "/")):
+                    continue
+                try:
+                    with _child_directory(parent, entry.name) as child:
+                        yield from visit(child, path + "/")
+                except OSError:
+                    # A directory replaced by a link cannot expand visibility.
+                    continue
+            elif entry.is_file(follow_symlinks=False) and path.startswith(prefix):
+                yield path
+
+    with _directory_fd(location.directory) as parent:
+        yield from visit(parent, "")
 
 
 def _relative_parts(path: str) -> tuple[str, ...]:

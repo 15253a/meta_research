@@ -28,7 +28,6 @@ from meta_research.deepfetch import CodexDeepFetchAdapter
 from meta_research.idea_skill import CodexIdeaSkillAdapter
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.reasoning_skill import CodexReasoningSkillAdapter
-from meta_research.writing_skill import CodexWritingSkillAdapter
 from meta_research.quest_drafting import (
     CodexDraftingAdapter, _DRAFTING_MODEL_CATALOG_PATH,
     _DRAFTING_MODEL_CATALOG_SHA256, _verified_drafting_model_catalog,
@@ -39,7 +38,7 @@ from pydantic import ValidationError
 adapters = [CodexAcquisitionRootAdapter, CodexBundleSkillAdapter,
             CodexCompanionAdapter, CodexDeepFetchAdapter, CodexIdeaSkillAdapter,
             CodexPlanSkillAdapter, CodexReasoningSkillAdapter,
-            CodexWritingSkillAdapter, CodexDraftingAdapter]
+            CodexDraftingAdapter]
 defaults = [inspect.signature(adapter).parameters['model_ref'].default for adapter in adapters]
 assert defaults == [CODEX_MODEL_REF] * len(adapters)
 assert all(root_capability_profile(kind).as_dict()['model_ref'] == CODEX_MODEL_REF

@@ -4,19 +4,70 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from meta_research.acquisition import AcquisitionBatchRequest, AcquisitionPaper
+from meta_research.semantic_mcp import SemanticCallContext
 from meta_research.web import create_app
+from test_public_acquisition_session import RecordingAcquisitionProvider
+from test_public_plan_stage import _confirm_direct_quest
 from test_root_workspace import _make, _external_context, _channel, _call, _accepted
 from test_dataset_effect_scope_recovery import _scope
 from test_root_human_request_lifecycle import _open_arguments
 
 
+def _reply_batch():
+    return AcquisitionBatchRequest(request_id="reply-work", route_policy="oa_first_then_institution",
+        papers=(AcquisitionPaper(paper_id="paper:reply-material", title="Field observation",
+            doi=None, arxiv_id=None, source_urls=()),))
+
+
+class _ReplyAcquisitionProvider(RecordingAcquisitionProvider):
+    def __init__(self, runtime, kind="offline_action"):
+        super().__init__()
+        self.runtime, self.kind = runtime, kind
+
+    def acquire(self, request):
+        self.scope = request.root_runtime_scope
+        scope = self.scope
+        self.context = SemanticCallContext(scope["run_ref"], scope["attempt_ref"], scope["root_session_ref"],
+            scope["fence_ref"], scope["runtime_binding_hash"], "acquisition", "batch", "human_request.open")
+        self.opened = _accepted(_call(self.runtime, _channel(self.runtime, self.context), "human_request.open",
+            **_open_arguments("reply-observations", self.kind)))
+        return super().acquire(request)
+
+    def reconcile(self, request):
+        # The original request has been answered; resolve this same batch.
+        return super().acquire(request)
+
+
 def _open(runtime, kind="offline_action"):
-    scope = _scope(runtime, run_ref="reply-work", root_ref="reply-root")
-    context = _external_context(scope)
-    channel = _channel(runtime, context)
-    opened = _accepted(_call(runtime, channel, "human_request.open",
-                            **_open_arguments("reply-observations", kind)))
-    return scope, context, opened
+    quest_ref = _confirm_direct_quest(runtime)["quest_ref"]
+    quest = runtime.owners.research_graph.query_quest_by_ref(quest_ref)
+    companion = _external_context(_scope(runtime, quest_ref=quest_ref,
+        run_ref="reply-companion", root_ref="reply-companion-root"))
+    denied = _call(runtime, _channel(runtime, companion), "human_request.open",
+        **_open_arguments("companion-cannot-open", kind))
+    assert denied["structuredContent"]["code"] == "capability_unavailable"
+    provider = _ReplyAcquisitionProvider(runtime, kind)
+    owner = runtime.owners.agent_runtime
+    session = owner.prepare_acquisition_session(initialization_id=quest.initialization_id,
+        draft_revision=quest.draft_revision,
+        config={key: quest.draft["literature"][key] for key in ("mode", "library_entry_url")},
+        provider=provider)
+    assert session.status == "ready"
+    owner.bind_acquisition_session_to_quest(quest.initialization_id, quest_ref)
+    owner.acquire_literature(session.session_ref, _reply_batch(), provider)
+    assert provider.scope["run_ref"] == "reply-work"
+    assert provider.scope["root_session_ref"] == session.session_ref
+    return provider.scope, provider.context, provider.opened
+
+
+def _complete_receiving_batch(runtime, scope):
+    owner = runtime.owners.agent_runtime
+    result = owner.acquire_literature(scope["root_session_ref"], _reply_batch(), _ReplyAcquisitionProvider(runtime))
+    assert result.request_id == scope["run_ref"]
+    assert result.session_ref == scope["root_session_ref"]
+    assert result.status == "missing"
+    assert owner.query_managed_run(scope["run_ref"])["status"] == "completed"
 
 
 def _login(client, runtime):
@@ -50,7 +101,7 @@ def test_explicit_upload_and_linked_directory_deliver_exact_original_root_withou
             assert result.status_code == 201, result.text
             response = result.json()
             delivery = response["delivery"]
-            assert (delivery["human_request_ref"], delivery["root_session_ref"], delivery["work_ref"], delivery["cycle_ref"]) == (opened["request_ref"], "reply-root", "reply-work", None)
+            assert (delivery["human_request_ref"], delivery["root_session_ref"], delivery["work_ref"], delivery["cycle_ref"]) == (opened["request_ref"], scope["root_session_ref"], scope["root_session_ref"], None)
             assert delivery["linked_locators"] == [{"kind": "linked_local", "locator": str(original), "description": "Raw observations in place.", "observed_kind": "directory"}]
             assert client.post(f"/api/v1/human-requests/{opened['request_ref']}/responses", headers=headers, json=body).json() == response
             body["note"] = "Changed after lost ACK."
@@ -167,7 +218,7 @@ def test_pending_reply_is_private_and_crash_recovery_resumes_library_material(tm
         assert json.loads(exact["text"])["response"]["delivery"] == response["delivery"]
         value = _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read", **response["delivery"]["uploaded_readers"][0]))
         assert value["text"] == "Exact lawful fulltext.\n"
-        assert value["root_session_ref"] == "reply-root"
+        assert value["root_session_ref"] == scope["root_session_ref"]
         assert runtime.owners.research_memory.query_snapshot() == before
     finally:
         runtime.close()

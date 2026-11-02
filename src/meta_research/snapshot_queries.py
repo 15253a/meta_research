@@ -177,7 +177,4 @@ def select_snapshot_sections(snapshot, *, include_assets, include_history):
         result['research_control'] = dict(result['research_control'])
         if 'recovery_records' in result['research_control']:
             result['research_control']['recovery_records'] = []
-        reason = result['writing'].get('reason')
-        if not isinstance(reason, dict) or reason.get('code') != 'writing_capability_not_configured':
-            result['writing'] = {'status': 'ready', 'document_types': ['report'], 'runs': [], 'reason': None, 'loaded': False}
     return deepcopy(result)

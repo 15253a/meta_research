@@ -10,7 +10,6 @@ from meta_research.external_mcp import ExternalMcpRuntime, parse_services
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
 from meta_research.owners.common import canonical_hash
 from meta_research.quest_drafting import IntentTurnRequest
-from meta_research.writing_skill import CodexWritingSkillAdapter
 from test_deepfetch_adapter import RecordingRunner, _request, _deepfetch_web_evidence_gate_output_schema
 from test_external_mcp import service
 from test_external_root_resident_mcp import _AcquisitionDelegate, _SequenceRunner, _fake_codex
@@ -33,11 +32,12 @@ def changed_config(runtime, tmp_path):
 
 def test_public_acquisition_preflight_before_quest_gets_external_context(tmp_path):
     external = configured(tmp_path)
-    runner = _SequenceRunner([{"accepted": True, "human_request": None}])
+    runner = _SequenceRunner([{"status": "ready", "browser_context_ref": None, "reason_code": None, "evidence": {"configuration_health": "not_required", "browser_control": "not_required", "authorized_resource": "oa_only"}}])
     adapter = CodexAcquisitionRootAdapter(tmp_path / "acquisition", _AcquisitionDelegate(),
         executable=str(_fake_codex(tmp_path / "fake-acquisition")), process_runner=runner)
     adapter.bind_external_mcp(external)
-    result = adapter.preflight(SimpleNamespace(session_ref="acquisition-before-quest", config_hash="9" * 64, generation=1))
+    from meta_research.acquisition import AcquisitionPreflightRequest
+    result = adapter.preflight(AcquisitionPreflightRequest("acquisition-before-quest", "initialization1", 1, "9" * 64, "oa_only", "", str(tmp_path / "private")))
     assert result.status == "ready"
     assert "META_RESEARCH_EXTERNAL_MCP_TOKEN" in runner.environments[0]
     assert "Use chamber A for this experiment." in runner.prompts[0]
@@ -68,20 +68,6 @@ def test_public_companion_before_quest_replays_frozen_context(tmp_path):
     assert not (tmp_path / "calls.jsonl").exists()
 
 
-def test_public_writing_draft_keeps_source_permissions_with_external_context(tmp_path):
-    from test_writing_skill_adapter import _SequenceRunner as WritingRunner, _request as writing_request, _draft_output
-
-    external = configured(tmp_path)
-    runner = WritingRunner([_draft_output()])
-    adapter = CodexWritingSkillAdapter(tmp_path / "writing", executable=str(_fake_codex(tmp_path / "fake-writing")), process_runner=runner)
-    adapter.bind_external_mcp(external)
-    draft = adapter.generate_draft(writing_request(adapter))
-    assert "rare morphology remains visible" in draft.markdown
-    assert "Use chamber A for this experiment." in runner.calls[0][1]
-    assert "META_RESEARCH_EXTERNAL_MCP_TOKEN" in runner.environments[0]
-    assert 'default_permissions="writing_snapshot"' in runner.calls[0][0]
-    assert (tmp_path / "discovery.jsonl").read_text().splitlines() == ['"tools/list"']
-    assert not (tmp_path / "calls.jsonl").exists()
 
 
 def test_unbound_standalone_deepfetch_preserves_native_mcp_configuration(tmp_path):

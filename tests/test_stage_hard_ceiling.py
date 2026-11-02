@@ -1170,8 +1170,11 @@ def test_reasoning_post_result_contract_failure_creates_successor(
         assert successor["blocker"] is None
         assert successor["completion_rejection"]["reason"] == {
             "code": "reasoning_review_result_contract_invalid",
-            "detail": "reasoning_skill_output_binding_mismatch",
+            "detail": "scientific_outcome_authoritative_metadata_conflict",
         }
+        assert "scientific_outcome.cycle_ref:supplied=None:expected=" in " ".join(
+            successor["completion_rejection"]["feedback"]
+        )
         assert provider.review_calls == 1
     finally:
         runtime.close()

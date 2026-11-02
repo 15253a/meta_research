@@ -70,7 +70,42 @@ def shared_reference_resources() -> dict[str, str]:
 
 @prepared_resource
 def shared_reference_bundle_hash() -> str:
-    return canonical_hash(shared_reference_resources())
+    return canonical_hash({"references": shared_reference_resources(),
+                           "writing": shared_writing_resources()})
+
+
+@prepared_resource
+def shared_writing_resources() -> dict[str, str]:
+    """Bind the one shared method and its required references, never a Writing root."""
+    root = shared_reference_root() / "writing-report"
+    names = ("SKILL.md", "references/context-and-handoff.md", "references/scientific-writing.md",
+             "references/report-writing.md", "references/paper-v1-advisory.md",
+             "references/presentation-v1-advisory.md", "agents/openai.yaml")
+    return {name: (root / name).read_text(encoding="utf-8") for name in names}
+
+
+def shared_writing_instructions(root_kind: str) -> str:
+    if root_kind not in {*CYCLE_ROLE_DIRECTORIES, "companion"}:
+        return ""
+    # Validate all linked resources at the existing preparation boundary. A
+    # missing installed reference must not silently select an older skill.
+    shared_writing_resources()
+    return ("\nShared writing skill source: " + str(shared_reference_root() / "writing-report" / "SKILL.md")
+            + "\n写作或修改论文、报告、配套 PPT、提纲或局部稿件时，读取这份共用 writing-report Skill，"
+            "按任务读取其中的文体、证据与交接参考；在当前任务、目录和权限内完成写作。"
+            "正式文件需独立审阅、实际渲染及视觉检查；局部工作按请求范围检查。\n")
+
+
+def companion_reference_instructions(root_kind: str) -> str:
+    if root_kind != "companion":
+        return ""
+    root = shared_reference_root()
+    return ("\nCompanion role source: " + str(root / "companion-work.md")
+            + "\nCreation role source: " + str(root / "first_creation" / "SKILL.md")
+            + "\n按本次业务分支读取并遵循相应主指导：日常交流及独立写作使用 Companion；"
+            "创建理解、重评、首题父子任务及 manual_question_creation 使用 first_creation 与相应上下文合同。"
+            "续轮或压缩后缺少适用规则时从这些准确入口恢复；始终使用本次实际提供的响应 schema，"
+            "manual 窗口仅起草六字段 Proposal，用户正式确认由原入口处理。\n")
 
 
 def shared_reference_instructions(root_kind: str) -> str:
@@ -85,7 +120,14 @@ def shared_reference_instructions(root_kind: str) -> str:
     cycle_roles = {"idea", "plan", "bundle", "target", "reasoning"}
     names = SHARED_REFERENCE_NAMES
     if root_kind == "acquisition":
-        names = ("human-guidance.md", "materials-and-custody.md")
+        return (
+            f"Shared reference root: {shared_reference_root()}\n"
+            "公共参考中的 references/... 相对此安装目录；文件内链接相对该文件。"
+            "已有完整且有效的正文直接使用；按需读取与指定获取有关的部分。"
+            "原件不可读时如实报告，不以其他版本替代。\n"
+            "- 需要人协助访问或收到回应时，读取 references/human-guidance.md 的正式求助、回执与回应部分。\n"
+            "- 接收全文、核实文件、交付或整理持久工作区时，读取 references/materials-and-custody.md 的材料保管部分。"
+        )
     elif root_kind not in cycle_roles:
         names = tuple(name for name in names if name != "cycle-work.md")
     return (
@@ -97,4 +139,6 @@ def shared_reference_instructions(root_kind: str) -> str:
         "Cycle 阶段提交、正式指导确认及目标演化规则仅适用于获得相应职责和工具的研究根；"
         "Acquisition 负责指定获取，Companion／Writing 按各自请求协作，不因此接管 Cycle。\n"
         + "\n".join(f"- **{purposes[name][0]}**：读取 `references/{name}`，{purposes[name][1]}。" for name in names)
+        + shared_writing_instructions(root_kind)
+        + companion_reference_instructions(root_kind)
     )

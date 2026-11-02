@@ -29,8 +29,7 @@ async function fixture() {
     value.research_space.current_question.title = title;
     value.question_tree.items[0].title = title;
     value.research_assets.loaded = req?.headers["x-meta-research-snapshot-assets"] !== "defer";
-    value.writing.loaded = req?.headers["x-meta-research-snapshot-history"] !== "defer";
-    value.human_collaboration.companion.loaded = value.writing.loaded;
+    value.human_collaboration.companion.loaded = req?.headers["x-meta-research-snapshot-history"] !== "defer";
     if (!value.research_assets.loaded) value.research_assets.items = [];
     return value;
   };

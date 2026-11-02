@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -31,6 +31,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from meta_research.auth import AuthSession
 from meta_research.asset_download import AssetDownloadResponse
+from meta_research.companion_writing import WritingRequest
 from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.time_budget import time_budget_seconds
 from meta_research.composition import ProductionRuntime
@@ -556,6 +557,7 @@ class CompanionMessageRequest(BaseModel):
     scope_ref: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=INTENT_MESSAGE_MAX_LENGTH)
     guidance_options: CompanionGuidanceOptionsRequest | None = None
+    writing_request: WritingRequest | None = None
     view_context: (
         CompanionQuestionViewContext | CompanionHumanRequestViewContext | None
     ) = None
@@ -707,38 +709,12 @@ class CapabilityAuthorizationRequest(BaseModel):
     confirmation_receipt_ref: str = Field(min_length=1, max_length=64)
 
 
-class WritingIntentRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    document_type: Literal["report", "paper", "presentation"] = "report"
-    quest_ref: str = Field(min_length=1, max_length=96)
-    title: str = Field(min_length=1, max_length=512)
-    audience: str = Field(min_length=1, max_length=2000)
-    purpose: str = Field(min_length=1, max_length=4000)
-    instructions: str = Field(default="", max_length=12000)
 
 
-class WritingConfirmationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    draft_revision: int = Field(ge=1)
-    draft_hash: str = Field(min_length=64, max_length=64)
-    preview_ref: str = Field(min_length=1, max_length=128)
-    preview_hash: str = Field(min_length=64, max_length=64)
 
 
-class WritingControlRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal["pause", "resume"]
-    expected_attempt_ref: str = Field(min_length=1, max_length=128)
-    expected_fence_ref: str = Field(min_length=1, max_length=128)
 
 
-class WritingRevisionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    feedback: list[str] = Field(min_length=1, max_length=64)
 
 
 class StartQuestCompletionRequest(BaseModel):
@@ -756,106 +732,10 @@ class QuestCompletionDecisionRequest(BaseModel):
     decision: Literal["confirmed", "rejected"]
 
 
-class WritingLocalDeliveryTargetRequest(BaseModel):
-    """Exact local target asserted before HC previews an external effect."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str = Field(min_length=1, max_length=4096)
-    permissions: Literal[384]
-    expected_existing_hash: str | None = Field(
-        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
-    )
-
-    @field_validator("path")
-    @classmethod
-    def validate_absolute_canonical_path(cls, value: str) -> str:
-        path = Path(value)
-        try:
-            resolved = str(path.resolve(strict=False))
-        except (OSError, RuntimeError) as error:
-            raise ValueError("writing_delivery_target_path_invalid") from error
-        if (
-            not path.is_absolute()
-            or value != resolved
-            or value == "/"
-            or "\x00" in value
-        ):
-            raise ValueError("writing_delivery_target_path_invalid")
-        return value
 
 
-class WritingRemoteDeliveryTargetRequest(BaseModel):
-    """Extensible target envelope for installed send/submit providers."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    target_ref: str = Field(
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
-    )
-    permissions: list[str] = Field(min_length=1, max_length=32)
-    expected_existing_hash: str | None = Field(
-        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
-    )
-
-    @field_validator("permissions")
-    @classmethod
-    def validate_permissions(cls, value: list[str]) -> list[str]:
-        if len(set(value)) != len(value) or any(
-            not item
-            or len(item) > 128
-            or not item[0].isalnum()
-            or any(
-                character
-                not in (
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    "abcdefghijklmnopqrstuvwxyz"
-                    "0123456789._:-"
-                )
-                for character in item
-            )
-            for item in value
-        ):
-            raise ValueError("writing_delivery_permissions_invalid")
-        return value
 
 
-class WritingDeliveryIntentRequest(BaseModel):
-    """One exact provider/action/target tuple; it authorizes no future use."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal["publish", "overwrite", "delete", "send", "submit"]
-    provider_ref: str = Field(
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
-    )
-    target: WritingLocalDeliveryTargetRequest | WritingRemoteDeliveryTargetRequest
-    output_format: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=32,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$",
-    )
-
-    @model_validator(mode="after")
-    def validate_provider_target_pair(self) -> "WritingDeliveryIntentRequest":
-        if self.provider_ref == "local-filesystem":
-            if not isinstance(self.target, WritingLocalDeliveryTargetRequest):
-                raise ValueError("writing_delivery_target_invalid")
-            expected = self.target.expected_existing_hash
-            if (
-                self.action not in {"publish", "overwrite", "delete"}
-                or (self.action == "publish" and expected is not None)
-                or (self.action != "publish" and expected is None)
-            ):
-                raise ValueError("writing_delivery_target_invalid")
-        elif not isinstance(self.target, WritingRemoteDeliveryTargetRequest):
-            raise ValueError("writing_delivery_target_invalid")
-        return self
 
 
 class ResearchInputRequest(BaseModel):
@@ -899,7 +779,6 @@ def create_app(
         "quest_completion_worker": _process_quest_completion,
         "goal_work_reconciler": _process_goal_work,
         "target_run_worker": _process_target_runs,
-        "writing_worker": _process_writing,
         "research_asset_intake_worker": _process_research_assets,
         "research_asset_verification_worker": _verify_research_assets,
     }
@@ -1038,7 +917,6 @@ def create_app(
                 "quest_completion_worker",
                 "goal_work_reconciler",
                 "target_run_worker",
-                "writing_worker",
                 "research_asset_intake_worker",
                 "research_asset_verification_worker",
             }
@@ -1227,7 +1105,6 @@ def create_app(
                 "asset_not_found",
                 "manual_question_creation_not_found",
                 "quest_initialization_not_found",
-                "writing_run_not_found",
             }
             else 409
         )
@@ -1295,7 +1172,6 @@ def create_app(
         target_runs = worker_check("target_run_worker")
         research_assets = worker_check("research_asset_intake_worker")
         research_asset_verification = worker_check("research_asset_verification_worker")
-        writing = worker_check("writing_worker")
         target_root = runtime.query_target_root_readiness()
         return {
             "status": health["status"],
@@ -1339,10 +1215,6 @@ def create_app(
             "target_runs": {
                 "status": target_runs["status"],
                 "last_error": worker_health["target_run_worker"].last_error,
-            },
-            "writing": {
-                "status": writing["status"],
-                "last_error": worker_health["writing_worker"].last_error,
             },
             "target_root": target_root,
             "research_assets": {
@@ -1622,7 +1494,41 @@ def create_app(
                 else message.view_context.model_dump()
             ),
             guidance_options=None if message.guidance_options is None else message.guidance_options.model_dump(),
+            writing_request=None if message.writing_request is None else message.writing_request.model_dump(),
         )
+
+    @app.get("/api/v1/companion/files")
+    def companion_files(scope_ref: str, offset: int = 0, limit: int = 50):
+        from meta_research.semantic_mcp import SemanticMcpError
+        scope = require_current_collaboration_scope(scope_ref, conflict_code="companion_scope_stale")
+        session = runtime.owners.human_collaboration.query_companion(scope)
+        if session.get("session_ref") is None:
+            return {"files": [], "offset": offset, "next_offset": None}
+        try:
+            page = runtime.root_workspaces.discover_companion_session(scope, session["session_ref"],
+                prefix="", offset=offset, limit=limit)
+        except SemanticMcpError as error:
+            raise OwnerConflict(error.code) from error
+        for item in page["files"]:
+            item["download_url"] = "/api/v1/companion/files/content?scope_ref=" + quote(scope, safe="") + "&workspace_ref=" + quote(item["workspace_ref"], safe="") + "&path=" + quote(item["path"], safe="") + "&sha256=" + str(item["sha256"])
+        return page
+
+    @app.get("/api/v1/companion/files/content")
+    def companion_file_content(scope_ref: str, workspace_ref: str, path: str, sha256: str):
+        import mimetypes
+        from meta_research.semantic_mcp import SemanticMcpError
+        scope = require_current_collaboration_scope(scope_ref, conflict_code="companion_scope_stale")
+        session = runtime.owners.human_collaboration.query_companion(scope)
+        if session.get("session_ref") is None:
+            raise HTTPException(404, "companion_session_not_found")
+        try:
+            item = runtime.root_workspaces.download_companion_session(scope, session["session_ref"],
+                workspace_ref=workspace_ref, path=path, expected_sha256=sha256)
+        except SemanticMcpError as error:
+            raise OwnerConflict(error.code) from error
+        return Response(item["content"], media_type=mimetypes.guess_type(path)[0] or "application/octet-stream",
+            headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(Path(path).name, safe=""),
+                     "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
     @app.post("/api/v1/companion/sessions/new")
     def start_new_companion_session(request: Request, message: CompanionNewSessionRequest) -> dict[str, object]:
@@ -1778,15 +1684,6 @@ def create_app(
         current = runtime.owners.agent_runtime.query_human_request(request_ref)
         target = None if current is None else current.get("target_assertion")
         idempotency_key = _idempotency_key(request)
-        if (
-            isinstance(target, dict)
-            and target.get("schema_ref")
-            == "meta-research/writing-system-operation-help/v1"
-        ):
-            return runtime.writing.retry_system_operation_help(
-                request_ref,
-                idempotency_key=idempotency_key,
-            )
         if (
             current is None
             or current.get("kind") != "system_operation_help"
@@ -3109,199 +3006,21 @@ def create_app(
         except (OSError, sqlite3.Error) as error:
             raise HTTPException(status_code=503, detail={"code": "timeline_summary_unavailable"}) from error
 
-    @app.get("/api/v1/writing")
-    def query_writing() -> dict[str, object]:
-        return runtime.writing.query_overview()
 
-    @app.post("/api/v1/writing/intents", status_code=201)
-    def create_writing_intent(
-        request: Request, intent: WritingIntentRequest
-    ) -> dict[str, object]:
-        return runtime.writing.create_intent(
-            **intent.model_dump(), idempotency_key=_idempotency_key(request)
-        )
 
-    @app.post("/api/v1/writing/intents/{intent_id}/preview")
-    def preview_writing_intent(
-        request: Request, intent_id: str, _command: EmptyCommandRequest
-    ) -> dict[str, object]:
-        return runtime.writing.preview_intent(
-            intent_id, idempotency_key=_idempotency_key(request)
-        )
 
-    @app.post("/api/v1/writing/intents/{intent_id}/confirmation")
-    def confirm_writing_intent(
-        request: Request,
-        intent_id: str,
-        confirmation: WritingConfirmationRequest,
-    ) -> dict[str, object]:
-        return runtime.writing.confirm_intent(
-            intent_id,
-            **confirmation.model_dump(),
-            idempotency_key=_idempotency_key(request),
-        )
 
-    @app.get("/api/v1/writing/runs/{run_ref}")
-    def query_writing_run(run_ref: str) -> dict[str, object]:
-        return runtime.writing.query_writing_report(run_ref)
 
-    @app.post("/api/v1/writing/runs/{run_ref}/control")
-    def control_writing_run(
-        request: Request, run_ref: str, command: WritingControlRequest
-    ) -> dict[str, object]:
-        return runtime.writing.control_report(
-            run_ref,
-            action=command.action,
-            expected_attempt_ref=command.expected_attempt_ref,
-            expected_fence_ref=command.expected_fence_ref,
-            idempotency_key=_idempotency_key(request),
-        )
 
-    @app.post("/api/v1/writing/runs/{run_ref}/cancellation-intents")
-    def preview_writing_cancellation(
-        request: Request, run_ref: str, _command: EmptyCommandRequest
-    ) -> dict[str, object]:
-        return runtime.writing.preview_report_cancellation(
-            run_ref, idempotency_key=_idempotency_key(request)
-        )
 
-    @app.post(
-        "/api/v1/writing/runs/{run_ref}/cancellation-intents/"
-        "{cancellation_intent_id}/confirmation"
-    )
-    def confirm_writing_cancellation(
-        request: Request,
-        run_ref: str,
-        cancellation_intent_id: str,
-        confirmation: WritingConfirmationRequest,
-    ) -> dict[str, object]:
-        return runtime.writing.confirm_report_cancellation(
-            run_ref,
-            cancellation_intent_id,
-            **confirmation.model_dump(),
-            idempotency_key=_idempotency_key(request),
-        )
 
-    @app.post("/api/v1/writing/runs/{run_ref}/revisions")
-    def revise_writing_run(
-        request: Request, run_ref: str, revision: WritingRevisionRequest
-    ) -> dict[str, object]:
-        return runtime.writing.request_revision(
-            run_ref,
-            feedback=tuple(revision.feedback),
-            idempotency_key=_idempotency_key(request),
-        )
 
-    @app.post(
-        "/api/v1/writing/runs/{run_ref}/delivery-intents",
-        status_code=201,
-    )
-    def create_writing_delivery_intent(
-        request: Request,
-        run_ref: str,
-        intent: WritingDeliveryIntentRequest,
-    ) -> dict[str, object]:
-        value = intent.model_dump()
-        return runtime.writing.create_delivery_intent(
-            run_ref,
-            action=value["action"],
-            provider_ref=value["provider_ref"],
-            target=value["target"],
-            output_format=value["output_format"],
-            idempotency_key=_idempotency_key(request),
-        )
 
-    @app.post("/api/v1/writing/delivery-intents/{intent_id}/preview")
-    def preview_writing_delivery_intent(
-        request: Request,
-        intent_id: str,
-        _command: EmptyCommandRequest,
-    ) -> dict[str, object]:
-        return runtime.writing.preview_delivery_intent(
-            intent_id,
-            idempotency_key=_idempotency_key(request),
-        )
 
-    @app.post(
-        "/api/v1/writing/delivery-intents/{intent_id}/confirmation"
-    )
-    def confirm_writing_delivery_intent(
-        request: Request,
-        intent_id: str,
-        confirmation: WritingConfirmationRequest,
-    ) -> dict[str, object]:
-        return runtime.writing.confirm_delivery_intent(
-            intent_id,
-            **confirmation.model_dump(),
-            idempotency_key=_idempotency_key(request),
-        )
 
-    @app.get("/api/v1/writing/deliveries/{operation_ref}")
-    def query_writing_delivery_operation(
-        operation_ref: str,
-    ) -> dict[str, object]:
-        return runtime.writing.query_delivery_operation(operation_ref)
 
-    @app.get("/api/v1/writing/runs/{run_ref}/compare")
-    def compare_writing_versions(
-        run_ref: str,
-        left_version_ref: str = Query(min_length=1, max_length=96),
-        right_version_ref: str = Query(min_length=1, max_length=96),
-    ) -> dict[str, object]:
-        return runtime.writing.compare_report_versions(
-            run_ref,
-            left_version_ref=left_version_ref,
-            right_version_ref=right_version_ref,
-        )
 
-    @app.get(
-        "/api/v1/writing/runs/{run_ref}/versions/{version_ref}/content"
-    )
-    def view_writing_report_version(run_ref: str, version_ref: str) -> Response:
-        viewed = runtime.writing.view_report_version(
-            run_ref,
-            version_ref=version_ref,
-        )
-        return Response(
-            content=viewed["content"],
-            media_type="text/markdown",
-            headers={
-                "X-Writing-Version-Ref": str(viewed["version_ref"]),
-                "X-Writing-Content-Hash": str(viewed["content_hash"]),
-                "X-Writing-Citation-Status": str(viewed["citation_status"]),
-                "X-Writing-Formal-Renderer": "false",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
 
-    @app.get("/api/v1/writing/runs/{run_ref}/render")
-    def render_writing_report(
-        run_ref: str,
-        format: str | None = Query(default=None, min_length=1, max_length=32),
-        version_ref: str | None = Query(
-            default=None, min_length=1, max_length=96
-        ),
-    ) -> Response:
-        rendered = runtime.writing.render_report(
-            run_ref,
-            version_ref=version_ref,
-            format=format,
-        )
-        return Response(
-            content=rendered["content"],
-            media_type=str(rendered["media_type"]).split(";", 1)[0],
-            headers={
-                "X-Writing-Version-Ref": str(rendered["version_ref"]),
-                "X-Writing-Render-Hash": str(rendered["render_hash"]),
-                "X-Writing-Render-Format": str(rendered["format"]),
-                "Content-Disposition": (
-                    "attachment; filename=\""
-                    + str(rendered.get("file_name", "writing-output"))
-                    + "\""
-                ),
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
 
     @app.get("/api/v1/root-capability-diagnostics")
     def query_root_capability_diagnostics(
@@ -3847,142 +3566,6 @@ async def _process_first_question_deepfetch(
     )
 
 
-async def _process_writing(
-    runtime: ProductionRuntime,
-    health: ReconciliationHealth,
-    on_health_change: Callable[[], None] | None = None,
-) -> None:
-    """Advance autonomous Writing independently of any browser connection."""
-
-    pending_deliveries: dict[str, _PendingWorkerOperation] = {}
-    delivery_sweep_exclusions: set[str] = set()
-    delivery_sweep_error_code: str | None = None
-    while True:
-        delivery_sweep_restarted = False
-        try:
-            claim = await _daemon_thread_call(runtime.writing.next_runnable_claim)
-            if claim is None:
-                advanced = False
-            else:
-                run_ref, attempt_ref, fence_ref = claim
-                advanced = await _await_monitored_worker_call(
-                    lambda: runtime.writing.process_once(
-                        expected_run_ref=run_ref,
-                        expected_attempt_ref=attempt_ref,
-                        expected_fence_ref=fence_ref,
-                    ),
-                    health=health,
-                    timeout_code="writing_operation_timeout",
-                    on_health_change=on_health_change,
-                    timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
-                )
-            delivery_advanced = False
-            for operation_ref, pending_delivery in tuple(
-                pending_deliveries.items()
-            ):
-                if not pending_delivery.operation.done():
-                    continue
-                pending_deliveries.pop(operation_ref)
-                pending_advanced = pending_delivery.operation.result()
-                delivery_advanced = bool(pending_advanced or delivery_advanced)
-                if not pending_advanced:
-                    delivery_sweep_exclusions.add(operation_ref)
-            next_delivery_ref = await _daemon_thread_call(
-                lambda: runtime.writing.next_runnable_delivery_operation_ref(
-                    excluded_operation_refs=frozenset(
-                        pending_deliveries.keys() | delivery_sweep_exclusions
-                    )
-                )
-            )
-            if next_delivery_ref is None:
-                # Every exact operation gets at most one no-progress attempt per
-                # sweep. Clearing only after the scan is exhausted preserves
-                # fairness while the normal idle delay bounds the next retry.
-                delivery_sweep_restarted = bool(delivery_sweep_exclusions)
-                delivery_sweep_exclusions.clear()
-            else:
-                try:
-                    delivery_outcome = await _await_monitored_worker_call(
-                        lambda: runtime.writing.process_delivery_once(
-                            expected_operation_ref=next_delivery_ref
-                        ),
-                        health=health,
-                        timeout_code="writing_delivery_operation_timeout",
-                        on_health_change=on_health_change,
-                        retain_operation_on_timeout=True,
-                        timeout_seconds=WRITING_DELIVERY_STALL_SECONDS,
-                    )
-                except Exception as error:
-                    # Only a failure from this exact selected operation belongs
-                    # to its sweep cursor. Selector/query/global failures happen
-                    # outside this catch and cannot exclude an unrelated ref.
-                    delivery_sweep_exclusions.add(next_delivery_ref)
-                    delivery_sweep_error_code = (
-                        error.code
-                        if isinstance(error, OwnerConflict)
-                        else str(getattr(error, "code", type(error).__name__))
-                    )
-                    raise
-                if isinstance(delivery_outcome, _PendingWorkerOperation):
-                    # A stable provider operation cannot be retired or safely
-                    # duplicated. Quarantine its exact ref while later internal
-                    # claims and independently confirmed deliveries advance.
-                    pending_deliveries[next_delivery_ref] = delivery_outcome
-                else:
-                    delivery_advanced = bool(
-                        delivery_outcome or delivery_advanced
-                    )
-                    if not delivery_outcome:
-                        delivery_sweep_exclusions.add(next_delivery_ref)
-            advanced = bool(advanced or delivery_advanced)
-        except Exception as error:
-            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
-                LOGGER.exception("writing worker attempt failed unexpectedly")
-            error_code = (
-                error.code
-                if isinstance(error, OwnerConflict)
-                else str(getattr(error, "code", type(error).__name__))
-            )
-            changed = (
-                health.status != "unavailable" or health.last_error != error_code
-            )
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            if pending_deliveries:
-                changed = (
-                    health.status != "unavailable"
-                    or health.last_error
-                    != "writing_delivery_operation_timeout"
-                )
-                health.status = "unavailable"
-                health.last_error = "writing_delivery_operation_timeout"
-            elif delivery_sweep_error_code is not None:
-                changed = (
-                    health.status != "unavailable"
-                    or health.last_error != delivery_sweep_error_code
-                )
-                health.status = "unavailable"
-                health.last_error = delivery_sweep_error_code
-            else:
-                changed = (
-                    health.status != "ready" or health.last_error is not None
-                )
-                health.status = "ready"
-                health.last_error = None
-                health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(
-                0 if advanced and not delivery_sweep_restarted else 0.2
-            )
-            if delivery_sweep_restarted:
-                delivery_sweep_error_code = None
 
 
 async def _process_research_assets(

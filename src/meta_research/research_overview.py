@@ -1,22 +1,98 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from meta_research.owners.common import OwnerConflict, canonical_hash
-from meta_research.writing_snapshot import WritingResearchSnapshotReader
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
+from meta_research.accepted_research import AcceptedResearchReader
 
 
 STAGES = ("idea", "plan", "bundle", "reasoning")
 SCHEMA = "meta-research/research-overview/v1"
 
 
-class ResearchOverviewReader(WritingResearchSnapshotReader):
+class ResearchOverviewReader(AcceptedResearchReader):
     """Read accepted research artifacts through the existing receipt verifiers.
 
-    This deliberately excludes Writing's asset inventory and frozen snapshot:
-    neither is the live research position. No model, Owner write, or provider is
-    invoked. An unavailable historical artifact remains a visible bounded gap.
+    No model, Owner write, or provider is invoked. An unavailable historical
+    artifact remains a visible bounded gap.
     """
+
+    def writing_context(self, quest_ref: str, *, question_ref=None):
+        """Keep the initial writing basis in one existing Owner read snapshot.
+
+        Scientific fields are exact excerpts, not generated summaries. Large
+        fields and full records stay behind their existing accurate readers.
+        Later discovery is still live; this is not an as-of query for all assets.
+        """
+        with self._research_graph._database.read_snapshot():
+            return self._writing_context(quest_ref, question_ref=question_ref)
+
+    def _writing_context(self, quest_ref: str, *, question_ref=None):
+        quest = self._research_graph.query_quest_by_ref(quest_ref)
+        if quest is None:
+            raise OwnerConflict("research_overview_quest_not_found")
+        # The first Owner read establishes the WAL snapshot. Persist this
+        # observation with the exact sources in the ordinary queued message.
+        basis_observed_at = datetime.now(timezone.utc).isoformat()
+        foreground = self._advancement_engine.query_foreground(quest_ref)
+        if question_ref is None and foreground is not None:
+            question_ref = foreground["question_ref"]
+        history = [cycle for cycle in self._advancement_engine.query_quest_stage_history_display(quest_ref)
+            if question_ref is None or cycle.question_ref == question_ref]
+        selected = history[-1:] + [cycle for cycle in reversed(history[:-1])
+            if any(commit.stage == "reasoning" for commit in cycle.commits)][:1]
+        artifacts = []
+        for cycle in selected:
+            requests = {request.request_ref: request for request in cycle.requests}
+            commits = {commit.stage: commit for commit in cycle.commits}
+            for stage in ("plan", "bundle", "reasoning"):
+                commit = commits.get(stage)
+                if commit is not None:
+                    artifact = self._artifact(quest_ref, cycle, requests.get(commit.request_ref), commit)
+                    if artifact is not None:
+                        artifacts.append(self._writing_artifact(artifact, commit))
+        return {"quest_ref": quest_ref, "question_ref": question_ref,
+            "basis_observed_at": basis_observed_at,
+            "goal": quest.draft.get("goal"), "scientific_artifacts": artifacts,
+            "availability": ("accepted_scientific_content" if any(
+                artifact["status"] == "accepted" for artifact in artifacts) else "no_accepted_scientific_result"),
+            "instruction": "scientific_fields 是原文的完整字段，非全文或生成摘要；deferred_fields 尚未展开，成稿前沿 reader 读取所需内容，不能把未展开解释为没有反证或限制。保持实际结论、结果与适用范围；未完成日志不当作已完成结果。"}
+
+    @staticmethod
+    def _writing_artifact(artifact, commit):
+        result = {key: value for key, value in artifact.items() if key != "content"}
+        content = artifact["content"]
+        if content is None:
+            return result
+        source = artifact["source"]
+        # Bundle's accepted report is retained in its immutable StageCommit
+        # closure; Plan and Reasoning already have exact RM content readers.
+        result["reader"] = {"operation": "research_memory.content.read", "args": {
+            "source_ref": commit.commit_ref if artifact["stage"] == "bundle" else source["content_ref"],
+            "version_ref": commit.receipt.payload_hash if artifact["stage"] == "bundle" else source["content_hash"],
+        }}
+        fields = {
+            "plan": ("bundle_disposition", "evidence_reuse_set", "coverage"),
+            "bundle": ("disposition", "remaining_experiment_keys", "blocker_refs",
+                "semantic_change_required", "accepted_target_commit_refs", "metric_result_refs", "evidence_refs"),
+            "reasoning": ("disposition", "claim", "support_scope", "limitations", "missing_evidence",
+                "uncertainty_basis", "causal_interpretation", "research_synthesis", "evidence"),
+        }[artifact["stage"]]
+        result.update(scientific_fields={}, deferred_fields=[], content_delivery="selected_fields")
+        # A display budget never rejects an accepted scientific record or cuts
+        # prose/JSON. Oversized semantic fields remain whole in the exact reader.
+        remaining = 16 * 1024
+        for field in fields:
+            if field not in content:
+                continue
+            size = len(canonical_json(content[field]))
+            if size <= remaining:
+                result["scientific_fields"][field] = content[field]
+                remaining -= size
+            else:
+                result["deferred_fields"].append(field)
+        return result
 
     def query(self, quest_ref: str) -> dict[str, Any]:
         for _attempt in range(3):
@@ -108,34 +184,34 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
         run = (self._agent_runtime.query_idea_stage_run(request.request_ref) if stage == 'idea'
                else self._agent_runtime.query_plan_stage_run(request.request_ref))
         if run is None or run.execution is None or run.completion is None:
-            raise OwnerConflict('writing_stage_result_missing')
+            raise OwnerConflict('research_stage_result_missing')
         if (run.run_ref != commit.run_ref or run.request_ref != request.request_ref
             or run.cycle_ref != request.cycle_ref or run.epoch != request.epoch
             or run.completion.receipt != commit.run_completion_receipt
             or run.completion.outcome_ref != commit.outcome_ref
             or run.completion.decision_receipt != commit.outcome_receipt):
-            raise OwnerConflict('writing_stage_result_invalid')
+            raise OwnerConflict('research_stage_result_invalid')
         content = (self._research_memory.query_idea_outcome_content(run.execution.submission_ref) if stage == 'idea'
                    else self._research_memory.query_plan_document(run.execution.submission_ref))
         if content is None:
-            raise OwnerConflict('writing_stage_result_invalid')
+            raise OwnerConflict('research_stage_result_invalid')
         decision = self._research_graph.query_stage_decision_display(request, commit, run.execution, content)
         if (decision is None or decision.decision != 'accepted'
             or decision.receipt != commit.outcome_receipt
             or decision.content_ref != content.content_ref
             or (decision.outcome_ref if stage == 'idea' else decision.formal_plan_ref)
             != commit.outcome_ref):
-            raise OwnerConflict('writing_stage_result_invalid')
+            raise OwnerConflict('research_stage_result_invalid')
         if stage == 'idea':
             if content.outcome_hash != decision.outcome_hash:
-                raise OwnerConflict('writing_stage_result_invalid')
+                raise OwnerConflict('research_stage_result_invalid')
             result = {'content_ref': content.content_ref, 'content_hash': content.payload_hash,
                       'outcome_hash': content.outcome_hash, 'outcome': content.outcome,
                       'content_receipt': content.receipt.as_public_dict(),
                       'acceptance_receipt': decision.receipt.as_public_dict()}
         else:
             if content.plan_document_hash != decision.plan_document_hash:
-                raise OwnerConflict('writing_stage_result_invalid')
+                raise OwnerConflict('research_stage_result_invalid')
             result = {'content_ref': content.content_ref, 'content_hash': content.payload_hash,
                       'plan_document_hash': content.plan_document_hash, 'plan_document': content.plan_document,
                       'content_receipt': content.receipt.as_public_dict(),
@@ -145,7 +221,7 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
     def _reasoning_stage_value(self, request: Any, commit: Any) -> dict[str, Any]:
         run = self._agent_runtime.query_reasoning_completion_display(request)
         if run is None:
-            raise OwnerConflict("writing_reasoning_result_missing")
+            raise OwnerConflict("research_reasoning_result_missing")
         completion = run["completion"]
         result = self._research_graph.query_reasoning_result_display(run["submission_ref"])
         if (
@@ -163,7 +239,7 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
             or result["receipt"] != commit.outcome_receipt
             or result["scientific_outcome"].get("foreground_epoch") != request.epoch
         ):
-            raise OwnerConflict("writing_reasoning_result_invalid")
+            raise OwnerConflict("research_reasoning_result_invalid")
         return {"result": {"content_ref": result["content_ref"],
                            "content_hash": result["payload_hash"],
                            "outcome": {"scientific_outcome": result["scientific_outcome"]}}}
@@ -172,7 +248,7 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
         report = self._agent_runtime.query_bundle_report_display(request)
         if report is None:
             if commit is not None:
-                raise OwnerConflict("writing_bundle_result_invalid")
+                raise OwnerConflict("research_bundle_result_invalid")
             return None
         if commit is not None:
             completion = report["completion"]
@@ -185,7 +261,7 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
                 or commit.run_completion_receipt != completion.receipt
                 or completion.request_ref != request.request_ref
             ):
-                raise OwnerConflict("writing_bundle_result_invalid")
+                raise OwnerConflict("research_bundle_result_invalid")
         return {"report": report}
 
     def _artifact(self, quest_ref: str, cycle: Any, request: Any, commit: Any) -> dict[str, Any] | None:

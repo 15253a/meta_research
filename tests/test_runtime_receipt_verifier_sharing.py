@@ -19,7 +19,6 @@ def test_runtime_receipt_verifier_is_shared_and_fresh_between_snapshots(
     for receipt_field, owner_field in (
         ("_database", "_database"),
         ("_stage_request_verifier", "_stage_request_verifier"),
-        ("_writing_authorization_verifier", "_authorization_verifier"),
         ("_bundle_report_evidence_verifier", "_bundle_report_evidence_verifier"),
         ("_bundle_exhaustion_verifier", "_bundle_exhaustion_verifier"),
         ("_bundle_report_disposition_verifier", "_bundle_report_disposition_verifier"),

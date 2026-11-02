@@ -5,7 +5,7 @@ description: 按 DeepFetch 已选定的有限论文清单，经合法开放获�
 
 # Nature Downloader：DeepFetch 全文获取服务
 
-只获取本次明确请求的论文，返回简洁交付证据。DeepFetch 提供精确标题、标识、URL 线索与绝对私有获取目录；选题、科学阅读及公开产物由 DeepFetch 负责。用户可见说明遵循当前根 Session 的语言偏好，原文和协议值保持原貌。
+只获取本次明确请求的论文，返回简洁交付证据。DeepFetch 提供精确标题、标识、URL 线索与绝对私有获取目录；选题、科学阅读及公开产物由 DeepFetch 负责。用户可见说明遵循运行时既有语言偏好，原文和协议值保持原貌。
 
 ## 当前请求与路线
 
@@ -13,13 +13,23 @@ description: 按 DeepFetch 已选定的有限论文清单，经合法开放获�
 
 获取服务负责合法路由、传输、内容验证、hash、typed 失败和私有 manifest，只写调用方指定目录。已选正文获取始终传 `--no-si` 和 `--cnki-format pdf`，无需再次确认补充材料；DeepFetch 接受核实的 PDF、HTML、XML 正文，CAJ 不适用。
 
+## 持续工作与本机经验
+
+在同一长期 Acquisition Session 和 workspace 中执行后续获取，复用已有工具、有效配置与工作记录。开始新任务时，先用适合本次模式的已验证入口和快捷路径，减少重复找浏览器、查机构入口及探索已走通过程。独立 request 保留各自执行事实，不要求重复探索未变化的机器环境。
+
+把值得复用的本机经验写入 workspace 的普通工作笔记：可用入口、具体操作或命令、适用条件、已知失效点。复用现有配置、缓存、manifest 与路线记录，不另建一套路由记忆服务。记忆只表明过去实际成功或失败；访问条件改变时只修受影响路径，并更新笔记。密码、cookie 和私有认证状态仍留在受控环境，不进入笔记正文。
+
+完成一批或压缩模型上下文后保留这个 workspace。后续继续使用已有文件和必要经验；清理无用临时文件不等于重置获取会话。只需知道当前要下载的论文和本次获取条件，不需要整体研究背景。
+
 ## 1. 预检
 
-`oa_only` 跳过全部机构／浏览器预检，并传 `--no-institutional-access`；这是已选主路线，不描述为被迫降级。`provided_only` 仅核实已提供文件，不发起网络下载。需要机构路线时，在 DeepFetch 开始主动检索计时前检查配置、连接和真实权限：
+`oa_only` 跳过全部机构／浏览器预检，并传 `--no-institutional-access`；这是已选主路线，不描述为被迫降级。`provided_only` 仅核实已提供文件，不发起网络下载。初次需要机构路线时检查配置、连接和真实权限；后续任务先复用当前仍有效的配置、健康缓存与受控页面，仅对过期、变化或出错的环节重新探测，不每批机械重跑全部预检。宿主负责主动检索计时，下载 Session 无需了解研究流程。
+
+按需使用以下检查；普通 health 可复用缓存，只有需要强制刷新相关连通性时才加 `--force`：
 
 ```bash
 python3 scripts/configure_school.py show
-python3 scripts/configure_school.py health --force
+python3 scripts/configure_school.py health
 node scripts/functional_cdp_probe.mjs --proxy http://127.0.0.1:3456
 ```
 
@@ -32,7 +42,9 @@ node scripts/direct_cdp_proxy.mjs --chrome http://127.0.0.1:9222 --port 3456
 curl --noproxy '*' --max-time 10 http://127.0.0.1:3456/targets
 ```
 
-桥接复用现有浏览器，仅暴露页面操作。凭据、cookie、local storage 和用户配置文件留在受控环境，不进入 Agent 上下文。机构路线仍不可用时给出具体登录待办、OA-only 继续或取消选项；纯用户等待不计主动检索时间。完成条件：当前模式已明确，所需访问已核实或有明确等待原因。
+桥接复用现有浏览器，仅暴露页面操作。凭据、cookie、local storage 和用户配置文件留在受控环境，不进入 Agent 上下文。图书馆连接错误或机构访问仍不可用、确需用户协助时，下载 Session 可通过宿主提供的 `human_request.open` 发送请求，说明错误现象、已尝试办法和所需操作（例如连接校园网络／VPN、在原浏览器重新登录或完成验证码）。仅标记 waiting_user 不等于请求已发送，以正式工具回执为准；当前无正式工具上下文时如实说明待办，不能伪称已投递。保留 Session、workspace 与受影响任务，用户处理后接续；改变访问模式仍以本次明确选择为准。纯用户等待不计主动检索时间。完成条件：当前模式已明确，所需访问已核实或有明确等待原因。
+
+图书馆访问求助使用 `library_reconnect`，成功发送后交回宿主等待。用户回复后先用原 effect 经 `human_request.open.reconcile` 对账，再复验连接并继续下载；“已连好”的文字回复本身不等于已恢复访问，也不能把结果未知当成需要重新发送同一请求。
 
 ## 2. 获取
 

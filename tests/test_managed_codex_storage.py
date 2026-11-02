@@ -27,7 +27,13 @@ def test_data_root_prepares_private_codex_home_and_deployment_cli_path(
     assert data_root.codex_environment == {
         "CODEX_HOME": str(data_root.codex_home),
         "CODEX_SQLITE_HOME": str(data_root.codex_home),
+        "HOME": str(data_root.codex_user_home),
+        "USERPROFILE": str(data_root.codex_user_home),
+        "XDG_CONFIG_HOME": str(data_root.codex_config),
+        "XDG_DATA_HOME": str(data_root.codex_data),
+        "XDG_STATE_HOME": str(data_root.codex_state),
         "XDG_CACHE_HOME": str(data_root.codex_cache),
+        "NODE_PATH": "",
         "PIP_CACHE_DIR": str(data_root.codex_pip_cache),
         "npm_config_cache": str(data_root.codex_npm_cache),
         "UV_CACHE_DIR": str(data_root.codex_uv_cache),
@@ -39,6 +45,10 @@ def test_data_root_prepares_private_codex_home_and_deployment_cli_path(
     for directory in (
         data_root.provider_homes,
         data_root.codex_home,
+        data_root.codex_user_home,
+        data_root.codex_config,
+        data_root.codex_data,
+        data_root.codex_state,
         data_root.codex_sessions,
         data_root.codex_archived_sessions,
         data_root.codex_cache,
@@ -59,14 +69,8 @@ def test_data_root_rejects_a_linked_codex_home(tmp_path: Path) -> None:
     data_root = prepare_data_root(tmp_path / "deployment")
     outside = tmp_path / "outside"
     outside.mkdir()
-    data_root.codex_npm_cache.rmdir()
-    data_root.codex_uv_cache.rmdir()
-    data_root.codex_pip_cache.rmdir()
-    data_root.codex_cache.rmdir()
-    data_root.codex_tmp.rmdir()
-    data_root.codex_sessions.rmdir()
-    data_root.codex_archived_sessions.rmdir()
-    data_root.codex_home.rmdir()
+    # Preserve the prepared managed tree while replacing only its entry path.
+    data_root.codex_home.rename(data_root.codex_home.with_name("preserved-codex"))
     try:
         data_root.codex_home.symlink_to(outside, target_is_directory=True)
     except OSError as error:
@@ -218,6 +222,7 @@ def test_default_codex_adapters_share_managed_runner_and_stage_ledgers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("META_RESEARCH_PROVIDER_TOOLS", raising=False)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "wrong-codex-home"))
     data_root = prepare_data_root(tmp_path / "deployment")
     runtime = build_production_runtime(
@@ -234,7 +239,6 @@ def test_default_codex_adapters_share_managed_runner_and_stage_ledgers(
             runtime.bundle_stage._provider,
             runtime.reasoning_stage._provider,
             runtime.deepfetch._provider,
-            runtime.writing._provider,
         )
         codex_runner = drafting._runner
         assert runtime.owners.human_collaboration._intent_drafting_provider is drafting
@@ -257,7 +261,6 @@ def test_default_codex_adapters_share_managed_runner_and_stage_ledgers(
             assert provider._codex_ledger_reader._codex_home == (
                 data_root.codex_home.resolve()
             )
-            assert provider._child_review_verifier is not None
         assert codex_harness.executable == expected_executable
         assert codex_harness._codex_child_ledger_reader._codex_home == (
             data_root.codex_home.resolve()

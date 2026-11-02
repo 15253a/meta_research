@@ -34,13 +34,6 @@ from meta_research.runtime_protection import (
     RuntimeProtectionUnavailable,
     record_runtime_boundary,
 )
-from meta_research.writing_contract import (
-    WRITING_DOCUMENT_TYPES,
-    SUPPORTED_WRITING_RESEARCH_SNAPSHOT_SCHEMAS,
-    normalize_writing_intent,
-    validate_writing_execution_budget,
-)
-from meta_research.writing_delivery import normalize_writing_delivery_payload
 
 
 HC_OWNER = "human_collaboration"
@@ -84,9 +77,6 @@ _HARD_COMMAND_KINDS = {
     "capability_expansion",
     "capability_authorization",
     "research_control",
-    "writing_report_start",
-    "writing_report_cancel",
-    "writing_external_delivery",
 }
 _MAX_PENDING_COMPANION_TURNS = 64
 
@@ -279,10 +269,6 @@ class SQLiteHumanCollaborationLadder:
             tuple[list[dict[str, object]], dict[str, int]],
         ]
         | None = None,
-        writing_snapshot_validator: Callable[[dict[str, object]], None] | None = None,
-        writing_delivery_binding_validator: (
-            Callable[[dict[str, object]], None] | None
-        ) = None,
         runtime_protection: RuntimeProtection | None = None,
         agent_runtime: ExternalRootTaskScopeOwner | None = None,
     ) -> None:
@@ -291,10 +277,6 @@ class SQLiteHumanCollaborationLadder:
         self._drafting_provider = drafting_provider
         self._context_resolver = context_resolver
         self._control_preview_resolver = control_preview_resolver
-        self._writing_snapshot_validator = writing_snapshot_validator
-        self._writing_delivery_binding_validator = (
-            writing_delivery_binding_validator
-        )
         self._runtime_protection = runtime_protection
         self._agent_runtime = agent_runtime
         with self._database.write() as connection:
@@ -327,13 +309,6 @@ class SQLiteHumanCollaborationLadder:
                     {"recovered_turn_count": int(recovered.rowcount)},
                 )
 
-    def bind_writing_delivery_binding_validator(
-        self, validator: Callable[[dict[str, object]], None]
-    ) -> None:
-        current = self._writing_delivery_binding_validator
-        if current is not None and current is not validator:
-            raise OwnerConflict("writing_delivery_verifier_already_bound")
-        self._writing_delivery_binding_validator = validator
 
     def ensure_companion_session(
         self,
@@ -419,47 +394,51 @@ class SQLiteHumanCollaborationLadder:
         """Switch only at an idle boundary; retries return the original switch."""
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")
         _idempotency_key(idempotency_key)
-        command_hash = canonical_hash({"command": "start_new_companion_session", "scope_ref": scope_ref})
         with self._database.fenced_write() as connection:
-            switch_ref = _collaboration_command(connection, idempotency_key, "companion_session_new", command_hash)
-            if switch_ref is None:
-                session_ref, created = self._ensure_companion_session_row(connection, scope_ref)
-                session = connection.execute(text(
-                    "SELECT * FROM hc_companion_sessions WHERE session_ref=:session_ref"),
-                    {"session_ref": session_ref}).one()
-                pending = connection.execute(text(
-                    "SELECT COUNT(*) FROM hc_companion_turns WHERE session_ref=:session_ref "
-                    "AND assistant_status IN ('queued','processing')"), {"session_ref": session_ref}).scalar_one()
-                if pending:
-                    raise OwnerConflict("companion_session_busy")
-                generation = int(session.native_session_generation) + 1
-                now = time.time()
-                switch_ref = new_ref("companion_switch")
-                connection.execute(text(
-                    "INSERT INTO hc_companion_native_sessions (session_ref,generation,created_at) "
-                    "VALUES (:session_ref,:generation,:now)"),
-                    {"session_ref": session_ref, "generation": generation, "now": now})
-                connection.execute(text(
-                    "INSERT INTO hc_companion_session_switches "
-                    "(switch_ref,scope_ref,session_ref,generation,previous_native_session_ref,created_at) "
-                    "VALUES (:switch_ref,:scope_ref,:session_ref,:generation,:previous,:now)"),
-                    {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
-                        "generation": generation, "previous": session.native_session_ref, "now": now})
-                connection.execute(text(
-                    "UPDATE hc_companion_sessions SET native_session_ref=NULL, "
-                    "native_session_generation=:generation,updated_at=:now WHERE session_ref=:session_ref"),
-                    {"session_ref": session_ref, "generation": generation, "now": now})
-                _record_collaboration_command(connection, idempotency_key, "companion_session_new", command_hash, switch_ref)
-                connection.execute(text(
-                    "UPDATE human_collaboration_state SET revision=revision+1, "
-                    "companion_session_count=companion_session_count+:created WHERE singleton='owner'"),
-                    {"created": int(created)})
-                self._feed.record(connection, "human_collaboration.companion_session_switched",
-                    {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
-                        "native_session_generation": generation})
-            switch = connection.execute(text(
-                "SELECT * FROM hc_companion_session_switches WHERE switch_ref=:switch_ref"),
-                {"switch_ref": switch_ref}).one()
+            return self._switch_companion_session(connection, scope_ref, idempotency_key)
+
+    def _switch_companion_session(self, connection, scope_ref: str, idempotency_key: str) -> dict[str, object]:
+        """Reuse /new inside a caller's writer transaction when enqueueing Writing."""
+        command_hash = canonical_hash({"command": "start_new_companion_session", "scope_ref": scope_ref})
+        switch_ref = _collaboration_command(connection, idempotency_key, "companion_session_new", command_hash)
+        if switch_ref is None:
+            session_ref, created = self._ensure_companion_session_row(connection, scope_ref)
+            session = connection.execute(text(
+                "SELECT * FROM hc_companion_sessions WHERE session_ref=:session_ref"),
+                {"session_ref": session_ref}).one()
+            pending = connection.execute(text(
+                "SELECT COUNT(*) FROM hc_companion_turns WHERE session_ref=:session_ref "
+                "AND assistant_status IN ('queued','processing')"), {"session_ref": session_ref}).scalar_one()
+            if pending:
+                raise OwnerConflict("companion_session_busy")
+            generation = int(session.native_session_generation) + 1
+            now = time.time()
+            switch_ref = new_ref("companion_switch")
+            connection.execute(text(
+                "INSERT INTO hc_companion_native_sessions (session_ref,generation,created_at) "
+                "VALUES (:session_ref,:generation,:now)"),
+                {"session_ref": session_ref, "generation": generation, "now": now})
+            connection.execute(text(
+                "INSERT INTO hc_companion_session_switches "
+                "(switch_ref,scope_ref,session_ref,generation,previous_native_session_ref,created_at) "
+                "VALUES (:switch_ref,:scope_ref,:session_ref,:generation,:previous,:now)"),
+                {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
+                    "generation": generation, "previous": session.native_session_ref, "now": now})
+            connection.execute(text(
+                "UPDATE hc_companion_sessions SET native_session_ref=NULL, "
+                "native_session_generation=:generation,updated_at=:now WHERE session_ref=:session_ref"),
+                {"session_ref": session_ref, "generation": generation, "now": now})
+            _record_collaboration_command(connection, idempotency_key, "companion_session_new", command_hash, switch_ref)
+            connection.execute(text(
+                "UPDATE human_collaboration_state SET revision=revision+1, "
+                "companion_session_count=companion_session_count+:created WHERE singleton='owner'"),
+                {"created": int(created)})
+            self._feed.record(connection, "human_collaboration.companion_session_switched",
+                {"switch_ref": switch_ref, "scope_ref": scope_ref, "session_ref": session_ref,
+                    "native_session_generation": generation})
+        switch = connection.execute(text(
+            "SELECT * FROM hc_companion_session_switches WHERE switch_ref=:switch_ref"),
+            {"switch_ref": switch_ref}).one()
         return {"scope_ref": switch.scope_ref, "session_ref": switch.session_ref, "status": "switched",
             "switch_ref": switch.switch_ref, "native_session_generation": int(switch.generation),
             "native_session_ref": None, "previous_native_session_ref": switch.previous_native_session_ref}
@@ -472,9 +451,13 @@ class SQLiteHumanCollaborationLadder:
         *,
         view_context: dict[str, object] | None = None,
         guidance_options: dict[str, object] | None = None,
+        writing_request: dict[str, object] | None = None,
+        prepare_writing: Callable[[], str] | None = None,
     ) -> dict[str, object]:
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")
-        _text(message, "companion_message_required", INTENT_MESSAGE_MAX_LENGTH)
+        # The UI text limit remains 12k. Structured writing selections are
+        # rendered by the authenticated API into the same durable turn.
+        _text(message, "companion_message_required", 256 * 1024)
         _reject_secret_content(message)
         _idempotency_key(idempotency_key)
         guidance_options = _guidance_options(guidance_options)
@@ -487,6 +470,7 @@ class SQLiteHumanCollaborationLadder:
         command_hash = canonical_hash(
             {
                 "command": "send_companion_message",
+                **({} if writing_request is None else {"writing_request": writing_request}),
                 "scope_ref": scope_ref,
                 "message": message,
                 **({} if guidance_options is None else {"guidance_options": guidance_options}),
@@ -518,6 +502,13 @@ class SQLiteHumanCollaborationLadder:
             _reject_secret_content(
                 _document(resolved, "companion_context_invalid")
             )
+        if writing_request is not None:
+            _reject_secret_content(writing_request)
+            if prepare_writing is None:
+                raise OwnerConflict("writing_context_unavailable")
+            message = prepare_writing()
+            _text(message, "companion_message_required", 256 * 1024)
+            _reject_secret_content(message)
         with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
@@ -541,6 +532,11 @@ class SQLiteHumanCollaborationLadder:
                 )
                 if pending_count >= _MAX_PENDING_COMPANION_TURNS:
                     raise OwnerConflict("companion_queue_full")
+                # The idle check, /new and its first Writing turn must commit
+                # together. A concurrent chat can only follow this first turn.
+                if writing_request is not None:
+                    self._switch_companion_session(connection, scope_ref,
+                        "writing-session:" + canonical_hash({"key": idempotency_key}))
                 now = time.time()
                 session_ref, created_session = self._ensure_companion_session_row(
                     connection,
@@ -2096,199 +2092,41 @@ class SQLiteHumanCollaborationLadder:
                         )
                     ).scalar_one()
                 )
-            if draft["command_kind"] == "writing_report_start":
-                snapshot = cast(dict[str, object], payload["snapshot"])
-                if self._writing_snapshot_validator is None:
-                    raise OwnerConflict("writing_snapshot_verifier_unavailable")
-                self._writing_snapshot_validator(snapshot)
-                document_type = cast(str, payload["document_type"])
-                target_assertion = {
-                    "owner": HC_OWNER,
-                    "operation": (
-                        "start_writing_report"
-                        if document_type == "report"
-                        else f"start_writing_{document_type}"
-                    ),
-                    "intent_id": intent_id,
-                    "quest_ref": payload["quest_ref"],
-                    **(
-                        {}
-                        if document_type == "report"
-                        else {"document_type": document_type}
-                    ),
-                    "intent_hash": payload["intent_hash"],
-                    "snapshot_ref": payload["snapshot_ref"],
-                    "snapshot_hash": payload["snapshot_hash"],
-                    "execution_budget_hash": canonical_hash(
-                        payload["execution_budget"]
-                    ),
-                    "authorization_head": authorization_count,
-                }
-                if document_type == "report":
-                    # Keep the accepted #125 preview byte-for-byte stable.  New
-                    # document profiles are additive and must not rewrite old
-                    # report confirmations or their hashes.
-                    owner_preview = {
-                        "source_owner": HC_OWNER,
-                        "target_assertion": target_assertion,
-                        "will_happen": [
-                            "记录精确的 report Writing Intent 与冻结研究 Snapshot",
-                            "确认后允许 Agent Runtime 建立独立 Writing Run",
-                        ],
-                        "will_not_happen": [
-                            "主 Quest Stage 不会被暂停或推进",
-                            "确认本身不会接受交付物、引用或渲染结果",
-                            "不会发布、发送或提交到外部系统",
-                        ],
-                        "risks": ["研究 Snapshot 变化后必须重新确认"],
-                        "stale_conditions": [
-                            "Writing Intent 或冻结 Snapshot 发生变化",
-                            "Quest 的广义研究授权发生变化",
-                        ],
-                    }
-                else:
-                    owner_preview = {
-                        "source_owner": HC_OWNER,
-                        "target_assertion": target_assertion,
-                        "will_happen": [
-                            f"记录精确的 {document_type} Writing Intent 与冻结研究 Snapshot",
-                            "确认后允许 Agent Runtime 在同一 Writing Run 模型中起草、自检与修订",
-                        ],
-                        "will_not_happen": [
-                            "主 Quest Stage 不会被暂停或推进",
-                            "确认本身不会接受 RM 交付物、RG 引用或 renderer artifact",
-                            "不会发布、发送或提交到外部系统",
-                        ],
-                        "risks": ["Intent 或冻结 Snapshot 变化后必须重新确认"],
-                        "stale_conditions": [
-                            "Writing Intent 或冻结 Snapshot 发生变化",
-                            "Quest 的广义研究授权发生变化",
-                        ],
-                    }
-            elif draft["command_kind"] == "writing_report_cancel":
-                target_assertion = {
-                    "owner": HC_OWNER,
-                    "operation": "cancel_writing_report",
-                    "intent_id": intent_id,
-                    "quest_ref": payload["quest_ref"],
-                    "run_ref": payload["run_ref"],
-                    "attempt_ref": payload["attempt_ref"],
-                    "fence_ref": payload["fence_ref"],
-                    "effect": payload["effect"],
-                    "authorization_head": authorization_count,
-                }
-                owner_preview = {
-                    "source_owner": HC_OWNER,
-                    "target_assertion": target_assertion,
-                    "will_happen": [
-                        "终止这一 Writing Run 的当前 managed Session",
-                        "保留既有 checkpoint、版本、receipt 与审计历史",
-                    ],
-                    "will_not_happen": [
-                        "不会删除已接纳的 Research Memory 资产",
-                        "不会停止、取消或推进主 Quest",
-                        "不会发布、发送或提交到外部系统",
-                    ],
-                    "risks": ["Writing Run 进入终态后不能继续或再修订"],
-                    "stale_conditions": [
-                        "Writing Run 的 current Attempt 或 Fence 发生变化",
-                        "Quest 的授权策略发生变化",
-                    ],
-                }
-            elif draft["command_kind"] == "writing_external_delivery":
-                if self._writing_delivery_binding_validator is None:
-                    raise OwnerConflict("writing_delivery_verifier_unavailable")
-                self._writing_delivery_binding_validator(payload)
-                target_assertion = {
-                    "owner": HC_OWNER,
-                    "operation": "confirm_writing_external_delivery",
-                    "intent_id": intent_id,
-                    "operation_ref": payload["operation_ref"],
-                    "action": payload["action"],
-                    "provider_ref": payload["provider_ref"],
-                    "run_ref": payload["run_ref"],
-                    "document_type": payload["document_type"],
-                    "version_ref": payload["version_ref"],
-                    "content_hash": payload["content_hash"],
-                    "citation_decision_ref": payload[
-                        "citation_decision_ref"
-                    ],
-                    "renderer_version_ref": payload[
-                        "renderer_version_ref"
-                    ],
-                    "renderer_artifact_sha256": payload[
-                        "renderer_artifact_sha256"
-                    ],
-                    "renderer_format": payload["renderer_format"],
-                    "target": payload["target"],
-                    "target_binding": payload["target_binding"],
-                    "effects": payload["effects"],
-                    "authorization_head": authorization_count,
-                }
-                owner_preview = {
-                    "source_owner": HC_OWNER,
-                    "target_assertion": target_assertion,
-                    "will_happen": [
-                        "仅确认预览中这一项精确外部副作用",
-                        "确认后由 Agent Runtime 以稳定 operation identity 接纳并执行",
-                        "连接或 ACK 丢失时先对账，不重复外部动作",
-                    ],
-                    "will_not_happen": [
-                        "确认本身不会调用外部 Provider",
-                        "不会授权未来版本、其他收件人、其他路径或其他 action",
-                        "Provider observation 不会替代 RM、RG、HC 或 AR receipt",
-                        "不会推进或改变主 Quest Stage",
-                    ],
-                    "risks": [
-                        "外部系统可能返回 partial 或 outcome_unknown",
-                        "目标内容、权限或绑定变化后本次确认不能执行",
-                    ],
-                    "stale_conditions": [
-                        "Writing version、RG citation 或 renderer artifact 变化",
-                        "provider、action、目标、收件人、权限、路径或 effects 变化",
-                        "当前 RM custody 不再可用",
-                    ],
-                }
-            else:
-                capability = cast(str, payload["capability"])
-                decision = cast(str, payload["decision"])
-                scope = cast(dict[str, object], payload["scope"])
-                target_assertion = {
-                    "owner": HC_OWNER,
-                    "operation": "decide_capability_authorization",
-                    "intent_id": intent_id,
-                    "capability": capability,
-                    "decision": decision,
-                    "scope_hash": canonical_hash(scope),
-                    "authorization_head": authorization_count,
-                }
-                owner_preview = {
-                    "source_owner": HC_OWNER,
-                    "target_assertion": target_assertion,
-                    "will_happen": [
-                        f"record an independent {decision} decision for {capability}"
-                    ],
-                    "will_not_happen": [
-                        "confirmation alone will not grant the capability",
-                        "no domain effect, Owner acceptance, Run, or Stage transition occurs",
-                        "the authorization cannot exceed the system hard ceiling",
-                    ],
-                    "risks": [
-                        "a grant may permit the exact high-risk capability inside its narrow scope"
-                    ],
-                    "stale_conditions": [
-                        "the command draft changes",
-                        "the capability authorization head changes",
-                    ],
-                }
+            capability = cast(str, payload["capability"])
+            decision = cast(str, payload["decision"])
+            scope = cast(dict[str, object], payload["scope"])
+            target_assertion = {
+                "owner": HC_OWNER,
+                "operation": "decide_capability_authorization",
+                "intent_id": intent_id,
+                "capability": capability,
+                "decision": decision,
+                "scope_hash": canonical_hash(scope),
+                "authorization_head": authorization_count,
+            }
+            owner_preview = {
+                "source_owner": HC_OWNER,
+                "target_assertion": target_assertion,
+                "will_happen": [
+                    f"record an independent {decision} decision for {capability}"
+                ],
+                "will_not_happen": [
+                    "confirmation alone will not grant the capability",
+                    "no domain effect, Owner acceptance, Run, or Stage transition occurs",
+                    "the authorization cannot exceed the system hard ceiling",
+                ],
+                "risks": [
+                    "a grant may permit the exact high-risk capability inside its narrow scope"
+                ],
+                "stale_conditions": [
+                    "the command draft changes",
+                    "the capability authorization head changes",
+                ],
+            }
             owner_previews = [
                 {**owner_preview, "digest": canonical_hash(owner_preview)}
             ]
             owner_revisions = {"human_collaboration": authorization_count}
-            if draft["command_kind"] == "writing_report_start":
-                owner_revisions.update(
-                    cast(dict[str, int], snapshot["owner_revisions"])
-                )
         with self._database.write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "command_preview", command_hash
@@ -2402,38 +2240,11 @@ class SQLiteHumanCollaborationLadder:
             if error.code == "command_draft_stale":
                 raise OwnerConflict("command_preview_stale") from error
             raise
-        writing_snapshot: dict[str, object] | None = None
-        writing_delivery: dict[str, object] | None = None
-        if confirmed_draft.get("command_kind") == "writing_report_start":
-            payload = cast(dict[str, object], confirmed_draft["payload"])
-            writing_snapshot = cast(dict[str, object], payload["snapshot"])
-            if self._writing_snapshot_validator is None:
-                raise OwnerConflict("writing_snapshot_verifier_unavailable")
-            self._writing_snapshot_validator(writing_snapshot)
-        elif confirmed_draft.get("command_kind") == "writing_external_delivery":
-            writing_delivery = cast(
-                dict[str, object], confirmed_draft["payload"]
-            )
-            if self._writing_delivery_binding_validator is None:
-                raise OwnerConflict("writing_delivery_verifier_unavailable")
-            self._writing_delivery_binding_validator(writing_delivery)
         with self._database.write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "command_confirm", command_hash
             )
             if replay is None:
-                if writing_snapshot is not None:
-                    if self._writing_snapshot_validator is None:
-                        raise OwnerConflict("writing_snapshot_verifier_unavailable")
-                    # Recheck the frozen value itself under the writer lock;
-                    # live research may advance independently of this intent.
-                    self._writing_snapshot_validator(writing_snapshot)
-                elif writing_delivery is not None:
-                    if self._writing_delivery_binding_validator is None:
-                        raise OwnerConflict("writing_delivery_verifier_unavailable")
-                    # External effects require the exact RM/RG/renderer/target
-                    # binding to remain current at the final confirmation edge.
-                    self._writing_delivery_binding_validator(writing_delivery)
                 preview = connection.execute(
                     text(
                         "SELECT * FROM hc_command_previews WHERE preview_ref = "
@@ -2452,23 +2263,9 @@ class SQLiteHumanCollaborationLadder:
                 owner_revisions = decoded_object(preview.owner_revisions_json)
                 if canonical_hash(owner_revisions) != preview.owner_revisions_hash:
                     raise OwnerConflict("command_preview_stale")
-                if writing_snapshot is None:
-                    expected_owner_revisions = _current_owner_revisions(
-                        connection, tuple(owner_revisions)
-                    )
-                else:
-                    # Preserve the frozen coherent-cut revisions and only
-                    # re-read HC's mutable authorization head. Later research
-                    # belongs to a later Snapshot, not this confirmation.
-                    expected_owner_revisions = _current_owner_revisions(
-                        connection, ("human_collaboration",)
-                    )
-                    expected_owner_revisions.update(
-                        cast(
-                            dict[str, int],
-                            writing_snapshot["owner_revisions"],
-                        )
-                    )
+                expected_owner_revisions = _current_owner_revisions(
+                    connection, tuple(owner_revisions)
+                )
                 if owner_revisions != expected_owner_revisions:
                     raise OwnerConflict("command_preview_stale")
                 confirmation_ref = new_ref("human_confirmation")
@@ -2782,34 +2579,6 @@ class SQLiteHumanCollaborationLadder:
             raise OwnerConflict("idempotency_conflict")
         return self.query_command(str(row.result_ref))
 
-    def query_commands(self, *, command_kind: str) -> tuple[dict[str, object], ...]:
-        if command_kind not in {
-            "writing_report_start",
-            "writing_report_cancel",
-            "writing_external_delivery",
-        }:
-            raise OwnerConflict("command_kind_invalid")
-        with self._database.read() as connection:
-            refs = connection.execute(
-                text(
-                    "SELECT intents.intent_id FROM hc_command_intents AS intents "
-                    "JOIN hc_command_drafts AS drafts ON drafts.intent_id = "
-                    "intents.intent_id AND drafts.draft_revision = "
-                    "intents.current_revision WHERE json_extract("
-                    "drafts.draft_json, '$.command_kind') = :command_kind "
-                    "ORDER BY intents.created_at DESC, intents.intent_id DESC"
-                ),
-                {"command_kind": command_kind},
-            ).scalars().all()
-        commands = tuple(self.query_command(str(ref)) for ref in refs)
-        if any(
-            cast(dict[str, object], command["draft"]).get("command_kind")
-            != command_kind
-            for command in commands
-        ):
-            raise OwnerConflict("command_kind_integrity_invalid")
-        return commands
-
     def _validate_command(self, value: dict[str, object]) -> dict[str, object]:
         command = _document(value, "command_draft_invalid")
         if set(command) != {"command_kind", "payload"}:
@@ -2823,56 +2592,7 @@ class SQLiteHumanCollaborationLadder:
         payload = command["payload"]
         if not isinstance(payload, dict):
             raise OwnerConflict("command_payload_invalid")
-        if command["command_kind"] == "writing_report_start":
-            if set(payload) != {
-                "document_type",
-                "quest_ref",
-                "intent",
-                "intent_hash",
-                "snapshot",
-                "snapshot_ref",
-                "snapshot_hash",
-                "execution_budget",
-            }:
-                raise OwnerConflict("command_payload_invalid")
-            document_type = payload["document_type"]
-            if document_type not in WRITING_DOCUMENT_TYPES:
-                raise OwnerConflict("writing_document_type_invalid")
-            _scope_ref(payload["quest_ref"], "writing_quest_ref_invalid")
-            intent = _document(payload["intent"], "writing_intent_invalid")
-            if normalize_writing_intent(str(document_type), intent) != intent:
-                raise OwnerConflict("writing_intent_invalid")
-            if canonical_hash(intent) != payload["intent_hash"]:
-                raise OwnerConflict("writing_intent_hash_mismatch")
-            snapshot = _document(payload["snapshot"], "writing_snapshot_invalid")
-            snapshot_without_hash = dict(snapshot)
-            embedded_hash = snapshot_without_hash.pop("snapshot_hash", None)
-            if (
-                not isinstance(snapshot.get("schema_ref"), str)
-                or snapshot.get("schema_ref") not in SUPPORTED_WRITING_RESEARCH_SNAPSHOT_SCHEMAS
-                or snapshot.get("quest_ref") != payload["quest_ref"]
-                or snapshot.get("snapshot_ref") != payload["snapshot_ref"]
-                or embedded_hash != payload["snapshot_hash"]
-                or canonical_hash(snapshot_without_hash) != payload["snapshot_hash"]
-            ):
-                raise OwnerConflict("writing_snapshot_hash_mismatch")
-            validate_writing_execution_budget(payload["execution_budget"])
-        elif command["command_kind"] == "writing_report_cancel":
-            if set(payload) != {
-                "quest_ref",
-                "run_ref",
-                "attempt_ref",
-                "fence_ref",
-                "effect",
-            }:
-                raise OwnerConflict("command_payload_invalid")
-            for field in ("quest_ref", "run_ref", "attempt_ref", "fence_ref"):
-                _scope_ref(payload[field], f"writing_cancel_{field}_invalid")
-            if payload["effect"] != "terminal_cancel_preserve_history":
-                raise OwnerConflict("writing_cancel_effect_invalid")
-        elif command["command_kind"] == "writing_external_delivery":
-            command["payload"] = normalize_writing_delivery_payload(payload)
-        elif command["command_kind"] == "capability_authorization":
+        if command["command_kind"] == "capability_authorization":
             if set(payload) != {"capability", "decision", "scope"}:
                 raise OwnerConflict("command_payload_invalid")
             _text(payload["capability"], "capability_required", 64)

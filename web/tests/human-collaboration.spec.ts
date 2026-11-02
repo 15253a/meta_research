@@ -129,10 +129,10 @@ async function installHumanCollaborationSnapshot(
     ),
     request(
       "system_operation_help",
-      "writing:HR-70:r1",
-      "writing",
-      "重试失败的 Writing 操作：https://status.example.invalid/run-219",
-      "writing-run-219",
+      "companion:HR-70:r1",
+      "companion",
+      "重试失败的助手操作：https://status.example.invalid/run-219",
+      "companion-session-219",
     ),
   ];
   items[1].business_purpose = "交回原始批准结果：https://vendor.example.invalid/approval";
@@ -1021,10 +1021,10 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     item.responses = [{
       response_ref: `response-retry-${item.revision}`,
       decision: "provided",
-      facts: { action: "retry", effect_id: "writing-effect-70" },
+      facts: { action: "retry", effect_id: "companion-effect-70" },
       note: "",
     }];
-    const retryStatus = requestRef === "writing:HR-70:r2" ? "succeeded" : "processing";
+    const retryStatus = requestRef === "companion:HR-70:r2" ? "succeeded" : "processing";
     await fulfillJson(route, {
       ...item,
       ...(retryStatus === "succeeded" ? {
@@ -1315,7 +1315,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await nextRequest.click();
   await expect(queue).toContainText("5 / 5");
   await expect(dialog.getByRole("heading", {
-    name: "重试失败的 Writing 操作：https://status.example.invalid/run-219",
+    name: "重试失败的助手操作：https://status.example.invalid/run-219",
   })).toBeVisible();
   await expect(dialog.getByRole("link", {
     name: "https://status.example.invalid/run-219",
@@ -1325,7 +1325,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("button", { name: /提交|接受|拒绝/ })).toHaveCount(0);
   await dialog.getByRole("button", { name: "重试", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
-    path: "/api/v1/human-requests/writing%3AHR-70%3Ar1/retry",
+    path: "/api/v1/human-requests/companion%3AHR-70%3Ar1/retry",
     body: {},
   });
   await expect(dialog).toContainText("重试进行中");
@@ -1336,25 +1336,25 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
 
   const humanRequests = (collaboration.human_requests as JsonRecord);
   const systemR1 = (humanRequests.items as JsonRecord[]).find(
-    (item) => item.request_ref === "writing:HR-70:r1",
+    (item) => item.request_ref === "companion:HR-70:r1",
   )!;
   const systemR2: JsonRecord = {
     ...systemR1,
-    request_ref: "writing:HR-70:r2",
+    request_ref: "companion:HR-70:r2",
     revision: 2,
     status: "open",
-    obligation: "再次重试同一 Writing 操作。",
-    predecessor_request_ref: "writing:HR-70:r1",
+    obligation: "再次重试同一助手操作。",
+    predecessor_request_ref: "companion:HR-70:r1",
     successor_request_ref: null,
     responses: [],
     evaluation: null,
     disposition: null,
   };
   humanRequests.items = (humanRequests.items as JsonRecord[]).map(
-    (item) => item.request_ref === "writing:HR-70:r1" ? systemR2 : item,
+    (item) => item.request_ref === "companion:HR-70:r1" ? systemR2 : item,
   );
   await page.reload({ waitUntil: "domcontentloaded" });
-  await expect(dialog.getByRole("heading", { name: "再次重试同一 Writing 操作。" }))
+  await expect(dialog.getByRole("heading", { name: "再次重试同一助手操作。" }))
     .toBeVisible();
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "重试", exact: true }).click();
@@ -2010,7 +2010,7 @@ test("HumanRequest deep links select the exact route and keep the background ine
     waitUntil: "domcontentloaded",
   });
   await expect(dialog.getByRole("heading", {
-    name: "重试失败的 Writing 操作：https://status.example.invalid/run-219",
+    name: "重试失败的助手操作：https://status.example.invalid/run-219",
   })).toBeVisible();
   await expect(page).toHaveURL(/\?panel=system-operation-help$/);
   await dialog.getByRole("button", { name: "关闭需要你处理的事项" }).click();

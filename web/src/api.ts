@@ -1649,285 +1649,20 @@ export type QuestCompletionProjection = {
   current: QuestCompletionView | null;
 };
 
-export type WritingReceipt = AssetReceipt & { status?: "accepted" };
-export type WritingDocumentType = "report" | "paper" | "presentation";
-
-export type WritingProviderCapability = {
-  provider_ref: string;
-  production_ready: boolean;
-  supported_actions: Array<"publish" | "overwrite" | "delete" | "send" | "submit">;
-};
-
-export type WritingDeliveryTarget = {
-  path: string;
-  permissions: 384;
-  expected_existing_hash: string | null;
-} | {
-  target_ref: string;
-  permissions: string[];
-  expected_existing_hash: string | null;
-};
-
-export type WritingDeliveryPayload = {
-  schema_ref: string;
-  request_nonce: string;
-  operation_ref: string;
-  action: "publish" | "overwrite" | "delete" | "send" | "submit";
-  provider_ref: string;
-  target: WritingDeliveryTarget;
-  effects: Array<Record<string, unknown>>;
-  run_ref: string;
-  document_type: WritingDocumentType;
-  asset_ref: string;
+export type CompanionWritingMaterial = {
   version_ref: string;
   content_hash: string;
-  manifest_hash: string;
-  version_receipt: WritingReceipt;
-  citation_decision_ref: string;
-  citation_receipt: WritingReceipt;
-  renderer_asset_ref: string;
-  renderer_version_ref: string;
-  renderer_content_hash: string;
-  renderer_manifest_hash: string;
-  renderer_artifact_sha256: string;
-  renderer_format: string;
-  renderer_media_type: string;
-  renderer_receipt: WritingReceipt;
+  role: "source" | "draft" | "feedback" | "document_template" | "presentation_template" | "dependency";
 };
 
-export type WritingDeliveryOperation = {
-  operation_ref: string;
-  payload: WritingDeliveryPayload;
-  payload_hash: string;
-  status: "not_attempted" | "partial" | "outcome_unknown" | "completed";
-  authority_status: "admitted" | "executing" | "partial" | "outcome_unknown" | "completed";
-  attempt_count: number;
-  provider_operation_ref: string;
-  provider_request_hash: string | null;
-  operation_receipt: WritingReceipt;
-  execution_receipt: WritingReceipt | null;
-  reconciliation_receipt: WritingReceipt | null;
-  provider_observations: Array<{
-    observation_ref: string;
-    provider_ref: string;
-    provider_operation_ref: string;
-    outcome: string;
-    observed_at: number;
-    details: Record<string, unknown>;
-    observation_hash: string;
-  }>;
-  failure?: { code: string };
-};
-
-export type WritingDeliveryView = {
-  intent_id: string;
-  status: "not_attempted" | "partial" | "outcome_unknown" | "completed";
-  confirmation_status: "draft" | "previewed" | "confirmed";
-  draft_revision: number;
-  draft_hash: string;
-  payload: WritingDeliveryPayload;
-  impact_preview?: null | {
-    preview_ref: string;
-    preview_hash: string;
-    draft_revision?: number;
-    draft_hash?: string;
-    status?: string;
-    owner_previews?: Array<{
-      source_owner: string;
-      target_assertion: Record<string, unknown>;
-      will_happen: string[];
-      will_not_happen: string[];
-      risks: string[];
-      stale_conditions: string[];
-      digest?: string;
-    }>;
-    target_assertion?: Record<string, unknown>;
-    will_happen?: string[];
-    will_not_happen?: string[];
-    risks?: string[];
-    stale_conditions?: string[];
-  };
-  confirmation_receipt?: WritingReceipt | null;
-  operation?: WritingDeliveryOperation | null;
-};
-
-export type WritingVersion = {
-  version_ref: string;
-  asset_ref: string;
-  version_number: number;
-  content_hash: string;
-  accepted_at: number;
-  integrity: string;
-  availability: string;
-  citation_status: "accepted" | "rejected";
-  citations: Array<{
-    citation_ref: string;
-    source_version_ref: string;
-    locator: string;
-    claim: string;
-    source_quote: string;
-  }>;
-  citation_feedback: string[];
-  deliverable_receipt: WritingReceipt;
-  citation_receipt: WritingReceipt;
-};
-
-export type WritingReportView = {
-  intent_id: string;
-  status: "draft" | "previewed" | "confirmed" | "running" | "paused" | "blocked" | "cancelled" | "completed";
-  document_type: WritingDocumentType;
-  draft_revision: number;
-  draft_hash: string;
-  intent: {
-    schema_ref: string;
-    title: string;
-    audience: string;
-    purpose: string;
-    instructions: string;
-  };
-  snapshot: {
-    snapshot_ref: string;
-    snapshot_hash: string;
-    quest_ref: string;
-    accepted_sources: Array<{ version_ref: string; [key: string]: unknown }>;
-    [key: string]: unknown;
-  };
-  impact_preview: null | {
-    preview_ref: string;
-    preview_hash: string;
-    status: string;
-    snapshot_hash: string;
-    target_assertion?: Record<string, unknown>;
-    owner_revisions?: Record<string, number>;
-    will_happen: string[];
-    will_not_happen: string[];
-    risks: string[];
-    stale_conditions: string[];
-  };
-  confirmation_receipt: WritingReceipt | null;
-  run: null | {
-    run_ref: string;
-    document_type: WritingDocumentType;
-    status: "active" | "paused" | "blocked" | "cancelled" | "completed";
-    attempt_ref: string;
-    attempt_generation: number;
-    content_revision: number;
-    root_session_ref: string;
-    native_session_ref: string | null;
-    fence_ref: string;
-    runtime_binding_hash: string;
-  };
-  execution: Record<string, unknown> & { status: string; receipt?: WritingReceipt | null };
-  deliverable: Record<string, unknown> & {
-    status: string;
-    version_ref?: string;
-    asset_ref?: string;
-    version_number?: number;
-    acceptance_status?: "accepted";
-    integrity?: string;
-    availability?: string;
-    failure?: null | { code: string };
-    receipt?: WritingReceipt;
-  };
-  citation: Record<string, unknown> & {
-    status: string;
-    feedback?: string[];
-    receipt?: WritingReceipt;
-  };
-  renderer: {
-    status: string;
-    reason?: { code: string };
-    default_format?: string;
-    formats?: string[];
-    artifact?: Record<string, unknown> & {
-      version_ref?: string;
-      content_hash?: string;
-      artifact_sha256?: string;
-    };
-  };
-  deliveries?: WritingDeliveryView[];
-  versions?: WritingVersion[];
-};
-
-export type WritingOverview = {
-  loaded?: boolean;
-  status: "ready";
-  document_types: WritingDocumentType[];
-  delivery_capabilities?: {
-    providers: WritingProviderCapability[];
-    renderers: Array<{
-      document_type: WritingDocumentType;
-      default_format: string;
-      formats: string[];
-    }>;
-  };
-  runs: WritingReportView[];
-};
-
-export type WritingComparison = {
-  run_ref: string;
-  left_version_ref: string;
-  right_version_ref: string;
-  content: {
-    changed: boolean;
-    left_hash: string;
-    right_hash: string;
-    unified_diff: string;
-  };
-  evidence: {
-    changed: boolean;
-    left_source_version_refs: string[];
-    right_source_version_refs: string[];
-    added_source_version_refs: string[];
-    removed_source_version_refs: string[];
-  };
-  citation: {
-    changed: boolean;
-    left_status: string;
-    right_status: string;
-    left_citations: WritingVersion["citations"];
-    right_citations: WritingVersion["citations"];
-    added_citation_refs: string[];
-    removed_citation_refs: string[];
-    changed_citations: Array<{
-      citation_ref: string;
-      left: WritingVersion["citations"][number];
-      right: WritingVersion["citations"][number];
-    }>;
-  };
-  snapshot: {
-    mode: "frozen";
-    snapshot_ref: string;
-    snapshot_hash: string;
-  };
-};
-
-export type WritingRender = {
-  version_ref: string;
-  render_hash: string;
-  content: string;
-};
-
-export type WritingVersionContent = {
-  version_ref: string;
-  content_hash: string;
-  citation_status: string;
-  formal_renderer: false;
-  content: string;
-};
-
-export type WritingCancellationPreview = {
-  intent_id: string;
-  draft_revision: number;
-  draft_hash: string;
-  impact_preview: null | {
-    preview_ref: string;
-    preview_hash: string;
-    will_happen: string[];
-    will_not_happen: string[];
-    risks: string[];
-    stale_conditions: string[];
-  };
+export type CompanionWritingRequest = {
+  document_type: "report" | "paper" | "presentation";
+  include_presentation: boolean;
+  task_scope: "full_document" | "outline" | "revision";
+  requirements: string;
+  materials: CompanionWritingMaterial[];
+  model: { kind: "current" } | { kind: "configured_api"; config_ref: string };
+  output_directory: string | null;
 };
 
 export type HarnessCapabilityState = {
@@ -2098,7 +1833,6 @@ export type PublicSnapshot = {
   reasoning_stage?: ReasoningStageProjection | null;
   autonomous_creation: AutonomousCreationProjection;
   quest_completion: QuestCompletionProjection;
-  writing: WritingOverview;
   harnesses: HarnessStatus;
   runtime_observability?: RuntimeObservability;
   unavailable: UnavailableCapability[];
@@ -2798,6 +2532,7 @@ export type HumanCapabilityAuthorization = {
 
 export type HumanCollaborationProjection = {
   companion: {
+    loaded?: boolean;
     status: "ready" | "unavailable";
     scope_ref?: string | null;
     session_ref: string | null;
@@ -3154,245 +2889,6 @@ export async function fetchTargetRawOutput(
   return (await response.json()) as TargetRawOutputPage;
 }
 
-export function fetchWriting(signal?: AbortSignal): Promise<WritingOverview> {
-  return readJson("/api/v1/writing", signal);
-}
-
-export function createWritingIntent(input: {
-  document_type?: WritingDocumentType;
-  quest_ref: string;
-  title: string;
-  audience: string;
-  purpose: string;
-  instructions: string;
-}): Promise<WritingReportView> {
-  return writeJson("/api/v1/writing/intents", "POST", input);
-}
-
-export function previewWritingIntent(intentId: string): Promise<WritingReportView> {
-  return writeJson(
-    `/api/v1/writing/intents/${encodeURIComponent(intentId)}/preview`,
-    "POST",
-    {},
-  );
-}
-
-export function confirmWritingIntent(
-  report: WritingReportView,
-): Promise<WritingReportView> {
-  if (!report.impact_preview) throw new ProductError("writing_preview_required");
-  return writeJson(
-    `/api/v1/writing/intents/${encodeURIComponent(report.intent_id)}/confirmation`,
-    "POST",
-    {
-      draft_revision: report.draft_revision,
-      draft_hash: report.draft_hash,
-      preview_ref: report.impact_preview.preview_ref,
-      preview_hash: report.impact_preview.preview_hash,
-    },
-  );
-}
-
-export function controlWritingRun(
-  runRef: string,
-  action: "pause" | "resume",
-  expectedAttemptRef: string,
-  expectedFenceRef: string,
-): Promise<WritingReportView> {
-  return writeJson(
-    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/control`,
-    "POST",
-    {
-      action,
-      expected_attempt_ref: expectedAttemptRef,
-      expected_fence_ref: expectedFenceRef,
-    },
-  );
-}
-
-export function previewWritingCancellation(
-  runRef: string,
-): Promise<WritingCancellationPreview> {
-  return writeJson(
-    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/cancellation-intents`,
-    "POST",
-    {},
-  );
-}
-
-export function confirmWritingCancellation(
-  runRef: string,
-  cancellation: WritingCancellationPreview,
-): Promise<WritingReportView> {
-  if (!cancellation.impact_preview) {
-    throw new ProductError("writing_cancel_preview_required");
-  }
-  return writeJson(
-    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/cancellation-intents/${encodeURIComponent(cancellation.intent_id)}/confirmation`,
-    "POST",
-    {
-      draft_revision: cancellation.draft_revision,
-      draft_hash: cancellation.draft_hash,
-      preview_ref: cancellation.impact_preview.preview_ref,
-      preview_hash: cancellation.impact_preview.preview_hash,
-    },
-  );
-}
-
-export function reviseWritingRun(
-  runRef: string,
-  feedback: string[],
-): Promise<WritingReportView> {
-  return writeJson(
-    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/revisions`,
-    "POST",
-    { feedback },
-  );
-}
-
-export function createWritingDeliveryIntent(
-  runRef: string,
-  input: {
-    action: WritingDeliveryPayload["action"];
-    provider_ref: string;
-    target: WritingDeliveryTarget;
-    output_format?: string;
-  },
-): Promise<WritingDeliveryView> {
-  return writeJson(
-    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/delivery-intents`,
-    "POST",
-    input,
-  );
-}
-
-export function previewWritingDeliveryIntent(
-  intentId: string,
-): Promise<WritingDeliveryView> {
-  return writeJson(
-    `/api/v1/writing/delivery-intents/${encodeURIComponent(intentId)}/preview`,
-    "POST",
-    {},
-  );
-}
-
-export function confirmWritingDeliveryIntent(
-  delivery: WritingDeliveryView,
-): Promise<WritingDeliveryView> {
-  const preview = delivery.impact_preview;
-  if (!preview) throw new ProductError("writing_delivery_preview_required");
-  return writeJson(
-    `/api/v1/writing/delivery-intents/${encodeURIComponent(delivery.intent_id)}/confirmation`,
-    "POST",
-    {
-      draft_revision: delivery.draft_revision,
-      draft_hash: delivery.draft_hash,
-      preview_ref: preview.preview_ref,
-      preview_hash: preview.preview_hash,
-    },
-  );
-}
-
-export function fetchWritingDeliveryOperation(
-  operationRef: string,
-  signal?: AbortSignal,
-): Promise<WritingDeliveryOperation> {
-  return readJson(
-    `/api/v1/writing/deliveries/${encodeURIComponent(operationRef)}`,
-    signal,
-  );
-}
-
-export function compareWritingVersions(
-  runRef: string,
-  leftVersionRef: string,
-  rightVersionRef: string,
-  signal?: AbortSignal,
-): Promise<WritingComparison> {
-  const parameters = new URLSearchParams({
-    left_version_ref: leftVersionRef,
-    right_version_ref: rightVersionRef,
-  });
-  return readJson(
-    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/compare?${parameters}`,
-    signal,
-  );
-}
-
-export function writingRenderUrl(
-  runRef: string,
-  versionRef?: string,
-  outputFormat?: string,
-): string {
-  const parameters = new URLSearchParams({ format: outputFormat ?? "markdown" });
-  if (versionRef) parameters.set("version_ref", versionRef);
-  return `/api/v1/writing/runs/${encodeURIComponent(runRef)}/render?${parameters}`;
-}
-
-export async function fetchWritingRender(
-  runRef: string,
-  versionRef?: string,
-  outputFormat?: string,
-  signal?: AbortSignal,
-): Promise<WritingRender> {
-  const response = await fetch(writingRenderUrl(runRef, versionRef, outputFormat), {
-    credentials: "same-origin",
-    headers: { Accept: "text/markdown" },
-    signal,
-  });
-  if (!response.ok) {
-    throw new ProductError(`writing_render_unavailable:${response.status}`);
-  }
-  const renderedVersion = response.headers.get("X-Writing-Version-Ref");
-  const renderHash = response.headers.get("X-Writing-Render-Hash");
-  if (!renderedVersion || !renderHash) {
-    throw new ProductError("writing_render_identity_missing");
-  }
-  return {
-    version_ref: renderedVersion,
-    render_hash: renderHash,
-    content: await response.text(),
-  };
-}
-
-export async function fetchWritingVersionContent(
-  runRef: string,
-  versionRef: string,
-  signal?: AbortSignal,
-): Promise<WritingVersionContent> {
-  const response = await fetch(
-    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/versions/`
-      + `${encodeURIComponent(versionRef)}/content`,
-    {
-      credentials: "same-origin",
-      headers: { Accept: "text/markdown" },
-      signal,
-    },
-  );
-  if (!response.ok) {
-    throw new ProductError(`writing_version_content_unavailable:${response.status}`);
-  }
-  const viewedVersion = response.headers.get("X-Writing-Version-Ref");
-  const contentHash = response.headers.get("X-Writing-Content-Hash");
-  const citationStatus = response.headers.get("X-Writing-Citation-Status");
-  const formalRenderer = response.headers.get("X-Writing-Formal-Renderer");
-  if (
-    !viewedVersion
-    || !contentHash
-    || !citationStatus
-    || formalRenderer !== "false"
-  ) {
-    throw new ProductError("writing_version_content_identity_missing");
-  }
-  return {
-    version_ref: viewedVersion,
-    content_hash: contentHash,
-    citation_status: citationStatus,
-    formal_renderer: false,
-    content: await response.text(),
-  };
-}
-
 export function fetchLiteratureSnapshot(
   snapshotRef: string,
   signal?: AbortSignal,
@@ -3546,12 +3042,30 @@ export function sendCompanionMessage(
   message: string,
   scopeRef?: string | null,
   viewContext?: CompanionViewContext | null,
+  writingRequest?: CompanionWritingRequest,
 ): Promise<Record<string, unknown>> {
   return writeJson("/api/v1/companion/messages", "POST", {
     ...(scopeRef ? { scope_ref: scopeRef } : {}),
     message,
     ...(viewContext ? { view_context: viewContext } : {}),
+    ...(writingRequest ? { writing_request: writingRequest } : {}),
   });
+}
+
+export type CompanionFile = {
+  workspace_ref: string;
+  path: string;
+  sha256: string;
+  bytes: number | null;
+  readable: boolean;
+  download_url: string;
+};
+
+export function fetchCompanionFiles(scopeRef: string, offset = 0, signal?: AbortSignal): Promise<{
+  files: CompanionFile[]; next_offset: number | null;
+}> {
+  const parameters = new URLSearchParams({ scope_ref: scopeRef, offset: String(offset), limit: "50" });
+  return readJson(`/api/v1/companion/files?${parameters}`, signal);
 }
 
 export function startNewCompanionSession(scopeRef: string): Promise<CompanionSessionSwitch> {

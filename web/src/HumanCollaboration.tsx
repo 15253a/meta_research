@@ -1,3 +1,4 @@
+import { CompanionFiles } from "./CompanionFiles";
 import { ServerMaterialPicker } from "./ServerMaterialPicker";
 import { useWorkMaterialDraft, WorkMaterialFields, WorkMaterialReferences, HumanRequestMaterialReferences } from "./WorkMaterialForm";
 import { currentMaterialReceiverPath, type ServerMaterialSelection } from "./workMaterialApi";
@@ -568,6 +569,7 @@ export function QuestCompanion({
         <code>{ready ? "可交流" : "暂不可用"}</code>
       </header>
       <CompanionSessionState companion={sessionSwitch.session} switching={sessionSwitch.switching} busy={sessionSwitch.busy} />
+      {ready && scopeRef && <CompanionFiles key={scopeRef} scopeRef={scopeRef} refreshKey={`${companion.native_session_generation}:${companion.messages.filter(message => message.role === "assistant" && message.status === "completed").map(message => message.message_ref).join(":")}`} />}
       <div ref={chatRef} className="lumen-chat" aria-live="polite">
         {questionContext ? (
           <article

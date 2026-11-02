@@ -1,8 +1,6 @@
 """Shared research tools do not grant helpers authority to evolve a Quest goal."""
 from __future__ import annotations
 
-from dataclasses import asdict
-
 import pytest
 from jsonschema import Draft202012Validator
 
@@ -20,12 +18,8 @@ from meta_research.runtime_conditions import read_runtime_conditions
 from meta_research.semantic_owner_gateway import ROOT_AGENT_SEMANTIC_OPERATION_IDS
 from test_public_human_collaboration_ladder import _CompanionRuntimeBinding
 from test_public_idea_stage import _DeterministicIdeaSkill
-from test_public_writing_report import (
-    _DeterministicDraftingAdapter,
-    _DeterministicProbe,
-    _DeterministicWritingSkill,
-    _admit_report,
-    _confirm_direct_quest,
+from test_public_idea_stage import (
+    _DeterministicDraftingAdapter, _DeterministicProbe, _confirm_direct_quest,
 )
 from test_research_datasets import _asset
 
@@ -151,7 +145,7 @@ def _assert_role_denies_goal_writes(runtime, root_kind, scope, arguments):
         runtime.harnesses.revoke_resident_mcp_channel(channel)
 
 
-@pytest.mark.parametrize("root_kind", ("companion", "writing"))
+@pytest.mark.parametrize("root_kind", ("companion",))
 def test_current_helper_grant_rejects_formal_goal_evolution(tmp_path, root_kind):
     companion = _CompanionWithGrantProbe()
     idea = _DeterministicIdeaSkill()
@@ -159,7 +153,6 @@ def test_current_helper_grant_rejects_formal_goal_evolution(tmp_path, root_kind)
         prepare_data_root(tmp_path / root_kind),
         proposal_drafter=companion, intent_drafting_provider=companion,
         host_compute_probe=_DeterministicProbe(), idea_skill_provider=idea,
-        writing_skill_provider=_DeterministicWritingSkill(),
         power_inhibitor=OperatorAttestedPowerInhibitor(),
         startup_power_probe=False, startup_harness_diagnostics=False,
     )
@@ -177,22 +170,15 @@ def test_current_helper_grant_rejects_formal_goal_evolution(tmp_path, root_kind)
             _assert_role_denies_goal_writes(runtime, root_kind, scope, arguments)
             observed.append(scope["run_ref"])
 
-        if root_kind == "companion":
-            companion.probe = probe
-            human = runtime.owners.human_collaboration
-            queued = human.send_companion_message(
-                f"quest:{quest_ref}", "Reconsider the current goal.", "helper-grant-message",
-            )
-            assert human.process_drafting_once()
-            assert observed == [queued["interaction_ref"]]
-            [turn] = human.query_companion(f"quest:{quest_ref}")["turns"]
-            assert turn["assistant_status"] == "completed"
-        else:
-            admitted = _admit_report(runtime, quest_ref, "helper-grant-writing")
-            run = runtime.owners.agent_runtime.query_writing_report(admitted["run"]["run_ref"])
-            assert run is not None
-            probe(asdict(run))
-            assert observed == [run.run_ref]
+        companion.probe = probe
+        human = runtime.owners.human_collaboration
+        queued = human.send_companion_message(
+            f"quest:{quest_ref}", "Reconsider the current goal.", "helper-grant-message",
+        )
+        assert human.process_drafting_once()
+        assert observed == [queued["interaction_ref"]]
+        [turn] = human.query_companion(f"quest:{quest_ref}")["turns"]
+        assert turn["assistant_status"] == "completed"
 
         assert graph.query_current_quest_goal_revision(quest_ref) == original
         assert canonical_hash(graph.query_current_quest_goal_revision(quest_ref)) == original_hash

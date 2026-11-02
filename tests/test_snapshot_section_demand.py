@@ -40,7 +40,6 @@ def test_omitted_section_contents_are_never_copied():
         value['research_assets'][key] = NotReturned()
     value['question_tree']['items'] = NotReturned()
     value['research_control']['recovery_records'] = NotReturned()
-    value['writing']['runs'] = NotReturned()
     result = select_snapshot_sections(value, include_assets=False, include_history=False)
     assert result['research_assets']['items'] == []
     assert result['question_tree']['loaded'] is False

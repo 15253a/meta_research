@@ -5,7 +5,7 @@ import stat
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.research_memory import AssetIntakeRequest
-from meta_research.research_content import _quest
+from meta_research.research_content import _quest, _reading_quest, _reader
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from sqlalchemy import text
 
@@ -63,7 +63,13 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
 
     def read(context, arguments, action):
         try:
-            quest = scope(context)
+            quest = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
+                human_collaboration=human_collaboration)
+            def status(asset_ref):
+                value = memory.query_asset_status(asset_ref)
+                history = value["history_reader"]
+                return {**value, "history_reader": {**history,
+                    "args": _reader(history["args"], arguments.get("source_quest_ref"))}}
             if action == "page":
                 offset, limit = arguments.get("offset", 0), arguments.get("limit", 20)
                 with memory._database.read() as connection:
@@ -84,9 +90,9 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     )
                 items = []
                 for asset_ref in refs[:limit]:
-                    lifecycle = memory.query_asset_status(asset_ref)
+                    lifecycle = status(asset_ref)
                     version_ref = lifecycle['version_ref']
-                    scope(context, version_ref)
+                    graph.verify_asset_quest_scope(version_ref, quest_ref=quest)
                     asset = memory.query_asset_version(version_ref)
                     lifecycle_state = lifecycle['state']
                     items.append(
@@ -104,13 +110,13 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     "next_offset": offset + limit if len(refs) > limit else None,
                 }
             version_ref = arguments["version_ref"]
-            scope(context, version_ref)
+            graph.verify_asset_quest_scope(version_ref, quest_ref=quest)
             asset = memory.query_asset_version(version_ref)
             if action == "lifecycle":
                 lifecycle = memory.query_asset_lifecycle(asset.asset_ref)
                 lifecycle["reference_revision"] = graph.query_asset_reference_revision()
                 return lifecycle
-            lifecycle = memory.query_asset_status(asset.asset_ref)
+            lifecycle = status(asset.asset_ref)
             current = memory.query_current_asset(asset.asset_ref)
             return {
                 "lifecycle": lifecycle,
@@ -271,10 +277,10 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
             SemanticOperation(
                 semantic_operation_id="research_memory.assets." + action,
                 owning_module="research_memory",
-                description="Discover and read this Quest's accepted asset lifecycle before registering material. Current selection is explicit. Exact historical content.read keeps original bytes and shows correction or retirement explanations.",
+                description="Discover and read accepted asset lifecycle. Companion may select source_quest_ref for another currently HC-authorized Quest; this does not authorize writes. Current selection is explicit. Exact historical content.read keeps original bytes and shows correction or retirement explanations.",
                 input_schema={
                     "type": "object",
-                    "properties": properties,
+                    "properties": {**properties, "source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256}},
                     "required": [] if action == "page" else ["version_ref"],
                     "additionalProperties": False,
                 },

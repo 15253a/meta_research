@@ -251,14 +251,14 @@ test("technical details expose only the runtime observability allowlist", async 
             attempt_ref: "active-attempt-secret",
             fence_ref: "active-fence-secret",
             operation_ref: "operation-secret",
-            effect_kind: "writing.generate",
+            effect_kind: "plan.generate",
             holder_ref: "active-holder-secret",
             raw_payload: "raw-payload-secret",
           }, {
             responsibility_ref: "duplicate-responsibility-secret",
             owner_scope: "agent_runtime",
             operation_ref: "duplicate-operation-secret",
-            effect_kind: "writing.generate",
+            effect_kind: "plan.generate",
           }, {
             responsibility_ref: "collaboration-responsibility-secret",
             owner_scope: "human_collaboration",
@@ -268,7 +268,7 @@ test("technical details expose only the runtime observability allowlist", async 
           durable_waiting: [{
             responsibility_ref: "waiting-responsibility-secret",
             operation_ref: "waiting-operation-secret",
-            effect_kind: "writing.generate",
+            effect_kind: "plan.generate",
             reason: {
               code: "power_inhibitor_acquisition_failed",
               raw: "waiting-raw-secret",
@@ -325,8 +325,8 @@ test("technical details expose only the runtime observability allowlist", async 
   const details = page.locator(".lumen-technical-details");
   await expect(details).toContainText("systemd-logind · unavailable · sleep");
   await expect(details).toContainText("power_inhibitor_release_failed");
-  await expect(details).toContainText("137 项未结责任 · 当前样本 3 · owners agent_runtime, human_collaboration · effects writing.generate, companion.reply");
-  await expect(details).toContainText("145 · 当前样本 2 · effects writing.generate, acquisition.fetch · reasons power_inhibitor_acquisition_failed, runtime_reconciliation_required");
+  await expect(details).toContainText("137 项未结责任 · 当前样本 3 · owners agent_runtime, human_collaboration · effects plan.generate, companion.reply");
+  await expect(details).toContainText("145 · 当前样本 2 · effects plan.generate, acquisition.fetch · reasons power_inhibitor_acquisition_failed, runtime_reconciliation_required");
   await expect(details).toContainText("173 · 当前样本 1 · kinds daemon · reasons daemon_restarted · reconciliation protected");
   await expect(details).toContainText("fresh · 8s");
   await expect(details).toContainText("opt-in · active");

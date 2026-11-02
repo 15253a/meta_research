@@ -6,6 +6,7 @@ from meta_research.stage_context_access import stage_context_operations
 from meta_research.root_workspace import workspace_operations
 from meta_research.work_materials import material_operations
 from meta_research.environment_operations import environment_operations
+from meta_research.literature_operations import literature_operations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -43,6 +44,7 @@ from meta_research.owners.agent_runtime import (
     AgentRuntimeInterface,
     BundleStageRun,
 )
+from meta_research.research_content import _reading_quest
 from meta_research.owners.common import (
     AcceptanceReceipt,
     OwnerConflict,
@@ -316,9 +318,10 @@ def create_semantic_owner_gateway(
                 research_graph, context, arguments
             ),
         ),
-        *_dataset_operations(research_graph, agent_runtime),
-        *environment_operations(research_graph, agent_runtime),
-        *_baseline_operations(research_graph, agent_runtime),
+        *_dataset_operations(research_graph, agent_runtime, human_collaboration),
+        *environment_operations(research_graph, agent_runtime, human_collaboration),
+        *literature_operations(research_graph, agent_runtime, human_collaboration),
+        *_baseline_operations(research_graph, agent_runtime, human_collaboration),
         *_root_agent_human_request_operations(
             agent_runtime=agent_runtime,
             research_memory=research_memory,
@@ -344,9 +347,9 @@ def create_semantic_owner_gateway(
         question_relation_operations,
     )
     operations.extend(question_relation_operations(
-        research_graph=research_graph, agent_runtime=agent_runtime))
+        research_graph=research_graph, agent_runtime=agent_runtime, human_collaboration=human_collaboration))
     operations.append(question_history_operations(
-        research_graph=research_graph, agent_runtime=agent_runtime))
+        research_graph=research_graph, agent_runtime=agent_runtime, human_collaboration=human_collaboration))
     if advancement_engine is not None:
         if research_memory is None:
             raise ValueError("formal semantic catalog requires research memory")
@@ -383,13 +386,18 @@ def create_semantic_owner_gateway(
         human_collaboration=human_collaboration, target_run_agent=target_run_agent))
     from meta_research.creation_basis import creation_basis_operations
     operations.extend(creation_basis_operations(research_memory, agent_runtime, human_collaboration))
+    from meta_research.writing_content import content_model_operation
+    operations.append(content_model_operation(agent_runtime))
     return SemanticMcpGateway(tuple(operations))
 
 
-def _baseline_operations(research_graph, agent_runtime):
+def _baseline_operations(research_graph, agent_runtime, human_collaboration=None):
     def read(context, arguments, *, page):
-        quest_ref = _dataset_scope(agent_runtime, context)["quest_ref"]
+        arguments = dict(arguments)
         try:
+            selected_quest = arguments.pop("source_quest_ref", None)
+            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=selected_quest,
+                human_collaboration=human_collaboration)
             if page:
                 return research_graph.query_baselines(**arguments, quest_ref=quest_ref)
             if "relation" not in arguments and any(key in arguments for key in (
@@ -400,6 +408,15 @@ def _baseline_operations(research_graph, agent_runtime):
                 reader = (research_graph.query_baseline_relations if "relation" in arguments
                           else research_graph.query_baseline_variants)
                 result["reusable_entities"] = reader(**arguments, quest_ref=quest_ref)
+                if selected_quest is not None:
+                    for item in result["reusable_entities"]["items"]:
+                        for record in (item, *item.get("runs", [])):
+                            descriptor = record.get("reader")
+                            if descriptor is not None:
+                                if "args" in descriptor:
+                                    descriptor["args"] = {**descriptor["args"], "source_quest_ref": selected_quest}
+                                else:
+                                    descriptor["source_quest_ref"] = selected_quest
             return {"status": "not_found" if result is None else "accepted", "result": result}
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
@@ -407,8 +424,8 @@ def _baseline_operations(research_graph, agent_runtime):
     return (
         SemanticOperation(
             semantic_operation_id="research_graph.baselines.page", owning_module="research_graph",
-            description="在当前 Quest 发现可复用的 Baseline 方法版本。query 匹配方法合同、Variant 配方、Evaluation 协议、真实 Run／Attempt 输入与结果说明及 Artifact 描述。文本或内容匹配只提供候选，由 Agent 明确选择；沿分页发现，再用选中的 baseline_ref 读取完整不可变方法合同及关联实体。",
-            input_schema={"type": "object", "properties": {
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 在当前 Quest 发现可复用的 Baseline 方法版本。query 匹配方法合同、Variant 配方、Evaluation 协议、真实 Run／Attempt 输入与结果说明及 Artifact 描述。文本或内容匹配只提供候选，由 Agent 明确选择；沿分页发现，再用选中的 baseline_ref 读取完整不可变方法合同及关联实体。",
+            input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256),
                 "query": {"type": "string", "maxLength": 1024},
                 "method_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -418,8 +435,8 @@ def _baseline_operations(research_graph, agent_runtime):
             handler=lambda context, arguments: read(context, arguments, page=True)),
         SemanticOperation(
             semantic_operation_id="research_graph.baselines.read", owning_module="research_graph",
-            description="读取当前 Quest 内一个精确 Baseline 方法版本，并用 variant_ref、offset 和 limit 按需展开关联实体。Bundle 在初始 Target 候选的 measurement_contract.baseline_forward_contract 中声明复用；Target 在 formal_runs 的 baseline_forward_contract 中引用实际 Baseline，或用 variant_ref 复用精确 Variant，遵循正式工作交接契约。relation 可独立选择 variants/runs/evaluations/attempts/metrics/artifacts；更深 ref 过滤须提供 relation。按返回 reader.operation/args 准确读取。以 next_offset 和 query_revision 续页，保持过滤与limit；缺修订 research_query_revision_required，范围或Owner记录变化 research_query_changed 后从0重开。result_state 区分 matches/page_pending/no_match/no_records/exhausted，scan_complete 只说明本查询扫描结束。每次实际工作的数据和证据另行绑定。",
-            input_schema={"type": "object", "properties": {"baseline_ref": _string(max_length=1024),
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 内一个精确 Baseline 方法版本，并用 variant_ref、offset 和 limit 按需展开关联实体。Bundle 在初始 Target 候选的 measurement_contract.baseline_forward_contract 中声明复用；Target 在 formal_runs 的 baseline_forward_contract 中引用实际 Baseline，或用 variant_ref 复用精确 Variant，遵循正式工作交接契约。relation 可独立选择 variants/runs/evaluations/attempts/metrics/artifacts；更深 ref 过滤须提供 relation。按返回 reader.operation/args 准确读取。以 next_offset 和 query_revision 续页，保持过滤与limit；缺修订 research_query_revision_required，范围或Owner记录变化 research_query_changed 后从0重开。result_state 区分 matches/page_pending/no_match/no_records/exhausted，scan_complete 只说明本查询扫描结束。每次实际工作的数据和证据另行绑定。",
+            input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "baseline_ref": _string(max_length=1024),
                 "variant_ref": _string(max_length=1024),
                 "variant_run_ref": _string(max_length=1024),
                 "evaluation_ref": _string(max_length=1024),
@@ -433,11 +450,11 @@ def _baseline_operations(research_graph, agent_runtime):
             handler=lambda context, arguments: read(context, arguments, page=False)),
         SemanticOperation(
             semantic_operation_id="research_graph.target_formal_results.read", owning_module="research_graph",
-            description="读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding 和当前 RG 生产归属；候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
-            input_schema={"type": "object", "properties": {"target_ref": _string(max_length=1024)},
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding 和当前 RG 生产归属；候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
+            input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "target_ref": _string(max_length=1024)},
                 "required": ["target_ref"], "additionalProperties": False},
             output_schema={"type": "object"},
-            handler=lambda context, arguments: _formal_results_read(research_graph, agent_runtime, context, arguments)),
+            handler=lambda context, arguments: _formal_results_read(research_graph, agent_runtime, context, arguments, human_collaboration)),
         SemanticOperation(
             semantic_operation_id="research_graph.artifact_roles.adjust", owning_module="research_graph",
             description="Correct the current attribution of one retained research artifact: move its owning run or assessment with a short reason. The exact content version, receipts and historical references stay unchanged; no new run, attempt or approval flow is created.",
@@ -464,11 +481,11 @@ def _baseline_operations(research_graph, agent_runtime):
                 research_graph, agent_runtime, context, arguments)),
         SemanticOperation(
             semantic_operation_id="research_graph.formal_results.read", owning_module="research_graph",
-            description="Read one exact formal result by its bare ref (variant_run_, evaluation_attempt_ or metric_result_ prefix, including target-root refs) with its verified lineage: a metric result resolves to its evaluation attempt and variant run, a variant run to its Target context. Uses the same receipt-verified reads as target_formal_results.read.",
-            input_schema={"type": "object", "properties": {"ref": _string(max_length=1024)},
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. Read one exact formal result by its bare ref (variant_run_, evaluation_attempt_ or metric_result_ prefix, including target-root refs) with its verified lineage: a metric result resolves to its evaluation attempt and variant run, a variant run to its Target context. Uses the same receipt-verified reads as target_formal_results.read.",
+            input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "ref": _string(max_length=1024)},
                 "required": ["ref"], "additionalProperties": False},
             output_schema={"type": "object"},
-            handler=lambda context, arguments: _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments)),
+            handler=lambda context, arguments: _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments, human_collaboration)),
     )
 
 
@@ -501,21 +518,19 @@ def _artifact_role_adjust_reconcile(research_graph, agent_runtime, context, argu
     return {"status": "not_found" if result is None else "accepted", "result": result}
 
 
-def _formal_results_read(research_graph, agent_runtime, context, arguments):
-    scope = _dataset_scope(agent_runtime, context)
+def _formal_results_read(research_graph, agent_runtime, context, arguments, human_collaboration=None):
     try:
-        return research_graph.query_target_result_handoff(
-            arguments["target_ref"], quest_ref=scope["quest_ref"])
+        quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
+            human_collaboration=human_collaboration)
+        return research_graph.query_target_result_handoff(arguments["target_ref"], quest_ref=quest_ref)
     except OwnerConflict as error:
         raise SemanticMcpError(error.code) from error
 
 
-def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments):
-    scope = _dataset_scope(agent_runtime, context)
-    quest_ref = scope.get("quest_ref") if isinstance(scope, dict) else None
-    if not isinstance(quest_ref, str) or not quest_ref:
-        raise SemanticMcpError("formal_result_quest_scope_required")
+def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments, human_collaboration=None):
     try:
+        quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
+            human_collaboration=human_collaboration)
         result = research_graph.query_formal_result_by_ref(
             arguments["ref"], quest_ref=quest_ref)
     except OwnerConflict as error:
@@ -523,7 +538,7 @@ def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments
     return {"status": "not_found" if result is None else "accepted", "result": result}
 
 
-def _dataset_operations(research_graph, agent_runtime):
+def _dataset_operations(research_graph, agent_runtime, human_collaboration=None):
     """Global discovery and scope-bound semantic effects; RM owns every byte."""
     common = {"effect_id": _string(max_length=128), "notes": {"type": "string"}}
     payloads = {
@@ -575,8 +590,8 @@ def _dataset_operations(research_graph, agent_runtime):
     result.extend((
         SemanticOperation(
             semantic_operation_id="research_graph.datasets.page", owning_module="research_graph",
-            description="分页发现当前 Quest 使用的 Dataset。每次选择一种模式：query 搜索语义身份、dataset_ref 列精确版本、question_ref 列研究用途，或 dataset_version_ref 列派生关系；各模式分别调用。direction 仅用于派生模式：sources 查该版本的输入，derived 查下游数据，默认 both。以 next_offset/query_revision 续页，保持查询与limit；research_query_changed 后从0重开，缺修订返回 research_query_revision_required。result_state/scan_complete 区分空结果与扫描结束。保留 notes 和 metadata；发现记录仍须经正式证据和执行输入绑定才能采用。",
-            input_schema={"type": "object", "properties": {
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 分页发现当前 Quest 使用的 Dataset。每次选择一种模式：query 搜索语义身份、dataset_ref 列精确版本、question_ref 列研究用途，或 dataset_version_ref 列派生关系；各模式分别调用。direction 仅用于派生模式：sources 查该版本的输入，derived 查下游数据，默认 both。以 next_offset/query_revision 续页，保持查询与limit；research_query_changed 后从0重开，缺修订返回 research_query_revision_required。result_state/scan_complete 区分空结果与扫描结束。保留 notes 和 metadata；发现记录仍须经正式证据和执行输入绑定才能采用。",
+            input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256),
                 "query": {"type": "string", "maxLength": 1024}, "dataset_ref": _string(max_length=1024),
                 "question_ref": _string(max_length=1024), "dataset_version_ref": _string(max_length=1024),
                 "direction": {"type": "string", "enum": ["sources", "derived", "both"]},
@@ -584,15 +599,15 @@ def _dataset_operations(research_graph, agent_runtime):
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
                 "additionalProperties": False}, output_schema={"type": "object"},
-            handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=True)),
+            handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=True, human_collaboration=human_collaboration)),
         SemanticOperation(
             semantic_operation_id="research_graph.datasets.read", owning_module="research_graph",
-            description="Read one exact Dataset identity, DatasetVersion, usage reference or derivation edge, including meaning, notes, exact RM bindings or processing provenance. Supply exactly one of dataset_ref, dataset_version_ref, dataset_reference_ref and dataset_derivation_ref.",
-            input_schema={"type": "object", "properties": {
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. Read one exact Dataset identity, DatasetVersion, usage reference or derivation edge, including meaning, notes, exact RM bindings or processing provenance. Supply exactly one of dataset_ref, dataset_version_ref, dataset_reference_ref and dataset_derivation_ref.",
+            input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256),
                 "dataset_ref": _string(max_length=1024), "dataset_version_ref": _string(max_length=1024),
                 "dataset_reference_ref": _string(max_length=1024), "dataset_derivation_ref": _string(max_length=1024)},
                 "additionalProperties": False}, output_schema={"type": "object"},
-            handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=False)),
+            handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=False, human_collaboration=human_collaboration)),
     ))
     return tuple(result)
 
@@ -644,8 +659,13 @@ def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *
     return {"status": "accepted", "result": result}
 
 
-def _dataset_read(research_graph, agent_runtime, context, arguments, *, page):
-    quest_ref = _dataset_scope(agent_runtime, context)["quest_ref"]
+def _dataset_read(research_graph, agent_runtime, context, arguments, *, page, human_collaboration=None):
+    arguments = dict(arguments)
+    try:
+        quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.pop("source_quest_ref", None),
+            human_collaboration=human_collaboration)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
     if page:
         return research_graph.query_datasets(**arguments, quest_ref=quest_ref)
     if len(arguments) != 1:
@@ -1819,7 +1839,18 @@ def _root_human_request_operation_binding(
     if context.root_kind is None:
         raise SemanticMcpError("root_agent_human_request_effect_unauthorized")
     quest_ref = scope.get("quest_ref")
-    if not isinstance(quest_ref, str) or not quest_ref:
+    initialized_deepfetch = (
+        context.root_kind == "deepfetch"
+        and scope.get("run_kind") == "deepfetch"
+        and isinstance(scope.get("initialization_id"), str)
+        and bool(scope["initialization_id"])
+        and isinstance(scope.get("acquisition_session_ref"), str)
+        and bool(scope["acquisition_session_ref"])
+    )
+    pre_quest = quest_ref is None and (
+        context.root_kind == "acquisition" or initialized_deepfetch
+    )
+    if not pre_quest and (not isinstance(quest_ref, str) or not quest_ref):
         raise SemanticMcpError("root_agent_human_request_scope_invalid")
     return {
         "quest_ref": quest_ref,
@@ -2937,7 +2968,7 @@ def _workspace_reply_schema() -> dict[str, object]:
 def _root_human_request_output_schema() -> dict[str, object]:
     operation_binding = _closed_object(
         {
-            "quest_ref": _string(max_length=256),
+            "quest_ref": {"type": ["string", "null"], "maxLength": 256},
             "task_ref": _string(max_length=256),
             "root_session_ref": _string(max_length=256),
             "operation_id": _string(
