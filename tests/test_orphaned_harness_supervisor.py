@@ -228,7 +228,7 @@ def test_two_unknown_reconciliations_finish_then_owner_admits_next_turn(tmp_path
             if generation:
                 assert owner.begin_reconciliation(operation_ref) == generation
             with pytest.raises(HarnessAdmissionError) as failure:
-                runtime._invoke_provider_turn(admission, request, prompt='Retain exact Target input.', mcp_base_url='http://127.0.0.1:8999', operation_ref=operation_ref, resume=False, reconciling=generation > 0, reconciliation_generation=generation)
+                runtime._invoke_provider_turn(admission, request, prompt='Retain exact Target input.', mcp_base_url='http://127.0.0.1:8999', operation_ref=operation_ref, owner_invocation_hash='f' * 64, resume=False, reconciling=generation > 0, reconciliation_generation=generation)
             assert failure.value.code == ('provider_outcome_unknown' if generation < 2 else 'provider_stopped')
             latest = owner.latest_operation(run.run_ref)
             assert latest.status == ('unknown_outcome' if generation < 2 else 'failed')

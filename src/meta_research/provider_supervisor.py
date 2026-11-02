@@ -1703,22 +1703,34 @@ def _supervise_locked(
     invocation_codex_home: Path | None = None
     result_read_fd: int | None = None
     result_write_fd: int | None = None
-    if selected_platform == "posix":
-        result_read_fd, result_write_fd = os.pipe()
-        provider_argv = provider_result_argv(
-            argv,
-            platform_name=selected_platform,
-            result_write_fd=result_write_fd,
-        )
-    elif selected_platform == "nt":
-        provider_argv = provider_result_argv(
-            argv,
-            platform_name=selected_platform,
-            result_path=result_temporary,
-        )
-    else:
-        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+    process: subprocess.Popen[bytes] | None = None
+    stdout_drainer: threading.Thread | None = None
+    result_drainer: threading.Thread | None = None
+    result_source = None
+
+    def close_result_pipe() -> None:
+        nonlocal result_read_fd, result_write_fd
+        _close_descriptors(result_read_fd, result_write_fd)
+        result_read_fd = result_write_fd = None
+
     with ExitStack() as stack:
+        # Cover setup failures too, before any stream or reader owns these FDs.
+        stack.callback(close_result_pipe)
+        if selected_platform == "posix":
+            result_read_fd, result_write_fd = os.pipe()
+            provider_argv = provider_result_argv(
+                argv,
+                platform_name=selected_platform,
+                result_write_fd=result_write_fd,
+            )
+        elif selected_platform == "nt":
+            provider_argv = provider_result_argv(
+                argv,
+                platform_name=selected_platform,
+                result_path=result_temporary,
+            )
+        else:
+            raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
         provider_job: ProviderProcessJob | None = None
         if selected_platform == "nt":
             provider_job = (
@@ -1736,9 +1748,40 @@ def _supervise_locked(
             if selected_platform == "posix"
             else None
         )
+        def finish_capture(exc_type, _error, _traceback) -> None:
+            if exc_type is not None and process is not None:
+                # A cleanup error must not leave the supervisor waiting forever,
+                # nor turn an unconfirmed provider outcome into an exit receipt.
+                try:
+                    _terminate_provider(
+                        process,
+                        process_platform=process_platform,
+                        provider_job=provider_job,
+                    )
+                    if provider_job is None:
+                        process_platform.terminate_process_group(process.pid)
+                except (OSError, ProviderSupervisorError, subprocess.SubprocessError):
+                    pass  # Preserve the original error and the unsealed spool.
+            close_result_pipe()
+            for drainer in (stdout_drainer, result_drainer):
+                if drainer is not None and drainer.ident is not None:
+                    drainer.join(timeout=1.0)
+            if result_source is not None and (
+                result_drainer is None or result_drainer.ident is None
+            ):
+                result_source.close()
+            if process is not None and process.stdout is not None and (
+                stdout_drainer is None or stdout_drainer.ident is None
+            ):
+                process.stdout.close()
+
+        # Run before ExitStack closes the destination files. A surviving external
+        # writer can still prevent EOF: daemon readers are only an error-path
+        # fallback; the normal path below requires both readers to finish.
+        stack.push(finish_capture)
         if stop_requested():
             termination_reason = "stopped"
-            _close_descriptors(result_read_fd, result_write_fd)
+            close_result_pipe()
         else:
             try:
                 operation_path = (
@@ -1768,7 +1811,7 @@ def _supervise_locked(
                     else subprocess.Popen(provider_argv, **spawn_options)
                 )
             except OSError:
-                _close_descriptors(result_read_fd, result_write_fd)
+                close_result_pipe()
                 termination_reason = "launch_failed"
                 returncode = 127
             else:
@@ -1783,6 +1826,7 @@ def _supervise_locked(
                 )
                 assert process.stdout is not None
                 stdout_drainer = threading.Thread(
+                    daemon=True,
                     target=_bounded_stdout_drain,
                     args=(
                         process.stdout,
@@ -1792,18 +1836,22 @@ def _supervise_locked(
                         stdout_errors,
                     ),
                 )
+                if result_read_fd is not None:
+                    result_source = os.fdopen(result_read_fd, "rb", buffering=0)
+                    result_read_fd = None  # Ownership transferred to the reader.
                 result_drainer = (
                     threading.Thread(
+                        daemon=True,
                         target=_bounded_stdout_drain,
                         args=(
-                            os.fdopen(result_read_fd, "rb", buffering=0),
+                            result_source,
                             result_stream,
                             result_max_bytes,
                             result_exceeded,
                             result_errors,
                         ),
                     )
-                    if result_read_fd is not None and result_stream is not None
+                    if result_source is not None and result_stream is not None
                     else None
                 )
                 stdout_drainer.start()
@@ -1867,7 +1915,7 @@ def _supervise_locked(
                         raise ProviderSupervisorError(
                             "provider_descendant_cleanup_failed"
                         )
-                _close_descriptors(result_write_fd)
+                close_result_pipe()
                 stdout_drainer.join(timeout=1.0)
                 if result_drainer is not None:
                     result_drainer.join(timeout=1.0)
