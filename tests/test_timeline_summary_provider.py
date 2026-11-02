@@ -329,3 +329,40 @@ def test_source_pages_pin_one_successful_read_for_this_binding_and_grant():
         runner.token = access.token
         assert "bbbb" in page(0)["text"]
         assert owner_reads == 4
+
+
+def test_adapter_validates_shared_ref_against_each_nodes_exact_binding(tmp_path):
+    cycle = node("cycle:cycle-1", "cycle", ["judgment"])
+    cycle["sources"][0]["binding"]["version"] = 2
+    request = job()
+    request["nodes"] = [node(STAGE, "stage", ["judgment"]), cycle]
+    value = output()
+    judgment = value["summaries"][1]
+    progress = dict(judgment, node_key=cycle["node_key"], summary_kind="process", summary="正在核对新增队列的数据。")
+    value["summaries"] = [judgment, progress]
+    runner = RecorderRunner(value)
+    runner.reads = [(STAGE, "judgment"), (cycle["node_key"], "judgment")]
+    runner.sources.read_source = lambda quest, n, ref: (
+        CLAIM if n["sources"][0]["binding"]["version"] == 1 else {"stage": "reasoning", "status": "pending"}
+    )
+
+    assert adapter(tmp_path, runner).summarize(**request)[0] == [judgment, progress]
+    progress["summary_kind"] = "accepted_conclusion"
+    with pytest.raises(DraftingUnavailable, match="output_invalid"):
+        adapter(tmp_path / "wrong-version", runner).summarize(**request)
+
+
+def test_recorder_releases_its_job_scope_even_if_gateway_cleanup_raises(monkeypatch):
+    runner = RecorderRunner()
+
+    def fail_cleanup(_token):
+        raise RuntimeError("injected cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner.channels.gateway, "revoke_channel", fail_cleanup)
+        with pytest.raises(RuntimeError, match="injected cleanup failure"):
+            with runner.channels.grant("job-1", job(), None) as old:
+                assert runner.channels.is_current(old.token)
+    assert not runner.channels.is_current(old.token)
+    with runner.channels.grant("job-2", job(), None) as new:
+        assert runner.channels.is_current(new.token)

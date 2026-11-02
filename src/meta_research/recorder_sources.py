@@ -81,8 +81,8 @@ class RecorderChannels:
         try:
             yield connection
         finally:
-            self.gateway.revoke_channel(connection.token)
             self._active = None
+            self.gateway.revoke_channel(connection.token)
 
     def is_current(self, token):
         active = self._active

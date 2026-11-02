@@ -261,8 +261,10 @@ def _validate(raw, basis, bodies, native):
     read = {}
     for (key, ref), body in bodies.items():
         source = next(s for s in nodes[key]["sources"] if s["ref"] == ref)
-        if ref not in read or body is not None:
-            read[ref] = (source["binding"], body)
+        identity = (ref, canonical_hash(source["binding"]))
+        if identity not in read or body is not None:
+            read[identity] = body
+    read_refs = {ref for ref, _ in read}
     for row in rows:
         if not isinstance(row, dict) or set(row) != _OUTPUT_KEYS:
             raise invalid()
@@ -271,7 +273,7 @@ def _validate(raw, basis, bodies, native):
             raise invalid()
         node = nodes[key]
         kind, refs, sentence = row["summary_kind"], row["source_refs"], row["summary"]
-        allowed = {s["ref"] for s in node["sources"]}
+        allowed = {s["ref"]: s["binding"] for s in node["sources"]}
         if (
             not refs
             and kind != "insufficient_evidence"
@@ -292,15 +294,15 @@ def _validate(raw, basis, bodies, native):
         ):
             raise invalid()
         available = {
-            s["ref"]: read[s["ref"]][1]
-            for s in node["sources"]
-            if s["ref"] in read and read[s["ref"]][0] == s["binding"]
+            ref: read[identity]
+            for ref, binding in allowed.items()
+            if ref in read_refs and (identity := (ref, canonical_hash(binding))) in read
         }
         stage = available.get(key)
         if (
             node["kind"] == "stage"
             and stage
-            and read[key][0].get("kind") == "stage"
+            and allowed[key].get("kind") == "stage"
             and stage.get("stage") == node["stage"]
             and stage.get("artifacts") == []
             and "current" in stage
@@ -319,9 +321,9 @@ def _validate(raw, basis, bodies, native):
             if kind == "accepted_conclusion":
                 eligible = node["kind"] == "cycle" or node["kind"] == "stage" and node["stage"] == "reasoning"
                 if not eligible or not any(
-                    read[ref][0].get("kind") == "artifact"
-                    and read[ref][0].get("stage") == "reasoning"
-                    and read[ref][0].get("cycle_ref") == node["cycle_ref"]
+                    allowed[ref].get("kind") == "artifact"
+                    and allowed[ref].get("stage") == "reasoning"
+                    and allowed[ref].get("cycle_ref") == node["cycle_ref"]
                     and _supports_conclusion(available[ref] or {}, refs)
                     for ref in refs
                 ):
