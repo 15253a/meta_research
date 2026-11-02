@@ -155,3 +155,29 @@ def test_managed_paths_win_and_provided_only_keeps_strict_exec_isolation(tmp_pat
     assert observed['tmp'] == root.codex_environment['TMPDIR']
     assert observed['forbidden'] == []
     assert observed['proxy_present'] and observed['node_ran'] and observed['python_ran']
+
+
+def test_final_creation_environment_replaces_host_policy_without_secret_or_empty_fallback(monkeypatch):
+    import tomllib
+    from meta_research.quest_drafting import protected_codex_shell_arguments
+    monkeypatch.setenv('HOME', '/host/managed-home')
+    monkeypatch.setenv('PATH', '/host/node:/host/python')
+    first = protected_codex_shell_arguments(['codex', 'exec', '-'], object())
+    jail = {'HOME': '/home/creation', 'TMPDIR': '/tmp', 'PATH': '/bin:/python/bin',
+        'PYTHONHOME': '/python', 'PYTHONPATH': '', 'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
+        'META_RESEARCH_MCP_TOKEN': 'private-bearer', 'WRITING_API_KEY': 'private-writing',
+        'HTTP_PROXY': 'http://private:credential@proxy.invalid:9'}
+    final = protected_codex_shell_arguments(first, environment=jail)
+    policy = {}
+    for previous, value in zip(final, final[1:]):
+        if previous == '--config' and value.startswith('shell_environment_policy.'):
+            item = tomllib.loads(value)['shell_environment_policy']
+            assert not policy.keys() & item.keys(), 'Previous host policy must not survive as a second override'
+            policy.update(item)
+    assert policy['set'] == {name: value for name, value in jail.items()
+                             if name not in {'META_RESEARCH_MCP_TOKEN', 'WRITING_API_KEY', 'HTTP_PROXY'}}
+    assert all(name in policy['include_only'] for name in ('PYTHONHOME', 'PYTHONNOUSERSITE', 'PYTHONDONTWRITEBYTECODE'))
+    assert not {'META_RESEARCH_MCP_TOKEN', 'WRITING_API_KEY'} & set(policy['include_only'])
+    assert '/host/' not in json.dumps(final) and 'private:' not in json.dumps(final)
+    empty = protected_codex_shell_arguments(first, environment={})
+    assert '/host/' not in json.dumps(empty)

@@ -605,6 +605,9 @@ class ProtectedCreationRuntime:
             "XDG_STATE_HOME": "/home/creation/.local/state", "XDG_CACHE_HOME": "/cache",
             "PIP_CACHE_DIR": "/cache/pip", "npm_config_cache": "/cache/npm", "UV_CACHE_DIR": "/cache/uv",
             "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp", "SQLITE_TMPDIR": "/tmp"})
+        if len(arguments) > 1 and arguments[1] == "exec":
+            from meta_research.quest_drafting import protected_codex_shell_arguments
+            arguments = protected_codex_shell_arguments(arguments, environment=environment)
         return arguments, environment, outputs, _mapped(call.prompt, mappings, self.work_directory)
 
     def _publish_output(self, source: Path, destination: Path) -> None:
