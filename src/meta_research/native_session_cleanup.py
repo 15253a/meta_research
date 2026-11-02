@@ -375,9 +375,12 @@ class NativeSessionCleanup:
                     retired = [r[0] for r in db.execute("""
                         SELECT DISTINCT j.native_session_ref FROM jobs j WHERE j.native_session_ref IS NOT NULL
                           AND j.status IN ('completed','failed')
-                          AND NOT EXISTS (SELECT 1 FROM quests q WHERE q.native_session_ref=j.native_session_ref)
-                          AND NOT EXISTS (SELECT 1 FROM jobs a WHERE a.status IN ('active','failed')
-                            AND json_extract(a.request_json,'$.native_session_ref')=j.native_session_ref)
+                          AND j.native_session_ref NOT IN (
+                            SELECT native_session_ref FROM quests WHERE native_session_ref IS NOT NULL
+                            UNION ALL
+                            SELECT json_extract(request_json,'$.native_session_ref') FROM jobs
+                             WHERE status IN ('active','failed') AND json_type(request_json,'$.native_session_ref')='text'
+                          )
                         ORDER BY 1 LIMIT ? OFFSET ?""", (limit, offset))]
                     self.offsets["recorder"] = offset + len(retired) if len(retired) == limit else 0
                     return reclaim(ids | set(retired))
