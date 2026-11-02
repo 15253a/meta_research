@@ -1,6 +1,7 @@
 """Reclaim only Owner-bound terminal work in this deployment's managed Codex home."""
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from sqlalchemy import bindparam, text
 
 from meta_research.owners.common import canonical_hash
 from meta_research.stage_session_retirement import retired_stage_ids
+from meta_research.target_session_retirement import replaced_target_sessions
 from meta_research.provider_supervisor import (ProviderSupervisorError, read_transport_envelope,
     read_transport_key_for_operation, SUPERVISOR_EXIT_SCHEMA, SUPERVISOR_EXIT_SCHEMA_V2)
 
@@ -31,7 +33,7 @@ def _uuid(value):
 _NATIVE_DELETE_BATCH_SECONDS = 2.0
 
 
-def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_paths=()):
+def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_paths=(), cursors=None):
     """Look up all candidate IDs together. Codex owns deletion of its associated metadata."""
     ids = {ref for ref in native_ids if _uuid(ref)}
     if not ids:
@@ -98,6 +100,11 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
         except (ValueError, KeyError, AttributeError, TypeError, OSError):
             continue
 
+    # Resume after the last CLI attempt in this batch, not after the last row
+    # we merely reported as deferred. Other pages and dry-runs do not move it.
+    batch = canonical_hash(sorted(ids)) if cursors is not None else None
+    after = cursors.get(batch, "") if cursors is not None else ""
+    last_attempted = None
     deadline = time.monotonic() + _NATIVE_DELETE_BATCH_SECONDS
     cleared = set()
     while planned:
@@ -106,7 +113,7 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
             for _, record in planned.values():
                 record["reason"] = "dependent_native_child"
             break
-        for ref in leaves:
+        for ref in sorted(leaves, key=lambda ref: (ref <= after, ref)):
             path, record = planned.pop(ref)
             try:
                 size = path.stat().st_size
@@ -130,6 +137,7 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
                     if remaining <= 0:
                         record["reason"] = "native_cleanup_deferred"
                         continue
+                    last_attempted = ref
                     subprocess.run([executable, "delete", "--force", ref], check=True,
                                    cwd=root.root, env={**os.environ, **root.codex_environment},
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -154,58 +162,18 @@ def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_pa
                         record.update(bytes=size, action="removed", reason="retired_native_session")
             except (OSError, sqlite3.Error, subprocess.SubprocessError):
                 record["reason"] = "native_delete_unavailable"
+    if cursors is not None and not dry_run:
+        cursors.pop(batch, None)
+        if last_attempted and any(r["reason"] == "native_cleanup_deferred" for r in reports):
+            cursors[batch] = last_attempted
+            if len(cursors) > 256:
+                cursors.popitem(last=False)
     return reports
 
 
 def _query_runs(connection, sql, work):
     return connection.execute(text(sql).bindparams(bindparam("runs", expanding=True)),
                               {"runs": tuple(work)})
-
-
-def _replaced_target_sessions(connection, work, target_agent):
-    # Read one representative event for each unambiguous native identity, only
-    # for operations of the eligible runs. The AR workspace lease supplies the
-    # authoritative attempt, root and fence of the old generation.
-    from meta_research.owners.common import OwnerConflict
-    from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError, _validated_target_root_event
-    ids = set()
-    targets = {run for run, kind in work.items() if kind == "target"}
-    if not targets:
-        return ids
-    for row in _query_runs(connection, """
-        WITH bindings AS (
-            SELECT p.run_ref, e.event_ref, e.sequence, e.summary_json, e.summary_hash,
-                json_extract(e.summary_json, '$.target_root_observation.scope') AS scope,
-                json_extract(e.summary_json, '$.target_root_observation.root_native_session_ref') AS native
-            FROM ar_harness_evidence_events e JOIN ar_harness_provider_operations p USING(operation_ref)
-            JOIN ar_harness_runs h ON h.run_ref=p.run_ref AND h.harness_family='codex'
-            WHERE p.run_ref IN :runs AND p.status IN ('executed','failed')
-              AND json_type(e.summary_json, '$.target_root_observation')='object'
-            GROUP BY p.operation_ref
-            HAVING count(json_extract(e.summary_json, '$.target_root_observation.scope'))=count(*)
-               AND count(json_extract(e.summary_json, '$.target_root_observation.root_native_session_ref'))=count(*)
-               AND count(DISTINCT json_extract(e.summary_json, '$.target_root_observation.scope'))=1
-               AND count(DISTINCT json_extract(e.summary_json, '$.target_root_observation.root_native_session_ref'))=1
-        )
-        SELECT b.*, w.*
-        FROM bindings b JOIN ar_target_run_workspaces w
-          ON w.target_run_ref=b.run_ref AND w.root_session_ref=json_extract(b.scope,'$.root_session_ref')
-           AND w.target_attempt_ref=json_extract(b.scope,'$.attempt_ref')
-           AND w.target_fence_ref=json_extract(b.scope,'$.fence_ref')
-        """, targets):
-        try:
-            target_agent._stored_target_workspace(row, require_current=False)
-            scope = json.loads(row.scope)
-            if (scope.get("target_run_ref") != row.run_ref or type(scope.get("attempt_generation")) is not int
-                    or scope["attempt_generation"] < 1 or scope.get("target_workspace_ref") not in (None, row.workspace_ref)):
-                continue
-            event = _validated_target_root_event(json.loads(row.summary_json),
-                expected_scope=scope, expected_native_session_ref=row.native)
-            if event[:4] == (row.event_ref, row.sequence, row.summary_json, row.summary_hash):
-                ids.add(row.native)
-        except (AgentRuntimeHarnessError, OwnerConflict, KeyError, TypeError, ValueError):
-            continue
-    return ids
 
 
 def cleanup_cycle_sessions(runtime, connection, candidates, *, dry_run, protected_paths=()):
@@ -224,11 +192,10 @@ def cleanup_cycle_sessions(runtime, connection, candidates, *, dry_run, protecte
         WHERE c.target_run_ref IN :runs AND c.completion_evidence_ref IS NOT NULL
     """, work).scalars().all()
     retired = (set(native) | retired_stage_ids(connection, work)
-               | _replaced_target_sessions(connection, work, runtime._target_agent))
+               | replaced_target_sessions(connection, work, runtime._target_agent))
     reports = cleanup.delete(retired, dry_run, protected_paths)
     reports.extend(_clean_spools(cleanup.root, connection, work, dry_run, protected_paths))
     return reports
-
 
 
 # Closed provider turns still serve exact public history, child observations,
@@ -311,11 +278,12 @@ class NativeSessionCleanup:
         self.root, self.executable = root, executable
         self.acquisition = getattr(acquisition, "retired_native_sessions", None)
         self.offsets = {}
+        self._delete_cursors = OrderedDict()
 
     def delete(self, ids, dry_run, protected_paths):
         try:
             return delete_codex_sessions(self.root, self.executable, ids, dry_run=dry_run,
-                                         protected_paths=protected_paths)
+                                         protected_paths=protected_paths, cursors=self._delete_cursors)
         except (OSError, sqlite3.Error, ValueError):
             return [{"root_kind": "native_session", "path": str(self.root.codex_home),
                      "action": "skipped", "reason": "native_index_unavailable", "bytes": 0}]
