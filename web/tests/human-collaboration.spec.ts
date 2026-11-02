@@ -1151,9 +1151,10 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
 
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await expect(dialog).toBeVisible();
-  const queue = dialog.getByRole("navigation", { name: "当前待办队列" });
-  const nextRequest = dialog.getByRole("button", { name: "查看下一个待办" });
-  await expect(queue).toContainText("1 / 5");
+  const categories = dialog.getByRole("navigation", { name: "求助类别" });
+  const category = (name: string) => categories.getByRole("button", { name: new RegExp(name) });
+  await expect(categories.getByRole("button")).toHaveCount(5);
+  await expect(category("图书馆重连")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "恢复当前图书馆会话，或选择合法全文替代路线。",
   })).toBeVisible();
@@ -1198,8 +1199,8 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     },
   });
 
-  await nextRequest.click();
-  await expect(queue).toContainText("2 / 5");
+  await category("线上获取").click();
+  await expect(category("线上获取")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "本人完成外部材料申请并交回批准结果。",
   })).toBeVisible();
@@ -1232,8 +1233,8 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "提交", exact: true })).toHaveCount(0);
 
-  await nextRequest.click();
-  await expect(queue).toContainText("3 / 5");
+  await category("现实世界操作").click();
+  await expect(category("现实世界操作")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "按已接纳协议完成线下校准并交回原始结果。",
   })).toBeVisible();
@@ -1256,8 +1257,8 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   expect(assetIntakes).toHaveLength(0);
   await expect(dialog.getByRole("button", { name: "提交", exact: true })).toHaveCount(0);
 
-  await nextRequest.click();
-  await expect(queue).toContainText("4 / 5");
+  await category("执行能力授权").click();
+  await expect(category("执行能力授权")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "决定是否允许当前 Run 访问一个新增外部目的地。",
   })).toBeVisible();
@@ -1312,8 +1313,8 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "提交授权回应" })).toHaveCount(0);
 
-  await nextRequest.click();
-  await expect(queue).toContainText("5 / 5");
+  await category("系统故障协助").click();
+  await expect(category("系统故障协助")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "重试失败的助手操作：https://status.example.invalid/run-219",
   })).toBeVisible();
