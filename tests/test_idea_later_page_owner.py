@@ -19,6 +19,7 @@ from test_public_idea_stage import _runtime, _confirm_direct_quest, _Determinist
 from test_public_plan_stage import _finish_idea_stage
 from test_bundle_skill_adapter import _fake_codex
 from test_runtime_conditions_provider_prompts import _SignedRunner
+from test_idea_skill_contract import _provider_idea_message
 from conftest import _isolate_platform_power_dependency
 
 
@@ -188,7 +189,7 @@ class _IdeaDiscoveryRunner(_SignedRunner):
         assert denied["structuredContent"] == {"code": "stage_context_ref_unbound"}
         draft = _DeterministicIdeaSkill().generate_draft(request).draft
         draft["candidates"][0]["evidence_boundary"]["accepted_evidence_refs"] = [self.selected_ref]
-        self.output = {"outcome": draft}
+        self.output = _provider_idea_message(draft)
         return super().__call__(argv, prompt, timeout, environment)
 
 

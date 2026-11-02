@@ -1829,6 +1829,7 @@ class CodexIdeaSkillAdapter:
             "仍有值得 Plan 推进的候选时，交回完整 IdeaSet。若根据证据改变判断，"
             "说明修订理由。判断所有候选在当前范围内均不可行时，交回 NoViableCandidate 并给出科学依据。"
             "涉及提交资格或拒绝时，以实际 Owner 回执为据。"
+            "传输格式中 outcome.kind 写结果种类，outcome.payload 写该结果的全部其他既定字段。"
             "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。ContextPack v4 不预装证据首页；"
             "需要发现证据时，调用 research_memory.stage_context.read（source=\"evidence_index\"，"
             "context_pack_ref=本次冻结引用，path=[]，index_offset=0，offset=0，limit=8192）。"
@@ -1868,8 +1869,9 @@ class CodexIdeaSkillAdapter:
         # Child/tool trace is diagnostic provenance, not part of the Idea
         # artifact contract.  A sealed, structurally valid draft must remain
         # usable even when the Harness omits or reshapes collaboration events.
-        draft_value = primary_output.get("outcome")
-        if not isinstance(draft_value, dict):
+        outcome = primary_output.get("outcome")
+        if (not isinstance(outcome, dict) or set(outcome) != {"kind", "payload"}
+                or not isinstance(outcome["payload"], dict) or "kind" in outcome["payload"]):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
                 operation_name="primary",
@@ -1879,7 +1881,7 @@ class CodexIdeaSkillAdapter:
                 rejected_candidate=primary_output,
             )
         return IdeaSkillDraft(
-            draft=cast(dict[str, object], draft_value),
+            draft={"kind": outcome["kind"], **outcome["payload"]},
             primary_session_ref=primary_session,
             adapter_kind="codex_cli",
         )
@@ -4039,11 +4041,22 @@ def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, objec
 def _outcome_envelope_schema(
     question_ref: str, context_pack_ref: str
 ) -> dict[str, object]:
+    # Both variants begin with the same decision field even when the provider
+    # sorts property names. Route-specific fields follow that decision.
+    tagged = []
+    for variant in _outcome_schema(question_ref, context_pack_ref)["anyOf"]:
+        fields = dict(variant["properties"])
+        kind = fields.pop("kind")
+        payload = {**variant, "properties": fields,
+                   "required": [key for key in variant["required"] if key != "kind"]}
+        tagged.append({"type": "object", "additionalProperties": False,
+                       "properties": {"kind": kind, "payload": payload},
+                       "required": ["kind", "payload"]})
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "outcome": _outcome_schema(question_ref, context_pack_ref),
+            "outcome": {"anyOf": tagged},
         },
         "required": ["outcome"],
     }

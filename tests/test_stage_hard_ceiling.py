@@ -2247,7 +2247,8 @@ def test_resume_after_production_ceiling_uses_a_new_physical_operation(
         "}\n"
         "args = sys.argv[1:]\n"
         "result_path = Path(args[args.index('--output-last-message') + 1])\n"
-        "result_path.write_text(json.dumps({'outcome': outcome}), encoding='utf-8')\n"
+        "tag = outcome.pop('kind')\n"
+        "result_path.write_text(json.dumps({'outcome': {'kind': tag, 'payload': outcome}}), encoding='utf-8')\n"
         "print(json.dumps({'type': 'thread.started', "
         "'thread_id': 'resumed-primary'}))\n",
         encoding="utf-8",

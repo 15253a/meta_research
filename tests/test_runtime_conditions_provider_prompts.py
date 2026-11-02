@@ -71,12 +71,12 @@ def _idea_call(adapter, *, job="job:initial", prompt="Research the actual questi
 
 
 def test_public_idea_provider_receives_saved_style_and_restores_original_operation_snapshot(root):
-    from test_idea_skill_contract import _request as idea_request, _idea_set
+    from test_idea_skill_contract import _request as idea_request, _idea_set, _provider_idea_message
     original = read_runtime_conditions(root, 'quest-one')
     current = save_runtime_conditions(root, 'quest-one', text=original['text'],
         research_style='focus', expected_revision=original['revision'])
     runner = _SignedRunner()
-    runner.output = {'outcome': _idea_set()}
+    runner.output = _provider_idea_message(_idea_set())
     workspace = root/'idea-provider'
     adapter = CodexIdeaSkillAdapter(workspace, executable=sys.executable, process_runner=runner)
     request = idea_request(runtime_binding=adapter.runtime_binding(), run_ref='run-one',
