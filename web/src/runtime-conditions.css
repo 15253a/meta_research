@@ -7,7 +7,8 @@
 .runtime-conditions-dialog.workspace-modal header .meta-trace { flex-shrink: 0; width: 36px; height: 36px; color: #625fe7; }
 .runtime-conditions-dialog.workspace-modal h2 { font-size: 20px; font-weight: 500; }
 .runtime-conditions-dialog.workspace-modal h3 { margin: 0 0 14px; font-size: 20px; font-weight: 500; }
-.runtime-deepfetch, .runtime-system { padding-top: 22px; border-top: 1px solid #dfe4ee; }
+.runtime-deepfetch, .runtime-system, .runtime-stage-models { padding-top: 22px; border-top: 1px solid #dfe4ee; }
+.runtime-stage-models .runtime-conditions-fields { margin-top: 14px; }
 .runtime-system { margin: 0 24px 24px; }
 .runtime-fulltext { padding: 18px; border: 1px solid #dfe4ee; border-radius: 13px; background: #f8f9fd; }
 .runtime-fulltext h4 { margin: 0 0 10px; font-size: 16px; font-weight: 500; }

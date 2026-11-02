@@ -2578,7 +2578,12 @@ export class ProductError extends Error {
 }
 
 export type LiteratureConfiguration = { mode: "oa_then_institution" | "oa_only" | "provided_only"; library_entry_url: string; institution_required: boolean };
-export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle; literature_configuration?: LiteratureConfiguration };
+export const researchStages = ["idea", "plan", "bundle", "target", "reasoning"] as const;
+export type StageModels = Record<typeof researchStages[number], string>;
+export type QuestRuntimeConditions = {
+  quest_ref: string; text: string; revision: string; research_style?: ResearchStyle;
+  literature_configuration?: LiteratureConfiguration; stage_models: StageModels; available_stage_models: string[];
+};
 
 export type QuestGoalRevisionDetail = {
   goal_revision_ref: string;
@@ -2608,9 +2613,9 @@ export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSign
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
 }
 
-export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle, literatureConfiguration?: LiteratureConfiguration): Promise<QuestRuntimeConditions> {
+export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle, literatureConfiguration?: LiteratureConfiguration, stageModels?: StageModels): Promise<QuestRuntimeConditions> {
   return writeJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, "PUT", {
-    text, expected_revision: expectedRevision, research_style: researchStyle, literature_configuration: literatureConfiguration,
+    text, expected_revision: expectedRevision, research_style: researchStyle, literature_configuration: literatureConfiguration, stage_models: stageModels,
   });
 }
 

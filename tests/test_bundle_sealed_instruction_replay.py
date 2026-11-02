@@ -125,6 +125,25 @@ def test_completed_signed_operation_replays_without_rewriting_frozen_inputs(seal
     }), encoding="utf-8")
 
 
+def test_model_edit_applies_to_next_call_and_preserves_sealed_replay(sealed_dispatch, monkeypatch):
+    provider, runner, _, dispatch, first, directory, original = sealed_dispatch
+    selected = "gpt-5.6-sol"
+    monkeypatch.setattr("meta_research.idea_skill.selected_stage_model", lambda *args, **kwargs: selected)
+    assert provider.schedule_target(dispatch) == first
+    assert len(runner.calls) == 1
+    assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == original
+
+    next_call = replace(dispatch, job_ref="bundle-job:changed-model", generation=2)
+    provider.schedule_target(next_call)
+    argv = runner.calls[-1][0]
+    assert argv[argv.index("--model") + 1] == selected
+    assert 'model_reasoning_effort="ultra"' in argv
+    path = directory.parent.parent / canonical_hash({"job_ref": next_call.job_ref}) / "dispatch-2" / "invocation.json"
+    payload = json.loads(path.read_text())["payload"]
+    assert payload["model_ref"] == payload["root_capability_profile"]["model_ref"] == selected
+    assert payload["root_capability_profile"]["effective_reasoning_effort"] == "max"
+
+
 @pytest.mark.parametrize("mutation", ["request", "native", "invocation", "seal"])
 def test_instruction_replay_keeps_request_identity_and_signed_invocation_exact(sealed_dispatch, mutation):
     provider, runner, _, dispatch, _, directory, original = sealed_dispatch

@@ -1146,7 +1146,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                     "structured-output-json-schema",
                     "trusted-local-quest-authorization",
                 ),
-                self._root_agent_kind,
+                self._root_agent_kind, self._model_ref,
             ),
             resource_bindings=tuple(
                 f"package:meta_research.skills{'' if name in SHARED_REFERENCE_PATHS else '.reasoning_stage'}/"

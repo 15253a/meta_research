@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import cast
 
+from meta_research.idea_skill import stage_provider
 from meta_research.feed import DurableFeed
 from meta_research.idea_stage import _public_run
 from meta_research.owners.advancement_engine import (
@@ -196,7 +197,7 @@ class PlanStageWorker:
         run = self._agent_runtime.query_plan_stage_run(request.request_ref)
         if run is None:
             try:
-                runtime_binding = self._provider.runtime_binding()
+                runtime_binding = stage_provider(self._provider, quest_ref=current.question.quest_ref).runtime_binding()
             except PlanSkillUnavailable as error:
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
@@ -427,7 +428,8 @@ class PlanStageWorker:
         if not isinstance(run.runtime_binding, PlanRuntimeBinding):
             raise OwnerConflict("plan_runtime_binding_invalid")
         try:
-            runtime_binding = self._provider.runtime_binding()
+            provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+            runtime_binding = provider.runtime_binding()
         except PlanSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
@@ -521,7 +523,7 @@ class PlanStageWorker:
             draft = None
             try:
                 try:
-                    draft = self._provider.generate_draft(skill_request)
+                    draft = provider.generate_draft(skill_request)
                     draft_hash = validate_plan_skill_draft(skill_request, draft)
                 except PlanSkillUnavailable as error:
                     if (
@@ -663,7 +665,7 @@ class PlanStageWorker:
         result = None
         try:
             try:
-                result = self._provider.review_draft(skill_request, draft)
+                result = provider.review_draft(skill_request, draft)
                 draft_hash, plan_hash, _review_hash = validate_plan_skill_result(
                     skill_request,
                     result,

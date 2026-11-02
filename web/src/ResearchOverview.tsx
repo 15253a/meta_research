@@ -408,7 +408,7 @@ function StageResultDialog({ data, selection, onSelect, onClose, error, loading,
   return <OverviewDialog title={stageNames[selection.stage]} subtitle={`${cycleOrdinalLabel(cycle?.ordinal)} · ${stageTechnicalNames[selection.stage]}${artifact ? ` · 记录版本 ${artifact.epoch}` : ""}`} onClose={onClose}>
     {loading && data ? <p className="overview-empty" role="status">历史成果正在更新，以下保留已读取记录。</p> : null}
     <div className="overview-history-controls"><label>研究轮次<select value={cycle?.cycle_ref ?? ""} onChange={event => onSelect({ ...selection, cycleRef: event.target.value, epoch: null })}>{data?.cycles.length ? data.cycles.map(item => <option key={item.cycle_ref} value={item.cycle_ref}>{cycleOrdinalLabel(item.ordinal)}{item.cycle_ref === data.cycle_ref ? " · 当前" : ""}</option>) : <option value="">轮次记录暂不可用</option>}</select></label>{artifacts.length > 1 && <label>阶段记录<select value={artifact?.epoch ?? ""} onChange={event => onSelect({ ...selection, epoch: Number(event.target.value) })}>{artifacts.map(item => <option key={item.epoch} value={item.epoch}>版本 {item.epoch} · {acceptedStatusNames[item.status]}</option>)}</select></label>}</div>
-    {artifact ? <><p className="overview-result-status">{acceptedStatusNames[artifact.status]}</p><StageCoreResult artifact={artifact} cycle={cycle} cycles={data?.cycles} /><SourceDetails source={{ ...artifact.source, cycle_ref: cycle?.cycle_ref, question_ref: cycle?.question_ref, epoch: artifact.epoch, reason: artifact.reason?.code }} />{artifact.content && <details className="overview-source-details"><summary>查看完整原始结果</summary><pre>{JSON.stringify(artifact.content, null, 2)}</pre></details>}</> : loading || (!data && !error) ? <p className="overview-empty" role="status">正在读取阶段结果与历史记录…</p> : <p className="overview-empty">{error || data?.status === "limited" ? "阶段结果暂不可用。" : "该轮次尚无此阶段的已接纳结果。"} 当前 Stage 对话仍可继续阅读。</p>}
+    {artifact ? <><p className="overview-result-status">{acceptedStatusNames[artifact.status]}</p><StageCoreResult artifact={artifact} cycle={cycle} cycles={data?.cycles} /><SourceDetails source={{ ...artifact.source, cycle_ref: cycle?.cycle_ref, question_ref: cycle?.question_ref, epoch: artifact.epoch, reason: artifact.reason?.code }} />{artifact.content && <details className="overview-source-details"><summary>查看完整原始结果</summary><pre>{JSON.stringify(artifact.content, null, 2)}</pre></details>}</> : loading || (!data && !error) ? <p className="overview-empty" role="status">正在读取阶段结果与历史记录…</p> : <p className="overview-empty">{error || data?.status === "limited" ? "阶段结果暂不可用。" : "该轮次尚无此阶段的已接纳结果。"} 仍可查看当前阶段的对话。</p>}
     {error && onRetry && <button className="overview-text-button" onClick={onRetry}>重新读取阶段结果</button>}
   </OverviewDialog>;
 }
@@ -697,8 +697,8 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
         const questionKey = `question:${group.questionRef}`;
         return <li key={group.key} className="research-timeline-question" data-question-ref={group.questionRef} data-current={active}>
           <BoundedDetails className="research-timeline-question-details" defaultOpen={active || groups.length === 1 || !isLiveQuest} summary={<>
-            <span className="research-timeline-question-name">Question {group.ordinal}<i className="research-timeline-chevron" aria-hidden="true">▸</i></span>
-            <span className="research-timeline-question-copy">{questionItem?.name ? <span className="research-timeline-question-title">{questionItem.name}{lifecycle && lifecycle !== "active" ? <small>{lifecycleLabel}</small> : null}{!group.cycles.length ? <small>尚无 Cycle</small> : null}</span> : null}<TimelineSummary className="research-timeline-question-summary" nodeKey={questionKey} node={summaries.nodes[questionKey]} unavailable={summaries.error} /></span>
+            <span className="research-timeline-question-name">研究问题 {group.ordinal}<i className="research-timeline-chevron" aria-hidden="true">▸</i></span>
+            <span className="research-timeline-question-copy">{questionItem?.name ? <span className="research-timeline-question-title">{questionItem.name}{lifecycle && lifecycle !== "active" ? <small>{lifecycleLabel}</small> : null}{!group.cycles.length ? <small>尚未开始首轮研究</small> : null}</span> : null}<TimelineSummary className="research-timeline-question-summary" nodeKey={questionKey} node={summaries.nodes[questionKey]} unavailable={summaries.error} /></span>
             {active || group.revisit ? <i className="research-timeline-badge">{active ? "当前问题" : "继续研究"}{active && group.revisit ? " · 再次进入" : ""}</i> : null}
           </>}>{() => group.cycles.length ? <ol className="research-timeline-cycles">{group.cycles.map(cycle => {
         const isCurrent = isLiveQuest && cycle.cycle_ref === foreground?.cycle_ref;
@@ -709,7 +709,7 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
         const targets = timelineTargets(snapshot, cycle, sessions, Object.values(summaries.nodes), sessionsUnavailable, isCurrent && paused);
         return <li key={cycle.cycle_ref} className="research-timeline-cycle" data-cycle-ref={cycle.cycle_ref} data-current={isCurrent}>
           <BoundedDetails className="research-timeline-cycle-details" defaultOpen={isCurrent} summary={<>
-            <span className="research-timeline-cycle-name">{isCurrent ? <MetaTrace variant="timeline" /> : null}Cycle {cycle.ordinal ?? "?"}<i className="research-timeline-chevron" aria-hidden="true">▸</i></span>
+            <span className="research-timeline-cycle-name">{isCurrent ? <MetaTrace variant="timeline" /> : null}{cycle.ordinal ? `第 ${cycle.ordinal} 轮研究` : "研究轮次待确认"}<i className="research-timeline-chevron" aria-hidden="true">▸</i></span>
             <TimelineSummary className="research-timeline-cycle-meta" nodeKey={`cycle:${cycle.cycle_ref}`} node={summaries.nodes[`cycle:${cycle.cycle_ref}`]} unavailable={summaries.error}
               acceptedResultNeedsReview={summaryNeedsAcceptedResultReview(summaries.nodes[`cycle:${cycle.cycle_ref}`], cycle, entries.flatMap(entry => entry.artifacts), summarySessions, summaries.observedAt)} />
             {isCurrent ? <i className="research-timeline-badge">当前轮</i> : null}
@@ -740,7 +740,7 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
               </ul> : null}
             </li>)}</ol>}</BoundedDetails>
         </li>;
-      })}</ol> : <p className="overview-readable-text">{questionItem?.summary || "正式问题已建立，尚未进入 Cycle。"}</p>}</BoundedDetails></li>;
+      })}</ol> : <p className="overview-readable-text">{questionItem?.summary || "正式问题已建立，尚未开始首轮研究。"}</p>}</BoundedDetails></li>;
       })}</ol></div>}
     {selection && data && <StageResultDialog data={data} selection={selection} onSelect={setSelection} onClose={() => setSelection(null)} />}
     {historicalConversation && !isLiveQuest ? <OverviewDialog title="历史工作会话" subtitle="只读浏览 · 当前研究继续执行" onClose={() => setHistoricalConversation(false)}><RootConversations model={historicalRoots} connected={true} /></OverviewDialog> : null}

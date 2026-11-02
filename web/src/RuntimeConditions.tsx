@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { fetchQuestRuntimeConditions, fetchQuestRuntimeDevices, ProductError, saveQuestRuntimeConditions, type QuestRuntimeConditions, type ResearchStyle, type LiteratureConfiguration } from "./api";
+import { fetchQuestRuntimeConditions, fetchQuestRuntimeDevices, ProductError, researchStages, saveQuestRuntimeConditions, type QuestRuntimeConditions, type ResearchStyle, type LiteratureConfiguration, type StageModels } from "./api";
 import { RESEARCH_STYLES, researchStyleLabel } from "./researchStyle";
 import { ExternalMcpSettings } from "./ExternalMcpSettings";
 import { SearchSourcesSettings } from "./SearchSourcesSettings";
@@ -16,7 +16,14 @@ import "./runtime-conditions.css";
 const LITERATURE_MODES = [["oa_then_institution", "公开全文与可选图书馆下载"], ["oa_only", "仅获取开放全文"], ["provided_only", "只使用我提供的材料"]];
 const MAX_CONDITIONS_LENGTH = 24000;
 // Unsaved edits belong to this page and Quest, never to another Quest or a server receipt.
-const conditionDrafts = new Map<string, { basis: QuestRuntimeConditions; text: string; researchStyle: ResearchStyle; library: LiteratureConfiguration | undefined; advanced: boolean; scrollTop: number }>();
+const conditionDrafts = new Map<string, { basis: QuestRuntimeConditions; text: string; researchStyle: ResearchStyle; library: LiteratureConfiguration | undefined; stageModels: StageModels | undefined; advanced: boolean; scrollTop: number }>();
+const modelStageLabels: Record<keyof StageModels, string> = {
+  idea: "研究构想（Idea）", plan: "研究计划（Plan）", bundle: "工作安排（Bundle）",
+  target: "任务执行（Target）", reasoning: "综合判断（Reasoning）",
+};
+function stageModelsChanged(draft: StageModels | undefined, basis: StageModels | undefined) {
+  return researchStages.some(stage => draft?.[stage] !== basis?.[stage]);
+}
 
 export function RuntimeConditions({ questRef, questionRef = null, disabled = false }: {
   questRef: string | null; questionRef?: string | null; disabled?: boolean;
@@ -46,6 +53,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   const [text, setText] = useState(restored?.text ?? "");
   const [researchStyle, setResearchStyle] = useState<ResearchStyle>(restored?.researchStyle ?? "balanced");
   const [library, setLibrary] = useState<LiteratureConfiguration | undefined>(restored?.library);
+  const [stageModels, setStageModels] = useState(restored?.stageModels);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -120,12 +128,13 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
         throw new Error("runtime_conditions_identity_invalid");
       }
       const cached = attempt === 0 ? conditionDrafts.get(questRef) : undefined;
-      const dirty = cached && (cached.text !== cached.basis.text || cached.researchStyle !== (cached.basis.research_style ?? "balanced") || JSON.stringify(cached.library) !== JSON.stringify(cached.basis.literature_configuration));
+      const dirty = cached && (cached.text !== cached.basis.text || cached.researchStyle !== (cached.basis.research_style ?? "balanced") || JSON.stringify(cached.library) !== JSON.stringify(cached.basis.literature_configuration) || stageModelsChanged(cached.stageModels, cached.basis.stage_models));
       const stale = Boolean(dirty && cached.basis.revision !== value.revision);
       setBasis(dirty ? cached.basis : value);
       setText(dirty ? cached.text : value.text);
       setResearchStyle(dirty ? cached.researchStyle : value.research_style ?? "balanced");
       setLibrary(dirty ? cached.library : value.literature_configuration);
+      setStageModels(dirty ? cached.stageModels : value.stage_models);
       setConflict(stale);
       if (stale) setError("运行条件已变化。当前编辑已保留，请核对最新版本后再继续。");
       rememberDevices(value.text);
@@ -140,8 +149,8 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   }, [questRef, attempt]);
 
   useEffect(() => {
-    if (questRef && basis && !loading) conditionDrafts.set(questRef, { basis, text, researchStyle, library, advanced, scrollTop: dialog.current?.scrollTop ?? 0 });
-  }, [questRef, basis, text, researchStyle, library, advanced, loading]);
+    if (questRef && basis && !loading) conditionDrafts.set(questRef, { basis, text, researchStyle, library, stageModels, advanced, scrollTop: dialog.current?.scrollTop ?? 0 });
+  }, [questRef, basis, text, researchStyle, library, stageModels, advanced, loading]);
 
   useEffect(() => {
     if (!questRef) return;
@@ -172,7 +181,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
     setSaved(false);
     setError(null);
     try {
-      const value = await saveQuestRuntimeConditions(questRef, text, basis.revision, researchStyle, library);
+      const value = await saveQuestRuntimeConditions(questRef, text, basis.revision, researchStyle, library, stageModels);
       if (!alive.current) return;
       if (value.quest_ref !== questRef || typeof value.text !== "string" || typeof value.revision !== "string") {
         throw new Error("runtime_conditions_identity_invalid");
@@ -181,6 +190,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
       setText(value.text);
       setResearchStyle(value.research_style ?? "balanced");
       setLibrary(value.literature_configuration);
+      setStageModels(value.stage_models);
       rememberDevices(value.text);
       setSaved(true);
     } catch (caught) {
@@ -194,7 +204,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   };
 
   return <dialog ref={dialog} className="runtime-conditions-dialog workspace-modal" aria-labelledby="runtime-conditions-title"
-    onScroll={event => { if (questRef && basis) conditionDrafts.set(questRef, { basis, text, researchStyle, library, advanced, scrollTop: event.currentTarget.scrollTop }); }}
+    onScroll={event => { if (questRef && basis) conditionDrafts.set(questRef, { basis, text, researchStyle, library, stageModels, advanced, scrollTop: event.currentTarget.scrollTop }); }}
     onCancel={event => { event.preventDefault(); onClose(); }}>
     {questRef ? <form onSubmit={event => { event.preventDefault(); void save(); }}>
       <header><MetaTrace variant="brief" /><div><h2 id="runtime-conditions-title">修改配置</h2><p>当前 Quest · {questRef}</p></div><button type="button" aria-label="关闭修改配置" onClick={onClose}>×</button></header>
@@ -215,6 +225,18 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
           disabled={controlsDisabled || !stringField(data.time_budget)}
           onChange={time_budget => editFields({ ...data, time_budget })} />
       </div>
+      <section className="runtime-stage-models" aria-label="研究阶段模型">
+        <h3>研究阶段模型</h3>
+        <p>推理强度固定为 Ultra（max）。保存后，各阶段从下一次新调用开始使用所选模型。已经发出的调用和它的重试沿用原模型。</p>
+        {stageModels && basis ? <div className="runtime-conditions-fields">
+          {researchStages.map(stage => <label key={stage}><span>{modelStageLabels[stage]}</span>
+            <select value={stageModels[stage]} disabled={loading || saving || !basis.available_stage_models?.length}
+              onChange={event => { setStageModels({ ...stageModels, [stage]: event.currentTarget.value }); setSaved(false); }}>
+              {!basis.available_stage_models?.includes(stageModels[stage]) && <option disabled value={stageModels[stage]}>{stageModels[stage]}（暂不可选）</option>}
+              {basis.available_stage_models?.map(model => <option key={model} value={model}>{model}</option>)}
+            </select></label>)}
+        </div> : !loading && <p>暂时无法读取阶段模型，请重新打开配置。</p>}
+      </section>
       <section className="runtime-deepfetch" aria-label="DeepFetch 配置"><h3>DeepFetch 配置</h3>
         <SearchSourcesSettings scope={{ kind: "quest", questRef }} />
         <section className="runtime-fulltext" aria-label="图书馆与全文获取"><h4>图书馆与全文获取</h4>
@@ -277,7 +299,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
       {saved ? <p role="status" className="runtime-conditions-saved">已保存，将用于后续新调用。</p> : null}
       <footer><button type="button" onClick={onClose}>{saved || saving ? "关闭" : "取消"}</button>
         {!basis && !loading ? <button type="button" onClick={() => setAttempt(value => value + 1)}>重新读取</button> : null}
-        <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || invalidBudget || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || (text === basis.text && researchStyle === (basis.research_style ?? "balanced") && JSON.stringify(library) === JSON.stringify(basis.literature_configuration))}>
+        <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || invalidBudget || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || (text === basis.text && researchStyle === (basis.research_style ?? "balanced") && JSON.stringify(library) === JSON.stringify(basis.literature_configuration) && !stageModelsChanged(stageModels, basis.stage_models))}>
           {saving ? "正在保存…" : "保存运行条件"}</button></footer>
     </form> : <><header className="runtime-conditions-pre-quest"><MetaTrace variant="brief" /><h2 id="runtime-conditions-title">修改配置</h2><button type="button" aria-label="关闭修改配置" onClick={onClose}>×</button></header><p className="runtime-pre-quest-note">尚无当前 Quest。可管理共享搜索源和系统通用 MCP；图书馆与全文获取在新建研究任务的初始化草稿中配置。</p><section className="runtime-deepfetch" aria-label="DeepFetch 配置"><h3>DeepFetch 配置</h3><SearchSourcesSettings scope={{ kind: "shared-only" }} /></section></>}
     <section className="runtime-system" aria-label="系统配置"><h3>系统配置</h3><p>通用 MCP 服务于整个系统的研究 Agent，按已选根类型授权；视频理解等通用能力无需登记为搜索源。</p>

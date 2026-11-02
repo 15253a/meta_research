@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 
 SUPPORTED_CODEX_MODEL_REFS = ("gpt-6.1-sol", "gpt-5.6-sol")
+RESEARCH_STAGES = ("idea", "plan", "bundle", "target", "reasoning")
+DEFAULT_STAGE_MODEL = "gpt-6.1-sol"
 CODEX_MODEL_REF = os.environ.get("META_RESEARCH_CODEX_MODEL", "gpt-6.1-sol")
 if CODEX_MODEL_REF not in SUPPORTED_CODEX_MODEL_REFS:
     raise ValueError(

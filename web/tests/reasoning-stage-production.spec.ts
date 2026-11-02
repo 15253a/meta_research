@@ -294,7 +294,7 @@ test("Chrome observes the real Reasoning chain and keeps every Owner boundary se
   await expect(childTreeItem).not.toHaveAttribute("data-current-question", "true");
   await childTreeItem.click();
   const inspector = tree.getByLabel("选中问题详情");
-  await expect(inspector).toContainText("未绑定当前 Cycle");
+  await expect(inspector).toContainText("本轮未选择这个问题");
   await expect(inspector).toContainText("Projection 未提供");
   await expect(inspector.getByText("当前攻克", { exact: true })).toHaveCount(0);
   await currentTreeItem.click();
@@ -314,7 +314,7 @@ test("Chrome observes the real Reasoning chain and keeps every Owner boundary se
     foreground.question_ref,
   );
   const stages = page.getByRole("list", {
-    name: "当前 Cycle 的四个可能 Stage",
+    name: "本轮研究可开展的四类工作",
   });
   await expect(stages.getByRole("listitem")).toHaveCount(4);
   for (const [position, state] of Object.entries({

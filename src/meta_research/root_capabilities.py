@@ -11,7 +11,7 @@ from meta_research.human_guidance import GUIDANCE_OPERATION_IDS
 from meta_research.quest_goal import GOAL_OPERATION_IDS
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF, CODEX_REASONING_EFFORT, CODEX_ROOT_REASONING_PRESET,
-    CODEX_COLLABORATION_MODE,
+    CODEX_COLLABORATION_MODE, RESEARCH_STAGES, SUPPORTED_CODEX_MODEL_REFS,
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, research_system_prompt
@@ -155,6 +155,7 @@ class RootCapabilityProfile:
     capabilities: tuple[str, ...] = ROOT_CAPABILITY_FLOOR
     multi_agent_enabled: bool = True
     web_search_mode: Literal["live"] = "live"
+    model_ref: str = CODEX_MODEL_REF
 
     @resource_preparation
     def as_dict(self) -> dict[str, object]:
@@ -170,7 +171,7 @@ class RootCapabilityProfile:
                 "references": shared_reference_bundle_hash(),
                 "index": _shared_reference_index_hash(),
             }),
-            "model_ref": CODEX_MODEL_REF,
+            "model_ref": self.model_ref,
             "cli_reasoning_preset": CODEX_ROOT_REASONING_PRESET,
             "effective_reasoning_effort": CODEX_REASONING_EFFORT,
             "collaboration_mode": CODEX_COLLABORATION_MODE,
@@ -399,10 +400,10 @@ def _shared_reference_index_hash() -> str:
     })
 
 
-def root_capability_profile(root_kind: RootAgentKind) -> RootCapabilityProfile:
+def root_capability_profile(root_kind: RootAgentKind, model_ref: str = CODEX_MODEL_REF) -> RootCapabilityProfile:
     if root_kind not in ROOT_AGENT_KINDS:
         raise ValueError("root_agent_kind_invalid")
-    return RootCapabilityProfile(root_kind=root_kind)
+    return RootCapabilityProfile(root_kind=root_kind, model_ref=model_ref)
 
 
 def parse_codex_feature_inventory(value: str) -> dict[str, bool] | None:
@@ -623,6 +624,9 @@ def validate_root_capability_diagnostics(
     allowed_profile_hashes = {
         profile.digest, *reviewed_historical_root_profile_hashes(profile.digest)
     }
+    if observed_kind in RESEARCH_STAGES and observed_profile_hash not in allowed_profile_hashes:
+        allowed_profile_hashes.update(root_capability_profile(observed_kind, model).digest
+                                      for model in SUPPORTED_CODEX_MODEL_REFS if model != profile.model_ref)
     entry_path = value.get("entry_path")
     availability = value.get("availability")
     usage = value.get("usage")
@@ -947,12 +951,12 @@ def _codex_event_capabilities(event: Mapping[str, object]) -> set[str]:
 
 
 def merge_root_capability_bindings(
-    existing: tuple[str, ...], root_kind: RootAgentKind
+    existing: tuple[str, ...], root_kind: RootAgentKind, model_ref: str = CODEX_MODEL_REF
 ) -> tuple[str, ...]:
     """Append the canonical floor without changing adapter-specific ordering."""
 
     merged = list(existing)
-    for binding in root_capability_profile(root_kind).runtime_bindings():
+    for binding in root_capability_profile(root_kind, model_ref).runtime_bindings():
         if binding not in merged:
             merged.append(binding)
     return tuple(merged)

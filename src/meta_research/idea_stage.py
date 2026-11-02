@@ -7,6 +7,7 @@ from typing import cast
 
 from meta_research.feed import DurableFeed
 from meta_research.idea_skill import (
+    stage_provider,
     IdeaSkillDraft,
     IdeaSkillContractError,
     IdeaSkillProvider,
@@ -122,7 +123,7 @@ class IdeaStageWorker:
         run = self._agent_runtime.query_idea_stage_run(request.request_ref)
         if run is None:
             try:
-                runtime_binding = self._provider.runtime_binding()
+                runtime_binding = stage_provider(self._provider, quest_ref=current.question.quest_ref).runtime_binding()
             except IdeaSkillUnavailable as error:
                 self._transient_error = error.code
                 return self.query_current()
@@ -212,7 +213,7 @@ class IdeaStageWorker:
         run = self._agent_runtime.query_idea_stage_run(request.request_ref)
         if run is None:
             try:
-                runtime_binding = self._provider.runtime_binding()
+                runtime_binding = stage_provider(self._provider, quest_ref=current.question.quest_ref).runtime_binding()
             except IdeaSkillUnavailable as error:
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
@@ -455,7 +456,8 @@ class IdeaStageWorker:
             request.accepted_question
         )
         try:
-            runtime_binding = self._provider.runtime_binding()
+            provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+            runtime_binding = provider.runtime_binding()
         except IdeaSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
@@ -544,7 +546,7 @@ class IdeaStageWorker:
             draft = None
             try:
                 try:
-                    draft = self._provider.generate_draft(skill_request)
+                    draft = provider.generate_draft(skill_request)
                     draft_hash = validate_idea_skill_draft(skill_request, draft)
                 except IdeaSkillUnavailable as error:
                     if (
@@ -686,7 +688,7 @@ class IdeaStageWorker:
         result = None
         try:
             try:
-                result = self._provider.review_draft(skill_request, draft)
+                result = provider.review_draft(skill_request, draft)
                 draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
                     skill_request,
                     result,

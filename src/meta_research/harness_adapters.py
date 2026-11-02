@@ -409,7 +409,7 @@ class _NativeCliHarnessAdapter:
         self._record_provider_capability(provider_version)
         try:
             # Verify the current packaged references before any provider launch.
-            root_capability_profile(invocation.root_kind or "target").as_dict()
+            root_capability_profile(invocation.root_kind or "target", invocation.model_ref).as_dict()
         except (OSError, UnicodeError, ModuleNotFoundError) as error:
             raise HarnessAdapterUnavailable("provider_resource_unavailable") from error
         provider_feature_inventory = self._provider_feature_inventory(
@@ -622,7 +622,7 @@ class _NativeCliHarnessAdapter:
                 if capability not in available_capabilities
             }
             root_diagnostics = root_capability_profile(
-                invocation.root_kind
+                invocation.root_kind, invocation.model_ref
             ).public_diagnostics(
                 entry_path=invocation.entry_path,
                 available_capabilities=tuple(
@@ -900,7 +900,7 @@ class _NativeCliHarnessAdapter:
 
         if self.family != "codex" or invocation.root_kind is None:
             return None
-        profile = root_capability_profile(invocation.root_kind)
+        profile = root_capability_profile(invocation.root_kind, invocation.model_ref)
         argv = [
             self.executable,
             *profile.codex_arguments(entry_path=invocation.entry_path, output_language=read_output_language(self._workspace)),
@@ -1037,7 +1037,7 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
                 'shell_environment_policy.inherit="none"',
             )
         capability_profile = root_capability_profile(
-            invocation.root_kind or "target"
+            invocation.root_kind or "target", invocation.model_ref
         )
         argv = [
             self.executable,

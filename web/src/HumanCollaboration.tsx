@@ -852,8 +852,8 @@ const researchControlLabels: Record<ResearchControlAction, string> = {
   resume: "恢复当前 Quest",
   normal_switch: "安全切换",
   forced_switch: "强制切换",
-  cancel: "取消当前 Cycle",
-  abandon: "放弃当前 Cycle",
+  cancel: "取消本轮研究",
+  abandon: "放弃本轮研究",
   prune: "剪裁 Question",
   restore: "恢复 Question",
 };
@@ -1166,7 +1166,7 @@ export function ForegroundResearchControlShortcut({
         data-action={effectiveAction}
         disabled={unavailable}
         aria-label={busyLabel}
-        title={`${actionLabel}当前 Cycle；当前界面与 Web 服务保持在线`}
+        title={`${actionLabel}本轮研究；当前界面与 Web 服务保持在线`}
         onClick={() => void preview()}
       >
         <span aria-hidden="true">{effectiveAction === "resume" ? "▶" : "Ⅱ"}</span>
@@ -1260,8 +1260,8 @@ function ForegroundResearchControlDialog({
             <h2 id="research-power-title">{verb}当前研究？</h2>
             <p>
               {action === "pause"
-                ? "系统会等待当前 Provider 到达安全边界；当前界面与 Web 服务保持在线。"
-                : "系统会从已记录的安全边界继续当前 Cycle。"}
+                ? "系统会等待当前步骤到达可以暂停的位置。暂停后仍可查看页面。"
+                : "系统会从已记录的安全边界继续本轮研究。"}
             </p>
           </div>
           <button
@@ -1280,7 +1280,7 @@ function ForegroundResearchControlDialog({
               ? command.draft.payload.target.quest_ref
               : "unknown"}
             {command.draft.command_kind === "research_control"
-              ? ` · Cycle ${command.draft.payload.target.cycle_ref} · Epoch ${command.draft.payload.target.epoch}`
+              ? ` · 研究轮次 ${command.draft.payload.target.cycle_ref} · Epoch ${command.draft.payload.target.epoch}`
               : ""}
           </p>
           {visiblePreview ? visiblePreview.owner_previews.map((owner) => (
@@ -1504,7 +1504,7 @@ function ResearchControlComposer({
                     event.target.value as ResearchControlTargetScope,
                   )}
                 >
-                  <option value="cycle">当前 Cycle</option>
+                  <option value="cycle">本轮研究</option>
                   <option value="stage">当前 Stage</option>
                   <option value="run">一个 managed Run</option>
                 </select>

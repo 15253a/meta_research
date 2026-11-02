@@ -82,7 +82,7 @@ from meta_research.target_raw_output import (
     TargetRawOutputUnavailable,
 )
 from meta_research.target_run_runtime_contract import TargetCompletionHandoff
-from meta_research.runtime_conditions import compose_runtime_prompt, render_runtime_conditions
+from meta_research.runtime_conditions import compose_runtime_prompt, render_runtime_conditions, selected_stage_model
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1169,6 +1169,7 @@ class HarnessRuntime:
         target_run_ref: str,
         harness_family: HarnessFamily,
         target_scope_binding: dict[str, object],
+        model_ref: str = CODEX_MODEL_REF,
     ) -> HarnessAdmission:
         """Admit production Target work from the selected live Codex binding."""
 
@@ -1178,7 +1179,7 @@ class HarnessRuntime:
             target_ref=target_ref,
             target_run_ref=target_run_ref,
             harness_family=harness_family,
-            model_ref=CODEX_MODEL_REF,
+            model_ref=model_ref,
             auth_profile_ref="harness-profile:codex-default",
             target_scope_binding=target_scope_binding,
         )
@@ -2118,6 +2119,13 @@ class HarnessRuntime:
         if isinstance(request, TargetHarnessRequest) and working_directory is not None:
             # Only a new operation gets current conditions. Reconciliation below
             # verifies and replays the original sealed prompt, including its conditions.
+            previous = self._owner.latest_operation(admission.run.run_ref) if generation > 1 else None
+            if previous is not None and previous.status == "failed":
+                model_ref = previous.model_ref or request.model_ref
+            else:
+                model_ref = selected_stage_model(working_directory, "target", run_ref=admission.run.run_ref,
+                                                 target_ref=request.target_ref, default=request.model_ref)
+            request = replace(request, model_ref=model_ref)
             prompt = self._target_work_prompt(prompt, admission, request, workspace_ref, working_directory)
         external_snapshot = None
         if isinstance(request, TargetHarnessRequest) and self._external_mcp is not None:
@@ -2146,6 +2154,7 @@ class HarnessRuntime:
             generation=generation,
             invocation_hash=invocation_hash,
             resume=resume,
+            model_ref=request.model_ref,
         )
         if consume_recovery_channel:
             self._recovered_target_requests.pop(request_ref, None)
@@ -2220,6 +2229,8 @@ class HarnessRuntime:
             raise HarnessAdmissionError(error.code) from error
         if operation is None or operation.status != "unknown_outcome":
             raise HarnessAdmissionError("provider_reconciliation_not_required")
+        if operation.model_ref is not None:
+            request = replace(request, model_ref=operation.model_ref)
         generation = operation.generation
         resume = admission.run.native_session_ref is not None
         if resume and admission.run.native_session_ref is None:
@@ -3555,6 +3566,7 @@ class HarnessRuntime:
         generation: int,
         invocation_hash: str,
         resume: bool,
+        model_ref: str,
     ) -> None:
         try:
             self._owner.start_operation(
@@ -3563,6 +3575,7 @@ class HarnessRuntime:
                 generation=generation,
                 invocation_hash=invocation_hash,
                 resume=resume,
+                model_ref=model_ref,
             )
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error
@@ -4125,7 +4138,7 @@ def _turn_invocation_material(
             request.provider_operation_timeout_seconds
         )
     if isinstance(request, TargetHarnessRequest):
-        profile = root_capability_profile("target")
+        profile = root_capability_profile("target", request.model_ref)
         try:
             material["multi_agent_enabled"] = profile.multi_agent_enabled
             material["root_capability_profile"] = profile.as_dict()

@@ -758,6 +758,7 @@ class RuntimeConditionsRequest(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
     research_style: Literal['focus', 'balanced', 'open'] | None = None
     literature_configuration: dict[str, object] | None = None
+    stage_models: dict[str, str] | None = None
 
 
 def create_app(

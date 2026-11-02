@@ -200,7 +200,7 @@ test("create Quest is one continuous production window with fixed responsibiliti
   await expect(form.getByText("先从左侧 Research Asset 工作台完成 Intake。")).toHaveCount(0);
   await expect(form.getByLabel("时间预算")).toBeVisible();
   await expect(form.getByRole("button", { name: "检测本机计算卡" })).toBeVisible();
-  await expect(form.getByText("Quest Resource Envelope：", { exact: true })).toBeVisible();
+  await expect(form.getByText("可用计算资源", { exact: true })).toBeVisible();
   await expect(form.getByLabel("文献全文获取范围")).toHaveValue("oa_then_institution");
   await expect(form.getByLabel("文献全文获取范围").locator("option")).toHaveCount(3);
   await expect(form.getByText("Google Chrome", { exact: false })).toBeVisible();
@@ -212,7 +212,7 @@ test("create Quest is one continuous production window with fixed responsibiliti
   await expect(form.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
 
   await expect(session.getByText("INTENT DRAFTING SESSION", { exact: true })).toBeVisible();
-  await expect(session.getByText("聊天不会直接创建 Quest。", { exact: true })).toBeVisible();
+  await expect(session.getByText("在这里讨论研究想法。", { exact: true })).toBeVisible();
   await expect(session.getByLabel("在 Quest Drafting Session 中发消息")).toBeVisible();
 
   const footerButtons = await footer

@@ -1575,10 +1575,10 @@ export function QuestCreationWorkbench({
                         </div>
                       ) : null}
                       <small className="quest-compute-boundary">
-                        <b>Quest Resource Envelope：</b>{" "}
+                        <b>可用计算资源</b>{" "}
                         {creation?.resource_envelope
                           ? resourceEnvelopeCopy(creation)
-                          : "检测并选择设备后形成；尚未创建任何 Run ResourceBinding。"}
+                          : "请检测本机计算卡，再选择允许研究使用的设备。"}
                       </small>
                     </section>
                   </div>
@@ -1779,7 +1779,7 @@ export function QuestCreationWorkbench({
                     <button type="button" onClick={focusSearchSourceSelection}>查看并保存搜索源选择</button>
                   </div> : null}
                   <div className="quest-question-sourcebar">
-                    <b>可编辑 QuestionProposal</b>
+                    <b>第一个问题草稿</b>
                     <span>{proposal ? "系统已填入六字段；确认前都可修改" : "起草后的六个字段可逐项修改"}</span>
                     <small>{proposalSourceCopy(creation)}</small>
                   </div>
@@ -1788,8 +1788,8 @@ export function QuestCreationWorkbench({
                     <div className="quest-proposal-state generating" role="status">
                       <span>
                         {draft.route === "deepfetch"
-                          ? "正在准备精确 LiteratureSnapshot 并原位生成六字段；右侧 Drafting Session 始终保留。"
-                          : "正在依据精确 DraftRevision 生成六字段；Quest 配置和右侧 Session 仍可使用。"}
+                          ? "正在整理检索到的资料并起草第一个问题。你可以继续使用右侧助手。"
+                          : "正在根据已保存的研究目标起草第一个问题。你可以继续使用右侧助手。"}
                       </span>
                       <code>proposal_generating</code>
                       <small>{deepfetch?.activity ?? generation?.status ?? "queued"}</small>
@@ -1797,13 +1797,13 @@ export function QuestCreationWorkbench({
                   ) : null}
                   {creation?.status === "proposal_stale" || creation?.proposal?.status === "stale" ? (
                     <div className="quest-proposal-state stale" role="status">
-                      <span>Quest basis 已变化；旧 Proposal 保留，但不能直接确认。</span>
+                      <span>研究依据已变化，请重新生成或复核问题草稿后再确认。</span>
                       <code>proposal_stale</code>
                     </div>
                   ) : null}
                   {creation?.proposal?.status === "incomplete" ? (
                     <div className="quest-proposal-state incomplete" role="status">
-                      <span>Proposal 当前 basis 仍有效，但四个必填字段尚未完整；补齐后才能确认。</span>
+                      <span>问题草稿缺少必填内容，请补齐后再确认。</span>
                       <code>proposal_incomplete</code>
                     </div>
                   ) : null}
@@ -1812,8 +1812,8 @@ export function QuestCreationWorkbench({
                     <div className="quest-proposal-state">
                       <span>
                         {generation?.status === "capability_unavailable"
-                          ? "生产 Proposal Drafter 当前不可用；不会用字符串模板伪造首问题。"
-                          : "填写必填基底并绑定 Quest Resource Envelope 后，可以原位生成完整六字段。"}
+                          ? "起草服务暂时不可用，请稍后重试。"
+                          : "填写研究目标和完成条件，检测计算卡后即可生成第一个问题。"}
                       </span>
                       <button
                         ref={proposalActionRef}
@@ -1912,19 +1912,19 @@ export function QuestCreationWorkbench({
               {creation?.status === "completed" ? (
                 <p className="quest-impact-summary" role="status">
                   <b>Quest 与第一个问题已就绪。</b>
-                  已接纳事实保持分层；可以关闭窗口并进入当前 Quest。
+                  关闭窗口可查看当前进展。
                 </p>
               ) : null}
               {creation && ["partial", "recovering"].includes(creation.status) ? (
                 <p className="quest-impact-summary waiting" role="status">
-                  <b>{creation.status === "recovering" ? "正在从首个缺失 receipt 恢复" : "Quest 已创建，第一个问题尚未完成"}</b>
-                  已接纳事实不会回滚；完整分层状态可在上方技术详情中查看。
+                  <b>{creation.status === "recovering" ? "正在继续尚未完成的创建步骤" : "Quest 已创建，第一个问题尚未完成"}</b>
+                  已完成的步骤已保存，系统会继续创建。
                 </p>
               ) : null}
               {creation?.status === "unavailable" ? (
                 <p className="quest-impact-summary waiting" role="alert">
-                  <b>已完成事实的持久对象暂时无法验证。</b>
-                  系统不会继续宣称 completed；将按原 receipt 绑定自动对账并恢复。
+                  <b>正在核实已保存的研究记录。</b>
+                  系统正在核对创建记录，会自动重试。
                 </p>
               ) : null}
               {visibleError ? (
@@ -2123,7 +2123,7 @@ function IntentDraftingSession({
         <span>{creation ? `绑定 draft r${creation.quest_draft.revision}` : "等待 initialization"}</span>
       </div>
       <div className="quest-intent-boundary">
-        <b>聊天不会直接创建 Quest。</b> 回复不会改写左侧字段、确认草案或签发 Owner receipt。
+        <b>在这里讨论研究想法。</b> 将选定的内容填入左侧草稿，核对后再确认创建。
       </div>
     </aside>
   );
@@ -2157,15 +2157,15 @@ function ImpactSummary({ creation }: { creation: QuestCreationView | null }) {
   if (!creation?.proposal) return null;
   return (
     <section className={`quest-impact-summary${current ? "" : " waiting"}`} aria-label="确认影响摘要">
-      <b>{current ? "当前 Impact Preview 已绑定，可以确认" : "Impact Preview 正在等待 current basis"}</b>
+      <b>{current ? "创建前请核对以下影响" : "正在根据当前草稿更新创建预览"}</b>
       <div className="quest-impact-columns">
         <div>
           <small>将发生</small>
-          <p>{preview?.will_happen?.join("；") || "自动 Preview current 后显示。"}</p>
+          <p>{preview?.will_happen?.join("；") || "正在读取创建预览。"}</p>
         </div>
         <div>
           <small>不会发生</small>
-          <p>{preview?.will_not_happen?.join("；") || "不会把一次确认冒充全部 Owner 已接纳。"}</p>
+          <p>{preview?.will_not_happen?.join("；") || "正在核对创建后的影响。"}</p>
         </div>
       </div>
     </section>
@@ -2832,12 +2832,12 @@ function creationStatusLabel(status: QuestCreationView["status"]): string {
 }
 
 function draftSaveLabel(state: SaveState, edited: boolean): string {
-  if (state === "opening") return "正在建立 durable 草案";
+  if (state === "opening") return "正在建立草稿";
   if (state === "unsaved") return "修改等待自动保存";
   if (state === "saving") return "正在自动保存…";
-  if (state === "saved") return edited ? "草案已自动保存" : "durable 草案已同步";
+  if (state === "saved") return edited ? "草案已自动保存" : "草稿已同步";
   if (state === "error") return "自动保存失败 · 草案仍留在当前窗口";
-  return "已恢复 durable 草案";
+  return "已恢复草稿";
 }
 
 function footerCopy(
@@ -2847,16 +2847,16 @@ function footerCopy(
   proposalDirty: boolean,
   inFlight: InFlightOperations,
 ): string {
-  if (!creation) return "正在建立首次创建专用 initialization";
+  if (!creation) return "正在准备研究草稿";
   if (inFlight.confirming || creation.status === "dispatching") return "正在创建；重复确认已禁用，可安全关闭后恢复";
-  if (creation.status === "recovering") return "正在从首个缺失 receipt 恢复；已接纳事实不会回滚";
+  if (creation.status === "recovering") return "正在继续尚未完成的创建步骤；已完成的步骤已保存";
   if (creation.status === "partial") return "Quest 已创建，第一个问题尚未完成；系统会继续对账";
-  if (creation.status === "unavailable") return "已完成事实暂不可验证；系统会按原 receipt 自动恢复";
+  if (creation.status === "unavailable") return "暂时无法核实创建结果，系统正在自动重试";
   if (creation.status === "completed") return "Quest 与第一个问题已就绪";
-  if (creation.status === "cancelled") return "已明确取消；未分配 provisional QuestRef 或 QuestionRef";
+  if (creation.status === "cancelled") return "已取消创建";
   if (!meaningful(draft.goal)) return "请先填写 Quest 目标";
   if (!meaningful(draft.completion_criteria)) return "还需填写边界";
-  if (!creation.resource_envelope) return "请检测本机计算卡，并为 Quest 形成 Resource Envelope";
+  if (!creation.resource_envelope) return "请检测本机计算卡并保存研究可用的资源";
   if (!proposal) {
     const deepfetch = currentDeepFetch(creation);
     if (deepfetch?.status === "failed") {
@@ -2868,48 +2868,48 @@ function footerCopy(
     }
     if (creation.status === "proposal_generating") {
       return creation.route === "deepfetch"
-        ? "DeepFetch 正在原位准备 LiteratureSnapshot 与首问题"
-        : "首问题正在原位生成";
+        ? "正在整理检索到的资料并起草第一个问题"
+        : "正在起草第一个问题";
     }
     return "请生成第一个问题";
   }
   if (proposalDirty) return "首问题修改正在自动保存";
   if (!questionIsComplete(proposal)) return "首问题仍需补齐四个必填字段";
-  if (!confirmationIsCurrent(creation)) return "依据已变化；等待 current Impact Preview";
-  return "Quest 与第一问已就绪 · 可以用唯一按钮一起确认";
+  if (!confirmationIsCurrent(creation)) return "研究依据已变化，正在更新确认内容";
+  return "研究目标和第一问已就绪，请核对后确认创建";
 }
 
 function proposalSourceCopy(creation: QuestCreationView | null): string {
-  if (!creation) return "等待 initialization";
+  if (!creation) return "正在读取草稿";
   if (creation.status === "proposal_generating") {
     return creation.route === "deepfetch"
-      ? `DeepFetch · ${currentDeepFetch(creation)?.activity ?? "queued"}`
-      : "production drafter · generating";
+      ? "正在整理检索材料"
+      : "正在起草";
   }
-  if (creation.proposal?.status === "stale") return `旧 Proposal · basis r${creation.proposal.basis_revision}`;
+  if (creation.proposal?.status === "stale") return "请按当前研究目标复核旧草稿";
   if (creation.proposal?.status === "incomplete") {
-    return `${creation.route} · incomplete draft r${creation.proposal.basis_revision}`;
+    return "还需补齐必填内容";
   }
   if (creation.proposal) {
-    return `${creation.route} · current draft r${creation.proposal.basis_revision}`;
+    return creation.route === "deepfetch" ? "根据检索材料起草" : "根据当前研究目标起草";
   }
-  if (currentProposalGeneration(creation)?.status === "capability_unavailable") return "capability_unavailable";
+  if (currentProposalGeneration(creation)?.status === "capability_unavailable") return "起草服务暂时不可用";
   return "等待生成";
 }
 
 function computeCopy(creation: QuestCreationView | null): string {
   const compute = creation?.compute;
-  if (!compute) return "尚未检测 · 不会显示 synthetic A100";
+  if (!compute) return "尚未检测本机计算卡";
   if (compute.status === "unavailable") {
     return `capability_unavailable · ${compute.reason?.code ?? "host_compute_unavailable"}`;
   }
-  if (!compute.devices.length) return "真实 Provider 已返回；当前没有可选择的计算卡";
+  if (!compute.devices.length) return "检测完成，当前没有可供选择的计算卡";
   return `检测到 ${compute.devices.length} 张计算卡 · 请选择允许本 Quest 使用的设备`;
 }
 
 function resourceEnvelopeCopy(creation: QuestCreationView): string {
   const envelope = creation.resource_envelope;
-  if (!envelope) return "尚未形成；不会冒充 Run ResourceBinding。";
+  if (!envelope) return "请先检测并选择设备。";
   const devicesByUuid = new Map(
     (creation.compute?.devices ?? []).map((device) => [device.uuid, device.name]),
   );
@@ -2917,11 +2917,11 @@ function resourceEnvelopeCopy(creation: QuestCreationView): string {
     .map((uuid) => devicesByUuid.get(uuid) ?? uuid)
     .join("、");
   const ceiling = envelope.hard_ceiling.seconds === null
-    ? "开放式 hard ceiling"
-    : `${envelope.hard_ceiling.seconds.toLocaleString("zh-CN")} 秒 hard ceiling`;
+    ? "未设时限"
+    : `${envelope.hard_ceiling.seconds.toLocaleString("zh-CN")} 秒上限`;
   return `已绑定 ${envelope.selected_device_uuids.length} 张实际检测设备。` +
     `时间预算 ${timeBudgetLabel(envelope.time_budget)} · ${ceiling} · ${devices || "未选设备"}；` +
-    `状态 ${envelope.status}，不是 Run ResourceBinding。`;
+    `实际使用情况将在作业运行后记录。`;
 }
 
 function formatMemory(memoryTotalMib: number): string {

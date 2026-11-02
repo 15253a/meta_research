@@ -11,6 +11,7 @@ import time
 
 from sqlalchemy import text as sql_text
 
+from meta_research.codex_runtime import DEFAULT_STAGE_MODEL, RESEARCH_STAGES, SUPPORTED_CODEX_MODEL_REFS
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.research_style import validate_research_style, render_research_style
 
@@ -152,7 +153,7 @@ def _initial_conditions(root: Path, *, quest_ref=None, run_ref=None,
         values["gpu_configuration"] = "未配置已选 GPU；不得将机器探测到的其他显卡当作用户已选择的资源。"
     initial_text = (
         "按以下条件安排研究与委派；显卡是用户选定的可用资源，按工作需要使用，无需为了使用显卡而改变方法。"
-        "时间预算是整个 Quest 的预算，进入新 Cycle 不会重置。\n"
+        "时间预算是整个 Quest 的预算，开始新一轮研究时不会重置。\n"
         + json.dumps(values, ensure_ascii=False, indent=2)
     )
     scope = quest_ref or _INIT_PREFIX + initialization_id
@@ -187,11 +188,35 @@ def _literature_configuration(value):
     return {**value, "library_entry_url": _validated_library_entry_url(value["library_entry_url"])}
 
 
-def _value(quest_ref: str, text: str, research_style: str = 'balanced', literature_configuration=None) -> dict[str, object]:
+def _stage_models(value):
+    if value is None:
+        return dict.fromkeys(RESEARCH_STAGES, DEFAULT_STAGE_MODEL)
+    if (not isinstance(value, dict) or set(value) != set(RESEARCH_STAGES)
+            or any(model not in SUPPORTED_CODEX_MODEL_REFS for model in value.values())):
+        raise OwnerConflict("stage_models_invalid")
+    return {stage: value[stage] for stage in RESEARCH_STAGES}
+
+
+def selected_stage_model(workspace: Path, stage: str, *, quest_ref=None, run_ref=None,
+                         target_ref=None, default: str) -> str:
+    if stage not in RESEARCH_STAGES:
+        return default
+    root = _data_root(workspace)
+    if root is None or not any((quest_ref, run_ref, target_ref)):
+        return default
+    initial = _initial_conditions(root, quest_ref=quest_ref, run_ref=run_ref, target_ref=target_ref)
+    if initial is None:
+        return default
+    return _stage_models(_read(root, *initial).get("stage_models"))[stage]
+
+
+def _value(quest_ref: str, text: str, research_style: str = 'balanced', literature_configuration=None, stage_models=None) -> dict[str, object]:
     fields = {'quest_ref': quest_ref, 'text': text,
               'research_style': validate_research_style(research_style)}
     if literature_configuration is not None:
         fields["literature_configuration"] = _literature_configuration(literature_configuration)
+    if stage_models is not None:
+        fields['stage_models'] = _stage_models(stage_models)
     return {**fields, 'revision': canonical_hash(fields)}
 
 
@@ -232,7 +257,7 @@ def _stored_value(scope: str, encoded: str, revision: str) -> dict[str, str]:
     ):
         raise OwnerConflict("runtime_conditions_invalid")
     try:
-        expected = _value(scope, value["text"], value["research_style"], value.get("literature_configuration"))
+        expected = _value(scope, value["text"], value["research_style"], value.get("literature_configuration"), value.get("stage_models"))
     except (TypeError, ValueError) as error:
         raise OwnerConflict("runtime_conditions_invalid") from error
     if value != expected or value.get("revision") != revision:
@@ -331,19 +356,24 @@ def read_runtime_conditions_in_transaction(
     return _stored_value(quest_ref, row.value_json, row.revision)
 
 
-def read_runtime_conditions(workspace: Path, quest_ref: str) -> dict[str, str]:
+def read_runtime_conditions(workspace: Path, quest_ref: str) -> dict[str, object]:
     root = _data_root(workspace)
     if root is None:
         raise OwnerConflict("runtime_conditions_unavailable")
     initial = _initial_conditions(root, quest_ref=quest_ref)
     if initial is None:
         raise OwnerConflict("runtime_conditions_quest_not_found")
-    return _read(root, *initial)
+    return _editable_conditions(_read(root, *initial))
+
+
+def _editable_conditions(value):
+    return {**value, "stage_models": _stage_models(value.get("stage_models")),
+            "available_stage_models": list(SUPPORTED_CODEX_MODEL_REFS)}
 
 
 def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
                             expected_revision: str, research_style: str | None = None,
-                            literature_configuration=None) -> dict[str, str]:
+                            literature_configuration=None, stage_models=None) -> dict[str, object]:
     if not isinstance(text, str) or not text.strip() or len(text) > _LIMIT:
         raise OwnerConflict("runtime_conditions_text_invalid")
     with _LOCK:
@@ -354,7 +384,8 @@ def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
         assert root is not None
         scope = current["quest_ref"]
         saved = _value(scope, text, current['research_style'] if research_style is None else research_style,
-                       current.get("literature_configuration") if literature_configuration is None else literature_configuration)
+                       current.get("literature_configuration") if literature_configuration is None else literature_configuration,
+                       current["stage_models"] if stage_models is None else stage_models)
         with closing(sqlite3.connect(root / "meta-research.sqlite3", timeout=5.0)) as db:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("PRAGMA busy_timeout=5000")
@@ -392,7 +423,7 @@ def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
             if changed != 1:
                 raise OwnerConflict("runtime_conditions_stale")
             db.commit()
-        return saved
+        return _editable_conditions(saved)
 
 
 def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
@@ -405,7 +436,7 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
     if initial is None:
         return ""
     current = _read(root, *initial)
-    public = {key: value for key, value in current.items() if key != "literature_configuration"}
+    public = {key: value for key, value in current.items() if key not in {"literature_configuration", "stage_models"}}
     return (
         "本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。"
         "同类旧运行条件以本段为准；已经接纳的研究成果、精确输入与正式授权仍按原记录核验。\n"

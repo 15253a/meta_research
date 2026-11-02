@@ -521,6 +521,7 @@ class _Owner:
         generation: int,
         invocation_hash: str,
         resume: bool,
+        model_ref: str | None = None,
     ) -> None:
         assert run_ref == self.run.run_ref
         assert resume is (self.run.native_session_ref is not None)
@@ -531,6 +532,7 @@ class _Owner:
                 harness_family=self.run.harness_family,
                 generation=generation,
                 invocation_hash=invocation_hash,
+                model_ref=model_ref,
                 status="running",
                 outcome_code=None,
             )

@@ -127,7 +127,7 @@ from meta_research.deepfetch import (
     validate_deepfetch_activity_events,
     validate_runtime_binding,
 )
-from meta_research.codex_runtime import CODEX_REASONING_EFFORT_BINDING
+from meta_research.codex_runtime import CODEX_MODEL_REF, CODEX_REASONING_EFFORT_BINDING, SUPPORTED_CODEX_MODEL_REFS
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
     IDEA_REVIEW_SCHEMA_REF,
@@ -25676,7 +25676,8 @@ def _validated_runtime_binding(
             and not operation_binding_resources
         )
     )
-    profile = root_capability_profile(cast(RootAgentKind, stage))
+    profile = root_capability_profile(cast(RootAgentKind, stage),
+        binding.model_ref if binding.model_ref in SUPPORTED_CODEX_MODEL_REFS else CODEX_MODEL_REF)
     allowed_root_bindings = set(profile.runtime_bindings())
     if allow_historical_root_profile:
         from meta_research.runtime_binding_compatibility import reviewed_historical_root_profile_hashes

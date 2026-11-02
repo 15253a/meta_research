@@ -310,7 +310,7 @@ test("a real BundleExhaustion exposes its public basis and remains a Cycle resul
   expect(decisionReceiptRef).toBeTruthy();
 
   const bundlePosition = page.getByRole("list", {
-    name: "当前 Cycle 的四个可能 Stage",
+    name: "本轮研究可开展的四类工作",
   }).locator('[data-stage-position="bundle"]');
   await expect(bundlePosition).toHaveAttribute("data-stage-state", "result");
 });

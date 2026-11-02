@@ -11,6 +11,8 @@ from test_harness_frozen_terminal_recovery import interrupted_root  # noqa: F401
 def test_target_conditions_survive_recovery_and_refresh_on_next_turn(request, monkeypatch):
     conditions = ["用户选择 GPU-A100-1，预算30d"]
     scopes = []
+    selected = ["gpt-5.6-sol"]
+    monkeypatch.setattr("meta_research.harness.selected_stage_model", lambda *args, **kwargs: selected[0])
 
     def current(_workspace, **scope):
         scopes.append(scope)
@@ -25,6 +27,8 @@ def test_target_conditions_survive_recovery_and_refresh_on_next_turn(request, mo
     first = owner.latest_operation(run.run_ref)
     assert scopes == [{"run_ref": run.run_ref, "target_ref": target_request.target_ref}]
 
+    assert first.model_ref == selected[0]
+    selected[0] = "gpt-6.1-sol"
     conditions[0] = "当前仅使用 GPU-A100-2，预算7d"
     with pytest.raises(HarnessAdmissionError, match="provider_stopped"):
         runtime().run_or_resume_target_root(
@@ -48,6 +52,8 @@ def test_target_conditions_survive_recovery_and_refresh_on_next_turn(request, mo
         conditions[0], "Original frozen Target work.",
     )
     assert runner.continuation_argv[-3:] == ["resume", "retained-native-session", "-"]
+    assert runner.continuation_argv[runner.continuation_argv.index("--model") + 1] == first.model_ref
+    assert owner.latest_operation(run.run_ref).model_ref == first.model_ref
     assert runner.calls == 2
     assert owner.latest_operation(run.run_ref).generation == 2
 
