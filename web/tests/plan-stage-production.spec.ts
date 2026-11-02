@@ -303,7 +303,7 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
     transitionedForeground.question_ref,
   );
   const stageStrip = page.getByRole("list", {
-    name: "当前 Cycle 的四个可能 Stage",
+    name: "本轮研究可开展的四类工作",
   });
   await expect(stageStrip.locator('[data-stage-position="plan"]'))
     .toHaveAttribute("data-stage-state", "result");

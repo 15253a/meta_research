@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 from meta_research.idea_skill import (
     IdeaSkillUnavailable, _compile_codex_output_schema,
     _decode_codex_provider_output, _operation_transport_limits,
-    _read_completed_operation, _read_operation_invocation, _read_spool_text,
+    _read_completed_operation, _read_operation_invocation, _read_sealed_operation_invocation, _read_spool_text,
     _unwrap_codex_root_output, _verified_operation_inputs,
 )
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -26,21 +26,18 @@ def _completed_operation(adapter, request, operation_name, raw_schema):
     """
     directory = (adapter._workspace / "provider-operations"
                  / canonical_hash({"job_ref": request.job_ref}) / operation_name)
-    envelope = json.loads(_read_spool_text(directory / "invocation.json", 128 * 1024))
-    invocation = envelope["payload"]
-    if not isinstance(invocation, dict):
-        raise ValueError("invalid invocation")
+    _key_path, key = adapter._transport_key()
+    invocation = _read_sealed_operation_invocation(directory / "invocation.json", key=key)
     expected = {k: v for k, v in invocation.items() if k != "transport_mode"}
-    profile = root_capability_profile(adapter._root_agent_kind)
+    profile = root_capability_profile(adapter._root_agent_kind, invocation["model_ref"])
     expected.update(
         job_ref=request.job_ref, operation_name=operation_name,
-        native_session_ref=request.native_session_ref, model_ref=adapter._model_ref,
+        native_session_ref=request.native_session_ref, model_ref=invocation["model_ref"],
         root_capability_profile=profile.as_dict(),
         root_capability_profile_hash=profile.digest,
         output_schema_hash=canonical_hash(_compile_codex_output_schema(raw_schema)),
         mcp_url=adapter._resident_mcp_base_url + "/mcp",
     )
-    _key_path, key = adapter._transport_key()
     invocation = _read_operation_invocation(
         directory / "invocation.json", key=key, expected_base=expected,
     )

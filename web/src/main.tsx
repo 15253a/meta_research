@@ -1597,14 +1597,14 @@ function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
         {question?.title ?? question?.unknown_statement ?? "当前研究问题"}<br />
         <em>{currentPurpose}</em>
       </h1>
-      <p>围绕同一个研究问题展开；以下四类工作按实际需要进入或跳过。</p>
+      <p>一轮研究围绕一个问题确定重心，按需要开展工作，再根据所得决定下一轮做什么。每轮用时由实际工作决定。</p>
       <details className="lumen-cycle-identity">
         <summary>查看本轮研究标识</summary>
-        <p>Question <code>{foreground.question_ref}</code> · Cycle <code>{foreground.cycle_ref}</code></p>
+        <p>研究问题 <code>{foreground.question_ref}</code> · 本轮研究 <code>{foreground.cycle_ref}</code></p>
       </details>
       <ol
         className="lumen-cycle-stage-map"
-        aria-label="当前 Cycle 的四个可能 Stage"
+        aria-label="本轮研究可开展的四类工作"
       >
         {stagePositions.map(({ kind, position, purpose }) => {
           const surface = surfaces.find((candidate) => candidate.kind === kind) ?? null;
@@ -2032,7 +2032,7 @@ function IdeaStageCard({
       <details className="lumen-idea-details">
         <summary>技术身份与核验记录</summary>
         <dl>
-          <IdeaDetail label="Cycle" value={ideaStage.eligibility.cycle_ref} />
+          <IdeaDetail label="研究轮次" value={ideaStage.eligibility.cycle_ref} />
           <IdeaDetail
             label="Eligibility reason"
             value={reasonCode(ideaStage.eligibility.reason)}
@@ -2420,7 +2420,7 @@ function PlanStageCard({
       <details className="lumen-idea-details">
         <summary>技术身份与核验记录</summary>
         <dl>
-          <IdeaDetail label="Cycle" value={planStage.eligibility.cycle_ref} />
+          <IdeaDetail label="研究轮次" value={planStage.eligibility.cycle_ref} />
           <IdeaDetail
             label="Eligibility reason"
             value={reasonCode(planStage.eligibility.reason)}
@@ -3272,7 +3272,7 @@ function BundleStageCard({
       <details className="lumen-idea-details">
         <summary>技术身份与核验记录</summary>
         <dl>
-          <IdeaDetail label="Cycle" value={bundleStage.eligibility.cycle_ref} />
+          <IdeaDetail label="研究轮次" value={bundleStage.eligibility.cycle_ref} />
           <IdeaDetail label="FormalPlan" value={bundleStage.eligibility.formal_plan_ref} />
           <IdeaDetail label="StageRunRequest" value={request?.request_ref} />
           <IdeaDetail label="StageRunRequest receipt" value={receiptRef(request?.receipt)} />
@@ -3450,7 +3450,7 @@ function reasoningFactRows(
         : transition.status === "proposed" ? "current" : "pending",
       title: transition.status === "proposed"
         ? `${transition.kind ?? "Transition"} 已提出，但尚不等于后继已接纳或 Quest 已结束`
-        : "等待唯一 NextCycleProposal 或 CandidateCompletion",
+        : "正在判断下一轮的研究重心，或评估课题是否已完成",
       status: transition.status,
     },
     {
@@ -3567,7 +3567,7 @@ function ReasoningStageCard({
       <details className="lumen-idea-details">
         <summary>技术身份与核验记录</summary>
         <dl>
-          <IdeaDetail label="Cycle" value={reasoningStage.eligibility.cycle_ref} />
+          <IdeaDetail label="研究轮次" value={reasoningStage.eligibility.cycle_ref} />
           <IdeaDetail label="StageRunRequest" value={request?.request_ref} />
           <IdeaDetail label="StageRunRequest receipt" value={receiptRef(request?.receipt)} />
           <IdeaDetail label="Foreground epoch" value={request?.epoch} />
@@ -4125,10 +4125,10 @@ function WorkspaceMain({
         {snapshot && foreground && !showingLiveOverview ? <div className="research-current-heading" data-testid="current-cycle-overview" data-cycle-ref={foreground.cycle_ref} data-question-ref={foreground.question_ref}>
           <div className="research-current-topline">
             <p className="lumen-eyebrow">当前研究问题</p>
-            <div className="research-cycle-badge" aria-live="polite" data-cycle-ref={foreground.cycle_ref}>
-              <span>当前 Cycle</span>
+            <div className="research-cycle-badge" title="一轮研究围绕当前问题组织工作，再根据所得安排下一轮。每轮用时由实际工作决定。" aria-live="polite" data-cycle-ref={foreground.cycle_ref}>
+              <span>当前研究轮次</span>
               <b>{overview.data ? cycleOrdinalLabel(overview.data.cycle_ordinal) : overview.error ? "轮次暂不可用" : "正在读取轮次…"}</b>
-              {overview.error && !overview.data ? <button type="button" onClick={overview.retry} aria-label="重新读取 Cycle 轮次">↻</button> : null}
+              {overview.error && !overview.data ? <button type="button" onClick={overview.retry} aria-label="重新读取研究轮次">↻</button> : null}
             </div>
           </div>
           <h1 id="workspace-title">{currentQuestion?.title ?? currentQuestion?.unknown_statement ?? "当前研究问题"}</h1>

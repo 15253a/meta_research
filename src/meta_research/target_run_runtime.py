@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Protocol
 
 from meta_research.database import Database
+from meta_research.codex_runtime import DEFAULT_STAGE_MODEL
+from meta_research.runtime_conditions import selected_stage_model
 from meta_research.context_presentation import STAGE_CONTEXT_DELIVERY_GUIDANCE
 from meta_research.bundle_protocol import (
     FormalPlan,
@@ -200,6 +202,9 @@ class TargetRunRuntime:
                     target_run_ref=launch.target_run_ref,
                     harness_family=self._harness_family,  # type: ignore[arg-type]
                     target_scope_binding=scope_binding,
+                    model_ref=(selected_stage_model(self._database.path.parent, "target",
+                               target_ref=target_ref, default=DEFAULT_STAGE_MODEL)
+                               if self._database is not None else DEFAULT_STAGE_MODEL),
                 )
             except HarnessAdmissionError as error:
                 self._set_status(

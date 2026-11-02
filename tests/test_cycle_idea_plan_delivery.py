@@ -55,7 +55,7 @@ def test_plan_reads_role_contracts_on_demand_and_preserves_revision_input(tmp_pa
 
 def test_idea_delivers_method_without_forcing_optional_checklist(tmp_path):
     from meta_research.idea_skill import CodexIdeaSkillAdapter
-    from test_idea_skill_contract import _request as idea_request, _idea_set, _SequenceRunner as IdeaRunner
+    from test_idea_skill_contract import _request as idea_request, _idea_set, _provider_idea_message, _SequenceRunner as IdeaRunner
     outcome = _idea_set()
     outcome["notes"] = "保留当前证据边界，交 Plan 判断具体投入。"
     for candidate in outcome["candidates"]:
@@ -70,4 +70,4 @@ def test_idea_delivers_method_without_forcing_optional_checklist(tmp_path):
     schema = delegate.calls[0][2]
     # Provider output transport must allow the same focused candidate as the domain contract.
     from jsonschema import Draft202012Validator
-    Draft202012Validator(schema).validate({"outcome": outcome})
+    Draft202012Validator(schema).validate(_provider_idea_message(outcome))

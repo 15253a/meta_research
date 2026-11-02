@@ -279,7 +279,7 @@ def test_system_help_handoff_returns_to_the_exact_retry_action_in_all_formats(tm
         url = f"/api/v1/human-requests/{quote(request['request_ref'], safe='')}"
         handoff = client.get(url + "/handoff", params={"revision": 1}).json()
         instructions = next(section["paragraphs"] for section in handoff["sections"] if section["key"] == "return_instructions")
-        retry_instruction = "请回到本求助页面确认当前修订，然后点击“重试”以恢复当前精确操作；无需填写答复表单或上传材料。"
+        retry_instruction = "请在本求助页面核对当前请求，可填写已做的处理和核验结果，然后点击“重试”。原任务收到回执后继续核验恢复条件。"
         assert retry_instruction in instructions
         assert not any("选择实际要交回" in paragraph or "助手产物也须" in paragraph for paragraph in instructions)
         for extension in ("md", "html", "pdf"):

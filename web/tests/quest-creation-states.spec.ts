@@ -181,7 +181,7 @@ test("an upgraded recovering v1 Quest remains readable through the corrected Web
   );
   await expect(dialog.getByLabel("文献全文获取范围")).toHaveValue("oa_only");
   await expect(
-    dialog.getByText("正在从首个缺失 receipt 恢复", { exact: true }).first(),
+    dialog.getByText("正在继续尚未完成的创建步骤", { exact: true }).first(),
   ).toBeVisible();
   expect(pageErrors).toEqual([]);
 
@@ -281,7 +281,7 @@ async function generateReadyProposal(dialog: Locator) {
 async function waitForReadyProposal(dialog: Locator) {
   await expect(
     dialog.getByText(
-      "正在依据精确 DraftRevision 生成六字段；Quest 配置和右侧 Session 仍可使用。",
+      "正在根据已保存的研究目标起草第一个问题。你可以继续使用右侧助手。",
       { exact: true },
     ),
   ).toBeVisible();
@@ -1189,11 +1189,11 @@ async function expectMinimumTouchTarget(locator: Locator) {
 
 async function openTechnicalDetails(dialog: Locator) {
   const details = dialog.locator("details", {
-    hasText: "查看 Preview、Owner 与 receipt 技术详情",
+    hasText: "查看创建预览与提交回执",
   });
   if ((await details.getAttribute("open")) === null) {
     await details.getByText(
-      "查看 Preview、Owner 与 receipt 技术详情",
+      "查看创建预览与提交回执",
       { exact: true },
     ).click();
   }
@@ -2010,7 +2010,7 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   await lateRegeneration.click();
   await expect(
     dialog.getByText(
-      "正在依据精确 DraftRevision 生成六字段；Quest 配置和右侧 Session 仍可使用。",
+      "正在根据已保存的研究目标起草第一个问题。你可以继续使用右侧助手。",
       { exact: true },
     ),
   ).toBeVisible();
@@ -2130,7 +2130,7 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   await expect(
     dialog.getByText("正在创建；重复确认已禁用，可安全关闭后恢复", { exact: true }),
   ).toBeVisible();
-  await expect(dialog.getByText("正在从首个缺失 receipt 恢复", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("正在继续尚未完成的创建步骤", { exact: true })).toBeVisible();
   await expect(dialog).toBeHidden({ timeout: 15_000 });
   const completedFirst = await waitForPublicStatus(
     page,
@@ -2177,12 +2177,12 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   ({ dialog } = await openCreation(page));
   await expect(
     dialog.getByText(
-      /Quest 已创建，第一个问题尚未完成|正在从首个缺失 receipt 恢复/,
+      /Quest 已创建，第一个问题尚未完成|正在继续尚未完成的创建步骤/,
     ).first(),
   ).toBeVisible();
   await waitForPublicStatus(page, second!.initialization_id, "recovering");
   await expect(
-    dialog.getByText("正在从首个缺失 receipt 恢复", { exact: true }).first(),
+    dialog.getByText("正在继续尚未完成的创建步骤", { exact: true }).first(),
   ).toBeVisible();
   await waitForPublicStatus(page, second!.initialization_id, "partial");
   await expect(

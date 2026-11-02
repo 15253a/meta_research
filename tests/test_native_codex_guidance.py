@@ -8,6 +8,8 @@ import time
 
 import pytest
 
+from test_idea_skill_contract import _provider_idea_message
+
 from meta_research.provider_supervisor import (
     ensure_transport_key, read_transport_envelope, write_transport_envelope,
 )
@@ -221,7 +223,7 @@ def test_driver_and_production_adapter_reconcile_unknown_generate_in_the_origina
     class NativeIdea(CodexIdeaSkillAdapter):
         def generate_draft(self, request):
             candidate = _DeterministicIdeaSkill().generate_draft(request)
-            server.with_suffix('.payload').write_text(json.dumps({"outcome": candidate.draft}))
+            server.with_suffix('.payload').write_text(json.dumps(_provider_idea_message(candidate.draft)))
             result = super().generate_draft(request)
             observed.append(result)
             return result
@@ -303,7 +305,7 @@ for line in sys.stdin:
                 # A structurally valid title-copy candidate is rejected by RG.
                 # Its real same-root correction must resume the old native id.
                 candidate.draft['candidates'][0]['direction'] = request.accepted_question_content['title']
-            server.with_suffix('.payload').write_text(json.dumps({'outcome': candidate.draft}))
+            server.with_suffix('.payload').write_text(json.dumps(_provider_idea_message(candidate.draft)))
             try:
                 result = super().generate_draft(request)
             except IdeaSkillUnavailable as error:
@@ -525,7 +527,7 @@ def test_confirmed_guidance_reaches_the_active_driver_adapter_and_native_turn(tm
     class NativeIdea(CodexIdeaSkillAdapter):
         def generate_draft(self, request):
             candidate = _DeterministicIdeaSkill().generate_draft(request)
-            server.with_suffix('.payload').write_text(json.dumps({"outcome": candidate.draft}))
+            server.with_suffix('.payload').write_text(json.dumps(_provider_idea_message(candidate.draft)))
             result = super().generate_draft(request)
             observed.append(result)
             return result

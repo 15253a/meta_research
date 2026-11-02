@@ -841,7 +841,7 @@ def _bundle_target_operations(
             input_schema=_target_ref_schema(),
             output_schema=_target_launch_request_output_schema(),
             handler=lambda context, arguments: _read_target_launch_request(
-                research_graph, agent_runtime, context, arguments
+                advancement_engine, research_graph, agent_runtime, context, arguments
             ),
         ),
         *(item for pair in target_effects for item in pair),
@@ -852,7 +852,7 @@ def _bundle_target_operations(
             input_schema=_target_ref_schema(),
             output_schema=_target_frontier_output_schema(),
             handler=lambda context, arguments: _read_target_frontier(
-                research_graph, agent_runtime, context, arguments
+                advancement_engine, research_graph, agent_runtime, context, arguments
             ),
         ),
         SemanticOperation(
@@ -2544,14 +2544,33 @@ def _implementation_content_public(accepted: object) -> dict[str, object]:
     return value
 
 
+def _verify_bundle_read_target(
+    advancement_engine: AdvancementEngineInterface,
+    research_graph: ResearchGraphInterface,
+    agent_runtime: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    target_ref: str,
+) -> None:
+    request, run = _bundle_stage_run(advancement_engine, agent_runtime, context)
+    graph = research_graph.query_target_graph(request.request_ref)
+    if (graph is None or graph.run_ref != run.run_ref or graph.request_ref != request.request_ref
+            or not any(target.target_ref == target_ref for target in graph.targets)):
+        raise SemanticMcpError("target_outside_bundle_graph")
+
+
 def _read_target_launch_request(
+    advancement_engine: AdvancementEngineInterface,
     research_graph: ResearchGraphInterface,
     agent_runtime: AgentRuntimeInterface,
     context: SemanticCallContext,
     arguments: dict[str, object],
 ) -> dict[str, object]:
-    _verify_bundle_scope(agent_runtime, context)
-    request = research_graph.query_target_launch_request(str(arguments["target_ref"]))
+    target_ref = str(arguments["target_ref"])
+    _verify_bundle_read_target(advancement_engine, research_graph, agent_runtime, context, target_ref)
+    try:
+        request = research_graph.query_target_launch_request(target_ref)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
     try:
         validate_target_launch_request(request)
     except BundleProtocolError as error:
@@ -2669,16 +2688,30 @@ def _verify_target_dispatch(
 
 
 def _read_target_frontier(
+    advancement_engine: AdvancementEngineInterface,
     research_graph: ResearchGraphInterface,
     agent_runtime: AgentRuntimeInterface,
     context: SemanticCallContext,
     arguments: dict[str, object],
 ) -> dict[str, object]:
-    _verify_bundle_scope(agent_runtime, context)
     target_ref = str(arguments["target_ref"])
+    _verify_bundle_read_target(advancement_engine, research_graph, agent_runtime, context, target_ref)
     entry = agent_runtime.query_target_frontier_entry(target_ref)
     if entry is None:
         return {"status": "absent"}
+    if entry.state == "terminal":
+        # AR verified the entry against the sealed launch. Once RG commits
+        # the result, a new launch request for this Target is no longer valid.
+        commit = research_graph.query_target_frontier_commit_transition(target_ref)
+        if commit is not None:
+            handle = entry.current_handle
+            if (entry.target_ref != target_ref or handle.target_ref != target_ref
+                    or commit.target_ref != target_ref or commit.target_commit_ref != entry.terminal_fact_ref
+                    or commit.target_run_ref != handle.target_run_ref
+                    or commit.execution_attempt_ref != handle.execution_attempt_ref
+                    or commit.execution_fence_ref != handle.execution_fence_ref):
+                raise SemanticMcpError("target_frontier_currentness_invalid")
+            return {"status": "present", "entry": _frontier_public(entry)}
     request = research_graph.query_target_launch_request(target_ref)
     if (
         entry.target_spec_binding != request.target_spec_binding

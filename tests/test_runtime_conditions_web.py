@@ -89,10 +89,16 @@ def test_edit_conditions_through_authenticated_api_keeps_research_facts(tmp_path
         value = initial.json()
         assert "GPU-test-1" in value["text"] and "81920" in value["text"]
         assert "30d" in value["text"]
-        payload = {"text": "仅使用 GPU-test-1；优先完成 CPU 核验，再按需训练。", "expected_revision": value["revision"]}
+        assert value["stage_models"] == dict.fromkeys(("idea", "plan", "bundle", "target", "reasoning"), "gpt-6.1-sol")
+        assert "gpt-5.6-sol" in value["available_stage_models"]
+        selected = {**value["stage_models"], "plan": "gpt-5.6-sol"}
+        payload = {"stage_models": selected, "text": "仅使用 GPU-test-1；优先完成 CPU 核验，再按需训练。", "expected_revision": value["revision"]}
         assert client.put(url, json=payload).status_code == 403
+        for invalid in ({**selected, "companion": "gpt-5.6-sol"}, {**selected, "idea": "unknown"}, {"idea": "gpt-5.6-sol"}):
+            assert client.put(url, json={**payload, "stage_models": invalid}, headers=headers).status_code == 409
         saved = client.put(url, json=payload, headers=headers)
         assert saved.status_code == 200
+        assert saved.json()["stage_models"] == selected
         assert saved.json()["revision"] != value["revision"]
         assert client.get(url).json() == saved.json()
         assert payload["text"] in render_runtime_conditions(runtime.data_root.root, quest_ref=quest["quest_ref"])

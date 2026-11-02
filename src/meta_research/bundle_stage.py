@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from meta_research.idea_skill import stage_provider
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
 from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
 
@@ -326,7 +327,8 @@ class BundleStageWorker:
             return True
         run = self._agent_runtime.query_bundle_stage_run(request.request_ref)
         if run is None:
-            runtime_binding = self._current_runtime_binding()
+            provider = stage_provider(self._provider, quest_ref=current.question.quest_ref)
+            runtime_binding = self._current_runtime_binding(provider)
             if runtime_binding is None:
                 return False
             self._agent_runtime.admit_bundle_stage(
@@ -562,7 +564,8 @@ class BundleStageWorker:
                 result = None
                 try:
                     try:
-                        result = self._provider.propose_target_batch(batch_request)
+                        provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+                        result = provider.propose_target_batch(batch_request)
                         validate_bundle_target_batch_result(batch_request, result)
                     except BundleSkillUnavailable as error:
                         error = self._recover_stopped_error(error, run.run_ref)
@@ -823,7 +826,8 @@ class BundleStageWorker:
             result = None
             try:
                 try:
-                    result = self._provider.schedule_target(dispatch_request)
+                    provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+                    result = provider.schedule_target(dispatch_request)
                     validate_bundle_dispatch_result(dispatch_request, result)
                     if (
                         result.action == "dispatch"
@@ -2727,7 +2731,8 @@ class BundleStageWorker:
             run.runtime_binding, BundleRuntimeBinding
         ):
             raise OwnerConflict("bundle_runtime_binding_invalid")
-        runtime_binding = self._current_runtime_binding()
+        provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+        runtime_binding = self._current_runtime_binding(provider)
         if runtime_binding is None:
             return False
         if not bundle_bindings_compatible(runtime_binding, run.runtime_binding):
@@ -2815,7 +2820,7 @@ class BundleStageWorker:
             draft = None
             try:
                 try:
-                    draft = self._provider.generate_draft(skill_request)
+                    draft = provider.generate_draft(skill_request)
                     draft_hash = validate_bundle_skill_draft(skill_request, draft)
                 except BundleSkillUnavailable as error:
                     error = self._recover_stopped_error(error, run.run_ref)
@@ -2956,7 +2961,7 @@ class BundleStageWorker:
             result = None
             try:
                 try:
-                    result = self._provider.review_draft(skill_request, draft)
+                    result = provider.review_draft(skill_request, draft)
                     if not isinstance(result, BundleExhaustionSkillResult):
                         raise BundleSkillContractError(
                             "bundle_skill_result_invalid"
@@ -3084,7 +3089,7 @@ class BundleStageWorker:
             return False
         result = None
         try:
-            result = self._provider.review_draft(skill_request, draft)
+            result = provider.review_draft(skill_request, draft)
             if not isinstance(result, BundleSkillResult):
                 raise BundleSkillContractError(
                     "bundle_skill_result_invalid"
@@ -3500,14 +3505,14 @@ class BundleStageWorker:
             if error.code != "runtime_provider_unit_not_found":
                 raise
 
-    def _current_runtime_binding(self) -> BundleRuntimeBinding | None:
+    def _current_runtime_binding(self, provider) -> BundleRuntimeBinding | None:
         if self._harnesses is None:
             self._transient_error = (
                 "bundle_harness_operation_binding_unavailable"
             )
             return None
         try:
-            runtime_binding = self._provider.runtime_binding()
+            runtime_binding = provider.runtime_binding()
         except (BundleSkillUnavailable, HarnessAdmissionError) as error:
             self._transient_error = error.code
             return None
@@ -3516,7 +3521,8 @@ class BundleStageWorker:
     def _runtime_binding_is_current(self, run: BundleStageRun) -> bool:
         if not isinstance(run.runtime_binding, BundleRuntimeBinding):
             raise OwnerConflict("bundle_runtime_binding_invalid")
-        current = self._current_runtime_binding()
+        provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+        current = self._current_runtime_binding(provider)
         if current is None:
             return False
         if not bundle_bindings_compatible(current, run.runtime_binding):

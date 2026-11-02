@@ -412,6 +412,11 @@ def test_owner_rejection_requires_a_material_successor_with_exact_lineage() -> N
     )
 
 
+def _provider_idea_message(outcome):
+    return {"outcome": {"kind": outcome["kind"],
+                        "payload": {key: value for key, value in outcome.items() if key != "kind"}}}
+
+
 class _SequenceRunner:
     def __init__(
         self,
@@ -447,6 +452,8 @@ class _SequenceRunner:
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         output_path = Path(argv[argv.index("--output-last-message") + 1])
         output = next(self._outputs)
+        if isinstance(output.get("outcome"), dict) and output["outcome"].get("kind") in {"IdeaSet", "NoViableCandidate"}:
+            output = _provider_idea_message(output["outcome"])
         output_path.write_text(json.dumps(output, ensure_ascii=False), encoding="utf-8")
         thread_id = (
             next(self._thread_ids)
@@ -1172,7 +1179,7 @@ class _ExitFailureRunner:
         self.calls += 1
         output_path = Path(argv[argv.index("--output-last-message") + 1])
         output_path.write_text(
-            json.dumps({"outcome": _idea_set()}, ensure_ascii=False),
+            json.dumps(_provider_idea_message(_idea_set()), ensure_ascii=False),
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(
@@ -1314,7 +1321,7 @@ def _fake_codex_executable(
         if read_all_input
         else "os.read(sys.stdin.fileno(), 1)"
     )
-    encoded_outcome = repr(json.dumps({"outcome": _idea_set()}, ensure_ascii=False))
+    encoded_outcome = repr(json.dumps(_provider_idea_message(_idea_set()), ensure_ascii=False))
     path.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
@@ -1338,7 +1345,7 @@ def _fake_codex_executable(
 
 
 def _descendant_codex_executable(path: Path, child_pid_path: Path) -> Path:
-    encoded_outcome = repr(json.dumps({"outcome": _idea_set()}, ensure_ascii=False))
+    encoded_outcome = repr(json.dumps(_provider_idea_message(_idea_set()), ensure_ascii=False))
     path.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
@@ -1383,6 +1390,8 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert result.adapter_kind == "codex_cli"
     assert len(runner.calls) == 1
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
+    assert "本回合的最终答复就是提交入口" in primary_prompt
+    assert "交回 NoViableCandidate 并给出科学依据" in primary_prompt
     assert primary_argv[:2] == ["codex", "exec"]
     assert primary_argv[2:4] == ["--enable", "multi_agent"]
     assert "--ignore-user-config" not in primary_argv
@@ -1430,8 +1439,23 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert "context_pack_hash=" + request.context_pack_hash in primary_prompt
     assert "不得创建 Question、Plan、Run、receipt" in primary_prompt
     assert set(primary_schema["properties"]) == {"outcome"}
-    assert "anyOf" in primary_schema["properties"]["outcome"]
+    for variant in primary_schema["properties"]["outcome"]["anyOf"]:
+        assert list(variant["properties"]) == ["kind", "payload"]
+        assert "kind" not in variant["properties"]["payload"]["properties"]
     _assert_codex_schema_types(primary_schema)
+
+
+@pytest.mark.parametrize("scientific_outcome", [_idea_set, _no_viable_candidate])
+def test_primary_result_tag_survives_signed_replay_without_changing_domain_fields(tmp_path, scientific_outcome):
+    outcome = scientific_outcome()
+    workspace = tmp_path / "tagged-provider"
+    runner = _SequenceRunner([{"outcome": outcome}])
+    adapter = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    request = _request(runtime_binding=adapter.runtime_binding(), job_ref="idea:tagged")
+    first = adapter.generate_draft(request)
+    assert first.draft == outcome
+    restored = CodexIdeaSkillAdapter(workspace, process_runner=_SequenceRunner([]))
+    assert restored.generate_draft(request) == first
 
 
 def test_idea_root_invocation_uses_and_revokes_its_operation_tree_channel(
@@ -2720,7 +2744,7 @@ def test_result_limit_does_not_limit_native_session_files(
     workspace = tmp_path / "native-session-file-budget"
     session_file = tmp_path / "native-session.jsonl"
     executable = tmp_path / "fake-codex-large-native-session"
-    encoded_outcome = repr(json.dumps({"outcome": _idea_set()}, ensure_ascii=False))
+    encoded_outcome = repr(json.dumps(_provider_idea_message(_idea_set()), ensure_ascii=False))
     executable.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"

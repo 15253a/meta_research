@@ -39,6 +39,30 @@ async function submit(page: Page, note: string) {
   return dialog;
 }
 
+test("system-help retry keeps the operator note with the exact response after reload", async ({ page }) => {
+  const { request, snapshot } = await workspace(page, route => route.abort());
+  Object.assign(request, { kind: "system_operation_help", obligation: "恢复当前实验的工作目录" });
+  await page.goto("http://localhost:18773/?workspace=1&panel=system-operation-help");
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项", exact: true });
+  const note = "工作目录读写已核对，请在原任务中重试 GPU 操作。";
+  await page.route("**/api/v1/human-requests/*/retry", async route => {
+    expect(decodeURIComponent(new URL(route.request().url()).pathname)).toBe(`/api/v1/human-requests/${request.request_ref}/retry`);
+    expect(route.request().postDataJSON()).toEqual({ note });
+    expect(route.request().headers()["idempotency-key"]).toBeTruthy();
+    Object.assign(request, { responses: [{ response_ref: "retry-receipt", decision: "provided", note, facts: { action: "retry" } }] });
+    snapshot.revision += 1;
+    await route.fulfill({ json: { ...request, retry: { status: "processing" } } });
+  });
+  await dialog.getByLabel("处理说明（可选）").fill(note);
+  await dialog.getByRole("button", { name: "重试", exact: true }).click();
+  await expect(dialog.getByText(note, { exact: false }).first()).toBeVisible();
+  await page.reload();
+  await expect(dialog).toContainText("重试进行中");
+  await expect(dialog).toContainText(note);
+  await dialog.getByText("查看重试回执").click();
+  await expect(dialog.getByText("retry-receipt", { exact: true })).toBeVisible();
+});
+
 test("lost acknowledgement remains unknown and automatically reconciles the sealed original in its window", async ({ page }, testInfo) => {
   const attempts: Array<{key: string; body: Json}> = [];
   let recover = false;

@@ -135,15 +135,15 @@ function lifecycleCopy(item: QuestionTreeItem): string {
 function cycleBindingCopy(item: QuestionTreeItem): string {
   const binding = item.cycle_binding;
   if (binding.status === "not_bound") {
-    return "未绑定当前 Cycle";
+    return "本轮未选择这个问题";
   }
   if (binding.status === "unavailable") {
-    return "当前 Cycle 信息不可用";
+    return "本轮研究的信息暂不可用";
   }
   if (!binding.foreground || !binding.cycle_ref) {
-    return "当前 Cycle 绑定信息不完整";
+    return "暂时无法确认本轮是否在研究这个问题";
   }
-  return `${binding.cycle_ref} · ${binding.foreground.stage} · epoch ${binding.foreground.epoch} · ${binding.foreground.status}`;
+  return `本轮已选择这个问题 · ${binding.foreground.stage} 阶段`;
 }
 
 function cycleBindingTechnicalCopy(item: QuestionTreeItem): string {
@@ -1321,7 +1321,7 @@ export function QuestionTree({
             </div>
             <div className="question-tree-inspector-facts">
               <div><small>问题状态</small><b>{lifecycleCopy(selected)}</b></div>
-              <div><small>当前 Cycle / Stage</small><b>{cycleBindingCopy(selected)}</b></div>
+              <div><small>本轮研究进展</small><b>{cycleBindingCopy(selected)}</b></div>
               <div><small>HumanRequest</small><b>{relatedHumanRequestCopy(selected)}</b></div>
               <div>
                 <small>最远已接纳 Stage 结果</small>
@@ -1337,7 +1337,7 @@ export function QuestionTree({
                 </div>
                 <div><small>Question fact / RG</small><b>{selected.question_ref} · {selected.question_receipt_ref} · {selected.schema_ref}</b></div>
                 <div><small>Content fact / RM</small><b>{selected.content_ref} · {selected.content_hash}</b></div>
-                <div><small>Cycle binding / AE</small><b>{cycleBindingTechnicalCopy(selected)}</b></div>
+                <div><small>研究轮次与执行记录</small><b>{cycleBindingTechnicalCopy(selected)}</b></div>
                 <div><small>HumanRequest / Owner</small><b>{relatedHumanRequestTechnicalCopy(selected)}</b></div>
                 <div>
                   <small>Accepted result</small>

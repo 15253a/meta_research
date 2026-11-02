@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import cast
 
+from meta_research.idea_skill import stage_provider
 from meta_research.feed import DurableFeed
 from meta_research.human_guidance import GuidanceRuntimeScope, StageGuidanceOperation
 from meta_research.runtime_binding_compatibility import reasoning_bindings_compatible
@@ -168,7 +169,7 @@ class ReasoningStageWorker:
         run = self._agent_runtime.query_reasoning_stage_run(request.request_ref)
         if run is None:
             try:
-                runtime_binding = self._provider.runtime_binding()
+                runtime_binding = stage_provider(self._provider, quest_ref=current.question.quest_ref).runtime_binding()
             except ReasoningSkillUnavailable as error:
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
@@ -383,7 +384,8 @@ class ReasoningStageWorker:
 
     def _decide_after_deepfetch(self, request, run, facts):
         checkpoint = run.autonomous_checkpoint
-        if not reasoning_bindings_compatible(self._provider.runtime_binding(), run.runtime_binding):
+        provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+        if not reasoning_bindings_compatible(provider.runtime_binding(), run.runtime_binding):
             self._transient_error = "reasoning_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
         base_job_ref = "reasoning-deepfetch-decision_" + canonical_hash({"checkpoint": checkpoint.checkpoint_ref, "facts": facts})
@@ -403,7 +405,7 @@ class ReasoningStageWorker:
             operation = self._freeze_completion_operation(
                 run, job_ref, "autonomous-resume", unit_ref
             )
-            decision = self._provider.decide_after_deepfetch(skill_request, checkpoint.checkpoint, facts, summary)
+            decision = provider.decide_after_deepfetch(skill_request, checkpoint.checkpoint, facts, summary)
             if isinstance(decision.get("final_output"), dict):
                 decision = {**decision, "final_output": _assemble_provider_document(
                     skill_request, decision["final_output"],
@@ -470,7 +472,8 @@ class ReasoningStageWorker:
         if not isinstance(run.runtime_binding, ReasoningRuntimeBinding):
             raise OwnerConflict("reasoning_runtime_binding_invalid")
         try:
-            runtime_binding = self._provider.runtime_binding()
+            provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+            runtime_binding = provider.runtime_binding()
         except ReasoningSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
@@ -519,7 +522,7 @@ class ReasoningStageWorker:
             draft = None
             try:
                 try:
-                    draft = self._provider.generate_draft(skill_request)
+                    draft = provider.generate_draft(skill_request)
                     draft = replace(draft, draft=_assemble_provider_document(
                         skill_request, draft.draft,
                     ))
@@ -672,7 +675,7 @@ class ReasoningStageWorker:
                 operation = self._freeze_completion_operation(
                     run, job_ref, "review", unit_ref
                 )
-                result = self._provider.review_draft(skill_request, draft)
+                result = provider.review_draft(skill_request, draft)
                 result = _assemble_provider_result(skill_request, result)
                 if isinstance(result, ReasoningAutonomousCheckpointResult):
                     (
@@ -1036,7 +1039,8 @@ class ReasoningStageWorker:
         if not isinstance(run.runtime_binding, ReasoningRuntimeBinding):
             raise OwnerConflict("reasoning_runtime_binding_invalid")
         try:
-            runtime_binding = self._provider.runtime_binding()
+            provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+            runtime_binding = provider.runtime_binding()
         except ReasoningSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
@@ -1067,7 +1071,7 @@ class ReasoningStageWorker:
                 operation = self._freeze_completion_operation(
                     run, job_ref, "autonomous-resume", unit_ref
                 )
-                result = self._provider.resume_after_autonomous_creation(
+                result = provider.resume_after_autonomous_creation(
                     skill_request,
                     checkpoint,
                     creation_result,

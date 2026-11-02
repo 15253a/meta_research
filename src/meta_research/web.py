@@ -521,6 +521,11 @@ class ReleaseEligibilityRequest(BaseModel):
     expected_reference_revision: int | None = Field(default=None, ge=0)
 
 
+class HumanRequestRetryCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    note: str = Field(default="", max_length=4000)
+
+
 class EmptyCommandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -758,6 +763,7 @@ class RuntimeConditionsRequest(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
     research_style: Literal['focus', 'balanced', 'open'] | None = None
     literature_configuration: dict[str, object] | None = None
+    stage_models: dict[str, str] | None = None
 
 
 def create_app(
@@ -1641,7 +1647,7 @@ def create_app(
     def retry_human_request_operation(
         request_ref: str,
         request: Request,
-        _command: EmptyCommandRequest,
+        command: HumanRequestRetryCommand,
     ) -> dict[str, object]:
         def agent_retry_result(current: dict[str, object]) -> dict[str, object]:
             open_effect = current.get("open_effect")
@@ -1693,11 +1699,12 @@ def create_app(
         response_key = "system-operation-retry:" + canonical_hash(
             {"request_ref": request_ref, "idempotency_key": idempotency_key}
         )
+        reply = ProvidedReply(command.note, {"action": "retry"})
         if current.get("status") == "satisfied":
             # Only the original command identity may replay a terminal Retry.
             runtime.owners.human_collaboration.respond_to_human_request(
                 request_ref,
-                reply=ProvidedReply("", {"action": "retry"}),
+                reply=reply,
                 idempotency_key=response_key,
             )
             reconciled = runtime.owners.agent_runtime.reconcile_root_human_request(
@@ -1708,7 +1715,7 @@ def create_app(
             raise OwnerConflict("system_operation_retry_unavailable")
         runtime.owners.human_collaboration.respond_to_human_request(
             request_ref,
-            reply=ProvidedReply("", {"action": "retry"}),
+            reply=reply,
             idempotency_key=response_key,
         )
         reconciled = runtime.owners.agent_runtime.reconcile_root_human_request(

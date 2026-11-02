@@ -73,6 +73,24 @@ async function openCreation(page: Page, failedAcquisition = false) {
   return { current, writes, errors };
 }
 
+test("creation reports actual selected cards and shows the next available action", async ({ page }) => {
+  const { current } = await openCreation(page);
+  const dialog = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
+  const generate = dialog.getByRole("button", { name: "生成第一个问题", exact: true });
+  await expect(generate).toBeDisabled();
+  const devices = Array.from({ length: 4 }, (_, index) => ({ name: "A100", uuid: `GPU-${index}`, memory_total_mib: 81920 }));
+  const envelope = { status: "current", devices, selected_device_uuids: [] as string[], time_budget: "30d", hard_ceiling: { seconds: null } };
+  Object.assign(current, { compute: { status: "ready", devices }, resource_envelope: envelope });
+  await page.reload();
+  await expect(dialog.getByText("检测到 4 张计算卡，尚未选择。点击设备可更改选择。")).toBeVisible();
+  envelope.selected_device_uuids = devices.map(device => device.uuid);
+  await page.reload();
+  await expect(dialog.getByText("检测到 4 张计算卡，已选 4 张。点击设备可更改选择。")).toBeVisible();
+  await expect(generate).toBeEnabled();
+  await expect(dialog.getByText("准备就绪，点击下方按钮生成第一个问题。")).toBeVisible();
+  await expect(dialog.getByText("查看创建预览与提交回执")).toBeVisible();
+});
+
 // A real layout regression: the retry button must not occupy the old 42px icon column.
 test("DeepFetch fulltext retry stays horizontal and compact at desktop and mobile widths", async ({ page }, testInfo) => {
   await openCreation(page, true);

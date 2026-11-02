@@ -450,12 +450,13 @@ test("QuestionTree marks only the foreground Question and keeps its facts separa
   await expect(sibling).not.toHaveAttribute("data-current-question", "true");
   await current.click();
   await expect(inspector).toContainText("active r7");
-  await expect(inspector).toContainText(`${CYCLE_REF} · reasoning · epoch 4 · active`);
+  await expect(inspector).toContainText("本轮已选择这个问题 · reasoning 阶段");
   await expect(inspector).toContainText("最远已接纳 Stage 结果");
   await inspector.locator(".question-tree-technical-details > summary").click();
+  await expect(inspector).toContainText(`${CYCLE_REF} · reasoning · epoch 4 · active`);
   await expect(inspector).toContainText("human-request-143-current"); await expect(inspector).toContainText("bundle-report-143");
   await sibling.click();
-  await expect(inspector).toContainText("active r1"); await expect(inspector).toContainText("未绑定当前 Cycle");
+  await expect(inspector).toContainText("active r1"); await expect(inspector).toContainText("本轮未选择这个问题");
   await expect(inspector).not.toContainText("human-request-143-current"); await expect(inspector).not.toContainText("bundle-report-143");
   await expect(current).toHaveAttribute("data-current-question", "true");
   for (const viewport of [{ width: 800, height: 900 }, { width: 390, height: 844 }]) {

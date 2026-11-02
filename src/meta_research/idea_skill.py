@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import secrets
+from copy import copy
 import logging
 import math
 import os
@@ -39,7 +40,7 @@ from meta_research.codex_ledger import (
 )
 from meta_research.system_prompt import read_output_language
 from meta_research.runtime_conditions import (
-    compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt,
+    compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt, selected_stage_model,
 )
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
@@ -1006,6 +1007,20 @@ def _idea_owner_rejection_prompt(request: IdeaSkillRequest) -> str:
     )
 
 
+def stage_provider(provider, *, quest_ref=None, model_ref=None):
+    """Use the same configured transport, channels and permissions for this Run."""
+    if not isinstance(provider, CodexIdeaSkillAdapter):
+        return provider
+    if model_ref is None:
+        model_ref = selected_stage_model(provider._workspace, provider._root_agent_kind,
+                                         quest_ref=quest_ref, default=provider._model_ref)
+    if model_ref == provider._model_ref:
+        return provider
+    scoped = copy(provider)
+    scoped._model_ref = model_ref
+    return scoped
+
+
 class CodexIdeaSkillAdapter:
     """Production Adapter: one root Codex Session with advisory finalization.
 
@@ -1192,10 +1207,11 @@ class CodexIdeaSkillAdapter:
         entry_path: RootCapabilityEntryPath,
         authorized_operation_ids: tuple[str, ...] = (),
         semantic_mcp_available: bool = False,
+        model_ref: str | None = None,
     ) -> dict[str, object]:
         """Probe effective Codex features when the real runner supports it."""
 
-        profile = root_capability_profile(self._root_agent_kind)
+        profile = root_capability_profile(self._root_agent_kind, model_ref or self._model_ref)
         feature_output: str | None = None
         run_command = getattr(self._runner, "run_command", None)
         if callable(run_command):
@@ -1500,7 +1516,7 @@ class CodexIdeaSkillAdapter:
                     "structured-output-json-schema",
                     "trusted-local-quest-authorization",
                 ),
-                self._root_agent_kind,
+                self._root_agent_kind, self._model_ref,
             ),
             resource_bindings=tuple(
                 f"package:meta_research.skills{'' if name in SHARED_REFERENCE_PATHS else '.idea_stage'}/{name}@sha256:"
@@ -1808,7 +1824,12 @@ class CodexIdeaSkillAdapter:
             "在当前原根连续完成研究、自主组织原生子智能体独立审阅、聚合反馈并修订后，"
             "交回最终完整候选；根承担最终判断，不提前返回草稿等待系统再次启动审阅。"
             "你是 Idea 主 Agent。只返回 {\"outcome\": ...}，其中 outcome 是一个完整 "
-            "IdeaSet 或 NoViableCandidate。"
+            "IdeaSet 或 NoViableCandidate。本回合的最终答复就是提交入口。"
+            "把独立审阅后形成的完整科研判断写入最终答复，工作区中的草稿只供接续。"
+            "仍有值得 Plan 推进的候选时，交回完整 IdeaSet。若根据证据改变判断，"
+            "说明修订理由。判断所有候选在当前范围内均不可行时，交回 NoViableCandidate 并给出科学依据。"
+            "涉及提交资格或拒绝时，以实际 Owner 回执为据。"
+            "传输格式中 outcome.kind 写结果种类，outcome.payload 写该结果的全部其他既定字段。"
             "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。ContextPack v4 不预装证据首页；"
             "需要发现证据时，调用 research_memory.stage_context.read（source=\"evidence_index\"，"
             "context_pack_ref=本次冻结引用，path=[]，index_offset=0，offset=0，limit=8192）。"
@@ -1848,8 +1869,9 @@ class CodexIdeaSkillAdapter:
         # Child/tool trace is diagnostic provenance, not part of the Idea
         # artifact contract.  A sealed, structurally valid draft must remain
         # usable even when the Harness omits or reshapes collaboration events.
-        draft_value = primary_output.get("outcome")
-        if not isinstance(draft_value, dict):
+        outcome = primary_output.get("outcome")
+        if (not isinstance(outcome, dict) or set(outcome) != {"kind", "payload"}
+                or not isinstance(outcome["payload"], dict) or "kind" in outcome["payload"]):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
                 operation_name="primary",
@@ -1859,7 +1881,7 @@ class CodexIdeaSkillAdapter:
                 rejected_candidate=primary_output,
             )
         return IdeaSkillDraft(
-            draft=cast(dict[str, object], draft_value),
+            draft={"kind": outcome["kind"], **outcome["payload"]},
             primary_session_ref=primary_session,
             adapter_kind="codex_cli",
         )
@@ -2220,7 +2242,9 @@ class CodexIdeaSkillAdapter:
                     prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding)
                 )
                 _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
+                model_ref = selected_stage_model(self._workspace, self._root_agent_kind, run_ref=run_ref, default=self._model_ref)
                 pre_turn_diagnostics = self._root_capability_diagnostics(
+                    model_ref=model_ref,
                     entry_path=entry_path,
                     authorized_operation_ids=authorized_operation_ids,
                     semantic_mcp_available=False,
@@ -2229,6 +2253,7 @@ class CodexIdeaSkillAdapter:
                     prefix="idea-provider-", dir=self._workspace
                 ) as raw_directory:
                     invoked = self._invoke_once(
+                        model_ref=model_ref,
                         execution_access_mode=execution_access_mode,
                         execution_write_root=execution_write_root,
                         directory=Path(raw_directory),
@@ -2313,6 +2338,9 @@ class CodexIdeaSkillAdapter:
                 )
                 _key_path, key = self._transport_key()
                 previous = _read_sealed_operation_invocation(invocation_path, key=key)
+                model_ref = previous.get("model_ref")
+                if not isinstance(model_ref, str) or not model_ref:
+                    raise IdeaSkillUnavailable("codex_operation_spool_invalid")
                 prompt_hash = previous.get("prompt_hash")
                 if (
                     not isinstance(prompt_hash, str)
@@ -2342,15 +2370,17 @@ class CodexIdeaSkillAdapter:
             # prompt and every operation binding before this input is used.
             prompt = persisted_prompt
         else:
+            model_ref = selected_stage_model(self._workspace, self._root_agent_kind, run_ref=run_ref, default=self._model_ref)
             prompt = compose_runtime_prompt(
                 prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding)
             )
         _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
-        capability_profile = root_capability_profile(self._root_agent_kind)
+        capability_profile = root_capability_profile(self._root_agent_kind, model_ref)
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
         )
         diagnostics_for_projection = self._root_capability_diagnostics(
+            model_ref=model_ref,
             entry_path=entry_path,
             authorized_operation_ids=authorized_operation_ids,
             semantic_mcp_available=False,
@@ -2364,7 +2394,7 @@ class CodexIdeaSkillAdapter:
             "prompt_hash": canonical_hash(prompt),
             "output_schema_hash": canonical_hash(schema),
             "native_session_ref": native_session_ref,
-            "model_ref": self._model_ref,
+            "model_ref": model_ref,
             "root_capability_profile": capability_profile.as_dict(),
             "root_capability_profile_hash": capability_profile.digest,
             "mcp_url": mcp_url,
@@ -2456,6 +2486,7 @@ class CodexIdeaSkillAdapter:
         _ensure_durable_text(directory / "prompt.txt", prompt)
         try:
             result = self._invoke_once(
+                model_ref=model_ref,
                 execution_access_mode=execution_access_mode,
                 execution_write_root=execution_write_root,
                 directory=directory,
@@ -2503,6 +2534,7 @@ class CodexIdeaSkillAdapter:
     def _invoke_once(
         self,
         *,
+        model_ref: str,
         directory: Path,
         prompt: str,
         schema: dict[str, object],
@@ -2549,7 +2581,7 @@ class CodexIdeaSkillAdapter:
         # The authenticated effect channel is owned by the current operation
         # tree. Root reconnects and native children share it, while shell
         # subprocesses do not inherit the bearer environment.
-        capability_profile = root_capability_profile(self._root_agent_kind)
+        capability_profile = root_capability_profile(self._root_agent_kind, model_ref)
         argv = [
             self._executable,
             "exec",
@@ -2600,7 +2632,7 @@ class CodexIdeaSkillAdapter:
             ),
             *self._sandbox_arguments(sandbox_read_root, working_directory=working_directory),
             "--model",
-            self._model_ref,
+            model_ref,
             "--cd",
             str(working_directory),
             "--json",
@@ -4009,11 +4041,22 @@ def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, objec
 def _outcome_envelope_schema(
     question_ref: str, context_pack_ref: str
 ) -> dict[str, object]:
+    # Both variants begin with the same decision field even when the provider
+    # sorts property names. Route-specific fields follow that decision.
+    tagged = []
+    for variant in _outcome_schema(question_ref, context_pack_ref)["anyOf"]:
+        fields = dict(variant["properties"])
+        kind = fields.pop("kind")
+        payload = {**variant, "properties": fields,
+                   "required": [key for key in variant["required"] if key != "kind"]}
+        tagged.append({"type": "object", "additionalProperties": False,
+                       "properties": {"kind": kind, "payload": payload},
+                       "required": ["kind", "payload"]})
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "outcome": _outcome_schema(question_ref, context_pack_ref),
+            "outcome": {"anyOf": tagged},
         },
         "required": ["outcome"],
     }

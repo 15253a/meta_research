@@ -17,13 +17,14 @@ const prefix = "按以下条件安排研究与委派；时间预算不会随新�
 const suffix = "\n另请保留这条手写约束。";
 const structuredText = (data: unknown = initialConditions) => prefix + JSON.stringify(data, null, 2) + suffix;
 const savedJson = (text: string) => JSON.parse(text.slice(prefix.length, -suffix.length));
+const defaultModels = { idea: "gpt-6.1-sol", plan: "gpt-6.1-sol", bundle: "gpt-6.1-sol", target: "gpt-6.1-sol", reasoning: "gpt-6.1-sol" };
 
 async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间预算：30 天", researchStyle?: string) {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];
   const questRef: string = snapshot.research_space.current_quest.quest_ref;
-  const configs: Record<string, { quest_ref: string; text: string; revision: string; research_style?: string }> = {
-    [questRef]: { quest_ref: questRef, text, revision: "r1", research_style: researchStyle },
+  const configs: Record<string, { quest_ref: string; text: string; revision: string; research_style?: string; stage_models?: typeof defaultModels; available_stage_models?: string[] }> = {
+    [questRef]: { quest_ref: questRef, text, revision: "r1", research_style: researchStyle, stage_models: defaultModels, available_stage_models: ["gpt-6.1-sol", "gpt-5.6-sol"] },
   };
   const state = {
     snapshot, questRef, reads: [] as string[], writes: [] as { questRef: string; text: string; expected_revision: string }[],
@@ -53,7 +54,8 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
       state.writes.push({ questRef: selected, ...body });
       if (state.failure) return json({ detail: { code: state.failure === 409 ? "runtime_conditions_stale" : "temporarily_unavailable" } }, state.failure);
       expect(body.expected_revision).toBe(state.configs[selected].revision);
-      const next = { quest_ref: selected, text: body.text, revision: `r${state.writes.length + 1}`,
+      const next = { ...state.configs[selected], text: body.text, revision: `r${state.writes.length + 1}`,
+        stage_models: body.stage_models ?? state.configs[selected].stage_models,
         research_style: body.research_style ?? state.configs[selected].research_style };
       state.configs[selected] = next;
       return json(next);
@@ -87,6 +89,30 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
 
 const dialog = (page: Page) => page.getByRole("dialog", { name: "修改配置", exact: true });
 const editor = (page: Page) => dialog(page).getByRole("textbox", { name: "运行条件内容" });
+
+test("one model per research stage, with fixed Ultra and independent persisted choices", async ({ page }) => {
+  const state = await workspace(page);
+  const open = page.getByRole("button", { name: "修改配置", exact: true });
+  await open.click();
+  const models = dialog(page).getByRole("region", { name: "研究阶段模型" });
+  await expect(models.getByText(/Ultra（max）/)).toBeVisible();
+  const selectors = models.getByRole("combobox");
+  await expect(selectors).toHaveCount(5);
+  for (const select of await selectors.all()) await expect(select).toHaveValue("gpt-6.1-sol");
+  const plan = models.getByLabel("研究计划（Plan）");
+  await plan.selectOption("gpt-5.6-sol");
+  await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
+  await open.click();
+  await expect(plan).toHaveValue("gpt-5.6-sol");
+  expect(state.writes).toHaveLength(0);
+  await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
+  await expect(dialog(page).getByRole("status")).toContainText("已保存");
+  expect(state.configs[state.questRef].stage_models).toEqual({ ...defaultModels, plan: "gpt-5.6-sol" });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await open.click();
+  await expect(plan).toHaveValue("gpt-5.6-sol");
+  await expect(models.getByLabel("研究构想（Idea）")).toHaveValue("gpt-6.1-sol");
+});
 
 test("configuration reopening retains unsaved conditions without writing", async ({ page }) => {
   const state = await workspace(page);
