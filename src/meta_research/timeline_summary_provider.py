@@ -1,10 +1,10 @@
-"""Schema-constrained research recorder over host-supplied observation snapshots."""
+"""The recorder's durable native Session and its observed, read-only source cut."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
+from meta_research.owners.common import canonical_hash
 from meta_research.quest_drafting import (
     PROVIDER_STREAM_MAX_BYTES,
     CodexDraftingAdapter,
@@ -13,237 +13,333 @@ from meta_research.quest_drafting import (
     _read_drafting_invocation,
     _read_durable_job,
 )
-
+from meta_research.recorder_sources import READ_SOURCE, RecorderChannels
 
 _SKILL_PATH = Path(__file__).with_name("skills") / "research-recorder" / "SKILL.md"
 _SUMMARY_LIMITS = {"zh": 180, "en": 360}
-_OUTPUT_KEYS = {"node_key", "source_hash", "summary", "source_refs"}
 _SUMMARY_KINDS = ("process", "tentative_finding", "accepted_conclusion", "insufficient_evidence")
+_OUTPUT_KEYS = {"node_key", "source_hash", "summary", "summary_kind", "source_refs", "milestone"}
+_EMPTY_SENTENCE = {
+    "zh": "该阶段尚无可读的工作或判断记录，无法确认具体进展。",
+    "en": "No readable work or judgment records are available for this stage, so its progress is unknown.",
+}
 
 
 class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
-    """An independent recorder Session; inherits durable jobs and cancellation.
+    def __init__(self, *args, channels: RecorderChannels, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.channels = channels
 
-    The service owns each Quest's native Session and job identity. This adapter
-    receives the complete read-only basis and returns prose with exact bindings;
-    it has no Owner interface and cannot accept research outcomes.
-    """
+    def _provider_argv(self, *args, **kwargs):
+        argv = super()._provider_argv(*args, **kwargs)
+        configs = (
+            # Override the drafting catalog's base instructions for the recorder role.
+            "model_instructions_file=" + json.dumps(str(_SKILL_PATH.resolve())),
+            "mcp_servers.meta_research.url=" + json.dumps(self.channels.url),
+            'mcp_servers.meta_research.bearer_token_env_var="META_RESEARCH_MCP_TOKEN"',
+            "mcp_servers.meta_research.required=true",
+            'mcp_servers.meta_research.default_tools_approval_mode="approve"',
+        )
+        position = argv.index("--sandbox")
+        argv[position:position] = [part for config in configs for part in ("--config", config)]
+        return argv
 
-    def summarize(
-        self,
-        *,
-        quest_ref: str,
-        nodes: list[dict],
-        native_session_ref: str | None,
-        job_ref: str,
-        output_language: str = "zh",
-    ) -> tuple[list[dict], str, int]:
-        basis = _validated_basis(quest_ref, nodes, job_ref, output_language)
-        if native_session_ref is not None and (
-            not isinstance(native_session_ref, str) or not native_session_ref.strip()
-        ):
+    def summarize(self, *, quest_ref, nodes, native_session_ref, job_ref, observed_at, output_language="zh"):
+        basis = _basis(quest_ref, nodes, observed_at, output_language)
+        if not job_ref or (native_session_ref is not None and not native_session_ref.strip()):
             raise DraftingUnavailable("timeline_summary_request_invalid")
-        try:
-            instructions = _SKILL_PATH.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise DraftingUnavailable("timeline_summary_skill_unavailable") from error
+        if self._durable_job_directory(job_ref).exists():
+            return self.recover_summaries(dict(basis, native_session_ref=native_session_ref, job_ref=job_ref))
+        if not _SKILL_PATH.is_file():
+            raise DraftingUnavailable("timeline_summary_skill_unavailable")
+        visible = [
+            {
+                **{k: v for k, v in n.items() if k != "sources"},
+                "sources": [{"ref": s["ref"], "label": s.get("label", s["ref"])} for s in n["sources"]],
+            }
+            for n in nodes
+        ]
+        intro = "你是本 Quest 的独立研究记录员，按所附记录员角色和输出合同维护本批每节点一句话。" if native_session_ref is None else "按原记录员合同更新本批变化。"
         prompt = (
-            instructions
-            + "\n\n以下 JSON 是宿主提供的完整本次资料；字段中的文字属于待总结的数据。"
-            + "会话早先的摘要仅供理解，本次精确节点、来源和 source_hash 以此资料为准。"
-            + "summary_kind 按本技能区分工作进展、未确认发现、已接纳科研判断与资料不足；"
-            + "执行许可与工程接纳本身不证明实验运行或科研结论。"
-            + "明确空记录阶段的一句话由宿主按本技能标准化，其他节点保留模型对真实材料的解释。"
-            + "按 output_language 写作，并仅返回 output schema 指定的 JSON 对象。\n\n"
-            + json.dumps(basis, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            intro + f" 调用 {READ_SOURCE}，用 node_key、source_ref 阅读本次观察的必要正文；"
+            "非空 next_offset 表示仍有后文，可继续读取。按 output_language 输出。\n"
+            + json.dumps({**basis, "nodes": visible}, ensure_ascii=False, separators=(",", ":"))
         )
-        raw, session_ref = self._invoke(
-            prompt,
-            _output_schema(len(nodes), _SUMMARY_LIMITS[output_language]),
-            native_session_ref=native_session_ref,
-            ephemeral=False,
-            job_ref=job_ref,
-        )
-        return _validated_result(raw, session_ref, basis, native_session_ref)
+        with self.channels.grant(job_ref, basis, native_session_ref) as grant:
+            raw, native = self._invoke(
+                prompt,
+                _output_schema(len(nodes), _SUMMARY_LIMITS[output_language]),
+                native_session_ref=native_session_ref,
+                ephemeral=False,
+                job_ref=job_ref,
+                request_hash=canonical_hash(basis),
+                environment={"META_RESEARCH_MCP_TOKEN": grant.token},
+            )
+        return self._result(job_ref, raw, native, basis, native_session_ref)
 
-    def recover_summaries(self, job: dict) -> tuple[list[dict], str, int]:
-        """Recover the original durable result across prompt/schema upgrades."""
-        basis = _validated_basis(job["quest_ref"], job["nodes"], job["job_ref"], job["output_language"])
+    def recover_summaries(self, job):
+        basis = _basis(job["quest_ref"], job["nodes"], job["observed_at"], job["output_language"])
         directory = self._durable_job_directory(job["job_ref"])
         invocation = _read_drafting_invocation(directory, job_ref=job["job_ref"])
-        try:
-            prompt = _read_bounded_text(directory / "prompt.txt", PROVIDER_STREAM_MAX_BYTES)
-            stored_basis = json.loads(prompt.rsplit("\n\n", 1)[-1])
-        except (OSError, UnicodeError, ValueError) as error:
-            raise DraftingUnavailable("codex_job_spool_invalid") from error
-        if (hashlib.sha256(prompt.encode("utf-8")).hexdigest() != invocation.get("prompt_hash")
-            or stored_basis != basis or invocation.get("native_session_ref") != job["native_session_ref"]
-            or invocation.get("ephemeral") is not False):
+        if (
+            invocation.get("request_hash") != canonical_hash(basis)
+            or invocation["native_session_ref"] != job["native_session_ref"]
+            or invocation["ephemeral"]
+        ):
             raise DraftingUnavailable("codex_job_spool_conflict")
-        raw, session_ref = _read_durable_job(directory, invocation)
-        return _validated_result(raw, session_ref, basis, job["native_session_ref"])
+        raw, native = _read_durable_job(directory, invocation)
+        return self._result(job["job_ref"], raw, native, basis, job["native_session_ref"])
+
+    def _result(self, job_ref, raw, native, basis, expected_native):
+        if (
+            not isinstance(native, str)
+            or not native.strip()
+            or expected_native is not None
+            and native != expected_native
+        ):
+            raise DraftingUnavailable("timeline_summary_session_invalid")
+        stdout = _read_bounded_text(
+            self._durable_job_directory(job_ref) / "stdout.jsonl", PROVIDER_STREAM_MAX_BYTES
+        )
+        bodies = _read_bodies(stdout, basis, native)
+        rows = _validate(raw, basis, bodies, native)
+        interval = raw["next_scan_seconds"]
+        return rows, native, interval if type(interval) is int and 300 <= interval <= 7200 else 300
 
 
-def _validated_result(raw: object, session_ref: str | None, basis: dict, native_session_ref: str | None):
-    if (not isinstance(session_ref, str) or not session_ref.strip()
-        or native_session_ref is not None and session_ref != native_session_ref):
-        raise DraftingUnavailable("timeline_summary_session_invalid")
-    summaries = _validated_summaries(raw, basis["nodes"], maximum_length=_SUMMARY_LIMITS[basis["output_language"]],
-        native_session_ref=session_ref, output_language=basis["output_language"])
-    next_scan = raw.get("next_scan_seconds")
-    # Saved output from the previous schema remains useful; scheduling metadata
-    # must never discard a valid scientific sentence.
-    interval = next_scan if type(next_scan) is int and 300 <= next_scan <= 7200 else 300
-    return summaries, session_ref, interval
-
-
-def _validated_basis(quest_ref, nodes, job_ref, output_language) -> dict:
+def _basis(quest_ref, nodes, observed_at, output_language):
     if (
-        not isinstance(quest_ref, str) or not quest_ref.strip()
-        or not isinstance(job_ref, str) or not job_ref.strip()
-        or not isinstance(output_language, str) or output_language not in _SUMMARY_LIMITS
-        or not isinstance(nodes, list) or not nodes
+        not quest_ref
+        or not isinstance(nodes, list)
+        or not nodes
+        or output_language not in _SUMMARY_LIMITS
+        or not isinstance(observed_at, (int, float))
+        or isinstance(observed_at, bool)
     ):
         raise DraftingUnavailable("timeline_summary_request_invalid")
     keys = set()
     for node in nodes:
-        if not isinstance(node, dict) or not {
-            "node_key", "kind", "source_hash", "content", "sources"
-        }.issubset(node):
-            raise DraftingUnavailable("timeline_summary_request_invalid")
-        for field in ("node_key", "kind", "source_hash"):
-            if not isinstance(node[field], str) or not node[field].strip():
-                raise DraftingUnavailable("timeline_summary_request_invalid")
-        if node["node_key"] in keys:
-            raise DraftingUnavailable("timeline_summary_request_invalid")
-        keys.add(node["node_key"])
-        if not isinstance(node["sources"], list) or any(
-            not isinstance(source, dict) or not isinstance(source.get("ref"), str)
-            or not source["ref"].strip()
-            for source in node["sources"]
+        if (
+            not isinstance(node, dict)
+            or node.get("quest_ref") != quest_ref
+            or "content" in node
+            or not all(isinstance(node.get(k), str) and node[k] for k in ("node_key", "kind", "source_hash"))
+            or node["node_key"] in keys
+            or not isinstance(node.get("sources"), list)
+            or any(
+                not isinstance(s, dict)
+                or not isinstance(s.get("ref"), str)
+                or not s["ref"]
+                or not isinstance(s.get("binding"), dict)
+                for s in node["sources"]
+            )
         ):
             raise DraftingUnavailable("timeline_summary_request_invalid")
-    try:
-        # Freeze the exact complete JSON basis before handing it to the provider.
-        return json.loads(json.dumps({
-            "quest_ref": quest_ref, "output_language": output_language, "nodes": nodes,
-        }, ensure_ascii=False, sort_keys=True, allow_nan=False))
-    except (TypeError, ValueError) as error:
-        raise DraftingUnavailable("timeline_summary_request_invalid") from error
+        keys.add(node["node_key"])
+    return {"quest_ref": quest_ref, "output_language": output_language, "observed_at": observed_at, "nodes": nodes}
 
 
-def _output_schema(count: int, maximum_length: int) -> dict:
+def _output_schema(count, maximum_length):
+    fields = {
+        "node_key": {"type": "string", "minLength": 1},
+        "source_hash": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "minLength": 1, "maxLength": maximum_length},
+        "summary_kind": {"type": "string", "enum": list(_SUMMARY_KINDS)},
+        "milestone": {"type": "boolean"},
+        "source_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    }
     return {
         "type": "object",
         "additionalProperties": False,
+        "required": ["summaries", "next_scan_seconds"],
         "properties": {
             "next_scan_seconds": {"type": "integer", "minimum": 300, "maximum": 7200},
             "summaries": {
-                "type": "array", "minItems": count, "maxItems": count,
+                "type": "array",
+                "minItems": count,
+                "maxItems": count,
                 "items": {
-                    "type": "object", "additionalProperties": False,
-                    "properties": {
-                        "node_key": {"type": "string", "minLength": 1},
-                        "source_hash": {"type": "string", "minLength": 1},
-                        "summary": {"type": "string", "minLength": 1, "maxLength": maximum_length,
-                            "description": "One sentence grounded in this node; a Stage with artifacts=[] and current=null has unknown progress, not an inferred execution state."},
-                        "summary_kind": {"type": "string", "enum": list(_SUMMARY_KINDS),
-                            "description": "Stages with artifacts=[] and current=null are insufficient_evidence; the host standardizes their missing-record sentence."},
-                        "source_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
-                    },
-                    "required": ["node_key", "source_hash", "summary", "summary_kind", "source_refs"],
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": fields,
+                    "required": list(fields),
                 },
             },
         },
-        "required": ["summaries", "next_scan_seconds"],
     }
 
 
-def _accepted_conclusion_refs(node: dict) -> set[str]:
-    """Only Owner-verified Reasoning artifacts carry scientific judgments.
-
-    Target result acceptance and public root prose are engineering/progress
-    records. A model's classification cannot upgrade either into a conclusion.
-    """
-    content = node.get("content")
-    if not isinstance(content, dict):
-        return set()
-    reasoning = content if node.get("kind") == "stage" and node.get("stage") == "reasoning" else None
-    if node.get("kind") == "cycle" and isinstance(content.get("stages"), dict):
-        reasoning = content["stages"].get("reasoning")
-    if not isinstance(reasoning, dict) or not isinstance(reasoning.get("artifacts"), list):
-        return set()
-    refs = set()
-    for artifact in reasoning["artifacts"]:
-        if not isinstance(artifact, dict) or artifact.get("stage") != "reasoning" or artifact.get("status") != "accepted":
+def _read_bodies(stdout, basis, native):
+    # Use the original provider output, including on recovery. Only successful pages
+    # of this root's reader count. The temporary spool already records those calls.
+    nodes = {n["node_key"]: n for n in basis["nodes"]}
+    pages, failed = {}, set()
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
             continue
-        judgment, source = artifact.get("content"), artifact.get("source")
-        if not isinstance(judgment, dict) or not isinstance(source, dict):
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
             continue
-        if not isinstance(judgment.get("claim"), str) or not judgment["claim"].strip():
+        item = event.get("item")
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "mcp_tool_call"
+            or item.get("server") != "meta_research"
+            or item.get("tool") != READ_SOURCE
+        ):
             continue
-        refs.update(source[key] for key in ("content_ref", "outcome_ref")
-                    if isinstance(source.get(key), str) and source[key])
-    return refs
+        args = item.get("arguments")
+        if not isinstance(args, dict):
+            continue
+        key, ref = args.get("node_key"), args.get("source_ref")
+        if not isinstance(key, str) or not isinstance(ref, str):
+            continue
+        node = nodes.get(key)
+        if not node or not any(s["ref"] == ref for s in node["sources"]):
+            continue
+        origin = (key, ref)
+        result = item.get("result") or {}
+        if (
+            item.get("status") != "completed"
+            or result.get("isError")
+            or result.get("is_error")
+            or item.get("error")
+        ):
+            failed.add(origin)
+            continue
+        # Codex retains MCP text content even when the native event omits structuredContent.
+        try:
+            page = json.loads(result["content"][0]["text"])
+            if (
+                page["source_hash"] != node["source_hash"]
+                or page["node_key"] != key
+                or page["source_ref"] != ref
+                or page["offset"] != args.get("offset", 0)
+                or not isinstance(page["text"], str)
+            ):
+                continue
+            pages.setdefault(origin, {})[page["offset"]] = page
+        except (ValueError, KeyError, TypeError, IndexError):
+            failed.add(origin)
+    bodies = {}
+    for origin, chunks in pages.items():
+        # A segment may be sufficient for ordinary progress. Only a full body
+        # can establish the empty-stage or accepted-claim qualifications.
+        bodies[origin] = None
+        offset, parts = 0, []
+        while offset in chunks:
+            page = chunks[offset]
+            parts.append(page["text"])
+            if page["next_offset"] is None:
+                body = json.loads("".join(parts))
+                if isinstance(body, dict):
+                    bodies[origin] = body
+                    failed.discard(origin)
+                break
+            if not page["text"] or page["next_offset"] != offset + len(page["text"]):
+                break
+            offset = page["next_offset"]
+    if failed:
+        raise DraftingUnavailable("timeline_summary_source_unavailable", native_session_ref=native)
+    return bodies
 
 
-def _validated_summaries(
-    raw: object, nodes: list[dict], *, maximum_length: int, native_session_ref: str, output_language: str,
-) -> list[dict]:
-    def invalid() -> DraftingUnavailable:
-        return DraftingUnavailable(
-            "timeline_summary_output_invalid", native_session_ref=native_session_ref,
-        )
+def _validate(raw, basis, bodies, native):
+    def invalid():
+        return DraftingUnavailable("timeline_summary_output_invalid", native_session_ref=native)
 
-    if not isinstance(raw, dict) or not {"summaries"} <= set(raw) <= {"summaries", "next_scan_seconds"}:
+    if not isinstance(raw, dict) or set(raw) != {"summaries", "next_scan_seconds"}:
         raise invalid()
+    nodes = {node["node_key"]: node for node in basis["nodes"]}
     rows = raw["summaries"]
     if not isinstance(rows, list) or len(rows) != len(nodes):
         raise invalid()
-    expected = {node["node_key"]: node for node in nodes}
-    accepted = {}
+    results = {}
+    language = basis["output_language"]
+    # The same source may legitimately support multiple levels of this batch.
+    read = {}
+    for (key, ref), body in bodies.items():
+        source = next(s for s in nodes[key]["sources"] if s["ref"] == ref)
+        if ref not in read or body is not None:
+            read[ref] = (source["binding"], body)
     for row in rows:
-        if not isinstance(row, dict) or not _OUTPUT_KEYS <= set(row) <= _OUTPUT_KEYS | {"summary_kind"}:
+        if not isinstance(row, dict) or set(row) != _OUTPUT_KEYS:
             raise invalid()
         key = row["node_key"]
-        if not isinstance(key, str) or key not in expected or key in accepted:
+        if not isinstance(key, str) or key not in nodes or key in results:
             raise invalid()
-        node = expected[key]
-        if row["source_hash"] != node["source_hash"]:
-            raise invalid()
-        summary = row["summary"]
+        node = nodes[key]
+        kind, refs, sentence = row["summary_kind"], row["source_refs"], row["summary"]
+        allowed = {s["ref"] for s in node["sources"]}
         if (
-            not isinstance(summary, str) or not summary.strip()
-            or len(summary.strip()) > maximum_length
-            or any(character in summary for character in "\r\n\u2028\u2029")
+            not refs
+            and kind != "insufficient_evidence"
+            or row["source_hash"] != node["source_hash"]
+            or kind not in _SUMMARY_KINDS
+            or not isinstance(refs, list)
+            or any(not isinstance(ref, str) or ref not in allowed for ref in refs)
+            or len(refs) != len(set(refs))
+            or bool(allowed)
+            and not refs
+            or type(row["milestone"]) is not bool
+            or row["milestone"]
+            and kind not in {"tentative_finding", "accepted_conclusion"}
+            or not isinstance(sentence, str)
+            or not sentence.strip()
+            or len(sentence.strip()) > _SUMMARY_LIMITS[language]
+            or any(c in sentence for c in "\r\n\u2028\u2029")
         ):
             raise invalid()
-        references = row["source_refs"]
-        allowed = {source["ref"] for source in node["sources"]}
+        available = {
+            s["ref"]: read[s["ref"]][1]
+            for s in node["sources"]
+            if s["ref"] in read and read[s["ref"]][0] == s["binding"]
+        }
+        stage = available.get(key)
         if (
-            not isinstance(references, list)
-            or any(not isinstance(ref, str) or ref not in allowed for ref in references)
-            or len(set(references)) != len(references)
-            or bool(allowed) and not references
+            node["kind"] == "stage"
+            and stage
+            and read[key][0].get("kind") == "stage"
+            and stage.get("stage") == node["stage"]
+            and stage.get("artifacts") == []
+            and "current" in stage
+            and stage["current"] is None
         ):
-            raise invalid()
-        summary_kind = row.get("summary_kind", "process")
-        if not isinstance(summary_kind, str) or summary_kind not in _SUMMARY_KINDS:
-            raise invalid()
-        content = node.get("content")
-        if (node.get("kind") == "stage" and isinstance(content, dict)
-            and content.get("artifacts") == [] and "current" in content and content["current"] is None):
-            # An empty read cut proves only that no records were available.
-            # Keep the model call for all substantive nodes, but this sentence
-            # comes from the host observation, never from a guessed execution.
-            summary = ("该阶段尚无可读的工作或判断记录，无法确认具体进展。" if output_language == "zh"
-                else "No readable work or judgment records are available for this stage, so its progress is unknown.")
-            summary_kind = "insufficient_evidence"
-            cycle_ref = node.get("cycle_ref")
-            references = [cycle_ref] if cycle_ref in allowed else list(dict.fromkeys(source["ref"] for source in node["sources"]))
-        if summary_kind == "accepted_conclusion" and not set(references) & _accepted_conclusion_refs(node):
-            raise invalid()
-        accepted[key] = {**row, "summary": summary.strip(), "summary_kind": summary_kind,
-                         "source_refs": list(references)}
-    # Model output order cannot reorder the stable host timeline.
-    return [accepted[node["node_key"]] for node in nodes]
+            row = dict(
+                row,
+                summary=_EMPTY_SENTENCE[language],
+                summary_kind="insufficient_evidence",
+                milestone=False,
+                source_refs=[node["cycle_ref"]] if node["cycle_ref"] in allowed else [key],
+            )
+        else:
+            if not all(ref in available for ref in refs) or sentence.strip() in _EMPTY_SENTENCE.values():
+                raise invalid()
+            if kind == "accepted_conclusion":
+                eligible = node["kind"] == "cycle" or node["kind"] == "stage" and node["stage"] == "reasoning"
+                if not eligible or not any(
+                    read[ref][0].get("kind") == "artifact"
+                    and read[ref][0].get("stage") == "reasoning"
+                    and read[ref][0].get("cycle_ref") == node["cycle_ref"]
+                    and _supports_conclusion(available[ref] or {}, refs)
+                    for ref in refs
+                ):
+                    raise invalid()
+            row = dict(row, summary=sentence.strip())
+        results[key] = row
+    return [results[key] for key in nodes]
+
+
+def _supports_conclusion(body, refs):
+    judgment, source = body.get("content"), body.get("source")
+    if not isinstance(judgment, dict) or not isinstance(source, dict):
+        return False
+    claim = judgment.get("claim")
+    return (
+        body.get("stage") == "reasoning"
+        and body.get("status") == "accepted"
+        and isinstance(claim, str)
+        and claim.strip()
+        and any(source.get(k) in refs for k in ("content_ref", "outcome_ref"))
+    )

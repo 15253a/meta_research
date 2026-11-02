@@ -547,6 +547,7 @@ function TimelineSummary({ nodeKey, node, className, unavailable, acceptedResult
     sourceTitle ? `依据：\n${sourceTitle}` : null].filter(Boolean).join("\n");
   return <span className={`${className} timeline-summary`} data-summary-key={nodeKey} data-summary-kind={node?.summary_kind ?? "process"} data-summary-status={status} data-summary-stale={stale}>
     {sentence ? <small className="timeline-summary-kind">{summaryKindNames[node?.summary_kind ?? "process"]}</small> : null}
+    {sentence && node?.milestone ? <small className="timeline-summary-kind">重要发现</small> : null}
     <span className="timeline-summary-text" title={title || undefined}>{sentence ?? (status === "failed" ? "总结暂未生成" : "记录员正在整理…")}</span>
     {sentence && acceptedResultNeedsReview ? <small className="timeline-summary-status timeline-summary-result-review">已有正式阶段成果，记录员摘要待核对；请查看正式成果。</small> : null}
     {sentence ? <small className="timeline-summary-saved-at">{savedAt}</small> : null}

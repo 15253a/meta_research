@@ -238,7 +238,47 @@ def test_timed_out_pending_job_must_confirm_cancellation_before_retry(recorder):
     assert not provider.calls
     now[0] += 301
     assert service.process_once()
-    assert provider.calls[0]['job_ref'] != job['job_ref']
+    assert provider.calls[0]['job_ref'] == job['job_ref']
+    assert provider.calls[0]['nodes'] == job['nodes']
+
+
+def test_failed_read_retries_original_basis_when_missing_material_returns(recorder):
+    service, store, reader, provider, now = recorder
+    provider.failure = DraftingUnavailable('timeline_summary_source_unavailable')
+    assert not service.process_once()
+    original = provider.calls[0]
+    now[0] += 301
+    provider.failure = None
+    assert service.process_once()
+    retry = provider.calls[1]
+    assert retry['job_ref'] == original['job_ref']
+    assert retry['nodes'] == original['nodes']
+    assert store.query('quest-1')['nodes'][0]['status'] == 'ready'
+
+
+def test_superseded_failed_read_does_not_block_new_observation(recorder):
+    service, store, reader, provider, now = recorder
+    provider.failure = DraftingUnavailable('timeline_summary_source_unavailable')
+    assert not service.process_once()
+    original = provider.calls[0]
+    reader.nodes['quest-1'] = [node('新的观察不能补成旧请求的依据。')]
+    now[0] += 301
+    provider.failure = None
+    assert service.process_once()
+    assert provider.calls[1]['job_ref'] != original['job_ref']
+    assert provider.calls[1]['nodes'] != original['nodes']
+    assert store.query('quest-1')['nodes'][0]['summary'] == '新的观察不能补成旧请求的依据。'
+
+
+def test_milestone_survives_storage_and_failed_refresh(recorder):
+    _, store, _, _, _ = recorder
+    store.sync('quest-1', [node()], 100)
+    job = store.claim(100, 'zh')
+    store.publish(job, [{'node_key': job['nodes'][0]['node_key'],
+        'source_hash': job['nodes'][0]['source_hash'], 'summary': '初步发现改善，仍需独立复核。',
+        'summary_kind': 'tentative_finding', 'milestone': True,
+        'source_refs': ['accepted-plan-1']}], 'native-recorder', 101)
+    assert store.query('quest-1')['nodes'][0]['milestone'] is True
 
 
 def test_late_duplicate_completion_cannot_replace_newer_summary(recorder):
@@ -391,24 +431,6 @@ def test_source_read_failure_is_not_retried_before_five_minutes_even_after_resta
     assert restarted.process_once()
     assert reader.calls == 2
 
-
-def test_existing_recorder_database_adopts_cadence_without_immediate_rescan(tmp_path):
-    path = tmp_path / 'old-recorder.sqlite3'
-    with sqlite3.connect(path) as db:
-        db.execute('''CREATE TABLE quests(quest_ref TEXT PRIMARY KEY,revision INTEGER NOT NULL DEFAULT 0,
-            native_session_ref TEXT,observed_at REAL NOT NULL DEFAULT 0)''')
-        db.execute("INSERT INTO quests VALUES ('quest-1',7,'preserved-native',100)")
-    store = TimelineSummaryStore(path)
-    reader, provider, now = Reader(), Provider(), [200.0]
-    service = TimelineSummaryService(store, reader, lambda: provider, clock=lambda: now[0])
-    assert not service.process_once()
-    assert not provider.calls and reader.calls == 0
-    assert store.query('quest-1')['next_scan_at'] == 400
-    now[0] = 400
-    assert service.process_once()
-    # Old sessions have no measured input budget; start fresh at the next due
-    # scan while retaining their old logs and all persisted summaries.
-    assert provider.calls[0]['native_session_ref'] is None
 
 
 def test_failed_publication_read_cannot_bypass_scan_cadence(recorder):

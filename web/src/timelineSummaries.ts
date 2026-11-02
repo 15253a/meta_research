@@ -11,6 +11,7 @@ export type TimelineSummaryNode = {
   target_ref: string | null;
   summary: string | null;
   summary_kind?: "process" | "tentative_finding" | "accepted_conclusion" | "insufficient_evidence";
+  milestone?: boolean;
   status: "pending" | "updating" | "ready" | "failed";
   source_hash: string | null;
   summarized_source_hash: string | null;
@@ -68,6 +69,7 @@ function validNode(node: TimelineSummaryNode): boolean {
   if (!node || typeof node.node_key !== "string" || typeof node.question_ref !== "string"
     || !["pending", "updating", "ready", "failed"].includes(node.status)
     || ![node.cycle_ref, node.stage, node.target_ref, node.summary, node.source_hash, node.summarized_source_hash].every(nullableText)
+    || node.milestone !== undefined && typeof node.milestone !== "boolean"
     || !(node.updated_at === null || typeof node.updated_at === "number" && Number.isFinite(node.updated_at))
     || !Array.isArray(node.sources) || node.sources.some(source => !source || typeof source.ref !== "string"
       || source.label !== undefined && typeof source.label !== "string")
@@ -115,7 +117,7 @@ export function useTimelineSummaries(questRef: string | null, active = true) {
             // A new generation or a transient failure never erases the last saved sentence.
             nodes[node.node_key] = !node.summary?.trim() && saved?.summary?.trim()
               ? { ...node, summary: saved.summary, summarized_source_hash: saved.summarized_source_hash,
-                summary_kind: saved.summary_kind, updated_at: saved.updated_at, sources: saved.sources }
+                summary_kind: saved.summary_kind, milestone: saved.milestone, updated_at: saved.updated_at, sources: saved.sources }
               : node;
           }
           return { questRef, revision: data.revision, observedAt: data.observed_at, nodes, error: false };

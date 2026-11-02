@@ -133,6 +133,24 @@ class RootSessionObservations:
             "limited": bool(reasons), "reasons": reasons,
         }
 
+    def research_sessions(self, quest_ref, foreground):
+        """Recorder needs current research roots, without the UI's full child and provider index."""
+        with self.database.read_snapshot() as db:
+            scope = {**foreground, "quest_ref":quest_ref}
+            run = db.execute(text("""
+                SELECT r.* FROM ar_stage_runs r JOIN ae_stage_run_requests q ON q.request_ref=r.request_ref
+                WHERE q.quest_ref=:quest_ref AND r.cycle_ref=:cycle_ref AND r.stage=:stage AND r.epoch=:epoch
+            """), scope).mappings().one_or_none()
+            if run:
+                units = self._stage_units(db, run)[:2]
+                yield ("stage", foreground["stage"]), run["root_session_ref"], _state(run["status"]), [u["unit_ref"] for u in units]
+            for row in self._target_rows(db, quest_ref, active_cycle=foreground["cycle_ref"]):
+                if row["_historical"] or row.get("_binding_invalid"):
+                    continue
+                operations = self._target_operations(db, row)[:2]
+                yield ("target", row["target_ref"]), row["root_session_ref"], _state(row["lifecycle_status"] or row["status"]), [
+                    op["operation_ref"] for op in operations]
+
     def _base_session(self, row, *, kind, title, stage, foreground):
         is_current = bool(foreground and row.get("cycle_ref") == foreground["cycle_ref"]
                           and row.get("question_ref") == foreground["question_ref"]
@@ -267,7 +285,7 @@ class RootSessionObservations:
         except Exception:
             session["limited"] = True
 
-    def _target_rows(self, connection, quest_ref, session_ref=None):
+    def _target_rows(self, connection, quest_ref, session_ref=None, *, active_cycle=None):
         current_rows = connection.execute(text("""
             SELECT h.*, l.target_ref, l.stage_request_ref, t.target_key, t.ordinal AS target_ordinal,
                    q.cycle_ref, q.question_ref, q.epoch, b.root_session_ref AS owner_session_ref,
@@ -279,9 +297,14 @@ class RootSessionObservations:
             LEFT JOIN ar_stage_runs b ON b.request_ref=q.request_ref
             LEFT JOIN ar_target_root_lifecycles life ON life.target_run_ref=h.run_ref
               AND life.target_ref=l.target_ref
-            WHERE l.quest_ref=:quest_ref
+            WHERE l.quest_ref=:quest_ref AND (:active_cycle IS NULL OR
+                (q.cycle_ref=:active_cycle AND NOT EXISTS (SELECT 1 FROM rg_target_commits c WHERE c.target_ref=l.target_ref)))
+              AND (:session_ref IS NULL OR h.root_session_ref=:session_ref OR EXISTS
+                (SELECT 1 FROM ar_target_root_handle_history p WHERE p.target_ref=l.target_ref AND
+                 p.target_run_ref=h.run_ref AND p.root_session_ref=:session_ref))
             ORDER BY h.created_at DESC, h.run_ref DESC LIMIT :maximum
-        """), {"quest_ref": quest_ref, "maximum": _MAX_ROOTS + 1}).mappings().all()
+        """), {"quest_ref": quest_ref, "session_ref": session_ref, "active_cycle": active_cycle,
+               "maximum": _MAX_ROOTS + 1}).mappings().all()
         roots = []
         for current_row in current_rows:
             current = dict(current_row)
@@ -554,7 +577,9 @@ class RootSessionObservations:
                         terminal=operation["status"] in {"executed", "failed"}).as_dict()
                     invocation_hash, _family = store._operation_bindings[operation_ref]
                     source = store._source_path(invocation_hash)
-                    page["source_updated_at"] = source.stat().st_mtime if page["source_bytes"] else None
+                    if page["source_bytes"]:
+                        stat = source.stat()
+                        page.update(source_updated_at=stat.st_mtime, source_change_ns=stat.st_ctime_ns)
                 except (TargetRawOutputUnavailable, OSError, ValueError, TypeError, KeyError) as error:
                     raise ValueError(_output_error(getattr(error, "code", ""))) from error
                 page["native_session_ref"] = page.get("root_native_session_ref")
