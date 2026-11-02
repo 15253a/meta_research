@@ -2980,6 +2980,10 @@ def test_corrected_v2_confirmation_preserves_the_owner_receipt_chain(
         assert hc.process_drafting_once()
         ready = hc.query_quest_creation(opened["initialization_id"])
         assert ready["status"] == "proposal_ready"
+        preview = ready["confirmation_preview"]
+        assert "保存并建立第一个研究问题，然后启动第一轮研究" in preview["will_happen"]
+        assert any("可用计算卡 1 张" in item for item in preview["will_happen"])
+        assert "确认前不会建立任务、问题或启动第一轮研究" in preview["will_not_happen"]
         confirmed = hc.confirm_quest(
             opened["initialization_id"],
             quest_draft_revision=ready["quest_draft"]["revision"],
@@ -2990,6 +2994,17 @@ def test_corrected_v2_confirmation_preserves_the_owner_receipt_chain(
             preview_hash=ready["confirmation_preview"]["hash"],
             idempotency_key="confirm-v2",
         )
+        with runtime._database.read() as connection:
+            binding = connection.execute(text(
+                "SELECT i.confirmed_preview_hash, p.preview_hash, b.summary_json "
+                "FROM hc_quest_initializations i JOIN hc_confirmation_previews p "
+                "ON p.preview_ref=i.confirmed_preview_ref JOIN hc_confirmation_preview_bindings b "
+                "ON b.preview_ref=p.preview_ref WHERE i.initialization_id=:init"
+            ), {"init": opened["initialization_id"]}).one()
+        assert binding.confirmed_preview_hash == binding.preview_hash == preview["hash"]
+        assert json.loads(binding.summary_json) == {
+            "will_happen": preview["will_happen"], "will_not_happen": preview["will_not_happen"],
+        }
         assert confirmed["receipts"]["human_confirmation"]["status"] == "accepted"
         while confirmed["status"] != "completed":
             assert hc.reconcile_once()
