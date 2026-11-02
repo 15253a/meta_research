@@ -22,7 +22,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from meta_research.acquisition import DEEPFETCH_PROTOTYPE_COMMIT
 from meta_research.system_prompt import read_output_language
@@ -2130,13 +2130,14 @@ class CodexDeepFetchAdapter:
                         raise ValueError("deepfetch reconciliation result invalid")
                     try:
                         evidence = _verified_turn_evidence("\n".join(traces))
+                        native_effects = _native_acquisition_effects("\n".join(traces))
                     except DeepFetchUnavailable as error:
                         raise error.as_verified_terminal(
                             observed_native
                         ) from error
                     return (
                         outcome[1], observed_native, evidence,
-                        _native_acquisition_effects("\n".join(traces)),
+                        native_effects,
                     )
                 if not isinstance(observed_native, str) or not observed_native:
                     raise DeepFetchUnavailable(
@@ -3196,11 +3197,12 @@ class CodexDeepFetchAdapter:
                 assert isinstance(completed_session, str)
                 try:
                     evidence = _verified_turn_evidence("\n".join(trace_parts))
+                    native_effects = _native_acquisition_effects("\n".join(trace_parts))
                 except DeepFetchUnavailable as error:
                     raise error.as_verified_terminal(completed_session) from error
                 return (
                     decoded, completed_session, evidence,
-                    _native_acquisition_effects("\n".join(trace_parts)),
+                    native_effects,
                 )
             recovered_session = outcome[3]
             if not isinstance(recovered_session, str) or not recovered_session:
@@ -4385,9 +4387,7 @@ def _validated_v4_acquisition_effect(
             "paper_id": paper_id,
             "title": title,
             "source_urls": [
-                _validated_public_url(
-                    url, "deepfetch_acquisition_source_url_invalid"
-                )
+                _validated_acquisition_source_url(url)
                 for url in urls
             ],
         }
@@ -4397,6 +4397,35 @@ def _validated_v4_acquisition_effect(
             normalized_target["arxiv_id"] = arxiv_id
         normalized_targets.append(normalized_target)
     return {"effect_id": effect_id, "targets": normalized_targets}
+
+
+def _validated_acquisition_source_url(url: str) -> str:
+    """Retain private local clues; only Owner attestation authorizes fulltext."""
+
+    code = "deepfetch_acquisition_source_url_invalid"
+    if not url.startswith("file:"):
+        return _validated_public_url(url, code)
+    try:
+        parsed = urlsplit(url)
+        path = unquote(parsed.path, errors="strict")
+    except (ValueError, UnicodeError) as error:
+        raise DeepFetchUnavailable(code) from error
+    if (
+        not url.startswith("file:///")
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or not path.startswith("/")
+        or path.startswith("//")
+        or "\\" in path
+        or any(part in {".", ".."} for part in path.split("/"))
+        or url != url.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in url + path)
+    ):
+        raise DeepFetchUnavailable(code)
+    # Do not read or resolve this untrusted path here. The existing Acquisition
+    # scope/custody checks and exact-target reattestation remain authoritative.
+    return url
 
 
 def _merge_web_evidence(
