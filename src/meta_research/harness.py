@@ -555,6 +555,7 @@ class HarnessRuntime:
             raise HarnessAdmissionError("runtime_incarnation_binding_invalid")
         self._resident_channel_scopes: dict[str, _ResidentMcpScope] = {}
         self._root_workspaces = None
+        self._recorder_channels = None
         self._recovered_target_requests: dict[str, int] = {}
         if runtime_protection is not None:
             self._recover_committed_runtime_boundaries()
@@ -3239,6 +3240,8 @@ class HarnessRuntime:
             raise HarnessAdmissionError(error.code) from error
         if self._root_workspaces is not None and self._root_workspaces.creation_channel_is_current(token):
             current = True
+        if self._recorder_channels is not None and self._recorder_channels.is_current(token):
+            current = True
         resident_scope = self._resident_channel_scopes.get(token_hash)
         allowed_operation_ids = None
         if resident_scope is not None:
@@ -3342,6 +3345,9 @@ class HarnessRuntime:
 
     def bind_root_workspaces(self, workspaces):
         self._root_workspaces = workspaces
+
+    def bind_recorder_channels(self, channels):
+        self._recorder_channels = channels
 
     def _full_conformance_request_ref(
         self, token: str, family: HarnessFamily

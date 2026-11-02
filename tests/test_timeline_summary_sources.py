@@ -1,252 +1,370 @@
 import json
-from contextlib import contextmanager
 from types import SimpleNamespace as NS
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import text, event
 
+from meta_research.database import Database
 from meta_research.owners.common import OwnerConflict
 from meta_research.timeline_summary_sources import TimelineSummarySourceReader, _public_messages
 
 
-class Database:
-    def __init__(self):
-        self.engine = create_engine("sqlite://")
-        self.cuts = 0
-        with self.engine.begin() as connection:
-            connection.execute(text("CREATE TABLE rg_quests (quest_ref TEXT, accepted_at REAL)"))
-            connection.execute(text("INSERT INTO rg_quests VALUES ('quest', 1), ('other', 2)"))
-
-    @contextmanager
-    def read_snapshot(self):
-        self.cuts += 1
-        with self.engine.connect() as connection:
-            yield connection
-
-
-def request(cycle="cycle", question="question", stage="bundle", epoch=1):
-    return NS(request_ref=f"request-{cycle}-{stage}-{epoch}", cycle_ref=cycle,
-              accepted_question=NS(quest_ref="quest", question_ref=question), stage=stage, epoch=epoch)
-
-
 class Fixture:
-    def __init__(self, *, target_count=1):
-        self.request = request()
-        self.history = [NS(cycle_ref="cycle", question_ref="question", requests=(self.request,), commits=())]
-        self.foreground = dict(quest_ref="quest", question_ref="question", cycle_ref="cycle",
-                               stage="bundle", epoch=1, status="active", grant_status="active")
-        self.graph = NS(quest_ref="quest", cycle_ref="cycle", request_ref=self.request.request_ref,
-            graph_ref="graph", formal_plan_ref="plan", targets=tuple(NS(target_ref=f"target-{i}",
-                graph_ref="graph", target_key=f"experiment-{i}", ordinal=i, spec_hash=f"spec-{i}") for i in range(target_count)))
-        self.context_failures = set()
-        self.result_failures = set()
+    """Seed exactly the same identity/revision columns the scanner reads."""
+
+    def __init__(self, path, target_count=3):
+        self.db = Database(path)
+        self.queries = []
+        self.body_reads = []
         self.results = {}
-        self.context_calls = []
-        self.index = {"quest_ref": "quest", "sessions": [], "observed_at": 1, "limited": False}
-        self.outputs = {}
-        self.output_calls = []
-        self.artifact_content = {"finding": "accepted finding"}
-        self.artifact_status = "accepted"
-        self.question_quest = "quest"
+        self.public = ""
+        self.read_sizes = []
+        self.change_ns = 1
+        self.sessions = []
+        self.current = {
+            "quest_ref": "quest",
+            "cycle_ref": "active",
+            "question_ref": "q",
+            "stage": "bundle",
+            "status": "active",
+            "grant_status": "active",
+            "epoch": 1,
+        }
+        with self.db.write() as db:
+            for table, columns in {
+                "rg_quests": "quest_ref, accepted_at",
+                "ae_cycles": "cycle_ref, question_ref, quest_ref, created_at",
+                "ae_stage_commits": "cycle_ref, stage, epoch, commit_ref, receipt_hash, request_ref, outcome_ref, disposition",
+                "ae_stage_run_requests": "cycle_ref, question_ref, stage, request_ref, quest_ref, epoch",
+                "ar_stage_runs": "cycle_ref, stage, epoch, run_ref",
+                "ar_bundle_reports": "request_ref, report_ref, report_hash, ordinal, run_ref",
+                "rg_targets": "target_ref, spec_hash, graph_ref, ordinal, append_ref",
+                "rg_target_graphs": "graph_ref, quest_ref, cycle_ref, plan_document_hash, request_ref, submission_ref, target_plan_hash",
+                "rg_target_root_measurements": "target_ref,target_run_ref,manifest_ref,completion_ref",
+                "rg_target_graph_appends": "append_ref, graph_ref, receipt_hash, generation, proposal_hash, proposal_ref",
+                "rg_target_commits": "target_ref, commit_ref,target_run_ref",
+                "rm_target_root_completion_manifests": "target_ref,target_run_ref,manifest_ref,result_document_hash,completion_ref",
+                "rm_target_research_notes": "target_ref,version_ref,note_hash,accepted_at",
+                **{
+                    k: "question_ref,quest_ref,content_ref,content_hash"
+                    for k in ("rg_questions", "rg_autonomous_questions", "rg_manual_questions")
+                },
+            }.items():
+                db.execute(text(f"CREATE TABLE {table} ({columns})"))
+            db.execute(text("INSERT INTO rg_quests VALUES ('quest',1),('other',2)"))
+            db.execute(
+                text(
+                    "INSERT INTO rg_questions VALUES ('q','quest','question-content','hash-q'),('past-q','quest','past-content','old')"
+                )
+            )
+            db.execute(text("INSERT INTO ae_cycles VALUES ('past','past-q','quest',1),('active','q','quest',2)"))
+            db.execute(
+                text(
+                    "INSERT INTO rg_target_graphs VALUES ('graph','quest','active','plan-hash','request','notes-source','notes-hash')"
+                )
+            )
+            db.execute(
+                text("INSERT INTO rg_targets VALUES (:t,'spec','graph',:ordinal,NULL)"),
+                [{"t": f"t{x}", "ordinal": x} for x in range(target_count)],
+            )
+        event.listen(
+            self.db._engine,
+            "before_cursor_execute",
+            lambda conn, cursor, statement, params, context, many: self.queries.append(statement),
+        )
+
+        def context(*, target_ref):
+            self.body_reads.append(target_ref)
+            return dict(
+                target_ref=target_ref,
+                question_ref="q",
+                plan_document_hash="plan-hash",
+                question="Estimate effect",
+                formal_plan_ref="plan",
+                obligations=[],
+                experiment_briefs=[{"objective": "Estimate effect"}],
+                plan_notes="",
+                stage_request_ref="request",
+                graph_ref="graph",
+                bundle_notes_source_ref="notes-source",
+                bundle_notes_source_hash="notes-hash",
+                bundle_notes="",
+                selection_boundary="Only the selected treatment",
+            )
+
+        def transition(t):
+            if t not in self.results:
+                return None
+            return NS(
+                target_ref=t,
+                target_commit_ref="commit",
+                target_run_ref="run",
+                target_execution_closure_ref="completion",
+                canonical_terminal=NS(asset_manifest_ref="manifest"),
+            )
+
+        def manifest(_):
+            self.body_reads.append("result")
+            body = self.results["t0"]
+            if body is None:
+                return None
+            return NS(
+                target_ref="t0",
+                target_run_ref="run",
+                completion_ref="completion",
+                manifest_ref="manifest",
+                result_document_hash="result-hash",
+                result_document=NS(as_dict=lambda: body),
+                entries=(),
+            )
+
         owners = NS(
-            research_graph=NS(query_quest_by_ref=lambda ref: NS(quest_ref=ref) if ref == "quest" else None,
-                query_question_history_by_ref=lambda ref: NS(question_ref=ref, quest_ref=self.question_quest,
-                    content_ref=f"content-{ref}", content_hash=f"hash-{ref}"),
-                query_target_graph=lambda ref: self.graph if ref == self.request.request_ref else None,
-                query_target_root_commit_transition=self.transition),
-            research_memory=NS(read_question_content=lambda ref, digest: {"title": "Does the intervention help?", "unknown_statement": "The effect is unknown."}),
-            advancement_engine=NS(query_quest_stage_history=lambda ref: tuple(self.history),
-                query_foreground=lambda ref: self.foreground,
-                query_bundle_stage_request=lambda ref: self.request),
-            agent_runtime=NS(query_bundle_stage_run=lambda ref: NS(run_ref="bundle-run", request_ref=self.request.request_ref,
-                cycle_ref=self.request.cycle_ref, stage=self.request.stage, epoch=self.request.epoch)))
-        self.runtime = NS(_database=Database(), owners=owners, data_root=NS(root="unused"),
-            target_run_authorities=NS(research_graph=NS(query_target_research_context=self.context)),
-            target_run_finalizer=NS(_memory=NS(query=self.manifest)))
-        self.reader = TimelineSummarySourceReader(self.runtime)
-        self.reader.observations = NS(query=lambda ref: self.index, query_output=self.output)
-        self.reader.overview = NS(_artifact=self.artifact)
-
-    def context(self, *, target_ref):
-        self.context_calls.append(target_ref)
-        if target_ref in self.context_failures:
-            raise OwnerConflict("target_research_context_invalid")
-        return {"target_ref": target_ref, "question_ref": "question", "formal_plan_ref": "plan",
-                "question_content_ref": "question-content", "question_content_hash": "question-hash",
-                "plan_document_hash": "plan-hash", "obligations": [{"description": "Estimate effect"}],
-                "experiment_briefs": [{"objective": "Measure the intervention against control"}],
-                "bundle_notes": "Use a held-out split", "bundle_notes_source_ref": "proposal",
-                "bundle_notes_source_hash": "proposal-hash", "selection_boundary": "Only selected experiments"}
-
-    def transition(self, ref):
-        if ref in self.result_failures:
-            raise OwnerConflict("target_root_commit_issuer_invalid")
-        if ref not in self.results:
-            return None
-        return NS(target_ref=ref, target_run_ref=f"run-{ref}", target_commit_ref=f"commit-{ref}",
-                  target_execution_closure_ref=f"completion-{ref}", canonical_terminal=NS(asset_manifest_ref=ref))
-
-    def manifest(self, ref):
-        return NS(target_ref=ref, target_run_ref=f"run-{ref}", completion_ref=f"completion-{ref}",
-                  manifest_ref=f"manifest-{ref}", result_document_hash=f"result-hash-{ref}",
-                  result_document=NS(as_dict=lambda: self.results[ref]), entries=())
-
-    def artifact(self, quest, cycle, req, commit):
-        return {"stage": "bundle", "epoch": 1, "status": self.artifact_status,
-                "source": {"request_ref": req.request_ref, "outcome_ref": "report"},
-                "content": self.artifact_content if self.artifact_status == "accepted" else None,
-                "reason": None if self.artifact_status == "accepted" else {"code": "writing_bundle_result_invalid"}}
+            research_graph=NS(query_target_root_commit_transition=transition),
+            advancement_engine=NS(query_foreground=lambda _: self.current),
+            research_memory=NS(),
+            agent_runtime=NS(),
+        )
+        runtime = NS(
+            _database=self.db,
+            owners=owners,
+            data_root=NS(root=path.parent),
+            target_run_authorities=NS(research_graph=NS(query_target_research_context=context)),
+            target_run_finalizer=NS(_memory=NS(query=manifest)),
+        )
+        self.reader = TimelineSummarySourceReader(runtime)
+        self.reader.observations = NS(research_sessions=lambda q, f: self.sessions, query_output=self.output)
 
     def output(self, quest, session, *, operation_ref, after=0, limit=65536):
-        self.output_calls.append((operation_ref, after, limit))
-        value = self.outputs[operation_ref]
-        return dict(quest_ref=quest, session_ref=session, operation_ref=operation_ref,
-            text=value, offset=after, source_bytes=len(value.encode()), root_native_session_ref="native-root", exact=True)
+        self.read_sizes.append(limit)
+        if not 4 <= limit <= 65536:
+            raise ValueError("root_session_output_limit_invalid")
+        raw = self.public.encode()
+        return dict(
+            quest_ref=quest,
+            session_ref=session,
+            operation_ref=operation_ref,
+            text=raw[after : after + limit].decode(),
+            offset=after,
+            next_offset=min(len(raw), after + limit),
+            root_native_session_ref="native",
+            source_bytes=len(raw),
+            source_change_ns=self.change_ns,
+            stream_ref="stream",
+            exact=True,
+        )
 
     def nodes(self):
-        return {node["node_key"]: node for node in self.reader.read("quest")}
+        return {n["node_key"]: n for n in self.reader.read("quest")}
+
+    def commit(self, result):
+        self.results["t0"] = result
+        with self.db.write() as db:
+            db.execute(text("INSERT INTO rg_target_commits VALUES ('t0','commit','run')"))
+            db.execute(text("INSERT INTO rg_target_root_measurements VALUES ('t0','run','manifest','completion')"))
+            db.execute(
+                text(
+                    "INSERT INTO rm_target_root_completion_manifests VALUES ('t0','run','manifest','result-hash','completion')"
+                )
+            )
+
+
+def test_one_changed_target_updates_only_its_ancestors_without_reading_any_history_body(tmp_path):
+    f = Fixture(tmp_path / "source.sqlite", target_count=513)
+    before = f.nodes()
+    f.queries.clear()
+    assert f.nodes() == before
+    query_count = len(f.queries)
+    assert f.body_reads == []
+    f.commit({"estimate": 0, "finding": "no effect", "missing_measurement": None})
+    f.queries.clear()
+    after = f.nodes()
+    changed = {k for k in before if before[k]["source_hash"] != after[k]["source_hash"]}
+    assert changed == {"target:active:t0", "stage:active:bundle", "cycle:active", "question:q"}
+    assert f.body_reads == []
+    assert len(f.queries) == query_count
+    print(f"513 targets; stable scan and one change: {query_count} statements, 0 research bodies")
+    # Only a Cycle is in the job, with no child row, yet its exact inputs can be opened separately.
+    cycle = after["cycle:active"]
+    assert f.reader.read_source("quest", cycle, "commit")["result_document"]["estimate"] == 0
+    assert f.body_reads == ["result"]
+    assert "Estimate effect" in str(f.reader.read_source("quest", cycle, "t0"))
+    assert f.body_reads == ["result", "t0"]
+    with pytest.raises(OwnerConflict, match="not_granted"):
+        f.reader.read_source("quest", before["cycle:active"], "commit")
+    with pytest.raises(OwnerConflict, match="not_granted"):
+        f.reader.read_source("other", cycle, "t0")
+
+
+def test_missing_body_can_be_retried_without_changing_the_cut_and_is_not_an_empty_stage(tmp_path):
+    f = Fixture(tmp_path / "source.sqlite")
+    f.commit(None)
+    frozen = f.nodes()
+    with pytest.raises(OwnerConflict, match="target_result_binding_invalid"):
+        f.reader.read_source("quest", frozen["cycle:active"], "commit")
+    f.results["t0"] = {
+        "result_disposition": "negative",
+        "measured_zero": 0,
+        "not_measured": None,
+        "limitation": "underpowered",
+    }
+    assert frozen == f.nodes()
+    assert f.reader.read_source("quest", frozen["cycle:active"], "commit")["result_document"] == f.results["t0"]
+    # Read the captured Stage, even after a later Foreground has replaced it.
+    f.current.update(stage="plan")
+    empty = f.reader.read_source("quest", frozen["stage:active:plan"], "stage:active:plan")
+    assert empty["artifacts"] == [] and empty["current"] is None
+    assert (
+        f.reader.read_source("quest", f.nodes()["stage:active:plan"], "stage:active:plan")["current"]["stage"]
+        == "plan"
+    )
+    assert f.reader.read_source("quest", frozen["cycle:active"], "stage:active:bundle")["current"]["stage"] == "bundle"
 
 
 def message(body, **fields):
-    return {"type": "item.completed", "thread_id": "native-root",
-            "item": {"type": "agent_message", "text": body}, **fields}
+    return {"type": "item.completed", "thread_id": "native", "item": {"type": "agent_message", "text": body}, **fields}
 
 
-def session(*, kind="target", target="target-0"):
-    return {"session_ref": "root-session", "kind": kind, "target_ref": target,
-            "question_ref": "question", "cycle_ref": "cycle", "stage": "bundle", "run_ref": "bundle-run",
-            "created_at": 1, "updated_at": 1, "status": "executing", "is_current": True,
-            "operations": [{"operation_ref": "operation", "created_at": 1}]}
+def test_verified_public_output_retains_full_limitations_and_excludes_private_or_partial_records(tmp_path):
+    f = Fixture(tmp_path / "source.sqlite")
+    f.sessions = [(("target", "t0"), "root", "waiting", ["op"])]
+    explanation = "Checking the baseline. " + "x" * 195000 + " A 0 effect is within measurement error."
+
+    def lines(records):
+        return "".join(json.dumps(r) + "\n" for r in records)
+
+    prefix = lines(
+        [
+            message("child", parent_thread_id="native"),
+            message("foreign", thread_id="wrong"),
+            message("analysis", channel="analysis"),
+            message("hidden", visibility="hidden"),
+            {"type": "item.completed", "item": {"type": "command_execution", "output": "secret"}},
+        ]
+    )
+    f.public = prefix + lines([message(explanation)]) + json.dumps(message("unfinished"))
+    frozen = f.nodes()["cycle:active"]
+    observed = f.reader.read_source("quest", frozen, "op")["public_messages"]
+    assert [m["text"] for m in observed] == [explanation]
+    f.read_sizes.clear()
+    f.nodes()
+    assert f.read_sizes == [4]  # only the active public transport revision
+    f.public += "\n"
+    f.change_ns += 1
+    assert f.reader.read_source("quest", frozen, "op")["public_messages"] == observed
+    assert (
+        f.reader.read_source("quest", f.nodes()["cycle:active"], "op")["public_messages"][-1]["text"] == "unfinished"
+    )
+    f.public = f.public.replace("Checking", "Spoofing")
+    f.change_ns += 1  # same inode, size and mtime; a corrected line has a new ctime
+    with pytest.raises(OwnerConflict, match="drift"):
+        f.reader.read_source("quest", frozen, "op")
+    changed = f.nodes()["cycle:active"]
+    assert f.reader.read_source("quest", changed, "op")["public_messages"][0]["text"].startswith("Spoofing")
+    assert _public_messages({"text": prefix}) == []
 
 
-def test_full_owner_history_not_bounded_root_index_and_failed_bundle_keeps_target_science():
-    fixture = Fixture(target_count=513)
-    fixture.index.update(limited=True, sessions=[])
-    fixture.artifact_status = "unavailable"
-    fixture.results["target-0"] = {"result_disposition": "negative", "metrics": {"effect": -0.2}, "finding": "No benefit was observed"}
-    fixture.context_failures.add("target-1")
-    fixture.result_failures.add("target-1")
-    nodes = fixture.nodes()
-    assert len([n for n in nodes.values() if n["kind"] == "target"]) == 513
-    assert len(fixture.context_calls) == 513
-    bundle = nodes["stage:cycle:bundle"]["content"]
-    assert bundle["artifacts"][0]["status"] == "unavailable"
-    assert bundle["targets"][0]["research_context"]["experiment_briefs"][0]["objective"] == "Measure the intervention against control"
-    assert bundle["targets"][0]["accepted_result"]["result_document"]["result_disposition"] == "negative"
-    assert bundle["targets"][1]["gaps"] == [{"code": "target_research_context_invalid"}, {"code": "target_root_commit_issuer_invalid"}]
-    assert bundle["targets"][2]["research_context"] is not None
-    refs = {s["ref"] for s in nodes["cycle:cycle"]["sources"]}
-    assert {"plan", "proposal", "commit-target-0", "manifest-target-0"} <= refs
+@pytest.mark.parametrize("remainder", [1, 2, 3])
+def test_short_final_public_page_keeps_the_frozen_utf8_cut_after_append(tmp_path, remainder):
+    f = Fixture(tmp_path / "source.sqlite")
+    f.sessions = [(("target", "t0"), "root", "waiting", ["op"])]
+    body = "结果为零"
+
+    def record(body):
+        return json.dumps(message(body), ensure_ascii=False) + "\n"
+
+    expected_size = 65536 + remainder
+    body = "x" * (expected_size - len(record(body).encode())) + body
+    f.public = record(body)
+    assert len(f.public.encode()) == expected_size
+    cycle = f.nodes()["cycle:active"]
+    f.public += record("后续观察")
+    assert [m["text"] for m in f.reader.read_source("quest", cycle, "op")["public_messages"]] == [body]
 
 
-def test_question_is_immutable_meaning_and_revisited_cycles_keep_owner_order():
-    fixture = Fixture()
-    fixture.history.extend([NS(cycle_ref="cycle-second", question_ref="other-question", requests=(), commits=()),
-                            NS(cycle_ref="cycle-third", question_ref="question", requests=(), commits=())])
-    before = fixture.reader.read("quest")
-    fixture.artifact_content = {"finding": "Later the result changed"}
-    after = fixture.reader.read("quest")
-    assert [n["cycle_ref"] for n in before if n["kind"] == "cycle"] == ["cycle", "cycle-second", "cycle-third"]
-    questions = [n for n in before if n["kind"] == "question"]
-    assert len(questions) == 2
-    assert questions == [n for n in after if n["kind"] == "question"]
-    assert "Later" not in json.dumps(questions)
-    assert next(n for n in before if n["kind"] == "cycle")["source_hash"] != next(n for n in after if n["kind"] == "cycle")["source_hash"]
+def test_accepted_question_before_first_cycle_can_read_its_own_original(tmp_path):
+    from test_manual_question_owner_boundaries import (
+        DeterministicManualConfirmationAuthority,
+        QUESTION,
+        _manual_owner_interfaces,
+    )
+    from test_public_plan_stage import (
+        _DeterministicIdeaSkill,
+        _DeterministicPlanSkill,
+        _confirm_direct_quest,
+        _runtime,
+    )
+
+    runtime = _runtime(
+        tmp_path / "manual", idea_skill=_DeterministicIdeaSkill(), plan_skill=_DeterministicPlanSkill(no_gap=False)
+    )
+    try:
+        root = _confirm_direct_quest(runtime)
+        quest_ref, parent_ref = root["quest_ref"], root["question_ref"]
+        authority = DeterministicManualConfirmationAuthority()
+        memory, graph = _manual_owner_interfaces(runtime, authority)
+        quest = graph.query_quest_by_ref(quest_ref)
+        context_ref = "manual_recorder_child"
+        proposal_ref, proposal_hash, content_hash, confirmation = authority.confirm(
+            context_ref=context_ref,
+            quest_ref=quest_ref,
+            parent_question_ref=parent_ref,
+            content=QUESTION,
+            basis_hash="a" * 64,
+        )
+        content = memory.accept_manual_question_content(
+            context_ref=context_ref,
+            quest=quest,
+            parent_question_ref=parent_ref,
+            proposal_ref=proposal_ref,
+            proposal_hash=proposal_hash,
+            confirmation=confirmation,
+            content=QUESTION,
+            content_hash=content_hash,
+        )
+        child = graph.accept_manual_question(
+            context_ref=context_ref,
+            quest=quest,
+            parent_question=graph.query_question_by_ref(parent_ref),
+            content=content,
+            confirmation=confirmation,
+        )
+        reader = TimelineSummarySourceReader(runtime)
+        reader.owners = NS(
+            research_memory=memory, research_graph=graph, advancement_engine=runtime.owners.advancement_engine
+        )
+        nodes = [n for n in reader.read(quest_ref) if n["question_ref"] == child.question_ref]
+        assert [(n["kind"], n["node_key"]) for n in nodes] == [("question", "question:" + child.question_ref)]
+        assert [s["ref"] for s in nodes[0]["sources"]] == [content.content_ref]
+        assert reader.read_source(quest_ref, nodes[0], content.content_ref) == QUESTION
+    finally:
+        runtime.close()
 
 
-def test_hash_ignores_poll_clock_and_executing_waiting_but_changes_for_public_content_and_pause():
-    fixture = Fixture()
-    fixture.index["sessions"] = [session()]
-    fixture.outputs["operation"] = json.dumps(message("Checking the selected dataset")) + "\n"
-    before = fixture.nodes()
-    fixture.index["observed_at"] = 999
-    fixture.index["sessions"][0].update(updated_at=1000, status="waiting", is_executing=False)
-    fixture.index["sessions"][0]["operations"][0].update(updated_at=1000, elapsed_seconds=55)
-    assert fixture.nodes() == before
-    fixture.outputs["operation"] = json.dumps(message("The dataset passed the schema check")) + "\n"
-    after = fixture.nodes()
-    for key in ("target:cycle:target-0", "stage:cycle:bundle", "cycle:cycle"):
-        assert before[key]["source_hash"] != after[key]["source_hash"]
-    assert before["question:question"] == after["question:question"]
-    fixture.foreground.update(status="paused", grant_status="suspended")
-    paused = fixture.nodes()
-    assert paused["target:cycle:target-0"]["content"]["progress"]["control"]["status"] == "paused"
-    assert paused["stage:cycle:bundle"]["source_hash"] != after["stage:cycle:bundle"]["source_hash"]
-
-
-def test_public_text_excludes_other_actors_children_analysis_tools_and_incomplete_records():
-    events = [message("old public"), message("child", parent_thread_id="native-root"),
-              message("foreign", thread_id="other"), message("hidden", channel="analysis"),
-              message("hidden reason", channel="reasoning"),
-              {"type": "item.completed", "item": {"type": "command_execution", "output": "tool secret"}},
-              message("middle public"), message("new public" + "x" * 2500),
-              message("sender conflict", sender_thread_id="other")]
-    raw = "\n".join(json.dumps(e) for e in events) + "\n" + json.dumps(message("unfinished"))
-    values = _public_messages(dict(text=raw, root_native_session_ref="native-root", offset=0))
-    assert len(values) == 2
-    assert values[0]["text"] == "middle public"
-    assert values[1]["text"].startswith("new public")
-    assert len(values[1]["text"]) == 2000
-    assert values[1]["truncated"]
-    assert _public_messages(dict(text=raw, offset=0)) == []
-    conflict = json.dumps({"type": "thread.started", "thread_id": "other"}) + "\n" + raw
-    assert _public_messages(dict(text=conflict, root_native_session_ref="native-root", offset=0)) == []
-
-
-def test_target_conversation_scope_excludes_foreign_and_replaced_roots():
-    fixture = Fixture()
-    foreign = session()
-    foreign.update(question_ref="another-question", created_at=1000)
-    replaced = session()
-    replaced.update(activity_label="已由新会话接续", created_at=2000)
-    fixture.index["sessions"] = [foreign, replaced]
-    nodes = fixture.nodes()
-    assert fixture.output_calls == []
-    assert nodes["target:cycle:target-0"]["content"]["progress"]["public_messages"] == []
-    fixture.question_quest = "other"
-    nodes = fixture.nodes()
-    assert nodes["question:question"]["content"]["question"] is None
-    assert nodes["question:question"]["content"]["gaps"] == [{"code": "timeline_summary_question_binding_invalid"}]
-
-
-def test_unknown_quest_and_foreign_foreground_fail_closed():
-    fixture = Fixture()
-    assert fixture.reader.quest_refs() == ["quest", "other"]
-    with pytest.raises(OwnerConflict, match="timeline_summary_quest_not_found"):
-        fixture.reader.read("missing")
-    fixture.foreground["quest_ref"] = "other"
-    with pytest.raises(OwnerConflict, match="timeline_summary_foreground_binding_invalid"):
-        fixture.reader.read("quest")
-
-
-def test_stage_artifact_io_failure_does_not_hide_question_or_target_science():
-    fixture = Fixture()
-    def fail(*args):
-        raise OSError("private source path must not leak")
-    fixture.reader.overview._artifact = fail
-    nodes = fixture.nodes()
-    assert nodes["stage:cycle:bundle"]["content"]["artifacts"][0]["reason"] == {"code": "timeline_stage_artifact_unavailable"}
-    assert nodes["target:cycle:target-0"]["content"]["research_context"] is not None
-    assert nodes["question:question"]["content"]["question"] is not None
-    assert "private source path" not in json.dumps(nodes)
-
-
-def test_repeated_operation_output_gaps_do_not_change_research_fingerprint():
-    fixture = Fixture()
-    fixture.index["sessions"] = [session()]
-    # The isolated observer cannot read either operation's public spool.
-    before = fixture.nodes()
-    fixture.index["sessions"][0]["operations"].append({"operation_ref": "later-operation", "created_at": 2})
-    after = fixture.nodes()
-    assert after == before
-    assert after["target:cycle:target-0"]["content"]["progress"]["gaps"] == [{"code": "timeline_public_messages_unavailable"}]
+def test_foreign_target_cannot_grant_public_output(tmp_path):
+    f = Fixture(tmp_path / "source.sqlite")
+    f.sessions = [(("target", "other-target"), "foreign", "waiting", ["op"])]
+    with pytest.raises(OwnerConflict, match="not_granted"):
+        f.reader.read_source("quest", f.nodes()["cycle:active"], "op")
+    f.current["quest_ref"] = "other"
+    with pytest.raises(OwnerConflict, match="foreground_binding_invalid"):
+        f.reader.read("quest")
+    with pytest.raises(OwnerConflict, match="quest_not_found"):
+        f.reader.read("missing")
 
 
 def test_real_accepted_idea_source_is_exact_and_does_not_advance_owners(tmp_path):
-    from test_public_plan_stage import (_DeterministicIdeaSkill, _DeterministicPlanSkill,
-        _runtime, _confirm_direct_quest, _finish_idea_stage, _owner_revisions)
-    runtime = _runtime(tmp_path / "reader", idea_skill=_DeterministicIdeaSkill(),
-                       plan_skill=_DeterministicPlanSkill(no_gap=False))
+    from test_public_plan_stage import (
+        _DeterministicIdeaSkill,
+        _DeterministicPlanSkill,
+        _runtime,
+        _confirm_direct_quest,
+        _finish_idea_stage,
+        _owner_revisions,
+    )
+
+    runtime = _runtime(
+        tmp_path / "reader", idea_skill=_DeterministicIdeaSkill(), plan_skill=_DeterministicPlanSkill(no_gap=False)
+    )
     try:
         quest = _confirm_direct_quest(runtime)
         _finish_idea_stage(runtime)
@@ -255,10 +373,13 @@ def test_real_accepted_idea_source_is_exact_and_does_not_advance_owners(tmp_path
         nodes = reader.read(quest["quest_ref"])
         assert _owner_revisions(runtime) == before
         idea = next(n for n in nodes if n["kind"] == "stage" and n["stage"] == "idea")
-        assert idea["content"]["artifacts"][0]["status"] == "accepted"
-        run = runtime.owners.agent_runtime.query_idea_stage_run(idea["content"]["artifacts"][0]["source"]["request_ref"])
+        assert "content" not in idea
+        outcome_ref = next(s["ref"] for s in idea["sources"] if s["label"] == "idea outcome")
+        artifact = reader.read_source(quest["quest_ref"], idea, outcome_ref)
+        assert artifact["status"] == "accepted"
+        run = runtime.owners.agent_runtime.query_idea_stage_run(artifact["source"]["request_ref"])
         expected = runtime.owners.research_memory.query_idea_outcome_content(run.execution.submission_ref).outcome
-        assert idea["content"]["artifacts"][0]["content"] == expected
+        assert artifact["content"] == expected
         assert reader.read(quest["quest_ref"]) == nodes
     finally:
         runtime.close()

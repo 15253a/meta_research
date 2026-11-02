@@ -246,6 +246,7 @@ def create_semantic_owner_gateway(
     human_collaboration=None,
     target_run_agent: SQLiteTargetRunAgentAuthority | None = None,
     search_sources=None,
+    recorder_channels=None,
 ) -> SemanticMcpGateway:
     """Bind semantic operations to public Owner interfaces only.
 
@@ -385,6 +386,8 @@ def create_semantic_owner_gateway(
     operations.extend(creation_basis_operations(research_memory, agent_runtime, human_collaboration))
     from meta_research.writing_content import content_model_operation
     operations.append(content_model_operation(agent_runtime))
+    if recorder_channels is not None:
+        operations.append(recorder_channels.operation)
     return SemanticMcpGateway(tuple(operations))
 
 

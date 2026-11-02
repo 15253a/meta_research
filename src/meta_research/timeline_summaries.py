@@ -23,12 +23,10 @@ MAX_BATCH_BYTES = 240_000
 GENERATION_TIMEOUT_SECONDS = 900
 DEFAULT_SCAN_SECONDS = 300
 MAX_SCAN_SECONDS = 7200
-MAX_SESSION_JOBS = 8
-MAX_SESSION_INPUT_BYTES = 240_000
 # Version the prose policy independently from scheduling instructions. Preserve
 # the original policy hash so a cadence-only update does not regenerate history.
 # Change this value when the factual summarization policy itself changes.
-SUMMARY_CONTENT_VERSION = 'research-recorder-evidence-kind-stage-gaps-20261008'
+SUMMARY_CONTENT_VERSION = 'research-recorder-independent-read-20261102'
 
 
 def _scan_interval(value):
@@ -56,12 +54,16 @@ class TimelineSummaryStore:
                     db.executescript("""
                         CREATE TABLE IF NOT EXISTS quests (
                             quest_ref TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,
-                            native_session_ref TEXT, observed_at REAL NOT NULL DEFAULT 0
+                            native_session_ref TEXT, observed_at REAL NOT NULL DEFAULT 0,
+                            scan_interval_seconds INTEGER NOT NULL DEFAULT 300,
+                            next_scan_at REAL NOT NULL DEFAULT 0,
+                            scan_decision_observed_at REAL NOT NULL DEFAULT -1
                         );
                         CREATE TABLE IF NOT EXISTS nodes (
                             quest_ref TEXT NOT NULL, node_key TEXT NOT NULL,
                             source_hash TEXT NOT NULL, source_revision INTEGER NOT NULL,
-                            node_json TEXT NOT NULL, summary TEXT, summary_kind TEXT NOT NULL DEFAULT 'process', summary_source_hash TEXT,
+                            node_json TEXT NOT NULL, summary TEXT, summary_kind TEXT NOT NULL DEFAULT 'process',
+                            milestone INTEGER NOT NULL DEFAULT 0, summary_source_hash TEXT,
                             summary_source_revision INTEGER NOT NULL DEFAULT 0,
                             summary_sources_json TEXT NOT NULL DEFAULT '[]', updated_at REAL,
                             status TEXT NOT NULL, retry_at REAL NOT NULL DEFAULT 0,
@@ -77,28 +79,8 @@ class TimelineSummaryStore:
                         CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_quest
                             ON jobs(quest_ref) WHERE status='active';
                     """)
-                    if 'retry_at' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
-                        db.execute('ALTER TABLE jobs ADD COLUMN retry_at REAL NOT NULL DEFAULT 0')
-                    if 'native_session_ref' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
-                        db.execute('ALTER TABLE jobs ADD COLUMN native_session_ref TEXT')
-                    if 'summary_kind' not in {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}:
-                        db.execute("ALTER TABLE nodes ADD COLUMN summary_kind TEXT NOT NULL DEFAULT 'process'")
-                    columns = {row['name'] for row in db.execute('PRAGMA table_info(quests)')}
-                    if 'scan_interval_seconds' not in columns:
-                        db.execute('ALTER TABLE quests ADD COLUMN scan_interval_seconds INTEGER NOT NULL DEFAULT 300')
-                    if 'next_scan_at' not in columns:
-                        db.execute('ALTER TABLE quests ADD COLUMN next_scan_at REAL NOT NULL DEFAULT 0')
-                        db.execute('UPDATE quests SET next_scan_at=observed_at+300 WHERE observed_at>0')
-                    if 'scan_decision_observed_at' not in columns:
-                        db.execute('ALTER TABLE quests ADD COLUMN scan_decision_observed_at REAL NOT NULL DEFAULT -1')
-                    if 'session_jobs' not in columns:
-                        db.execute('ALTER TABLE quests ADD COLUMN session_jobs INTEGER NOT NULL DEFAULT 0')
-                        # The old session has no reliable retained input budget.
-                        # Recover any active job unchanged, then start a bounded session.
-                        db.execute('UPDATE quests SET session_jobs=? WHERE native_session_ref IS NOT NULL', (MAX_SESSION_JOBS,))
-                    if 'session_input_bytes' not in columns:
-                        db.execute('ALTER TABLE quests ADD COLUMN session_input_bytes INTEGER NOT NULL DEFAULT 0')
                     self._initialized = True
+                db.execute('BEGIN IMMEDIATE')
                 yield db
 
     @staticmethod
@@ -119,6 +101,14 @@ class TimelineSummaryStore:
                     raise ValueError("timeline_summary_duplicate_node")
                 seen.add(key)
                 old = previous.get(key)
+                if old is None or old['source_hash'] != node['source_hash'] or not old['active']:
+                    prior = {} if old is None else {
+                        source['ref']: source for source in json.loads(old['node_json'])['sources']}
+                    incoming = {source['ref']: source for source in node['sources']}
+                    node = {**node, 'changes': {
+                        'changed_source_refs': [ref for ref, source in incoming.items() if prior.get(ref) != source],
+                        'removed_source_refs': [ref for ref in prior if ref not in incoming],
+                    }}
                 if old is None:
                     db.execute("""INSERT INTO nodes
                         (quest_ref,node_key,source_hash,source_revision,node_json,status)
@@ -135,18 +125,46 @@ class TimelineSummaryStore:
                 if key not in seen and old['active']:
                     db.execute("UPDATE nodes SET active=0 WHERE quest_ref=? AND node_key=?", (quest_ref, key))
                     changed = True
+            if changed:
+                self._retire_superseded(db, quest_ref)
             db.execute("UPDATE quests SET observed_at=? WHERE quest_ref=?", (now, quest_ref))
             if changed:
                 self._bump(db, quest_ref)
             return changed
+
+    @staticmethod
+    def _retire_superseded(db, quest_ref):
+        # A retry keeps its original basis until that observation is replaced.
+        current = {row['node_key']: row for row in db.execute(
+            'SELECT node_key,source_revision,active FROM nodes WHERE quest_ref=?', (quest_ref,))}
+        for job in db.execute("SELECT job_ref,request_json FROM jobs WHERE quest_ref=? AND status='failed' AND request_json!='{}'", (quest_ref,)).fetchall():
+            requested = json.loads(job['request_json'])['nodes']
+            if any(n['node_key'] not in current or not current[n['node_key']]['active']
+                   or n['source_revision'] != current[n['node_key']]['source_revision'] for n in requested):
+                db.execute("UPDATE jobs SET request_json='{}' WHERE job_ref=?", (job['job_ref'],))
+                for node in requested:
+                    db.execute("""UPDATE nodes SET status='pending',retry_at=0 WHERE quest_ref=?
+                        AND node_key=? AND status='failed' AND active=1""", (quest_ref, node['node_key']))
 
     def claim(self, now: float, language: str) -> dict | None:
         with self._write() as db:
             active = db.execute("SELECT * FROM jobs WHERE status='active' AND retry_at<=? ORDER BY created_at LIMIT 1", (now,)).fetchone()
             if active is not None:
                 return {**dict(active), **json.loads(active['request_json'])}
+            retry = db.execute("""SELECT * FROM jobs WHERE status='failed' AND retry_at<=?
+                AND request_json!='{}' AND NOT EXISTS (SELECT 1 FROM jobs active
+                    WHERE active.quest_ref=jobs.quest_ref AND active.status='active')
+                ORDER BY retry_at,created_at LIMIT 1""", (now,)).fetchone()
+            if retry is not None:
+                db.execute("UPDATE jobs SET status='active',created_at=?,error_code=NULL WHERE job_ref=?",
+                           (now, retry['job_ref']))
+                request = json.loads(retry['request_json'])
+                for node in request['nodes']:
+                    db.execute("""UPDATE nodes SET status='updating' WHERE quest_ref=? AND node_key=?
+                        AND source_hash=? AND active=1""", (retry['quest_ref'], node['node_key'], node['source_hash']))
+                return {**dict(retry), **request, 'created_at': now, 'status': 'active'}
             first = db.execute("""SELECT quest_ref FROM nodes WHERE active=1 AND retry_at<=?
-                AND status IN ('pending','failed')
+                AND status='pending'
                 AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.quest_ref=nodes.quest_ref AND jobs.status='active')
                 ORDER BY retry_at,rowid LIMIT 1""", (now,)).fetchone()
             if first is None:
@@ -154,7 +172,7 @@ class TimelineSummaryStore:
             quest_ref = first['quest_ref']
             selected, size = [], 0
             for row in db.execute("""SELECT * FROM nodes WHERE quest_ref=? AND active=1
-                AND retry_at<=? AND status IN ('pending','failed') ORDER BY rowid""", (quest_ref, now)):
+                AND retry_at<=? AND status='pending' ORDER BY rowid""", (quest_ref, now)):
                 node = json.loads(row['node_json'])
                 node.update(previous_summary=row['summary'], source_revision=row['source_revision'])
                 node_size = len(_json(node).encode('utf-8'))
@@ -164,14 +182,6 @@ class TimelineSummaryStore:
                 size += node_size
             quest = db.execute('SELECT * FROM quests WHERE quest_ref=?', (quest_ref,)).fetchone()
             native = quest['native_session_ref']
-            jobs, input_bytes = quest['session_jobs'], quest['session_input_bytes']
-            if native is None or jobs >= MAX_SESSION_JOBS or input_bytes + size > MAX_SESSION_INPUT_BYTES:
-                native, jobs, input_bytes = None, 0, 0
-            # Count claims (including failed calls), never recovery reads. Each
-            # job carries the complete current basis and prior summary, so a new
-            # session loses no research evidence. The completed job retains its native identity for later retirement.
-            db.execute('UPDATE quests SET native_session_ref=?,session_jobs=?,session_input_bytes=? WHERE quest_ref=?',
-                       (native, jobs + 1, input_bytes + size, quest_ref))
             request = {'nodes': selected, 'native_session_ref': native,
                        'observed_at': quest['observed_at'], 'output_language': language}
             job_ref = 'timeline-summary-' + uuid.uuid4().hex
@@ -216,17 +226,18 @@ class TimelineSummaryStore:
                     continue
                 # A useful first draft may finish while work progresses. Keep its
                 # exact provenance and leave it pending until the newer cut is summarized.
-                latest = current['source_hash'] == result['source_hash']
+                latest = current['source_hash'] == result['source_hash'] and current['source_revision'] == node['source_revision']
                 refs = set(result['source_refs'])
-                sources = [source for source in node['sources'] if source['ref'] in refs]
-                db.execute("""UPDATE nodes SET summary=?,summary_kind=?,summary_source_hash=?,summary_source_revision=?,
+                sources = [{key: source[key] for key in ('ref', 'label') if key in source}
+                           for source in node['sources'] if source['ref'] in refs]
+                db.execute("""UPDATE nodes SET summary=?,summary_kind=?,milestone=?,summary_source_hash=?,summary_source_revision=?,
                     summary_sources_json=?,updated_at=?,status=?,retry_at=0,failures=0
                     WHERE quest_ref=? AND node_key=?""",
-                    (result['summary'], result.get('summary_kind', 'process'), result['source_hash'], node['source_revision'], _json(sources), now,
+                    (result['summary'], result.get('summary_kind', 'process'), bool(result.get('milestone', False)), result['source_hash'], node['source_revision'], _json(sources), now,
                      'ready' if latest else 'pending', job['quest_ref'], node['node_key']))
             seconds = _scan_interval(next_scan_seconds)
             quest = db.execute('SELECT * FROM quests WHERE quest_ref=?', (job['quest_ref'],)).fetchone()
-            observation = job.get('observed_at', quest['observed_at'])
+            observation = job['observed_at']
             same_cut = observation == quest['observed_at']
             first_decision = same_cut and quest['scan_decision_observed_at'] != observation
             if first_decision:
@@ -248,18 +259,26 @@ class TimelineSummaryStore:
             state = db.execute("SELECT status FROM jobs WHERE job_ref=?", (job['job_ref'],)).fetchone()
             if state is None or state['status'] != 'active':
                 return
+            retry_at = now + DEFAULT_SCAN_SECONDS
             for node in job['nodes']:
                 current = db.execute("SELECT source_hash,failures FROM nodes WHERE quest_ref=? AND node_key=?",
                                      (job['quest_ref'], node['node_key'])).fetchone()
                 if current is None or current['source_hash'] != node['source_hash']:
                     continue
                 failures = current['failures'] + 1
+                retry_at = max(retry_at, now + min(MAX_SCAN_SECONDS, DEFAULT_SCAN_SECONDS * 2 ** min(failures - 1, 5)))
                 db.execute("""UPDATE nodes SET status='failed',failures=?,retry_at=?
                     WHERE quest_ref=? AND node_key=?""",
-                    (failures, now + min(MAX_SCAN_SECONDS, DEFAULT_SCAN_SECONDS * 2 ** min(failures - 1, 5)), job['quest_ref'], node['node_key']))
+                    (failures, retry_at, job['quest_ref'], node['node_key']))
             if native_session_ref:
                 db.execute("UPDATE quests SET native_session_ref=? WHERE quest_ref=?", (native_session_ref, job['quest_ref']))
-            db.execute("UPDATE jobs SET status='failed',error_code=?,request_json='{}',native_session_ref=? WHERE job_ref=?", (code, native_session_ref, job['job_ref']))
+            request = {key: job[key] for key in ('nodes', 'native_session_ref', 'observed_at', 'output_language')}
+            if native_session_ref:
+                request['native_session_ref'] = native_session_ref
+            db.execute("""UPDATE jobs SET status='failed',error_code=?,request_json=?,retry_at=?,
+                       native_session_ref=? WHERE job_ref=?""",
+                       (code, _json(request), retry_at, request['native_session_ref'], job['job_ref']))
+            self._retire_superseded(db, job['quest_ref'])
             self._bump(db, job['quest_ref'])
 
     def query(self, quest_ref: str) -> dict:
@@ -279,7 +298,7 @@ class TimelineSummaryStore:
                 result['nodes'].append({
                     **{key: node.get(key) for key in ('node_key','kind','question_ref','cycle_ref','stage','target_ref')},
                     'summary': row['summary'], 'status': row['status'], 'source_hash': row['source_hash'],
-                    'summary_kind': row['summary_kind'] if 'summary_kind' in row.keys() else 'process',
+                    'summary_kind': row['summary_kind'], 'milestone': bool(row['milestone']),
                     'summarized_source_hash': row['summary_source_hash'], 'updated_at': row['updated_at'],
                     'sources': json.loads(row['summary_sources_json']),
                 })
@@ -358,7 +377,7 @@ class TimelineSummaryService:
                 else:
                     summaries, native, next_scan_seconds = self._provider.summarize(
                         quest_ref=job['quest_ref'], nodes=job['nodes'], native_session_ref=job['native_session_ref'],
-                        job_ref=job['job_ref'], output_language=job['output_language'])
+                        job_ref=job['job_ref'], output_language=job['output_language'], observed_at=job['observed_at'])
                 if self._stopped:
                     return False  # Durable provider result will be recovered on the next startup.
             except Exception as error:
@@ -408,17 +427,20 @@ def create_timeline_summary_service(runtime, executable: str, *, provider=None) 
     from meta_research.system_prompt import read_output_language
 
     root = runtime.data_root.root / 'research-recorder'
+    reader = TimelineSummarySourceReader(runtime)
+    runtime.recorder_channels.reader = reader
 
     def create_provider():
         from meta_research.quest_drafting import _CancellableProcessRunner
         from meta_research.timeline_summary_provider import CodexTimelineSummaryAdapter
         return provider or CodexTimelineSummaryAdapter(
             root / 'provider', executable=executable, timeout_seconds=GENERATION_TIMEOUT_SECONDS,
+            channels=runtime.recorder_channels,
             process_runner=_CancellableProcessRunner(protected_environment=runtime.data_root.codex_environment))
 
     def prompt_version():
         return SUMMARY_CONTENT_VERSION
 
     return TimelineSummaryService(TimelineSummaryStore(root / 'summaries.sqlite3'),
-        TimelineSummarySourceReader(runtime), create_provider,
+        reader, create_provider,
         language=lambda: read_output_language(runtime.data_root.root), prompt_version=prompt_version)

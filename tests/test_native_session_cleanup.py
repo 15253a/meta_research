@@ -83,6 +83,48 @@ def test_owned_retired_thread_is_deleted_and_other_thread_still_resumes(tmp_path
         assert call("thread/read", {"threadId": active})["thread"]["id"] == active
 
 
+def test_recorder_retry_preserves_thread_until_its_observation_is_superseded(tmp_path):
+    from meta_research.timeline_summaries import TimelineSummaryStore
+    from test_completed_workspace_cleanup import _cleanup_runtime
+    from test_timeline_summaries import node
+
+    executable = _vendor()
+    runtime = _cleanup_runtime(tmp_path / "instance")
+    try:
+        root = runtime.data_root
+        retry_thread, current_thread = _saved_threads(executable, root, ["retry", "current"])
+        store = TimelineSummaryStore(root.root / "research-recorder" / "summaries.sqlite3")
+        first = node("first observation")
+        store.sync("quest", [first], 100)
+        failed_job = store.claim(100, "zh")
+        store.fail(failed_job, "source_unavailable", 101, retry_thread)
+
+        # Another completed job advances the Quest binding while the first is in backoff.
+        second = dict(node("second observation"), node_key="stage:c2:plan", cycle_ref="c2")
+        store.sync("quest", [first, second], 102)
+        other_job = store.claim(102, "zh")
+        store.publish(other_job, [dict(node_key=second["node_key"], source_hash=second["source_hash"],
+                                       summary="updated", source_refs=[])], current_thread, 103)
+        cleanup = runtime.target_run_runtime.cleanup_completed_workspaces
+        assert all(r.get("session_ref") != retry_thread for r in cleanup(dry_run=False))
+        with _server(executable, root) as call:
+            assert call("thread/resume", {"threadId": retry_thread})["thread"]["id"] == retry_thread
+        retry = store.claim(1000, "zh")
+        assert (retry["job_ref"], retry["native_session_ref"]) == (failed_job["job_ref"], retry_thread)
+        assert all(r.get("session_ref") != retry_thread for r in cleanup(dry_run=False))
+
+        # A failed retry may not report a new native ID. Keep the known binding
+        # so the thread can be reclaimed once its durable read is superseded.
+        store.fail(retry, "source_unavailable", 1001)
+        store.sync("quest", [node("replaced observation"), second], 1002)
+        assert any(r.get("session_ref") == retry_thread and r["action"] == "removed"
+                   for r in cleanup(dry_run=False))
+        with _server(executable, root) as call:
+            assert call("thread/read", {"threadId": current_thread})["thread"]["id"] == current_thread
+    finally:
+        runtime.close()
+
+
 def test_open_grandchild_or_retained_child_prevents_cli_cascade(tmp_path):
     from meta_research.native_session_cleanup import delete_codex_sessions
 

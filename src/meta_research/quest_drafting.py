@@ -1085,6 +1085,8 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         native_session_ref: str | None,
         ephemeral: bool,
         job_ref: str | None,
+        request_hash: str | None = None,
+        environment: dict[str, str] | None = None,
     ) -> tuple[dict[str, object], str | None]:
         if job_ref is None:
             if _text_exceeds_limit(prompt, PROVIDER_STREAM_MAX_BYTES):
@@ -1110,6 +1112,8 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                 directory=directory,
                 provider_version=CODEX_DRAFTING_LOCKED_VERSION,
             )
+            if request_hash is not None:
+                expected["request_hash"] = request_hash
             return _read_durable_job(directory, expected)
         if _text_exceeds_limit(prompt, PROVIDER_STREAM_MAX_BYTES):
             raise DraftingUnavailable("codex_prompt_too_large")
@@ -1123,6 +1127,8 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             directory=directory,
             provider_version=provider_version,
         )
+        if request_hash is not None:
+            invocation["request_hash"] = request_hash
         try:
             directory.parent.mkdir(parents=True, exist_ok=True)
             directory.mkdir()
@@ -1137,6 +1143,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             job_ref=job_ref,
             durable_directory=directory,
             invocation=invocation,
+            environment=environment,
         )
         _seal_durable_job(directory, invocation, result)
         return result
@@ -1278,6 +1285,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         job_ref: str | None,
         durable_directory: Path | None,
         invocation: dict[str, object] | None,
+        environment: dict[str, str] | None = None,
     ) -> tuple[dict[str, object], str | None]:
         directory_context: contextlib.AbstractContextManager[Path | str]
         if durable_directory is None:
@@ -1315,6 +1323,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                 ):
                     raise DraftingUnavailable("codex_job_spool_conflict")
             try:
+                runner_kwargs = {"environment": environment} if environment else {}
                 run_job = getattr(self._process_runner, "run_job", None)
                 durable_job = getattr(
                     self._process_runner, "run_durable_job", None
@@ -1375,17 +1384,17 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                     if isinstance(self._process_runner, _CancellableProcessRunner):
                         completed = durable_job(
                             *durable_arguments,
-                            stdout_max_bytes=PROVIDER_STREAM_MAX_BYTES,
+                            stdout_max_bytes=PROVIDER_STREAM_MAX_BYTES, **runner_kwargs,
                         )
                     else:
-                        completed = durable_job(*durable_arguments)
+                        completed = durable_job(*durable_arguments, **runner_kwargs)
                 elif job_ref is not None and callable(run_job):
                     completed = run_job(
-                        job_ref, argv, prompt, self._timeout_seconds
+                        job_ref, argv, prompt, self._timeout_seconds, **runner_kwargs
                     )
                 else:
                     completed = self._process_runner(
-                        argv, prompt, self._timeout_seconds
+                        argv, prompt, self._timeout_seconds, **runner_kwargs
                     )
             except _ProcessStopped as error:
                 if supervised and invocation is not None:
@@ -1437,6 +1446,8 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                 raise DraftingUnavailable("codex_output_invalid") from error
             if not isinstance(decoded, dict):
                 raise DraftingUnavailable("codex_output_invalid")
+            if invocation is not None and "request_hash" in invocation:
+                _ensure_durable_text(directory / "stdout.jsonl", completed.stdout)
             thread_id = native_session_ref or _thread_id(completed.stdout)
             return cast(dict[str, object], decoded), thread_id
 
@@ -1594,6 +1605,10 @@ def _read_drafting_invocation(
         if set(invocation) != base_keys:
             raise DraftingUnavailable("codex_job_spool_invalid")
         return cast(dict[str, object], invocation)
+    if "request_hash" in invocation:
+        if not _is_sha256(invocation["request_hash"]):
+            raise DraftingUnavailable("codex_job_spool_invalid")
+        base_keys.add("request_hash")
     if set(invocation) != {*base_keys, "execution_contract"}:
         raise DraftingUnavailable("codex_job_spool_invalid")
     contract = invocation.get("execution_contract")

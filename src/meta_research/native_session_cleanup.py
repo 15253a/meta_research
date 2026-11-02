@@ -376,7 +376,7 @@ class NativeSessionCleanup:
                         SELECT DISTINCT j.native_session_ref FROM jobs j WHERE j.native_session_ref IS NOT NULL
                           AND j.status IN ('completed','failed')
                           AND NOT EXISTS (SELECT 1 FROM quests q WHERE q.native_session_ref=j.native_session_ref)
-                          AND NOT EXISTS (SELECT 1 FROM jobs a WHERE a.status='active'
+                          AND NOT EXISTS (SELECT 1 FROM jobs a WHERE a.status IN ('active','failed')
                             AND json_extract(a.request_json,'$.native_session_ref')=j.native_session_ref)
                         ORDER BY 1 LIMIT ? OFFSET ?""", (limit, offset))]
                     self.offsets["recorder"] = offset + len(retired) if len(retired) == limit else 0
