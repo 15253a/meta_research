@@ -126,23 +126,25 @@ class TimelineSummaryStore:
                     db.execute("UPDATE nodes SET active=0 WHERE quest_ref=? AND node_key=?", (quest_ref, key))
                     changed = True
             if changed:
-                # Retry an unavailable source at the same cut. Once that cut is
-                # superseded, retire only the failed request, never substitute
-                # current material into its old basis or block newer work.
-                current = {row['node_key']: row for row in db.execute(
-                    'SELECT node_key,source_revision,active FROM nodes WHERE quest_ref=?', (quest_ref,))}
-                for job in db.execute("SELECT job_ref,request_json FROM jobs WHERE quest_ref=? AND status='failed' AND request_json!='{}'", (quest_ref,)).fetchall():
-                    requested = json.loads(job['request_json'])['nodes']
-                    if any(n['node_key'] not in current or not current[n['node_key']]['active']
-                           or n['source_revision'] != current[n['node_key']]['source_revision'] for n in requested):
-                        db.execute("UPDATE jobs SET request_json='{}' WHERE job_ref=?", (job['job_ref'],))
-                        for node in requested:
-                            db.execute("""UPDATE nodes SET status='pending',retry_at=0 WHERE quest_ref=?
-                                AND node_key=? AND status='failed' AND active=1""", (quest_ref, node['node_key']))
+                self._retire_superseded(db, quest_ref)
             db.execute("UPDATE quests SET observed_at=? WHERE quest_ref=?", (now, quest_ref))
             if changed:
                 self._bump(db, quest_ref)
             return changed
+
+    @staticmethod
+    def _retire_superseded(db, quest_ref):
+        # A retry keeps its original basis until that observation is replaced.
+        current = {row['node_key']: row for row in db.execute(
+            'SELECT node_key,source_revision,active FROM nodes WHERE quest_ref=?', (quest_ref,))}
+        for job in db.execute("SELECT job_ref,request_json FROM jobs WHERE quest_ref=? AND status='failed' AND request_json!='{}'", (quest_ref,)).fetchall():
+            requested = json.loads(job['request_json'])['nodes']
+            if any(n['node_key'] not in current or not current[n['node_key']]['active']
+                   or n['source_revision'] != current[n['node_key']]['source_revision'] for n in requested):
+                db.execute("UPDATE jobs SET request_json='{}' WHERE job_ref=?", (job['job_ref'],))
+                for node in requested:
+                    db.execute("""UPDATE nodes SET status='pending',retry_at=0 WHERE quest_ref=?
+                        AND node_key=? AND status='failed' AND active=1""", (quest_ref, node['node_key']))
 
     def claim(self, now: float, language: str) -> dict | None:
         with self._write() as db:
@@ -162,15 +164,15 @@ class TimelineSummaryStore:
                         AND source_hash=? AND active=1""", (retry['quest_ref'], node['node_key'], node['source_hash']))
                 return {**dict(retry), **request, 'created_at': now, 'status': 'active'}
             first = db.execute("""SELECT quest_ref FROM nodes WHERE active=1 AND retry_at<=?
-                AND status IN ('pending','failed')
-                AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.quest_ref=nodes.quest_ref AND jobs.status IN ('active','failed') AND jobs.request_json!='{}')
+                AND status='pending'
+                AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.quest_ref=nodes.quest_ref AND jobs.status='active')
                 ORDER BY retry_at,rowid LIMIT 1""", (now,)).fetchone()
             if first is None:
                 return None
             quest_ref = first['quest_ref']
             selected, size = [], 0
             for row in db.execute("""SELECT * FROM nodes WHERE quest_ref=? AND active=1
-                AND retry_at<=? AND status IN ('pending','failed') ORDER BY rowid""", (quest_ref, now)):
+                AND retry_at<=? AND status='pending' ORDER BY rowid""", (quest_ref, now)):
                 node = json.loads(row['node_json'])
                 node.update(previous_summary=row['summary'], source_revision=row['source_revision'])
                 node_size = len(_json(node).encode('utf-8'))
@@ -275,6 +277,7 @@ class TimelineSummaryStore:
                 request['native_session_ref'] = native_session_ref
             db.execute("UPDATE jobs SET status='failed',error_code=?,request_json=?,retry_at=? WHERE job_ref=?",
                        (code, _json(request), retry_at, job['job_ref']))
+            self._retire_superseded(db, job['quest_ref'])
             self._bump(db, job['quest_ref'])
 
     def query(self, quest_ref: str) -> dict:

@@ -281,6 +281,31 @@ def test_milestone_survives_storage_and_failed_refresh(recorder):
     assert store.query('quest-1')['nodes'][0]['milestone'] is True
 
 
+def test_failed_node_backoff_does_not_block_other_pending_nodes(recorder):
+    _, store, _, _, _ = recorder
+    store.sync('quest-1', [node()], 100)
+    original = store.claim(100, 'zh')
+    store.fail(original, 'timeline_summary_source_unavailable', 101)
+    other = dict(node('另一节点已有完整材料。'), node_key='stage:c2:plan')
+    store.sync('quest-1', [node(), other], 102)
+    next_job = store.claim(102, 'zh')
+    assert [n['node_key'] for n in next_job['nodes']] == ['stage:c2:plan']
+    store.publish(next_job, [{'node_key': other['node_key'], 'source_hash': other['source_hash'],
+        'summary': '另一节点已有完整材料。', 'source_refs': ['accepted-plan-1']}], 'native', 103)
+    assert store.claim(401, 'zh')['job_ref'] == original['job_ref']
+
+
+def test_active_old_job_failure_after_new_scan_cannot_block_current_basis(recorder):
+    _, store, _, _, _ = recorder
+    store.sync('quest-1', [node()], 100)
+    original = store.claim(100, 'zh')
+    store.sync('quest-1', [node('已观察到新的版本。')], 101)
+    store.fail(original, 'timeline_summary_source_unavailable', 102)
+    current = store.claim(103, 'zh')
+    assert current['job_ref'] != original['job_ref']
+    assert current['nodes'][0]['content']['finding'] == '已观察到新的版本。'
+
+
 def test_late_duplicate_completion_cannot_replace_newer_summary(recorder):
     service, store, reader, provider, now = recorder
     assert service.process_once()

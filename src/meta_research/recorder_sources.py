@@ -1,15 +1,24 @@
 """One job-scoped grant for the recorder, over the resident Owner gateway."""
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from secrets import compare_digest
+from threading import Lock
 
-from meta_research.owners.common import OwnerConflict, canonical_hash
-from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
+from meta_research.semantic_mcp import McpConnection, SemanticMcpError, SemanticOperation
 
 READ_SOURCE = "timeline.sources.read"
 PAGE_CHARS = 3500
+
+
+@dataclass
+class _ReadGrant:
+    connection: McpConnection
+    basis: dict
+    documents: dict[tuple[str, str], str] = field(default_factory=dict)
+    lock: Lock = field(default_factory=Lock)
 
 
 class RecorderChannels:
@@ -68,7 +77,7 @@ class RecorderChannels:
             root_kind=None,
             phase="research_recorder",
         )
-        self._active = (connection, basis)
+        self._active = _ReadGrant(connection, basis)
         try:
             yield connection
         finally:
@@ -77,26 +86,32 @@ class RecorderChannels:
 
     def is_current(self, token):
         active = self._active
-        return bool(active and token and compare_digest(active[0].token.encode(), token.encode()))
+        return bool(active and token and compare_digest(active.connection.token.encode(), token.encode()))
 
     def _unavailable(self, context):
         active = self._active
-        return None if active and context.channel_grant_ref == active[0].grant_ref else "not_granted"
+        return None if active and context.channel_grant_ref == active.connection.grant_ref else "not_granted"
 
     def _read(self, context, arguments):
         active = self._active
-        if not active or active[0].grant_ref != context.channel_grant_ref:
+        if not active or active.connection.grant_ref != context.channel_grant_ref:
             raise SemanticMcpError("capability_unavailable")
-        basis = active[1]
+        basis = active.basis
         ref = arguments["source_ref"]
         node = next((node for node in basis["nodes"] if node["node_key"] == arguments["node_key"]), None)
-        if node is None or not any(source["ref"] == ref for source in node["sources"]):
+        source = next((s for s in node["sources"] if s["ref"] == ref), None) if node else None
+        if source is None:
             raise SemanticMcpError("capability_unavailable")
-        try:
-            body = self.reader.read_source(basis["quest_ref"], node, ref)
-        except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
-        serialized = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        # Keep the validated JSON in this grant so every page slices the same text.
+        key = (ref, canonical_hash(source["binding"]))
+        with active.lock:
+            serialized = active.documents.get(key)
+            if serialized is None:
+                try:
+                    body = self.reader.read_source(basis["quest_ref"], node, ref)
+                except OwnerConflict as error:
+                    raise SemanticMcpError(error.code) from error
+                serialized = active.documents[key] = canonical_json(body)
         offset = arguments.get("offset", 0)
         if offset >= len(serialized):
             raise SemanticMcpError("content_offset_invalid")

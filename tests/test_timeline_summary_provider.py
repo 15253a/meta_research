@@ -285,3 +285,47 @@ def test_unrelated_root_cannot_discover_or_call_the_recorders_operation(tmp_path
             assert result["isError"] and result["structuredContent"]["code"] == "capability_unavailable"
     finally:
         gateway.revoke_channel(unrelated.token)
+
+
+def test_source_pages_pin_one_successful_read_for_this_binding_and_grant():
+    runner = RecorderRunner()
+    request = job()
+    current = {"text": "a" * 194_980}
+    owner_reads = 0
+    request["nodes"][1]["sources"].append(
+        {"ref": "question-1", "label": "another version", "binding": {"version": 2}}
+    )
+
+    def read(quest, node, ref):
+        nonlocal owner_reads
+        owner_reads += 1
+        if owner_reads == 1:
+            raise OwnerConflict("content_temporarily_unavailable")
+        return current
+
+    runner.sources.read_source = read
+
+    def page(offset, key=Q):
+        status, response = runner.call(READ_SOURCE, {"node_key": key, "source_ref": "question-1", "offset": offset})
+        assert status == 200
+        return response["result"]["structuredContent"]
+
+    with runner.channels.grant("job-1", request, None) as access:
+        runner.token = access.token
+        assert page(0)["code"] == "content_temporarily_unavailable"
+        first = page(0)
+        current = {"text": "b" * 194_980}
+        text, offset = first["text"], first["next_offset"]
+        while offset is not None:
+            chunk = page(offset)
+            text += chunk["text"]
+            offset = chunk["next_offset"]
+        assert json.loads(text) == {"text": "a" * 194_980}
+        assert owner_reads == 2  # one unavailable read, then one body for all 56 pages
+        assert "bbbb" in page(0, key=STAGE)["text"]
+        assert owner_reads == 3
+
+    with runner.channels.grant("job-2", request, None) as access:
+        runner.token = access.token
+        assert "bbbb" in page(0)["text"]
+        assert owner_reads == 4

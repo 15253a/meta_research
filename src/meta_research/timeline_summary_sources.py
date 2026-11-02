@@ -204,12 +204,12 @@ class TimelineSummarySourceReader:
                     )
                 cycle_node = _node("cycle:" + c, "cycle", quest_ref, q, [identity], stage_nodes, cycle_ref=c)
                 grouped[q].append([cycle_node, *stage_nodes[:3], *target_nodes, stage_nodes[3]])
-            questions = {}
-            for q, groups in grouped.items():
-                source = question_sources.get(q)
-                if source is None:
-                    raise OwnerConflict("timeline_summary_question_binding_invalid")
-                questions[q] = _node("question:" + q, "question", quest_ref, q, [source], [g[0] for g in groups])
+            if grouped.keys() - question_sources.keys():
+                raise OwnerConflict("timeline_summary_question_binding_invalid")
+            questions = {
+                q: _node("question:" + q, "question", quest_ref, q, [source], [g[0] for g in grouped[q]])
+                for q, source in question_sources.items()
+            }
             nodes = []
             by_cycle = {g[0]["cycle_ref"]: g for groups in grouped.values() for g in groups}
             for cycle in cycles:
@@ -217,6 +217,7 @@ class TimelineSummarySourceReader:
                 if question:
                     nodes.append(question)
                 nodes.extend(by_cycle[cycle["cycle_ref"]])
+            nodes.extend(questions.values())  # Accepted Questions that have no Cycle yet.
             return nodes
 
     def _progress(self, quest, foreground):
@@ -306,7 +307,8 @@ class TimelineSummarySourceReader:
         cursor = start
         while cursor < end:
             try:
-                p = self._page(quest, b["session_ref"], b["operation_ref"], cursor, min(_PUBLIC_BYTES, end - cursor))
+                limit = max(4, min(_PUBLIC_BYTES, end - cursor))
+                p = self._page(quest, b["session_ref"], b["operation_ref"], cursor, limit)
             except ValueError:
                 # A byte-addressed tail can start in the middle of UTF-8.
                 if start and cursor < start + 3:
@@ -317,9 +319,15 @@ class TimelineSummarySourceReader:
                 p["root_native_session_ref"] != b["native"]
                 or p["source_bytes"] < end
                 or p.get("stream_ref") != b["stream_ref"]
-                or not cursor < p["next_offset"] <= end
+                or p["offset"] != cursor
+                or not cursor < p["next_offset"] <= cursor + limit
             ):
                 raise OwnerConflict("timeline_public_output_drift")
+            if p["next_offset"] > end:
+                # query_output requires at least four bytes. An append after the cut
+                # may fill that last page; discard it, even if its UTF-8 is multibyte.
+                parts.append(p["text"].encode("utf-8")[: end - cursor].decode("utf-8", errors="ignore"))
+                break
             parts.append(p["text"])
             cursor = p["next_offset"]
         return "".join(parts)

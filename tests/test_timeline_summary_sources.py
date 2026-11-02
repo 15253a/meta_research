@@ -136,6 +136,8 @@ class Fixture:
 
     def output(self, quest, session, *, operation_ref, after=0, limit=65536):
         self.read_sizes.append(limit)
+        if not 4 <= limit <= 65536:
+            raise ValueError("root_session_output_limit_invalid")
         raw = self.public.encode()
         return dict(
             quest_ref=quest,
@@ -259,6 +261,83 @@ def test_verified_public_output_retains_full_limitations_and_excludes_private_or
     changed = f.nodes()["cycle:active"]
     assert f.reader.read_source("quest", changed, "op")["public_messages"][0]["text"].startswith("Spoofing")
     assert _public_messages({"text": prefix}) == []
+
+
+@pytest.mark.parametrize("remainder", [1, 2, 3])
+def test_short_final_public_page_keeps_the_frozen_utf8_cut_after_append(tmp_path, remainder):
+    f = Fixture(tmp_path / "source.sqlite")
+    f.sessions = [(("target", "t0"), "root", "waiting", ["op"])]
+    body = "结果为零"
+
+    def record(body):
+        return json.dumps(message(body), ensure_ascii=False) + "\n"
+
+    expected_size = 65536 + remainder
+    body = "x" * (expected_size - len(record(body).encode())) + body
+    f.public = record(body)
+    assert len(f.public.encode()) == expected_size
+    cycle = f.nodes()["cycle:active"]
+    f.public += record("后续观察")
+    assert [m["text"] for m in f.reader.read_source("quest", cycle, "op")["public_messages"]] == [body]
+
+
+def test_accepted_question_before_first_cycle_can_read_its_own_original(tmp_path):
+    from test_manual_question_owner_boundaries import (
+        DeterministicManualConfirmationAuthority,
+        QUESTION,
+        _manual_owner_interfaces,
+    )
+    from test_public_plan_stage import (
+        _DeterministicIdeaSkill,
+        _DeterministicPlanSkill,
+        _confirm_direct_quest,
+        _runtime,
+    )
+
+    runtime = _runtime(
+        tmp_path / "manual", idea_skill=_DeterministicIdeaSkill(), plan_skill=_DeterministicPlanSkill(no_gap=False)
+    )
+    try:
+        root = _confirm_direct_quest(runtime)
+        quest_ref, parent_ref = root["quest_ref"], root["question_ref"]
+        authority = DeterministicManualConfirmationAuthority()
+        memory, graph = _manual_owner_interfaces(runtime, authority)
+        quest = graph.query_quest_by_ref(quest_ref)
+        context_ref = "manual_recorder_child"
+        proposal_ref, proposal_hash, content_hash, confirmation = authority.confirm(
+            context_ref=context_ref,
+            quest_ref=quest_ref,
+            parent_question_ref=parent_ref,
+            content=QUESTION,
+            basis_hash="a" * 64,
+        )
+        content = memory.accept_manual_question_content(
+            context_ref=context_ref,
+            quest=quest,
+            parent_question_ref=parent_ref,
+            proposal_ref=proposal_ref,
+            proposal_hash=proposal_hash,
+            confirmation=confirmation,
+            content=QUESTION,
+            content_hash=content_hash,
+        )
+        child = graph.accept_manual_question(
+            context_ref=context_ref,
+            quest=quest,
+            parent_question=graph.query_question_by_ref(parent_ref),
+            content=content,
+            confirmation=confirmation,
+        )
+        reader = TimelineSummarySourceReader(runtime)
+        reader.owners = NS(
+            research_memory=memory, research_graph=graph, advancement_engine=runtime.owners.advancement_engine
+        )
+        nodes = [n for n in reader.read(quest_ref) if n["question_ref"] == child.question_ref]
+        assert [(n["kind"], n["node_key"]) for n in nodes] == [("question", "question:" + child.question_ref)]
+        assert [s["ref"] for s in nodes[0]["sources"]] == [content.content_ref]
+        assert reader.read_source(quest_ref, nodes[0], content.content_ref) == QUESTION
+    finally:
+        runtime.close()
 
 
 def test_foreign_target_cannot_grant_public_output(tmp_path):
