@@ -409,7 +409,7 @@ class RootSessionObservations:
             row["_identity_limited"] = True
             return []
         operations = connection.execute(text("""
-            SELECT operation_ref, run_ref, generation, status, outcome_code, created_at, completed_at
+            SELECT operation_ref, run_ref, invocation_hash, generation, status, outcome_code, created_at, completed_at
             FROM ar_harness_provider_operations WHERE run_ref=:run_ref
               AND (:operation_ref IS NULL OR operation_ref=:operation_ref)
             ORDER BY generation DESC LIMIT :maximum
@@ -450,7 +450,8 @@ class RootSessionObservations:
         if operation["operation_ref"] not in store._operation_bindings:
             try:
                 # Only an in-memory read binding is recovered here.
-                harness._recover_target_raw_output_binding(run_ref=run.run_ref, operation_ref=operation["operation_ref"])
+                harness._recover_target_raw_output_binding(run_ref=run.run_ref, operation_ref=operation["operation_ref"],
+                    owner_invocation_hash=operation["invocation_hash"])
             except Exception:
                 with self.database.read() as connection:
                     receipts = connection.execute(text("""

@@ -1852,6 +1852,7 @@ class HarnessRuntime:
             self._recover_target_raw_output_binding(
                 run_ref=run.run_ref,
                 operation_ref=operation.operation_ref,
+                owner_invocation_hash=operation.invocation_hash,
             )
             try:
                 page = store.query(
@@ -1884,6 +1885,7 @@ class HarnessRuntime:
         *,
         run_ref: str,
         operation_ref: str,
+        owner_invocation_hash: str | None = None,
     ) -> None:
         store = self._target_raw_output_store
         if store is None:
@@ -1917,7 +1919,7 @@ class HarnessRuntime:
             recover = getattr(adapter, "recover_transport_receipt", None)
             if callable(recover):
                 try:
-                    recovered = recover(operation_ref)
+                    recovered = recover(operation_ref, owner_invocation_hash=owner_invocation_hash)
                 except (OSError, HarnessAdapterUnavailable) as error:
                     raise HarnessAdmissionError("target_raw_output_binding_unavailable") from error
                 if recovered is not None:
