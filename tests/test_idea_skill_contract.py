@@ -1383,6 +1383,8 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert result.adapter_kind == "codex_cli"
     assert len(runner.calls) == 1
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
+    assert "本回合的最终答复就是提交入口" in primary_prompt
+    assert "交回 NoViableCandidate 并给出科学依据" in primary_prompt
     assert primary_argv[:2] == ["codex", "exec"]
     assert primary_argv[2:4] == ["--enable", "multi_agent"]
     assert "--ignore-user-config" not in primary_argv
