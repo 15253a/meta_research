@@ -51,11 +51,12 @@ class ExistingWorkAdapter:
             is_note = entry["relative_path"] == "project/notes.md"
             witnesses = []
             if is_note:
-                read = self.workspaces.read_initialization(request.initialization_id, request.root_session_ref,
-                    workspace_ref=entry["workspace_ref"], path=entry["path"], expected_sha256=entry["sha256"])
-                assert read["content"] == b"Room improves; cold worsens. More field work remains.\n"
-                witnesses = [{"material_key": entry["material_key"], "offset": 0, "length": len(read["content"]),
-                    "chunk_sha256": hashlib.sha256(read["content"]).hexdigest(), "location": "notes line 1"}]
+                binding = self.workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
+                content = (binding.directory / entry["path"]).read_bytes()
+                assert hashlib.sha256(content).hexdigest() == entry["sha256"]
+                assert content == b"Room improves; cold worsens. More field work remains.\n"
+                witnesses = [{"material_key": entry["material_key"], "offset": 0, "length": len(content),
+                    "chunk_sha256": hashlib.sha256(content).hexdigest(), "location": "notes line 1"}]
                 understanding["claims_and_conditions"] = [{"ref": "room-claim", "text": "Room improves and cold worsens.",
                     "kind": "reported_work", "conditions": ["Condition matters."], "sources": witnesses}]
                 understanding["unfinished_questions"] = [{"ref": "unfinished", "text": "Which condition changes the calibration effect?",
@@ -249,8 +250,8 @@ def test_literature_revision_updates_source_coverage_without_changing_the_prepar
             binding = self.workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
             basis = json.loads((binding.directory / request.context["relative_root"] / "basis.json").read_text())
             source = next(item for item in basis["sources"] if item["relative_path"] == "project/raw.log")
-            content = self.workspaces.read_initialization(request.initialization_id, request.root_session_ref,
-                workspace_ref=source["workspace_ref"], path=source["path"], expected_sha256=source["sha256"])["content"]
+            content = (binding.directory / source["path"]).read_bytes()
+            assert hashlib.sha256(content).hexdigest() == source["sha256"]
             coverage = {"material_key": source["material_key"], "kind": "read", "read_ranges": [{
                 "material_key": source["material_key"], "offset": 0, "length": len(content),
                 "chunk_sha256": hashlib.sha256(content).hexdigest(), "location": "raw.log line 1"}], "unread_description": ""}

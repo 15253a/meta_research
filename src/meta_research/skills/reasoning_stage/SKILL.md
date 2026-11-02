@@ -17,7 +17,7 @@ description: 分析本轮工作，经 RG 审视整体路线与关键关系，交
 
 先对照首轮的完整 Question、当前 Goal 与适用指导、本轮重心、完整 FormalPlan、Bundle 最终交接及每项实际工作的关键结果和限制，分清计划承担的回答责任、真正开展的工作及尚未获得的证据，联系结果与限制判断已有认识发生了什么变化。再围绕综合所需的问题展开准确原文和相关历史；首轮组织及读取触发见[上下文与准确材料](references/contract.md#上下文与准确材料)。保持 request、Question、Quest、Goal、epoch 和来源绑定。Idea／Plan／Bundle 的 Completed、Skipped、Exhausted、NoViableCandidate 是路线状态，本身不证明科学主张。
 
-本 Cycle 阶段与 Target 的暂存说明及本工作已交付文件沿获授 Workspace reader 核对；加工、保管或跨 Cycle 文件交接读[材料与保管](../references/materials-and-custody.md)。这些材料可解释过程和未决项，科学结论的正式来源仍须核验接纳链。摘要尚未呈现的内容先沿准确入口核实，区分尚未读取与工作实际未产出。
+本 Cycle 阶段与 Target 的暂存说明及本工作已交付文件在宿主提供的目录用原生文件工具核对；加工、保管或跨 Cycle 文件交接读[材料与保管](../references/materials-and-custody.md)。这些材料可解释过程和未决项，科学结论的正式来源仍须核验接纳链。摘要尚未呈现的内容先沿准确入口核实，区分尚未读取与工作实际未产出。
 
 比较历史结果时，将实验结论对应到实际产生它的 Cycle／ScientificOutcome，区分结果产生轮次与后来转述它的轮次。“上一轮”仅指当前 Cycle 的直接前序；较早试点写明来源轮次，尚未核实轮次时称“既有试点”，保留架构、数据和协议差异。独立审阅据这项对应关系核对比较措辞。
 

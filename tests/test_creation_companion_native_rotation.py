@@ -64,11 +64,9 @@ def test_creation_new_rotates_the_actual_intent_consumer_and_preserves_its_works
         assert fresh.root_session_ref == root_ref
         assert "Previous creation conversation fact." not in str(fresh.draft)
         history, = fresh.draft["companion_context"]["prior_conversations"]
-        read = runtime.root_workspaces.read_initialization(initialization_id, root_ref,
-            workspace_ref=history["workspace_ref"], path=history["path"])
-        assert json.loads(read["content"])["turns"] == original["intent_session"]["turns"]
-        assert runtime.root_workspaces.read_initialization(initialization_id, root_ref,
-            workspace_ref=binding.location.workspace_ref, path="retained-intent.txt")["content"] == b"Creation workspace material."
+        assert binding.location.workspace_ref == history["workspace_ref"]
+        assert json.loads((binding.directory / history["path"]).read_bytes())["turns"] == original["intent_session"]["turns"]
+        assert (binding.directory / "retained-intent.txt").read_bytes() == b"Creation workspace material."
         assert human.query_companion("quest-initialization:" + initialization_id)["session_ref"] is None
         replay = client.post(new_url, headers={**headers, "Idempotency-Key": "creation-new"}, json={})
         assert replay.status_code == 200
@@ -216,9 +214,8 @@ def test_actual_codex_creation_prompt_has_only_prior_history_paths_after_new(tmp
         draft_line = next(line for line in prompt.splitlines() if line.startswith("current_draft="))
         draft = json.loads(draft_line.removeprefix("current_draft="))
         descriptor, = draft["companion_context"]["prior_conversations"]
-        history = runtime.root_workspaces.read_initialization(opened["initialization_id"], view["intent_session"]["ref"],
-            workspace_ref=descriptor["workspace_ref"], path=descriptor["path"])
-        assert json.loads(history["content"])["native_session_ref"] == "codex-creation-1"
+        binding = runtime.root_workspaces.bind_initialization(opened["initialization_id"], view["intent_session"]["ref"])
+        assert json.loads((binding.directory / descriptor["path"]).read_bytes())["native_session_ref"] == "codex-creation-1"
         assert descriptor["workspace_ref"] == view["intent_session"]["workspace_ref"]
         assert draft["companion_context"]["native_session_generation"] == 2
         assert view["quest_draft"] == opened["quest_draft"]
@@ -226,8 +223,6 @@ def test_actual_codex_creation_prompt_has_only_prior_history_paths_after_new(tmp
         assert f"current_draft_hash={opened['quest_draft']['hash']}" in prompt
         material, = draft["material_manifest"]["entries"]
         assert material["workspace_ref"] == descriptor["workspace_ref"]
-        read = runtime.root_workspaces.read_initialization(opened["initialization_id"], view["intent_session"]["ref"],
-            workspace_ref=material["workspace_ref"], path=material["path"])
-        assert read["content"] == b"Preserve the actual creation material."
+        assert (binding.directory / material["path"]).read_bytes() == b"Preserve the actual creation material."
     finally:
         runtime.close()

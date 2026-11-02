@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -12,7 +11,7 @@ import stat
 from dataclasses import dataclass
 
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
-from meta_research.semantic_mcp import SemanticCallContext, SemanticMcpError, SemanticOperation
+from meta_research.semantic_mcp import SemanticCallContext, SemanticMcpError
 
 
 _STAGES = ("idea", "plan", "bundle", "reasoning")
@@ -208,18 +207,12 @@ class RootWorkspaces:
                 launch.stage_request_ref, target_ref))
         return tuple(locations)
 
-    def read_cycle_stage_workspace_locations(self, cycle_ref: str) -> tuple[WorkspaceLocation, ...]:
-        """Locate recorded stage work without creating or reopening directories."""
-        locations = []
-        for request in self._ae.query_cycle_stage_requests(cycle_ref):
-            run = getattr(self._ar, 'query_' + request.stage + '_stage_run')(request.request_ref)
-            if run is None:
-                continue
-            location = self._runtime_location(run.run_ref)
-            if location.cycle_ref != cycle_ref or location.request_ref != request.request_ref:
-                raise OwnerConflict('workspace_lineage_invalid')
-            locations.append(location)
-        return tuple(locations)
+    def read_stage_workspace_location(self, run_ref: str, cycle_ref: str, stage: str) -> WorkspaceLocation:
+        """Locate a recorded Stage without creating or reopening its directory."""
+        location = self._runtime_location(run_ref)
+        if stage not in _STAGES or (location.root_kind, location.cycle_ref) != (stage, cycle_ref):
+            raise OwnerConflict("workspace_lineage_invalid")
+        return location
 
     def _target_location(self, target_ref: str) -> WorkspaceLocation:
         return self._target_locations(target_ref)[0]
@@ -420,30 +413,42 @@ class RootWorkspaces:
 
     def _visible(self, context: SemanticCallContext) -> tuple[WorkspaceLocation, ...]:
         current = self.bind_runtime(context).location
+        return self._visible_locations(current)
+
+    def receiving_locations(self, context: SemanticCallContext) -> tuple[WorkspaceLocation, ...]:
+        # Registering a human file with an earlier work does not grant that
+        # external file to every reader of the earlier scratch directory.
+        return self._visible_locations(self.bind_runtime(context).location, previous_cycles=False)
+
+    def _visible_locations(self, current: WorkspaceLocation, *, previous_cycles=True) -> tuple[WorkspaceLocation, ...]:
         if current.cycle_ref is None:
             return (current,)
         locations = {current.workspace_ref: current}
+
+        def include(source, cycle):
+            if source.quest_ref != current.quest_ref or source.cycle_ref != cycle:
+                raise SemanticMcpError("workspace_lineage_invalid")
+            locations.setdefault(source.workspace_ref, source)
+
         if current.root_kind == "target":
             for source in self._target_locations(current.target_ref, history=True):
-                locations[source.workspace_ref] = source
+                include(source, current.cycle_ref)
         rank = 2 if current.root_kind == "target" else _STAGES.index(current.root_kind)
-        for request in self._ae.query_cycle_stage_requests(current.cycle_ref):
-            if _STAGES.index(request.stage) >= rank:
-                continue
-            run = getattr(self._ar, "query_" + request.stage + "_stage_run")(request.request_ref)
-            if run is not None:
-                source = self._runtime_location(run.run_ref)
-                if source.cycle_ref != current.cycle_ref or source.quest_ref != current.quest_ref:
-                    raise SemanticMcpError("workspace_lineage_invalid")
-                locations[source.workspace_ref] = source
-        if current.root_kind in {"bundle", "reasoning"}:
-            for request in self._ae.query_cycle_stage_requests(current.cycle_ref):
-                if request.stage != "bundle":
+        window = self._ae.query_recent_workspace_cycles(current.quest_ref) if previous_cycles else (current.cycle_ref,)
+        # A late operation still owns its actual work. It cannot expose a
+        # newer Cycle or reopen a complete fourth workspace.
+        recent = window[window.index(current.cycle_ref):] if current.cycle_ref in window else ()
+        for cycle in recent:
+            for request in self._ae.query_cycle_stage_requests(cycle):
+                in_progress = cycle == current.cycle_ref
+                if not in_progress or _STAGES.index(request.stage) < rank:
+                    run = getattr(self._ar, "query_" + request.stage + "_stage_run")(request.request_ref)
+                    if run is not None:
+                        include(self._runtime_location(run.run_ref), cycle)
+                if request.stage != "bundle" or (in_progress and current.root_kind not in {"bundle", "reasoning"}):
                     continue
                 graph = self._rg.query_target_graph(request.request_ref)
-                if graph is None:
-                    continue
-                for target in graph.targets:
+                for target in graph.targets if graph is not None else ():
                     if self._ar.query_admitted_target_launch(target.target_ref) is None:
                         continue
                     try:
@@ -453,83 +458,75 @@ class RootWorkspaces:
                             continue
                         raise
                     for source in sources:
-                        if source.cycle_ref != current.cycle_ref or source.quest_ref != current.quest_ref:
-                            raise SemanticMcpError("workspace_lineage_invalid")
-                        locations[source.workspace_ref] = source
-        return tuple(locations[key] for key in sorted(locations))
+                        include(source, cycle)
+        return tuple(locations.values())
 
-    def discover(self, context: SemanticCallContext, *, prefix: str = "", offset: int = 0,
-                 limit: int = 50) -> dict[str, object]:
-        return self._discover(self._visible(context), prefix=prefix, offset=offset, limit=limit)
+    def native_directories(self, binding: WorkspaceBinding) -> tuple[dict, ...]:
+        """Resolve authorized directory roots only; never create or walk old work."""
+        return self._native_directories(binding.location)
 
-    def discover_initialization(self, initialization_id: str, root_session_ref: str, **arguments):
-        return self._discover((self.bind_initialization(initialization_id, root_session_ref).location,), **arguments)
+    def _native_directories(self, current: WorkspaceLocation) -> tuple[dict, ...]:
+        result = []
+        for source in self._visible_locations(current):
+            directory = source.directory
+            if (not directory.is_dir() or directory.resolve() != directory
+                    or not os.access(directory, os.R_OK | os.X_OK)):
+                continue
+            writable = source == current and os.access(directory, os.W_OK)
+            result.append({**source.source(), "directory": str(directory),
+                           "access": "read_write" if writable else "read"})
+        return tuple(result)
 
-    def discover_manual_creation(self, context_ref: str, root_session_ref: str,
-                                 context_generation: int, **arguments):
-        return self._discover((self._manual_creation_binding(context_ref, root_session_ref,
-            context_generation, require_open=False).location,), **arguments)
+    def target_directory_prompt(self, target_ref: str, workspace_ref: str, directory: Path) -> str:
+        # Harness has already resolved the Target's current handle and fence.
+        current = self._target_location(target_ref)
+        if (current.workspace_ref, current.directory) != (workspace_ref, directory):
+            raise OwnerConflict("workspace_scope_stale")
+        return self.native_directory_prompt(current)
 
-    def discover_companion_session(self, scope_ref: str, root_session_ref: str, **arguments):
-        return self._discover((self._companion_session_binding(scope_ref, root_session_ref,
-            require_open=False).location,), **arguments)
+    def native_directory_prompt(self, current: WorkspaceLocation) -> str:
+        return ("\n\nUse native file or shell tools in these work directories. "
+                "Write only in your own read_write directory; other listed work is read-only. "
+                "Do not traverse parent directories, private spools or authority stores. "
+                "Presence does not admit a formal asset. Work directories: "
+                + canonical_json(self._native_directories(current)))
 
-    def _discover(self, locations, *, prefix="", offset=0, limit=50):
-        if prefix:
-            _relative_parts(prefix.rstrip("/"))
+    def list_companion_files(self, scope_ref: str, root_session_ref: str, *, offset=0, limit=50):
+        """List the requested page for the human-facing Companion file panel."""
+        location = self._companion_session_binding(scope_ref, root_session_ref, require_open=False).location
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
             raise SemanticMcpError("workspace_page_invalid")
         files = []
         seen = 0
         next_offset = None
-        for location in sorted(locations, key=lambda item: item.workspace_ref):
-            if not location.directory.exists():
-                continue
-            # Enumerate only through the requested page and one look-ahead entry.
-            # Skipped pages and look-ahead paths never read or hash file content.
-            with closing(_workspace_paths(location, prefix)) as paths:
-                for path in paths:
-                    if seen < offset:
-                        seen += 1
-                        continue
-                    if len(files) == limit:
-                        next_offset = seen
-                        break
+        # Enumerate only through the requested page and one look-ahead entry.
+        # Skipped pages and look-ahead paths never read or hash file content.
+        with closing(_companion_file_paths(location.directory)) as paths:
+            for path in paths:
+                if seen < offset:
                     seen += 1
-                    try:
-                        content = _read_bytes(location.directory, path)
-                    except SemanticMcpError as error:
-                        if error.code == "workspace_file_unsafe":
-                            continue
-                        if error.code == "workspace_file_too_large":
-                            files.append({**location.source(), "path": path,
-                                "bytes": error.details.get("bytes"), "sha256": None,
-                                "readable": False, "read_error": {"code": error.code,
-                                    "maximum_bytes": _MAX_FILE_BYTES}})
-                            continue
-                        raise
-                    files.append({**location.source(), "path": path, "bytes": len(content),
-                                  "sha256": hashlib.sha256(content).hexdigest(), "readable": True})
-            if next_offset is not None:
-                break
+                    continue
+                if len(files) == limit:
+                    next_offset = seen
+                    break
+                seen += 1
+                try:
+                    content = _read_bytes(location.directory, path)
+                except SemanticMcpError as error:
+                    if error.code == "workspace_file_unsafe":
+                        continue
+                    if error.code == "workspace_file_too_large":
+                        files.append({**location.source(), "path": path,
+                            "bytes": error.details.get("bytes"), "sha256": None,
+                            "readable": False, "read_error": {"code": error.code,
+                                "maximum_bytes": _MAX_FILE_BYTES}})
+                        continue
+                    raise
+                files.append({**location.source(), "path": path, "bytes": len(content),
+                              "sha256": hashlib.sha256(content).hexdigest(), "readable": True})
         return {"files": files, "offset": offset, "next_offset": next_offset,
                 "limits": {"maximum_file_bytes": _MAX_FILE_BYTES,
                     "maximum_chunk_bytes": 65536, "maximum_scan_entries": _MAX_SCAN_FILES}}
-
-    def read(self, context: SemanticCallContext, **arguments) -> dict[str, object]:
-        return self._read(self._visible(context), **arguments)
-
-    def read_initialization(self, initialization_id: str, root_session_ref: str, **arguments):
-        return self._read((self.bind_initialization(initialization_id, root_session_ref).location,), **arguments)
-
-    def read_manual_creation(self, context_ref: str, root_session_ref: str,
-                             context_generation: int, **arguments):
-        return self._read((self._manual_creation_binding(context_ref, root_session_ref,
-            context_generation, require_open=False).location,), **arguments)
-
-    def read_companion_session(self, scope_ref: str, root_session_ref: str, **arguments):
-        return self._read((self._companion_session_binding(scope_ref, root_session_ref,
-            require_open=False).location,), **arguments)
 
     def download_companion_session(self, scope_ref: str, root_session_ref: str, *,
                                    workspace_ref: str, path: str, expected_sha256: str):
@@ -545,24 +542,6 @@ class RootWorkspaces:
         if expected_sha256 != digest:
             raise SemanticMcpError("workspace_content_changed")
         return {**source.source(), "path": path, "sha256": digest, "total_bytes": len(content), "content": content}
-
-    def _read(self, locations, *, workspace_ref, path, expected_sha256=None, offset=0, max_bytes=65536):
-        if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
-            raise SemanticMcpError("workspace_page_invalid")
-        source = next((item for item in locations if item.workspace_ref == workspace_ref), None)
-        if source is None:
-            raise SemanticMcpError("workspace_not_visible")
-        parts = _relative_parts(path)
-        if any(part.startswith(".delivery-") or part == ".delivery.json" for part in parts) or (source.root_kind == "target" and parts[0] == "inputs"):
-            raise SemanticMcpError("workspace_file_unsafe")
-        content = _read_bytes(source.directory, path)
-        digest = hashlib.sha256(content).hexdigest()
-        if expected_sha256 is not None and expected_sha256 != digest:
-            raise SemanticMcpError("workspace_content_changed")
-        chunk = content[offset:offset + max_bytes]
-        next_offset = offset + len(chunk) if offset + len(chunk) < len(content) else None
-        return {**source.source(), "path": path, "sha256": digest, "offset": offset,
-                "total_bytes": len(content), "next_offset": next_offset, "content": chunk}
 
     def deliver_current_material(self, receiver, *, delivery_ref, files):
         """Deliver selected uploads to the exact current receiving works."""
@@ -658,7 +637,7 @@ class RootWorkspaces:
             current.mkdir(exist_ok=True, mode=0o700)
 
 
-def _workspace_paths(location: WorkspaceLocation, prefix: str):
+def _companion_file_paths(directory: Path):
     scanned = 0
 
     def visit(parent: int, relative: str):
@@ -673,20 +652,16 @@ def _workspace_paths(location: WorkspaceLocation, prefix: str):
                 continue
             path = relative + entry.name
             if entry.is_dir(follow_symlinks=False):
-                if not relative and location.root_kind == "target" and entry.name == "inputs":
-                    continue
-                if prefix and not (path.startswith(prefix) or prefix.startswith(path + "/")):
-                    continue
                 try:
                     with _child_directory(parent, entry.name) as child:
                         yield from visit(child, path + "/")
                 except OSError:
                     # A directory replaced by a link cannot expand visibility.
                     continue
-            elif entry.is_file(follow_symlinks=False) and path.startswith(prefix):
+            elif entry.is_file(follow_symlinks=False):
                 yield path
 
-    with _directory_fd(location.directory) as parent:
+    with _directory_fd(directory) as parent:
         yield from visit(parent, "")
 
 
@@ -780,41 +755,3 @@ def _read_bytes(root: Path, path: str) -> bytes:
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
-
-
-def workspace_operations(workspaces: RootWorkspaces | None) -> tuple[SemanticOperation, ...]:
-    def call(context, arguments):
-        if workspaces is None:
-            raise SemanticMcpError("workspace_service_unavailable")
-        try:
-            if context.operation_id == "research_workspace.discover":
-                return workspaces.discover(context, **arguments)
-            value = workspaces.read(context, **arguments)
-        except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
-        content = value.pop("content")
-        try:
-            value.update(encoding="utf-8", text=content.decode("utf-8"))
-        except UnicodeDecodeError:
-            value.update(encoding="base64", base64=base64.b64encode(content).decode("ascii"))
-        return value
-
-    return (
-        SemanticOperation("research_workspace.discover", "research_workspace",
-            "Discover pending working files in this actual work and eligible earlier work in the same Cycle. Returns source work, relative paths, observed SHA-256 and limits. Files above 64 MiB remain listed with readable=false, sha256=null and read_error=workspace_file_too_large. Scans stop at 10000 directory entries. These files are not formal assets.", call,
-            {"type": "object", "properties": {"prefix": {"type": "string", "maxLength": 1024},
-                "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
-             "additionalProperties": False}, {"type": "object"},
-            unavailable_reason=lambda context: "workspace_service_unavailable" if workspaces is None else None,
-            return_description="offset and next_offset count entries. next_offset=null ends the current listing. Entries are workspace observations, not formal research assets.",
-            error_descriptions={"workspace_service_unavailable": "The working-file service is not connected in this runtime."}),
-        SemanticOperation("research_workspace.read", "research_workspace",
-            "Read at most 65536 bytes from a discovered working file or HumanRequest delivery.reply_reader/uploaded_readers using its workspace_ref, path and expected_sha256. Rechecks original work visibility and hash, with or without a Cycle. UTF-8 or base64 content includes next_offset. Linked locators remain at their host paths for bounded native reads. Reply delivery does not register formal assets.", call,
-            {"type": "object", "properties": {"workspace_ref": {"type": "string", "maxLength": 256},
-                "path": {"type": "string", "maxLength": 1024}, "expected_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-                "offset": {"type": "integer", "minimum": 0}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536}},
-             "required": ["workspace_ref", "path"], "additionalProperties": False}, {"type": "object"},
-            unavailable_reason=lambda context: "workspace_service_unavailable" if workspaces is None else None,
-            return_description="offset/max_bytes count bytes. UTF-8 text or base64 bytes include next_offset; use the returned exact workspace and original-work visibility.",
-            error_descriptions={"workspace_service_unavailable": "The working-file service is not connected in this runtime."}),
-    )

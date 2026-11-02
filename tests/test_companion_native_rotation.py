@@ -53,8 +53,7 @@ def test_new_native_session_preserves_workspace_history_and_replays_after_restar
             for item in current["native_sessions"]] == [(1, "native-1"), (2, "native-2")]
         assert provider.intent_requests[-1].native_session_ref is None
         assert "Prior conversation marker" not in str(provider.intent_requests[-1].draft)
-        assert runtime.root_workspaces.read_companion_session("workspace", original["session_ref"],
-            workspace_ref=binding.location.workspace_ref, path="retained-draft.txt")["content"] == b"prior material"
+        assert (binding.directory / "retained-draft.txt").read_bytes() == b"prior material"
         client.close()
         runtime.close()
         runtime = _runtime(tmp_path / "runtime", RotationProvider())
@@ -179,12 +178,10 @@ def test_rotation_keeps_other_scopes_and_their_workspace_material_isolated(tmp_p
         (first.directory / "private-note.txt").write_text("scope a", encoding="utf-8")
         human.start_new_companion_session(scopes[0], "first-scope-only")
         assert human.query_companion(scopes[1]) == sessions[1]
-        assert runtime.root_workspaces.read_companion_session(scopes[0], sessions[0]["session_ref"],
-            workspace_ref=sessions[0]["workspace_ref"], path="private-note.txt")["content"] == b"scope a"
-        from meta_research.semantic_mcp import SemanticMcpError
-        with pytest.raises(SemanticMcpError, match="workspace_not_visible"):
-            runtime.root_workspaces.read_companion_session(scopes[1], sessions[1]["session_ref"],
-                workspace_ref=sessions[0]["workspace_ref"], path="private-note.txt")
+        assert (first.directory / "private-note.txt").read_bytes() == b"scope a"
+        other = runtime.root_workspaces.bind_companion_session(scopes[1], sessions[1]["session_ref"])
+        assert first.directory != other.directory
+        assert not (other.directory / "private-note.txt").exists()
         with pytest.raises(OwnerConflict, match="idempotency_conflict"):
             human.start_new_companion_session(scopes[1], "first-scope-only")
     finally:
@@ -228,9 +225,9 @@ def test_new_session_can_read_old_conversation_on_demand_without_prompt_reinject
         history, = context["prior_conversations"]
         assert history["generation"] == 1
         assert history["native_session_ref"] == "native-1"
-        readback = runtime.root_workspaces.read_companion_session("workspace", original["session_ref"],
-            workspace_ref=history["workspace_ref"], path=history["path"])
-        conversation = json.loads(readback["content"])
+        binding = runtime.root_workspaces.bind_companion_session("workspace", original["session_ref"])
+        assert history["workspace_ref"] == binding.location.workspace_ref
+        conversation = json.loads((binding.directory / history["path"]).read_bytes())
         assert conversation["turns"] == original["turns"]
         assert conversation["native_session_ref"] == "native-1"
         assert conversation["session_ref"] == original["session_ref"]

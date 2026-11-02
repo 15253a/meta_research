@@ -14,7 +14,6 @@ from test_public_manual_question_lifecycle import DeterministicDraftingAdapter, 
 from test_public_manual_question_lifecycle import _accept_root_question
 from test_public_human_collaboration_web import _authenticated_client
 from test_root_workspace_native import _native_executable
-from test_root_workspace import _channel, _call, _accepted
 
 
 def _conversation_executable(path):
@@ -102,9 +101,7 @@ def test_real_unscoped_companion_uses_its_durable_session_work(tmp_path, context
             intent = runtime.root_workspaces.bind_initialization(creation["initialization_id"],
                 creation["intent_session"]["ref"])
             assert intent.directory != binding.directory
-        pending = runtime.root_workspaces.read_companion_session(scope_ref, root_ref,
-            workspace_ref=location.workspace_ref, path="native-pending-note.txt")
-        nonce = pending["content"].decode()
+        nonce = (location.directory / "native-pending-note.txt").read_text()
         assert len(nonce) == 32
         human.send_companion_message(scope_ref, "Read the prior pending note.", "companion-second-message")
         assert human.process_drafting_once()
@@ -127,10 +124,7 @@ def test_real_unscoped_companion_uses_its_durable_session_work(tmp_path, context
         assert human.process_drafting_once()
         assert human.query_companion(scope_ref)["turns"][-1]["assistant_content"] == "Prior note: " + nonce
         assert (location.directory / "native-marker.txt").read_text().splitlines() == [str(location.directory)] * 3
-        assert runtime.root_workspaces.read_companion_session(scope_ref, root_ref,
-            workspace_ref=location.workspace_ref, path="native-pending-note.txt")["content"] == nonce.encode()
-        assert any(item["path"] == "native-pending-note.txt" for item in
-            runtime.root_workspaces.discover_companion_session(scope_ref, root_ref)["files"])
+        assert (location.directory / "native-pending-note.txt").read_bytes() == nonce.encode()
         assert not (adapter.research_workspace_root / "native-marker.txt").exists()
         foreign_scope = "workspace"
         if context_kind == "workspace":
@@ -143,9 +137,7 @@ def test_real_unscoped_companion_uses_its_durable_session_work(tmp_path, context
             runtime.root_workspaces.bind_companion_session(scope_ref, foreign_ref)
         with pytest.raises(DraftingUnavailable, match="workspace_companion_scope_invalid"):
             adapter.reply(replace(replay_request, root_session_ref=foreign_ref))
-        with pytest.raises(SemanticMcpError, match="workspace_not_visible"):
-            runtime.root_workspaces.read_companion_session(scope_ref, root_ref,
-                workspace_ref=foreign.location.workspace_ref, path="native-pending-note.txt")
+        assert binding.directory != foreign.directory
         assert not (foreign.directory / "native-marker.txt").exists()
         if context_kind == "human_request":
             persisted = runtime.owners.agent_runtime.query_human_request(scope_ref)
@@ -163,7 +155,7 @@ def test_real_quest_companion_turns_preserve_actual_native_session_work(tmp_path
         def reply(self, request):
             scope = request.root_runtime_scope
             context = SemanticCallContext(scope["run_ref"], scope["attempt_ref"], scope["root_session_ref"],
-                scope["fence_ref"], scope["runtime_binding_hash"], "companion", "companion-turn", "research_workspace.read")
+                scope["fence_ref"], scope["runtime_binding_hash"], "companion", "companion-turn", "")
             facts = self.runtime.owners.human_collaboration.query_companion_work_context(scope["root_session_ref"])
             with patch.object(self.runtime.owners.human_collaboration, "query_companion_work_context",
                     return_value={**facts, "quest_ref": self.foreign_quest_ref}):
@@ -171,15 +163,14 @@ def test_real_quest_companion_turns_preserve_actual_native_session_work(tmp_path
                     self.runtime.root_workspaces.bind_runtime(context)
             result = super().reply(request)
             binding = self.runtime.root_workspaces.bind_runtime(context)
-            observed = _accepted(_call(self.runtime, _channel(self.runtime, context), "research_workspace.read",
-                workspace_ref=binding.location.workspace_ref, path="native-pending-note.txt"))
-            assert observed["work_ref"] == scope["root_session_ref"]
-            assert observed["request_ref"] == scope["run_ref"]
-            assert observed["quest_ref"] == scope["quest_ref"]
+            assert binding.location.work_ref == scope["root_session_ref"]
+            assert binding.location.request_ref == scope["run_ref"]
+            assert binding.location.quest_ref == scope["quest_ref"]
+            note = (binding.directory / "native-pending-note.txt").read_text()
             if self.notes:
                 assert result.reply == "Prior note: " + self.notes[0]
-                assert observed["text"] == self.notes[0]
-            self.notes.append(observed["text"])
+                assert note == self.notes[0]
+            self.notes.append(note)
             return result
 
     adapter = Reader(provider_root, executable=str(executable))

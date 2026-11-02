@@ -21,7 +21,7 @@ from test_research_notes_and_call_observations import _SystemEvidenceReader
 from test_public_reasoning_stage import (_reasoning_runtime, _confirm_deepfetch_quest,
     _MultiRunIdeaSkill, _MultiRunPlanSkill)
 from test_two_cycle_actual_work import _ready_existing, _finish_stage, _Reasoning
-from test_root_workspace import _context, _channel, _call, _accepted
+from test_root_workspace import _directories, _context
 from test_public_bundle_stage import _finish_plan_stage
 
 
@@ -44,13 +44,6 @@ class _WorkspaceIdea(_WorkspaceDraft, _MultiRunIdeaSkill):
 class _WorkspacePlan(_WorkspaceDraft, _MultiRunPlanSkill):
     kind = 'plan'
 
-    def generate_draft(self, request):
-        draft = super().generate_draft(request)
-        if getattr(self, 'observe_discovery', False):
-            channel = _channel(self.runtime, _context(request, self.kind))
-            self.successor_discovery = _accepted(_call(self.runtime, channel, 'research_workspace.discover'))
-        return draft
-
 
 class _WorkspaceBundle(_WorkspaceDraft, _CurrentBindingBundleSkill):
     kind = 'bundle'
@@ -61,11 +54,9 @@ class _WorkspaceReasoning(_WorkspaceDraft, _Reasoning):
 
     def generate_draft(self, request):
         draft = super().generate_draft(request)
-        channel = _channel(self.runtime, _context(request, self.kind))
-        page = _accepted(_call(self.runtime, channel, 'research_workspace.discover'))
-        self.handoff_readbacks = [_accepted(_call(self.runtime, channel, 'research_workspace.read',
-            workspace_ref=entry['workspace_ref'], path=entry['path'], expected_sha256=entry['sha256']))
-            for entry in page['files'] if entry['path'] == 'working-note.txt']
+        directories = _directories(self.runtime, _context(request, self.kind))
+        self.handoff_readbacks = [{**item, "text": (Path(item["directory"]) / "working-note.txt").read_text()}
+            for item in directories if (Path(item["directory"]) / "working-note.txt").is_file()]
         return draft
 
 
@@ -80,9 +71,34 @@ def _cleanup_runtime(path, *, idea=None):
     return runtime
 
 
-def _complete(tmp_path, *, publish=True, finish_cycle=True, runtime=None):
+def _next_foreground(runtime, *, resume=False):
+    """Construct one foreground transition, without executing another research Cycle."""
+    with runtime._database.fenced_write() as connection:
+        head = connection.exec_driver_sql("SELECT * FROM ae_foreground_heads").mappings().one()
+        epoch = head['epoch'] + 1
+        cycle = head['cycle_ref'] if resume else f'fixture-cycle-{epoch}'
+        if not resume:
+            connection.exec_driver_sql(
+                "INSERT INTO ae_cycles (cycle_ref,quest_ref,question_ref,question_receipt_ref,"
+                "question_receipt_hash,stage,status,created_at,updated_at) "
+                "SELECT ?,quest_ref,question_ref,question_receipt_ref,question_receipt_hash,'idea','ongoing',"
+                "created_at,updated_at FROM ae_cycles WHERE cycle_ref=?", (cycle, head['cycle_ref']))
+        connection.exec_driver_sql("UPDATE ae_foreground_grants SET status='completed' WHERE quest_ref=? AND epoch=?",
+                                   (head['quest_ref'], head['epoch']))
+        connection.exec_driver_sql("INSERT INTO ae_foreground_grants "
+            "(grant_ref,quest_ref,cycle_ref,question_ref,stage,epoch,status,predecessor_grant_ref,granted_at)"
+            " SELECT ?,quest_ref,?,question_ref,'idea',?,'active',grant_ref,granted_at"
+            " FROM ae_foreground_grants WHERE quest_ref=? AND epoch=?",
+            (f'fixture-grant-{epoch}', cycle, epoch, head['quest_ref'], head['epoch']))
+        connection.exec_driver_sql("UPDATE ae_foreground_heads SET cycle_ref=?, epoch=?, stage='idea' WHERE quest_ref=?",
+                                   (cycle, epoch, head['quest_ref']))
+        return cycle
+
+
+def _complete(tmp_path, *, publish=True, finish_cycle=True, out_of_window=True, runtime=None, quest=None):
     seeded = runtime or _cleanup_runtime(tmp_path / "cleanup-root")
-    quest = _confirm_deepfetch_quest(seeded)
+    if quest is None:
+        quest = _confirm_deepfetch_quest(seeded)
     _finish_stage(seeded, 'idea')
     _finish_plan_stage(seeded)
     ready = _ready_existing(seeded)
@@ -99,6 +115,9 @@ def _complete(tmp_path, *, publish=True, finish_cycle=True, runtime=None):
         if finish_cycle:
             _finish_stage(runtime, 'bundle')
             _finish_stage(runtime, 'reasoning')
+            if out_of_window:
+                _next_foreground(runtime)
+                _next_foreground(runtime)
     runtime.cleanup_test_cycle_ref = quest['cycle_ref']
     manifest = memory.query(completed.manifest_ref)
     with runtime._database.read() as connection:
@@ -112,11 +131,43 @@ def _target_cleanup(runtime, **arguments):
         if item.get('root_kind', 'target') == 'target')
 
 
+def test_completed_workspace_survives_until_three_newer_distinct_foreground_cycles(tmp_path):
+    runtime, _, _, workspace, _, _, _ = _complete(tmp_path, out_of_window=False)
+    try:
+        _next_foreground(runtime, resume=True)  # A new epoch of the same Cycle takes no extra slot.
+        for _ in range(2):
+            recent = _target_cleanup(runtime, dry_run=False)
+            assert recent[0]['reason'] == 'recent_cycle_window' and workspace.is_dir(), recent
+            _next_foreground(runtime)
+        released = _target_cleanup(runtime, dry_run=False)
+        assert released[0]['action'] == 'removed' and released[0]['bytes'] > 0
+        assert not workspace.exists()
+    finally:
+        runtime.close()
+
+
+def test_missing_foreground_history_does_not_expire_a_completed_workspace(tmp_path):
+    runtime, _, _, workspace, _, _, _ = _complete(tmp_path)
+    try:
+        with runtime._database.fenced_write() as connection:
+            # Simulate missing lineage for a completed root. The Quest still has
+            # a valid head and three later Cycles in its visible window.
+            connection.exec_driver_sql(
+                "UPDATE ae_foreground_grants SET cycle_ref=(SELECT cycle_ref FROM ae_foreground_heads "
+                "WHERE quest_ref=ae_foreground_grants.quest_ref) WHERE cycle_ref=?",
+                (runtime.cleanup_test_cycle_ref,))
+        row, = _target_cleanup(runtime, dry_run=False)
+        assert (row["action"], row["reason"]) == ("skipped", "workspace_cycle_lineage_unavailable")
+        assert workspace.is_dir() and (workspace / "implementation/train.py").is_file()
+    finally:
+        runtime.close()
+
+
 def test_target_completion_preserves_workspace_until_cycle_business_completion(tmp_path):
     runtime, handle, _, workspace, _, _, _ = _complete(tmp_path, finish_cycle=False)
     try:
         result = _target_cleanup(runtime,
-            dry_run=False, now=time.time()+90000)
+            dry_run=False)
         assert result[0]['action'] == 'skipped' and result[0]['reason'] == 'cycle_incomplete', result
         assert workspace.is_dir()
     finally:
@@ -184,7 +235,7 @@ def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_r
 
         with monkeypatch.context() as context:
             context.setattr(Path, 'read_text', counted)
-            result = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+            result = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         expected = {f'{directory}/SKILL.md' for directory in CYCLE_ROLE_DIRECTORIES.values()}
         expected.update(f'target-execution/references/{name}' for name in ('formal-work.md', 'data-preservation.md'))
         assert expected <= reads.keys(), 'each cleanup pass must read current role resources'
@@ -224,18 +275,10 @@ def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_r
         assert 'claim' in read_content(graph, runtime.owners.research_memory,
             quest_ref=reasoning.accepted_question.quest_ref, source_ref=commit.outcome_ref,
             version_ref=commit.outcome_ref)['text']
-        _finish_stage(runtime, 'idea')
-        runtime.cleanup_test_skills['plan'].observe_discovery = True
-        _finish_stage(runtime, 'plan')
-        discovery = runtime.cleanup_test_skills['plan'].successor_discovery
-        assert discovery['files'] and all(item['cycle_ref'] != cycle for item in discovery['files'])
-        assert {item['root_kind'] for item in discovery['files']} == {'idea', 'plan'}
         cleanup_with_resource_observation()
-        assert all(Path(item.directory).is_dir() for kind in ('idea', 'plan')
-            for ref, item in runtime.cleanup_test_skills[kind].locations.items() if ref != cycle)
         print('CYCLE_CLEANUP ' + json.dumps({'cycle_ref': cycle, 'report': result,
             'rm_readback': '36\n', 'reasoning_outcome_readable': True,
-            'successor_discovery': discovery, 'external_original_readable': True}, sort_keys=True))
+            'external_original_readable': True}, sort_keys=True))
     finally:
         runtime.close()
 
@@ -249,15 +292,14 @@ def test_cycle_cleanup_and_native_rotation_keep_the_companion_workspace(tmp_path
         session = human.query_companion(scope_ref)
         binding = runtime.root_workspaces.bind_companion_session(scope_ref, session["session_ref"])
         (binding.directory / "retained-investigation.txt").write_text("Still useful across Cycles.", encoding="utf-8")
-        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         assert {item["root_kind"] for item in report if item["action"] == "removed"} == {
             "target", "idea", "plan", "bundle", "reasoning"}
         assert not cycle_workspace.exists()
         assert all(item["path"] != str(binding.directory) for item in report)
         human.start_new_companion_session(scope_ref, "after-cycle-cleanup")
         assert human.query_companion(scope_ref)["workspace_ref"] == session["workspace_ref"]
-        assert runtime.root_workspaces.read_companion_session(scope_ref, session["session_ref"],
-            workspace_ref=session["workspace_ref"], path="retained-investigation.txt")["content"] == b"Still useful across Cycles."
+        assert (binding.directory / "retained-investigation.txt").read_bytes() == b"Still useful across Cycles."
     finally:
         runtime.close()
 
@@ -272,14 +314,14 @@ def test_pending_stage_asset_intake_survives_cleanup_and_releases_after_public_r
             custody_mode='managed', source_locator=str(source), display_name='Plan working observation',
             asynchronous=True), idempotency_key='cycle-pending-intake')
         assert job.status == 'queued'
-        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         protected = next(item for item in report if item['workspace_ref'] == location.workspace_ref)
         assert protected['action'] == 'skipped' and protected['reason'] == 'pending_asset_intake', report
         assert source.read_text() == 'Temporary plan working notes.'
         assert memory.process_asset_intake_once()
         accepted = memory.query_asset_intake(job.job_ref)
         assert accepted.status == 'accepted'
-        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         assert next(item for item in report if item['workspace_ref'] == location.workspace_ref)['action'] == 'removed'
         assert memory.materialize_asset(accepted.asset.version_ref).content == b'Temporary plan working notes.'
         print('CYCLE_PENDING_INTAKE ' + json.dumps({'job_ref': job.job_ref, 'report': report,
@@ -302,16 +344,16 @@ def test_cleanup_retry_after_restart_never_reclaims_new_work_at_an_old_location(
                 raise OSError('controlled cleanup interruption')
             with monkeypatch.context() as patch:
                 patch.setattr(cleanup_module.shutil, 'rmtree', interrupt)
-                report = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+                report = _target_cleanup(runtime, dry_run=False)
             assert report[0]['reason'] == 'OSError'
         else:
-            assert _target_cleanup(runtime, dry_run=False, now=time.time()+90000)[0]['action'] == 'removed'
+            assert _target_cleanup(runtime, dry_run=False)[0]['action'] == 'removed'
         runtime.close()
         workspace.mkdir(exist_ok=True)
         source = workspace / 'newly-needed.txt'
         source.write_text('New work must survive an old Cycle cleanup retry.')
         runtime = _cleanup_runtime(data_root)
-        report = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+        report = _target_cleanup(runtime, dry_run=False)
         assert report[0]['action'] == 'skipped' and report[0]['reason'] == {
             'removed': 'workspace_cleanup_scope_closed',
             'interrupted': 'workspace_cleanup_scope_changed'}[first_attempt], report
@@ -337,14 +379,14 @@ def test_interrupted_cleanup_retry_preserves_changed_work_at_a_previously_record
             raise OSError('controlled cleanup interruption')
         with monkeypatch.context() as patch:
             patch.setattr(cleanup_module.shutil, 'rmtree', interrupt)
-            report = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+            report = _target_cleanup(runtime, dry_run=False)
         assert report[0]['reason'] == 'OSError'
         runtime.close()
         source = workspace / {'recreated_old_name': 'implementation/train.py',
             'overwritten_surviving_file': 'outputs/data/run1.txt'}[change]
         source.write_text('New research content at an old relative name.')
         runtime = _cleanup_runtime(data_root)
-        report = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+        report = _target_cleanup(runtime, dry_run=False)
         assert report[0]['action'] == 'skipped' and report[0]['reason'] == 'workspace_cleanup_scope_changed', report
         assert source.read_text() == 'New research content at an old relative name.'
         asset = next(entry for entry in manifest.entries if entry.declared_relative_path == 'outputs/data/run1.txt')
@@ -361,10 +403,10 @@ def test_published_workspace_reclaimed_after_readback_and_formal_assets_survive(
         graph = runtime.owners.research_graph
         before = graph.query_target_formal_results(handle.target_ref)
         asset = next(entry for entry in manifest.entries if entry.declared_relative_path == 'outputs/data/run1.txt')
-        report = _target_cleanup(runtime, now=time.time()+90000)
+        report = _target_cleanup(runtime)
         assert len(report) == 1 and report[0]['action'] == 'candidate' and report[0]['bytes'] > 0
         assert workspace.exists()
-        report = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+        report = _target_cleanup(runtime, dry_run=False)
         assert report[0]['action'] == 'removed', report
         assert not workspace.exists()
         import json
@@ -372,16 +414,15 @@ def test_published_workspace_reclaimed_after_readback_and_formal_assets_survive(
         assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b'36\n'
         assert graph.query_target_formal_results(handle.target_ref) == before
         assert finalizer.finalize(handle=handle, evidence=evidence) == completed
-        assert _target_cleanup(runtime, dry_run=False, now=time.time()+90000)[0]['reason'] == 'already_removed'
+        assert _target_cleanup(runtime, dry_run=False)[0]['reason'] == 'already_removed'
     finally:
         runtime.close()
 
 
-@pytest.mark.parametrize('protection', ['linked_local', 'linked_local_stage', 'symlink', 'retention', 'mount_detection'])
+@pytest.mark.parametrize('protection', ['linked_local', 'linked_local_stage', 'symlink', 'mount_detection'])
 def test_cleanup_preserves_external_originals_and_unsafe_or_recent_workspace(tmp_path, protection, monkeypatch):
     runtime, handle, manifest, workspace, finalizer, evidence, completed = _complete(tmp_path)
     try:
-        now = time.time()+90000
         if protection == 'linked_local_stage':
             workspace = runtime.cleanup_test_skills['plan'].locations[runtime.cleanup_test_cycle_ref].directory
         if protection in {'linked_local', 'linked_local_stage'}:
@@ -403,16 +444,14 @@ def test_cleanup_preserves_external_originals_and_unsafe_or_recent_workspace(tmp
             # The host forbids unshare/mount; this is not a real bind mount.
             monkeypatch.setattr(Path, 'is_mount',
                 lambda candidate: candidate == source or actual_is_mount(candidate))
-        else:
-            now = time.time()
         report = tuple(item for item in runtime.target_run_runtime.cleanup_completed_workspaces(
-            dry_run=False, now=now) if item['path'] == str(workspace))
+            dry_run=False) if item['path'] == str(workspace))
         assert report[0]['action'] == ('pruned' if protection in {'linked_local', 'linked_local_stage'} else 'skipped'), report
         assert report[0]['reason'] == {'linked_local':'originals_preserved_in_place', 'linked_local_stage':'originals_preserved_in_place',
-            'symlink':'workspace_cleanup_unsafe_boundary', 'retention':'retention_period',
+            'symlink':'workspace_cleanup_unsafe_boundary',
             'mount_detection':'workspace_cleanup_unsafe_boundary'}[protection]
         assert workspace.exists()
-        if protection != 'retention': assert source.exists()
+        assert source.exists()
         if protection in {'linked_local', 'linked_local_stage'}:
             assert runtime.owners.research_memory.materialize_asset(asset.version_ref).content == b'subject,value\na,36\n'
         if protection == 'mount_detection':
@@ -422,13 +461,23 @@ def test_cleanup_preserves_external_originals_and_unsafe_or_recent_workspace(tmp
         runtime.close()
 
 
-@pytest.mark.parametrize("state", ["running", "unknown_outcome", "reserved_child"])
+@pytest.mark.parametrize("state", ["running", "unknown_outcome", "reserved_child", "human_wait"])
 def test_cleanup_preserves_owner_recorded_active_and_recoverable_sessions(tmp_path, state):
     runtime, handle, manifest, workspace, _, _, _ = _complete(tmp_path)
     process = None
     try:
         harness = runtime.owners.agent_runtime.harness_runs
-        if state == "reserved_child":
+        if state == "human_wait":
+            location = runtime.cleanup_test_skills["idea"].locations[runtime.cleanup_test_cycle_ref]
+            condition = {"quest_ref": location.quest_ref, "target_ref": handle.target_ref}
+            runtime.owners.agent_runtime.open_human_request(
+                request_kind="offline_action", obligation="Provide the observation for this work.",
+                business_purpose="Continue the original work after the observation arrives.",
+                target_assertion=condition, acceptance_conditions=("Receive the missing observation.",),
+                direct_waiter={"waiter_ref": "root_run:" + handle.target_run_ref, "generation": 1,
+                    "target_assertion": condition, "wait_scope": "local", "other_blockers": []},
+                quest_ref=location.quest_ref, idempotency_key="cleanup-human-wait")
+        elif state == "reserved_child":
             child = harness.reserve_target_child_session(target_run_ref=handle.target_run_ref, review_kind="result")
             assert child.completion_evidence_ref is None
         else:
@@ -442,21 +491,34 @@ def test_cleanup_preserves_owner_recorded_active_and_recoverable_sessions(tmp_pa
                 # A real local process uses this scratch path while AR records a
                 # running operation; no model or transport receipt is fabricated.
                 process = subprocess.Popen([sys.executable, "-c",
-                    "from pathlib import Path; import time; Path('active.marker').write_text('in use'); time.sleep(30)"], cwd=workspace)
-                for _ in range(100):
-                    if (workspace / "active.marker").exists(): break
-                    time.sleep(0.01)
+                    "from pathlib import Path; import sys; marker = Path('active.marker'); "
+                    "marker.touch(); print('ready', flush=True); sys.stdin.readline(); "
+                    "marker.write_bytes(b'in use'); print('written', flush=True); sys.stdin.readline()"],
+                    cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                assert process.stdout.readline().strip() == "ready"
                 assert process.poll() is None and (workspace / "active.marker").is_file()
             assert harness.latest_operation(handle.target_run_ref).status == state
-        before = _workspace_bytes(workspace)
-        result = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+        def files():
+            return {p.relative_to(workspace): p.read_bytes() for p in workspace.rglob('*') if p.is_file()}
+
+        before_files, before_bytes = files(), _workspace_bytes(workspace)
+        if process is not None:
+            process.stdin.write("append\n")
+            process.stdin.flush()
+        result = _target_cleanup(runtime, dry_run=False)
         assert result[0]["action"] == "skipped", result
-        assert result[0]["reason"] == "active_or_recoverable_session", result
-        assert workspace.exists() and _workspace_bytes(workspace) == before
+        reason = "pending_human_request" if state == "human_wait" else "active_or_recoverable_session"
+        assert result[0]["reason"] == reason, result
+        if process is not None:
+            assert process.stdout.readline().strip() == "written"
+            assert before_files[Path('active.marker')] == b''
+            before_files[Path('active.marker')] = b'in use'
+        assert workspace.is_dir() and files() == before_files
         assert all(skill.locations[runtime.cleanup_test_cycle_ref].directory.is_dir()
             for skill in runtime.cleanup_test_skills.values())
         if process is not None: assert process.poll() is None
-        print("T16_PROTECTED " + json.dumps({"state":state,"report":result,"bytes_unchanged":before}))
+        print("T16_PROTECTED " + json.dumps({"state": state, "report": result,
+            "allocated_before": before_bytes, "allocated_after": _workspace_bytes(workspace)}))
     finally:
         if process is not None:
             process.terminate(); process.wait(timeout=5)
@@ -477,7 +539,7 @@ def test_cleanup_waits_for_actual_handoff_and_pending_finalizer_files(tmp_path, 
                 None if path.is_dir() else path.read_bytes())
                 for path in workspace.rglob("*")}
         before_contents = workspace_contents()
-        result = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+        result = _target_cleanup(runtime, dry_run=False)
         if dependency == "unpublished":
             # Completion and RM/RG receipts exist, but publication has not yet
             # advanced the AR lifecycle from finalizing to completed. It is
@@ -500,7 +562,9 @@ def test_cleanup_waits_for_actual_handoff_and_pending_finalizer_files(tmp_path, 
                 completion_ref=completed.completion_ref, target_commit_ref=completed.target_commit_ref)
             _finish_stage(runtime, 'bundle')
             _finish_stage(runtime, 'reasoning')
-            published = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+            _next_foreground(runtime)
+            _next_foreground(runtime)
+            published = _target_cleanup(runtime, dry_run=False)
             assert published[0]["action"] == "removed" and not workspace.exists()
             asset = next(entry for entry in manifest.entries if entry.declared_relative_path == "outputs/data/run1.txt")
             assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b"36\n"
@@ -537,7 +601,7 @@ def test_interrupted_real_removal_recovers_after_runtime_reconstruction(tmp_path
             raise OSError("controlled cleanup interruption")
         with monkeypatch.context() as patch:
             patch.setattr(cleanup_module.shutil, "rmtree", interrupted)
-            result = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+            result = _target_cleanup(runtime, dry_run=False)
         assert result[0]["reason"] == "OSError" and result[0]["action"] != "removed", result
         assert workspace.exists() and not (workspace / "implementation/train.py").exists()
         partial = _workspace_bytes(workspace)
@@ -546,11 +610,11 @@ def test_interrupted_real_removal_recovers_after_runtime_reconstruction(tmp_path
         runtime.close()
         runtime = _cleanup_runtime(root)
         assert runtime.owners.research_graph.query_target_formal_results(handle.target_ref) == facts
-        report = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+        report = _target_cleanup(runtime, dry_run=False)
         assert report[0]["action"] == "removed" and not workspace.exists(), report
         assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b"36\n"
         assert runtime.owners.research_graph.query_target_formal_results(handle.target_ref) == facts
-        repeated = _target_cleanup(runtime, dry_run=False, now=time.time()+90000)
+        repeated = _target_cleanup(runtime, dry_run=False)
         assert repeated[0]["reason"] == "already_removed"
         print("T16_RECOVERY " + json.dumps({"before_bytes":before,"partial_bytes":partial,"after_bytes":0,
             "interruption":result,"recovered":report,"repeated":repeated,"rm_readback":"36\n"}))

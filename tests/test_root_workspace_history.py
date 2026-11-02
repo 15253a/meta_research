@@ -1,3 +1,4 @@
+from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from meta_research.root_workspace import WorkspaceBinding
 from meta_research.semantic_mcp import SemanticCallContext
 from test_root_workspace import _accepted, _call, _channel
 from test_root_human_request_lifecycle import _open_arguments
-from test_stage_resource_handoff import _bundle_channel
+from test_root_workspace import _bundle_context, _directories
 from test_target_root_finalizer import _root_finalizer_fixture
 
 
@@ -159,7 +160,7 @@ def test_controlled_history_keeps_late_human_material_in_original_work_and_visib
         runtime.owners.agent_runtime.harness_runs.start_operation(run_ref=run.run_ref,
             operation_ref="controlled-original-human-turn", generation=1, invocation_hash="b" * 64, resume=False)
         context = SemanticCallContext(run.run_ref, run.attempt_ref, run.root_session_ref,
-            run.fence_ref, run.capability_binding_hash, "target", "target_root", "research_workspace.read")
+            run.fence_ref, run.capability_binding_hash, "target", "target_root", "")
         opened = _accepted(_call(runtime, _channel(runtime, context), "human_request.open",
             **_open_arguments("controlled-late-original-file", "offline_action")))
         rows = _controlled_history(target, lease)
@@ -183,11 +184,10 @@ def test_controlled_history_keeps_late_human_material_in_original_work_and_visib
         delivered = runtime.root_workspaces.deliver(destination, delivery_ref="controlled-late-answer",
             files=(("human.txt", b"Late original-root pending material"),))
         assert not (locations[-1][1] / delivered["files"][0]["path"]).exists()
-        channel = _bundle_channel(runtime)
-        value = _accepted(_call(runtime, channel, "research_workspace.read", workspace_ref=lease.workspace_ref,
-            path=delivered["files"][0]["path"]))
-        assert value["text"] == "Late original-root pending material"
-        assert value["root_session_ref"] == handle.root_session_ref
+        entry, = (item for item in _directories(runtime, _bundle_context(runtime))
+                  if item["workspace_ref"] == lease.workspace_ref)
+        assert (Path(entry["directory"]) / delivered["files"][0]["path"]).read_text() == "Late original-root pending material"
+        assert entry["root_session_ref"] == handle.root_session_ref
         source = runtime.root_workspaces._target_locations(handle.target_ref, history=True)[-1]
         monkeypatch.setattr(runtime.root_workspaces, "bind_runtime",
             lambda _context: WorkspaceBinding(source, "controlled-scope"))

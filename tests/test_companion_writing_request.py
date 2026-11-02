@@ -65,7 +65,7 @@ def test_selected_model_receives_only_explicit_material_and_never_falls_back(tmp
 def test_assistant_catalog_does_not_grant_research_writes():
     catalog = root_operation_catalog("companion", common_operation_ids=ROOT_AGENT_COMMON_OPERATION_IDS)
     assert "research_memory.content.read" in catalog
-    assert "research_workspace.read" in catalog
+    assert "research_workspace.materials.read" in catalog
     assert "research_graph.datasets.register" not in catalog
     assert "research_memory.assets.intake" not in catalog
     assert "research_memory.assets.retire" not in catalog

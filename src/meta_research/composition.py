@@ -135,6 +135,7 @@ from meta_research.telemetry import (
     OtlpHttpTelemetryExporter,
     validate_otlp_http_endpoint,
 )
+from meta_research.recorder_sources import RecorderChannels
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 from meta_research.root_workspace import RootWorkspaces
 from meta_research.external_mcp import ExternalMcpRuntime
@@ -287,6 +288,7 @@ class ProductionRuntime:
     quest_completion: QuestCompletionService
     deepfetch: FirstQuestionDeepFetchWorker
     harnesses: HarnessRuntime
+    recorder_channels: RecorderChannels
     external_mcp: ExternalMcpRuntime
     search_sources: SearchSourceRegistry
     root_workspaces: RootWorkspaces
@@ -309,6 +311,7 @@ class ProductionRuntime:
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         self.external_mcp.configure_endpoint(base_url)
+        self.recorder_channels.url = base_url.rstrip("/") + "/mcp"
         self.root_workspaces.configure_creation_endpoint(base_url)
         for provider in self._resident_mcp_providers:
             configure = getattr(
@@ -985,8 +988,9 @@ def build_production_runtime(
     if callable(bind_materials):
         from meta_research.accepted_materials import DeepFetchAcceptedMaterials
         bind_materials(DeepFetchAcceptedMaterials(agent_runtime, human_collaboration, research_memory))
+    recorder_channels = RecorderChannels()
     semantic_gateway = create_semantic_owner_gateway(
-        root_workspaces=root_workspaces,
+        recorder_channels=recorder_channels,
         research_graph=owners.research_graph,
         advancement_engine=owners.advancement_engine,
         research_memory=owners.research_memory,
@@ -997,6 +1001,7 @@ def build_production_runtime(
         human_collaboration=owners.human_collaboration,
         target_run_agent=target_run_agent,
     )
+    recorder_channels.gateway = semantic_gateway
     root_workspaces.bind_creation_gateway(semantic_gateway)
     harness_operation_canceller = None
     target_raw_output_store = TargetRawOutputStore(
@@ -1036,7 +1041,8 @@ def build_production_runtime(
         root_operation_diagnostic_recorder=root_operation_diagnostics,
     )
     harnesses.bind_resident_mcp_scope_verifier(owners.agent_runtime)
-    harnesses.bind_creation_channels(root_workspaces)
+    harnesses.bind_root_workspaces(root_workspaces)
+    harnesses.bind_recorder_channels(recorder_channels)
     harnesses.bind_human_guidance_authority(owners.human_collaboration)
     for provider in (idea_skill_provider, plan_skill_provider, bundle_skill_provider, reasoning_skill_provider):
         bind_guidance = getattr(provider, "bind_human_guidance_authority", None)
@@ -1125,6 +1131,7 @@ def build_production_runtime(
         research_memory,
         deepfetch_provider,
     )
+    from meta_research.native_session_cleanup import NativeSessionCleanup
     target_run_runtime = TargetRunRuntime(
         agent_runtime=owners.agent_runtime,
         research_graph=owners.research_graph,
@@ -1136,6 +1143,7 @@ def build_production_runtime(
         database=database,
         root_workspaces=root_workspaces,
         advancement_engine=owners.advancement_engine,
+        native_cleanup=NativeSessionCleanup(data_root, codex_executable, acquisition_provider),
         protected_storage_roots=(data_root.objects, data_root.provider_homes,
             data_root.run / 'harness-supervisor', data_root.database),
     )
@@ -1192,6 +1200,7 @@ def build_production_runtime(
             bind_external(external_mcp)
     harnesses.bind_external_mcp(external_mcp)
     runtime = ProductionRuntime(
+        recorder_channels=recorder_channels,
         external_mcp=external_mcp,
         search_sources=search_sources,
         data_root=data_root,

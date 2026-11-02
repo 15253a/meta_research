@@ -16,6 +16,7 @@ from meta_research.semantic_mcp import SemanticCallContext
 from meta_research.quest_drafting import _CancellableProcessRunner
 from test_harness_adapters import _invocation
 from test_public_plan_stage import _DeterministicDraftingAdapter, _DeterministicProbe
+from test_root_workspace import _bundle_context, _directories, _native_file
 from test_root_workspace import (
     _make, _context, _external_context, _scope, _channel, _call, _accepted,
     _Writer, _confirm_direct_quest, _finish_idea_stage,
@@ -54,6 +55,10 @@ def _native_executable(path):
         "            print(json.dumps({'method':'turn/completed','params':{'threadId':'local-native-root','turn':{'id':'local-turn','status':'completed'}}}), flush=True)\n"
         "    raise SystemExit(0)\n"
         "prompt = sys.stdin.read()\n"
+        "if 'Read the prior Idea marker' in prompt:\n"
+        "    entries, _ = json.JSONDecoder().raw_decode(prompt.split('Work directories: ', 1)[1])\n"
+        "    source, = [item for item in entries if item['root_kind'] == 'idea' and item['access'] == 'read']\n"
+        "    (Path.cwd() / 'observed-idea.txt').write_bytes((Path(source['directory']) / 'native-marker.txt').read_bytes())\n"
         "marker = Path('native-marker.txt')\n"
         "previous = marker.read_text() if marker.exists() else ''\n"
         "marker.write_text(previous + os.getcwd() + '\\n')\n"
@@ -134,13 +139,24 @@ def test_real_idea_dispatch_native_initial_resume_and_public_plan_read(tmp_path,
             assert runtime.plan_stage.process_once()
             if hasattr(reader, "context"):
                 break
-        channel = _channel(runtime, reader.context)
-        page = _accepted(_call(runtime, channel, "research_workspace.discover"))
-        native, = [item for item in page["files"] if item["path"] == "native-marker.txt"]
-        assert native["work_ref"] == writer.location.work_ref
-        assert _accepted(_call(runtime, channel, "research_workspace.read",
-            workspace_ref=native["workspace_ref"], path=native["path"]))["text"] == (
-                str(writer.location.directory) + "\n") * 2
+        # The native process receives the directory table from the production
+        # adapter and reads Idea's file without a Workspace tool or file manifest.
+        from meta_research.plan_skill import CodexPlanSkillAdapter
+        plan = CodexPlanSkillAdapter(tmp_path / "plan-transport", executable=str(tmp_path / "local-codex"))
+        plan.bind_workspaces(runtime.root_workspaces)
+        binding = runtime.root_workspaces.bind_runtime(reader.context)
+        plan._invoke(operation_name="primary", prompt="Read the prior Idea marker",
+                     schema=_SCHEMA, native_session_ref=None, job_ref="plan-native" if durable else None,
+                     workspace_binding=binding)
+        assert (binding.directory / "observed-idea.txt").read_text() == (str(writer.location.directory) + "\n") * 2
+        if durable:
+            # Replay reads the sealed turn; disappearance of a formerly listed
+            # directory must not invalidate its business input or rerun the process.
+            writer.location.directory.rename(writer.location.directory.with_name("offline-idea"))
+            plan._invoke(operation_name="primary", prompt="Read the prior Idea marker", schema=_SCHEMA,
+                         native_session_ref=None, job_ref="plan-native", workspace_binding=binding)
+            assert (binding.directory / "native-marker.txt").read_text().splitlines() == [str(binding.directory)]
+
     finally:
         runtime.close()
 
@@ -187,14 +203,11 @@ def test_shared_companion_adapter_interleaves_roots_and_resumes_distinct_jobs(tm
         assert other_resumed["cwd"] == str(locations[1].directory)
         assert other_resumed["previous"] is True
         for context, location in zip((a, b), locations):
-            read = _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read",
-                workspace_ref=location.workspace_ref, path="native-marker.txt"))
-            assert read["text"] == (str(location.directory) + "\n") * 2
-            assert read["work_ref"] == context.run_ref
-            assert read["root_session_ref"] == context.root_session_ref
-        foreign = _call(runtime, _channel(runtime, b), "research_workspace.read",
-            workspace_ref=locations[0].workspace_ref, path="native-marker.txt")
-        assert foreign["structuredContent"]["code"] == "workspace_not_visible"
+            native, = _directories(runtime, context)
+            assert native["work_ref"] == context.run_ref
+            assert native["root_session_ref"] == context.root_session_ref
+            assert (Path(native["directory"]) / "native-marker.txt").read_text() == (str(location.directory) + "\n") * 2
+        assert locations[0].workspace_ref not in {d["workspace_ref"] for d in _directories(runtime, b)}
         assert Path.cwd() == original_cwd
         assert not (adapter.research_workspace_root / "native-marker.txt").exists()
     finally:
@@ -239,13 +252,10 @@ def test_actual_claude_child_cwd_initial_resume_and_signed_replay(tmp_path, dura
             operation_ref=second_invocation.provider_operation_ref, generation=1,
             invocation_hash="a" * 64, resume=False)
         context = SemanticCallContext(owner_run.run_ref, owner_run.attempt_ref, owner_run.root_session_ref,
-            owner_run.fence_ref, owner_run.capability_binding_hash, "target", "target_root", "research_workspace.read")
+            owner_run.fence_ref, owner_run.capability_binding_hash, "target", "target_root", "")
         assert runtime.root_workspaces.bind_runtime(context).directory == workspace
         channel = _channel(runtime, context)
-        content = _accepted(_call(runtime, channel, "research_workspace.read",
-            workspace_ref=lease.workspace_ref, path="native-marker.txt"))
-        assert content["text"] == (str(workspace) + "\n") * 2
-        assert content["work_ref"] == handle.target_run_ref
+        assert _native_file(runtime, context, {"workspace_ref": lease.workspace_ref, "path": "native-marker.txt"}).read_text() == (str(workspace) + "\n") * 2
         from test_root_human_request_lifecycle import _open_arguments
         opened = _accepted(_call(runtime, channel, "human_request.open",
             **_open_arguments("target-pending-human-file", "offline_action")))
@@ -264,10 +274,8 @@ def test_actual_claude_child_cwd_initial_resume_and_signed_replay(tmp_path, dura
         assert third.native_session_ref == first.native_session_ref
         assert (workspace / "native-observed-human.txt").read_text() == "original Target pending observation"
         assert (workspace / "native-marker.txt").read_text().splitlines() == [str(workspace)] * 3
-        from test_stage_resource_handoff import _bundle_channel
-        channel = _bundle_channel(runtime)
-        assert _accepted(_call(runtime, channel, "research_workspace.read",
-            workspace_ref=lease.workspace_ref, path=delivered["files"][0]["path"]))["text"] == "original Target pending observation"
+        assert _native_file(runtime, _bundle_context(runtime), {"workspace_ref": lease.workspace_ref,
+            "path": delivered["files"][0]["path"]}).read_text() == "original Target pending observation"
     finally:
         runtime.close()
 
@@ -385,10 +393,8 @@ def test_real_deepfetch_initial_acquire_uses_persisted_operation_and_original_lo
                 assert location.directory == self.research_workspace_path(request.job_ref + ":v4-turn:2",
                     scope["capability_binding_hash"])
                 (location.directory / "radar.txt").write_bytes(b"native DeepFetch pending observations")
-                value = self.channels.call_operation(**scope, operation_id="research_workspace.read",
-                    arguments={"workspace_ref": location.workspace_ref, "path": "radar.txt"})
-                assert value["text"] == "native DeepFetch pending observations"
-                assert value["work_ref"] == request.run_ref
+                assert (location.directory / "radar.txt").read_bytes() == b"native DeepFetch pending observations"
+                assert location.work_ref == request.run_ref
                 self.location = location
             finally:
                 self.channels.release(key)
@@ -424,17 +430,14 @@ def test_actual_acquisition_wrapper_binds_preflight_and_scoped_batch_native_work
             value = super().acquire(request)
             scope = request.root_runtime_scope
             context = SemanticCallContext(scope["run_ref"], scope["attempt_ref"], scope["root_session_ref"],
-                scope["fence_ref"], scope["runtime_binding_hash"], "acquisition", "acquisition-root-turn", "research_workspace.read")
+                scope["fence_ref"], scope["runtime_binding_hash"], "acquisition", "acquisition-root-turn", "")
             location = self.runtime.root_workspaces.bind_runtime(context).location
             assert location.directory.parent == self.research_workspace_root
             assert location.cycle_ref is None
             assert location.work_ref == request.session_ref
             assert location.request_ref == request.request_id
-            read = _accepted(_call(self.runtime, _channel(self.runtime, context), "research_workspace.read",
-                workspace_ref=location.workspace_ref, path="native-marker.txt"))
-            assert read["text"] == (str(location.directory) + "\n") * (len(self.locations) + 2)
-            assert _accepted(_call(self.runtime, _channel(self.runtime, context), "research_workspace.read",
-                workspace_ref=location.workspace_ref, path="native-observed-preflight.txt"))["text"] == "Acquisition preflight pending nonce"
+            assert (location.directory / "native-marker.txt").read_text() == (str(location.directory) + "\n") * (len(self.locations) + 2)
+            assert (location.directory / "native-observed-preflight.txt").read_text() == "Acquisition preflight pending nonce"
             self.locations.append(location)
             return value
 

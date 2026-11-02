@@ -385,6 +385,12 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             receipts.append(receipt)
         return tuple(receipts)
 
+    def retired_native_sessions(self, session_ref: str) -> set[str]:
+        receipts = self._session_receipts(session_ref)
+        if not receipts:
+            return set()
+        return {str(item["native_session_ref"]) for item in receipts} - {str(receipts[-1]["native_session_ref"])}
+
     def _latest_native_session_ref(self, session_ref: str) -> str | None:
         receipts = self._session_receipts(session_ref)
         return None if not receipts else str(receipts[-1]["native_session_ref"])

@@ -545,8 +545,23 @@ class CreationBasisMemory:
         return self.query(ref, digest)
 
     def read_workspace(self, body, entry, offset=0, limit=65536):
-        return self.workspaces.read_initialization(body["draft"]["initialization_id"], body["root_session_ref"],
-            workspace_ref=entry["workspace_ref"], path=entry["path"], expected_sha256=entry["sha256"], offset=offset, max_bytes=limit)
+        from meta_research.root_workspace import _read_bytes, _relative_parts
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 65536:
+            raise OwnerConflict("workspace_page_invalid")
+        location = self.workspaces.bind_initialization(
+            body["draft"]["initialization_id"], body["root_session_ref"]).location
+        if location.workspace_ref != entry["workspace_ref"]:
+            raise OwnerConflict("workspace_not_visible")
+        if any(part.startswith(".delivery-") or part == ".delivery.json" for part in _relative_parts(entry["path"])):
+            raise OwnerConflict("workspace_file_unsafe")
+        content = _read_bytes(location.directory, entry["path"])
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != entry["sha256"]:
+            raise OwnerConflict("workspace_content_changed")
+        end = min(len(content), offset + limit)
+        return {**location.source(), "path": entry["path"], "sha256": digest, "offset": offset,
+            "total_bytes": len(content), "next_offset": end if end < len(content) else None,
+            "content": content[offset:end]}
 
     def accept_prepared(self, request, understanding):
         from meta_research.owners.research_memory import AssetIntakeRequest

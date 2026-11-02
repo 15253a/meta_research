@@ -120,10 +120,10 @@ def material_submission(database, submission_ref):
     uploads = []
     for root in command['receiver'].get('roots', []):
         for upload in command.get('uploads', []):
-            uploads.append({**root, 'media_type': upload['media_type'], 'reader': {
+            uploads.append({**root, 'media_type': upload['media_type'], 'file': {
                 'workspace_ref': root['workspace_ref'],
                 'path': 'inbox/' + canonical_hash({'delivery_ref': submission_ref}) + '/' + upload['relative_path'],
-                'expected_sha256': hashlib.sha256(base64.b64decode(upload['content_base64'], validate=True)).hexdigest()}})
+                'sha256': hashlib.sha256(base64.b64decode(upload['content_base64'], validate=True)).hexdigest()}})
     return {"submission_ref": submission_ref, "receiver": json.loads(row.receiver_json),
             "references": [material_reference(database, item.reference_ref) for item in references],
             "description": command["description"], "state": "saved", "created_at": row.created_at,
@@ -288,7 +288,7 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
         return material_reference(self._database, reference_ref)
 
     def _material_visible_workspaces(self, context):
-        locations = self._root_workspaces._visible(context)
+        locations = self._root_workspaces.receiving_locations(context)
         visible = {location.workspace_ref for location in locations}
         if context.root_kind != "companion":
             return visible

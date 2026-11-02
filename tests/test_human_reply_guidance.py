@@ -28,7 +28,7 @@ def test_actual_packaged_stage_guidance_selects_reply_readers_and_optional_intak
     assert actual not in developer
     assert "human_request.open.reconcile" in actual
     assert "无 Quest 时须传精确 request_ref 与 response_ref" in actual
-    assert "delivery.reply_reader 与 uploaded_readers" in actual
+    assert "delivery.reply_file 与 uploaded_files" in actual
     assert "linked_locators" in actual
     assert "provided_material" in actual
     assert "判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理" in actual

@@ -1,4 +1,5 @@
 """Actual receiving roots process materials before choosing research custody."""
+import hashlib
 from fastapi.testclient import TestClient
 import pytest
 
@@ -89,11 +90,10 @@ def test_linked_processing_result_survives_cycle_cleanup_and_reports_later_drift
                 effect_id="copy-linked", reference_ref=reference, path="", observation_ref=observation))
             self.result_path = Path(copied["working_path"])
             self.result_path.write_text("Retained analysis: calibration is still required.\n")
-            entry = next(item for item in _accepted(_call(self.runtime, channel, "research_workspace.discover"))["files"]
-                if item["path"] == copied["work_file"]["path"])
-            selection = {"source": {"kind": "workspace_file", "workspace_ref": entry["workspace_ref"],
-                "path": entry["path"], "expected_sha256": entry["sha256"]}, "custody": "linked_local",
-                "purpose": "Keep the actual working analysis available to the next research work."}
+            location = self.runtime.root_workspaces.bind_runtime(_context(request, "idea")).location
+            selection = {"source": {"kind": "workspace_file", "workspace_ref": location.workspace_ref,
+                "path": copied["work_file"]["path"], "expected_sha256": hashlib.sha256(self.result_path.read_bytes()).hexdigest()},
+                "custody": "linked_local", "purpose": "Keep the actual working analysis available to the next research work."}
             self.treatments = [_accepted(_call(self.runtime, channel, "research_workspace.materials.feedback",
                 **_feedback(reference, effect_id=effect, selections=[selection])))
                 for effect in ("first-use", "second-use")]
@@ -104,9 +104,9 @@ def test_linked_processing_result_survives_cycle_cleanup_and_reports_later_drift
     runtime, _, _, _, _, _, _ = _complete(tmp_path, runtime=seeded)
     try:
         location = idea.locations[runtime.cleanup_test_cycle_ref]
-        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
+        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
         protected = next(item for item in report if item["workspace_ref"] == location.workspace_ref)
-        assert protected["action"] == "skipped" and protected["reason"] == "linked_local_original", report
+        assert protected["action"] == "pruned" and protected["reason"] == "originals_preserved_in_place", report
         successor = _external_context(_scope(runtime, quest_ref=location.quest_ref,
             run_ref="post-cleanup-reader", root_ref="post-cleanup-session"))
         channel = _channel(runtime, successor)
@@ -223,10 +223,9 @@ def test_receiving_research_root_chooses_custody_and_successor_reads_retained_us
                     selections.append({"source": {"kind": "original_file", "path": "", "observation_ref": observation},
                         "custody": "linked_local", "purpose": "Preserve the actual supplied observation and its uncertainty."})
                 if choice in {"result", "both"}:
-                    entry = next(item for item in _accepted(_call(self.runtime, channel, "research_workspace.discover"))["files"]
-                        if item["path"] == copied["work_file"]["path"])
-                    selections.append({"source": {"kind": "workspace_file", "workspace_ref": entry["workspace_ref"],
-                        "path": entry["path"], "expected_sha256": entry["sha256"]},
+                    location = self.runtime.root_workspaces.bind_runtime(context).location
+                    selections.append({"source": {"kind": "workspace_file", "workspace_ref": location.workspace_ref,
+                        "path": copied["work_file"]["path"], "expected_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest()},
                         "custody": "managed", "purpose": "Retain the calibration analysis, not a measured result."})
                 treatment = _accepted(_call(self.runtime, channel, "research_workspace.materials.feedback",
                     **_feedback(reference, selections=selections)))

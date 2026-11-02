@@ -3,7 +3,6 @@ from dataclasses import replace
 import hashlib
 import subprocess
 import sys
-import time
 import json
 
 import pytest
@@ -79,16 +78,7 @@ class _Reasoning(_MultiRunReasoningSkill):
 
 
 @pytest.mark.parametrize("input_kind", ["evidence_ref", "asset_version_ref"])
-def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_evaluation(tmp_path, input_kind):
-    _workproduct_plan_selection(tmp_path, input_kind, check_cleanup=True)
-
-
-@pytest.mark.parametrize("input_kind", ["evidence_ref", "asset_version_ref"])
 def test_protected_workproduct_and_scientific_outcome_feed_the_next_plan(tmp_path, input_kind):
-    _workproduct_plan_selection(tmp_path, input_kind, check_cleanup=False)
-
-
-def _workproduct_plan_selection(tmp_path, input_kind, *, check_cleanup):
     plan, bundle, reasoning = _Plan(), _Bundle(), _Reasoning(entry_stage="plan")
     runtime = fixtures.build_production_runtime(fixtures.prepare_data_root(tmp_path / "workproduct"),
         proposal_drafter=SnapshotAwareProposalDrafter(),
@@ -138,14 +128,10 @@ def _workproduct_plan_selection(tmp_path, input_kind, *, check_cleanup):
         runtime.owners.agent_runtime.publish_target_root_completion(target_ref=handle.target_ref,
             completion_ref=completed.completion_ref, target_commit_ref=completed.target_commit_ref)
         graph = runtime.owners.research_graph
-        cleanup = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, now=time.time()+90000)
-        if check_cleanup:
-            assert len(cleanup) == 1 and cleanup[0]["action"] == "removed" and cleanup[0]["bytes"] > 0, cleanup
-            assert not workspace.exists()
-        else:
-            assert len(cleanup) == 1 and cleanup[0]["action"] == "skipped", cleanup
-            assert cleanup[0]["reason"] == "cycle_incomplete"
-            assert cleanup[0]["bytes"] == 0 and workspace.exists()
+        cleanup = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
+        assert len(cleanup) == 1 and cleanup[0]["action"] == "skipped", cleanup
+        assert cleanup[0]["reason"] == "cycle_incomplete"
+        assert cleanup[0]["bytes"] == 0 and workspace.exists()
         assert runtime.owners.research_memory.materialize_asset(retained.binding.version_ref).content == output
         facts = graph.query_target_formal_results(handle.target_ref)
         assert len(facts) == 1 and facts[0]["variant_run"]["status"] == "executed"

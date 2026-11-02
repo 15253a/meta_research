@@ -87,7 +87,9 @@ class _HumanRequestRunner(CommonAcquisitionEffectRunner):
             "request_ref": self.opened["request_ref"], "response_ref": self.response["response_ref"],
             "limit": 16384,
         })["text"])
-        self.reply_bytes = call("research_workspace.read", self.readback["response"]["delivery"]["reply_reader"])
+        reply_file = self.readback["response"]["delivery"]["reply_file"]
+        workspace = Path(argv[argv.index("--cd") + 1])
+        self.reply_text = (workspace / reply_file["path"]).read_text()
 
         public_root = Path(next(line.removeprefix("public_output_root=") for line in prompt.splitlines()
                                 if line.startswith("public_output_root=")))
@@ -121,7 +123,7 @@ def test_initialization_deepfetch_formal_human_reply_returns_to_original_root(tm
         assert runner.opened is not None and runner.readback is not None
         assert runner.readback["response"]["response_ref"] == runner.response["response_ref"]
         assert runner.readback["response"]["delivery"] == runner.response["delivery"]
-        assert "The local reader was repaired" in runner.reply_bytes["text"]
+        assert "The local reader was repaired" in runner.reply_text
         assert runner.readback["response"]["delivery"]["root_session_ref"] == runner.opened["operation_binding"]["root_session_ref"]
         current = runtime.owners.agent_runtime.query_human_request(runner.opened["request_ref"])
         assert current["status"] == "satisfied"
