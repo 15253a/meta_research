@@ -1468,7 +1468,7 @@ def test_quest_deletion_fences_an_inflight_acquisition_completion(
         runtime.close()
 
 
-def test_quest_deletion_terminates_a_late_acquisition_root_registration(
+def test_quest_deletion_prevents_acquisition_after_atomic_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1504,18 +1504,16 @@ def test_quest_deletion_terminates_a_late_acquisition_root_registration(
                 ),
             ),
         )
-        original_register = owner.register_external_root_task_scope
+        original_acquire = owner._runtime_protection.acquire
 
-        def delayed_register(**values):
+        def delayed_acquire(identity):
+            # The claim and scope are committed together. Pause at the next
+            # real boundary, before the runtime hold or provider can start.
             registration_started.set()
             assert continue_registration.wait(timeout=5)
-            return original_register(**values)
+            return original_acquire(identity)
 
-        monkeypatch.setattr(
-            owner,
-            "register_external_root_task_scope",
-            delayed_register,
-        )
+        monkeypatch.setattr(owner._runtime_protection, "acquire", delayed_acquire)
 
         def acquire() -> None:
             try:
@@ -1552,7 +1550,16 @@ def test_quest_deletion_terminates_a_late_acquisition_root_registration(
                     "request_id": request.request_id,
                 },
             ).scalar_one()
-        assert responsibility_count == 0
+        # A hold admitted concurrently with cancellation must be closed by the
+        # exact permanent fence; it cannot authorize a late provider launch.
+        assert responsibility_count == 1
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(text(
+                "SELECT status, boundary FROM ar_execution_responsibilities WHERE "
+                "root_run_ref = :session_ref AND operation_ref = :request_id"
+            ), {"session_ref": session_ref, "request_id": request.request_id}).one()
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "permanent_fence"
     finally:
         continue_registration.set()
         client.close()

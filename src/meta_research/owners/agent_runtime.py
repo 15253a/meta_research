@@ -7164,125 +7164,140 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> dict[str, object]:
         """Register one server-derived Acquisition or Companion provider task."""
 
+        with self._database.fenced_write() as connection:
+            return self._register_external_root_task_scope(
+                connection,
+                root_kind=root_kind,
+                root_runtime_scope=root_runtime_scope,
+            )
+
+    def _register_external_root_task_scope(
+        self,
+        connection,
+        *,
+        root_kind: RootAgentKind,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]:
+        """Register the same scope inside the caller's fenced transaction."""
+
         scope = _validated_external_root_task_scope(
             root_kind=root_kind,
             root_runtime_scope=root_runtime_scope,
         )
         now = time.time()
-        with self._database.fenced_write() as connection:
-            registration_status = "running"
-            terminal_reason = None
-            if root_kind == "acquisition":
-                acquisition = connection.execute(
-                    text(
-                        "SELECT sessions.status AS session_status, "
-                        "sessions.reason_code AS session_reason_code, "
-                        "requests.status AS request_status, "
-                        "requests.attempt_count FROM ar_acquisition_sessions AS "
-                        "sessions JOIN ar_acquisition_requests AS requests ON "
-                        "requests.session_ref = sessions.session_ref WHERE "
-                        "sessions.session_ref = :session_ref AND "
-                        "requests.request_id = :request_id"
-                    ),
-                    {
-                        "session_ref": scope["root_session_ref"],
-                        "request_id": scope["run_ref"],
-                    },
-                ).first()
-                if (
-                    acquisition is not None
-                    and acquisition.session_status == "cancelled"
-                    and acquisition.session_reason_code == "quest_deleted"
-                    and acquisition.request_status == "missing"
-                    and int(acquisition.attempt_count) == scope["generation"]
-                ):
-                    registration_status = "terminated"
-                    terminal_reason = "acquisition_session_cancelled"
-            existing = connection.execute(
-                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                {"run_ref": scope["run_ref"]},
-            ).first()
-            if existing is not None:
-                try:
-                    _assert_external_root_task_scope_row(
-                        existing,
-                        root_kind=root_kind,
-                        scope=scope,
-                    )
-                except OwnerConflict:
-                    if not _external_root_task_scope_can_advance(
-                        existing,
-                        root_kind=root_kind,
-                        scope=scope,
-                    ):
-                        raise
-                    advanced = connection.execute(
-                        text(
-                            "UPDATE ar_run_controls SET status = 'running', "
-                            "attempt_ref = :attempt_ref, fence_ref = :fence_ref, "
-                            "attempt_generation = :generation, control_revision = "
-                            "control_revision + 1, safe_point_ref = NULL, "
-                            "terminal_reason = NULL, updated_at = :now WHERE "
-                            "run_ref = :run_ref AND run_kind = :run_kind AND "
-                            "status IN ('running', 'completed') AND "
-                            "attempt_generation = :prior_generation"
-                        ),
-                        {
-                            **scope,
-                            "run_kind": root_kind,
-                            "prior_generation": int(scope["generation"]) - 1,
-                            "now": now,
-                        },
-                    )
-                    if int(advanced.rowcount or 0) != 1:
-                        raise OwnerConflict("external_root_task_scope_conflict")
-                    self._feed.record(
-                        connection,
-                        "agent_runtime.external_root_task_advanced",
-                        {
-                            "root_kind": root_kind,
-                            "root_runtime_scope": scope,
-                        },
-                    )
-                    existing = connection.execute(
-                        text(
-                            "SELECT * FROM ar_run_controls WHERE run_ref = "
-                            ":run_ref"
-                        ),
-                        {"run_ref": scope["run_ref"]},
-                    ).one()
-                return _external_root_task_scope_document(existing)
-            connection.execute(
+        registration_status = "running"
+        terminal_reason = None
+        if root_kind == "acquisition":
+            acquisition = connection.execute(
                 text(
-                    "INSERT INTO ar_run_controls (run_ref, run_kind, quest_ref, "
-                    "cycle_ref, epoch, status, attempt_ref, root_session_ref, "
-                    "fence_ref, control_revision, safe_point_ref, terminal_reason, "
-                    "cleanup_status, runtime_binding_hash, attempt_generation, "
-                    "updated_at) VALUES (:run_ref, :run_kind, :quest_ref, NULL, "
-                    "NULL, :status, :attempt_ref, :root_session_ref, :fence_ref, "
-                    "1, NULL, :terminal_reason, 'none', :runtime_binding_hash, "
-                    ":generation, :now)"
+                    "SELECT sessions.status AS session_status, "
+                    "sessions.reason_code AS session_reason_code, "
+                    "requests.status AS request_status, "
+                    "requests.attempt_count FROM ar_acquisition_sessions AS "
+                    "sessions JOIN ar_acquisition_requests AS requests ON "
+                    "requests.session_ref = sessions.session_ref WHERE "
+                    "sessions.session_ref = :session_ref AND "
+                    "requests.request_id = :request_id"
                 ),
                 {
-                    **scope,
-                    "run_kind": root_kind,
-                    "status": registration_status,
-                    "terminal_reason": terminal_reason,
-                    "now": now,
+                    "session_ref": scope["root_session_ref"],
+                    "request_id": scope["run_ref"],
                 },
-            )
-            self._feed.record(
-                connection,
-                "agent_runtime.external_root_task_registered",
-                {
-                    "root_kind": root_kind,
-                    "root_runtime_scope": scope,
-                },
-            )
-            row = connection.execute(
-                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                {"run_ref": scope["run_ref"]},
-            ).one()
+            ).first()
+            if (
+                acquisition is not None
+                and acquisition.session_status == "cancelled"
+                and acquisition.session_reason_code == "quest_deleted"
+                and acquisition.request_status == "missing"
+                and int(acquisition.attempt_count) == scope["generation"]
+            ):
+                registration_status = "terminated"
+                terminal_reason = "acquisition_session_cancelled"
+        existing = connection.execute(
+            text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+            {"run_ref": scope["run_ref"]},
+        ).first()
+        if existing is not None:
+            try:
+                _assert_external_root_task_scope_row(
+                    existing,
+                    root_kind=root_kind,
+                    scope=scope,
+                )
+            except OwnerConflict:
+                if not _external_root_task_scope_can_advance(
+                    existing,
+                    root_kind=root_kind,
+                    scope=scope,
+                ):
+                    raise
+                advanced = connection.execute(
+                    text(
+                        "UPDATE ar_run_controls SET status = 'running', "
+                        "attempt_ref = :attempt_ref, fence_ref = :fence_ref, "
+                        "attempt_generation = :generation, control_revision = "
+                        "control_revision + 1, safe_point_ref = NULL, "
+                        "terminal_reason = NULL, updated_at = :now WHERE "
+                        "run_ref = :run_ref AND run_kind = :run_kind AND "
+                        "status IN ('running', 'completed') AND "
+                        "attempt_generation = :prior_generation"
+                    ),
+                    {
+                        **scope,
+                        "run_kind": root_kind,
+                        "prior_generation": int(scope["generation"]) - 1,
+                        "now": now,
+                    },
+                )
+                if int(advanced.rowcount or 0) != 1:
+                    raise OwnerConflict("external_root_task_scope_conflict")
+                self._feed.record(
+                    connection,
+                    "agent_runtime.external_root_task_advanced",
+                    {
+                        "root_kind": root_kind,
+                        "root_runtime_scope": scope,
+                    },
+                )
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM ar_run_controls WHERE run_ref = "
+                        ":run_ref"
+                    ),
+                    {"run_ref": scope["run_ref"]},
+                ).one()
+            return _external_root_task_scope_document(existing)
+        connection.execute(
+            text(
+                "INSERT INTO ar_run_controls (run_ref, run_kind, quest_ref, "
+                "cycle_ref, epoch, status, attempt_ref, root_session_ref, "
+                "fence_ref, control_revision, safe_point_ref, terminal_reason, "
+                "cleanup_status, runtime_binding_hash, attempt_generation, "
+                "updated_at) VALUES (:run_ref, :run_kind, :quest_ref, NULL, "
+                "NULL, :status, :attempt_ref, :root_session_ref, :fence_ref, "
+                "1, NULL, :terminal_reason, 'none', :runtime_binding_hash, "
+                ":generation, :now)"
+            ),
+            {
+                **scope,
+                "run_kind": root_kind,
+                "status": registration_status,
+                "terminal_reason": terminal_reason,
+                "now": now,
+            },
+        )
+        self._feed.record(
+            connection,
+            "agent_runtime.external_root_task_registered",
+            {
+                "root_kind": root_kind,
+                "root_runtime_scope": scope,
+            },
+        )
+        row = connection.execute(
+            text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+            {"run_ref": scope["run_ref"]},
+        ).one()
         return _external_root_task_scope_document(row)
 
     def complete_external_root_task_scope(
@@ -13751,7 +13766,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         previous_results: tuple[AcquisitionItemResult, ...] = ()
         reconcile_only = False
         new_request = False
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             session_row = connection.execute(
                 text(
                     "SELECT * FROM ar_acquisition_sessions WHERE "
@@ -13986,6 +14001,29 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "route_policy": request.route_policy,
                 },
             )
+            # The durable claim and its scope must commit together. A binding
+            # rejection or interrupted registration must not consume an attempt.
+            protection_effect = _acquisition_runtime_effect(
+                session_ref=session_ref,
+                request_id=request.request_id,
+                attempt_count=attempt_count,
+            )
+            root_runtime_scope: dict[str, object] | None = None
+            if session_row.quest_ref is None or isinstance(session_row.quest_ref, str):
+                root_runtime_scope = _acquisition_root_runtime_scope(
+                    quest_ref=session_row.quest_ref,
+                    session_ref=session_ref,
+                    runtime_binding_hash=runtime_binding_hash,
+                    generation=attempt_count,
+                    effect=protection_effect,
+                )
+                registered_root = self._register_external_root_task_scope(
+                    connection,
+                    root_kind="acquisition",
+                    root_runtime_scope=root_runtime_scope,
+                )
+                if registered_root["status"] != "running":
+                    raise OwnerConflict("acquisition_request_fence_stale")
             browser_context_ref = (
                 None
                 if session_row.browser_context_ref is None
@@ -14029,26 +14067,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             for paper in provider_request.papers
             if new_request or paper.paper_id in affected_ids
         )
-        protection_effect = _acquisition_runtime_effect(
-            session_ref=session_ref,
-            request_id=request.request_id,
-            attempt_count=attempt_count,
-        )
-        root_runtime_scope: dict[str, object] | None = None
-        if session_row.quest_ref is None or isinstance(session_row.quest_ref, str):
-            root_runtime_scope = _acquisition_root_runtime_scope(
-                quest_ref=session_row.quest_ref,
-                session_ref=session_ref,
-                runtime_binding_hash=runtime_binding_hash,
-                generation=attempt_count,
-                effect=protection_effect,
-            )
-            registered_root = self.register_external_root_task_scope(
-                root_kind="acquisition",
-                root_runtime_scope=root_runtime_scope,
-            )
-            if registered_root["status"] != "running":
-                raise OwnerConflict("acquisition_request_fence_stale")
         attempt_request = replace(
             provider_request,
             papers=affected_papers,
@@ -14085,6 +14103,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         outcome_resolved = False
         operation_terminal = False
         try:
+            # Cancellation can arrive after the atomic claim while the runtime
+            # hold is being acquired. Reuse the exact scope fence before effects.
+            if root_runtime_scope is not None:
+                self.verify_root_agent_runtime_scope(
+                    root_kind="acquisition",
+                    run_ref=cast(str, root_runtime_scope["run_ref"]),
+                    attempt_ref=cast(str, root_runtime_scope["attempt_ref"]),
+                    root_session_ref=cast(
+                        str, root_runtime_scope["root_session_ref"]
+                    ),
+                    fence_ref=cast(str, root_runtime_scope["fence_ref"]),
+                    runtime_binding_hash=cast(
+                        str, root_runtime_scope["runtime_binding_hash"]
+                    ),
+                )
             reconcile = getattr(provider, "reconcile", None)
             if (
                 resume_route is not None
