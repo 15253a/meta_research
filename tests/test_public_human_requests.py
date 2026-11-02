@@ -1059,6 +1059,30 @@ def _seed_root_human_request_task(runtime, *, task_index: int = 1) -> None:
         )
 
 
+def _exercise_acquisition_preflight_scope(runtime, exercise):
+    from test_public_acquisition_session import RecordingAcquisitionProvider
+
+    class ScopeProvider(RecordingAcquisitionProvider):
+        def preflight(self, request):
+            self.scope = request.root_runtime_scope
+            session = runtime.owners.agent_runtime.query_acquisition_session(session_ref=request.session_ref)
+            assert session is not None and session.quest_ref is None
+            assert self.scope["root_session_ref"] == session.session_ref
+            assert self.scope["quest_ref"] is None
+            exercise(self.scope)
+            return super().preflight(request)
+
+    creation = runtime.owners.human_collaboration.create_quest({}, "external-root-preflight")
+    provider = ScopeProvider()
+    session = runtime.owners.agent_runtime.prepare_acquisition_session(
+        initialization_id=creation["initialization_id"],
+        draft_revision=creation["quest_draft"]["revision"],
+        config={"mode": "oa_only", "library_entry_url": ""}, provider=provider)
+    assert session.status == "ready"
+    assert session.quest_ref is None
+    assert provider.scope["root_session_ref"] == session.session_ref
+
+
 @pytest.mark.parametrize("root_kind", ("acquisition", "companion"))
 def test_external_root_task_scope_drives_exact_human_request_lifecycle(
     tmp_path,
@@ -1077,32 +1101,32 @@ def test_external_root_task_scope_drives_exact_human_request_lifecycle(
         "runtime_binding_hash": "b" * 64,
         "generation": 2,
     }
-    binding = {
-        "quest_ref": scope["quest_ref"],
-        "task_ref": scope["run_ref"],
-        "root_session_ref": scope["root_session_ref"],
-        "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
-        "attempt_ref": scope["attempt_ref"],
-        "generation": scope["generation"],
-        "request_owner": "agent_runtime",
-        "root_kind": root_kind,
-        "phase": "primary",
-        "fence_ref": scope["fence_ref"],
-        "runtime_binding_hash": scope["runtime_binding_hash"],
-    }
-    target = {
-        "schema_ref": "meta-research/root-agent-human-request-target/v1",
-        "root": {
-            "run_kind": root_kind,
-            "run_ref": scope["run_ref"],
-            "attempt_ref": scope["attempt_ref"],
+    def exercise(scope):
+        binding = {
+            "quest_ref": scope["quest_ref"],
+            "task_ref": scope["run_ref"],
             "root_session_ref": scope["root_session_ref"],
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": scope["attempt_ref"],
+            "generation": scope["generation"],
+            "request_owner": "agent_runtime",
+            "root_kind": root_kind,
+            "phase": "preflight" if root_kind == "acquisition" else "primary",
             "fence_ref": scope["fence_ref"],
-            "waiter_generation": scope["generation"],
-        },
-        "condition": {"operator_choice": "continue_without_optional_input"},
-    }
-    try:
+            "runtime_binding_hash": scope["runtime_binding_hash"],
+        }
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": root_kind,
+                "run_ref": scope["run_ref"],
+                "attempt_ref": scope["attempt_ref"],
+                "root_session_ref": scope["root_session_ref"],
+                "fence_ref": scope["fence_ref"],
+                "waiter_generation": scope["generation"],
+            },
+            "condition": {"operator_choice": "continue_without_optional_input"},
+        }
         registered = owner.register_external_root_task_scope(
             root_kind=root_kind,
             root_runtime_scope=scope,
@@ -1141,7 +1165,7 @@ def test_external_root_task_scope_drives_exact_human_request_lifecycle(
                 "wait_scope": "local",
                 "other_blockers": [],
             },
-            quest_ref=str(scope["quest_ref"]),
+            quest_ref=scope["quest_ref"],
         )
         suspended = owner.query_managed_run(str(scope["run_ref"]))
         assert suspended is not None and suspended["status"] == "suspended"
@@ -1184,6 +1208,12 @@ def test_external_root_task_scope_drives_exact_human_request_lifecycle(
             root_kind=root_kind,
             root_runtime_scope=scope,
         ) == completed
+
+    try:
+        if root_kind == "acquisition":
+            _exercise_acquisition_preflight_scope(runtime, exercise)
+        else:
+            exercise(scope)
     finally:
         runtime.close()
 
@@ -1329,30 +1359,34 @@ def test_external_root_task_scope_rejects_missing_quest_and_identity_drift(
         prepare_data_root(tmp_path / "external-root-scope-invalid")
     )
     owner = runtime.owners.agent_runtime
-    scope = {
-        "quest_ref": "quest_external_root_invalid",
-        "run_ref": "acquisition_task_external_root_invalid",
-        "attempt_ref": "acquisition_attempt_external_root_invalid",
-        "root_session_ref": "acquisition_session_external_root_invalid",
-        "fence_ref": "acquisition_fence_external_root_invalid",
-        "runtime_binding_hash": "c" * 64,
-        "generation": 1,
-    }
-    try:
+    def exercise(scope):
+        # Pre-Quest Acquisition has a real Owner Session; other external roots
+        # still require a Quest, and exact identity cannot drift on replay.
+        assert scope["quest_ref"] is None
         with pytest.raises(OwnerConflict, match="external_root_task_scope_invalid"):
             owner.register_external_root_task_scope(
-                root_kind="acquisition",
-                root_runtime_scope={**scope, "quest_ref": None},
-            )
-        owner.register_external_root_task_scope(
-            root_kind="acquisition",
-            root_runtime_scope=scope,
-        )
+                root_kind="companion", root_runtime_scope=scope)
+        registered = owner.register_external_root_task_scope(
+            root_kind="acquisition", root_runtime_scope=scope)
+        assert owner.register_external_root_task_scope(
+            root_kind="acquisition", root_runtime_scope=scope) == registered
+        verified = owner.verify_root_agent_runtime_scope(
+            root_kind="acquisition", run_ref=scope["run_ref"],
+            attempt_ref=scope["attempt_ref"], root_session_ref=scope["root_session_ref"],
+            fence_ref=scope["fence_ref"], runtime_binding_hash=scope["runtime_binding_hash"])
+        assert verified["quest_ref"] is None
+        assert verified["waiter_generation"] == scope["generation"]
         with pytest.raises(OwnerConflict, match="external_root_task_scope_conflict"):
             owner.register_external_root_task_scope(
                 root_kind="acquisition",
-                root_runtime_scope={**scope, "fence_ref": "stale-fence"},
-            )
+                root_runtime_scope={**scope, "fence_ref": "stale-fence"})
+        with pytest.raises(OwnerConflict, match="root_agent_human_request_scope_stale"):
+            owner.verify_root_agent_runtime_scope(
+                root_kind="acquisition", run_ref=scope["run_ref"],
+                attempt_ref=scope["attempt_ref"], root_session_ref=scope["root_session_ref"],
+                fence_ref="stale-fence", runtime_binding_hash=scope["runtime_binding_hash"])
+    try:
+        _exercise_acquisition_preflight_scope(runtime, exercise)
     finally:
         runtime.close()
 

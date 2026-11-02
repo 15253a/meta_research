@@ -79,7 +79,7 @@ def test_human_directory_remains_quest_scoped_after_receiving_work_ends(tmp_path
 @pytest.mark.parametrize('source_kind', ['server_reference', 'linked_local'])
 def test_reply_directory_and_upload_keep_actual_receiver_and_later_quest_access(tmp_path, source_kind):
     import base64
-    from test_public_human_reply_delivery import _open
+    from test_public_human_reply_delivery import _open, _complete_receiving_batch
     runtime = _make(tmp_path / 'runtime')
     original = tmp_path / 'reply-original'
     original.mkdir()
@@ -96,13 +96,15 @@ def test_reply_directory_and_upload_keep_actual_receiver_and_later_quest_access(
                         'content_base64': base64.b64encode(b'\x00\xffanswer').decode()}]})
             assert response.status_code == 201, response.text
             delivery = response.json()['delivery']
-        assert delivery['work_ref'] == scope['run_ref']
+        assert delivery['human_request_ref'] == opened['request_ref']
+        assert delivery['root_session_ref'] == scope['root_session_ref']
+        assert delivery['work_ref'] == scope['root_session_ref']
         upload = delivery['uploaded_readers'][0]
         page = _accepted(_call(runtime, _channel(runtime, context), 'research_workspace.read', **upload))
         assert base64.b64decode(page['base64']) == b'\x00\xffanswer'
         reference = delivery['work_materials'][0]['reference_ref']
         receiver = runtime.owners.human_collaboration.query_work_material(reference)['receiver']
-        runtime.owners.agent_runtime.complete_external_root_task_scope(root_kind='companion', root_runtime_scope=scope)
+        _complete_receiving_batch(runtime, scope)
         for ordinal in range(4):
             later = _external_context(_scope(runtime, quest_ref=scope['quest_ref'], run_ref=f'next-{ordinal}', root_ref=f'next-{ordinal}'))
             page = _accepted(_call(runtime, _channel(runtime, later), 'research_workspace.materials.discover', reference_ref=reference))

@@ -415,17 +415,21 @@ def test_production_synthesis_prompt_and_spool_bind_actual_loaded_skill_and_fres
 
 
 def test_production_deepfetch_prompt_loads_creation_basis_without_replacing_v4_workflow(tmp_path):
-    from types import SimpleNamespace
-    from meta_research.deepfetch import CodexDeepFetchAdapter, _deepfetch_skill_root, _deepfetch_skill_bundle_hash
+    from dataclasses import replace
+    from meta_research.deepfetch import CodexDeepFetchAdapter, _deepfetch_skill_root, _deepfetch_skill_bundle_hash, canonical_hash
+    from test_deepfetch_adapter import _request
     adapter = object.__new__(CodexDeepFetchAdapter)
     adapter._skill_root = _deepfetch_skill_root()
+    adapter._workspace = tmp_path / "provider"
     scope = {"creation_basis": {"basis_ref": "precise-prior", "basis_hash": "a" * 64, "kind": "prepared"},
         "existing_work_retrieval": {"claims_and_conditions": [{"text": "Cold-condition result differs."}]}, "literature_mode": "oa_only"}
-    request = SimpleNamespace(scope=scope, request_ref="request", draft_revision=4, draft_hash="b" * 64, accepted_material_bindings=())
+    request = replace(_request(), scope=scope, scope_hash=canonical_hash(scope),
+        draft_revision=4, draft_hash="b" * 64, literature_access_mode="oa_only")
     prompt = adapter._initial_prompt(request, public_root=tmp_path / "public", private_root=tmp_path / "private")
     assert "precise-prior" in prompt and "Cold-condition result differs." in prompt
     assert "research_memory.creation_basis.read" in prompt
-    assert all(value in prompt for value in ("Radar", "Ledger", "Acquisition", "independent Readers", "Synthesis"))
+    assert all(value in prompt for value in ("## 2. 发现", "## 3. 维护台账并选择全文",
+        "## 4. 并行获取和阅读", "Acquisition", "独立 Reader 负责全文科学阅读", "## 5. 综合并验证"))
     assert len(_deepfetch_skill_bundle_hash(adapter._skill_root)) == 64
     skill = (adapter._skill_root / "SKILL.md").read_text()
     assert "references/creation-basis.md" in skill

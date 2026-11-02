@@ -153,7 +153,7 @@ def test_original_request_reference_is_readable_through_actual_root_and_child_mc
             assert client.post(f"/api/v1/human-requests/{opened['request_ref']}/responses", json=body, headers=headers).json() == response
             reference_ref = response["delivery"]["work_materials"][0]["reference_ref"]
             saved = client.get(f"/api/v1/work-materials/{reference_ref}").json()
-            assert (saved["receiver"]["kind"], saved["receiver"]["request_ref"], saved["receiver"]["roots"][0]["work_ref"]) == ("request", opened["request_ref"], scope["run_ref"])
+            assert (saved["receiver"]["kind"], saved["receiver"]["request_ref"], saved["receiver"]["roots"][0]["work_ref"]) == ("request", opened["request_ref"], scope["root_session_ref"])
             assert saved["read_state"] == "not_read"
         channel = _channel(runtime, context)
         status, catalog, _ = runtime.harnesses.dispatch_mcp_http(channel.connection.token,
