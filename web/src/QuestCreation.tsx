@@ -1532,7 +1532,7 @@ export function QuestCreationWorkbench({
                       <div className="quest-compute-head">
                         <div>
                           <b id="quest-compute-title">本机计算卡</b>
-                          <small>真实 host snapshot</small>
+                          <small>由运行研究的服务器检测</small>
                         </div>
                         <button
                           ref={computeButtonRef}
@@ -1547,7 +1547,7 @@ export function QuestCreationWorkbench({
                         className={`quest-compute-status ${creation?.compute?.status ?? ""}`}
                         role="status"
                       >
-                        {computeCopy(creation)}
+                        {computeCopy(creation, selectedDevices.size, !draftInteractionLocked && !computeActionLocked)}
                       </div>
                       {creation?.compute?.status === "ready" && creation.compute.devices.length ? (
                         <div className="quest-device-list" aria-label="实际检测到的计算卡">
@@ -1813,7 +1813,9 @@ export function QuestCreationWorkbench({
                       <span>
                         {generation?.status === "capability_unavailable"
                           ? "起草服务暂时不可用，请稍后重试。"
-                          : "填写研究目标和完成条件，检测计算卡后即可生成第一个问题。"}
+                          : proposalActionLocked ? null : draftComplete && resourceEnvelopeCurrent
+                            ? "准备就绪，点击下方按钮生成第一个问题。"
+                            : footerNote}
                       </span>
                       <button
                         ref={proposalActionRef}
@@ -2176,7 +2178,7 @@ function TechnicalDetails({ creation }: { creation: QuestCreationView | null }) 
   if (!creation) return null;
   return (
     <details className="quest-technical-details">
-      <summary>查看 Preview、Owner 与 receipt 技术详情</summary>
+      <summary>查看创建预览与提交回执</summary>
       <div className="quest-technical-grid">
         <span>initialization · {creation.initialization_id}</span>
         <span>draft · r{creation.quest_draft.revision} · {creation.quest_draft.hash}</span>
@@ -2856,7 +2858,8 @@ function footerCopy(
   if (creation.status === "cancelled") return "已取消创建";
   if (!meaningful(draft.goal)) return "请先填写 Quest 目标";
   if (!meaningful(draft.completion_criteria)) return "还需填写边界";
-  if (!creation.resource_envelope) return "请检测本机计算卡并保存研究可用的资源";
+  if (!validTimeBudget(draft.time_budget)) return "请填写有效的研究时间预算";
+  if (creation.resource_envelope?.status !== "current") return "请检测本机计算卡，确认本次研究可用的资源";
   if (!proposal) {
     const deepfetch = currentDeepFetch(creation);
     if (deepfetch?.status === "failed") {
@@ -2897,14 +2900,15 @@ function proposalSourceCopy(creation: QuestCreationView | null): string {
   return "等待生成";
 }
 
-function computeCopy(creation: QuestCreationView | null): string {
+function computeCopy(creation: QuestCreationView | null, selectedCount: number, editable: boolean): string {
   const compute = creation?.compute;
   if (!compute) return "尚未检测本机计算卡";
   if (compute.status === "unavailable") {
     return `capability_unavailable · ${compute.reason?.code ?? "host_compute_unavailable"}`;
   }
   if (!compute.devices.length) return "检测完成，当前没有可供选择的计算卡";
-  return `检测到 ${compute.devices.length} 张计算卡 · 请选择允许本 Quest 使用的设备`;
+  const selection = selectedCount ? `已选 ${selectedCount} 张` : "尚未选择";
+  return `检测到 ${compute.devices.length} 张计算卡，${selection}。` + (editable ? "点击设备可更改选择。" : "");
 }
 
 function resourceEnvelopeCopy(creation: QuestCreationView): string {

@@ -11,7 +11,7 @@ import pytest
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.runtime_conditions import (
     compose_runtime_prompt, read_runtime_conditions, render_runtime_conditions,
-    save_runtime_conditions, split_runtime_prompt,
+    save_runtime_conditions, selected_stage_model, split_runtime_prompt,
 )
 
 
@@ -74,6 +74,18 @@ def root(tmp_path):
         db.execute("INSERT INTO ar_harness_runs VALUES (?,?,?)",
                    ("harness-one", json.dumps(request), canonical_hash(request)))
     return tmp_path
+
+
+def test_stage_binding_uses_only_the_requested_stage_and_quest(root):
+    initial = read_runtime_conditions(root, "quest-one")
+    selected = {**initial["stage_models"], "plan": "gpt-5.6-sol", "target": "gpt-5.6-sol"}
+    save_runtime_conditions(root, "quest-one", expected_revision=initial["revision"],
+                            text=initial["text"], stage_models=selected)
+    for stage, model in selected.items():
+        assert selected_stage_model(root, stage, run_ref="run-one", default="unused") == model
+        assert selected_stage_model(root, stage, run_ref="run-two", default="unused") == "gpt-6.1-sol"
+    assert selected_stage_model(root, "target", target_ref="target-one", default="unused") == selected["target"]
+    assert selected_stage_model(root, "companion", run_ref="run-one", default="auxiliary-model") == "auxiliary-model"
 
 
 def test_selected_four_gpus_budget_literature_and_target_directory(root):

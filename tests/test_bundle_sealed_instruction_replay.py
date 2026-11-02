@@ -142,6 +142,9 @@ def test_model_edit_applies_to_next_call_and_preserves_sealed_replay(sealed_disp
     payload = json.loads(path.read_text())["payload"]
     assert payload["model_ref"] == payload["root_capability_profile"]["model_ref"] == selected
     assert payload["root_capability_profile"]["effective_reasoning_effort"] == "max"
+    from meta_research.root_capabilities import root_capability_profile, validate_root_capability_diagnostics
+    diagnostic = root_capability_profile("bundle", selected).public_diagnostics()
+    assert validate_root_capability_diagnostics(diagnostic) == diagnostic
 
 
 @pytest.mark.parametrize("mutation", ["request", "native", "invocation", "seal"])

@@ -1189,11 +1189,11 @@ async function expectMinimumTouchTarget(locator: Locator) {
 
 async function openTechnicalDetails(dialog: Locator) {
   const details = dialog.locator("details", {
-    hasText: "查看 Preview、Owner 与 receipt 技术详情",
+    hasText: "查看创建预览与提交回执",
   });
   if ((await details.getAttribute("open")) === null) {
     await details.getByText(
-      "查看 Preview、Owner 与 receipt 技术详情",
+      "查看创建预览与提交回执",
       { exact: true },
     ).click();
   }

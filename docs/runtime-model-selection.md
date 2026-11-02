@@ -1,23 +1,19 @@
-# Codex model for a deployment
+# Codex model selection
 
-The default model is `gpt-6.1-sol`. Set `META_RESEARCH_CODEX_MODEL=gpt-5.6-sol`
-in an instance's startup environment to select `gpt-5.6-sol` for that instance.
-The setting is read when the Python process starts. Unsupported values fail
-at startup instead of silently selecting another model.
+In a Quest’s **修改配置** dialog, select the Codex model for Idea, Plan,
+Bundle, Target and Reasoning separately. Each stage defaults to
+`gpt-6.1-sol` and uses Ultra (effective reasoning effort `max`).
+Saving applies the selected model on that stage’s next new call. An
+operation already sent to the provider retains its original model during
+reconciliation and retry. The settings survive a service restart.
 
-The selected model is shared by creation and research Companion, Idea,
-DeepFetch, Plan, Bundle, Target, Reasoning, acquisition, and Writing. The
-schema-only drafting adapter selects a separately verified catalog for the
-same model. The diagnostic API and CLI accept the currently configured model;
-they do not change production selection.
+Other Codex roles and the schema-only drafting adapter use the deployment
+model. Its default is `gpt-6.1-sol`. Setting
+`META_RESEARCH_CODEX_MODEL=gpt-5.6-sol` in the instance’s startup
+environment selects the other supported deployment model. The drafting
+adapter uses a verified catalog for that model. Diagnostic API and CLI
+requests use the deployment model.
 
-Changing the setting requires a restart of that instance. Allow running work
-to settle first. Stored model identities, native sessions, and signed runtime
-bindings remain unchanged; a configuration change does not migrate earlier
-work or authorize resuming it under a different model. New work receives the
-new model identity.
-
-Model selection does not grant account access. Verify the exact model with
-the instance's own authentication before enabling it. For example, a ChatGPT
-login can succeed while the provider rejects a particular model. Do not
-substitute a different model automatically after such a rejection.
+Provider availability depends on the instance’s authentication. Verify
+the selected model with the account on that instance. Provider rejection
+is reported for the selected model.

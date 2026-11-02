@@ -1408,21 +1408,26 @@ def test_recovery_replays_temporary_channel_failure_without_stale_cache(
 
 
 def test_target_root_lifecycle_chooses_first_then_resume_in_one_native_session(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     runtime, owner, adapter = _runtime(tmp_path)
 
+    selected = ["gpt-5.6-sol"]
+    monkeypatch.setattr("meta_research.harness.selected_stage_model", lambda *args, **kwargs: selected[0])
     first = runtime.run_or_resume_target_root(
         "target-harness-request:test",
         prompt="Own implementation through final training completion.",
         mcp_base_url="http://127.0.0.1:8765",
     )
+    selected[0] = "gpt-6.1-sol"
     resumed = runtime.run_or_resume_target_root(
         "target-harness-request:test",
         prompt="Continue the same Target root lifecycle.",
         mcp_base_url="http://127.0.0.1:8765",
     )
 
+    assert [turn.model_ref for turn in adapter.invocations] == ["gpt-5.6-sol", "gpt-6.1-sol"]
+    assert [turn.model_ref for turn in owner.operations] == ["gpt-5.6-sol", "gpt-6.1-sol"]
     assert TARGET_ROOT_LIFECYCLE_PHASE == "target_root_lifecycle"
     assert first.native_session_ref == "native-target-root"
     assert resumed.native_session_ref == first.native_session_ref
