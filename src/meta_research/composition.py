@@ -981,6 +981,10 @@ def build_production_runtime(
     bind_sources = getattr(deepfetch_provider, "bind_search_sources", None)
     if callable(bind_sources):
         bind_sources(search_sources)
+    bind_materials = getattr(deepfetch_provider, "bind_accepted_materials", None)
+    if callable(bind_materials):
+        from meta_research.accepted_materials import DeepFetchAcceptedMaterials
+        bind_materials(DeepFetchAcceptedMaterials(agent_runtime, human_collaboration, research_memory))
     semantic_gateway = create_semantic_owner_gateway(
         root_workspaces=root_workspaces,
         research_graph=owners.research_graph,

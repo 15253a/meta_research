@@ -9,6 +9,7 @@ from meta_research.context_presentation import ExactContextPages, context_read_p
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from meta_research.research_pagination import bind_page, page_state
+from meta_research.accepted_materials import DeepFetchAcceptedMaterials
 
 
 def _quest(agent_runtime, context):
@@ -350,6 +351,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
                                 target_run_agent=None):
     from meta_research.asset_lifecycle_operations import asset_lifecycle_operations
     page_cache = ExactContextPages()
+    initialization_materials = DeepFetchAcceptedMaterials(agent_runtime, human_collaboration, research_memory)
     def invoke(context, arguments):
         try:
             if context.phase == "creation_materials":
@@ -378,8 +380,15 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
                 return research_memory.read_asset_content_page(version, **page_arguments)
             arguments = dict(arguments)
             selected_quest = arguments.pop("source_quest_ref", None)
-            quest_ref = _reading_quest(agent_runtime, context,
-                source_quest_ref=selected_quest, human_collaboration=human_collaboration)
+            try:
+                quest_ref = _reading_quest(agent_runtime, context,
+                    source_quest_ref=selected_quest, human_collaboration=human_collaboration)
+            except OwnerConflict as error:
+                if error.code != "content_quest_scope_required" or context.root_kind != "deepfetch":
+                    raise
+                if selected_quest is not None:
+                    arguments["source_quest_ref"] = selected_quest
+                return initialization_materials.read(context, arguments)
             result = read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,page_cache=page_cache,
                 reader_source_quest_ref=selected_quest, **arguments)
             if selected_quest is not None:
@@ -393,7 +402,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
     operations=[SemanticOperation(semantic_operation_id="research_memory.content.read",owning_module="research_memory",
-        description="Read an exact authorized source using its returned source_ref/version_ref. Companion may explicitly select source_quest_ref outside the page selection when current HC authority grants it; other roots retain their current Quest scope. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
+        description="Read an exact authorized source using its returned source_ref/version_ref. Before Quest creation, DeepFetch may read only its current HC request's accepted input versions using the supplied version/version reader. Companion may explicitly select source_quest_ref outside the page selection when current HC authority grants it; other roots retain their current Quest scope. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
         return_description="Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Asset file pages use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. A hash names complete digital content, not a physical resource or its verified condition. Preserve returned exact source bindings and readers.",
         error_descriptions={
             "content_version_unbound": "This exact source/version is not bound within the authorized scope; this does not mean all research content is absent.",

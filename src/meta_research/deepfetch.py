@@ -80,6 +80,7 @@ from meta_research.root_resident_mcp import (
     semantic_mcp_environment,
 )
 from meta_research.semantic_mcp import ROOT_AGENT_ACQUISITION_OPERATION_IDS
+from meta_research.owners.common import OwnerConflict
 
 if TYPE_CHECKING:
     from meta_research.owners.common import AcceptanceReceipt
@@ -718,6 +719,10 @@ class CodexDeepFetchAdapter:
         self._root_resident_mcp = RootResidentMcpChannels("deepfetch")
         self._external_mcp: ExternalMcpRuntime | None = None
         self._search_sources: SearchSourceRegistry | None = None
+        self._accepted_materials = None
+
+    def bind_accepted_materials(self, materials) -> None:
+        self._accepted_materials = materials
 
     def bind_search_sources(self, registry: SearchSourceRegistry) -> None:
         self._search_sources = registry
@@ -2658,14 +2663,32 @@ class CodexDeepFetchAdapter:
         except RootResidentMcpError as error:
             raise DeepFetchUnavailable(error.code) from error
 
-    def _context_reference(self, request: DeepFetchProviderRequest) -> str:
-        path = self._workspace / "research-inputs" / (_deepfetch_protocol_identity(request) + ".json")
+    def _provided_materials(self, request: DeepFetchProviderRequest) -> list[dict]:
+        if request.creation_context_kind != "quest_initialization" or not request.accepted_material_bindings:
+            return []
+        if self._accepted_materials is None:
+            raise DeepFetchUnavailable("deepfetch_material_runtime_missing")
+        try:
+            return self._accepted_materials.prepare(request, self._agent_workspace_for(
+                request.job_ref, canonical_hash(request.runtime_binding.as_dict())))
+        except OwnerConflict as error:
+            raise DeepFetchUnavailable(error.code) from error
+
+    def _context_reference(self, request: DeepFetchProviderRequest, *, materials=None) -> str:
+        if materials is None:
+            materials = self._provided_materials(request)
+        # Preserve an earlier context file on same-session upgrades. The new
+        # exact input view adds verified native paths without changing HC facts.
+        suffix = ("-materials-" + self._provider_execution_key(request.job_ref) + ".json"
+                  if materials else ".json")
+        path = self._workspace / "research-inputs" / (_deepfetch_protocol_identity(request) + suffix)
         path.parent.mkdir(parents=True, exist_ok=True)
         value = canonical_json({"request_ref": request.request_ref, "scope": request.scope,
             "accepted_material_bindings": list(request.accepted_material_bindings),
             "creation_context_kind": request.creation_context_kind,
             "creation_context_ref": request.creation_context_ref, "quest_ref": request.quest_ref,
-            "literature_access_mode": _effective_access_mode(request)})
+            "literature_access_mode": _effective_access_mode(request),
+            **({"provided_materials": materials} if materials else {})})
         _ensure_durable_text(path, value)
         return (f"exact_scientific_input_path={path}\n"
             f"exact_scientific_input_sha256={hashlib.sha256(value.encode('utf-8')).hexdigest()}\n"
@@ -2673,6 +2696,7 @@ class CodexDeepFetchAdapter:
 
     def _scientific_input(self, request: DeepFetchProviderRequest) -> str:
         mode = _effective_access_mode(request)
+        materials = self._provided_materials(request)
         basis = ""
         if request.scope.get("creation_basis") is not None:
             basis = (
@@ -2694,7 +2718,12 @@ class CodexDeepFetchAdapter:
             "is the preference, not authority. Quest identity, creation basis and Cycle identity are independent.\n"
             f"scope={canonical_json(request.scope)}\n"
             f"accepted_material_bindings={canonical_json(list(request.accepted_material_bindings))}\n"
-            + basis + self._context_reference(request)
+            + (f"provided_materials={canonical_json(materials)}\n"
+               "Each path is a verified native copy of this request's exact accepted version. "
+               "Use its supplied version/version reader when needed; do not reconstruct binary files from tool pages. "
+               "For Acquisition, pass only the selected paper's exact clues and its local path as a file:// source URL. "
+               "Retain the binding and source receipt; keep input copies unchanged.\n" if materials else "")
+            + basis + self._context_reference(request, materials=materials)
         )
 
     def _initial_prompt(

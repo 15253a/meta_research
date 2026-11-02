@@ -1,7 +1,6 @@
 """Writing is an ordinary Companion request, with exact selected inputs."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -9,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.accepted_materials import selected_material_path
 
 
 class WritingMaterial(BaseModel):
@@ -52,42 +52,8 @@ class WritingRequest(BaseModel):
 
 
 def _selected_material_path(memory, asset, workspace_root: Path, input_key: str) -> Path:
-    """Export explicit exact selections using RM's existing verified byte copy."""
-    root = workspace_root.resolve()
-    description = memory.describe_asset_export(asset.version_ref)
-    destination = (root / "writing-inputs" / canonical_hash({"request": input_key})
-                   / canonical_hash({"version_ref": asset.version_ref}) / description.file_name)
-    if not destination.resolve().is_relative_to(root):
-        raise OwnerConflict("writing_input_path_invalid")
-    # Refuse symlink aliases, including aliases to another file inside the
-    # workspace: an input copy must not overwrite or impersonate earlier work.
-    if any(path.is_symlink() for path in (destination, *destination.parents) if path != root):
-        raise OwnerConflict("writing_input_path_invalid")
-    try:
-        return memory.export_asset(asset.version_ref, destination).path
-    except OwnerConflict as error:
-        if error.code != "asset_export_destination_exists":
-            raise
-    # A lost enqueue can retry after the export completed. Reuse only the exact
-    # exported content; edited copies remain untouched and are reported.
-    try:
-        expected = set()
-        for entry in description.entries:
-            path = destination / entry.path if description.kind == "directory" else destination
-            expected.add(path)
-            if path.is_symlink() or not path.is_file() or path.stat().st_size != entry.size:
-                raise ValueError()
-            with path.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != entry.sha256:
-                    raise ValueError()
-        if description.kind == "directory":
-            if any(path.is_symlink() for path in destination.rglob("*")):
-                raise ValueError()
-            if {path for path in destination.rglob("*") if path.is_file()} != expected:
-                raise ValueError()
-    except (OSError, ValueError):
-        raise OwnerConflict("writing_input_changed") from None
-    return destination
+    return selected_material_path(memory, asset, workspace_root, input_key,
+        directory="writing-inputs", error_prefix="writing_input")
 
 
 def writing_message(request: WritingRequest, message: str, memory, *, science=None,
