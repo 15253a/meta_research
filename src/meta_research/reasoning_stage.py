@@ -1284,9 +1284,13 @@ class ReasoningStageWorker:
         # This contract error carries field/supplied/expected evidence after
         # its stable code. Preserve that evidence in feedback, not in the
         # Owner's bounded machine-code field.
-        metadata_conflict = "scientific_outcome_authoritative_metadata_conflict"
-        if detail_code.startswith(metadata_conflict + ":"):
-            detail_code = metadata_conflict
+        for code in (
+            "scientific_outcome_authoritative_metadata_conflict",
+            "scientific_outcome_evidence_invalid",
+        ):
+            if detail_code.startswith(code + ":"):
+                detail_code = code
+                break
         self._agent_runtime.reject_stage_completion_candidate(
             unit_ref=unit_ref,
             run_ref=run.run_ref,

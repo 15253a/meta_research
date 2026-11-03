@@ -870,6 +870,12 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                 self.candidate_rejection_feedback(
                     code, result_document_path=completion.handoff.result_document_path,
                 ),
+                *(
+                    _implementation_directory_feedback(index, artifact.relative_path)
+                    for index, artifact in enumerate(completion.handoff.artifacts)
+                    if code == "target_implementation_workspace_invalid"
+                    and artifact.role == "implementation"
+                ),
             }
             or (
                 stored_code is not None
@@ -1349,6 +1355,7 @@ class TargetRunFinalizer:
                     )
                     if feedback is None:
                         raise
+                    feedback = getattr(error, "feedback", feedback)
                     completion = self._lifecycle.accept_completion(
                         handle=handle,
                         handoff=handoff,
@@ -1681,6 +1688,8 @@ class TargetRunFinalizer:
                 for artifact in declared_implementation
             ):
                 raise OwnerConflict("target_implementation_workspace_invalid")
+            if retained_completion is None:
+                _preflight_implementation_directories(root_descriptor, handoff.artifacts)
         frozen_artifacts: list[_FrozenArtifact] = []
         for ordinal, artifact in enumerate(handoff.artifacts):
             frozen_artifact = None
@@ -1762,6 +1771,30 @@ def target_root_manifest_projection(manifest):
         if entry.get("research_note") is None:
             entry.pop("research_note", None)
     return value
+
+
+def _implementation_directory_feedback(index: int, path: str) -> str:
+    return (
+        f"$.artifacts[{index}].relative_path={path!r} with role implementation must select an existing directory. "
+        "Correct the corresponding formal_runs[].implementation_paths selection to its intended directory. "
+        "Preserve the completed research and complete another root turn."
+    )
+
+
+def _preflight_implementation_directories(
+    root_descriptor: int, declarations: tuple[TargetCompletionArtifact, ...]
+) -> None:
+    for index, declaration in enumerate(declarations):
+        if declaration.role != "implementation":
+            continue
+        descriptor, info = _open_workspace_artifact(root_descriptor, declaration.relative_path)
+        try:
+            if not stat.S_ISDIR(info.st_mode):
+                error = OwnerConflict("target_implementation_workspace_invalid")
+                error.feedback = _implementation_directory_feedback(index, declaration.relative_path)
+                raise error
+        finally:
+            os.close(descriptor)
 
 
 def _system_target_completion_handoff(

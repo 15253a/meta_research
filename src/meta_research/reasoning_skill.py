@@ -65,6 +65,7 @@ from meta_research.reasoning_contract import (
     validate_new_reasoning_successor_entry,
     validate_reasoning_stage_output,
     validate_scientific_outcome,
+    validate_scientific_evidence_selection,
 )
 from .research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 from meta_research.semantic_mcp import (
@@ -836,14 +837,24 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         native_session_ref: str,
     ) -> dict[str, object]:
         try:
-            return _assemble_reasoning_output(request, output)
+            assembled = _assemble_reasoning_output(request, output)
+            outcome = assembled.get("scientific_outcome")
+            if isinstance(outcome, dict):
+                validate_scientific_evidence_selection(
+                    outcome.get("evidence"),
+                    frozen_evidence_closure=request.frozen_evidence_closure,
+                    historical_resolver=request.historical_evidence_resolver,
+                )
+            return assembled
         except ReasoningContractError as error:
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
                 operation_name=operation_name,
                 native_session_ref=native_session_ref,
                 failure_code=self._transport_contract_failure_code(operation_name),
-                detail_code=str(error),
+                detail_code=str(error) + (
+                    ": " + error.feedback if hasattr(error, "feedback") else ""
+                ),
                 rejected_candidate=output,
             ) from error
 

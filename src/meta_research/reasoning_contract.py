@@ -1176,6 +1176,45 @@ def validate_scientific_outcome(
         goal_revision_ref=cast(str, outcome["goal_revision_ref"]),
     )
 
+    cited_refs = validate_scientific_evidence_selection(
+        outcome.get("evidence"),
+        frozen_evidence_closure=frozen_evidence_closure,
+        historical_resolver=historical_resolver,
+    )
+
+    missing_evidence = _require_text_list(
+        outcome.get("missing_evidence"), "scientific_outcome_missing_evidence_invalid"
+    )
+    uncertainty_basis = _require_text_list(
+        outcome.get("uncertainty_basis"), "scientific_outcome_uncertainty_invalid"
+    )
+    _validate_outcome_scope_and_synthesis(
+        outcome,
+        cited_refs=cited_refs,
+        expected_context=expected_context,
+    )
+    if disposition == "insufficient_evidence":
+        if (
+            outcome.get("claim") is not None
+            or not missing_evidence
+        ):
+            raise ReasoningContractError(
+                "scientific_outcome_insufficient_evidence_invalid"
+            )
+        return canonical_hash(outcome)
+
+    _require_text(outcome.get("claim"), "scientific_outcome_claim_invalid")
+    if disposition == "uncertain":
+        if not uncertainty_basis:
+            raise ReasoningContractError("scientific_outcome_uncertainty_invalid")
+    return canonical_hash(outcome)
+
+
+def validate_scientific_evidence_selection(
+    evidence: object, *,
+    frozen_evidence_closure: list[dict[str, object]] | tuple[dict[str, object], ...],
+    historical_resolver: HistoricalEvidenceResolver | None = None,
+) -> set[str]:
     closure_by_ref: dict[str, dict[str, object]] = {}
     for value in frozen_evidence_closure:
         if not isinstance(value, dict):
@@ -1185,11 +1224,10 @@ def validate_scientific_outcome(
             raise ReasoningContractError("reasoning_evidence_closure_invalid")
         closure_by_ref[evidence_ref] = value
 
-    evidence = outcome.get("evidence")
     if not isinstance(evidence, list):
         raise ReasoningContractError("scientific_outcome_evidence_invalid")
     cited_refs: set[str] = set()
-    for value in evidence:
+    for index, value in enumerate(evidence):
         if not isinstance(value, dict):
             raise ReasoningContractError("scientific_outcome_evidence_invalid")
         _exact_keys(
@@ -1219,35 +1257,22 @@ def validate_scientific_outcome(
             or finding not in _SCIENTIFIC_FINDINGS
             or evidence_ref in cited_refs
         ):
-            raise ReasoningContractError("scientific_outcome_evidence_invalid")
+            if frozen is None or evidence_ref in cited_refs:
+                field = "ref"
+            elif value.get("kind") != frozen_kind:
+                field = "kind"
+            else:
+                field = "finding"
+            error = ReasoningContractError("scientific_outcome_evidence_invalid")
+            error.feedback = (
+                f"$.scientific_outcome.evidence[{index}].{field} does not match an authorized selected evidence leaf. "
+                "Use the exact ref and kind supplied by the frozen closure or authorized content reader; "
+                "catalog and container references do not substitute for a selected evidence leaf."
+            )
+            raise error
         cited_refs.add(evidence_ref)
 
-    missing_evidence = _require_text_list(
-        outcome.get("missing_evidence"), "scientific_outcome_missing_evidence_invalid"
-    )
-    uncertainty_basis = _require_text_list(
-        outcome.get("uncertainty_basis"), "scientific_outcome_uncertainty_invalid"
-    )
-    _validate_outcome_scope_and_synthesis(
-        outcome,
-        cited_refs=cited_refs,
-        expected_context=expected_context,
-    )
-    if disposition == "insufficient_evidence":
-        if (
-            outcome.get("claim") is not None
-            or not missing_evidence
-        ):
-            raise ReasoningContractError(
-                "scientific_outcome_insufficient_evidence_invalid"
-            )
-        return canonical_hash(outcome)
-
-    _require_text(outcome.get("claim"), "scientific_outcome_claim_invalid")
-    if disposition == "uncertain":
-        if not uncertainty_basis:
-            raise ReasoningContractError("scientific_outcome_uncertainty_invalid")
-    return canonical_hash(outcome)
+    return cited_refs
 
 
 def _validate_frozen_research_context(
