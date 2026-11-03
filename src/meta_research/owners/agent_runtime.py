@@ -6413,13 +6413,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 request_ref = connection.execute(text(
                     "SELECT request_ref FROM ar_stage_runs WHERE run_ref = :run_ref"
                 ), {"run_ref": row["run_ref"]}).scalar_one()
-            is_review = row["run_kind"] == "plan_stage"
-            run = (self.query_plan_stage_run(request_ref) if is_review
+            is_plan = row["run_kind"] == "plan_stage"
+            run = (self.query_plan_stage_run(request_ref) if is_plan
                    else self.query_bundle_stage_run(request_ref) if row["run_kind"] == "bundle_stage"
                    else self.query_reasoning_stage_run(request_ref))
             if run is None:
                 raise OwnerConflict("operator_stop_checkpoint_invalid")
-            if (run.primary_draft is not None) != is_review or run.execution is not None:
+            if (run.primary_draft is not None and not is_plan) or run.execution is not None:
                 continue
             checkpoint = self._operator_stop_reader(row["run_ref"])
             if checkpoint is not None:
@@ -10672,10 +10672,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         saved = _query_managed_safe_point(connection, row)
         scope = checkpoint.get("scope", {})
         native = checkpoint.get("native_session_ref")
-        is_review = row.run_kind == "plan_stage"
+        is_review = row.run_kind == "plan_stage" and scope.get("unit_kind") == "plan_review"
         phase = "review" if is_review else "primary"
-        unit_kind = ("plan_review" if is_review else "bundle_primary"
-                     if row.run_kind == "bundle_stage" else "reasoning_primary")
+        unit_kind = f"{row.run_kind.removesuffix('_stage')}_{phase}"
         reason_code = f"operator_stopped_{phase}_resumed"
         if (saved is None or saved["checkpoint"].get("action") != "pause"
                 or checkpoint.get("schema_ref") != f"meta-research/operator-stopped-{phase}/v1"
@@ -10709,7 +10708,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or attempt.status != "running" or fence.status != "current"
                 or session.status != "active" or session.native_session_ref not in {None, native}
                 or unit is None or unit.unit_ref != scope.get("unit_ref")
-                or unit.status != "completed" or unit.unit_kind != unit_kind
+                or unit.status != "completed" or unit.unit_kind != unit_kind or scope.get("unit_kind") != unit_kind
                 or (unit.run_ref, unit.attempt_ref, unit.fence_ref, unit.operation_ref) != (
                     row.run_ref, row.attempt_ref, row.fence_ref, scope.get("operation_ref"))
                 or connection.execute(text(

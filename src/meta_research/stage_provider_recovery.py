@@ -54,6 +54,7 @@ class StoppedStageProviderRecovery:
             expected_phase = {
                 ("reasoning_stage", "reasoning_primary"): "primary",
                 ("bundle_stage", "bundle_primary"): "primary",
+                ("plan_stage", "plan_primary"): "primary",
                 ("plan_stage", "plan_review"): "review",
             }.get((scope["run_kind"], scope["unit_kind"]))
             if scope["status"] != "completed" or expected_phase is None:

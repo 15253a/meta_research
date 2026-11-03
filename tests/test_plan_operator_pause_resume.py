@@ -1,4 +1,4 @@
-"""Owner pause of optional same-root work retains the saved primary draft.
+"""A paused Plan continues its primary or its optional post-draft work.
 
 The fixture explicitly schedules post-draft work. The production Plan adapter
 still checkpoints its final candidate locally without a second review call.
@@ -61,7 +61,7 @@ class _SupervisedPlanWithOptionalContinuation(CodexPlanSkillAdapter):
         return super().review_draft(request, draft)
 
 
-def _provider(path, root):
+def _provider(path, root, *, stop_on_call=2):
     path.write_text(
         '#!/usr/bin/env python3\nimport json, signal, sys, time\nfrom pathlib import Path\n'
         "if '--version' in sys.argv:\n print('codex 0.156.1'); raise SystemExit(0)\n"
@@ -74,7 +74,7 @@ def _provider(path, root):
         "def stopped(*_): result.write_text(''); sys.exit(0)\n"
         'signal.signal(signal.SIGTERM, stopped)\n'
         f"print(json.dumps({{'type':'thread.started','thread_id':{NATIVE!r}}}),flush=True)\n"
-        "if len(calls.read_text().splitlines())==2: time.sleep(90)\n"
+        f"if len(calls.read_text().splitlines())=={stop_on_call}: time.sleep(90)\n"
         "output=json.loads((root/'next-output.json').read_text())\n"
         "schema=json.loads(Path(sys.argv[sys.argv.index('--output-schema')+1]).read_text())\n"
         "if set(schema.get('properties',{}))=={'provider_output'}: output={'provider_output':output}\n"
@@ -90,6 +90,85 @@ def _make_runtime(root, executable):
     runtime.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
     adapter.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
     return runtime, adapter
+
+
+@pytest.mark.parametrize('tamper', [False, True], ids=['continue-original-native', 'reject-invalid-seal'])
+def test_pause_before_first_plan_draft_resumes_original_native(tmp_path, tamper):
+    root = tmp_path / 'data'
+    root.mkdir()
+    executable = _provider(tmp_path / 'codex', root, stop_on_call=1)
+    runtime, _ = _make_runtime(root, executable)
+    _confirm_direct_quest(runtime)
+    _finish_idea_stage(runtime)
+    for _ in range(2):
+        assert runtime.plan_stage.process_once()
+    request = runtime.plan_stage.query_current()['stage_run_request']['request_ref']
+    original = runtime.owners.agent_runtime.query_plan_stage_run(request)
+    assert original.primary_draft is None
+    worker = threading.Thread(target=runtime.plan_stage.process_once)
+    worker.start()
+    deadline = time.monotonic() + 20
+    spool = None
+    while time.monotonic() < deadline:
+        spool = next((root / 'plan-skill-provider').glob('provider-operations/*/primary/stdout.jsonl'), None)
+        if spool is not None and NATIVE in spool.read_text():
+            break
+        time.sleep(.02)
+    else:
+        pytest.fail('Plan primary did not produce its native identity')
+    _control(runtime, original, 'pause')
+    worker.join(15)
+    assert not worker.is_alive()
+    runtime.close()
+    directory = spool.parent
+    assert json.loads((directory / 'supervisor-exit.json').read_text())['payload']['termination_reason'] == 'stopped'
+    sealed = {p.name:p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    if tamper:
+        spool.write_bytes(spool.read_bytes() + b'{}\n')
+    resumed, adapter = _make_runtime(root, executable)
+    try:
+        if tamper:
+            with pytest.raises(OwnerConflict, match='operator_stop_checkpoint_invalid'):
+                _control(resumed, original, 'resume')
+            assert resumed.owners.agent_runtime.query_managed_run(original.run_ref)['status'] == 'suspended'
+            return
+        assert _control(resumed, original, 'resume')['executed']
+        owner = resumed.owners.agent_runtime
+        run = owner.query_plan_stage_run(request)
+        assert (run.run_ref, run.root_session_ref) == (original.run_ref, original.root_session_ref)
+        assert run.attempt_ref != original.attempt_ref and run.fence_ref != original.fence_ref
+        assert run.primary_invocation.operation_ref != original.primary_invocation.operation_ref
+        assert run.primary_draft is None and run.native_session_ref == NATIVE
+        assert resumed.plan_stage.process_once()
+        assert owner.query_plan_stage_run(request).primary_draft is not None and adapter.primary_calls == 1
+        calls = [json.loads(line) for line in (root / 'provider-calls.jsonl').read_text().splitlines()]
+        assert len(calls) == 2 and calls[-1][-3:] == ['resume', NATIVE, '-']
+        assert sealed == {p.name:p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    finally:
+        resumed.close()
+
+
+def test_pause_before_any_plan_call_keeps_the_prepared_primary(tmp_path):
+    root = tmp_path / 'data'
+    root.mkdir()
+    runtime, _ = _make_runtime(root, _provider(tmp_path / 'codex', root))
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        for _ in range(2):
+            assert runtime.plan_stage.process_once()
+        request = runtime.plan_stage.query_current()['stage_run_request']['request_ref']
+        owner = runtime.owners.agent_runtime
+        before = owner.query_plan_stage_run(request)
+        _control(runtime, before, 'pause')
+        assert _control(runtime, before, 'resume')['executed']
+        after = owner.query_plan_stage_run(request)
+        assert (after.attempt_ref, after.fence_ref) == (before.attempt_ref, before.fence_ref)
+        assert after.primary_invocation == before.primary_invocation
+        assert after.native_session_ref is None
+        assert not (root / 'provider-calls.jsonl').exists()
+    finally:
+        runtime.close()
 
 
 @pytest.mark.parametrize('tamper', [False, True], ids=['resume-review-only', 'reject-tampered-stop'])
