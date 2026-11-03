@@ -1053,7 +1053,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
         "target_type",
     } & set(candidate_core)
     assert "execution" not in target_schema["properties"]
-    assert "semantic_inputs" in target_schema["properties"]
+    assert "semantic_inputs" not in target_schema["properties"]
     assert "Metric definitions 保持顺序" in contract
     assert dispatch.selected_target_ref == "target:accepted-structure"
     assert dispatch.native_session_ref == result.primary_session_ref

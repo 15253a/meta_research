@@ -1239,6 +1239,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                     ),
                     "batch_view_source_hash": _file_sha256(Path(__file__).with_name("bundle_batch_view.py")),
                     "batch_access_source_hash": _file_sha256(Path(__file__).with_name("bundle_batch_access.py")),
+                    "output_assembly_source_hash": _file_sha256(Path(__file__).with_name("bundle_output_assembly.py")),
                 }
             ),
             model_ref=self._model_ref,
@@ -1276,6 +1277,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 + _file_sha256(Path(__file__).with_name("bundle_batch_view.py")),
                 "adapter-source:meta_research.bundle_batch_access@sha256:"
                 + _file_sha256(Path(__file__).with_name("bundle_batch_access.py")),
+                "adapter-source:meta_research.bundle_output_assembly@sha256:"
+                + _file_sha256(Path(__file__).with_name("bundle_output_assembly.py")),
                 "adapter-source:meta_research.idea_skill@sha256:"
                 f"{shared_adapter_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
@@ -1333,6 +1336,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             f"{human_resume}"
             "本回合按角色方法及 references/contract.md 的正式输出合同形成完整候选，"
+            "输出只选择 experiment_key、完成单元和固定条件；冻结 Brief 的 semantic_inputs 与 semantic_delta 由装配层按本次 Plan 原文补入。"
             "完成独立子智能体审阅并由根自主修订后，返回 target_plan 或 exhaustion_assessment。"
             "保持下列准确 FormalPlan、完整采用来源与当前反馈；核验未知效果后再决定是否可提交。\n"
             f"{lineage}\n"
@@ -1365,6 +1369,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if session_ref is None or type(output) is not dict:
             raise BundleSkillUnavailable("codex_bundle_primary_invalid")
+        from meta_research.bundle_output_assembly import assemble_bundle_primary
+        from meta_research.bundle_target_contract import BundleTargetContractError
+        try:
+            output = assemble_bundle_primary(output, request.plan_document)
+        except BundleTargetContractError as error:
+            raise self._sealed_result_failure(job_ref=request.job_ref, operation_name="primary",
+                native_session_ref=session_ref, failure_code="bundle_primary_result_contract_invalid",
+                detail_code=str(error), rejected_candidate=output) from error
         # Collaboration trace is advisory provenance.  TargetPlan and
         # exhaustion assessment acceptance stays with the Skill-defined
         # structural/domain validators.
@@ -1676,6 +1688,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续当前 Bundle 根。根据本次正式 TargetCommit、仍未完成的责任及真实反馈，"
+            "候选输出不复写 semantic_inputs；装配层按本次 Plan 与 experiment_keys 补入不可改写的 Brief 原文。"
             "按 references/contract.md 形成下一份 FormalStrategyUpdate。需要继续实施时追加候选；"
             "全部所需 cells 已由 current accepted TargetCommit 覆盖时，先读最后结果、整理可复用资源、"
             "完成独立审阅，再以空 candidates、strategy_complete=true 和完整 notes 封口。"
@@ -1727,6 +1740,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 failure_code="bundle_review_result_contract_invalid",
                 detail_code="codex_bundle_target_batch_invalid",
             )
+        from meta_research.bundle_output_assembly import assemble_strategy_update
+        from meta_research.bundle_target_contract import BundleTargetContractError
+        try:
+            strategy_update = assemble_strategy_update(strategy_update, request.plan_document)
+        except BundleTargetContractError as error:
+            raise self._sealed_result_failure(job_ref=request.job_ref, operation_name=operation_name,
+                native_session_ref=session_ref, failure_code="bundle_review_result_contract_invalid",
+                detail_code=str(error), rejected_candidate=output) from error
         result = BundleTargetBatchResult(
             strategy_update=cast(dict[str, object], strategy_update),
             rationale=rationale,
@@ -2296,13 +2317,11 @@ def _normalized_experiment_schema() -> dict[str, object]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "semantic_inputs": _semantic_inputs_schema(),
             "brief": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
                     "experiment_key": _plan_semantic_text_schema(),
-                    "semantic_delta": _plan_semantic_text_schema(),
                     "held_fixed_slots": _ref_array_schema(min_items=0),
                     "required_measurement_unit_keys": _ref_array_schema(
                         min_items=1
@@ -2310,34 +2329,12 @@ def _normalized_experiment_schema() -> dict[str, object]:
                 },
                 "required": [
                     "experiment_key",
-                    "semantic_delta",
                     "held_fixed_slots",
                     "required_measurement_unit_keys",
                 ],
             },
         },
-        "required": ["semantic_inputs", "brief"],
-    }
-
-
-def _semantic_inputs_schema() -> dict[str, object]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "experiment_key": _plan_semantic_text_schema(),
-            "goal": _plan_semantic_text_schema(),
-            "characteristics": _plan_semantic_text_schema(),
-            "boundary_constraints": _plan_semantic_text_schema(),
-            "semantic_delta": _plan_semantic_text_schema(),
-        },
-        "required": [
-            "experiment_key",
-            "goal",
-            "characteristics",
-            "boundary_constraints",
-            "semantic_delta",
-        ],
+        "required": ["brief"],
     }
 
 
@@ -2385,7 +2382,6 @@ def _formal_strategy_update_schema(
 def _formal_target_candidate_schema(
     request: BundleSkillRequest | BundleTargetBatchRequest,
 ) -> dict[str, object]:
-    briefs = _plan_briefs(request)
     text = _ref_schema()
     return {
         "type": "object",
@@ -2437,19 +2433,12 @@ def _formal_target_candidate_schema(
                     "direct_accepted_input_asset_refs",
                 ],
             },
-            "semantic_inputs": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": max(1, len(briefs)),
-                "items": _semantic_inputs_schema(),
-            },
             "measurement_contract": _measurement_contract_schema(),
             "risk_class": {"type": "string", "enum": ["normal", "high"]},
         },
         "required": [
             "schema_ref",
             "candidate",
-            "semantic_inputs",
             "measurement_contract",
             "risk_class",
         ],
