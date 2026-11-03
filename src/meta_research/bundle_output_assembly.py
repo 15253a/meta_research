@@ -11,6 +11,34 @@ from meta_research.owners.common import canonical_hash
 _SEMANTIC_FIELDS = ("experiment_key", "goal", "characteristics", "boundary_constraints", "semantic_delta")
 
 
+def full_prose_output_schema(schema):
+    """Support full-copy output for future calls while retaining compact-result decoding."""
+    from meta_research.plan_contract import PLAN_TEXT_MAX_CHARS, MAX_PLAN_EXPERIMENT_BRIEFS
+    semantic = {"type": "object", "additionalProperties": False,
+                "properties": {key: {"type": "string", "minLength": 1, "maxLength": PLAN_TEXT_MAX_CHARS}
+                               for key in _SEMANTIC_FIELDS}, "required": list(_SEMANTIC_FIELDS)}
+    result = deepcopy(schema)
+    def visit(node):
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+        elif isinstance(node, dict):
+            for value in list(node.values()):
+                visit(value)
+            properties = node.get("properties", {})
+            if set(properties) == {"brief"} and "held_fixed_slots" in properties["brief"].get("properties", {}):
+                properties["semantic_inputs"] = deepcopy(semantic)
+                node["required"].append("semantic_inputs")
+                properties["brief"]["properties"]["semantic_delta"] = deepcopy(semantic["properties"]["semantic_delta"])
+                properties["brief"]["required"].append("semantic_delta")
+            elif properties.get("schema_ref", {}).get("const") == "meta-research/bundle-formal-target-candidate/v2":
+                properties["semantic_inputs"] = {"type": "array", "minItems": 1,
+                    "maxItems": MAX_PLAN_EXPERIMENT_BRIEFS, "items": deepcopy(semantic)}
+                node["required"].append("semantic_inputs")
+    visit(result)
+    return result
+
+
 def assemble_completion_contract(value, plan_document):
     if not isinstance(value, dict) or value.get("plan_document_hash") != canonical_hash(plan_document):
         raise BundleTargetContractError("completion_contract_plan_hash_mismatch")

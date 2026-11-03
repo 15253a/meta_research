@@ -963,6 +963,22 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
     def bind_batch_plan_reader(self, reader) -> None:
         self._batch_plan_reader = reader
 
+    def _operation_output_schema(self, schema, job_ref, operation_name):
+        from meta_research.bundle_output_assembly import full_prose_output_schema
+        from meta_research.idea_skill import _read_sealed_operation_invocation
+        full = full_prose_output_schema(schema)
+        if job_ref is not None:
+            path = (self._workspace / "provider-operations" / canonical_hash({"job_ref": job_ref})
+                    / operation_name / "invocation.json")
+            if path.exists():
+                _, key = self._transport_key()
+                sealed = _read_sealed_operation_invocation(path, key=key)
+                for candidate in (schema, full):
+                    if sealed.get("output_schema_hash") == canonical_hash(_compile_codex_output_schema(candidate)):
+                        return candidate
+                raise BundleSkillUnavailable("codex_operation_identity_conflict")
+        return full if os.environ.get("META_RESEARCH_BUNDLE_OUTPUT_MODE") == "full" else schema
+
     def bind_full_conformance_authority(
         self, authority: BundleFullConformanceAuthority
     ) -> None:
@@ -1045,6 +1061,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         operation_input: dict[str, object] | None = None,
         inline_guidance: bool = False,
     ) -> tuple[dict[str, object], str | None, str]:
+        schema = self._operation_output_schema(schema, job_ref, operation_name)
         prompt, guidance_binding = self._prepare_stage_guidance(
             run_ref=run_ref, attempt_ref=attempt_ref, root_session_ref=root_session_ref,
             fence_ref=fence_ref, runtime_binding_hash=canonical_hash(runtime_binding.as_dict()),
@@ -1222,6 +1239,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "target-dispatch": _dispatch_schema(("__target__",)),
             "target-batch": _target_batch_schema(_schema_template_request()),
         }
+        from meta_research.bundle_output_assembly import full_prose_output_schema
+        schemas.update({name + "-full": full_prose_output_schema(schema)
+                        for name, schema in list(schemas.items()) if name != "target-dispatch"})
         schemas = {
             name: _compile_codex_output_schema(schema)
             for name, schema in schemas.items()
@@ -1336,7 +1356,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             f"{human_resume}"
             "本回合按角色方法及 references/contract.md 的正式输出合同形成完整候选，"
-            "输出只选择 experiment_key、完成单元和固定条件；冻结 Brief 的 semantic_inputs 与 semantic_delta 由装配层按本次 Plan 原文补入。"
+            f"{_bundle_output_assembly_prompt()}"
             "完成独立子智能体审阅并由根自主修订后，返回 target_plan 或 exhaustion_assessment。"
             "保持下列准确 FormalPlan、完整采用来源与当前反馈；核验未知效果后再决定是否可提交。\n"
             f"{lineage}\n"
@@ -1688,7 +1708,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续当前 Bundle 根。根据本次正式 TargetCommit、仍未完成的责任及真实反馈，"
-            "候选输出不复写 semantic_inputs；装配层按本次 Plan 与 experiment_keys 补入不可改写的 Brief 原文。"
+            f"{_bundle_output_assembly_prompt()}"
             "按 references/contract.md 形成下一份 FormalStrategyUpdate。需要继续实施时追加候选；"
             "全部所需 cells 已由 current accepted TargetCommit 覆盖时，先读最后结果、整理可复用资源、"
             "完成独立审阅，再以空 candidates、strategy_complete=true 和完整 notes 封口。"
@@ -1765,6 +1785,12 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 detail_code=str(error),
             ) from error
         return result
+
+
+def _bundle_output_assembly_prompt() -> str:
+    if os.environ.get("META_RESEARCH_BUNDLE_OUTPUT_MODE") == "full":
+        return "本次按完整输出 schema 携带 semantic_inputs 与 semantic_delta，逐字保留本次 Plan 的 Brief 原文。"
+    return "输出只选择 experiment_key、完成单元和固定条件；冻结 Brief 的 semantic_inputs 与 semantic_delta 由装配层按本次 Plan 原文补入。"
 
 
 def _provider_correction_prompt(feedback: dict[str, object] | None) -> str:

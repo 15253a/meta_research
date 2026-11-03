@@ -78,6 +78,27 @@ def test_strategy_assembly_cannot_select_unknown_experiment_or_rewrite_semantics
         assemble_strategy_update(update, plan)
 
 
+def test_output_rollback_only_changes_new_schema_and_preserves_sealed_compact_call(tmp_path, monkeypatch):
+    import json
+    from dataclasses import replace
+    from test_bundle_input_drift_recovery import _adapter, _request, _output
+    adapter, runner = _adapter(tmp_path, _output("batch"), durable=True)
+    request = _request(adapter, "batch")
+    binding = adapter.runtime_binding()
+    adapter.propose_target_batch(request)
+    operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
+    saved = {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()}
+    monkeypatch.setenv("META_RESEARCH_BUNDLE_OUTPUT_MODE", "full")
+    assert adapter.runtime_binding() == binding
+    adapter.propose_target_batch(request)
+    assert len(runner.calls) == 1
+    assert {name: (operation / name).read_bytes() for name in saved} == saved
+    adapter.propose_target_batch(replace(request, job_ref="new-full-output-operation"))
+    assert len(runner.calls) == 2
+    schema = runner.calls[-1][2]
+    assert "semantic_inputs" in schema["properties"]["strategy_update"]["properties"]["candidates"]["items"]["properties"]
+
+
 def test_compact_output_runs_through_real_adapter(tmp_path, monkeypatch):
     import test_bundle_skill_adapter as suite
     original_runner = suite._SequenceRunner
