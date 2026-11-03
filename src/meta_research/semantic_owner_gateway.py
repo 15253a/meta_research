@@ -522,7 +522,8 @@ def _formal_results_read(research_graph, agent_runtime, context, arguments, huma
     try:
         quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
             human_collaboration=human_collaboration)
-        return research_graph.query_target_result_handoff(arguments["target_ref"], quest_ref=quest_ref)
+        result = research_graph.query_target_result_handoff(arguments["target_ref"], quest_ref=quest_ref)
+        return _target_content_readers(result, arguments.get("source_quest_ref"))
     except OwnerConflict as error:
         raise SemanticMcpError(error.code) from error
 
@@ -535,7 +536,39 @@ def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments
             arguments["ref"], quest_ref=quest_ref)
     except OwnerConflict as error:
         raise SemanticMcpError(error.code) from error
-    return {"status": "not_found" if result is None else "accepted", "result": result}
+    return {"status": "not_found" if result is None else "accepted",
+            "result": None if result is None else _target_fact_readers(result, arguments.get("source_quest_ref"))}
+
+
+def _asset_reader(binding, *, source_ref=None, source_quest_ref=None):
+    args = {"source_ref": source_ref or binding["version_ref"], "version_ref": binding["version_ref"]}
+    if source_quest_ref is not None:
+        args["source_quest_ref"] = source_quest_ref
+    return {"operation": "research_memory.content.read", "args": args}
+
+
+def _target_fact_readers(fact, source_quest_ref):
+    return {**fact, **{key: [{**entry, "reader": _asset_reader(entry,
+                source_quest_ref=source_quest_ref)}
+            for entry in fact[key]]
+        for key in ("run_artifacts", "evaluation_artifacts") if key in fact}}
+
+
+def _target_content_readers(result, source_quest_ref):
+    candidates = result["resource_candidates"]
+    return {**result, "items": [_target_fact_readers(fact, source_quest_ref) for fact in result["items"]],
+        "resource_candidates": {**candidates, **{key: [{**item,
+            "reader": _asset_reader(item["asset_binding"],
+                source_quest_ref=source_quest_ref)} for item in candidates[key]]
+            for key in ("dataset_candidates", "environment_candidates")}}}
+
+
+def _dataset_content_readers(result, source_quest_ref):
+    if "asset_bindings" not in result:
+        return result
+    return {**result, "asset_readers": [_asset_reader(binding,
+        source_ref=result["dataset_version_ref"], source_quest_ref=source_quest_ref)
+        for binding in result["asset_bindings"]]}
 
 
 def _dataset_operations(research_graph, agent_runtime, human_collaboration=None):
@@ -661,13 +694,15 @@ def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *
 
 def _dataset_read(research_graph, agent_runtime, context, arguments, *, page, human_collaboration=None):
     arguments = dict(arguments)
+    source_quest_ref = arguments.pop("source_quest_ref", None)
     try:
-        quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.pop("source_quest_ref", None),
+        quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=source_quest_ref,
             human_collaboration=human_collaboration)
     except OwnerConflict as error:
         raise SemanticMcpError(error.code) from error
     if page:
-        return research_graph.query_datasets(**arguments, quest_ref=quest_ref)
+        result = research_graph.query_datasets(**arguments, quest_ref=quest_ref)
+        return {**result, "items": [_dataset_content_readers(item, source_quest_ref) for item in result["items"]]}
     if len(arguments) != 1:
         raise SemanticMcpError("dataset_read_ref_invalid")
     readers = {"dataset_ref": research_graph.query_dataset,
@@ -676,7 +711,8 @@ def _dataset_read(research_graph, agent_runtime, context, arguments, *, page, hu
                "dataset_derivation_ref": research_graph.query_dataset_derivation}
     field, ref = next(iter(arguments.items()))
     result = readers[field](ref, quest_ref=quest_ref)
-    return {"status": "not_found" if result is None else "accepted", "result": result}
+    return {"status": "not_found" if result is None else "accepted",
+            "result": None if result is None else _dataset_content_readers(result, source_quest_ref)}
 
 
 def _plan_evidence_operations(

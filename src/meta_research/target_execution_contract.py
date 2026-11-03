@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 from meta_research.bundle_protocol import (
     TARGET_METRIC_MAX_DEPTH, TargetMetricValue, valid_target_metric_value,
@@ -76,3 +77,15 @@ def target_execution_skill_text() -> str:
             "角色方法由 Harness 指令维持；交接正式工作时读 references/formal-work.md，"
             "选择数据与保存原件时读 references/data-preservation.md。"
             "Resolve role reference links relative to this source directory.")
+
+
+def target_execution_reading_tools(frozen_input_manifest_path: str | None) -> dict[str, object]:
+    python = str(Path(sys.executable).absolute())
+    return {
+        "project_python": python,
+        "read_frozen_manifest_argv": None if frozen_input_manifest_path is None else [
+            python, "-c", "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())",
+            frozen_input_manifest_path,
+        ],
+        "usage": "Use this absolute project Python entry without relying on PATH. The manifest command reads the exact frozen file as bytes. Pass argv as separate arguments; shell use requires quoting each argument for that shell. Other research environments must be selected from the accepted Environment bindings.",
+    }
