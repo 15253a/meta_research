@@ -1065,6 +1065,13 @@ def build_production_runtime(
     )
     if callable(bind_bundle_conformance):
         bind_bundle_conformance(harnesses)
+    bind_batch_reader = getattr(bundle_skill_provider, "bind_batch_plan_reader", None)
+    if callable(bind_batch_reader):
+        from functools import partial
+        from meta_research.bundle_batch_access import verified_batch_plan_reader
+        bind_batch_reader(partial(verified_batch_plan_reader,
+            advancement_engine=owners.advancement_engine, agent_runtime=owners.agent_runtime,
+            research_graph=owners.research_graph, research_memory=owners.research_memory))
     bind_reasoning_conformance = getattr(
         reasoning_skill_provider, "bind_full_conformance_authority", None
     )

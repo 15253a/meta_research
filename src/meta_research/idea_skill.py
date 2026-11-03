@@ -1151,7 +1151,7 @@ class CodexIdeaSkillAdapter:
         self._human_guidance_authority = authority
 
     def _prepare_stage_guidance(self, *, run_ref, attempt_ref, root_session_ref,
-            fence_ref, runtime_binding_hash, job_ref, operation_name, prompt, resident=True):
+            fence_ref, runtime_binding_hash, job_ref, operation_name, prompt, resident=True, include_body=False):
         authority = self._human_guidance_authority
         if authority is None or self._root_agent_kind not in GUIDANCE_ROOT_KINDS:
             return prompt, None
@@ -1165,7 +1165,7 @@ class CodexIdeaSkillAdapter:
         except Exception as error:
             raise IdeaSkillUnavailable(str(getattr(error, "code", "guidance_preparation_failed"))) from error
         bind_live_guidance(authority, operation.scope, cut.binding)
-        return prompt + guidance_prompt(cut, resident=resident), cut.binding
+        return prompt + guidance_prompt(cut, resident=resident, include_body=include_body), cut.binding
 
     def bind_resident_mcp_authority(
         self, authority: RootResidentMcpAuthority

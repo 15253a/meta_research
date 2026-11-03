@@ -138,7 +138,7 @@ class FrozenGuidanceCut:
         }
 
 
-def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True) -> str:
+def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True, include_body: bool = False) -> str:
     items = [{
         "delivery_ref": item.delivery_ref,
         "constraint_ref": decoded_object(item.guide_json)["constraint_ref"],
@@ -161,6 +161,8 @@ def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True) -> str:
         "局部严格要求不因力度5需要目标演化；整体变化才沿目标演化流程，"
         "收到、读取或反馈不表示目标已切换。HumanRequest 答复仍归原请求根。\n"
     )
-    if not resident:
+    if include_body and resident:
+        rendered += "\n本次授权内的冻结指导原文与既有处理如下。\n" + canonical_json(cut.as_dict())
+    elif not resident:
         rendered += "\n冻结原文如下。工具通道未建立时，不记录收到、读取或反馈事实。\n" + canonical_json(cut.as_dict())
     return rendered

@@ -13,6 +13,7 @@ from meta_research.runtime_binding_compatibility import bundle_bindings_compatib
 from dataclasses import dataclass, replace
 import hashlib
 import hmac
+import os
 from importlib.resources import files
 from pathlib import Path
 import subprocess
@@ -957,6 +958,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         self._resident_mcp_channels: dict[
             tuple[str, str], ResidentMcpChannel
         ] = {}
+        self._batch_plan_reader = None
+
+    def bind_batch_plan_reader(self, reader) -> None:
+        self._batch_plan_reader = reader
 
     def bind_full_conformance_authority(
         self, authority: BundleFullConformanceAuthority
@@ -1038,11 +1043,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         native_session_ref: str | None,
         job_ref: str | None,
         operation_input: dict[str, object] | None = None,
+        inline_guidance: bool = False,
     ) -> tuple[dict[str, object], str | None, str]:
         prompt, guidance_binding = self._prepare_stage_guidance(
             run_ref=run_ref, attempt_ref=attempt_ref, root_session_ref=root_session_ref,
             fence_ref=fence_ref, runtime_binding_hash=canonical_hash(runtime_binding.as_dict()),
             job_ref=job_ref, operation_name=operation_name, prompt=prompt,
+            include_body=inline_guidance,
         )
         authority = self._full_conformance_authority
         base_url = self._resident_mcp_base_url
@@ -1230,6 +1237,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                     "dispatch_recovery_source_hash": _file_sha256(
                         Path(__file__).with_name("bundle_dispatch_recovery.py")
                     ),
+                    "batch_view_source_hash": _file_sha256(Path(__file__).with_name("bundle_batch_view.py")),
+                    "batch_access_source_hash": _file_sha256(Path(__file__).with_name("bundle_batch_access.py")),
                 }
             ),
             model_ref=self._model_ref,
@@ -1263,6 +1272,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 + _file_sha256(Path(__file__).with_name("bundle_dispatch_recovery.py")),
                 "adapter-source:meta_research.bundle_skill@sha256:"
                 f"{adapter_source_hash}",
+                "adapter-source:meta_research.bundle_batch_view@sha256:"
+                + _file_sha256(Path(__file__).with_name("bundle_batch_view.py")),
+                "adapter-source:meta_research.bundle_batch_access@sha256:"
+                + _file_sha256(Path(__file__).with_name("bundle_batch_access.py")),
                 "adapter-source:meta_research.idea_skill@sha256:"
                 f"{shared_adapter_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
@@ -1639,9 +1652,24 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "kind": "bundle_target_batch", "identity": _rolling_operation_identity(request),
             "request": prompt_context,
         }
-        reading_context = {name: value for name, value in prompt_context.items()
-            if name not in {"run_ref", "attempt_ref", "fence_ref", "root_session_ref",
-                            "runtime_binding_hash", "provider_feedback"}}
+        from meta_research.bundle_batch_view import render_batch_reading_context
+        from meta_research.semantic_mcp import SemanticMcpError
+
+        operation_name = f"target-batch-{request.base_generation + 1}"
+        sealed = request.job_ref is not None and (
+            self._workspace / "provider-operations" / canonical_hash({"job_ref": request.job_ref})
+            / operation_name / "invocation.json").exists()
+        reader = None
+        if (not sealed and request.native_session_ref and request.target_commits
+                and request.native_replacement_context is None and not request.provider_feedback
+                and self._batch_plan_reader is not None):
+            try:
+                reader = self._batch_plan_reader(request)
+            except SemanticMcpError as error:
+                raise BundleSkillUnavailable(str(error)) from error
+        reading_context = render_batch_reading_context(request, prompt_context,
+            verified_plan_reader=reader if os.environ.get("META_RESEARCH_BUNDLE_BATCH_VIEW", "plan-reference-v1")
+                == "plan-reference-v1" else None)
         prompt = (
             _rolling_position_prompt(request) +
             stage_replacement_prompt(request) +
@@ -1672,6 +1700,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 native_session_ref=request.native_session_ref,
                 job_ref=request.job_ref,
                 operation_input=operation_input,
+                inline_guidance="formal_plan_reader" in reading_context,
             )
         except BundleSkillUnavailable as error:
             if error.code in {
