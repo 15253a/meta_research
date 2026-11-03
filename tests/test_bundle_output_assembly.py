@@ -78,17 +78,19 @@ def test_strategy_assembly_cannot_select_unknown_experiment_or_rewrite_semantics
         assemble_strategy_update(update, plan)
 
 
-def test_output_rollback_only_changes_new_schema_and_preserves_sealed_compact_call(tmp_path, monkeypatch):
+@pytest.mark.parametrize("initial_mode,next_mode", [("compact", "full"), ("full", "compact")])
+def test_output_rollback_only_changes_new_schema_and_preserves_sealed_call(tmp_path, monkeypatch, initial_mode, next_mode):
     import json
     from dataclasses import replace
     from test_bundle_input_drift_recovery import _adapter, _request, _output
+    monkeypatch.setenv("META_RESEARCH_BUNDLE_OUTPUT_MODE", initial_mode)
     adapter, runner = _adapter(tmp_path, _output("batch"), durable=True)
     request = _request(adapter, "batch")
     binding = adapter.runtime_binding()
     adapter.propose_target_batch(request)
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
     saved = {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()}
-    monkeypatch.setenv("META_RESEARCH_BUNDLE_OUTPUT_MODE", "full")
+    monkeypatch.setenv("META_RESEARCH_BUNDLE_OUTPUT_MODE", next_mode)
     assert adapter.runtime_binding() == binding
     adapter.propose_target_batch(request)
     assert len(runner.calls) == 1
@@ -96,12 +98,14 @@ def test_output_rollback_only_changes_new_schema_and_preserves_sealed_compact_ca
     adapter.propose_target_batch(replace(request, job_ref="new-full-output-operation"))
     assert len(runner.calls) == 2
     schema = runner.calls[-1][2]
-    assert "semantic_inputs" in schema["properties"]["strategy_update"]["properties"]["candidates"]["items"]["properties"]
+    assert ("semantic_inputs" in schema["properties"]["strategy_update"]["properties"]["candidates"]["items"]["properties"]) == (next_mode == "full")
 
 
-def test_output_rollback_reconciles_unknown_compact_operation_without_dispatch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("initial_mode,next_mode", [("compact", "full"), ("full", "compact")])
+def test_output_rollback_reconciles_unknown_operation_without_dispatch(tmp_path, monkeypatch, initial_mode, next_mode):
     from meta_research.idea_skill import IdeaSkillUnavailable
     from test_bundle_input_drift_recovery import _adapter, _request, _output
+    monkeypatch.setenv("META_RESEARCH_BUNDLE_OUTPUT_MODE", initial_mode)
     adapter, runner = _adapter(tmp_path, _output("batch"), durable=True)
     request = _request(adapter, "batch")
     adapter.propose_target_batch(request)
@@ -109,7 +113,7 @@ def test_output_rollback_reconciles_unknown_compact_operation_without_dispatch(t
     for name in ("exit.json", "completed.json", "supervisor-exit.json"):
         (operation / name).unlink(missing_ok=True)
     saved = {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()}
-    monkeypatch.setenv("META_RESEARCH_BUNDLE_OUTPUT_MODE", "full")
+    monkeypatch.setenv("META_RESEARCH_BUNDLE_OUTPUT_MODE", next_mode)
     with pytest.raises(IdeaSkillUnavailable, match="codex_operation_reconciliation_pending"):
         adapter.propose_target_batch(request)
     assert len(runner.calls) == 1
