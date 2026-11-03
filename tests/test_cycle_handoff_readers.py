@@ -1,5 +1,7 @@
 """Exercise discoverable exact readers against retained Owner content."""
 import os
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -142,7 +144,11 @@ def test_absolute_project_python_reads_frozen_manifest_without_path(tmp_path):
     path = tmp_path / "frozen manifest.json"
     original = '{"evidence":"原行", "missing":null}\n'.encode()
     path.write_bytes(original)
-    tools = target_execution_reading_tools(str(path))
+    (tmp_path / "inputs").mkdir()
+    pointer = {"schema_ref": "meta-research/target-root-input-pointer/v1",
+        "read_only_manifest_path": str(path), "manifest_sha256": hashlib.sha256(original).hexdigest()}
+    (tmp_path / "inputs/manifest.json").write_text(json.dumps(pointer))
+    tools = target_execution_reading_tools(tmp_path)
     assert Path(tools["project_python"]).is_absolute()
     env = {**os.environ, "PATH": ""}
     with pytest.raises(FileNotFoundError):
@@ -152,3 +158,7 @@ def test_absolute_project_python_reads_frozen_manifest_without_path(tmp_path):
         assert missing.returncode == 127
     result = subprocess.run(tools["read_frozen_manifest_argv"], env=env, capture_output=True, check=True)
     assert result.stdout == original
+    path.write_bytes(b"changed")
+    rejected = subprocess.run(tools["read_frozen_manifest_argv"], env=env, capture_output=True)
+    assert rejected.returncode != 0 and rejected.stdout == b""
+    assert b"frozen manifest hash mismatch" in rejected.stderr

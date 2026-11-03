@@ -2132,6 +2132,10 @@ class HarnessRuntime:
         external_snapshot = None
         if isinstance(request, TargetHarnessRequest) and self._external_mcp is not None:
             try:
+                # These hints belong to a new operation's durable prompt snapshot.
+                from meta_research.target_execution_contract import target_execution_reading_prompt
+                if working_directory is not None:
+                    prompt = target_execution_reading_prompt(prompt, working_directory)
                 external_snapshot = self._external_mcp.operation_snapshot(operation_identity=operation_ref,
                     root_kind="target", task_prompt=prompt)
                 prompt = compose_external_mcp_prompt(prompt, external_snapshot)

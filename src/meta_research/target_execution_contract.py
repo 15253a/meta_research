@@ -79,13 +79,26 @@ def target_execution_skill_text() -> str:
             "Resolve role reference links relative to this source directory.")
 
 
-def target_execution_reading_tools(frozen_input_manifest_path: str | None) -> dict[str, object]:
+def target_execution_reading_tools(workspace_directory: Path) -> dict[str, object]:
     python = str(Path(sys.executable).absolute())
+    read_manifest = (
+        "import hashlib,json,pathlib,sys\n"
+        "p=json.loads(pathlib.Path(sys.argv[1]).read_bytes())\n"
+        "m=pathlib.Path(p['read_only_manifest_path'])\n"
+        "if p.get('schema_ref') != 'meta-research/target-root-input-pointer/v1' or not m.is_absolute(): raise ValueError('invalid frozen manifest pointer')\n"
+        "b=m.read_bytes()\n"
+        "if hashlib.sha256(b).hexdigest() != p['manifest_sha256']: raise ValueError('frozen manifest hash mismatch')\n"
+        "sys.stdout.buffer.write(b)"
+    )
     return {
         "project_python": python,
-        "read_frozen_manifest_argv": None if frozen_input_manifest_path is None else [
-            python, "-c", "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())",
-            frozen_input_manifest_path,
-        ],
-        "usage": "Use this absolute project Python entry without relying on PATH. The manifest command reads the exact frozen file as bytes. Pass argv as separate arguments; shell use requires quoting each argument for that shell. Other research environments must be selected from the accepted Environment bindings.",
+        "read_frozen_manifest_argv": [python, "-c", read_manifest, str(workspace_directory / "inputs" / "manifest.json")],
+        "usage": "Use this absolute project Python entry without relying on PATH. The manifest command follows inputs/manifest.json and verifies the frozen manifest hash before returning its original bytes. Pass argv as separate arguments; shell use requires quoting each argument for that shell. Other research environments must be selected from the accepted Environment bindings.",
     }
+
+
+def target_execution_reading_prompt(prompt: str, workspace_directory: Path) -> str:
+    if not (workspace_directory / "inputs" / "manifest.json").is_file():
+        return prompt
+    from meta_research.owners.common import canonical_json
+    return "Execution reading tools:\n" + canonical_json(target_execution_reading_tools(workspace_directory)) + "\n" + prompt

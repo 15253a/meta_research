@@ -72,10 +72,7 @@ def test_notes_free_real_admitted_launch_reaches_bound_target_root_prompt(
 
         prompt = captured[0][1]["prompt"]
         material = json.loads(prompt.split("Exact Owner context:\n", 1)[1])
-        import sys
-        from pathlib import Path
-        assert material["execution_reading_tools"]["project_python"] == str(Path(sys.executable).absolute())
-        assert material["execution_reading_tools"]["read_frozen_manifest_argv"][-1] == material["frozen_input_manifest_path"]
+        assert "execution_reading_tools" not in material
         research = material["research_context"]
         position = json.loads(prompt.splitlines()[0].removeprefix("cycle_position="))
         handle = runtime.target_run_authorities.agent_runtime.query_current_target_work_handle(target.target_ref)

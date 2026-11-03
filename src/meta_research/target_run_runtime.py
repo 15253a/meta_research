@@ -25,7 +25,7 @@ from meta_research.bundle_protocol import (
     projection_plain_value,
 )
 from meta_research.target_execution_contract import (
-    target_execution_context, target_execution_skill_text, target_execution_reading_tools,
+    target_execution_context, target_execution_skill_text,
 )
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
 from meta_research.resource_preparation import resource_preparation
@@ -743,7 +743,6 @@ class TargetRunRuntime:
                 proof.asset_ref for proof in handle.accepted_input_asset_proofs
             ],
             "frozen_input_manifest_path": frozen_input_manifest_path,
-            "execution_reading_tools": target_execution_reading_tools(frozen_input_manifest_path),
             "owner_revision_request": revision_request,
             "completion_binding": {
                 "owner": "system",
