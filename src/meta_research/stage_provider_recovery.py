@@ -45,7 +45,7 @@ class StoppedStageProviderRecovery:
             # Missing, stale, or unverified evidence cannot authorize a fence.
             return None
 
-    def read_for_operator_resume(self, run_ref: str) -> dict[str, object] | None:
+    def read_for_operator_resume(self, run_ref: str, pending_phase: str) -> dict[str, object] | None:
         """Verify the exact stopped transport before replacing a paused call."""
         try:
             scope = self._reader._validated_scope(
@@ -57,7 +57,7 @@ class StoppedStageProviderRecovery:
                 ("plan_stage", "plan_primary"): "primary",
                 ("plan_stage", "plan_review"): "review",
             }.get((scope["run_kind"], scope["unit_kind"]))
-            if scope["status"] != "completed" or expected_phase is None:
+            if scope["status"] != "completed" or expected_phase is None or expected_phase != pending_phase:
                 return None
             operation = self._reader._resolve_operation(scope)
             if operation is None:

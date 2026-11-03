@@ -6339,7 +6339,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._feed = feed
         self._host_compute_probe = host_compute_probe
         self._runtime_protection = runtime_protection
-        self._operator_stop_reader: Callable[[str], dict[str, object] | None] | None = None
+        self._operator_stop_reader: Callable[[str, str], dict[str, object] | None] | None = None
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
         self._formal_plan_verifier = formal_plan_verifier
@@ -6398,7 +6398,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
 
 
     def bind_operator_stop_reader(
-        self, reader: Callable[[str], dict[str, object] | None]
+        self, reader: Callable[[str, str], dict[str, object] | None]
     ) -> None:
         self._operator_stop_reader = reader
 
@@ -6421,7 +6421,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 raise OwnerConflict("operator_stop_checkpoint_invalid")
             if (run.primary_draft is not None and not is_plan) or run.execution is not None:
                 continue
-            checkpoint = self._operator_stop_reader(row["run_ref"])
+            phase = "primary" if run.primary_draft is None else "review"
+            checkpoint = self._operator_stop_reader(row["run_ref"], phase)
             if checkpoint is not None:
                 checkpoints[row["run_ref"]] = checkpoint
         return checkpoints

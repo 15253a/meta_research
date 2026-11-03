@@ -171,6 +171,30 @@ def test_pause_before_any_plan_call_keeps_the_prepared_primary(tmp_path):
         runtime.close()
 
 
+def test_saved_plan_draft_needs_no_primary_spool_to_resume_before_review(tmp_path):
+    runtime = _runtime(tmp_path / 'data', idea_skill=_DeterministicIdeaSkill(),
+                       plan_skill=_DeterministicPlanSkill(no_gap=False))
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        for _ in range(3):
+            assert runtime.plan_stage.process_once()
+        request = runtime.plan_stage.query_current()['stage_run_request']['request_ref']
+        owner = runtime.owners.agent_runtime
+        before = owner.query_plan_stage_run(request)
+        assert before.primary_draft is not None
+        _control(runtime, before, 'pause')
+        assert _control(runtime, before, 'resume')['executed']
+        after = owner.query_plan_stage_run(request)
+        assert after.primary_draft == before.primary_draft
+        assert (after.attempt_ref, after.fence_ref) == (before.attempt_ref, before.fence_ref)
+        assert after.native_session_ref == before.native_session_ref
+        assert runtime.plan_stage.process_once()
+        assert owner.query_plan_stage_run(request).execution is not None
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize('tamper', [False, True], ids=['resume-review-only', 'reject-tampered-stop'])
 def test_paused_plan_review_preserves_primary_and_replaces_stopped_operation(tmp_path, tamper):
     """Pause the fixture's optional work; never repeat its accepted primary."""

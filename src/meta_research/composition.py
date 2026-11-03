@@ -888,7 +888,8 @@ def build_production_runtime(
         data_root.root,
         scope_lookup=owners.agent_runtime.query_stage_root_observation_scope,
     )
-    if (isinstance(reasoning_skill_provider, CodexReasoningSkillAdapter)
+    if (isinstance(plan_skill_provider, CodexPlanSkillAdapter)
+            or isinstance(reasoning_skill_provider, CodexReasoningSkillAdapter)
             or isinstance(bundle_skill_provider, CodexBundleSkillAdapter)):
         agent_runtime.bind_operator_stop_reader(
             StoppedStageProviderRecovery(stage_root_observations).read_for_operator_resume
