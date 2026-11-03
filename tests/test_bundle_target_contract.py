@@ -278,22 +278,8 @@ def _measurement_contract(
     }
 
 
-def _candidate(
-    contract,
-    label: str,
-    cell: str,
-    *,
-    experiment_keys: tuple[str, ...] = ("experiment-a",),
-    held_revision: str = "implementation-shared",
-    depends_on: tuple[str, ...] = (),
-    tier: str = "self-implementation",
-) -> dict[str, object]:
+def _retired_reuse_trace(label: str, tier: str) -> dict[str, object]:
     implementation_ref = f"implementation-{label}"
-    contract_doc = normalized_completion_contract_to_dict(contract)
-    semantics_by_key = {
-        row["brief"]["experiment_key"]: row["semantic_inputs"]
-        for row in contract_doc["experiments"]
-    }
     decisions: list[dict[str, object]] = []
     tier_index = (
         "accepted-local",
@@ -326,6 +312,27 @@ def _candidate(
         }
     )
     return {
+        "tier_decisions": decisions,
+        "greenfield_exception": "simple-implementation" if tier == "self-implementation" else None,
+    }
+
+
+def _candidate(
+    contract,
+    label: str,
+    cell: str,
+    *,
+    experiment_keys: tuple[str, ...] = ("experiment-a",),
+    held_revision: str = "implementation-shared",
+    depends_on: tuple[str, ...] = (),
+) -> dict[str, object]:
+    implementation_ref = f"implementation-{label}"
+    contract_doc = normalized_completion_contract_to_dict(contract)
+    semantics_by_key = {
+        row["brief"]["experiment_key"]: row["semantic_inputs"]
+        for row in contract_doc["experiments"]
+    }
+    return {
         "schema_ref": FORMAL_TARGET_CANDIDATE_SCHEMA_REF,
         "candidate": {
             "local_label": label,
@@ -339,14 +346,6 @@ def _candidate(
             ],
             "implementation_revision_ref": implementation_ref,
             "code_changed": False,
-            "reuse_trace": {
-                "tier_decisions": decisions,
-                "greenfield_exception": (
-                    "simple-implementation"
-                    if tier == "self-implementation"
-                    else None
-                ),
-            },
             "routes": [
                 {
                     "route_ref": f"route-{label}",
@@ -398,7 +397,6 @@ def test_measurement_wrapper_does_not_extend_fixed_prototype_records() -> None:
         "held_fixed_bindings",
         "implementation_revision_ref",
         "code_changed",
-        "reuse_trace",
         "routes",
         "depends_on_labels",
         "direct_accepted_input_asset_refs",
@@ -471,9 +469,8 @@ def test_full_candidate_round_trip_uses_canonical_prototype_records() -> None:
     )
 
     assert candidate.candidate.measurement_unit_keys == ("cell-a",)
-    assert candidate.candidate.reuse_trace.tier_decisions[-1].tier == (
-        "self-implementation"
-    )
+    assert candidate.candidate.implementation_revision_ref == "implementation-target-a"
+    assert candidate.candidate.direct_accepted_input_asset_refs == ("asset-target-a",)
     assert candidate.measurement_contract.protocol_version.required_metric_keys == (
         "metric:zeta",
         "metric:alpha",
@@ -715,46 +712,27 @@ def test_candidate_rejects_multi_cell_unknown_dependency_and_semantic_drift() ->
         )
 
 
-@pytest.mark.parametrize(
-    ("field", "expected"),
-    [
-        ("exact_version_ref", "reuse version"),
-        ("license_ref", "mature external license"),
-        ("content_hash_ref", "mature external source content hash"),
-        ("patch_ref", "mature external patch"),
-    ],
-)
-def test_external_reuse_requires_version_license_content_and_patch(
-    field: str, expected: str
-) -> None:
+@pytest.mark.parametrize("field", [
+    "exact_version_ref", "license_ref", "content_hash_ref", "patch_ref",
+])
+def test_formal_candidate_rejects_retired_external_reuse_claims(field: str) -> None:
     _, contract = _contract()
-    document = _candidate(
-        contract, "external", "cell-a", tier="mature-external"
-    )
-    selected = document["candidate"]["reuse_trace"]["tier_decisions"][-1]
-    selected["source_proofs"][0][field] = None if field != "exact_version_ref" else ""
-    with pytest.raises(BundleTargetContractError, match=expected):
+    document = _candidate(contract, "external", "cell-a")
+    trace = _retired_reuse_trace("external", "mature-external")
+    trace["tier_decisions"][-1]["source_proofs"][0][field] = None
+    document["candidate"]["reuse_trace"] = trace
+    with pytest.raises(BundleTargetContractError, match="^target_candidate_invalid$"):
         formal_target_candidate_from_dict(document, completion_contract=contract)
 
 
-def test_owner_tier_reuse_requires_eligibility_and_trace_cannot_be_empty() -> None:
+def test_retired_owner_and_empty_reuse_traces_cannot_enter_formal_candidates() -> None:
     _, contract = _contract()
-    owner_source = _candidate(
-        contract, "owner-source", "cell-a", tier="accepted-local"
-    )
-    source = owner_source["candidate"]["reuse_trace"]["tier_decisions"][0][
-        "source_proofs"
-    ][0]
-    source["eligibility_receipt"] = None
-    with pytest.raises(BundleTargetContractError, match="eligibility_missing"):
-        formal_target_candidate_from_dict(
-            owner_source, completion_contract=contract
-        )
-
-    no_trace = _candidate(contract, "no-trace", "cell-a")
-    no_trace["candidate"]["reuse_trace"]["tier_decisions"] = []
-    with pytest.raises(BundleTargetContractError, match="reuse_trace_missing"):
-        formal_target_candidate_from_dict(no_trace, completion_contract=contract)
+    for trace in (_retired_reuse_trace("owner-source", "accepted-local"),
+                  {"tier_decisions": []}):
+        document = _candidate(contract, "owner-source", "cell-a")
+        document["candidate"]["reuse_trace"] = trace
+        with pytest.raises(BundleTargetContractError, match="^target_candidate_invalid$"):
+            formal_target_candidate_from_dict(document, completion_contract=contract)
 
 
 def test_rolling_initial_append_and_empty_seal_cover_exact_cells() -> None:
