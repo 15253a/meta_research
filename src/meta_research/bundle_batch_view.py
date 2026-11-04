@@ -50,7 +50,7 @@ def _brief_plan_bindings(plan, completion):
                 or semantics.get(key) != {name: brief[name] for name in _SEMANTIC_FIELDS}):
             return None
         seen.add(key)
-        bindings.append({name: deepcopy(value) for name, value in brief.items()
+        bindings.append({name: value for name, value in brief.items()
                          if name == "experiment_key" or name not in _SEMANTIC_FIELDS})
     return bindings if seen == set(semantics) else None
 
@@ -93,8 +93,7 @@ def render_batch_reading_context(request, prompt_context, *, verified_plan_reade
     brief_bindings = _brief_plan_bindings(request.plan_document, completion)
     if brief_bindings is None:
         return legacy
-    view = deepcopy(legacy)
-    del view["formal_plan"]
+    view = deepcopy({name: value for name, value in legacy.items() if name != "formal_plan"})
     view["formal_plan_reader"] = {
         "semantic_operation_id": reader["operation"],
         "arguments": deepcopy(reader["arguments"]),
@@ -106,7 +105,7 @@ def render_batch_reading_context(request, prompt_context, *, verified_plan_reade
         key: deepcopy(value) for key, value in request.plan_document.items()
         if key not in _REFERENCED_PLAN_FIELDS
     }
-    view["plan_responsibilities"]["brief_plan_bindings"] = brief_bindings
+    view["plan_responsibilities"]["brief_plan_bindings"] = deepcopy(brief_bindings)
     view["completion_contract"] = deepcopy(completion)
     view["cycle_position"] = deepcopy(request.cycle_position)
     return view
@@ -144,12 +143,13 @@ def _plan_verified(request, prompt_context, verified_plan_reader):
 
 
 def _exact_source(reader, request, source, source_ref, document, *, path=(), selected=None):
+    document_hash = canonical_hash(document)
     expected = {"context_pack_ref": request.context_pack_ref, "source": source,
-        "source_ref": source_ref, "version_ref": canonical_hash(document),
+        "source_ref": source_ref, "version_ref": document_hash,
         "path": list(path), "offset": 0, "limit": _LIMIT}
     return (isinstance(reader, dict) and reader.get("semantic_operation_id") == _READ_OP
             and reader.get("arguments") == expected
-            and reader.get("content_hash") == canonical_hash(document if selected is None else selected))
+            and reader.get("content_hash") == (document_hash if selected is None else canonical_hash(selected)))
 
 
 def partition_batch_records(records, baseline_records, readers, *, key):
@@ -190,21 +190,23 @@ def partition_batch_records(records, baseline_records, readers, *, key):
 
 def render_delta_batch_reading_context(request, prompt_context, *, verified_plan_reader=None,
                                        verified_source_readers=None, verified_delivery_baseline=None):
-    view = deepcopy(_legacy_view(prompt_context))
+    legacy = _legacy_view(prompt_context)
     plan_verified = _plan_verified(request, prompt_context, verified_plan_reader)
     if (not request.native_session_ref or request.native_replacement_context is not None
             or request.provider_feedback is not None
             or (not plan_verified and not verified_source_readers)):
-        return view
+        return deepcopy(legacy)
     completion = request.initial_target_plan.get("completion_contract")
     if not isinstance(completion, dict) or _brief_plan_bindings(request.plan_document, completion) is None:
-        return view
-    view.pop("cycle_position", None)
+        return deepcopy(legacy)
+    omitted = {"cycle_position", "current_targets", "target_commits"}
+    if plan_verified:
+        omitted.add("formal_plan")
+    view = deepcopy({name: value for name, value in legacy.items() if name not in omitted})
     readers = verified_source_readers or {}
     completion_reader = readers.get("completion_contract")
     retained = []
     if plan_verified:
-        del view["formal_plan"]
         view["formal_plan_reader"] = {
             "semantic_operation_id": _READ_OP, "arguments": deepcopy(verified_plan_reader["arguments"]),
             "content_hash": verified_plan_reader["plan_hash"], "formal_plan_ref": request.formal_plan_ref,
@@ -225,19 +227,22 @@ def render_delta_batch_reading_context(request, prompt_context, *, verified_plan
     view["delivery_basis"] = (None if baseline is None else
         {key: deepcopy(baseline[key]) for key in ("operation_name", "invocation_hash", "prompt_hash", "base_generation")})
     indexes = {}
+    commit_refs = {}
+    for commit in request.target_commits:
+        commit_refs.setdefault(commit["target_ref"], []).append(commit["commit_ref"])
     for field, key, source in (("current_targets", "target_ref", "bundle_target"),
                                 ("target_commits", "commit_ref", "bundle_target_commit")):
         previous = None if baseline is None else baseline[field]
-        current = view[field]
+        current = legacy[field]
         exact_readers = {item[key]: readers.get(field, {}).get(item[key]) for item in current
             if _exact_source(readers.get(field, {}).get(item[key]), request, source, item[key], item)}
         shown, index, exceptions = partition_batch_records(current, previous, exact_readers, key=key)
         retained.extend({"field": field, **item} for item in exceptions)
         current_refs = {item[key] for item in current}
-        shown_hashes = {canonical_hash(item) for item in shown}
+        shown_refs = {item[key] for item in shown}
         for item, entry in zip(current, index):
             ref = item[key]
-            if canonical_hash(item) in shown_hashes:
+            if ref in shown_refs:
                 entry["body_reason"] = "no_verified_delivery_basis" if baseline is None else "new_or_changed_or_reader_unavailable"
                 if baseline is None:
                     retained.append({"field": field, key: ref, "reason": "no_verified_delivery_basis"})
@@ -246,12 +251,11 @@ def render_delta_batch_reading_context(request, prompt_context, *, verified_plan
                 entry.update({name: deepcopy(candidate[name]) for name in (
                     "local_label", "experiment_keys", "measurement_unit_keys", "held_fixed_bindings") if name in candidate})
                 entry["dependency_refs"] = deepcopy(item.get("dependency_refs", []))
-                entry["accepted_commit_refs"] = [commit["commit_ref"] for commit in request.target_commits
-                                                  if commit["target_ref"] == ref]
+                entry["accepted_commit_refs"] = list(commit_refs.get(ref, ()))
             else:
                 entry["target_ref"] = item["target_ref"]
                 if "result_disposition" in item:
-                    entry["result_disposition"] = item["result_disposition"]
+                    entry["result_disposition"] = deepcopy(item["result_disposition"])
         view[field] = shown
         indexes[field] = index
         if baseline is not None:

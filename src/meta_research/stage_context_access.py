@@ -37,7 +37,7 @@ def _bundle_source(research_graph, request, context, arguments):
         if target is not None:
             value = target_projection(target)
     elif source == 'bundle_target_commit':
-        commit = next((item for item in research_graph.query_target_commits(graph.graph_ref)
+        commit = next((item for item in research_graph.query_target_commits(graph.graph_ref, commit_ref=source_ref)
                        if item.commit_ref == source_ref), None)
         if commit is not None:
             transition = research_graph.query_target_frontier_commit_transition(commit.target_ref)

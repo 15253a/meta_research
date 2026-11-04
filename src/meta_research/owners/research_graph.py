@@ -2017,7 +2017,9 @@ class ResearchGraphInterface(ResearchLiteratureOwnerInterface, ResearchEnvironme
         idempotency_key: str,
     ) -> TargetRootGraphAcceptance: ...
 
-    def query_target_commits(self, graph_ref: str) -> tuple[TargetCommit, ...]: ...
+    def query_target_commits(
+        self, graph_ref: str, *, commit_ref: str | None = None
+    ) -> tuple[TargetCommit, ...]: ...
 
     def query_target_commits_for_quest(
         self, quest_ref: str, *, target_commit_refs: tuple[str, ...] | None = None
@@ -16366,15 +16368,22 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
 
         raise OwnerConflict("target_generic_measurement_shadow_write_forbidden")
 
-    def query_target_commits(self, graph_ref: str) -> tuple[TargetCommit, ...]:
+    def query_target_commits(
+        self, graph_ref: str, *, commit_ref: str | None = None
+    ) -> tuple[TargetCommit, ...]:
+        parameters = {"graph_ref": graph_ref}
+        selected = ""
+        if commit_ref is not None:
+            parameters["commit_ref"] = commit_ref
+            selected = "AND c.commit_ref = :commit_ref "
         with self._database.read() as connection:
             rows = connection.execute(
                 text(
                     "SELECT c.* FROM rg_target_commits c JOIN rg_targets t ON "
                     "t.target_ref = c.target_ref WHERE t.graph_ref = :graph_ref "
-                    "ORDER BY t.ordinal"
+                    + selected + "ORDER BY t.ordinal"
                 ),
-                {"graph_ref": graph_ref},
+                parameters,
             ).fetchall()
         return tuple(_target_commit(row) for row in rows)
 

@@ -55,9 +55,10 @@ def verified_batch_source_readers(request, *, advancement_engine, agent_runtime,
         capability_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
     )
     def prove(source, source_ref, document, *, path=(), version_document=None):
+        content_hash = canonical_hash(document)
         arguments = {"context_pack_ref": request.context_pack_ref, "source": source,
                      "source_ref": source_ref,
-                     "version_ref": canonical_hash(document if version_document is None else version_document),
+                     "version_ref": content_hash if version_document is None else canonical_hash(version_document),
                      "path": list(path), "offset": 0, "limit": 16384}
         try:
             page = read_stage_context(advancement_engine, agent_runtime, research_graph,
@@ -67,10 +68,10 @@ def verified_batch_source_readers(request, *, advancement_engine, agent_runtime,
                 return None
             raise
         if (page["context_pack_hash"] != request.context_pack_hash
-                or page["content_hash"] != canonical_hash(document)):
+                or page["content_hash"] != content_hash):
             raise SemanticMcpError("bundle_batch_source_binding_stale")
         return {"semantic_operation_id": "research_memory.stage_context.read",
-                "arguments": arguments, "content_hash": canonical_hash(document)}
+                "arguments": arguments, "content_hash": content_hash}
 
     result = {
         "completion_contract": prove("bundle_initial_target_plan", request.graph_ref,

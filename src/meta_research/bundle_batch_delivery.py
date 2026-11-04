@@ -32,6 +32,11 @@ def verified_batch_delivery_baseline(adapter, request, *, verified_proposals=(),
     delivered = {"current_targets": set(), "target_commits": set()}
     latest = None
     operations = []
+    identity = _rolling_operation_identity(request)
+    initial_plan_hash = canonical_hash(request.initial_target_plan)
+    proposals_by_generation = {}
+    for proposal in verified_proposals:
+        proposals_by_generation.setdefault(proposal.base_generation, []).append(proposal)
     for generation, operation in sorted(candidates):
         invocation = _read_sealed_operation_invocation(operation / "invocation.json", key=key)
         digest = canonical_hash(invocation)
@@ -39,7 +44,7 @@ def verified_batch_delivery_baseline(adapter, request, *, verified_proposals=(),
         body = _read_operation_business_input(operation, invocation, limits)
         fields = body.get("request", {})
         if (body.get("kind") != "bundle_target_batch"
-                or body.get("identity") != _rolling_operation_identity(request)
+                or body.get("identity") != identity
                 or invocation.get("job_ref") != request.job_ref
                 or invocation.get("operation_name") != operation.name
                 or invocation.get("native_session_ref") != request.native_session_ref
@@ -48,7 +53,7 @@ def verified_batch_delivery_baseline(adapter, request, *, verified_proposals=(),
                 or fields.get("context_pack_ref") != request.context_pack_ref
                 or fields.get("context_pack_hash") != request.context_pack_hash
                 or fields.get("formal_plan") != request.plan_document
-                or fields.get("initial_target_plan_hash") != canonical_hash(request.initial_target_plan)):
+                or fields.get("initial_target_plan_hash") != initial_plan_hash):
             raise IdeaSkillUnavailable("codex_operation_identity_conflict")
         output, _, _ = _read_completed_operation(operation, invocation_hash=digest,
                                                 native_session_ref=request.native_session_ref,
@@ -62,9 +67,8 @@ def verified_batch_delivery_baseline(adapter, request, *, verified_proposals=(),
                                                   request.job_ref, operation.name)
         output = _decode_codex_provider_output(_unwrap_codex_root_output(output, schema), schema)
         strategy = assemble_strategy_update(output.get("strategy_update"), request.plan_document)
-        matching = [proposal for proposal in verified_proposals
-                    if proposal.base_generation == fields["base_generation"]
-                    and proposal.base_head_receipt.as_public_dict() == fields["base_head_receipt"]
+        matching = [proposal for proposal in proposals_by_generation.get(fields["base_generation"], ())
+                    if proposal.base_head_receipt.as_public_dict() == fields["base_head_receipt"]
                     and (verified_proposal_checkpoints or {}).get(proposal.proposal_ref) == fields["inbox_checkpoint"]
                     and proposal.strategy_update == strategy]
         if not matching:

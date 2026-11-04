@@ -3322,7 +3322,7 @@ def _read_operation_business_input(
         text = _read_spool_text(directory / "business-input.json", transport_limits.prompt_max_bytes)
         body = json.loads(text)
         if (not isinstance(body, dict) or canonical_json(body) != text
-                or canonical_hash(body) != invocation.get("operation_input_hash")):
+                or hashlib.sha256(text.encode("utf-8")).hexdigest() != invocation.get("operation_input_hash")):
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
         return body
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -3375,11 +3375,11 @@ def _verified_operation_inputs(
         or canonical_hash(envelope["payload"]) != invocation_hash
         or invocation.get("schema_ref")
         != _CODEX_PROVIDER_OPERATION_SCHEMA
-        or invocation.get("prompt_hash") != canonical_hash(prompt)
-        or invocation.get("output_schema_hash") != canonical_hash(schema)
+        or invocation.get("prompt_hash") != (prompt_hash := canonical_hash(prompt))
+        or invocation.get("output_schema_hash") != (schema_hash := canonical_hash(schema))
     ):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
-    return canonical_hash(prompt), canonical_hash(schema), transport_limits
+    return prompt_hash, schema_hash, transport_limits
 
 
 def _verified_native_session(stdout: str, *, expected: str | None) -> str:
