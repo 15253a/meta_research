@@ -214,10 +214,16 @@
   .research-timeline-panel .research-timeline-question-details > summary > .research-timeline-badge { max-width: 88px; white-space: normal; }
   .research-timeline-panel .research-timeline-cycle-details > summary,
   .research-timeline-panel .research-timeline-stage-open,
-  .research-timeline-panel .research-timeline-target-open { grid-template-columns: auto minmax(0, 1fr); gap: 0 5px; }
-  .research-timeline-panel .research-timeline-cycle-details > summary > .research-timeline-badge { grid-column: 2; grid-row: 2; justify-self: start; }
+  .research-timeline-panel .research-timeline-target-open { grid-template-columns: minmax(0, 1fr) auto; gap: 3px 5px; }
+  .research-timeline-panel .research-timeline-cycle-name,
+  .research-timeline-panel .research-timeline-stage-head,
+  .research-timeline-panel .research-timeline-target-open > b { grid-column: 1; grid-row: 1; }
+  .research-timeline-panel .research-timeline-cycle-meta,
+  .research-timeline-panel .research-timeline-stage-summary,
+  .research-timeline-panel .research-timeline-target-summary { grid-column: 1 / -1; grid-row: 2; }
+  .research-timeline-panel .research-timeline-cycle-details > summary > .research-timeline-badge { grid-column: 2; grid-row: 1; justify-self: end; }
   .research-timeline-panel .research-timeline-stage-state,
-  .research-timeline-panel .research-timeline-target-state { grid-column: 2; grid-row: 2; max-width: none; line-height: 1.6; }
+  .research-timeline-panel .research-timeline-target-state { grid-column: 2; grid-row: 1; max-width: none; line-height: 1.6; }
   .research-timeline-panel .research-timeline-target-open > b { max-width: 76px; }
 }
 @media (max-width: 1160px) and (min-width: 881px) {

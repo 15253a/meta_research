@@ -274,15 +274,21 @@ test("timeline summaries remain complete at different widths and result details 
       await expect(summary).toBeVisible();
       await expect(summary).toHaveText(originalText[index]);
       expect(await summary.getAttribute("title")).toContain(originalText[index]);
+      expect((await summary.boundingBox())!.width, `${width}px summary remains wide enough to read`).toBeGreaterThan(60);
     }
     expect(await timeline.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
     await timeline.screenshot({ path: evidencePath(`focus-layout-compact-timeline-${width}.png`) });
   }
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await observationResize(page).press("Home");
-  expect(await timeline.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
-  await timeline.screenshot({ path: evidencePath("focus-layout-compact-timeline-minimum.png") });
+  for (const width of [1440, 900]) {
+    await page.setViewportSize({ width, height: 900 });
+    await observationResize(page).press("Home");
+    for (const summary of summaries) {
+      expect((await summary.boundingBox())!.width, `${width}px minimum split preserves readable summary width`).toBeGreaterThan(60);
+    }
+    expect(await timeline.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    await timeline.screenshot({ path: evidencePath(`focus-layout-compact-timeline-minimum-${width}.png`) });
+  }
   await idea.click();
   await expect(transcript(page, "stage-history-idea")).toContainText(outputText("stage-history-idea"));
   await historical.locator('[data-stage="reasoning"] > .research-timeline-stage-result').click();
