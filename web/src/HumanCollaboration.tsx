@@ -355,6 +355,7 @@ export function QuestCompanion({
   onChanged,
   onOpenRequest,
   goalAlignment = [],
+  onHide,
 }: {
   state: CompanionShellState;
   collaboration?: HumanCollaborationProjection;
@@ -364,6 +365,7 @@ export function QuestCompanion({
   onChanged: () => void;
   onOpenRequest: (requestRef: string) => void;
   goalAlignment?: GoalGuidanceAlignment[];
+  onHide?: () => void;
 }) {
   const companion = collaboration?.companion;
   const sessionSwitch = useCompanionSessionSwitch(companion, onChanged);
@@ -567,6 +569,7 @@ export function QuestCompanion({
             : "随时询问正在发生的研究"}</small>
         </div>
         <code>{ready ? "可交流" : "暂不可用"}</code>
+        {onHide ? <button type="button" className="research-panel-hide" aria-label="隐藏研究助手" title="隐藏研究助手" aria-controls="research-companion" aria-expanded={true} onClick={onHide}>−</button> : null}
       </header>
       <CompanionSessionState companion={sessionSwitch.session} switching={sessionSwitch.switching} busy={sessionSwitch.busy} />
       {ready && scopeRef && <CompanionFiles key={scopeRef} scopeRef={scopeRef} refreshKey={`${companion.native_session_generation}:${companion.messages.filter(message => message.role === "assistant" && message.status === "completed").map(message => message.message_ref).join(":")}`} />}

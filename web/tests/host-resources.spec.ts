@@ -19,7 +19,7 @@ test("research view uses the CPU interval separately from the GPU query and stay
   const state = await openResources(page, true);
   state.sample.sampled_from = 1791458399;
   await page.getByRole("button", { name: "刷新资源", exact: true }).click();
-  const panel = page.getByRole("region", { name: "执行机器整机资源" });
+  const panel = page.getByRole("region", { name: "资源监控" });
   await expect(panel).toContainText("100 ms");
   await expect(panel).toContainText(/CPU 采样区间 \d{2}:\d{2}:\d{2}\.800 至 \d{2}:\d{2}:\d{2}\.900/);
   await expect(panel).toContainText("GPU 采样时间");
@@ -30,7 +30,7 @@ test("research view uses the CPU interval separately from the GPU query and stay
   })).toBe(true);
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "执行机器资源", exact: true })).toBeFocused();
+  await expect(page.getByRole("button", { name: "资源监控", exact: true })).toBeFocused();
   expect(state.writes).toEqual([]);
 });
 
@@ -54,13 +54,13 @@ async function openResources(page: Page, workspace = false) {
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
   });
   await page.goto(`http://host-resources.test/${workspace ? "?workspace=1" : ""}`);
-  await page.getByRole("button", { name: "执行机器资源", exact: true }).click();
+  await page.getByRole("button", { name: "资源监控", exact: true }).click();
   return state;
 }
 
 test("home shows whole-host CPU, memory and each GPU with sample time and true zero", async ({ page }) => {
   const state = await openResources(page);
-  const panel = page.getByRole("region", { name: "执行机器整机资源" });
+  const panel = page.getByRole("region", { name: "资源监控" });
   await expect(panel).toBeVisible();
   await expect(panel).toContainText("整机口径");
   await expect(panel).toContainText("compute-test");
@@ -74,7 +74,7 @@ test("home shows whole-host CPU, memory and each GPU with sample time and true z
 
 test("resources distinguish missing values, no devices and disconnects, and recover after GPU changes", async ({ page }) => {
   const state = await openResources(page);
-  const panel = page.getByRole("region", { name: "执行机器整机资源" });
+  const panel = page.getByRole("region", { name: "资源监控" });
   const refresh = page.getByRole("button", { name: "刷新资源", exact: true });
   await expect(panel.locator('[data-gpu-uuid="GPU-B"]')).toContainText("73%");
   state.sample.cpu = { ...state.sample.cpu, status: "unavailable", utilization_percent: null, reason_code: "cpu_read_failed" };

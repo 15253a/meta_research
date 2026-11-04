@@ -1,23 +1,82 @@
-.host-resource-trigger { border:1px solid #d9dbe8; border-radius:9px; padding:8px 10px; background:#fff; color:#565476; font:inherit; font-size:12px; cursor:pointer; white-space:nowrap; }
-.host-resource-panel { position:fixed; z-index:80; top:92px; right:24px; width:min(560px,calc(100vw - 32px)); max-height:calc(100dvh - 115px); overflow:auto; box-sizing:border-box; padding:24px; border:1px solid #d9dbe8; border-radius:16px; background:#fff; color:#252b38; box-shadow:0 14px 60px #252b382b; font-size:14px; }
-.host-resource-panel header,.host-resource-refresh { display:flex; align-items:center; justify-content:space-between; gap:12px; }
-.host-resource-panel h2 { margin:0; font-size:18px; }
-.host-resource-panel button { padding:6px 9px; border:1px solid #d9dbe8; border-radius:7px; background:#f6f7fb; color:#565476; font:inherit; cursor:pointer; }
+.host-resources { display:inline-flex; flex-shrink:0; }
+.host-resource-trigger { display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:36px; border:1px solid #dfe2ee; border-radius:10px; padding:8px 12px; background:#fff; color:#505a76; font:inherit; font-size:12px; font-weight:500; cursor:pointer; white-space:nowrap; transition:background .16s,border-color .16s,color .16s; }
+.host-resource-trigger svg { width:16px; height:16px; flex-shrink:0; color:#7876a9; }
+.host-resource-trigger:hover,.host-resource-trigger[aria-expanded="true"] { background:#f5f4fc; border-color:#cbc8e6; color:#55508c; }
+.host-resource-trigger:disabled { opacity:.5; cursor:default; }
+.host-resource-trigger:focus-visible,.host-resource-panel button:focus-visible,.host-resource-drag-handle:focus-visible,.host-resource-details summary:focus-visible { outline:2px solid #7770cb; outline-offset:3px; }
+.host-resource-panel { position:fixed; z-index:80; top:88px; right:24px; width:min(640px,calc(100vw - 24px)); max-height:calc(100dvh - 112px); display:flex; flex-direction:column; box-sizing:border-box; overflow:hidden; border:1px solid #dedfec; border-radius:20px; background:#fcfcff; color:#2e3650; box-shadow:0 20px 70px #31314e25,0 2px 8px #31314e08; font-size:13px; }
+.host-resource-panel:focus { outline:none; }
+.host-resource-panel[style] { right:auto; }
+.host-resource-panel.is-dragging { box-shadow:0 26px 80px #31314e30; }
+.host-resource-panel-header { display:flex; flex-shrink:0; align-items:center; justify-content:space-between; gap:12px; min-height:68px; padding:0 20px; border-bottom:1px solid #e8e8f1; background:linear-gradient(110deg,#fafaff,#f3f2fb); }
+.host-resource-drag-handle { display:flex; flex:1; min-width:0; align-items:center; gap:10px; align-self:stretch; border-radius:8px; cursor:grab; touch-action:none; user-select:none; }
+.is-dragging .host-resource-drag-handle { cursor:grabbing; }
+.host-resource-drag-handle>svg { width:20px; height:20px; color:#7971b7; flex-shrink:0; }
+.host-resource-panel h2 { margin:0; font-size:17px; font-weight:600; letter-spacing:.02em; }
+.host-resource-drag-handle>span { margin-left:4px; color:#888c9f; font-size:11px; font-weight:400; }
+.host-resource-panel button { display:inline-flex; align-items:center; justify-content:center; border:1px solid #dfe1ec; border-radius:8px; padding:7px 10px; background:#fff; color:#656580; font:inherit; font-size:11px; cursor:pointer; transition:background .16s,border-color .16s; }
+.host-resource-panel button:hover { background:#f2f1fb; border-color:#cbc8e2; }
 .host-resource-panel button:disabled { opacity:.5; cursor:wait; }
-.host-resource-scope,.host-resource-time { color:#6b7183; line-height:1.65; font-size:12px; }
-.host-resource-host { margin-bottom:4px; overflow-wrap:anywhere; font-weight:600; }
-.host-resource-warning { background:#fff4e5; color:#885828; padding:10px; border-radius:8px; line-height:1.6; }
-.host-resource-metrics { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:16px; }
-.host-resource-metrics article { background:#f6f7fb; padding:14px; border-radius:10px; min-width:0; }
-.host-resource-metrics h3 { margin:0 0 10px; font-size:13px; }
-.host-resource-metrics b { display:block; font-size:19px; }
-.host-resource-metrics small,.host-resource-metrics span { display:block; margin-top:8px; color:#72788a; font-size:11px; overflow-wrap:anywhere; }
-.host-gpu-heading { font-size:14px; margin-top:24px; }
-.host-gpu-heading small { font-weight:400; color:#72788a; }
-.host-gpu-list { margin:0; padding:0; list-style:none; }
-.host-gpu-list li { padding:14px 0; border-top:1px solid #e6e7ee; }
-.host-gpu-list code { display:block; margin-top:5px; font-size:11px; color:#72788a; overflow-wrap:anywhere; }
-.host-gpu-list dl { display:flex; flex-wrap:wrap; gap:16px 32px; margin:12px 0 0; }
-.host-gpu-list dt { font-size:11px; color:#72788a; }
-.host-gpu-list dd { margin:5px 0 0; font-size:16px; }
-@media(max-width:650px) { .host-resource-panel { top:80px; right:16px; padding:18px; max-height:calc(100dvh - 96px); } .host-resource-metrics { grid-template-columns:1fr; } .status-home-header { flex-wrap:wrap; padding-bottom:12px; padding-top:12px; } }
+.host-resource-panel .host-resource-close { width:30px; height:30px; padding:6px; border-color:transparent; background:transparent; color:#83869a; flex-shrink:0; }
+.host-resource-close svg { width:18px; height:18px; }
+.host-resource-body { padding:20px 22px 18px; overflow:auto; min-height:0; scrollbar-width:thin; scrollbar-color:#d5d4e6 transparent; overscroll-behavior:contain; }
+.host-resource-refresh { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.host-resource-refresh>div { min-width:0; }
+.host-resource-refresh>button { flex-shrink:0; }
+.host-resource-status { display:inline-flex; align-items:center; gap:6px; color:#617168; font-size:11px; }
+.host-resource-status i { width:5px; height:5px; border-radius:50%; background:#72a495; }
+.host-resource-status.is-failed { color:#977441; }
+.host-resource-status.is-failed i { background:#c19d65; }
+.host-resource-scope { margin:7px 0 0; color:#8990a0; font-size:11px; line-height:1.6; }
+.host-resource-warning { background:#fcf7ed; color:#8c6d3c; margin:14px 0; padding:10px 12px; border:1px solid #efe5d2; border-radius:10px; font-size:12px; line-height:1.7; }
+.host-resource-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:20px; }
+.host-resource-metrics article { background:#fff; border:1px solid #e3e5ef; padding:17px 18px 15px; border-radius:13px; min-width:0; }
+.host-resource-metrics h3 { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0; font-size:12px; font-weight:600; color:#555d79; }
+.host-resource-metrics h3 span { font-weight:400; font-size:10px; color:#999bad; }
+.host-resource-metrics b { display:block; margin:15px 0 13px; color:#353451; font-size:34px; font-weight:500; letter-spacing:-1px; font-variant-numeric:tabular-nums; line-height:1.2; }
+.host-resource-metrics small { display:block; margin-top:10px; color:#8990a1; font-size:10px; line-height:1.6; overflow-wrap:anywhere; }
+.host-resource-meter { height:4px; background:#edecf6; border-radius:4px; overflow:hidden; }
+.host-resource-meter>span { display:block; height:100%; background:#8d85c9; border-radius:inherit; transition:width .25s ease; }
+.host-resource-meter.is-unavailable { background:repeating-linear-gradient(135deg,#edecf3 0 4px,#f8f8fb 4px 8px); }
+[data-testid="host-memory"] .host-resource-meter>span { background:#7ca79f; }
+.host-gpu-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:24px 0 12px; }
+.host-gpu-heading h3 { display:flex; align-items:center; gap:8px; margin:0; font-size:13px; font-weight:600; }
+.host-gpu-heading h3 span { border-radius:5px; padding:3px 6px; background:#eeedf8; color:#77709e; font-size:10px; font-weight:400; }
+.host-gpu-heading>small { color:#9599aa; font-size:10px; }
+.host-gpu-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:0; padding:0; list-style:none; }
+.host-gpu-list li { min-width:0; padding:16px 18px; border:1px solid #e3e5ef; border-radius:13px; background:#fff; }
+.host-gpu-identity { display:flex; flex-direction:column; gap:5px; }
+.host-gpu-identity>span { color:#626280; font-size:11px; font-weight:600; }
+.host-gpu-identity>b { color:#9497a7; font-size:10px; font-weight:400; line-height:1.6; overflow-wrap:anywhere; }
+.host-gpu-list dl { margin:14px 0 9px; }
+.host-gpu-list dl>div { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
+.host-gpu-list dt { color:#878c9f; font-size:10px; }
+.host-gpu-list dd { margin:0; color:#494763; font-variant-numeric:tabular-nums; }
+.host-gpu-utilization dd { font-size:25px; font-weight:500; line-height:1.2; letter-spacing:-.5px; }
+.host-gpu-list .host-gpu-memory { flex-wrap:wrap; row-gap:5px; }
+.host-gpu-memory dt span { margin-left:4px; color:#a0a3b2; }
+.host-gpu-memory dd { font-size:11px; }
+.host-gpu-list li>.host-resource-meter:last-child>span { background:#7ca79f; }
+.host-resource-empty { padding:22px 16px; margin:12px 0 0; border-radius:12px; background:#f5f5fa; color:#9094a5; font-size:12px; line-height:1.7; }
+.host-resource-details { margin-top:22px; border-top:1px solid #e8e9f1; color:#858a9c; font-size:11px; }
+.host-resource-details summary { width:fit-content; padding:14px 2px 2px; cursor:pointer; }
+.host-resource-details>div { padding:8px 0 0; }
+.host-resource-host { margin:6px 0; overflow-wrap:anywhere; color:#686d83; font-size:12px; }
+.host-resource-time { margin:8px 0; color:#9297a8; font-size:10px; line-height:1.9; }
+.host-resource-details dl { margin:10px 0 0; font-size:10px; line-height:1.8; }
+.host-resource-details dl>div { display:grid; grid-template-columns:76px minmax(0,1fr); gap:8px; }
+.host-resource-details dt { color:#858b9e; }
+.host-resource-details dd { margin:0; overflow-wrap:anywhere; color:#989dae; }
+.host-resource-sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0; }
+@media(max-width:540px) {
+  .host-resource-panel { border-radius:16px; max-height:calc(100dvh - 24px); }
+  .host-resource-panel-header { padding-inline:16px; min-height:60px; }
+  .host-resource-body { padding:16px; }
+  .host-resource-drag-handle>span { display:none; }
+  .host-resource-metrics { gap:9px; margin-top:16px; }
+  .host-resource-metrics article { padding:14px 12px; }
+  .host-resource-metrics b { font-size:29px; }
+  .host-gpu-list { grid-template-columns:1fr; gap:10px; }
+  .host-gpu-list li { padding:14px 16px; }
+}
+@media(prefers-reduced-motion:reduce) { .host-resource-trigger,.host-resource-panel button,.host-resource-meter>span { transition:none; } }

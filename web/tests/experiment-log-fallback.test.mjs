@@ -39,7 +39,7 @@ function fixtures() {
 }
 function mount(props) {
   const state = [], effects = [], refs = [];
-  let cursor = 0, pending = [], tree, scrolls = 0;
+  let cursor = 0, pending = [], tree, outputOpens = 0;
   const context = { exports: {}, require: createRequire(import.meta.url), selectTarget,
     useState(initial) { const i = cursor++; if (!(i in state)) state[i] = initial;
       return [state[i], value => state[i] = typeof value === "function" ? value(state[i]) : value]; },
@@ -47,14 +47,13 @@ function mount(props) {
     useEffect(effect, deps) { const i = cursor++; if (!effects[i] || deps.some((v, k) => v !== effects[i][k])) {
       effects[i] = deps; pending.push(effect);
     } },
-    document: { getElementById: () => ({ focus() {}, scrollIntoView() { scrolls++; } }) },
     TargetTerminalDialog: "TargetTerminalDialog", ExperimentLogs: "ExperimentLogs",
   };
   vm.runInNewContext(compiled, context);
-  const render = () => { cursor = 0; tree = context.exports.launcher(props); return tree; };
+  const render = () => { cursor = 0; tree = context.exports.launcher({ ...props, onOpenOutput() { outputOpens++; } }); return tree; };
   const flush = () => { render(); const tasks = pending; pending = []; tasks.forEach(task => task()); return render(); };
   flush();
-  return { props, render: flush, get tree() { return tree; }, get scrolls() { return scrolls; } };
+  return { props, render: flush, get tree() { return tree; }, get outputOpens() { return outputOpens; } };
 }
 function elements(node, type) {
   if (Array.isArray(node)) return node.flatMap(child => elements(child, type));
@@ -71,7 +70,7 @@ test("current Target public records remain reachable when Bundle belongs to an o
   assert.doesNotMatch(text(model.tree), /本轮尚无实验日志/);
   button(model).props.onClick();
   assert.deepEqual(props.selections, [["bundle", session.session_ref]]);
-  assert.equal(model.scrolls, 1);
+  assert.equal(model.outputOpens, 1);
   assert.equal(elements(model.tree, "TargetTerminalDialog").length, 0);
 });
 
@@ -85,6 +84,7 @@ test("normal Bundle Target retains execution records and log-file dialogs", () =
   dialog.props.onShowLogFiles(); model.render();
   assert.equal(elements(model.tree, "ExperimentLogs")[0].props.target.target_ref, target.target_ref);
   assert.deepEqual(props.selections, []);
+  assert.equal(model.outputOpens, 0);
 });
 
 test("uncertain, foreign and missing session scope cannot claim a current public record", () => {
@@ -100,6 +100,7 @@ test("uncertain, foreign and missing session scope cannot claim a current public
   ]) {
     const props = fixtures(); change(props); const model = mount(props);
     assert.equal(button(model).props.disabled, true);
+    assert.equal(model.outputOpens, 0);
     if (props.rootConversations.error || props.rootConversations.context.stale)
       assert.doesNotMatch(text(model.tree), /本轮尚无实验日志/);
   }
@@ -111,6 +112,7 @@ test("multiple current Target sessions are selectable; exact observed records su
   const model = mount(props), select = elements(model.tree, "select")[0];
   assert.ok(select); select.props.onChange({ currentTarget: { value: "target-root:2" } }); model.render();
   button(model).props.onClick(); assert.deepEqual(props.selections, [["bundle", "target-root:2"]]);
+  assert.equal(model.outputOpens, 1);
 });
 
 test("Quest, Cycle and Question changes clear prior Target selection", () => {
@@ -123,5 +125,6 @@ test("Quest, Cycle and Question changes clear prior Target selection", () => {
     props.rootConversations.data.sessions = props.rootConversations.data.sessions.map(s => ({ ...s,
       cycle_ref: props.snapshot.research_control.foreground.cycle_ref, question_ref: props.snapshot.research_control.foreground.question_ref }));
     model.render(); button(model).props.onClick(); assert.deepEqual(props.selections.at(-1), ["bundle", "target-root:1"]);
+    assert.equal(model.outputOpens, 1);
   }
 });

@@ -7,15 +7,15 @@ import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
 import type { RootOperation, RootOutput } from "../src/rootSessionsApi.js";
 
-// Render the real operation header with the public-output read at its React
+// Render the real operation time details with the public-output read at its React
 // state seam. No browser, network request, or research runtime is started.
 const sourcePath = resolve(process.cwd(), "src/RootConversations.tsx");
 const source = readFileSync(sourcePath, "utf8");
 const parsed = ts.createSourceFile(sourcePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const nodes = parsed.statements.filter(node =>
-  ts.isFunctionDeclaration(node) && node.name?.text === "RootOperationOutput"
+  ts.isFunctionDeclaration(node) && ["RootOperationOutput", "RootOutputTimestamp"].includes(node.name?.text ?? "")
   || ts.isVariableStatement(node) && node.declarationList.declarations.some(declaration => declaration.name.getText(parsed) === "timeText"));
-expect(nodes).toHaveLength(2);
+expect(nodes).toHaveLength(3);
 const javascript = ts.transpileModule(nodes.map(node => node.getText(parsed)).join("\n"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.React },
 }).outputText;
@@ -36,17 +36,24 @@ function header(sourceUpdatedAt: number | null | undefined, createdAt = reschedu
     useState: (initial: unknown) => [slot++ === 1 ? page : typeof initial === "function" ? initial() : initial, () => {}],
     useRef: (initial: unknown) => ({ current: initial }), useEffect: () => {},
     StageReadableOutput: () => null, ExecutionElapsed: () => null,
-    RootOperationOutput: null as unknown as (props: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; onOutput: () => void; readingCache: Map<string, unknown> }) => React.ReactElement<{ children: React.ReactNode[] }>,
+    createPortal: (children: React.ReactNode) => children,
+    RootOperationOutput: null as unknown as (props: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; onOutput: () => void; readingCache: Map<string, unknown>; detailsHost: object; clockHost: null; onShowHistory: () => void }) => React.ReactElement<{ children: React.ReactNode[] }>,
   };
   runInNewContext(javascript, sandbox, { filename: sourcePath });
   const operation: RootOperation = { operation_ref: "operation", label: "Bundle", phase: null, status: "completed", created_at: createdAt, updated_at: createdAt };
-  const article = sandbox.RootOperationOutput({ questRef: "quest", sessionRef: "session", operation, ordinal: 5, active: true, onOutput: () => {}, readingCache: new Map() });
-  return renderToStaticMarkup(article.props.children[0]);
+  const article = sandbox.RootOperationOutput({ questRef: "quest", sessionRef: "session", operation, ordinal: 5, active: true, onOutput: () => {}, readingCache: new Map(), detailsHost: {}, clockHost: null, onShowHistory: () => {} });
+  const details = React.Children.toArray(article.props.children).find(child =>
+    React.isValidElement<{ className?: string }>(child) && child.props.className === "root-operation-details");
+  if (!React.isValidElement<{ children: React.ReactNode }>(details)) throw new Error("operation details must remain available");
+  const timestamp = React.Children.toArray(details.props.children).find(child =>
+    React.isValidElement<{ className?: string }>(child) && child.props.className === "root-operation-time");
+  if (!React.isValidElement(timestamp)) throw new Error("operation output timestamp must remain available");
+  return renderToStaticMarkup(timestamp);
 }
 
 test("a saved output shows its source update, not the later Owner reschedule time", () => {
   const rendered = header(outputTime);
-  expect(rendered).toContain("工作记录 5 · Bundle");
+  expect(rendered).toContain("执行 5 · Bundle");
   expect(rendered).toContain(`输出更新 · ${formatted(outputTime)}`);
   expect(rendered).not.toContain(formatted(rescheduledTime));
 });

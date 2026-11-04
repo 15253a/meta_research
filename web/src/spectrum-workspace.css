@@ -55,7 +55,7 @@ body:has(.status-home) { overflow: auto; }
 .status-home-error { padding: 10px 12px; font-size: 12px; }
 
 /* Keep the navy controls, lavender companion and serif research headings. */
-.lumen-shell { grid-template-columns: 76px minmax(0, 1fr) 348px; grid-template-rows: 68px minmax(0, 1fr); gap: 14px; padding: 12px; }
+.lumen-shell { grid-template-columns: 76px minmax(0, 1fr) 8px var(--assistant-width, 420px); grid-template-rows: 68px minmax(0, 1fr); gap: 14px; padding: 12px; }
 .lumen-header { gap: 24px; border-radius: 20px; box-shadow: 0 8px 30px #34396004; }
 .lumen-brand { min-width: 205px; }
 .lumen-brand b { font-size: 14px; }
@@ -116,9 +116,9 @@ body:has(.status-home) { overflow: auto; }
 .research-overview-dialog-layout > header { background: linear-gradient(120deg, #fcfcff, #f1f0ff); }
 .research-overview-dialog-layout h2 { font-weight: 500; }
 
-@media (min-width: 1600px) { .lumen-shell { grid-template-columns: 78px minmax(0, 1fr) 360px; } .lumen-main { padding-inline: 13px; } }
+@media (min-width: 1600px) { .lumen-shell { grid-template-columns: 78px minmax(0, 1fr) 8px var(--assistant-width, 420px); } .lumen-main { padding-inline: 13px; } }
 @media (max-width: 1280px) { .status-home main { padding-inline: 30px; } .lumen-header { gap: 18px; } }
-@media (max-width: 1160px) { .lumen-shell { grid-template-columns: 66px minmax(0, 1fr) 300px; gap: 11px; } .lumen-header { padding-inline: 14px; gap: 16px; } .lumen-brand { min-width: 170px; } .lumen-main { padding-inline: 3px; } .research-experiment-entry select { max-width: 230px; } .research-connection { margin-left: auto; } }
+@media (max-width: 1160px) { .lumen-shell { grid-template-columns: 66px minmax(0, 1fr) 8px var(--assistant-width, 420px); gap: 11px; } .lumen-header { padding-inline: 14px; gap: 16px; } .lumen-brand { min-width: 170px; } .lumen-main { padding-inline: 3px; } .research-experiment-entry select { max-width: 230px; } .research-connection { margin-left: auto; } }
 @media (max-width: 880px) {
   .lumen-shell { grid-template-columns: 64px minmax(0, 1fr); grid-template-rows: 68px auto; }
   .lumen-main { padding: 5px 5px 50px; }

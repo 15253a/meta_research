@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { StageReadableOutput } from "./ReadableOutput";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
 import { fetchRootOutput, fetchRootSessions, RootSessionError, type RootOperation, type RootOutput, type RootSession, type RootSessions } from "./rootSessionsApi";
@@ -23,6 +24,12 @@ export const rootSessionStatus = (session: RootSession, language: "zh" | "en" = 
   : session.activity_label || statusLabels[session.status];
 const timeText = (value: number | null) => value ? new Date(value * 1_000).toLocaleString("zh-CN", { hour12: false }) : "时间待确认";
 
+function RootOutputTimestamp({ sourceUpdatedAt }: { sourceUpdatedAt: number | null | undefined }) {
+  return typeof sourceUpdatedAt === "number" && Number.isFinite(sourceUpdatedAt) && sourceUpdatedAt > 0
+    ? <time>输出更新 · {timeText(sourceUpdatedAt)}</time>
+    : <span>输出时间待确认</span>;
+}
+
 export type RootConversationContext = {
   questRef?: string | null;
   revisionDomain?: string;
@@ -36,7 +43,7 @@ type OperationReadingState = {
   tailOffset: number; clock: ExecutionClockSample | null; visibleCount: number;
 };
 type SessionReadingState = {
-  historyEnd: number | null; follow: boolean; scrollTop: number | null; operations: Map<string, OperationReadingState>;
+  historyEnd: number | null; follow: boolean; scrollTop: number | null; operations: Map<string, OperationReadingState>; detailsOpen: boolean;
 };
 
 function usePageVisible() {
@@ -57,7 +64,8 @@ export function useRootConversations(context: RootConversationContext, active: b
   const [failure, setFailure] = useState<{ scope: string; message: string } | null>(null);
   const error = failure?.scope === scope ? failure.message : null;
   const [retry, setRetry] = useState(0);
-  const [selection, setSelection] = useState<{ scope: string; cycleRef: string | null; stage: SpectrumStage | null; ref: string | null; role?: ReasoningRole } | null>(null);
+  const [selection, setSelection] = useState<{ scope: string; cycleRef: string | null; stage: SpectrumStage | null; ref: string | null; role?: ReasoningRole;
+    timelineKind?: "stage" | "target"; questionRef?: string; targetRef?: string; runRef?: string | null } | null>(null);
   const retainedSelection = useRef<{ scope: string; session: RootSession } | null>(null);
   const readingCache = useMemo(() => new Map<string, SessionReadingState>(), [scope]);
   const refresh = useCallback(() => setRetry(value => value + 1), []);
@@ -122,7 +130,17 @@ export function useRootConversations(context: RootConversationContext, active: b
   const selectedStage = chosen?.stage ?? (current ? sessionStage(current) : null) ?? currentStage;
   const roleRoot = (role: ReasoningRole, selectedCycle = cycleRef) => role === "reasoning" ? defaultRoot("reasoning", selectedCycle) : forStage("reasoning", false, selectedCycle).find(item => reasoningRole(item) === role) ?? null;
   const selectedRole = selectedStage === "reasoning" ? chosen?.role ?? "reasoning" : null;
-  const observedSelection = chosen?.ref ? sessions.find(item => item.session_ref === chosen.ref) ?? null
+  const timelineCandidates = chosen?.timelineKind ? sessions.filter(session => session.cycle_ref === chosen.cycleRef
+    && (!session.question_ref || session.question_ref === chosen.questionRef)
+    && (chosen.timelineKind === "target" ? session.kind === "target" && session.target_ref === chosen.targetRef
+      && (!chosen.runRef || session.run_ref === chosen.runRef) : session.kind === "stage" && spectrumStage(session.stage) === chosen.stage))
+    .sort((a, b) => Number(b.is_current === true) - Number(a.is_current === true)
+      || Number(b.is_executing) - Number(a.is_executing) || (b.created_at ?? 0) - (a.created_at ?? 0)
+      || b.session_ref.localeCompare(a.session_ref)) : [];
+  // A timeline click binds its exact work, including an empty stage or Target.
+  // Never substitute the foreground's current root for that selection.
+  const observedSelection = chosen?.timelineKind ? (chosen.ref ? timelineCandidates.find(item => item.session_ref === chosen.ref) : timelineCandidates[0]) ?? null
+    : chosen?.ref ? sessions.find(item => item.session_ref === chosen.ref) ?? null
     : !chosen ? current : selectedRole ? roleRoot(selectedRole, chosen.cycleRef) : defaultRoot(selectedStage, chosen.cycleRef);
   const pendingRoot = chosen && !chosen.ref ? observedSelection : null;
   const selected = observedSelection ?? (chosen?.ref && retainedSelection.current?.scope === scope
@@ -138,20 +156,34 @@ export function useRootConversations(context: RootConversationContext, active: b
     setSelection(previous => previous === chosen ? { ...previous, ref: pendingRoot.session_ref } : previous);
   }, [chosen, pendingRoot?.session_ref]);
   const selectStage = (stage: SpectrumStage, ref: string | null = null) => setSelection(questRef ? { scope, cycleRef, stage, ref: ref ?? defaultRoot(stage)?.session_ref ?? null } : null);
+  const selectTimelineStage = (stage: SpectrumStage, selectedCycle: string, questionRef: string) => setSelection(questRef
+    ? { scope, cycleRef: selectedCycle, questionRef, stage, ref: null, timelineKind: "stage" } : null);
+  const selectTimelineTarget = (targetRef: string, selectedCycle: string, questionRef: string, ref: string | null = null, runRef: string | null = null) => setSelection(questRef
+    ? { scope, cycleRef: selectedCycle, questionRef, stage: "bundle", ref, targetRef, runRef, timelineKind: "target" } : null);
   const selectReasoningRole = (role: ReasoningRole) => setSelection(questRef ? { scope, cycleRef, stage: "reasoning", ref: null, role } : null);
   const returnCurrent = () => setSelection(null);
   const pinReading = () => {
     if (!chosen && questRef && selected) setSelection({ scope, cycleRef: selected.cycle_ref, stage: selectedStage, ref: selected.session_ref });
   };
   return { context, questRef, scope, data, sessions, error, refresh, current, selected, selectedStage, currentStage, selectedRole,
-    selectedRef: chosen?.ref ?? null, selectedUnavailable, manualSelection: Boolean(chosen), readingCache, pinReading, forStage, selectStage, selectReasoningRole, returnCurrent, active: active && visible };
+    selectedRef: chosen?.ref ?? null, selectedCycleRef: chosen?.cycleRef ?? selected?.cycle_ref ?? null,
+    selectedTimelineKind: chosen?.timelineKind ?? null, selectedTargetRef: chosen?.targetRef ?? selected?.target_ref ?? null,
+    selectedUnavailable, manualSelection: Boolean(chosen), readingCache, pinReading, forStage, selectStage, selectTimelineStage, selectTimelineTarget, selectReasoningRole, returnCurrent, active: active && visible };
 
 }
 
 export type RootConversationsModel = ReturnType<typeof useRootConversations>;
 type Model = RootConversationsModel;
 
-export function StageRootSessions({ model, stage }: { model: Model; stage: SpectrumStage }) {
+export function focusResearchOutput(): void {
+  requestAnimationFrame(() => {
+    const output = document.getElementById("research-activity");
+    output?.focus({ preventScroll: true });
+    output?.scrollIntoView({ block: "start" });
+  });
+}
+
+export function StageRootSessions({ model, stage, onOpenOutput }: { model: Model; stage: SpectrumStage; onOpenOutput?: () => void }) {
   const { language } = useOutputLanguage();
   const sessions = model.forStage(stage), historical = model.forStage(stage, true);
   const stageName = spectrumStages.find(item => item.id === stage)!.name;
@@ -165,7 +197,7 @@ export function StageRootSessions({ model, stage }: { model: Model; stage: Spect
       aria-pressed={model.selectedStage === stage && model.selected?.session_ref === session.session_ref}
       aria-label={`${label}${ordinal} · ${scope} · ${model.error ? "上次记录" : rootSessionStatus(session, language)}`}
       title={`${session.title} · ${scope} · ${rootSessionStatus(session, language)}`}
-      onClick={() => model.selectStage(stage, session.session_ref)}>
+      onClick={() => { model.selectStage(stage, session.session_ref); onOpenOutput?.(); }}>
       <span>{label}{ordinal}</span><small>{session.kind === "acquisition" ? "共享" : session.kind === "deepfetch" && !session.cycle_ref ? scope : history ? "历史" : ""}</small>
     </button>;
   });
@@ -180,7 +212,7 @@ export function StageRootSessions({ model, stage }: { model: Model; stage: Spect
         const actual = sessions.filter(session => reasoningRole(session) === role);
         return actual.length ? choices(actual) : <button type="button" key={`pending-${role}`} data-root-role={role}
           aria-pressed={model.selectedStage === "reasoning" && model.selectedRole === role && !model.selected && !model.selectedRef}
-          aria-label={`${reasoningRoleLabels[role]} · ${roleStatus}`} onClick={() => model.selectReasoningRole(role)}>
+          aria-label={`${reasoningRoleLabels[role]} · ${roleStatus}`} onClick={() => { model.selectReasoningRole(role); onOpenOutput?.(); }}>
           <span>{reasoningRoleLabels[role]}</span><small>{roleStatus}</small>
         </button>;
       }) : <PageWindow items={sessions} label={`${stageName} 本轮会话分页`} render={session => choices([session])} />}
@@ -197,7 +229,9 @@ function sessionScope(session: RootSession, context: RootConversationContext) {
   return session.scope_label || "Quest 资料会话";
 }
 
-export function RootConversations({ model, connected, polling = false, targetRetry }: { model: Model; connected: boolean; polling?: boolean; targetRetry?: TargetRetryObservation | null }) {
+export function RootConversations({ model, connected, polling = false, targetRetry, onHide, onReturnCurrent }: {
+  model: Model; connected: boolean; polling?: boolean; targetRetry?: TargetRetryObservation | null; onHide?: () => void; onReturnCurrent?: () => void;
+}) {
   const foreground = model.context.foreground;
   const failure = model.context.checks.find(check => check.status === "unavailable" && (
     check.name === `${foreground?.stage.toLowerCase()}_stage_worker`
@@ -205,15 +239,49 @@ export function RootConversations({ model, connected, polling = false, targetRet
   ));
   const usageLimit = failure?.reason?.code === "codex_usage_limit";
   const retrySummary = failure && targetRetry?.checkName === failure.name && targetRetry.reasonCode === failure.reason?.code ? targetRetry.summary : null;
+  const choices = model.selected && !model.sessions.some(session => session.session_ref === model.selected?.session_ref)
+    ? [...model.sessions, model.selected] : model.sessions;
+  const select = (session: RootSession) => model.selectStage(sessionStage(session) ?? model.selectedStage ?? model.currentStage ?? "idea", session.session_ref);
+  const targets = model.forStage("bundle").filter(session => session.kind === "target");
+  const statusKnown = !model.context.stale && !model.error && !model.data?.limited;
   return <section className="research-flow root-conversations" id="research-activity" tabIndex={-1} aria-labelledby="research-trace-title">
-    <header className="research-flow-heading"><h2 id="research-trace-title">研究过程</h2>
-      {model.manualSelection ? <button className="root-return-current" onClick={model.returnCurrent}>返回当前阶段 ↗</button> : null}
-      <span className="research-connection" data-connected={connected || polling}><i />{model.context.stale ? "状态待确认 · 保留记录" : connected ? "实时连接" : polling ? "定时更新" : "连接中断 · 保留记录"}</span>
+    <header className="research-flow-heading"><div className="research-flow-title"><h2 id="research-trace-title">研究过程</h2>
+      <span className="research-connection" data-connected={connected || polling}><i />{model.context.stale ? "状态待确认 · 保留记录" : connected ? "实时连接" : polling ? "定时更新" : "连接中断 · 保留记录"}</span></div>
+      {onHide ? <button type="button" className="research-panel-hide" aria-label="隐藏研究过程" aria-controls="research-output-panel" onClick={onHide}>−</button> : null}
     </header>
+    <div className="root-session-controls" tabIndex={0} aria-label="会话选择与状态">
+    <div className="root-view-toolbar">
+      <label>查看会话<select aria-label="选择查看的会话" value={model.selected?.session_ref ?? ""} onChange={event => {
+        const session = choices.find(item => item.session_ref === event.target.value);
+        if (session) select(session);
+      }}>
+        {!model.selected ? <option value="">{model.data ? "暂无会话" : "正在读取…"}</option> : null}
+        {choices.map(session => {
+          const name = session.short_title || session.title;
+          const sameName = choices.filter(choice => (choice.short_title || choice.title) === name);
+          return <option key={session.session_ref} value={session.session_ref}>{name}{sameName.length > 1 ? ` ${sameName.findIndex(choice => choice.session_ref === session.session_ref) + 1}` : ""} · {sessionScope(session, model.context)} · {rootSessionStatus(session)}</option>;
+        })}
+      </select></label>
+      <div className="root-follow-controls"><span>{model.manualSelection ? "正在回看" : statusKnown && model.current?.is_executing ? "跟随当前执行" : "当前工作"}</span>
+        {model.manualSelection ? <button className="root-return-current" onClick={() => { model.returnCurrent(); onReturnCurrent?.(); }}>返回当前执行</button> : null}
+      </div>
+    </div>
+    {targets.length ? <nav className="root-parallel-targets" aria-label="并行 Target 会话"><span>Target</span>{targets.map(session => {
+      const name = session.short_title || session.title;
+      const sameName = targets.filter(target => (target.short_title || target.title) === name);
+      const executing = statusKnown && session.is_executing;
+      return <button key={session.session_ref} type="button" data-session-ref={session.session_ref} data-executing={executing}
+        title={`${session.title} · ${statusKnown ? rootSessionStatus(session) : "状态待确认"}`}
+        aria-label={`${name} · ${executing ? "正在执行" : statusKnown ? rootSessionStatus(session) : "状态待确认"}`}
+        aria-pressed={model.selected?.session_ref === session.session_ref} onClick={() => select(session)}>
+        {executing ? <i className="root-running-spinner" aria-hidden="true" /> : null}{name}{sameName.length > 1 ? ` · ${sameName.findIndex(target => target.session_ref === session.session_ref) + 1}` : ""}{!session.is_executing && session.status === "completed" ? " · 已完成" : ""}</button>;
+    })}</nav> : null}
     {failure ? <div className="lumen-idea-health-blocker" data-testid="research-current-worker-blocker" role="status"><span aria-hidden="true">!</span><div><b>{retrySummary ?? (usageLimit ? "模型额度已用尽" : failure.name === "target_run_worker" ? "Target 推进受阻" : "当前阶段推进受阻")}</b><small>{retrySummary ? "原会话正在继续；上次错误与研究记录仍保留。" : usageLimit ? "原会话和研究记录已保留；额度恢复后可继续研究。" : "已形成的会话与研究记录仍可查看。"}</small></div><code title={failure.reason?.code}>{failure.reason?.code ?? "worker_unavailable"}</code></div> : null}
     {model.error || model.data?.limited ? <div className="root-session-warning" role="status">{model.data ? "会话状态更新不完整，保留已读取记录。" : "暂时无法读取研究会话。"}<button onClick={model.refresh}>重新读取</button>{model.error ? <details><summary>状态详情</summary><code>{model.error}</code></details> : null}</div> : null}
     {model.selectedUnavailable && model.selected ? <div className="root-session-warning" role="status">所选根会话暂不可读取，保留已读取内容和阅读位置。<button onClick={model.refresh}>重新读取所选会话</button></div> : null}
+    </div>
     {model.selected && model.questRef ? <RootSessionTimeline key={`${model.scope}:${model.selected.session_ref}:${model.manualSelection ? "selected" : "current"}`} questRef={model.questRef} session={model.selected} scope={sessionScope(model.selected, model.context)} active={model.active} stale={Boolean(model.context.stale || model.error || model.data?.limited || model.selectedUnavailable)} readingCache={model.readingCache} followCurrent={!model.manualSelection} onReadHistory={model.pinReading} />
+      : model.selectedTimelineKind ? <p className="research-output-empty">{model.selectedRef ? "所选会话暂不可读取。" : !model.data ? "正在读取所选工作会话…" : model.error || model.data.limited ? "所选工作会话暂不可确认，请重新读取。" : model.selectedTimelineKind === "target" ? "所选实验任务尚无会话。" : "所选轮次的此阶段尚无会话。"}</p>
       : model.selectedStage === "reasoning" && model.selectedRole && !model.selectedRef ? <section className="research-conversation root-pending-role" aria-label={`${reasoningRoleLabels[model.selectedRole]} 待启动会话`} data-root-role={model.selectedRole}>
         <h3>{reasoningRoleLabels[model.selectedRole]}</h3>
         <p>{!model.data || model.error || model.data.limited ? "正在确认此入口的根会话状态。" : model.selectedRole === "deepfetch" ? "Reasoning 尚未建立由本阶段发起的 DeepFetch 根会话。" : model.selectedRole === "reasoning" ? "当前轮尚未建立 Reasoning 根会话。" : "此 Quest 尚未建立共享 Acquisition 根会话。"}</p>
@@ -225,9 +293,9 @@ export function RootConversations({ model, connected, polling = false, targetRet
 function RootSessionTimeline({ questRef, session, scope, active, stale, readingCache, followCurrent, onReadHistory }: { questRef: string; session: RootSession; scope: string; active: boolean; stale: boolean; readingCache: Map<string, SessionReadingState>; followCurrent: boolean; onReadHistory: () => void }) {
   const { language } = useOutputLanguage();
   const [reading] = useState(() => {
-    const state = readingCache.get(session.session_ref) ?? { historyEnd: null, follow: true, scrollTop: null, operations: new Map<string, OperationReadingState>() };
+    const state = readingCache.get(session.session_ref) ?? { historyEnd: null, follow: true, scrollTop: null, operations: new Map<string, OperationReadingState>(), detailsOpen: false };
     if (followCurrent) {
-      state.historyEnd = null; state.follow = true; state.scrollTop = null;
+      state.historyEnd = null; state.follow = true; state.scrollTop = null; state.detailsOpen = false;
       for (const output of state.operations.values()) { output.browseOffset = null; output.visibleCount = 80; }
     }
     readingCache.set(session.session_ref, state);
@@ -235,12 +303,47 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   });
   const [historyEnd, setHistoryEnd] = useState<number | null>(reading.historyEnd);
   const [follow, setFollow] = useState(reading.follow);
+  const [detailsOpen, setDetailsOpen] = useState(reading.detailsOpen);
+  const [detailsHost, setDetailsHost] = useState<HTMLDivElement | null>(null);
+  const [clockHost, setClockHost] = useState<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const autoScroll = useRef<number | null>(null);
+  const intentTimeout = useRef<number | null>(null);
+  const readingIntent = useRef<{ top: number; pointerId?: number } | null>(null);
+  const touchY = useRef<number | null>(null);
+  const cancelAutoScroll = useCallback(() => {
+    if (autoScroll.current !== null) cancelAnimationFrame(autoScroll.current);
+    autoScroll.current = null;
+  }, []);
+  const clearReadingIntent = useCallback(() => {
+    if (intentTimeout.current !== null) clearTimeout(intentTimeout.current);
+    intentTimeout.current = null; readingIntent.current = null;
+  }, []);
+  const onOutput = useCallback(() => {
+    cancelAutoScroll();
+    if (reading.follow) autoScroll.current = requestAnimationFrame(() => {
+      autoScroll.current = null;
+      const node = scrollRef.current;
+      if (node && reading.follow && !readingIntent.current) node.scrollTop = node.scrollHeight;
+    });
+  }, [reading, cancelAutoScroll]);
+  const readIntent = (node: HTMLDivElement, pointerId?: number) => {
+    // Passive wheel/touch handlers can run after the browser has already moved.
+    const top = Math.max(node.scrollTop, reading.scrollTop ?? node.scrollTop);
+    if (!reading.follow || top <= 0) return;
+    cancelAutoScroll(); clearReadingIntent();
+    readingIntent.current = { top, pointerId };
+    // An input that never scrolls must not turn a later layout change into a pause.
+    if (pointerId === undefined) intentTimeout.current = window.setTimeout(() => {
+      clearReadingIntent(); onOutput();
+    }, 300);
+  };
   const children = (session.children ?? []).filter(child => child.parent_session_ref === session.session_ref);
   const operations = [...session.operations].sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0) || a.operation_ref.localeCompare(b.operation_ref));
   const end = Math.min(historyEnd ?? operations.length, operations.length);
   const start = Math.max(0, end - 4);
   const pauseReading = (readingEnd = end) => {
+    cancelAutoScroll(); clearReadingIntent();
     reading.follow = false; reading.historyEnd = readingEnd;
     reading.scrollTop = scrollRef.current?.scrollTop ?? null;
     setFollow(false); setHistoryEnd(readingEnd); onReadHistory();
@@ -257,36 +360,79 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
     if (!followCurrent && reading.scrollTop !== null) node.scrollTop = reading.scrollTop;
     return () => { reading.scrollTop = node.scrollTop; };
   }, [reading, followCurrent]);
-  const onOutput = useCallback(() => {
-    if (follow) requestAnimationFrame(() => { const node = scrollRef.current; if (node) node.scrollTop = node.scrollHeight; });
-  }, [follow]);
-  useEffect(onOutput, [onOutput, operations.length]);
+  useEffect(() => {
+    const releasePointer = (event: PointerEvent) => {
+      if (readingIntent.current?.pointerId === event.pointerId) { clearReadingIntent(); onOutput(); }
+    };
+    const blur = () => { clearReadingIntent(); touchY.current = null; };
+    document.addEventListener("pointerup", releasePointer, true);
+    document.addEventListener("pointercancel", releasePointer, true);
+    window.addEventListener("blur", blur);
+    return () => {
+      cancelAutoScroll(); clearReadingIntent();
+      document.removeEventListener("pointerup", releasePointer, true);
+      document.removeEventListener("pointercancel", releasePointer, true);
+      window.removeEventListener("blur", blur);
+    };
+  }, [cancelAutoScroll, clearReadingIntent, onOutput]);
+  useEffect(onOutput, [onOutput, operations.length, follow]);
   return <section className="research-conversation root-session-conversation" aria-label={`${session.title} 会话`} data-session-ref={session.session_ref}>
-    <header className="root-session-heading"><div><b>{session.title}</b><small>{scope} · {kindLabels[session.kind]}{session.stage ? ` · ${session.stage}` : ""}</small></div><span data-executing={!stale && session.is_executing}>{stale ? `状态待确认 · 上次${rootSessionStatus(session, language)}` : rootSessionStatus(session, language)}</span></header>
-    <div className="root-session-context"><span>{stale ? "当前会话状态暂不可确认，以下为已读取的工作记录。" : isHistoricalWaitingSession(session) ? language === "en" ? "View recorded content." : "查看已记录内容。" : session.status === "waiting" ? "当前会话等待继续条件，暂无模型调用在执行。" : session.status === "completed" ? "本会话已完成，以下保留已产生的公开工作记录。" : "同一会话的连续工作记录"}</span><details><summary>归属</summary><p>会话 {session.session_ref}</p><p>研究轮次 {session.cycle_ref ?? "Quest 资料范围"}</p><p>研究问题 {session.question_ref ?? "未绑定单个问题"}</p>{session.owner_session_ref ? <p>发起会话 {session.owner_session_ref}</p> : null}</details></div>
+    <header className="root-session-heading"><div><b>{session.title}</b><small>{scope}{session.kind === "acquisition" ? " · 共享 Acquisition" : ""}</small></div><span data-executing={!stale && session.is_executing}>{stale ? `状态待确认 · 上次${rootSessionStatus(session, language)}` : rootSessionStatus(session, language)}</span></header>
+    {operations.length ? <div className="root-session-live-time" ref={setClockHost} /> : null}
     {children.length ? <section className="root-delegated-children" aria-label="委派子智能体">
       <h4>委派子智能体 <small>{children.length}</small></h4>
       <PageWindow items={children} label="子智能体分页" wrap={rows => <ul>{rows}</ul>} render={child => <li key={child.session_ref} data-child-session-ref={child.session_ref} data-child-status={stale ? "unknown" : child.status}>
-        <div><b>{child.label || "子智能体"}</b><small>{child.provider === "claude" ? "Claude" : "Codex"} · <code title={child.native_session_ref ?? child.session_ref}>{child.session_ref}</code></small></div>
+        <div><b>{child.label || "子智能体"}</b></div>
         <span>{stale ? `待核实 · 上次${childStatusLabels[child.status]}` : childStatusLabels[child.status]}</span>
       </li>} />
     </section> : null}
-    <div className="root-session-scroll" ref={scrollRef} role="log" aria-live="off" aria-label={`${session.title} 连续工作记录`} onScroll={event => {
+    <div className="root-session-scroll" ref={scrollRef} role="log" tabIndex={0} aria-live="off" aria-label={`${session.title} 连续工作记录`}
+      onWheel={event => {
+        if (!event.defaultPrevented && event.deltaY < 0) readIntent(event.currentTarget);
+        else clearReadingIntent();
+      }}
+      onKeyDown={event => {
+        if (event.defaultPrevented || event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable=true]")) return;
+        if (["ArrowUp", "PageUp", "Home"].includes(event.key) || event.key === " " && event.shiftKey) readIntent(event.currentTarget);
+        else clearReadingIntent();
+      }}
+      onPointerDown={event => {
+        const node = event.currentTarget;
+        const bounds = node.getBoundingClientRect();
+        if (event.button === 0 && event.clientX >= bounds.left + node.clientLeft + node.clientWidth) readIntent(node, event.pointerId);
+        else clearReadingIntent();
+      }}
+      onTouchStart={event => { touchY.current = event.touches[0]?.clientY ?? null; }}
+      onTouchMove={event => {
+        const nextY = event.touches[0]?.clientY;
+        if (nextY !== undefined && touchY.current !== null && nextY > touchY.current) readIntent(event.currentTarget);
+        touchY.current = nextY ?? null;
+      }}
+      onTouchEnd={() => { touchY.current = null; }}
+      onTouchCancel={() => { touchY.current = null; clearReadingIntent(); }}
+      onScroll={event => {
       const node = event.currentTarget;
       reading.scrollTop = node.scrollTop;
-      if (follow && node.scrollHeight - node.clientHeight - node.scrollTop > 48) pauseReading();
+      if (follow && readingIntent.current && node.scrollTop < readingIntent.current.top && node.scrollHeight - node.clientHeight - node.scrollTop > 48) pauseReading();
     }}>
       {start > 0 ? <button className="root-load-earlier" onClick={() => pauseReading(start)}>读取更早工作 · 还有 {start} 次</button> : null}
       {operations.slice(start, end).map((operation, index) => <RootOperationOutput key={operation.operation_ref} questRef={questRef} sessionRef={session.session_ref}
-        operation={operation} ordinal={start + index + 1} active={active} followLive={follow} onOutput={onOutput} readingCache={reading.operations} onReadHistory={() => pauseReading()} />)}
+        operation={operation} ordinal={start + index + 1} active={active} followLive={follow} onOutput={onOutput} readingCache={reading.operations} onReadHistory={() => pauseReading()}
+        detailsHost={detailsHost} clockHost={index === end - start - 1 ? clockHost : null}
+        onShowHistory={() => { reading.detailsOpen = true; setDetailsOpen(true); pauseReading(); }} />)}
       {end < operations.length ? <button className="root-load-earlier" onClick={() => setHistoryEnd(Math.min(operations.length, end + 4))}>读取后续工作 · 还有 {operations.length - end} 次</button> : null}
       {!operations.length ? <p className="research-output-empty">会话已建立，等待第一条公开工作记录。</p> : null}
     </div>
-    <footer className="research-output-footer"><button type="button" aria-pressed={follow} onClick={() => { if (follow) pauseReading(); else { setFollow(true); setHistoryEnd(null); requestAnimationFrame(() => { const node = scrollRef.current; if (node) node.scrollTop = node.scrollHeight; }); } }}>{follow ? "跟随最新 ✓" : "继续跟随 ↓"}</button><span>{follow ? "默认显示最近 4 次工作；原始历史可分页读取" : "已固定当前已读视图；返回当前或继续跟随可读取新输出"}</span></footer>
+    {operations.length ? <details className="root-session-details" open={detailsOpen} onToggle={event => {
+      reading.detailsOpen = event.currentTarget.open; setDetailsOpen(reading.detailsOpen); if (reading.detailsOpen) pauseReading();
+    }}>
+      <summary>执行详情与历史分页</summary><div ref={setDetailsHost} />
+    </details> : null}
+    <footer className="research-output-footer"><span>{follow ? "" : "正在回看"}</span><button type="button" aria-pressed={follow} onClick={() => { clearReadingIntent(); reading.follow = true; setFollow(true); setHistoryEnd(null); onOutput(); }}>{follow ? "跟随最新输出 ✓" : "回到最新输出 ↓"}</button></footer>
   </section>;
 }
 
-function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active, followLive = true, onOutput, readingCache, onReadHistory }: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; followLive?: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void }) {
+function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active, followLive = true, onOutput, readingCache, onReadHistory, detailsHost, clockHost, onShowHistory }: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; followLive?: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void; detailsHost: HTMLDivElement | null; clockHost: HTMLDivElement | null; onShowHistory: () => void }) {
   const [reading] = useState(() => {
     const state = readingCache.get(operation.operation_ref) ?? { page: null, chunks: [], browseOffset: null, tailOffset: 0, clock: null, visibleCount: 80 };
     readingCache.set(operation.operation_ref, state);
@@ -382,25 +528,24 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
     return () => { controller.abort(); clearTimeout(timer); };
   }, [questRef, sessionRef, operation.operation_ref, operation.status, active, followLive, retry, browseOffset]);
   useEffect(onOutput, [page?.next_offset, page?.stream_ref, onOutput]);
-  const sourceUpdatedAt = page?.source_updated_at;
   return <article className="root-operation" data-operation-ref={operation.operation_ref}>
-    <div className="root-operation-time"><span>工作记录 {ordinal}{operation.label ? ` · ${operation.label}` : ""}</span>
-      {typeof sourceUpdatedAt === "number" && Number.isFinite(sourceUpdatedAt) && sourceUpdatedAt > 0
-        ? <time>输出更新 · {timeText(sourceUpdatedAt)}</time>
-        : <span>输出时间待确认</span>}
-    </div>
-    {error ? <div className="root-session-warning" role="status">记录暂时无法更新，已保留上次内容。<button onClick={() => { retryRequested.current = true; setRetry(value => value + 1); }}>重试</button><details><summary>读取详情</summary><code>{error}</code></details></div> : null}
-    {page ? <>{(chunks[0]?.offset ?? 0) > 0 && browseOffset === null ? <p className="root-output-truncated">这次调用较早的记录已收起，可通过分页回看。</p> : null}
+    {clockHost ? createPortal(<><RootOutputTimestamp sourceUpdatedAt={page?.source_updated_at} />
+      {page ? <ExecutionElapsed sample={clock} ended={page.status === "terminal"} /> : null}</>, clockHost) : null}
+    {error ? <div className="root-session-warning" role="status">{page ? "记录暂时无法更新，已保留上次内容。" : "部分记录暂时无法读取，后续内容仍可继续查看。"}<button onClick={() => { retryRequested.current = true; setRetry(value => value + 1); }}>重试</button><details><summary>读取详情</summary><code>{error}</code></details></div> : null}
+    {page ? <>{(chunks[0]?.offset ?? 0) > 0 && browseOffset === null ? <button type="button" className="root-load-earlier root-output-older" onClick={onShowHistory}>前文已收起 · 查看更早内容</button> : null}
       <StageReadableOutput rawText={page.text} chunks={chunks} streamKey={page.stream_ref} rootNativeSessionRef={page.native_session_ref} isTerminal={page.status === "terminal"} publicOnly
         visibleCount={visibleCount} onVisibleCountChange={count => { reading.visibleCount = count; setVisibleCount(count); }} onPauseFollow={onReadHistory} />
-      <div className="root-operation-clock"><ExecutionElapsed sample={clock} ended={page.status === "terminal"} />{page.has_more && browseOffset === null ? <small>正在补读后续记录…</small> : null}</div>
-      <details className="root-output-pages" open={browseOffset !== null}><summary>查看这次调用的分页记录</summary><nav aria-label={`工作记录 ${ordinal} 分页`}>
+      {page.has_more && browseOffset === null ? <small className="root-operation-clock">正在读取后续记录…</small> : null}
+      </> : !error ? <p className="root-output-loading" role="status">正在读取公开工作记录…</p> : null}
+    {detailsHost ? createPortal(<section className="root-operation-details" data-operation-details-ref={operation.operation_ref}>
+      <div className="root-operation-time"><span>执行 {ordinal}{operation.label ? ` · ${operation.label}` : ""}</span><RootOutputTimestamp sourceUpdatedAt={page?.source_updated_at} /></div>
+      {page ? <>{(chunks[0]?.offset ?? 0) > 0 && browseOffset === null ? <p className="root-output-truncated">较早记录可分页回看。</p> : null}
+      <nav className="root-output-pages" aria-label={`执行 ${ordinal} 历史分页`}>
         <button disabled={page.offset === 0} onClick={() => browse(0)}>最早记录</button>
         <button disabled={page.offset === 0} onClick={() => browse(Math.max(0, page.offset - 65536))}>上一页</button>
-        <span>{page.offset}–{page.next_offset} / {page.source_bytes} 字节</span>
         <button disabled={!page.has_more} onClick={() => browse(page.next_offset)}>下一页</button>
         {browseOffset !== null ? <button onClick={() => browse(null)}>返回最新记录</button> : null}
-      </nav></details></>
-      : <p className="research-output-empty">正在读取公开工作记录…</p>}
+      </nav></> : null}
+    </section>, detailsHost) : null}
   </article>;
 }

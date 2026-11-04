@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState, type CSSProperties, ty
 import type { PublicSnapshot } from "./api";
 import "./research-overview.css";
 import { SpectrumStages, spectrumStage } from "./Spectrum";
-import { StageRootSessions, RootConversations, useRootConversations, rootSessionStatus, type RootConversationsModel } from "./RootConversations";
+import { StageRootSessions, focusResearchOutput, rootSessionStatus, type RootConversationsModel } from "./RootConversations";
 import { BoundedDetails, PageWindow } from "./BoundedDetails";
 import type { RootSession } from "./rootSessionsApi";
 import { summaryNeedsAcceptedResultReview, useTimelineSummaries, type TimelineSummaryNode } from "./timelineSummaries";
@@ -266,6 +266,7 @@ export function ResearchOverview({ snapshot, overview, error, onRetry, onOpenWri
 
 type StageHistoryProps = {
   rootConversations?: RootConversationsModel;
+  onOpenOutput?: () => void;
   snapshot: PublicSnapshot;
   overview?: ResearchOverviewData | null;
   error?: string | null;
@@ -276,8 +277,8 @@ type StageHistoryProps = {
 };
 
 /** Read the current work separately from the recorder's interpretation and scientific findings. */
-export function ResearchBrief({ snapshot, overview, error, rootConversations }: {
-  snapshot: PublicSnapshot; overview?: ResearchOverviewData | null; error?: string | null; rootConversations?: RootConversationsModel;
+export function ResearchBrief({ snapshot, overview, error, rootConversations, onOpenOutput }: {
+  snapshot: PublicSnapshot; overview?: ResearchOverviewData | null; error?: string | null; rootConversations?: RootConversationsModel; onOpenOutput?: () => void;
 }) {
   const data = scopedOverview(snapshot, overview);
   const foreground = snapshot.research_control.foreground;
@@ -316,8 +317,7 @@ export function ResearchBrief({ snapshot, overview, error, rootConversations }: 
     stages.flatMap(item => currentCycle.stages[item] ?? []), rootConversations?.sessions ?? [], summaries.observedAt) : false;
   const openCurrent = () => {
     if (stage) rootConversations?.selectStage(stage);
-    requestAnimationFrame(() => document.getElementById("research-activity")?.focus({ preventScroll: true }));
-    document.getElementById("research-activity")?.scrollIntoView({ block: "start" });
+    (onOpenOutput ?? focusResearchOutput)();
   };
   return <section className="research-brief" aria-label="研究近况" ref={motion.ref} data-motion-active={motion.active}>
     <header><h2><MetaTrace variant="brief" active={motion.active} />研究近况</h2><span>{cycleOrdinalLabel(data?.cycle_ordinal)}</span></header>
@@ -334,7 +334,7 @@ export function ResearchBrief({ snapshot, overview, error, rootConversations }: 
   </section>;
 }
 
-export function StageHistoryStrip({ snapshot, overview, error, loading, onRetry, onStageResult, onRequestOverview, rootConversations }: StageHistoryProps) {
+export function StageHistoryStrip({ snapshot, overview, error, loading, onRetry, onStageResult, onRequestOverview, rootConversations, onOpenOutput }: StageHistoryProps) {
   const data = scopedOverview(snapshot, overview);
   const current = data?.cycles.find(cycle => cycle.cycle_ref === data.cycle_ref) ?? null;
   const foregroundStage = spectrumStage(snapshot.research_control.foreground?.stage);
@@ -353,7 +353,7 @@ export function StageHistoryStrip({ snapshot, overview, error, loading, onRetry,
   };
   return <>
     {loading && data ? <p className="overview-empty" role="status">历史成果正在更新，以下保留已读取记录；当前运行状态见阶段会话。</p> : null}
-    <SpectrumStages compact running={foregroundStage !== null && currentStageStatus(foregroundStage, snapshot, rootConversations).state === "running"} stageContent={rootConversations ? stage => <StageRootSessions model={rootConversations} stage={stage} /> : undefined} selected={rootConversations?.selectedStage} current={foregroundStage} onSelect={rootConversations ? stage => rootConversations.selectStage(stage) : open} onResult={open} labels={Object.fromEntries((["idea", "plan", "bundle", "reasoning"] as const).map(stage => {
+    <SpectrumStages compact running={foregroundStage !== null && currentStageStatus(foregroundStage, snapshot, rootConversations).state === "running"} stageContent={rootConversations ? stage => <StageRootSessions model={rootConversations} stage={stage} onOpenOutput={onOpenOutput} /> : undefined} selected={rootConversations?.selectedStage} current={foregroundStage} onSelect={rootConversations ? stage => { rootConversations.selectStage(stage); onOpenOutput?.(); } : open} onResult={open} labels={Object.fromEntries((["idea", "plan", "bundle", "reasoning"] as const).map(stage => {
       const last = [...(current?.stages[stage] ?? [])].sort((a, b) => a.epoch - b.epoch).at(-1);
       const isCurrent = snapshot.research_control.foreground?.stage.toLowerCase() === stage;
       return [stage, isCurrent ? "当前阶段" : last ? acceptedStatusNames[last.status] : error || data?.status === "limited" ? "暂不可用" : data ? "尚无结果" : "查看结果"];
@@ -543,7 +543,7 @@ function TimelineSummary({ nodeKey, node, className, unavailable, acceptedResult
   const savedAt = node?.updated_at != null ? `总结保存于 ${new Date(node.updated_at * 1_000).toLocaleString("zh-CN", {
     year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
   })}` : "既有总结（保存时间未知）";
-  const title = [sentence ? `记录员独立摘要 · ${savedAt}` : null,
+  const title = [sentence, sentence ? `记录员独立摘要 · ${savedAt}` : null,
     sourceTitle ? `依据：\n${sourceTitle}` : null].filter(Boolean).join("\n");
   return <span className={`${className} timeline-summary`} data-summary-key={nodeKey} data-summary-kind={node?.summary_kind ?? "process"} data-summary-status={status} data-summary-stale={stale}>
     {sentence ? <small className="timeline-summary-kind">{summaryKindNames[node?.summary_kind ?? "process"]}</small> : null}
@@ -561,6 +561,11 @@ type TimelineProps = {
   error?: string | null;
   onRetry?: () => void;
   rootConversations?: RootConversationsModel;
+  browsingQuestRef: string | null;
+  onBrowseQuest: (questRef: string | null) => void;
+  historicalConversations: RootConversationsModel;
+  onOpenOutput: (historical: boolean) => void;
+  onHide?: () => void;
 };
 
 function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, sessions: RootSession[], recordedNodes: TimelineSummaryNode[], unavailable: boolean, paused: boolean) {
@@ -603,15 +608,15 @@ function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, session
       : target?.status === "running" ? "等待执行记录"
       : target?.status === "failed" || target?.blocker ? "执行受阻"
       : "等待启动";
-    return { ref, label, status, session: currentSession,
+    return { ref, label, status, session: currentSession, runRef: target?.target_run_ref ?? session?.run_ref ?? null,
       executing: !unavailable && !paused && !commit && Boolean(currentSession?.is_executing) };
   });
 }
 
 /** Keep consecutive Question visits in time order: revisiting a Question never moves its new Cycle into the past. */
-export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConversations }: TimelineProps) {
+export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConversations, browsingQuestRef, onBrowseQuest,
+  historicalConversations, onOpenOutput, onHide }: TimelineProps) {
   const liveQuestRef = overviewQuestRef(snapshot);
-  const [browsingQuestRef, setBrowsingQuestRef] = useState<string | null>(null);
   const questRef = browsingQuestRef ?? liveQuestRef;
   const isLiveQuest = questRef === liveQuestRef;
   const questionVersion = isLiveQuest ? JSON.stringify(snapshot.question_tree.items.map(item => item.question_ref)) : "history";
@@ -624,9 +629,7 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
   const data = availableData ?? (retainedData.current?.questRef === questRef ? retainedData.current.data : null);
   const readError = isLiveQuest ? error : history.overviewError;
   const retryHistory = () => { history.retry(); if (isLiveQuest) onRetry?.(); };
-  const historicalRoots = useRootConversations({ revisionDomain: snapshot.revision_domain, questRef, foreground: null, checks: [], stale: false }, !isLiveQuest);
-  const roots = isLiveQuest ? rootConversations : historicalRoots;
-  const [historicalConversation, setHistoricalConversation] = useState(false);
+  const roots = isLiveQuest ? rootConversations : historicalConversations;
   const cycles = data?.cycles ?? [];
   const foreground = snapshot.research_control.foreground;
   const sessions = roots?.sessions ?? [];
@@ -669,18 +672,18 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
     if (tree && current) { tree.scrollTop += current.getBoundingClientRect().top - tree.getBoundingClientRect().top - 12; tree.focus({ preventScroll: true }); }
     });
   }, [isLiveQuest, returnRequest, data]);
-  useEffect(() => { setSelection(null); setHistoricalConversation(false); }, [questRef]);
+  useEffect(() => { setSelection(null); }, [questRef]);
   const observedControl = rootConversations?.context.foreground ?? foreground;
   const paused = ["paused", "suspended"].includes(observedControl?.status ?? "") || observedControl?.grant_status === "suspended";
   const sourcesObservedAt = summaries.observedAt > 0 ? new Date(summaries.observedAt * 1_000).toLocaleString("zh-CN", {
     year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
   }) : null;
   return <section className="research-timeline" aria-label="研究时间线" ref={motion.ref} data-motion-active={motion.active}>
-    <header className="research-timeline-heading"><div><h2>研究时间线</h2><details className="research-timeline-note"><summary>摘要说明</summary><p>摘要按扫描资料独立整理；过程摘要、待确认发现与科研结论分别标明。阶段状态与正式成果请查看详情。</p></details>{sourcesObservedAt ? <p>资料最近扫描开始于 {sourcesObservedAt}</p> : null}</div><span>{groups.length ? `${questionOrdinals.size} 个问题 · ${cycles.length} 轮探索` : "随研究更新"}</span></header>
-    <div className="research-timeline-browse"><label>浏览 Quest<select value={questRef ?? ""} onChange={event => { setBrowsingQuestRef(event.target.value === liveQuestRef ? null : event.target.value); }}>
+    <header className="research-timeline-heading"><div><h2>研究时间线</h2><details className="research-timeline-note"><summary>摘要说明</summary><p>摘要按扫描资料独立整理；过程摘要、待确认发现与科研结论分别标明。阶段状态与正式成果请查看详情。</p></details>{sourcesObservedAt ? <p title={`资料最近扫描开始于 ${sourcesObservedAt}`}>资料最近扫描开始于 {sourcesObservedAt}</p> : null}</div>{onHide ? <button type="button" className="research-panel-hide" aria-label="隐藏研究时间线" aria-controls="research-timeline-panel" onClick={onHide}>−</button> : null}</header>
+    <div className="research-timeline-browse"><label>浏览研究<select value={questRef ?? ""} onChange={event => { onBrowseQuest(event.target.value === liveQuestRef ? null : event.target.value); }}>
       {questRef && !history.quests.some(item => item.quest_ref === questRef) ? <option value={questRef}>{isLiveQuest ? snapshot.research_space.current_quest.goal || questRef : questRef}</option> : null}
       {history.quests.map(item => <option key={item.quest_ref} value={item.quest_ref}>{item.goal || item.quest_ref}{item.quest_ref === liveQuestRef ? " · 当前工作" : ""}</option>)}
-    </select></label><button type="button" className="overview-text-button" onClick={() => { setBrowsingQuestRef(null); setReturnRequest(value => value + 1); }}>返回当前工作</button></div>
+    </select></label><button type="button" className="overview-text-button" onClick={() => { onBrowseQuest(null); rootConversations?.returnCurrent(); onOpenOutput(false); setReturnRequest(value => value + 1); }}>返回当前工作</button></div>
     {history.questLoading || history.questionsLoading ? <p className="overview-empty" role="status">正在读取{history.questLoading ? "Quest 列表" : "全部正式问题"}…</p> : null}
     {history.questError || history.questionsError ? <p className="overview-empty" role="status">{history.questError ? "Quest 列表" : "问题历史"}读取失败，已显示的记录仍可阅读；列表可能不完整。<button className="overview-text-button" onClick={retryHistory}>重新读取</button></p> : null}
     {readError && data ? <p className="overview-empty" role="status">时间线更新暂不可用，保留已读取记录。<button className="overview-text-button" onClick={retryHistory}>重新读取</button></p> : null}
@@ -714,26 +717,22 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
               acceptedResultNeedsReview={summaryNeedsAcceptedResultReview(summaries.nodes[`cycle:${cycle.cycle_ref}`], cycle, entries.flatMap(entry => entry.artifacts), summarySessions, summaries.observedAt)} />
             {isCurrent ? <i className="research-timeline-badge">当前轮</i> : null}
           </>}>{() => <ol className="research-timeline-stages">{entries.map(({ stage, artifacts, latest }) => <li key={stage} className="research-timeline-stage" data-stage={stage} style={{ "--stage-accent": stageAccents[stage] } as CSSProperties}>
-              <button type="button" className="research-timeline-stage-open" aria-label={`查看${stageNames[stage]}结果与历史`} onClick={() => setSelection({ cycleRef: cycle.cycle_ref, stage, epoch: latest?.epoch ?? null })}>
+              <button type="button" className="research-timeline-stage-open" aria-label={`查看 ${stageTechnicalNames[stage]} 输出`}
+                aria-pressed={roots?.selectedTimelineKind === "stage" && roots.selectedCycleRef === cycle.cycle_ref && roots.selectedStage === stage}
+                onClick={() => { roots?.selectTimelineStage(stage, cycle.cycle_ref, cycle.question_ref); onOpenOutput(!isLiveQuest); }}>
                 <span className="research-timeline-stage-head"><b>{stageTechnicalNames[stage]}</b></span>
                 <TimelineSummary className="research-timeline-stage-summary" nodeKey={`stage:${cycle.cycle_ref}:${stage}`} node={summaries.nodes[`stage:${cycle.cycle_ref}:${stage}`]} unavailable={summaries.error}
                   acceptedResultNeedsReview={summaryNeedsAcceptedResultReview(summaries.nodes[`stage:${cycle.cycle_ref}:${stage}`], cycle, artifacts, summarySessions, summaries.observedAt)} />
                 <small className="research-timeline-stage-state">{isCurrent && foreground?.stage.toLowerCase() === stage ? <><span>当前阶段</span><span>{currentStageStatus(stage, snapshot, rootConversations).label}</span></> : latest ? acceptedStatusNames[latest.status] : "尚无记录"}</small>
               </button>
+              <button type="button" className="overview-text-button research-timeline-stage-result" aria-label={`查看${stageNames[stage]}结果与历史`} title="结果与历史" onClick={() => setSelection({ cycleRef: cycle.cycle_ref, stage, epoch: latest?.epoch ?? null })}>↗</button>
               {stage === "bundle" && (targets.length > 0 || isCurrent) ? <ul className="research-timeline-targets">
                 {targets.map(target => <li key={target.ref} className="research-timeline-target" data-target-ref={target.ref} data-executing={target.executing}>
-                  <button className="research-timeline-target-open" type="button" onClick={() => {
-                    if (!target.session || !roots) {
-                      setSelection({ cycleRef: cycle.cycle_ref, stage: "bundle", epoch: latest?.epoch ?? null });
-                      return;
-                    }
-                    roots.selectStage("bundle", target.session.session_ref);
-                    if (!isLiveQuest) { setHistoricalConversation(true); return; }
-                    requestAnimationFrame(() => {
-                      const activity = document.getElementById("research-activity");
-                      activity?.focus({ preventScroll: true });
-                      activity?.scrollIntoView({ block: "start", behavior: motion.active ? "smooth" : "auto" });
-                    });
+                  <button className="research-timeline-target-open" type="button"
+                    aria-pressed={roots?.selectedTimelineKind === "target" && roots.selectedCycleRef === cycle.cycle_ref && roots.selectedTargetRef === target.ref}
+                    onClick={() => {
+                    roots?.selectTimelineTarget(target.ref, cycle.cycle_ref, cycle.question_ref, target.session?.session_ref ?? null, target.runRef);
+                    onOpenOutput(!isLiveQuest);
                   }}><b>{target.label}</b><TimelineSummary className="research-timeline-target-summary" nodeKey={`target:${cycle.cycle_ref}:${target.ref}`} node={summaries.nodes[`target:${cycle.cycle_ref}:${target.ref}`]} unavailable={summaries.error} /><small className="research-timeline-target-state">{target.status}</small></button>
                 </li>)}
                 {!targets.length ? <li className="research-timeline-target"><span className="research-timeline-target-summary">{sessionsUnavailable ? "Target 工作记录暂不可确认" : "尚无可展示的 Target 工作记录"}</span></li> : null}
@@ -743,6 +742,5 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
       })}</ol> : <p className="overview-readable-text">{questionItem?.summary || "正式问题已建立，尚未开始首轮研究。"}</p>}</BoundedDetails></li>;
       })}</ol></div>}
     {selection && data && <StageResultDialog data={data} selection={selection} onSelect={setSelection} onClose={() => setSelection(null)} />}
-    {historicalConversation && !isLiveQuest ? <OverviewDialog title="历史工作会话" subtitle="只读浏览 · 当前研究继续执行" onClose={() => setHistoricalConversation(false)}><RootConversations model={historicalRoots} connected={true} /></OverviewDialog> : null}
   </section>;
 }

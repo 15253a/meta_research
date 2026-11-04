@@ -88,12 +88,16 @@ import { MetaTrace } from "./MetaTrace";
 import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
 import { ExperimentLogs, ExperimentOutputViews, ParallelExecutionLogs } from "./ExperimentLogs";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
-import { RootConversations, StageRootSessions, useRootConversations } from "./RootConversations";
+import { RootConversations, StageRootSessions, useRootConversations, focusResearchOutput } from "./RootConversations";
+import { AssistantResize, useAssistantWidth } from "./AssistantResize";
 import { RuntimeConditions } from "./RuntimeConditions";
 import { CodexAccount } from "./CodexAccount";
 import "./research-interaction.css";
 import "./spectrum-workspace.css";
 import "./workspace-modal.css";
+import "./workspace-header.css";
+import "./focus-layout.css";
+import { ObservationResize, useObservationSplit } from "./ObservationResize";
 
 const capabilityLabels: Record<string, string> = {
   accepted_material_basis: "研究资料",
@@ -3900,10 +3904,11 @@ function ReasoningFollowupDock({
   );
 }
 
-function ExperimentLogLauncher({snapshot, blocked, paused, observationPointers, rootConversations}: {
+function ExperimentLogLauncher({snapshot, blocked, paused, observationPointers, rootConversations, onOpenOutput}: {
   snapshot: PublicSnapshot; blocked: boolean; paused: boolean;
   observationPointers: Record<string, TargetRootObservationPointer>;
   rootConversations: ReturnType<typeof useRootConversations>;
+  onOpenOutput: () => void;
 }) {
   const foreground = snapshot.research_control.foreground;
   const bundle = allStageSurfaces(snapshot).find(surface => surface.kind === "Bundle");
@@ -3936,8 +3941,7 @@ function ExperimentLogLauncher({snapshot, blocked, paused, observationPointers, 
       onClick={() => {
         if (publicTarget) {
           rootConversations.selectStage("bundle", publicTarget.session_ref);
-          const activity = document.getElementById("research-activity");
-          activity?.focus({ preventScroll: true }); activity?.scrollIntoView({ block: "start" });
+            onOpenOutput();
         } else {if (!open) setView("records"); setOpen(true); setMinimized(false);}
       }}>⌘ {publicTarget ? "实验工作记录" : "实验日志"} <span>↗</span></button>
     {available.length > 1 ? <select aria-label="选择实验任务" value={target?.target_ref ?? ""} onChange={event => {setSelected(event.currentTarget.value); setMinimized(false);}}>
@@ -4000,6 +4004,21 @@ function WorkspaceMain({
   const [historyOpen, setHistoryOpen] = useState(false);
   const liveContext = conversationContext(snapshot, runtimeStatus.status, runtimeStatus.error);
   const rootConversations = useRootConversations({ ...liveContext, questRef: overviewQuestRef(snapshot) }, !hidden);
+  const [timelineHidden, setTimelineHidden] = useState(false);
+  const [outputHidden, setOutputHidden] = useState(false);
+  const observationSplit = useObservationSplit();
+  const [timelineQuestRef, setTimelineQuestRef] = useState<string | null>(null);
+  const [historicalOutput, setHistoricalOutput] = useState(false);
+  const historicalConversations = useRootConversations({ revisionDomain: snapshot?.revision_domain,
+    questRef: timelineQuestRef, foreground: null, checks: [], stale: false }, !hidden && Boolean(timelineQuestRef));
+  const openOutput = useCallback((historical = false) => {
+    setHistoricalOutput(historical);
+    setOutputHidden(false);
+    requestAnimationFrame(focusResearchOutput);
+  }, []);
+  const returnCurrentOutput = () => { rootConversations.returnCurrent(); openOutput(); };
+  const hasTimeline = Boolean(snapshot && overviewQuestRef(snapshot));
+  const hasOutput = Boolean(liveContext.foreground || rootConversations.selected || rootConversations.selectedRef || historicalOutput);
   const targetRetry = observedTargetRetry(!runtimeStatus.error && !liveContext.stale
     && liveContext.foreground === runtimeStatus.status?.foreground ? runtimeStatus.status : null,
     !rootConversations.error ? rootConversations.data : null);
@@ -4118,8 +4137,8 @@ function WorkspaceMain({
             running={!liveContext.stale && !rootConversations.error && !rootConversations.data?.limited
               && liveContext.foreground?.status === "active" && liveContext.foreground.grant_status === "active"
               && Boolean(targetObservation || rootConversations.current?.is_executing)}
-            onSelect={stage => rootConversations.selectStage(stage)} stale={liveContext.stale}
-            stageContent={stage => <StageRootSessions model={rootConversations} stage={stage} />} />
+            onSelect={stage => { rootConversations.selectStage(stage); openOutput(); }} stale={liveContext.stale}
+            stageContent={stage => <StageRootSessions model={rootConversations} stage={stage} onOpenOutput={() => openOutput()} />} />
           <p role="status">{liveContext.stale ? "运行状态正在重新读取，以下保留上次记录。" : "当前运行状态已载入。"}
             {error ? "详细成果读取失败，正在重试。" : "详细成果仍在加载，会自动补充。"}</p>
         </div> : null}
@@ -4134,7 +4153,7 @@ function WorkspaceMain({
           </div>
           <h1 id="workspace-title">{currentQuestion?.title ?? currentQuestion?.unknown_statement ?? "当前研究问题"}</h1>
           {targetActivity}
-          <StageHistoryStrip snapshot={snapshot} overview={overview.data} error={overview.error} loading={overview.loading} onRetry={overview.retry} onRequestOverview={() => setStageResultsRequested(true)} rootConversations={rootConversations} />
+          <StageHistoryStrip snapshot={snapshot} overview={overview.data} error={overview.error} loading={overview.loading} onRetry={overview.retry} onRequestOverview={() => setStageResultsRequested(true)} rootConversations={rootConversations} onOpenOutput={() => openOutput()} />
           <button className="research-history-toggle" aria-expanded={historyOpen} onClick={() => setHistoryOpen(open => !open)}>{historyOpen ? "收起本轮记录与历史结果" : "查看本轮记录与历史结果"}<span aria-hidden="true">{historyOpen ? "−" : "+"}</span></button>
         </div> : snapshot && !showingLiveOverview ? <SnapshotHero snapshot={snapshot} /> : null}
         {snapshot && !foreground && state !== "loading" && state !== "first-error" ? (
@@ -4164,25 +4183,42 @@ function WorkspaceMain({
       </section>
 
       {snapshot?.research_space.current_quest.status === "ready" ? <ReturnSummary snapshot={snapshot} /> : null}
-      {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchBrief snapshot={snapshot} overview={overview.data} error={overview.error} rootConversations={rootConversations} /> : null}
-      {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchTimeline snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} rootConversations={rootConversations} /> : null}
+      {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchBrief snapshot={snapshot} overview={overview.data} error={overview.error} rootConversations={rootConversations} onOpenOutput={() => openOutput()} /> : null}
       {snapshot && foreground && !showingLiveOverview ? <>
         {historyOpen ? <>
           <ResearchOverview snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} onOpenWriting={onBrowseWriting} connected={connected} rootConversations={rootConversations} />
         </> : null}
-        <div className="research-primary-actions">
-          <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} observationPointers={targetRootObservationPointers} rootConversations={rootConversations} />
-          <div><button onClick={onBrowseAssets}>研究资料 ↗</button><button onClick={onBrowseQuestions}>问题树 ↗</button></div>
-        </div>
-        <ParallelExecutionLogs targets={allStageSurfaces(snapshot).flatMap(surface => surface.kind === "Bundle" ? surface.projection.target_graph.targets : [])}
-          blocked={humanRequestModalOpen} paused={hidden} />
         {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{requests[0].obligation}</span></span><b>查看并回应 ↗</b></button> : null}
-        {rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
+        {!historicalOutput && (!rootConversations.manualSelection || rootConversations.selectedCycleRef === foreground.cycle_ref)
+          && rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
           <header><h2>{displayedTarget.target_key}</h2><p>{displayedTargetFacts.summary}</p></header>
           <BoundedDetails key={displayedTarget.target_ref} className="research-target-details" summary="查看输入、产物与交接">{() => <TargetResearchFactsView facts={displayedTargetFacts} label={displayedTarget.target_key} />}</BoundedDetails>
         </section> : null}
       </> : null}
-      {(liveContext.foreground || rootConversations.selected || rootConversations.selectedRef) && !hidden ? <RootConversations model={rootConversations} connected={connected} polling={Boolean(runtimeStatus.status && !runtimeStatus.error)} targetRetry={targetRetry} /> : null}
+      {(timelineHidden && hasTimeline || outputHidden && hasOutput) ? <div className="research-panel-restores" aria-label="展开观察区域">
+        {timelineHidden && hasTimeline ? <button type="button" aria-controls="research-timeline-panel" aria-expanded={false} onClick={() => setTimelineHidden(false)}>＋ 展开研究时间线</button> : null}
+        {outputHidden && hasOutput ? <button type="button" aria-controls="research-output-panel" aria-expanded={false} onClick={() => { setOutputHidden(false); requestAnimationFrame(focusResearchOutput); }}>＋ 展开研究过程</button> : null}
+      </div> : null}
+      <div className="research-observation-grid" ref={observationSplit.gridRef} style={observationSplit.style} data-timeline-visible={hasTimeline && !timelineHidden && !showingLiveOverview} data-output-visible={hasOutput && !outputHidden}>
+        {snapshot && hasTimeline && !showingLiveOverview ? <div id="research-timeline-panel" className="research-timeline-panel" hidden={timelineHidden}>
+          <ResearchTimeline snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} rootConversations={rootConversations}
+            browsingQuestRef={timelineQuestRef} onBrowseQuest={ref => { setTimelineQuestRef(ref); setHistoricalOutput(false); }} historicalConversations={historicalConversations}
+            onOpenOutput={openOutput} onHide={() => { setTimelineHidden(true); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('[aria-controls="research-timeline-panel"][aria-expanded="false"]')?.focus()); }} />
+        </div> : null}
+        {hasTimeline && !timelineHidden && !showingLiveOverview && hasOutput && !outputHidden && !hidden ? <ObservationResize split={observationSplit} /> : null}
+        {hasOutput && !hidden ? <div id="research-output-panel" className="research-output-panel" hidden={outputHidden}>
+          <RootConversations model={historicalOutput ? historicalConversations : rootConversations} connected={connected} polling={Boolean(runtimeStatus.status && !runtimeStatus.error)} targetRetry={historicalOutput ? null : targetRetry}
+            onReturnCurrent={returnCurrentOutput} onHide={() => { setOutputHidden(true); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('[aria-controls="research-output-panel"][aria-expanded="false"]')?.focus()); }} />
+        </div> : null}
+      </div>
+      {snapshot && foreground && !showingLiveOverview ? <section className="research-experiment-row" aria-label="实验日志区域">
+        <div className="research-primary-actions">
+          <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} observationPointers={targetRootObservationPointers} rootConversations={rootConversations} onOpenOutput={() => openOutput()} />
+          <div><button onClick={onBrowseAssets}>研究资料 ↗</button><button onClick={onBrowseQuestions}>问题树 ↗</button></div>
+        </div>
+        <ParallelExecutionLogs targets={allStageSurfaces(snapshot).flatMap(surface => surface.kind === "Bundle" ? surface.projection.target_graph.targets : [])}
+          blocked={humanRequestModalOpen} paused={hidden} />
+      </section> : null}
       <details className="research-existing-details"><summary>研究材料与阶段详情</summary>
       {showingLiveOverview && snapshot ? <p role="status">以下保留上次读取的阶段详情；当前轮次的详细结果仍在加载。</p> : null}
       <div className="lumen-lower">
@@ -4371,6 +4407,7 @@ function App() {
 }
 
 function DetailedApp() {
+  const assistantWidth = useAssistantWidth();
   const initialParameters = useMemo(
     () => new URLSearchParams(window.location.search),
     [],
@@ -4379,6 +4416,7 @@ function DetailedApp() {
     () => window.matchMedia("(max-width: 880px)").matches,
   );
   const [companionOpen, setCompanionOpen] = useState(() => initialParameters.get("companion") === "1");
+  const [companionHidden, setCompanionHidden] = useState(false);
   const companionReturnFocusRef = useRef<HTMLElement | null>(null);
   const companionScrollRef = useRef(0);
   const companionToggleRef = useRef<HTMLButtonElement>(null);
@@ -4404,6 +4442,7 @@ function DetailedApp() {
         ? document.activeElement : null;
       companionScrollRef.current = window.scrollY;
       setCompanionOpen(true);
+      setCompanionHidden(false);
     }
   };
   const [snapshot, setSnapshot] = useState<PublicSnapshot | null>(null);
@@ -4854,6 +4893,7 @@ function DetailedApp() {
     companionReturnFocusRef.current = opener;
     companionScrollRef.current = window.scrollY;
     setCompanionOpen(true);
+    setCompanionHidden(false);
     setSelectedQuestionContext(question);
     setQuestionRouteNodeRef(question.question_ref);
     window.history.replaceState(
@@ -5115,7 +5155,7 @@ function DetailedApp() {
         {showCompanion ? "跳到研究助手" : "跳到主要内容"}
       </a>
       {(recovery.updating || error) ? <div className="projection-refresh" data-testid="projection-refresh" role="status">{error ?? "详细状态正在更新"}</div> : null}
-      <div className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-companion-open={showCompanion} data-hc-background>
+      <div ref={assistantWidth.shellRef} style={assistantWidth.style} className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-companion-open={showCompanion} data-companion-hidden={!compactLayout && companionHidden} data-hc-background>
         <header className="lumen-header" data-shell-region="header">
           <a className="lumen-brand" aria-label="Meta-research 首页" href="/" style={{ color: "inherit", textDecoration: "none" }}>
             <span className="lumen-logo" aria-hidden="true"><MetaTrace variant="signature" /></span>
@@ -5132,6 +5172,11 @@ function DetailedApp() {
             </span>
             {snapshot ? <code>状态 {snapshot.revision}</code> : null}
           </div>
+          <div className="workspace-header-tools">
+            {!compactLayout && companionHidden ? <button className="research-companion-restore" type="button" aria-label="展开研究助手" aria-controls="research-companion" aria-expanded={false} onClick={() => {
+              setCompanionHidden(false);
+              requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('[aria-label="隐藏研究助手"]')?.focus());
+            }}><span aria-hidden="true">＋</span>研究助手</button> : null}
           <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
           <CodexAccount disabled={humanRequestSurfaceOpen} />
           <ResearchMotionControl />
@@ -5142,6 +5187,7 @@ function DetailedApp() {
             disabled={humanRequestSurfaceOpen || detailsScopeChanged}
             onChanged={() => void reload()}
           />
+          </div>
         </header>
         <LumenRail
           activeSection={humanRequestSurfaceOpen ? "requests"
@@ -5214,8 +5260,10 @@ function DetailedApp() {
             onControlQuestion={controlQuestionLifecycle}
           />
         ) : null}
+        {!companionHidden || compactLayout ? <AssistantResize width={assistantWidth.width} maximum={assistantWidth.maximum} onResize={assistantWidth.resize} onCommit={assistantWidth.commit} /> : null}
         <div id="research-companion" className="lumen-companion-panel" tabIndex={-1}>
         <QuestCompanion
+          onHide={() => { if (compactLayout) toggleCompanion(); else { setCompanionHidden(true); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(".research-companion-restore")?.focus()); } }}
           state={state}
           collaboration={snapshot?.human_collaboration}
           goalAlignment={snapshot?.research_space.current_quest.guidance_alignment ?? []}
@@ -5279,6 +5327,7 @@ function DetailedApp() {
           onSent={() => {
             setWritingOpen(false);
             setCompanionOpen(true);
+            setCompanionHidden(false);
             window.history.replaceState(null, "", "/?workspace=1&companion=1");
             void reload();
           }}
