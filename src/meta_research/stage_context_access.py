@@ -1,10 +1,57 @@
 """Authenticated, paged reading of a stage's frozen inputs and scoped history."""
 from meta_research.context_presentation import ExactContextPages, context_read_page, literature_reference, reasoning_handoff_reference
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.bundle_source_projection import target_projection, target_commit_projection
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from meta_research.target_research_note_access import read_target_research_notes
 
 STAGE_CONTEXT_OPERATION_ID = 'research_memory.stage_context.read'
+
+
+def _bundle_source(research_graph, request, context, arguments):
+    if context.root_kind != 'bundle':
+        raise SemanticMcpError('stage_bundle_source_unbound')
+    graph = research_graph.query_target_graph(request.request_ref)
+    plan = request.accepted_formal_plan
+    if (graph is None or plan is None
+            or graph.request_ref != request.request_ref
+            or graph.run_ref != context.run_ref
+            or graph.quest_ref != request.accepted_question.quest_ref
+            or graph.formal_plan_ref != plan.formal_plan_ref
+            or graph.plan_document_hash != canonical_hash(plan.plan_document)
+            or graph.context_pack_ref != request.context_pack_ref
+            or graph.context_pack_hash != request.context_pack_hash):
+        raise SemanticMcpError('stage_bundle_source_unbound')
+    research_graph.verify_target_graph_receipt(request_ref=graph.request_ref,
+        run_ref=graph.run_ref, graph_ref=graph.graph_ref, receipt=graph.receipt,
+        require_current=False, require_complete=False)
+    source_ref = arguments.get('source_ref')
+    source = arguments['source']
+    value = None
+    if source == 'bundle_initial_target_plan' and source_ref == graph.graph_ref:
+        value = graph.target_plan
+        if canonical_hash(value) != graph.target_plan_hash:
+            raise SemanticMcpError('stage_bundle_version_unbound')
+    elif source == 'bundle_target':
+        target = next((item for item in graph.targets if item.target_ref == source_ref), None)
+        if target is not None:
+            value = target_projection(target)
+    elif source == 'bundle_target_commit':
+        commit = next((item for item in research_graph.query_target_commits(graph.graph_ref)
+                       if item.commit_ref == source_ref), None)
+        if commit is not None:
+            transition = research_graph.query_target_frontier_commit_transition(commit.target_ref)
+            if (transition is None or transition.target_commit_ref != commit.commit_ref
+                    or transition.target_ref != commit.target_ref
+                    or transition.target_run_ref != commit.target_run_ref
+                    or transition.issuer_receipt != commit.receipt):
+                raise SemanticMcpError('stage_bundle_source_unbound')
+            value = target_commit_projection(commit)
+    if value is None:
+        raise SemanticMcpError('stage_bundle_source_unbound')
+    if canonical_hash(value) != arguments.get('version_ref'):
+        raise SemanticMcpError('stage_bundle_version_unbound')
+    return source_ref, value
 
 
 def _predecessor(advancement_engine, request, source_ref):
@@ -72,6 +119,8 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
                 raise SemanticMcpError('research_note_predecessor_unbound')
         if source=='context_pack':
             value=pack
+        elif source in {'bundle_initial_target_plan', 'bundle_target', 'bundle_target_commit'}:
+            source_ref, value = _bundle_source(research_graph, request, context, arguments)
         elif source in {'creation_understanding','creation_corrections','creation_sources'}:
             binding=pack.get('creation_basis')
             if not isinstance(binding,dict):
@@ -137,7 +186,7 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
         # Source resolution and all current scope checks above run even on a
         # representation hit. Current history has no exact revision identity.
         identity = None if source in {'question_history', 'question_index', 'evidence_index', 'research_notes', 'creation_sources'} else (
-            request.context_pack_ref, request.context_pack_hash, source, source_ref)
+            request.context_pack_ref, request.context_pack_hash, source, source_ref, arguments.get('version_ref'))
         page=context_read_page(value,path=arguments.get('path',[]),offset=arguments.get('offset',0),limit=arguments.get('limit',8192),
             cache=page_cache, identity=identity)
     except ValueError as error:
@@ -152,11 +201,13 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
     page_cache = ExactContextPages()
     return (SemanticOperation(semantic_operation_id=STAGE_CONTEXT_OPERATION_ID,
         owning_module='research_memory',
-        description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. For byte/index pagination and errors, read this operation\'s tools.contracts.read contract.',
+        description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. Bundle sources require the supplied source_ref and version_ref. version_ref pins the whole source; content_hash identifies the selected JSON path. JSON path is not a filesystem path. For byte/index pagination and errors, read this operation\'s tools.contracts.read contract.',
         return_description='Return <=16384 UTF-8 JSON bytes with exact source hash; next_offset=null ends the byte stream, while complete only means this page contains the entire source. Then follow index_page.next_offset with index_offset and reset byte offset to 0; history pages 12 outcomes/Questions or 32 evidence references. For question_history, carry index_page.query_revision as query_revision when continuing; keep it for byte pages of that index page. Changed Owner history requires restarting at index_offset=0 and byte offset=0 without the old revision.',
         error_descriptions={
             'semantic_call_scope_stale': 'The current stage root, attempt or fence no longer matches the Owner; recover through the current authorized root.',
             'stage_context_ref_unbound': 'context_pack_ref must match this stage request\'s frozen context.',
+            'stage_bundle_source_unbound': 'The exact source is not accepted within this Bundle graph and current stage scope.',
+            'stage_bundle_version_unbound': 'The source version hash does not match. Never substitute a newer version.',
             'stage_predecessor_source_unbound': 'The requested predecessor is not the exact accepted predecessor bound to this successor.',
             'stage_context_page_invalid': 'The history index offset is invalid; use the returned index_page continuation.',
             'research_query_revision_required': 'A question_history continuation requires the query_revision returned by its first index page.',
@@ -164,8 +215,9 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
         },
         input_schema={'type':'object','properties':{
             'context_pack_ref':{'type':'string','minLength':1,'maxLength':256},
-            'source':{'type':'string','enum':['context_pack','question','literature_records','creation_understanding','creation_corrections','creation_sources','scientific_outcome','predecessor_closure','question_history','question_index','evidence_index']},
+            'source':{'type':'string','enum':['context_pack','question','literature_records','creation_understanding','creation_corrections','creation_sources','scientific_outcome','predecessor_closure','question_history','question_index','evidence_index','bundle_initial_target_plan','bundle_target','bundle_target_commit']},
             'source_ref':{'type':'string','maxLength':256},
+            'version_ref':{'type':'string','pattern':'^[0-9a-f]{64}$'},
             'query_revision':{'type':'string','pattern':'^[0-9a-f]{64}$'},
             'path':{'type':'array','maxItems':16,'items':{'type':'string','maxLength':256}},
             'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':16384},

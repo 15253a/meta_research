@@ -1072,6 +1072,13 @@ def build_production_runtime(
         bind_batch_reader(partial(verified_batch_plan_reader,
             advancement_engine=owners.advancement_engine, agent_runtime=owners.agent_runtime,
             research_graph=owners.research_graph, research_memory=owners.research_memory))
+    bind_batch_sources = getattr(bundle_skill_provider, "bind_batch_source_readers", None)
+    if callable(bind_batch_sources):
+        from functools import partial
+        from meta_research.bundle_batch_access import verified_batch_source_readers
+        bind_batch_sources(partial(verified_batch_source_readers,
+            advancement_engine=owners.advancement_engine, agent_runtime=owners.agent_runtime,
+            research_graph=owners.research_graph, research_memory=owners.research_memory))
     bind_reasoning_conformance = getattr(
         reasoning_skill_provider, "bind_full_conformance_authority", None
     )

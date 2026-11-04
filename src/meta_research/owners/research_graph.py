@@ -1896,6 +1896,12 @@ class ResearchGraphInterface(ResearchLiteratureOwnerInterface, ResearchEnvironme
 
     def query_target_graph(self, request_ref: str) -> AcceptedTargetGraph | None: ...
 
+    def verify_target_graph_receipt(
+        self, *, request_ref: str, run_ref: str, graph_ref: str,
+        receipt: AcceptanceReceipt, require_current: bool = False,
+        require_complete: bool = False,
+    ) -> dict[str, object]: ...
+
     def query_target_measurement_domain_authority(
         self, target_ref: str
     ) -> AcceptedTargetMeasurementDomainAuthority | None: ...
@@ -13030,6 +13036,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
     def query_target_graph(self, request_ref: str) -> AcceptedTargetGraph | None:
         facts = self._receipt_verifier._query_target_graph_read_facts(request_ref)
         return None if facts is None else facts[0]
+
+    def verify_target_graph_receipt(self, **values) -> dict[str, object]:
+        return self._receipt_verifier.verify_target_graph_receipt(**values)
 
     def query_target_measurement_domain_authority(
         self, target_ref: str

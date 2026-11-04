@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from meta_research.bundle_source_projection import target_projection, target_commit_projection
 from meta_research.idea_skill import stage_provider
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
 from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
@@ -1828,41 +1829,8 @@ class BundleStageWorker:
             graph_receipt=graph.receipt, native_session_ref=native_session_ref,
             proof=context["isolation_basis"])
 
-    @staticmethod
-    def _target_projection(target: AcceptedTarget) -> dict[str, object]:
-        candidate = target.spec.get("candidate")
-        risk_class = target.spec.get("risk_class")
-        if (
-            not isinstance(candidate, dict)
-            or risk_class not in {"normal", "high"}
-        ):
-            raise OwnerConflict("target_dispatch_formal_spec_invalid")
-        return {
-            "target_ref": target.target_ref,
-            "target_key": target.target_key,
-            "spec_hash": target.spec_hash,
-            "spec": target.spec,
-            "candidate": candidate,
-            "risk_class": risk_class,
-            "dependency_refs": list(target.dependency_refs),
-            "receipt": target.receipt.as_public_dict(),
-        }
-
-    @staticmethod
-    def _target_commit_projection(commit: TargetCommit) -> dict[str, object]:
-        return {
-            "commit_ref": commit.commit_ref,
-            "target_ref": commit.target_ref,
-            "target_run_ref": commit.target_run_ref,
-            "evaluation_attempt_ref": commit.evaluation_attempt_ref,
-            "target_spec_hash": commit.target_spec_hash,
-            "closure_hash": commit.closure_hash,
-            **({"result_disposition": commit.result_disposition}
-               if commit.result_disposition is not None else {}),
-            "protocol": commit.closure["protocol"],
-            "metric_result": target_commit_metric_result(commit),
-            "receipt": commit.receipt.as_public_dict(),
-        }
+    _target_projection = staticmethod(target_projection)
+    _target_commit_projection = staticmethod(target_commit_projection)
 
     def _evidence_for_commits(self, quest_ref: str, commits) -> tuple[dict[str, object], ...]:
         """Read this graph's exact published roots even outside the Plan page."""
