@@ -211,6 +211,7 @@ class ProtectedCreationRuntime:
                     if self._stop_before_launch:
                         return self._cancelled_call(call)
                 self._prepare_runtime()
+                self._refresh_account_credentials()
                 arguments, environment, outputs, prompt = self._prepare_call(call)
                 launch = self._control / ("launch-" + secrets.token_hex(12) + ".json")
                 receipt = launch.with_suffix(".receipt.json")
@@ -528,6 +529,73 @@ class ProtectedCreationRuntime:
             os.chown(destination, _UID, _UID)
         _write_private(marker, json.dumps({"entry": identity, "files": staged, "file_modes": file_modes}).encode())
 
+    def _refresh_account_credentials(self) -> None:
+        """Apply explicit account changes between sealed native calls only.
+
+        A native session may refresh its own tokens. Leave those private bytes
+        alone until the operator explicitly activates a different generation.
+        """
+        source_state = self.credentials_home / "account-state.json"
+        try:
+            with _regular_reader(source_state) as stream:
+                details = os.fstat(stream.fileno())
+                if details.st_uid != 0 or details.st_mode & 0o077:
+                    raise ProtectedCreationError("protected_creation_credentials_invalid")
+                state = json.loads(stream.read(4097))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            raise ProtectedCreationError("protected_creation_credentials_invalid") from error
+        if (not isinstance(state, dict)
+            or set(state) not in ({"generation", "logged_out"}, {"generation", "logged_out", "account_id_hash"})
+            or not isinstance(state["generation"], str)
+            or re.fullmatch(r"[0-9a-f]{16,128}", state["generation"]) is None
+            or type(state["logged_out"]) is not bool
+            or ("account_id_hash" in state and (not isinstance(state["account_id_hash"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", state["account_id_hash"]) is None))):
+            raise ProtectedCreationError("protected_creation_credentials_invalid")
+        if not state["logged_out"]:
+            from meta_research.codex_account import CodexAccountStateError, ensure_codex_account_current
+            try:
+                ensure_codex_account_current(self.credentials_home)
+            except CodexAccountStateError as error:
+                code = ("codex_account_credentials_changed" if error.code == "codex_account_credentials_changed"
+                        else "protected_creation_credentials_invalid")
+                raise ProtectedCreationError(code) from error
+        applied = self._control / "account-generation.json"
+        try:
+            with _regular_reader(applied) as stream:
+                details = os.fstat(stream.fileno())
+                if details.st_uid != 0 or details.st_mode & 0o077:
+                    raise ProtectedCreationError("protected_creation_credentials_invalid")
+                previous = json.loads(stream.read(4097))
+        except FileNotFoundError:
+            previous = None
+        except (OSError, ValueError) as error:
+            raise ProtectedCreationError("protected_creation_credentials_invalid") from error
+        if previous == {"generation": state["generation"]}:
+            return
+        destination = self.jail_root / "home/creation/.codex/auth.json"
+        if state["logged_out"]:
+            with _parent_descriptor(destination) as parent:
+                try:
+                    os.unlink(destination.name, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+        else:
+            try:
+                with _regular_reader(self.credentials_home / "auth.json") as stream:
+                    details = os.fstat(stream.fileno())
+                    if details.st_uid != 0 or details.st_mode & 0o077:
+                        raise ProtectedCreationError("protected_creation_credentials_invalid")
+                    content = stream.read(_INPUT_LIMIT + 1)
+                if len(content) > _INPUT_LIMIT or not isinstance(json.loads(content), dict):
+                    raise ProtectedCreationError("protected_creation_credentials_invalid")
+            except (OSError, ValueError) as error:
+                raise ProtectedCreationError("protected_creation_credentials_invalid") from error
+            _atomic_account_file(destination, content, uid=_UID)
+        _atomic_account_file(applied, json.dumps({"generation": state["generation"]}).encode(), uid=0)
+
     def _restore_runtime_permissions(self, manifest: dict[str, object]) -> None:
         # A private daemon umask used to seal valid bytes with root-only access.
         # Repair only verified, root-owned runtime entries, while holding the
@@ -751,6 +819,26 @@ def _replace_private(path: Path, content: bytes, mode: int) -> None:
         except FileNotFoundError:
             pass
     _write_private(path, content, mode)
+
+
+def _atomic_account_file(path: Path, content: bytes, *, uid: int) -> None:
+    with _parent_descriptor(path) as parent:
+        temporary = ".account-" + secrets.token_hex(16)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                os.fchown(stream.fileno(), uid, uid)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
 
 
 @contextmanager

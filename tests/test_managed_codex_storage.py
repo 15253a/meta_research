@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import json
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,8 +12,128 @@ import pytest
 from meta_research.cli import CliError, _daemon_environment, _explicit_data_root
 from meta_research.composition import build_production_runtime
 from meta_research.paths import DataRootError, prepare_data_root
-from meta_research.provider_supervisor import protected_subprocess_environment
+from meta_research.provider_supervisor import (
+    SUPERVISOR_REQUEST_SCHEMA_V2, ensure_transport_key, read_transport_envelope,
+    protected_subprocess_environment, write_supervisor_request,
+)
 from meta_research.quest_drafting import _CancellableProcessRunner
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Synthetic provider uses a POSIX executable entry.")
+def test_logged_out_account_blocks_new_provider_but_allows_local_probe(tmp_path):
+    root = prepare_data_root(tmp_path / "data")
+    state = root.codex_home / "account-state.json"
+    state.write_text(json.dumps({"generation": "b" * 32, "logged_out": True}))
+    state.chmod(0o600)
+    # A provider already in flight can finish by refreshing its old credentials.
+    auth = root.codex_home / "auth.json"
+    auth.write_text('{"tokens":{"account_id":"previous-account"}}')
+    auth.chmod(0o600)
+    executable = tmp_path / "fake-codex"
+    executable.write_text(f"#!{sys.executable}\nprint('local probe')\n")
+    executable.chmod(0o700)
+    runner = _CancellableProcessRunner(protected_environment=root.codex_environment)
+
+    with pytest.raises(OSError, match="^codex_account_logged_out$"):
+        runner([str(executable), "exec", "-"], "", 5)
+
+    assert runner.run_command([str(executable), "--version"], 5).stdout == "local probe\n"
+    assert runner.run_command([str(executable), "--config", "features.test=false", "features", "list"], 5).stdout == "local probe\n"
+    assert runner.run_command([str(executable), "app-server", "generate-json-schema"], 5).stdout == "local probe\n"
+
+
+@pytest.mark.parametrize("transport", ("exec", "app-server", "native_bridge", "harness_bridge"))
+@pytest.mark.parametrize("durable", (False, True))
+def test_provider_identity_guard_rejects_old_account_for_codex_transports(tmp_path, transport, durable):
+    root = prepare_data_root(tmp_path / "data")
+    state = root.codex_home / "account-state.json"
+    state.write_text(json.dumps({"generation": "f" * 32, "logged_out": False,
+        "account_id_hash": "3d5c2194f0cc7c9a964b46fd0e6d408325f7fdcbe1a877ba8522fb03bba74033"}))
+    state.chmod(0o600)
+    auth = root.codex_home / "auth.json"
+    auth.write_text('{"tokens":{"account_id":"previous-account"}}')
+    auth.chmod(0o600)
+    argv = {"exec": ["unused-codex", "exec", "-"],
+        "app-server": ["unused-codex", "app-server"],
+        "native_bridge": [sys.executable, "-m", "meta_research.native_codex_bridge"],
+        "harness_bridge": [sys.executable, "-m", "meta_research.harness_cli_bridge", "--family", "codex"],
+    }[transport]
+    runner = _CancellableProcessRunner(protected_environment=root.codex_environment)
+
+    with pytest.raises(OSError, match="^codex_account_credentials_changed$"):
+        if durable:
+            runner.run_durable_job("test", argv, "", 5, tmp_path / "stdout", tmp_path / "pid", tmp_path / "request")
+        else:
+            runner(argv, "", 5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Synthetic provider uses a POSIX executable entry.")
+def test_durable_supervisor_rechecks_account_before_provider_launch(tmp_path):
+    root = prepare_data_root(tmp_path / "data")
+    state = root.codex_home / "account-state.json"
+    state.write_text(json.dumps({"generation": "c" * 32, "logged_out": True}))
+    state.chmod(0o600)
+    executable = tmp_path / "fake-codex"
+    executable.write_text(f"#!{sys.executable}\nprint('must not launch')\n")
+    executable.chmod(0o700)
+    _, key = ensure_transport_key(tmp_path)
+    invocation_hash = "d" * 64
+    operation = tmp_path / "provider-operations" / invocation_hash[:2] / invocation_hash
+    operation.mkdir(parents=True)
+    paths = {name + "_path": operation / filename for name, filename in (
+        ("prompt", "prompt.txt"), ("schema", "output-schema.json"),
+        ("stdout", "stdout.jsonl"), ("result", "last-message.json"),
+        ("lock", "supervisor.lock"), ("ready", "supervisor-ready.json"),
+        ("started", "provider-started.json"), ("receipt", "supervisor-exit.json"),
+        ("stop", "supervisor-stop.json"),
+    )}
+    paths["prompt_path"].write_text("synthetic test")
+    paths["schema_path"].write_text("{}")
+    request = operation / "supervisor-request.json"
+    write_supervisor_request(request, {
+        "schema_ref": SUPERVISOR_REQUEST_SCHEMA_V2, "invocation_hash": invocation_hash,
+        "argv": [str(executable), "exec", "--output-schema", str(paths["schema_path"]),
+                 "--output-last-message", str(paths["result_path"]), "-"],
+        "timeout_seconds": 5.0, "stream_max_bytes": 4096, "result_max_bytes": 4096,
+        **{name: str(path) for name, path in paths.items()},
+    }, key)
+
+    completed = subprocess.run([sys.executable, "-m", "meta_research.streaming_provider_supervisor", str(request)],
+        env={**os.environ, **root.codex_environment}, capture_output=True, timeout=10)
+
+    assert completed.returncode == 0
+    assert read_transport_envelope(paths["receipt_path"], key)["termination_reason"] == "launch_failed"
+    assert not paths["started_path"].exists()
+    assert paths["stdout_path"].read_bytes() == b""
+
+
+def test_explicit_account_logout_prevents_template_reseed(tmp_path, monkeypatch):
+    template = tmp_path / "deployment-auth.json"
+    template.write_text('{"auth_mode":"chatgpt","tokens":{"test":"original"}}')
+    monkeypatch.setenv("META_RESEARCH_CODEX_AUTH_TEMPLATE", str(template))
+    root = prepare_data_root(tmp_path / "data")
+    assert (root.codex_home / "auth.json").is_file()
+    (root.codex_home / "account-state.json").write_text(json.dumps({
+        "generation": "a" * 32, "logged_out": True,
+    }))
+    (root.codex_home / "auth.json").unlink()
+
+    reopened = prepare_data_root(root.root)
+
+    assert not (reopened.codex_home / "auth.json").exists()
+    assert json.loads(template.read_text())["tokens"] == {"test": "original"}
+
+
+@pytest.mark.parametrize("state", ('{"generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","logged_out":false}', "broken-state"))
+def test_managed_account_state_never_falls_back_to_old_template(tmp_path, monkeypatch, state):
+    template = tmp_path / "deployment-auth.json"
+    template.write_text('{"test":"old-account"}')
+    monkeypatch.setenv("META_RESEARCH_CODEX_AUTH_TEMPLATE", str(template))
+    root = prepare_data_root(tmp_path / "data")
+    (root.codex_home / "account-state.json").write_text(state)
+    (root.codex_home / "auth.json").unlink()
+
+    assert not (prepare_data_root(root.root).codex_home / "auth.json").exists()
 
 
 def test_data_root_prepares_private_codex_home_and_deployment_cli_path(

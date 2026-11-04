@@ -33,6 +33,7 @@ from meta_research.auth import AuthSession
 from meta_research.asset_download import AssetDownloadResponse
 from meta_research.companion_writing import WritingRequest
 from meta_research.codex_runtime import CODEX_MODEL_REF
+from meta_research.codex_account import CodexAccountService
 from meta_research.time_budget import time_budget_seconds
 from meta_research.composition import ProductionRuntime
 from meta_research.human_reply import ProvidedReply
@@ -766,6 +767,36 @@ class RuntimeConditionsRequest(BaseModel):
     stage_models: dict[str, str] | None = None
 
 
+class CodexAccountAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class CancelCodexLoginRequest(CodexAccountAction):
+    login_id: str = Field(min_length=1, max_length=160)
+
+
+class CodexAccountIdentity(BaseModel):
+    type: Literal["chatgpt", "apiKey"]
+    email: str | None = None
+    plan_type: str | None = None
+
+
+class CodexLoginView(BaseModel):
+    id: str
+    status: Literal["pending", "completed", "failed", "cancelled"]
+    verification_url: str | None = None
+    user_code: str | None = None
+    error_code: str | None = None
+    expires_at: float | None = None
+
+
+class CodexAccountView(BaseModel):
+    status: Literal["authenticated", "unauthenticated", "unavailable"]
+    account: CodexAccountIdentity | None = None
+    login: CodexLoginView | None = None
+    error_code: str | None = None
+
+
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
@@ -796,6 +827,7 @@ def create_app(
     asset_io_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_IO_OPERATIONS)
     asset_intake_recovery_slots = asyncio.Semaphore(1)
     asset_handoff_singleflight = _AssetIOSingleFlight()
+    codex_account = CodexAccountService(runtime.data_root)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -821,6 +853,11 @@ def create_app(
         try:
             yield
         finally:
+            # Cancel only this app's pending sign-in, never the research account.
+            try:
+                await asyncio.to_thread(codex_account.close)
+            except Exception:
+                LOGGER.error("account login shutdown failed")
             try:
                 await asyncio.to_thread(runtime.request_stop)
             except Exception:
@@ -843,6 +880,30 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    def account_response(operation: Callable[[], dict[str, object]]) -> CodexAccountView:
+        try:
+            # The public boundary allowlists identity fields, never credentials.
+            return CodexAccountView.model_validate(operation())
+        except Exception:
+            # Native errors can include credentials; never return/log their text.
+            raise HTTPException(status_code=503, detail={"code": "codex_account_unavailable"}) from None
+
+    @app.get("/api/v1/codex/account", response_model=CodexAccountView)
+    def read_codex_account() -> CodexAccountView:
+        return account_response(codex_account.read)
+
+    @app.post("/api/v1/codex/account/login", response_model=CodexAccountView)
+    def start_codex_login(_request: CodexAccountAction) -> CodexAccountView:
+        return account_response(codex_account.start_login)
+
+    @app.post("/api/v1/codex/account/login/cancel", response_model=CodexAccountView)
+    def cancel_codex_login(request: CancelCodexLoginRequest) -> CodexAccountView:
+        return account_response(lambda: codex_account.cancel_login(request.login_id))
+
+    @app.post("/api/v1/codex/account/logout", response_model=CodexAccountView)
+    def logout_codex_account(_request: CodexAccountAction) -> CodexAccountView:
+        return account_response(codex_account.logout)
 
     @app.get("/api/v1/runtime/resources")
     def runtime_resources() -> dict[str, object]:

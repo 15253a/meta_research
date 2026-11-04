@@ -90,6 +90,7 @@ import { ExperimentLogs, ExperimentOutputViews, ParallelExecutionLogs } from "./
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
 import { RootConversations, StageRootSessions, useRootConversations } from "./RootConversations";
 import { RuntimeConditions } from "./RuntimeConditions";
+import { CodexAccount } from "./CodexAccount";
 import "./research-interaction.css";
 import "./spectrum-workspace.css";
 import "./workspace-modal.css";
@@ -5132,6 +5133,7 @@ function DetailedApp() {
             {snapshot ? <code>状态 {snapshot.revision}</code> : null}
           </div>
           <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
+          <CodexAccount disabled={humanRequestSurfaceOpen} />
           <ResearchMotionControl />
           <HostResources disabled={humanRequestSurfaceOpen} />
           <ForegroundResearchControlShortcut

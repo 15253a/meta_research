@@ -34,6 +34,7 @@ from meta_research.provider_supervisor import (
     read_transport_key_for_operation,
     read_verified_exit_receipt,
     protected_subprocess_environment,
+    ensure_provider_account_current,
     request_supervisor_stop,
     supervisor_request_never_started,
     write_supervisor_request,
@@ -486,6 +487,8 @@ class _CancellableProcessRunner:
             with self._lock:
                 if self._stopping or job_ref in self._cancelled_jobs:
                     raise _ProcessStopped
+            process_environment = self._subprocess_environment(environment)
+            ensure_provider_account_current(argv, process_environment)
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -497,7 +500,7 @@ class _CancellableProcessRunner:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name == "posix",
-                env=self._subprocess_environment(environment),
+                env=process_environment,
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None
             ready_path = supervisor_request_path.parent / "supervisor-ready.json"
@@ -577,13 +580,15 @@ class _CancellableProcessRunner:
                 job_ref is not None and job_ref in self._cancelled_jobs
             ):
                 raise _ProcessStopped
+            process_environment = self._subprocess_environment(environment)
+            ensure_provider_account_current(argv, process_environment)
             process = subprocess.Popen(
                 argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name == "posix",
-                env=self._subprocess_environment(environment),
+                env=process_environment,
                 cwd=provider_working_directory(argv, environment),
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None

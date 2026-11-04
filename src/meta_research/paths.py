@@ -402,12 +402,21 @@ def _seed_codex_home_auth(root: DataRoot) -> None:
     Codex keeps its login inside ``CODEX_HOME/auth.json`` while sessions and
     queues stay per research root, so a new root copies the deployment-level
     credential template once and then owns its own state.  An existing auth
-    file is never overwritten; a missing or unreadable template is a silent
-    no-op (capability probing reports the unauthenticated provider).
+    file is never overwritten. Once an account has been explicitly activated
+    or logged out, its local state owns the login and templates cannot restore
+    an older account. A missing or unreadable template is a silent no-op.
     """
 
     auth = root.codex_home / "auth.json"
     try:
+        # lstat also recognizes an unreadable or dangling linked marker. Such
+        # state must not authorize falling back to a shared credential.
+        try:
+            (root.codex_home / "account-state.json").lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            return
         if auth.exists():
             return
     except OSError:

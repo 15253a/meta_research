@@ -1,0 +1,30 @@
+.lumen-header .codex-account-entry { flex: 0 1 210px; min-width: 100px; max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 9px 12px; border: 1px solid #d8deea; border-radius: 10px; color: #35405b; background: #fff; font-size: 12px; cursor: pointer; }
+.codex-account-entry:disabled { opacity: .5; cursor: default; }
+.codex-account-dialog { width: min(520px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow: auto; border: 1px solid #d8deea; border-radius: 18px; padding: 24px; color: #172033; background: #fff; box-shadow: 0 24px 90px #15213c40; }
+.codex-account-dialog::backdrop { background: #17203366; }
+.codex-account-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.codex-account-dialog h2 { margin: 0; font-size: 20px; }
+.codex-account-dialog p { color: #66718a; font-size: 14px; line-height: 1.6; }
+.codex-account-dialog dl { display: grid; gap: 14px; padding: 16px; background: #f4f6fb; border-radius: 12px; }
+.codex-account-dialog dl > div { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 10px; }
+.codex-account-dialog dt { color: #66718a; font-size: 13px; }
+.codex-account-dialog dd { margin: 0; overflow-wrap: anywhere; font-size: 14px; }
+.codex-account-dialog button { padding: 9px 13px; border: 1px solid #d8deea; border-radius: 9px; background: #fff; color: #35405b; cursor: pointer; }
+.codex-account-dialog button:disabled { opacity: .5; cursor: default; }
+.codex-account-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.codex-device-login, .codex-logout-confirm { margin-top: 20px; padding: 16px; border: 1px solid #d8deea; border-radius: 12px; background: #f8f9fd; }
+.codex-device-login h3 { margin: 0; font-size: 16px; }
+.codex-device-code { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 16px 0; }
+.codex-device-code code { user-select: all; overflow-wrap: anywhere; font-size: 22px; letter-spacing: .08em; color: #172033; }
+.codex-device-login a { color: #514cc8; font-weight: 600; text-underline-offset: 3px; }
+.codex-account-dialog [role="alert"] { color: #a82e3d; }
+@media (max-width: 1160px) {
+  .lumen-shell:has(.codex-account-entry) { grid-template-rows: auto minmax(0, 1fr); }
+  .lumen-header:has(.codex-account-entry) { height: auto; min-height: 64px; flex-wrap: wrap; gap: 8px; padding: 12px; }
+  .lumen-header:has(.codex-account-entry) .lumen-quest-context { min-width: 120px; }
+}
+@media (max-width: 600px) {
+  .lumen-header:has(.codex-account-entry) .lumen-quest-context { flex: 1 1 calc(100% - 54px); min-width: 0; }
+  .lumen-header .codex-account-entry { flex: 1 1 100px; padding: 7px 9px; font-size: 11px; max-width: none; }
+  .codex-account-dialog { padding: 18px; }
+}

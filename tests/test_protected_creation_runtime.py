@@ -402,6 +402,141 @@ print(Path.home().joinpath(".codex/config.toml").read_text(), end="")
     assert (runtime.credentials_home / "auth.json").read_text() == '{"test":"private-copy"}'
 
 
+def test_explicit_account_activation_refreshes_next_call_but_preserves_native_refresh(runtime, tmp_path):
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+    auth = credentials / "auth.json"
+    auth.write_text('{"test":"first-account"}')
+    auth.chmod(0o600)
+    account = ProtectedCreationRuntime(tmp_path / "account-jail", runtime.executable, credentials)
+    account.run(_call('''
+from pathlib import Path
+(Path.home()/".codex/auth.json").write_text('{"test":"native-refresh"}')
+(Path.home()/".codex/session-test").write_text("same native session")
+'''))
+    auth.write_text('{"test":"second-account"}')
+    state = credentials / "account-state.json"
+    state.write_text(json.dumps({"generation": "a" * 32, "logged_out": False}))
+    state.chmod(0o600)
+
+    activated = account.run(_call('''
+from pathlib import Path
+home = Path.home()/".codex"
+print(home.joinpath("auth.json").read_text())
+print(home.joinpath("session-test").read_text())
+home.joinpath("auth.json").write_text('{"test":"second-native-refresh"}')
+'''))
+    resumed = ProtectedCreationRuntime(account.jail_root, runtime.executable, credentials).run(_call('''
+from pathlib import Path
+print((Path.home()/".codex/auth.json").read_text())
+'''))
+
+    assert activated.stdout == '{"test":"second-account"}\nsame native session\n'
+    assert resumed.stdout == '{"test":"second-native-refresh"}\n'
+    assert auth.read_text() == '{"test":"second-account"}'
+
+
+def test_explicit_logout_applies_after_running_call_and_preserves_session(runtime, tmp_path):
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+    auth = credentials / "auth.json"
+    auth.write_text('{"test":"running-account"}')
+    auth.chmod(0o600)
+    state = credentials / "account-state.json"
+    state.write_text(json.dumps({"generation": "b" * 32, "logged_out": False}))
+    state.chmod(0o600)
+    account = ProtectedCreationRuntime(tmp_path / "logout-jail", runtime.executable, credentials)
+    started = threading.Event()
+    outcomes = []
+    failures = []
+
+    def run():
+        try:
+            outcomes.append(account.run(replace(_call('''
+from pathlib import Path
+import time
+home = Path.home()/".codex"
+home.joinpath("session-test").write_text("resume after logout")
+print("running", flush=True)
+time.sleep(1)
+print(home.joinpath("auth.json").read_text())
+'''), stdout_sink=lambda data: started.set() if b"running" in data else None)))
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert started.wait(30), "Native call did not start"
+        state.write_text(json.dumps({"generation": "c" * 32, "logged_out": True}))
+        auth.unlink()
+    finally:
+        worker.join(30)
+    assert not worker.is_alive()
+    assert not failures
+    assert outcomes[0].stdout == 'running\n{"test":"running-account"}\n'
+
+    after = ProtectedCreationRuntime(account.jail_root, runtime.executable, credentials).run(_call('''
+from pathlib import Path
+home = Path.home()/".codex"
+print(home.joinpath("auth.json").exists())
+print(home.joinpath("session-test").read_text())
+'''))
+    assert after.stdout == "False\nresume after logout\n"
+
+
+def test_account_identity_change_rejects_late_refresh_even_after_generation_applied(runtime, tmp_path):
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+    auth = credentials / "auth.json"
+    auth.write_text('{"tokens":{"account_id":"selected-account"}}')
+    auth.chmod(0o600)
+    state = credentials / "account-state.json"
+    state.write_text(json.dumps({"generation": "e" * 32, "logged_out": False,
+        "account_id_hash": "3d5c2194f0cc7c9a964b46fd0e6d408325f7fdcbe1a877ba8522fb03bba74033"}))
+    state.chmod(0o600)
+    account = ProtectedCreationRuntime(tmp_path / "identity-jail", runtime.executable, credentials)
+    read_account = _call('from pathlib import Path; import json; print(json.loads((Path.home()/".codex/auth.json").read_text())["tokens"]["account_id"])')
+    assert account.run(read_account).stdout == "selected-account\n"
+
+    # A prior ordinary provider finishes its refresh after the explicit switch.
+    auth.write_text('{"tokens":{"account_id":"previous-account"}}')
+
+    with pytest.raises(ProtectedCreationError, match="^codex_account_credentials_changed$"):
+        account.run(read_account)
+
+
+@pytest.mark.parametrize("case", ("malformed_state", "linked_state", "linked_auth", "public_state"))
+def test_account_changes_reject_untrusted_credential_inputs(runtime, tmp_path, case):
+    credentials = tmp_path / "credentials"
+    credentials.mkdir(mode=0o700)
+    auth = credentials / "auth.json"
+    auth.write_text('{"test":"initial-account"}')
+    auth.chmod(0o600)
+    account = ProtectedCreationRuntime(tmp_path / "invalid-account-jail", runtime.executable, credentials)
+    account.run(_call("print('initialized')"))
+    state = credentials / "account-state.json"
+    state.write_text(json.dumps({"generation": "d" * 32, "logged_out": False}))
+    state.chmod(0o600)
+    outside = tmp_path / "outside-private.json"
+    outside.write_text('{"test":"unrelated-private-account"}')
+    outside.chmod(0o600)
+    if case == "malformed_state":
+        state.write_text("private-invalid-state")
+    elif case == "linked_state":
+        state.unlink()
+        state.symlink_to(outside)
+    elif case == "linked_auth":
+        auth.unlink()
+        auth.symlink_to(outside)
+    else:
+        state.chmod(0o644)
+
+    with pytest.raises(ProtectedCreationError, match="^protected_creation_credentials_invalid$"):
+        account.run(_call("print('must not start')"))
+    assert outside.read_text() == '{"test":"unrelated-private-account"}'
+
+
 def test_native_failure_preserves_actual_status_and_stdout(runtime):
     completed = runtime.run(_call("print('failed program'); raise SystemExit(7)"))
     assert completed.returncode == 7

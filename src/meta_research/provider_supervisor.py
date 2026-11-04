@@ -522,6 +522,31 @@ def protected_subprocess_environment(
     return environment
 
 
+def ensure_provider_account_current(
+    argv: list[str], environment: Mapping[str, str] | None,
+) -> None:
+    """Fence new Codex calls, while keeping local admission probes available."""
+    arguments = argv[1:]
+    while arguments and arguments[0] in {"--config", "-c", "--enable", "--disable"}:
+        arguments = arguments[2:]
+    native = bool(arguments and arguments[0] == "exec")
+    if arguments and arguments[0] == "app-server":
+        native = not any(value in {"generate-json-schema", "generate-ts"} for value in arguments[1:])
+    if arguments[:2] == ["-m", "meta_research.native_codex_bridge"]:
+        native = True
+    if arguments[:2] == ["-m", "meta_research.harness_cli_bridge"]:
+        native = any(arguments[index:index + 2] == ["--family", "codex"]
+                     for index in range(2, len(arguments) - 1))
+    home = (os.environ if environment is None else environment).get("CODEX_HOME")
+    if not native or not home:
+        return
+    from meta_research.codex_account import CodexAccountStateError, ensure_codex_account_current
+    try:
+        ensure_codex_account_current(Path(home))
+    except CodexAccountStateError as error:
+        raise OSError(error.code) from error
+
+
 def current_process_group() -> int:
     return ProviderProcessPlatform().current_process_group()
 
@@ -1797,6 +1822,7 @@ def _supervise_locked(
                         if supplied is not None and supplied != str(working_directory):
                             raise ProviderSupervisorError("provider_working_directory_conflict")
                     provider_environment["META_RESEARCH_PROVIDER_CWD"] = str(working_directory)
+                ensure_provider_account_current(provider_argv, provider_environment)
                 spawn_options: dict[str, object] = {
                     "stdin": prompt_stream,
                     "stdout": subprocess.PIPE,
