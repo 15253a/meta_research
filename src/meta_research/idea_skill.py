@@ -3183,6 +3183,10 @@ def _verified_success_exit(
         directory,
         invocation_hash=invocation_hash,
     )
+    return _require_success_exit(marker)
+
+
+def _require_success_exit(marker: dict[str, object]) -> dict[str, object]:
     returncode = marker.get("returncode")
     if not isinstance(returncode, int) or isinstance(returncode, bool):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
@@ -3309,6 +3313,22 @@ def _provider_terminal_contract_checkpoint(
     }
 
 
+def _read_operation_business_input(
+    directory: Path,
+    invocation: dict[str, object],
+    transport_limits: ProviderTransportLimits,
+) -> dict[str, object]:
+    try:
+        text = _read_spool_text(directory / "business-input.json", transport_limits.prompt_max_bytes)
+        body = json.loads(text)
+        if (not isinstance(body, dict) or canonical_json(body) != text
+                or canonical_hash(body) != invocation.get("operation_input_hash")):
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+        return body
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+
+
 def _verified_operation_inputs(
     directory: Path,
     *,
@@ -3333,12 +3353,7 @@ def _verified_operation_inputs(
         )
         schema = json.loads(schema_text)
         if "operation_input_hash" in invocation:
-            business_text = _read_spool_text(directory / "business-input.json", transport_limits.prompt_max_bytes)
-            business_input = json.loads(business_text)
-            if (not isinstance(business_input, dict)
-                    or canonical_json(business_input) != business_text
-                    or canonical_hash(business_input) != invocation["operation_input_hash"]):
-                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            _read_operation_business_input(directory, invocation, transport_limits)
     except IdeaSkillUnavailable:
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProviderSupervisorError) as error:
@@ -3630,10 +3645,7 @@ def _read_completed_operation(
             raise IdeaSkillUnavailable("codex_output_invalid")
         return decoded, recovered_session, stdout
     try:
-        exit_marker = _verified_success_exit(
-            directory,
-            invocation_hash=invocation_hash,
-        )
+        exit_marker = _require_success_exit(marker)
     except IdeaSkillUnavailable as error:
         if error.recovery_checkpoint is None:
             raise

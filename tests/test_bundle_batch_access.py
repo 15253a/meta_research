@@ -97,17 +97,18 @@ def test_authorized_missing_reader_keeps_body_and_wrong_native_is_rejected(tmp_p
         reader(request)
 
 
-def test_rollback_keeps_full_new_input_but_still_checks_current_scope(tmp_path, monkeypatch):
+def test_rollback_keeps_full_new_input_without_unused_reader_probe(tmp_path, monkeypatch):
     adapter, runner = _adapter(tmp_path, _output("batch"))
     request, _, _, _, calls, _ = _bind(adapter)
     monkeypatch.setenv("META_RESEARCH_BUNDLE_BATCH_VIEW", "full")
     adapter.propose_target_batch(request)
     view = json.loads(next(line.removeprefix("batch_context=") for line in runner.calls[0][1].splitlines() if line.startswith("batch_context=")))
     assert view["formal_plan"] == request.plan_document
-    assert calls
+    assert not calls
 
 
-def test_plan_proof_requires_every_page_and_rejects_revocation_between_pages(tmp_path):
+def test_plan_probe_is_bounded_and_real_read_rejects_revocation_between_pages(tmp_path, monkeypatch):
+    import meta_research.bundle_batch_access as access
     adapter, _ = _adapter(tmp_path, _output("batch"))
     request, reader, stage, _, calls, revoked = _bind(adapter)
     plan = {**request.plan_document, "notes": "保留缺测与反例。" * 2000}
@@ -115,18 +116,21 @@ def test_plan_proof_requires_every_page_and_rejects_revocation_between_pages(tmp
     stage.context_pack["accepted_formal_plan_binding"]["plan_document"] = plan
     stage.context_pack_hash = canonical_hash(stage.context_pack)
     request = replace(request, plan_document=plan, context_pack_hash=stage.context_pack_hash)
-    assert reader(request)["plan_hash"] == canonical_hash(plan)
-    assert len(calls) > 1
-    calls.clear()
-    original = stage.context_pack
-    class RevokeOnRead(dict):
-        def __getitem__(self, key):
-            value = super().__getitem__(key)
-            revoked.append(True)
-            return value
-    stage.context_pack = RevokeOnRead(original)
+    captured = []
+    original = access.read_stage_context
+    def capture(*args, **kwargs):
+        captured.append(args)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(access, "read_stage_context", capture)
+    descriptor = reader(request)
+    assert descriptor["plan_hash"] == canonical_hash(plan)
+    assert len(calls) == 1
+    dependencies = captured[0][:-1]
+    page = original(*dependencies, descriptor["arguments"])
+    assert page["next_offset"] is not None
+    revoked.append(True)
     with pytest.raises(SemanticMcpError, match="semantic_call_scope_stale"):
-        reader(request)
+        original(*dependencies, {**descriptor["arguments"], "offset": page["next_offset"]})
 
 
 def test_late_guidance_body_is_included_only_in_requested_batch_view(tmp_path):

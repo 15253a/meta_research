@@ -38,7 +38,8 @@ def test_baseline_proves_actual_prompt_and_success_without_dispatch(tmp_path):
     assert {name: (operation / name).read_bytes() for name in original} == original
 
 
-@pytest.mark.parametrize("name", ["prompt.txt", "business-input.json", "invocation.json", "supervisor-exit.json"])
+@pytest.mark.parametrize("name", ["prompt.txt", "business-input.json", "invocation.json", "supervisor-exit.json",
+                                "output-schema.json", "stdout.jsonl", "last-message.json", "completed.json", "exit.json"])
 def test_corruption_is_not_a_full_text_fallback(tmp_path, name):
     adapter, runner, request, operation = _previous(tmp_path)
     (operation / name).write_text("{}")

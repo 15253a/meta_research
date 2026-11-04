@@ -1,6 +1,5 @@
 """Resolve a frozen Plan through the same current-scope reader used by Bundle."""
-from meta_research.context_presentation import ExactContextPages
-from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.owners.common import canonical_hash
 from meta_research.semantic_mcp import SemanticCallContext, SemanticMcpError
 from meta_research.stage_context_access import read_stage_context
 
@@ -16,11 +15,9 @@ def verified_batch_plan_reader(request, *, advancement_engine, agent_runtime,
     arguments = {"context_pack_ref": request.context_pack_ref, "source": "context_pack",
                  "path": ["accepted_formal_plan_binding", "plan_document"],
                  "offset": 0, "limit": 16384}
-    # This reader rechecks current authorization even when its bytes are cached.
-    cache = ExactContextPages()
     try:
         page = read_stage_context(advancement_engine, agent_runtime, research_graph,
-                                  research_memory, context, arguments, page_cache=cache)
+                                  research_memory, context, {**arguments, "limit": 1})
     except SemanticMcpError as error:
         if str(error) != "stage_context_path_invalid":
             raise
@@ -43,15 +40,6 @@ def verified_batch_plan_reader(request, *, advancement_engine, agent_runtime,
     plan_hash = canonical_hash(request.plan_document)
     if page["context_pack_hash"] != request.context_pack_hash or page["content_hash"] != plan_hash:
         raise SemanticMcpError("bundle_batch_plan_binding_stale")
-    chunks = [page["text"]]
-    while page["next_offset"] is not None:
-        page = read_stage_context(advancement_engine, agent_runtime, research_graph,
-            research_memory, context, {**arguments, "offset": page["next_offset"]}, page_cache=cache)
-        if page["context_pack_hash"] != request.context_pack_hash or page["content_hash"] != plan_hash:
-            raise SemanticMcpError("bundle_batch_plan_binding_stale")
-        chunks.append(page["text"])
-    if "".join(chunks) != canonical_json(request.plan_document):
-        raise SemanticMcpError("bundle_batch_plan_binding_stale")
     return {"operation": "research_memory.stage_context.read", "arguments": arguments,
             "context_pack_ref": request.context_pack_ref, "context_pack_hash": request.context_pack_hash,
             "formal_plan_ref": request.formal_plan_ref, "plan_hash": plan_hash,
@@ -66,38 +54,25 @@ def verified_batch_source_readers(request, *, advancement_engine, agent_runtime,
         root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
         capability_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
     )
-    cache = ExactContextPages()
-
     def prove(source, source_ref, document, *, path=(), version_document=None):
         arguments = {"context_pack_ref": request.context_pack_ref, "source": source,
                      "source_ref": source_ref,
                      "version_ref": canonical_hash(document if version_document is None else version_document),
                      "path": list(path), "offset": 0, "limit": 16384}
-        chunks = []
-        offset = 0
-        while True:
-            try:
-                page = read_stage_context(advancement_engine, agent_runtime, research_graph,
-                    research_memory, context, {**arguments, "offset": offset}, page_cache=cache)
-            except SemanticMcpError as error:
-                if str(error) == "stage_context_path_invalid":
-                    return None
-                raise
-            if (page["context_pack_hash"] != request.context_pack_hash
-                    or page["content_hash"] != canonical_hash(document)):
-                raise SemanticMcpError("bundle_batch_source_binding_stale")
-            chunks.append(page["text"])
-            offset = page["next_offset"]
-            if offset is None:
-                break
-        if "".join(chunks) != canonical_json(document):
+        try:
+            page = read_stage_context(advancement_engine, agent_runtime, research_graph,
+                research_memory, context, {**arguments, "limit": 1})
+        except SemanticMcpError as error:
+            if str(error) == "stage_context_path_invalid":
+                return None
+            raise
+        if (page["context_pack_hash"] != request.context_pack_hash
+                or page["content_hash"] != canonical_hash(document)):
             raise SemanticMcpError("bundle_batch_source_binding_stale")
         return {"semantic_operation_id": "research_memory.stage_context.read",
                 "arguments": arguments, "content_hash": canonical_hash(document)}
 
-    initial = prove("bundle_initial_target_plan", request.graph_ref, request.initial_target_plan)
     result = {
-        "initial_target_plan": initial,
         "completion_contract": prove("bundle_initial_target_plan", request.graph_ref,
             request.initial_target_plan["completion_contract"], path=("completion_contract",),
             version_document=request.initial_target_plan),

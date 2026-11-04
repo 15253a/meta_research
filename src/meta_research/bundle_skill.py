@@ -1701,6 +1701,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         mode = os.environ.get("META_RESEARCH_BUNDLE_BATCH_VIEW", "delta-v2")
         if (not sealed and request.native_session_ref and request.target_commits
                 and request.native_replacement_context is None and not request.provider_feedback
+                and mode in {"delta-v2", "plan-reference-v1"}
                 and self._batch_plan_reader is not None):
             try:
                 reader = self._batch_plan_reader(request)

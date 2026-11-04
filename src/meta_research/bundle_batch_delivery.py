@@ -6,7 +6,8 @@ from dataclasses import replace
 
 from meta_research.idea_skill import (
     IdeaSkillUnavailable, _read_completed_operation, _read_sealed_operation_invocation,
-    _read_spool_text, _verified_operation_inputs, _decode_codex_provider_output,
+    _read_spool_text, _read_operation_business_input, _operation_transport_limits,
+    _decode_codex_provider_output,
     _unwrap_codex_root_output,
 )
 from meta_research.owners.common import canonical_hash
@@ -34,8 +35,8 @@ def verified_batch_delivery_baseline(adapter, request, *, verified_proposals=(),
     for generation, operation in sorted(candidates):
         invocation = _read_sealed_operation_invocation(operation / "invocation.json", key=key)
         digest = canonical_hash(invocation)
-        _, _, limits = _verified_operation_inputs(operation, invocation_hash=digest)
-        body = json.loads(_read_spool_text(operation / "business-input.json", limits.prompt_max_bytes))
+        limits = _operation_transport_limits(invocation)
+        body = _read_operation_business_input(operation, invocation, limits)
         fields = body.get("request", {})
         if (body.get("kind") != "bundle_target_batch"
                 or body.get("identity") != _rolling_operation_identity(request)

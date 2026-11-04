@@ -102,8 +102,7 @@ def test_host_proof_round_trips_model_callable_descriptors(committed_targets):
     readers = verified_batch_source_readers(request, advancement_engine=owner.advancement_engine,
         agent_runtime=owner.agent_runtime, research_graph=owner.research_graph,
         research_memory=owner.research_memory)
-    expected = [(readers["initial_target_plan"], graph.target_plan),
-                (readers["completion_contract"], graph.target_plan["completion_contract"])]
+    expected = [(readers["completion_contract"], graph.target_plan["completion_contract"])]
     expected.extend((readers["current_targets"][record["target_ref"]], record)
                     for record in request.current_targets)
     expected.extend((readers["target_commits"][record["commit_ref"]], record)
