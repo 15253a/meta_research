@@ -366,6 +366,8 @@ test("current and historical progress select their matching inline stage or Targ
   snapshot.research_control.foreground.stage = "bundle";
   await page.reload({ waitUntil: "domcontentloaded" });
   const currentTargetFacts = page.getByRole("region", { name: "当前研究工作状态", exact: true });
+  await expect(currentTargetFacts).toBeHidden();
+  await page.locator("details.research-existing-details > summary").click();
   await expect(currentTargetFacts).toBeVisible();
   await cycle(timeline).getByRole("button", { name: "查看 Plan 输出", exact: true }).click();
   await expect(transcript(page, "stage-current-plan")).toContainText(outputText("stage-current-plan"));
@@ -383,6 +385,110 @@ test("current and historical progress select their matching inline stage or Targ
   await expect(transcript(page, "target-r3a")).toContainText(outputText("target-r3a"));
   await expect(currentTargetFacts).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(errors).toEqual([]);
+  expect(writes).toEqual([]);
+});
+
+test("the clean workspace keeps its core in the first desktop screen and details available on demand", async ({ page }) => {
+  const { errors, writes } = await openFocusWorkspace(page);
+  const main = page.locator("#main-content");
+  await main.evaluate(node => { node.scrollTop = 0; });
+  const brief = main.locator(".lumen-hero .research-brief");
+  await expect(brief).toHaveCount(1);
+  await expect(main.locator(":scope > .research-brief")).toHaveCount(0);
+  const details = main.locator("details.research-existing-details");
+  await expect(details).not.toHaveAttribute("open", "");
+  await expect(main.locator(".spectrum-stage")).toHaveCount(4);
+  await expect(main.getByRole("region", { name: "研究目标版本", exact: true })).toBeVisible();
+  const mainBox = (await main.boundingBox())!, gridBox = (await main.locator(".research-observation-grid").boundingBox())!;
+  expect(gridBox.y, "the observation panes begin within the first desktop screen").toBeLessThan(mainBox.y + mainBox.height * 0.8);
+  const fonts = await page.locator(".lumen-main h1, .spectrum-stage-name, .root-session-scroll, .lumen-rail-button small").evaluateAll(nodes => nodes.map(node => getComputedStyle(node).fontFamily));
+  expect(fonts.length).toBeGreaterThan(3);
+  for (const font of fonts) {
+    expect(font).toContain("Microsoft YaHei");
+    expect(font).not.toMatch(/monospace|Songti|STSong/);
+  }
+  const plan = main.locator('.spectrum-stage[data-stage="plan"]');
+  const sessions = plan.locator("details.stage-root-sessions");
+  await expect(sessions).not.toHaveAttribute("open", "");
+  await sessions.locator(":scope > summary").click();
+  await sessions.locator('[data-session-ref="stage-current-plan"]').click();
+  await expect(transcript(page, "stage-current-plan")).toContainText(outputText("stage-current-plan"));
+  await details.locator(":scope > summary").click();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(details.locator(".lumen-lower")).toBeVisible();
+  await expect(details.locator(".lumen-card").first()).toBeVisible();
+  expect(errors).toEqual([]);
+  expect(writes).toEqual([]);
+});
+
+test("summary notes stay readable without moving the timeline browser when opened by keyboard", async ({ page }) => {
+  const { timeline, errors, writes } = await openFocusWorkspace(page);
+  const note = timeline.locator("details.research-timeline-note");
+  const summary = note.locator(":scope > summary");
+  const explanation = note.locator(":scope > p");
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 900, height: 720 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport);
+    await timeline.scrollIntoViewIfNeeded();
+    const before = (await timeline.locator(".research-timeline-browse").boundingBox())!;
+    await summary.press("Enter");
+    await expect(note).toHaveAttribute("open", "");
+    await expect(explanation).toBeInViewport();
+    await expect(explanation).toContainText("摘要按扫描资料独立整理");
+    await expect(explanation).toContainText("资料最近扫描开始于");
+    const panel = (await explanation.boundingBox())!;
+    expect(panel.x).toBeGreaterThanOrEqual(0);
+    expect(panel.x + panel.width).toBeLessThanOrEqual(viewport.width);
+    const opened = (await timeline.locator(".research-timeline-browse").boundingBox())!;
+    expect(Math.abs(opened.y - before.y)).toBeLessThanOrEqual(1);
+    await page.screenshot({ path: evidencePath(`focus-layout-summary-note-${viewport.width}.png`) });
+    await summary.press("Enter");
+    await expect(explanation).toBeHidden();
+    expect(Math.abs((await timeline.locator(".research-timeline-browse").boundingBox())!.y - before.y)).toBeLessThanOrEqual(1);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
+  }
+  expect(errors).toEqual([]);
+  expect(writes).toEqual([]);
+});
+
+test("research motion follows real execution and respects still pictures, visibility and reduced motion", async ({ page }) => {
+  const writes: string[] = [];
+  page.on("request", request => { if (request.method() !== "GET") writes.push(request.method()); });
+  const { catalog, errors } = await openTimeline(page, { runningBundle: true });
+  const spectrum = page.getByRole("region", { name: "研究光谱", exact: true });
+  await spectrum.scrollIntoViewIfNeeded();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  await expect.poll(() => spectrum.locator(".spectrum-flow").evaluate(node => getComputedStyle(node).animationPlayState)).toBe("running");
+  const still = page.getByRole("button", { name: "静止画面", exact: true });
+  await still.click();
+  await expect(still).toHaveAttribute("aria-pressed", "true");
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  await still.click();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  await page.setViewportSize({ width: 1440, height: 390 });
+  await page.locator(".lumen-main").evaluate(node => { node.scrollTop = node.scrollHeight; });
+  await expect(spectrum).not.toBeInViewport();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  await spectrum.scrollIntoViewIfNeeded();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  catalog.sessions[0].status = "waiting";
+  catalog.sessions[0].is_executing = false;
+  catalog.active_session_refs = [];
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
   expect(errors).toEqual([]);
   expect(writes).toEqual([]);
 });

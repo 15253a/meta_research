@@ -1,5 +1,5 @@
 .workspace-modal {
-  --workspace-font: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif;
+  --workspace-font: var(--font-family);
   font-family: var(--workspace-font);
   color: var(--ink);
 }

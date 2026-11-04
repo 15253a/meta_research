@@ -192,16 +192,40 @@ try {
   assert.ok((await trainPane.boundingBox()).width <= 390);
   if (artifacts) await logs.screenshot({ path: resolve(artifacts, 'parallel-logs-mobile.png') });
   checks.push('all existing logs remain expanded and fit a narrow mobile workspace');
+  const firstTargetCatalogReads = () => reads.filter(path => path.startsWith(
+    `/api/v1/bundle/targets/${encodeURIComponent(first.target_ref)}/experiment-logs?`,
+  )).length;
+  const beforeEmptyReads = firstTargetCatalogReads();
   noFiles = true;
   await page.goto(base + '/?workspace=1', { waitUntil: 'domcontentloaded' });
-  await expect(logs).toContainText('尚未发现当前执行日志', { timeout: 7000 });
+  await expect.poll(firstTargetCatalogReads, { timeout: 7000 }).toBeGreaterThan(beforeEmptyReads);
   await expect(logs.getByRole('log')).toHaveCount(0);
-  checks.push('an execution without discovered log files has a readable empty state without reserving log panes');
+  await expect(logs.getByRole('heading', { name: '当前执行日志', exact: true })).toHaveCount(0);
+  await expect(logs).toHaveText('');
+  const afterEmptyRead = firstTargetCatalogReads();
+  await expect.poll(firstTargetCatalogReads, { timeout: 7000 }).toBeGreaterThan(afterEmptyRead);
+  checks.push('an execution without discovered files reserves no heading, placeholder or pane while read-only discovery keeps polling');
+  temporarilyUnavailable = true;
+  await expect(logs.getByRole('status').filter({ hasText: 'Training A 的执行日志暂不可读，正在重试。' })).toBeVisible({ timeout: 7000 });
+  await expect(logs.getByRole('log')).toHaveCount(0);
+  const unavailableReads = firstTargetCatalogReads();
+  await expect.poll(firstTargetCatalogReads, { timeout: 7000 }).toBeGreaterThan(unavailableReads);
+  temporarilyUnavailable = false;
+  noFiles = false;
+  await expect(logs.getByRole('log')).toHaveCount(3, { timeout: 7000 });
+  await expect(trainLog).toContainText('RECOVERED_AFTER_UNAVAILABLE_NULL_STATUS', { timeout: 7000 });
+  await expect(logs.getByRole('heading', { name: '当前执行日志', exact: true })).toBeVisible();
+  checks.push('discovery failures remain visible and retryable; later discovered files appear with the normal heading and actual output');
   for (const target of targets) target.target_run_ref = null;
   await page.goto(base + '/?workspace=1', { waitUntil: 'domcontentloaded' });
-  await expect(logs).toContainText('当前没有实验执行日志；其他工作输出可在研究会话中查看。');
+  await expect(logs).toHaveCount(1);
+  await expect(logs.getByRole('heading', { name: '当前执行日志', exact: true })).toHaveCount(0);
   await expect(logs.getByRole('log')).toHaveCount(0);
-  checks.push('no actual TargetRun is distinct from an execution without discovered files');
+  await expect(logs).toHaveText('');
+  const noRunReads = firstTargetCatalogReads();
+  await page.waitForTimeout(3500);
+  assert.equal(firstTargetCatalogReads(), noRunReads);
+  checks.push('no actual TargetRun reserves no empty UI and starts no log discovery, distinct from a running target with no discovered files');
   assert.deepEqual(writes, []); assert.deepEqual(errors, []);
   console.log(JSON.stringify({ status: 'passed', checks, researchWrites: writes.length }, null, 2));
 } finally {

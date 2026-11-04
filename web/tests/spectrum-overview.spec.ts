@@ -67,8 +67,8 @@ test("research brief keeps an uncertain finding separate from confirmed conclusi
   const brief = page.getByRole("region", { name: "研究近况", exact: true });
   await brief.scrollIntoViewIfNeeded();
   await expect(brief).toBeVisible();
-  await expect(brief).toContainText("正在做什么");
-  await expect(brief).toContainText("还在等什么");
+  await expect(brief.locator(".research-brief-state")).toBeVisible();
+  await expect(brief).toContainText("正在核对实验结果，还需要更多证据。");
   await expect(brief).toContainText("过程摘要");
   await expect(brief.getByText("待确认发现", { exact: true })).toBeVisible();
   await expect(brief).toContainText("一组测试出现改善，尚待复测。");
@@ -82,7 +82,7 @@ test("a recorder's tentative finding remains distinct from a scientific conclusi
   const { summaries, errors } = await workspace(page);
   const timeline = page.getByRole("region", { name: "研究时间线", exact: true });
   await timeline.scrollIntoViewIfNeeded();
-  await expect(timeline.getByText("过程摘要", { exact: true })).toBeVisible();
+  await expect(timeline.locator('.timeline-summary[data-summary-kind="process"] .timeline-summary-kind').first()).toHaveText("过程摘要");
   summaries.nodes[0].summary_kind = "tentative_finding";
   summaries.revision += 1;
   await expect(timeline.getByText("待确认发现", { exact: true })).toBeVisible();
@@ -115,6 +115,8 @@ test("a paused projection keeps recorded Target summaries when the live graph is
   await expect(target).toContainText("状态待确认");
   await expect(target).toHaveAttribute("data-executing", "false");
   await target.getByRole("button").click();
+  await expect(page.locator("#research-output-panel")).toContainText("所选实验任务尚无会话。");
+  await timeline.locator('.research-timeline-cycle[data-current="true"] [data-stage="bundle"] > .research-timeline-stage-result').click();
   await expect(page.getByRole("dialog")).toContainText("实验与证据");
   await expect(page.getByRole("dialog")).toContainText("结果");
   expect(errors).toEqual([]);
@@ -147,6 +149,7 @@ test("visible summary regions share reads while still pictures keep updating and
 
   await page.setViewportSize({ width: 1440, height: 390 });
   await brief.getByRole("button", { name: "查看当前工作 ↗", exact: true }).click();
+  await page.locator("details.research-existing-details > summary").click();
   await page.locator(".lumen-main").evaluate(main => { main.scrollTop = main.scrollHeight; });
   await expect(brief).not.toBeInViewport();
   await expect(timeline).not.toBeInViewport();

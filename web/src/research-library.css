@@ -5,7 +5,7 @@
 .output-language-control small { max-width:220px; }
 .asset-window { overflow:auto; }
 .research-library { padding:22px 28px; border-bottom:1px solid #dbe3ec; background:#f8fafd; color:#26394e; }
-.library-intro h3 { margin:0 0 8px; font-size:23px; font-family:Georgia,serif; }
+.library-intro h3 { margin:0 0 8px; font-size:23px; font-family:var(--font-family); }
 .library-intro p { max-width:850px; line-height:1.7; margin:0 0 7px; }
 .library-intro small,.library-muted { color:#61748a; line-height:1.6; }
 .library-tabs { display:flex; gap:6px; margin:20px 0 14px; flex-wrap:wrap; }

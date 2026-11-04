@@ -41,14 +41,14 @@
   display: block;
   margin-bottom: 10px;
   color: var(--tree-violet);
-  font: 850 9px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 850 9px/1.2 var(--font-family);
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 
 .question-tree-header h1 {
   margin: 0 0 8px;
-  font-family: "Songti SC", "STSong", "Noto Serif CJK SC", serif;
+  font-family: var(--font-family);
   font-size: 42px;
   font-weight: 650;
   line-height: 1.05;
@@ -78,7 +78,7 @@
   background: #fff;
   border: 1px solid var(--tree-line);
   border-radius: 10px;
-  font: 750 9px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 750 9px/1.2 var(--font-family);
   white-space: nowrap;
 }
 
@@ -122,7 +122,7 @@
 
 .question-tree-error span {
   overflow-wrap: anywhere;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-family);
 }
 
 .question-tree-card {
@@ -178,13 +178,13 @@
 .question-tree-handoff small {
   margin-bottom: 4px;
   color: var(--tree-violet);
-  font: 800 8.5px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 800 8.5px/1.2 var(--font-family);
   letter-spacing: 0.055em;
 }
 
 .question-tree-handoff b {
   overflow-wrap: anywhere;
-  font-family: "Songti SC", "STSong", "Noto Serif CJK SC", serif;
+  font-family: var(--font-family);
   font-size: 15px;
   line-height: 1.4;
 }
@@ -193,7 +193,7 @@
   margin-top: 4px;
   overflow-wrap: anywhere;
   color: #56667b;
-  font: 9px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 9px/1.4 var(--font-family);
 }
 
 .question-tree-handoff.syncing {
@@ -238,7 +238,7 @@
 .question-tree-topline small {
   margin-left: auto;
   color: var(--tree-muted);
-  font: 9px/1.3 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 9px/1.3 var(--font-family);
 }
 
 .question-tree-canvas {
@@ -366,7 +366,7 @@
 .question-canvas-node small {
   margin-bottom: 7px;
   color: #7c899b;
-  font: 800 8.5px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 800 8.5px/1.2 var(--font-family);
   letter-spacing: 0.045em;
   text-transform: uppercase;
 }
@@ -381,7 +381,7 @@
   background: #fff0c9;
   border: 1px solid #dfb85e;
   border-radius: 999px;
-  font: 850 8px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 850 8px/1 var(--font-family);
   letter-spacing: 0.04em;
 }
 
@@ -411,7 +411,7 @@
   overflow: hidden;
   margin-top: 8px;
   color: #7b8798;
-  font: 8.5px/1.3 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 8.5px/1.3 var(--font-family);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -458,7 +458,7 @@
   border: 1px solid #cfd7e2;
   border-radius: 50%;
   box-shadow: 0 7px 18px rgba(31, 40, 62, 0.14);
-  font: 850 17px/1 system-ui, sans-serif;
+  font: 850 17px/1 var(--font-family);
   opacity: 0;
   pointer-events: none;
   transform: translateY(-50%) scale(0.82);
@@ -534,7 +534,7 @@
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid #dbe2ec;
   border-radius: 9px;
-  font: 750 8.5px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 750 8.5px/1.2 var(--font-family);
 }
 
 .question-tree-minimap {
@@ -607,7 +607,7 @@
   padding: 12px 3px 0;
   color: var(--tree-muted);
   border-top: 1px solid #e8ebf2;
-  font: 8.5px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 8.5px/1.4 var(--font-family);
 }
 
 .question-tree-caption span {
@@ -664,7 +664,7 @@
 
 .question-tree-inspector-kicker span {
   color: var(--tree-violet);
-  font: 850 9px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 850 9px/1.2 var(--font-family);
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
@@ -672,7 +672,7 @@
 .question-tree-inspector-kicker small {
   margin-left: auto;
   color: var(--tree-muted);
-  font: 9px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 9px/1.2 var(--font-family);
 }
 
 .question-inspector-current {
@@ -682,7 +682,7 @@
 
 .question-tree-inspector h2 {
   margin: 0 0 7px;
-  font-family: "Songti SC", "STSong", serif;
+  font-family: var(--font-family);
   font-size: 24px;
   font-weight: 650;
   line-height: 1.35;
@@ -738,7 +738,7 @@
 .question-tree-query-panel > header small {
   margin-bottom: 3px;
   color: var(--tree-violet);
-  font: 800 8px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 800 8px/1.2 var(--font-family);
 }
 
 .question-tree-query-panel > header b {
@@ -772,7 +772,7 @@
 .question-query-state code,
 .question-query-state small {
   overflow-wrap: anywhere;
-  font: 9px/1.5 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 9px/1.5 var(--font-family);
 }
 
 .question-query-binding {
@@ -798,7 +798,7 @@
 .question-history-events small,
 .question-evidence-list small {
   color: #777594;
-  font: 800 8px/1.3 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 800 8px/1.3 var(--font-family);
 }
 
 .question-query-binding b {
@@ -835,7 +835,7 @@
   display: block;
   overflow-wrap: anywhere;
   color: #555f74;
-  font: 8.5px/1.5 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 8.5px/1.5 var(--font-family);
 }
 
 .question-evidence-list dl,
@@ -862,7 +862,7 @@
   margin: 2px 0 0;
   overflow-wrap: anywhere;
   color: #3c4658;
-  font: 8.5px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 8.5px/1.4 var(--font-family);
 }
 
 .question-history-content {
@@ -950,7 +950,7 @@
 .question-tree-inspector-facts small {
   margin-bottom: 4px;
   color: #777594;
-  font: 800 8px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 800 8px/1.2 var(--font-family);
   text-transform: uppercase;
 }
 

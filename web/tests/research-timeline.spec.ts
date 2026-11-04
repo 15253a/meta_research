@@ -192,6 +192,9 @@ test("missing recorder sentences never fall back to clipped source text or assem
   updateSummary(recorder, `stage:${CYCLE_REF}:plan`, { status: "ready", summary: CURRENT_PLAN_SUMMARY, summarized_source_hash: "source-v1", updated_at: SOURCE_TIME + 60 });
   await expect(plan.locator(".timeline-summary-text")).toHaveText(CURRENT_PLAN_SUMMARY);
   const facts = page.getByRole("region", { name: "当前研究工作状态", exact: true });
+  await expect(facts).toBeHidden();
+  await page.locator("details.research-existing-details > summary").click();
+  await expect(facts).toBeVisible();
   await expect(facts.locator(".target-research-facts")).not.toBeVisible();
   await facts.getByText("查看输入、产物与交接", { exact: true }).click();
   await expect(facts.locator(".target-research-facts dt")).toHaveCount(7);
@@ -385,6 +388,8 @@ test("a resumed Target keeps its current root and saved sentence when a supersed
     is_current: false, is_executing: false, activity_label: "已由新会话接续", created_at: SOURCE_TIME + 900, updated_at: SOURCE_TIME + 900,
   }));
   await expect.poll(() => reads.roots).toBeGreaterThan(previousReads);
+  const rootDisclosure = page.locator('.spectrum-stage[data-stage="bundle"] details.stage-root-sessions');
+  await rootDisclosure.locator(":scope > summary").click();
   await expect(page.locator('.stage-root-links [data-session-ref="target-r3a-old"]')).toBeVisible();
   await expect(target).toHaveCount(1);
   await expect(target.locator(".research-timeline-target-state")).toHaveText("正在执行");

@@ -2,6 +2,7 @@ import { useId, type ReactNode } from "react";
 import "./spectrum.css";
 import { MetaTrace } from "./MetaTrace";
 import { useResearchMotion } from "./ResearchMotion";
+import { QuestGoalEvolution, type QuestGoalDisplay } from "./QuestGoalEvolution";
 
 export const spectrumStages = [
   { id: "idea", name: "Idea", label: "研究思路", description: "探索问题，形成假设", color: "#3ecfb2" },
@@ -39,7 +40,7 @@ function SpectrumChart({ current }: { current: SpectrumStage | null }) {
   </svg>;
 }
 
-export function SpectrumStages({ current, labels, onSelect, compact = false, stale = false, stageContent, selected, onResult, running = false }: {
+export function SpectrumStages({ current, labels, onSelect, compact = false, stale = false, stageContent, selected, onResult, running = false, goal, goalStale = false, goalScope }: {
   current: SpectrumStage | null;
   labels?: Partial<Record<SpectrumStage, string>>;
   onSelect?: (stage: SpectrumStage) => void;
@@ -49,10 +50,13 @@ export function SpectrumStages({ current, labels, onSelect, compact = false, sta
   selected?: SpectrumStage | null;
   onResult?: (stage: SpectrumStage) => void;
   running?: boolean;
+  goal?: QuestGoalDisplay | null;
+  goalStale?: boolean;
+  goalScope?: string;
 }) {
   const motion = useResearchMotion<HTMLElement>(running && !stale);
   return <section ref={motion.ref} data-spectrum-choice="D" data-motion-active={motion.active} className={`research-spectrum${compact ? " is-compact" : ""}`} aria-label="研究光谱">
-    <div className="spectrum-caption"><span>棱镜谱带 <i /> 研究光谱</span><small>四个阶段 · 随研究推进</small></div>
+    {goal ? <QuestGoalEvolution goal={goal} stale={goalStale || stale} scopeKey={goalScope} /> : null}
     <SpectrumChart current={current} />
     <nav className="spectrum-stages" aria-label="本轮阶段与历史结果">{spectrumStages.map((stage, index) => {
       const active = current === stage.id;

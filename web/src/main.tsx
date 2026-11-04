@@ -4134,6 +4134,7 @@ function WorkspaceMain({
           <h1 id="workspace-title">{targetObservation?.status.current_task?.title ?? runtimeStatus.status?.current_task?.title ?? (liveContext.foreground ? "当前研究" : "当前没有运行中的阶段")}</h1>
           {targetActivity}
           <SpectrumStages compact current={rootConversations.currentStage} selected={rootConversations.selectedStage}
+            goal={snapshot?.research_space.current_quest.quest_ref === liveContext.foreground?.quest_ref ? snapshot?.research_space.current_quest : null} goalScope={snapshot?.revision_domain}
             running={!liveContext.stale && !rootConversations.error && !rootConversations.data?.limited
               && liveContext.foreground?.status === "active" && liveContext.foreground.grant_status === "active"
               && Boolean(targetObservation || rootConversations.current?.is_executing)}
@@ -4152,6 +4153,7 @@ function WorkspaceMain({
             </div>
           </div>
           <h1 id="workspace-title">{currentQuestion?.title ?? currentQuestion?.unknown_statement ?? "当前研究问题"}</h1>
+          <ResearchBrief snapshot={snapshot} overview={overview.data} error={overview.error} rootConversations={rootConversations} onOpenOutput={() => openOutput()} />
           {targetActivity}
           <StageHistoryStrip snapshot={snapshot} overview={overview.data} error={overview.error} loading={overview.loading} onRetry={overview.retry} onRequestOverview={() => setStageResultsRequested(true)} rootConversations={rootConversations} onOpenOutput={() => openOutput()} />
           <button className="research-history-toggle" aria-expanded={historyOpen} onClick={() => setHistoryOpen(open => !open)}>{historyOpen ? "收起本轮记录与历史结果" : "查看本轮记录与历史结果"}<span aria-hidden="true">{historyOpen ? "−" : "+"}</span></button>
@@ -4182,18 +4184,11 @@ function WorkspaceMain({
         ) : null}
       </section>
 
-      {snapshot?.research_space.current_quest.status === "ready" ? <ReturnSummary snapshot={snapshot} /> : null}
-      {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchBrief snapshot={snapshot} overview={overview.data} error={overview.error} rootConversations={rootConversations} onOpenOutput={() => openOutput()} /> : null}
       {snapshot && foreground && !showingLiveOverview ? <>
         {historyOpen ? <>
           <ResearchOverview snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} onOpenWriting={onBrowseWriting} connected={connected} rootConversations={rootConversations} />
         </> : null}
         {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{requests[0].obligation}</span></span><b>查看并回应 ↗</b></button> : null}
-        {!historicalOutput && (!rootConversations.manualSelection || rootConversations.selectedCycleRef === foreground.cycle_ref)
-          && rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
-          <header><h2>{displayedTarget.target_key}</h2><p>{displayedTargetFacts.summary}</p></header>
-          <BoundedDetails key={displayedTarget.target_ref} className="research-target-details" summary="查看输入、产物与交接">{() => <TargetResearchFactsView facts={displayedTargetFacts} label={displayedTarget.target_key} />}</BoundedDetails>
-        </section> : null}
       </> : null}
       {(timelineHidden && hasTimeline || outputHidden && hasOutput) ? <div className="research-panel-restores" aria-label="展开观察区域">
         {timelineHidden && hasTimeline ? <button type="button" aria-controls="research-timeline-panel" aria-expanded={false} onClick={() => setTimelineHidden(false)}>＋ 展开研究时间线</button> : null}
@@ -4220,6 +4215,12 @@ function WorkspaceMain({
           blocked={humanRequestModalOpen} paused={hidden} />
       </section> : null}
       <details className="research-existing-details"><summary>研究材料与阶段详情</summary>
+      {snapshot?.research_space.current_quest.status === "ready" ? <ReturnSummary snapshot={snapshot} /> : null}
+      {!showingLiveOverview && !historicalOutput && foreground && (!rootConversations.manualSelection || rootConversations.selectedCycleRef === foreground.cycle_ref)
+        && rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
+        <header><h2>{displayedTarget.target_key}</h2><p>{displayedTargetFacts.summary}</p></header>
+        <BoundedDetails key={displayedTarget.target_ref} className="research-target-details" summary="查看输入、产物与交接">{() => <TargetResearchFactsView facts={displayedTargetFacts} label={displayedTarget.target_key} />}</BoundedDetails>
+      </section> : null}
       {showingLiveOverview && snapshot ? <p role="status">以下保留上次读取的阶段详情；当前轮次的详细结果仍在加载。</p> : null}
       <div className="lumen-lower">
         {stageSurface && question ? (
@@ -5154,7 +5155,7 @@ function DetailedApp() {
       <a className="lumen-skip" href={showCompanion ? "#research-companion" : "#main-content"} data-hc-background>
         {showCompanion ? "跳到研究助手" : "跳到主要内容"}
       </a>
-      {(recovery.updating || error) ? <div className="projection-refresh" data-testid="projection-refresh" role="status">{error ?? "详细状态正在更新"}</div> : null}
+      {(recovery.updating || error) ? <div className="projection-refresh workspace-refresh-note" data-testid="projection-refresh" role="status">{error ?? "详细状态正在更新"}</div> : null}
       <div ref={assistantWidth.shellRef} style={assistantWidth.style} className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-companion-open={showCompanion} data-companion-hidden={!compactLayout && companionHidden} data-hc-background>
         <header className="lumen-header" data-shell-region="header">
           <a className="lumen-brand" aria-label="Meta-research 首页" href="/" style={{ color: "inherit", textDecoration: "none" }}>

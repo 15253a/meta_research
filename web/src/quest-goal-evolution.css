@@ -1,0 +1,26 @@
+.quest-goal-evolution { min-width: 0; margin-bottom: 12px; color: #3d4960; }
+.quest-goal-evolution header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: 5px; }
+.quest-goal-evolution header b { font-size: 13px; font-weight: 600; }
+.quest-goal-evolution header > span { color: #788398; font-size: 11px; }
+.quest-goal-lines { display: grid; gap: 3px; list-style: none; margin: 0; padding: 0; }
+.quest-goal-lines li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 7px; margin: 0; font-size: 12px; line-height: 1.7; }
+.quest-goal-lines li > b { color: #827c9e; font-family: inherit; font-size: 11px; font-weight: 500; line-height: 1.7; }
+.quest-goal-copy { min-width: 0; }
+.quest-goal-copy > summary { display: flex; align-items: baseline; gap: 5px; min-height: 24px; color: inherit; cursor: pointer; list-style: none; }
+.quest-goal-copy > summary::-webkit-details-marker { display: none; }
+.quest-goal-preview { display: -webkit-box; flex: 1; min-width: 0; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden; overflow-wrap: anywhere; }
+.quest-goal-chevron { flex: 0 0 auto; color: #817a9a; transition: transform 120ms; }
+.quest-goal-copy[open] > summary .quest-goal-chevron { transform: rotate(180deg); }
+.quest-goal-full { min-width: 0; margin: 3px 0 8px; padding: 8px 10px; border-left: 2px solid #dcd8f0; color: #4b566d; background: #f8f8fc; font-size: 12px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.quest-goal-full p { margin: 0; }
+.quest-goal-full > div { margin-top: 7px; }
+.quest-goal-full b { font-size: 11px; font-weight: 500; color: #817a9a; }
+.quest-goal-lines li[data-current=true] > b { color: #625fe7; }
+.quest-goal-lines small { color: #817a9a; font-size: 10px; }
+.quest-goal-evolution > details { margin-top: 4px; font-size: 11px; }
+.quest-goal-evolution > details > summary { width: fit-content; padding: 3px 0; color: #7b7396; cursor: pointer; }
+.quest-goal-evolution > details[open] > summary { margin-bottom: 4px; }
+.quest-goal-evolution > details button { margin-top: 5px; padding: 4px 7px; border: 1px solid #e1dfec; border-radius: 5px; background: transparent; color: #6d648b; font: inherit; cursor: pointer; }
+.quest-goal-evolution > details > p { margin: 5px 0; color: #788398; }
+.quest-goal-evolution details > summary:focus-visible, .quest-goal-evolution button:focus-visible { outline: 2px solid #625fe7; outline-offset: 2px; }
+@media (max-width: 640px) { .quest-goal-preview { -webkit-line-clamp: 2; } .quest-goal-copy > summary { min-height: 44px; } }

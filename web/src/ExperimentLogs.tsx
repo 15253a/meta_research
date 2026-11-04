@@ -487,16 +487,10 @@ export function ParallelExecutionLogs({ targets, blocked, paused }: {
   }, []);
   const counts = available.map(target => discovered[`${target.target_ref}:${target.target_run_ref}`]);
   const hasFiles = counts.some(count => count !== null && count !== undefined && count > 0);
-  const confirmed = counts.every(count => count !== null && count !== undefined);
-  return <section className="parallel-execution-logs" aria-label="当前执行日志">
-    <header><h2>当前执行日志</h2><p>各项实际文件同时展开；每条日志可以独立回看或返回最新写入。</p></header>
-    <p className="parallel-log-source-note">按 train/eval 文件名发现原始写入；文件名本身不代表训练或评估已经运行。</p>
+  return <section className={`parallel-execution-logs${hasFiles ? " has-logs" : ""}`} aria-label="当前执行日志">
+    {hasFiles ? <header><h2>当前执行日志</h2><p>每条日志可独立回看，或跟随最新写入。</p></header> : null}
     <div className="parallel-execution-log-grid">
       {available.map(target => <TargetLogFiles key={`${target.target_ref}:${target.target_run_ref}`} target={target} blocked={blocked} paused={paused} onDiscovery={onDiscovery} />)}
     </div>
-    {!available.length ? <p className="parallel-log-read-status">当前没有实验执行日志；其他工作输出可在研究会话中查看。</p> : null}
-    {available.length > 0 && !hasFiles ? <p className="parallel-log-read-status" role="status">{confirmed
-      ? "尚未发现当前执行日志；准备工作和其他命令输出可从任务执行记录查看。"
-      : "正在查找当前执行日志…"}</p> : null}
   </section>;
 }

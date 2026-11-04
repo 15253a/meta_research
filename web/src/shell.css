@@ -1,7 +1,8 @@
 :root {
   color: #172033;
   background: #f4f6fb;
-  font-family: "Aptos", "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-family: "Microsoft YaHei", "微软雅黑", sans-serif;
+  font-family: var(--font-family);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   --ink: #172033;
@@ -16,8 +17,9 @@
   --coral: #f27858;
   --amber: #f27858;
   --ice: #eeedff;
-  --display: "Songti SC", "STSong", "Noto Serif CJK SC", serif;
-  --utility: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  --display: var(--font-family);
+  --body: var(--font-family);
+  --utility: var(--font-family);
   --focus: #f27858;
 }
 
@@ -48,8 +50,16 @@ body {
 button,
 input,
 textarea,
+select,
 summary {
   font: inherit;
+}
+
+pre,
+code,
+kbd,
+samp {
+  font-family: inherit;
 }
 
 button:focus-visible,
@@ -461,7 +471,7 @@ a:focus-visible,
 }
 
 .lumen-rail-button small {
-  font: 600 10px/1.3 system-ui, sans-serif;
+  font: 600 10px/1.3 var(--font-family);
   white-space: nowrap;
 }
 
@@ -492,7 +502,7 @@ a:focus-visible,
   border-radius: 10px;
   color: #fff;
   background: #bf4d33;
-  font: 700 9px/13px system-ui, sans-serif;
+  font: 700 9px/13px var(--font-family);
 }
 
 .lumen-main {

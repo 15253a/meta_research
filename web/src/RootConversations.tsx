@@ -193,7 +193,7 @@ export function StageRootSessions({ model, stage, onOpenOutput }: { model: Model
     const ordinal = sameLabel.length > 1 ? ` ${sameLabel.findIndex(item => item.session_ref === session.session_ref) + 1}` : "";
     const scope = sessionScope(session, model.context);
     return <button type="button" key={session.session_ref} data-session-ref={session.session_ref}
-      data-executing={!model.error && !model.data?.limited && session.is_executing}
+      data-executing={!model.context.stale && !model.error && !model.data?.limited && session.is_executing}
       aria-pressed={model.selectedStage === stage && model.selected?.session_ref === session.session_ref}
       aria-label={`${label}${ordinal} · ${scope} · ${model.error ? "上次记录" : rootSessionStatus(session, language)}`}
       title={`${session.title} · ${scope} · ${rootSessionStatus(session, language)}`}
@@ -202,9 +202,10 @@ export function StageRootSessions({ model, stage, onOpenOutput }: { model: Model
     </button>;
   });
   const missingRoles = stage === "reasoning" ? reasoningRoles.filter(role => !sessions.some(session => reasoningRole(session) === role)) : [];
-  const uncertain = Boolean(model.error || model.data?.limited);
+  const uncertain = Boolean(model.context.stale || model.error || model.data?.limited);
   const roleStatus = !model.data ? uncertain ? "状态待确认" : "正在读取" : uncertain ? "状态待确认" : "待启动";
-  return <div className="stage-root-sessions">
+  return <details className="stage-root-sessions">
+    <summary>研究会话{model.data ? ` · ${sessions.length}` : ""}</summary>
     <p className="stage-root-count">{stage === "reasoning" ? `3 个根 session 入口 · ${model.data ? `${sessions.length} 个已建立 · ${uncertain ? "其余状态待确认" : `${missingRoles.length} 个待启动`}` : roleStatus}`
       : model.data ? `${sessions.length} 个根 session${uncertain ? " · 上次记录" : ""}` : model.error ? "会话暂不可用" : "正在读取会话…"}</p>
     <div className="stage-root-links" role="group" aria-label={`${stageName} 本轮根会话`}>
@@ -219,7 +220,7 @@ export function StageRootSessions({ model, stage, onOpenOutput }: { model: Model
     </div>
     {stage !== "reasoning" && model.data && !sessions.length ? <small className="stage-root-empty">尚未建立</small> : null}
     {historical.length ? <BoundedDetails className="stage-root-history" summary={`历史会话 · ${historical.length}`}>{() => <div className="stage-root-links" role="group" aria-label={`${stageName} 历史根会话`}><PageWindow items={[...historical].sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))} label={`${stageName} 历史会话分页`} render={session => choices([session], true)} /></div>}</BoundedDetails> : null}
-  </div>;
+  </details>;
 }
 
 function sessionScope(session: RootSession, context: RootConversationContext) {
