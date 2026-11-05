@@ -88,7 +88,10 @@ export function CodexAccount({ disabled = false }: { disabled?: boolean }) {
   const label = failed || view?.status === "unavailable" ? "状态未知" : view?.status === "authenticated" ? view.account?.email ?? (view.account?.type === "apiKey" ? "API Key" : "已登录") : view?.status === "unauthenticated" ? "未登录" : "读取中…";
   const url = verificationLink(view?.login?.verification_url);
   return <>
-    <button ref={trigger} type="button" className="codex-account-entry" disabled={disabled} aria-haspopup="dialog" title={`Codex · ${label}`} onClick={() => { setOpen(true); void refresh(); }}>Codex · {label}</button>
+    <button ref={trigger} type="button" className="codex-account-entry" disabled={disabled} aria-haspopup="dialog" aria-label={`Codex · ${label}`}
+      title={`Codex · ${label}`} onClick={() => { setOpen(true); void refresh(); }}>
+      <span>Codex</span><span className="codex-account-label"> · {label}</span>
+    </button>
     {open && !disabled ? createPortal(<dialog ref={panel} className="codex-account-dialog" aria-labelledby="codex-account-title" onCancel={event => { event.preventDefault(); close(); }}>
       <header><h2 id="codex-account-title">Codex 账户</h2><button type="button" aria-label="关闭 Codex 账户" onClick={close}>关闭</button></header>
       <p>此账户用于这台服务的 Codex 调用。</p>

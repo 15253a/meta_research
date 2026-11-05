@@ -250,7 +250,7 @@ test("deferred assets load only when opened and late reads cannot replace the re
     if (req.headers["x-meta-research-snapshot-assets"] === "include") held = { req, res };
     else app.send(res, app.cut(12, "返回后读取的详情", req));
   };
-  await page.getByRole("button", { name: "研究资料 ↗", exact: true }).click();
+  await page.getByRole("button", { name: "研究资料", exact: true }).click();
   await expect.poll(() => held !== undefined).toBe(true);
   await expect(page.getByTestId("projection-refresh")).toBeVisible();
   await page.getByRole("button", { name: "关闭研究资料", exact: true }).click();
@@ -270,7 +270,7 @@ test("an opened section stays pending until its real content arrives even at the
   };
   await page.goto(app.url + "/?workspace=1");
   await expect(heading(page, "研究详情 10")).toBeVisible();
-  await page.getByRole("button", { name: "研究资料 ↗", exact: true }).click();
+  await page.getByRole("button", { name: "研究资料", exact: true }).click();
   await expect(page.getByTestId("projection-refresh")).toBeVisible();
   await expect.poll(() => includes, { timeout: 8000 }).toBeGreaterThanOrEqual(3);
   await expect(page.getByTestId("projection-refresh")).toHaveCount(0);

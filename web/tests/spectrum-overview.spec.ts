@@ -148,7 +148,7 @@ test("visible summary regions share reads while still pictures keep updating and
   await expect.poll(() => reads.summaries).toBeGreaterThan(backgroundReads);
 
   await page.setViewportSize({ width: 1440, height: 390 });
-  await brief.getByRole("button", { name: "查看当前工作 ↗", exact: true }).click();
+  await brief.getByRole("button", { name: "查看当前工作", exact: true }).click();
   await page.locator("details.research-existing-details > summary").click();
   await page.locator(".lumen-main").evaluate(main => { main.scrollTop = main.scrollHeight; });
   await expect(brief).not.toBeInViewport();
@@ -158,5 +158,44 @@ test("visible summary regions share reads while still pictures keep updating and
   expect(reads.summaries).toBe(awayReads);
   await timeline.scrollIntoViewIfNeeded();
   await expect.poll(() => reads.summaries).toBeGreaterThan(awayReads);
+  expect(errors).toEqual([]);
+});
+
+test("current-stage light sweeps while research is paused without showing execution and honors motion controls", async ({ page }, testInfo) => {
+  const { snapshot, errors } = await workspace(page);
+  snapshot.research_control.foreground!.status = "suspended";
+  snapshot.research_control.foreground!.grant_status = "suspended";
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const spectrum = page.getByRole("region", { name: "研究光谱", exact: true });
+  await spectrum.scrollIntoViewIfNeeded();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  const sweep = spectrum.locator("path.spectrum-light");
+  await expect(sweep).toHaveCount(1);
+  const offset = () => sweep.evaluate(node => getComputedStyle(node).strokeDashoffset);
+  await expect.poll(async () => {
+    const value = Number.parseFloat(await offset());
+    return value > -100 && value < -10;
+  }).toBe(true);
+  const initial = await offset();
+  await expect.poll(offset).not.toBe(initial);
+  await expect(spectrum.locator('.meta-trace[data-motion-active="true"]')).toHaveCount(0);
+  await spectrum.screenshot({ path: testInfo.outputPath("spectrum-light.png"), animations: "allow" });
+
+  const still = page.getByRole("button", { name: "静止画面", exact: true });
+  await still.click();
+  await expect(sweep).toHaveCSS("animation-play-state", "paused");
+  const stopped = await offset();
+  await page.waitForTimeout(200);
+  expect(await offset()).toBe(stopped);
+  await still.click();
+  await expect(sweep).toHaveCSS("animation-play-state", "running");
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(sweep).toHaveCSS("animation-name", "none");
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(sweep).toHaveCSS("animation-play-state", "paused");
   expect(errors).toEqual([]);
 });

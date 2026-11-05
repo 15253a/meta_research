@@ -107,6 +107,7 @@ from meta_research.target_commit_evidence import (
 
 
 _CYCLE_EVENT = "advancement_engine.initial_cycle_activated"
+_DISPATCH_RECHECK_SECONDS = 300
 _TARGET_AUTHORIZATION_OBLIGATION = (
     "决定是否仅为这一精确高风险 Target 授予一次执行权限。"
 )
@@ -179,6 +180,7 @@ class BundleStageWorker:
         self._stopped_provider_checkpoint = stopped_provider_checkpoint
         self._transient_error: str | None = None
         self._worker_cursor_cycle_ref: str | None = None
+        self._input_error_recheck_at: dict[str, float] = {}
 
     @property
     def transient_error(self) -> str | None:
@@ -739,6 +741,10 @@ class BundleStageWorker:
         inbox_checkpoint = self._drain_bundle_inbox(run)
         decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
         latest = decisions[-1] if decisions else None
+        # Preparation is observed at decision time. Polling the same research
+        # state must not re-verify every candidate's input assets.
+        previous_state = dict(latest.state) if latest is not None else {}
+        previous_errors = previous_state.pop("launch_input_errors", None)
         root_human_request_needed = any(
             request is None for request in human_requests.values()
         )
@@ -747,7 +753,7 @@ class BundleStageWorker:
             and latest.fence_ref == run.fence_ref
             and latest.graph_ref == graph.graph_ref
             and latest.frontier == dispatch_frontier
-            and latest.state == dispatch_state
+            and previous_state == dispatch_state
             and self._operation_uses_inbox_checkpoint(
                 operation_kind="dispatch",
                 operation_ref=latest.decision_ref,
@@ -787,6 +793,34 @@ class BundleStageWorker:
                 or _research_wait_recheck_due(latest, dispatch_frontier)
             )
         ):
+            if not self._runtime_binding_is_current(run):
+                return False
+            if (
+                same_input and not root_human_request_needed
+                and time.monotonic() < self._input_error_recheck_at.get(run.run_ref, 0)
+            ):
+                return False
+            # The root can read the launch envelope while choosing. Materialize
+            # its prerequisites here; only a recorded dispatch permits admission.
+            input_errors: dict[str, str] = {}
+            for target in launchable:
+                try:
+                    if self._prepare_launch_inputs(target):
+                        return True
+                except OwnerConflict as error:
+                    input_errors[target.target_ref] = error.code
+            self._input_error_recheck_at.pop(run.run_ref, None)
+            if input_errors:
+                dispatch_state["launch_input_errors"] = input_errors
+                if (
+                    same_input and latest.action == "wait" and not root_human_request_needed
+                    and len(input_errors) == len(launchable) and input_errors == previous_errors
+                ):
+                    # The root already saw these errors. Check the Owner again
+                    # later; new inbox or frontier facts can wake the root sooner.
+                    self._input_error_recheck_at[run.run_ref] = time.monotonic() + _DISPATCH_RECHECK_SECONDS
+                    self._transient_error = next(iter(input_errors.values()))
+                    return False
             replacement_context = self._rolling_replacement_context(request, run, graph, commits)
             dispatch_request = BundleDispatchRequest(
                 stage_request_ref=request.request_ref,
@@ -809,8 +843,6 @@ class BundleStageWorker:
                     run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
                 ),
             )
-            if not self._runtime_binding_is_current(run):
-                return False
             try:
                 self._agent_runtime.begin_provider_unit(
                     unit_ref=dispatch_unit_ref,
@@ -830,15 +862,13 @@ class BundleStageWorker:
                     provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
                     result = provider.schedule_target(dispatch_request)
                     validate_bundle_dispatch_result(dispatch_request, result)
-                    if (
-                        result.action == "dispatch"
-                        and result.selected_target_ref
-                        not in {target.target_ref for target in launchable}
-                    ):
-                        self._transient_error = (
-                            "target_high_risk_authorization_required"
-                        )
-                        return False
+                    if result.action == "dispatch":
+                        selected = cast(str, result.selected_target_ref)
+                        if selected not in {target.target_ref for target in launchable}:
+                            self._transient_error = "target_high_risk_authorization_required"
+                            return False
+                        if selected in input_errors:
+                            raise BundleSkillContractError(input_errors[selected])
                 except BundleSkillUnavailable as error:
                     error = self._recover_stopped_error(error, run.run_ref)
                     if error.code == "codex_operation_reconciliation_pending":
@@ -937,25 +967,8 @@ class BundleStageWorker:
             ack = self._agent_runtime.query_target_launch_ack(target.target_ref)
             admitted_now = False
             if ack is None:
-                candidate_projection = (
-                    self._research_graph.query_target_candidate_projection(
-                        target_ref=target.target_ref
-                    )
-                )
-                if candidate_projection is None:
-                    self._research_graph.accept_target_candidate_projection(
-                        target_ref=target.target_ref,
-                        idempotency_key=_operation_key(
-                            "target-candidate-projection", target.target_ref
-                        ),
-                    )
-                    self._transient_error = None
-                    return True
-                if (
-                    target.spec["candidate"]["direct_accepted_input_asset_refs"]
-                    and self._research_graph.prepare_target_input_assets(target.target_ref)
-                ):
-                    self._transient_error = None
+                # An already recorded dispatch may predate pre-decision preparation.
+                if self._prepare_launch_inputs(target):
                     return True
                 launch_request = self._research_graph.query_target_launch_request(
                     target.target_ref
@@ -1018,6 +1031,18 @@ class BundleStageWorker:
                 else "target_launch_pending"
             )
         return False
+
+    def _prepare_launch_inputs(self, target: AcceptedTarget) -> bool:
+        graph = self._research_graph
+        if graph.query_target_candidate_projection(target_ref=target.target_ref) is None:
+            graph.accept_target_candidate_projection(
+                target_ref=target.target_ref,
+                idempotency_key=_operation_key("target-candidate-projection", target.target_ref),
+            )
+            return True
+        return bool(target.spec["candidate"]["direct_accepted_input_asset_refs"]) and (
+            graph.prepare_target_input_assets(target.target_ref)
+        )
 
     def _advance_bundle_report_closure(
         self,
@@ -3884,5 +3909,5 @@ def _research_wait_recheck_due(decision, frontier, *, now: float | None = None) 
         decision is not None
         and decision.action == "wait"
         and any(item.get("dispatch_allowed", True) is True for item in frontier)
-        and (time.time() if now is None else now) - decision.created_at >= 300
+        and (time.time() if now is None else now) - decision.created_at >= _DISPATCH_RECHECK_SECONDS
     )

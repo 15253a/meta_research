@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from "react-dom";
 import { StageReadableOutput } from "./ReadableOutput";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
+import { rootSessionStatusUncertain } from "./rootSessionObservation";
 import { fetchRootOutput, fetchRootSessions, RootSessionError, type RootOperation, type RootOutput, type RootSession, type RootSessions } from "./rootSessionsApi";
 import { spectrumStage, spectrumStages, type SpectrumStage } from "./Spectrum";
 import { BoundedDetails, PageWindow } from "./BoundedDetails";
@@ -192,8 +193,9 @@ export function StageRootSessions({ model, stage, onOpenOutput }: { model: Model
     const sameLabel = (history ? historical : sessions).filter(item => (item.short_title || (item.kind === "stage" ? stageName : kindLabels[item.kind])) === label);
     const ordinal = sameLabel.length > 1 ? ` ${sameLabel.findIndex(item => item.session_ref === session.session_ref) + 1}` : "";
     const scope = sessionScope(session, model.context);
+    const executing = !model.context.stale && !model.error && !rootSessionStatusUncertain(model.data, session) && session.is_executing;
     return <button type="button" key={session.session_ref} data-session-ref={session.session_ref}
-      data-executing={!model.context.stale && !model.error && !model.data?.limited && session.is_executing}
+      data-executing={executing}
       aria-pressed={model.selectedStage === stage && model.selected?.session_ref === session.session_ref}
       aria-label={`${label}${ordinal} · ${scope} · ${model.error ? "上次记录" : rootSessionStatus(session, language)}`}
       title={`${session.title} · ${scope} · ${rootSessionStatus(session, language)}`}
@@ -244,7 +246,14 @@ export function RootConversations({ model, connected, polling = false, targetRet
     ? [...model.sessions, model.selected] : model.sessions;
   const select = (session: RootSession) => model.selectStage(sessionStage(session) ?? model.selectedStage ?? model.currentStage ?? "idea", session.session_ref);
   const targets = model.forStage("bundle").filter(session => session.kind === "target");
-  const statusKnown = !model.context.stale && !model.error && !model.data?.limited;
+  const sessionKnown = (session: RootSession | null | undefined) => !model.context.stale && !model.error && !rootSessionStatusUncertain(model.data, session);
+  const sessionDisplay = (session: RootSession) => {
+    if (!sessionKnown(session)) return { executing: false, label: "状态待确认" };
+    if (!session.is_executing) return { executing: false, label: rootSessionStatus(session) };
+    const executing = session.status === "executing" && Boolean(model.data?.active_session_refs.includes(session.session_ref));
+    return { executing, label: executing ? rootSessionStatus(session) : "状态待确认" };
+  };
+  const selectedExecuting = Boolean(model.selected && !model.selectedUnavailable && sessionDisplay(model.selected).executing);
   return <section className="research-flow root-conversations" id="research-activity" tabIndex={-1} aria-labelledby="research-trace-title">
     <header className="research-flow-heading"><div className="research-flow-title"><h2 id="research-trace-title">研究过程</h2>
       <span className="research-connection" data-connected={connected || polling}><i />{model.context.stale ? "状态待确认 · 保留记录" : connected ? "实时连接" : polling ? "定时更新" : "连接中断 · 保留记录"}</span></div>
@@ -252,36 +261,47 @@ export function RootConversations({ model, connected, polling = false, targetRet
     </header>
     <div className="root-session-controls" tabIndex={0} aria-label="会话选择与状态">
     <div className="root-view-toolbar">
-      <label>查看会话<select aria-label="选择查看的会话" value={model.selected?.session_ref ?? ""} onChange={event => {
-        const session = choices.find(item => item.session_ref === event.target.value);
-        if (session) select(session);
-      }}>
-        {!model.selected ? <option value="">{model.data ? "暂无会话" : "正在读取…"}</option> : null}
-        {choices.map(session => {
-          const name = session.short_title || session.title;
-          const sameName = choices.filter(choice => (choice.short_title || choice.title) === name);
-          return <option key={session.session_ref} value={session.session_ref}>{name}{sameName.length > 1 ? ` ${sameName.findIndex(choice => choice.session_ref === session.session_ref) + 1}` : ""} · {sessionScope(session, model.context)} · {rootSessionStatus(session)}</option>;
-        })}
-      </select></label>
-      <div className="root-follow-controls"><span>{model.manualSelection ? "正在回看" : statusKnown && model.current?.is_executing ? "跟随当前执行" : "当前工作"}</span>
-        {model.manualSelection ? <button className="root-return-current" onClick={() => { model.returnCurrent(); onReturnCurrent?.(); }}>返回当前执行</button> : null}
-      </div>
+      <label>查看会话<span className="root-session-select" data-executing={selectedExecuting}>
+        {selectedExecuting ? <i className="root-running-spinner" aria-hidden="true" /> : null}
+        <select aria-label="选择查看的会话" value={model.selected?.session_ref ?? ""} onChange={event => {
+          const session = choices.find(item => item.session_ref === event.target.value);
+          if (session) select(session);
+        }}>
+          {!model.selected ? <option value="">{model.data ? "暂无会话" : "正在读取…"}</option> : null}
+          {choices.map(session => {
+            const name = session.short_title || session.title;
+            const sameName = choices.filter(choice => (choice.short_title || choice.title) === name);
+            return <option key={session.session_ref} value={session.session_ref}>{name}{sameName.length > 1 ? ` ${sameName.findIndex(choice => choice.session_ref === session.session_ref) + 1}` : ""} · {sessionScope(session, model.context)} · {sessionDisplay(session).label}</option>;
+          })}
+        </select>
+      </span></label>
+      {model.manualSelection ? <button type="button" className="root-return-current" onClick={() => { model.returnCurrent(); onReturnCurrent?.(); }}>返回当前执行</button>
+        : <span className="root-follow-label">{selectedExecuting ? "跟随当前执行" : "当前工作"}</span>}
     </div>
     {targets.length ? <nav className="root-parallel-targets" aria-label="并行 Target 会话"><span>Target</span>{targets.map(session => {
       const name = session.short_title || session.title;
       const sameName = targets.filter(target => (target.short_title || target.title) === name);
-      const executing = statusKnown && session.is_executing;
+      const { executing, label } = sessionDisplay(session);
       return <button key={session.session_ref} type="button" data-session-ref={session.session_ref} data-executing={executing}
-        title={`${session.title} · ${statusKnown ? rootSessionStatus(session) : "状态待确认"}`}
-        aria-label={`${name} · ${executing ? "正在执行" : statusKnown ? rootSessionStatus(session) : "状态待确认"}`}
+        title={`${session.title} · ${label}`}
+        aria-label={`${name} · ${executing ? "正在执行" : label}`}
         aria-pressed={model.selected?.session_ref === session.session_ref} onClick={() => select(session)}>
-        {executing ? <i className="root-running-spinner" aria-hidden="true" /> : null}{name}{sameName.length > 1 ? ` · ${sameName.findIndex(target => target.session_ref === session.session_ref) + 1}` : ""}{!session.is_executing && session.status === "completed" ? " · 已完成" : ""}</button>;
+        {executing ? <i className="root-running-spinner" aria-hidden="true" /> : null}
+        <span>{name}{sameName.length > 1 ? ` · ${sameName.findIndex(target => target.session_ref === session.session_ref) + 1}` : ""}</span>
+        {!session.is_executing && session.status === "completed" ? <span className="root-target-completed">已完成</span> : null}
+      </button>;
     })}</nav> : null}
-    {failure ? <div className="lumen-idea-health-blocker" data-testid="research-current-worker-blocker" role="status"><span aria-hidden="true">!</span><div><b>{retrySummary ?? (usageLimit ? "模型额度已用尽" : failure.name === "target_run_worker" ? "Target 推进受阻" : "当前阶段推进受阻")}</b><small>{retrySummary ? "原会话正在继续；上次错误与研究记录仍保留。" : usageLimit ? "原会话和研究记录已保留；额度恢复后可继续研究。" : "已形成的会话与研究记录仍可查看。"}</small></div><code title={failure.reason?.code}>{failure.reason?.code ?? "worker_unavailable"}</code></div> : null}
-    {model.error || model.data?.limited ? <div className="root-session-warning" role="status">{model.data ? "会话状态更新不完整，保留已读取记录。" : "暂时无法读取研究会话。"}<button onClick={model.refresh}>重新读取</button>{model.error ? <details><summary>状态详情</summary><code>{model.error}</code></details> : null}</div> : null}
+    {failure ? <div className="root-worker-notice" data-testid="research-current-worker-blocker">
+      <div role="status">
+        <b>{retrySummary ?? (usageLimit ? "模型额度已用尽" : failure.name === "target_run_worker" ? "Target 推进受阻" : "当前阶段推进受阻")}</b>
+        <span>{retrySummary ? "原会话正在继续；上次错误与研究记录仍保留。" : usageLimit ? "原会话和研究记录已保留；额度恢复后可继续研究。" : "已形成的会话与研究记录仍可查看。"}</span>
+      </div>
+      <details><summary>错误详情</summary><code>{failure.reason?.code ?? "worker_unavailable"}</code></details>
+    </div> : null}
+    {model.error || model.data?.limited ? <div className="root-session-warning" role="status">{model.error ? "会话暂时无法更新，保留已读取记录。" : "部分会话记录未完整载入。"}<button onClick={model.refresh}>重新读取</button>{model.error ? <details><summary>状态详情</summary><code>{model.error}</code></details> : null}</div> : null}
     {model.selectedUnavailable && model.selected ? <div className="root-session-warning" role="status">所选根会话暂不可读取，保留已读取内容和阅读位置。<button onClick={model.refresh}>重新读取所选会话</button></div> : null}
     </div>
-    {model.selected && model.questRef ? <RootSessionTimeline key={`${model.scope}:${model.selected.session_ref}:${model.manualSelection ? "selected" : "current"}`} questRef={model.questRef} session={model.selected} scope={sessionScope(model.selected, model.context)} active={model.active} stale={Boolean(model.context.stale || model.error || model.data?.limited || model.selectedUnavailable)} readingCache={model.readingCache} followCurrent={!model.manualSelection} onReadHistory={model.pinReading} />
+    {model.selected && model.questRef ? <RootSessionTimeline key={`${model.scope}:${model.selected.session_ref}:${model.manualSelection ? "selected" : "current"}`} questRef={model.questRef} session={model.selected} scope={sessionScope(model.selected, model.context)} active={model.active} stale={!sessionKnown(model.selected) || model.selectedUnavailable} readingCache={model.readingCache} followCurrent={!model.manualSelection} onReadHistory={model.pinReading} />
       : model.selectedTimelineKind ? <p className="research-output-empty">{model.selectedRef ? "所选会话暂不可读取。" : !model.data ? "正在读取所选工作会话…" : model.error || model.data.limited ? "所选工作会话暂不可确认，请重新读取。" : model.selectedTimelineKind === "target" ? "所选实验任务尚无会话。" : "所选轮次的此阶段尚无会话。"}</p>
       : model.selectedStage === "reasoning" && model.selectedRole && !model.selectedRef ? <section className="research-conversation root-pending-role" aria-label={`${reasoningRoleLabels[model.selectedRole]} 待启动会话`} data-root-role={model.selectedRole}>
         <h3>{reasoningRoleLabels[model.selectedRole]}</h3>
@@ -418,7 +438,7 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
     }}>
       {start > 0 ? <button className="root-load-earlier" onClick={() => pauseReading(start)}>读取更早工作 · 还有 {start} 次</button> : null}
       {operations.slice(start, end).map((operation, index) => <RootOperationOutput key={operation.operation_ref} questRef={questRef} sessionRef={session.session_ref}
-        operation={operation} ordinal={start + index + 1} active={active} followLive={follow} onOutput={onOutput} readingCache={reading.operations} onReadHistory={() => pauseReading()}
+        operation={operation} sessionState={stale ? "unknown" : session.status} ordinal={start + index + 1} active={active} followLive={follow} onOutput={onOutput} readingCache={reading.operations} onReadHistory={() => pauseReading()}
         detailsHost={detailsHost} clockHost={index === end - start - 1 ? clockHost : null}
         onShowHistory={() => { reading.detailsOpen = true; setDetailsOpen(true); pauseReading(); }} />)}
       {end < operations.length ? <button className="root-load-earlier" onClick={() => setHistoryEnd(Math.min(operations.length, end + 4))}>读取后续工作 · 还有 {operations.length - end} 次</button> : null}
@@ -433,7 +453,7 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   </section>;
 }
 
-function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active, followLive = true, onOutput, readingCache, onReadHistory, detailsHost, clockHost, onShowHistory }: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; followLive?: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void; detailsHost: HTMLDivElement | null; clockHost: HTMLDivElement | null; onShowHistory: () => void }) {
+function RootOperationOutput({ questRef, sessionRef, operation, sessionState, ordinal, active, followLive = true, onOutput, readingCache, onReadHistory, detailsHost, clockHost, onShowHistory }: { questRef: string; sessionRef: string; operation: RootOperation; sessionState?: RootSession["status"] | "unknown"; ordinal: number; active: boolean; followLive?: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void; detailsHost: HTMLDivElement | null; clockHost: HTMLDivElement | null; onShowHistory: () => void }) {
   const [reading] = useState(() => {
     const state = readingCache.get(operation.operation_ref) ?? { page: null, chunks: [], browseOffset: null, tailOffset: 0, clock: null, visibleCount: 80 };
     readingCache.set(operation.operation_ref, state);
@@ -530,8 +550,9 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
   }, [questRef, sessionRef, operation.operation_ref, operation.status, active, followLive, retry, browseOffset]);
   useEffect(onOutput, [page?.next_offset, page?.stream_ref, onOutput]);
   return <article className="root-operation" data-operation-ref={operation.operation_ref}>
-    {clockHost ? createPortal(<><RootOutputTimestamp sourceUpdatedAt={page?.source_updated_at} />
-      {page ? <ExecutionElapsed sample={clock} ended={page.status === "terminal"} /> : null}</>, clockHost) : null}
+    {clockHost ? createPortal(page ? <ExecutionElapsed sample={clock} ended={page.status === "terminal"}
+      state={error ? "unknown" : sessionState && sessionState !== "executing" ? sessionState : page.status === "waiting" ? "waiting" : "executing"} />
+      : <RootOutputTimestamp sourceUpdatedAt={null} />, clockHost) : null}
     {error ? <div className="root-session-warning" role="status">{page ? "记录暂时无法更新，已保留上次内容。" : "部分记录暂时无法读取，后续内容仍可继续查看。"}<button onClick={() => { retryRequested.current = true; setRetry(value => value + 1); }}>重试</button><details><summary>读取详情</summary><code>{error}</code></details></div> : null}
     {page ? <>{(chunks[0]?.offset ?? 0) > 0 && browseOffset === null ? <button type="button" className="root-load-earlier root-output-older" onClick={onShowHistory}>前文已收起 · 查看更早内容</button> : null}
       <StageReadableOutput rawText={page.text} chunks={chunks} streamKey={page.stream_ref} rootNativeSessionRef={page.native_session_ref} isTerminal={page.status === "terminal"} publicOnly

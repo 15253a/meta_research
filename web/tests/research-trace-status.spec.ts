@@ -86,6 +86,43 @@ async function fixture(page: Page) {
   return { snapshot, catalog, bundle, target1, target2, acquisition, history, output, state, errors, writes, operation };
 }
 
+test("waiting output shows a stable last record and resumes its elapsed clock only when executing", async ({ page }) => {
+  const f = await fixture(page);
+  f.target1.is_executing = false;
+  f.target1.status = "waiting";
+  f.target1.operations[0].status = "waiting";
+  await page.goto("http://research-trace.test/?workspace=1");
+  const trace = page.locator("#research-activity");
+  await trace.getByLabel("选择查看的会话").selectOption(f.target1.session_ref);
+  const clock = trace.locator(".research-execution-clock");
+  await expect(clock).toContainText("等待继续");
+  await expect(clock).toContainText("最后记录于");
+  await expect(clock).not.toContainText("距上次执行记录");
+  f.target1.is_executing = true;
+  f.target1.status = "executing";
+  f.target1.operations[0].status = "executing";
+  await expect(clock).toContainText("执行中");
+  await expect(clock).toContainText("距上次执行记录");
+  const seconds = Number(await clock.locator("b").innerText());
+  await expect.poll(async () => Number(await clock.locator("b").innerText())).toBeGreaterThan(seconds);
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
+test("incomplete older history does not erase a verified executing Target", async ({ page }) => {
+  const f = await fixture(page);
+  f.catalog.limited = true;
+  f.catalog.reasons = [{ code: "deepfetch_root_operation_unavailable" }, { code: "root_session_operations_limited" }];
+  f.target1.limited = true;
+  await page.goto("http://research-trace.test/?workspace=1");
+  const trace = page.locator("#research-activity");
+  await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
+  await expect(trace.locator(".root-session-heading")).toContainText("正在执行");
+  await expect(trace.locator(".root-session-heading")).not.toContainText("状态待确认");
+  await expect(trace.locator(".research-execution-clock")).toContainText("执行中");
+  await expect(trace).toContainText("部分会话记录未完整载入");
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
 test("current output follows an executing Target instead of its waiting stage and supports parallel roots", async ({ page }) => {
   const f = await fixture(page);
   await page.goto("http://research-trace.test/?workspace=1");
@@ -93,19 +130,30 @@ test("current output follows an executing Target instead of its waiting stage an
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
   await expect(trace).toContainText("T1 正在执行基线实验。");
   await expect(trace).not.toContainText("现在等待两个 Target 的证据。");
-  await page.locator('button[data-session-ref="session-t2"]').click();
+  const targetRings = trace.locator(".root-parallel-targets .root-running-spinner");
+  const selectedRing = trace.locator(".root-session-select .root-running-spinner");
+  await expect(targetRings).toHaveCount(2);
+  await expect(selectedRing).toHaveCSS("animation-play-state", "running");
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(selectedRing).toHaveCSS("animation-name", "none");
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await trace.locator('button[data-session-ref="session-t2"]').click();
   await expect(trace).toContainText("T2 正在执行对照实验。");
-  await trace.getByRole("button", { name: "返回当前阶段 ↗" }).click();
+  await trace.getByRole("button", { name: "返回当前执行", exact: true }).click();
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
   f.target1.is_executing = false; f.target1.status = "completed";
   f.catalog.active_session_refs = [f.target2.session_ref, f.acquisition.session_ref];
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target2.session_ref);
+  await expect(targetRings).toHaveCount(1);
+  await expect(trace.locator('button[data-session-ref="session-t2"] .root-running-spinner')).toBeVisible();
   f.target2.is_executing = false; f.target2.status = "completed";
   f.acquisition.is_executing = false; f.acquisition.status = "waiting";
   f.catalog.active_session_refs = [];
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.bundle.session_ref);
   await expect(trace.locator(".root-session-heading")).toContainText("等待继续");
   await expect(trace.locator('.root-session-heading [data-executing="true"]')).toHaveCount(0);
+  await expect(targetRings).toHaveCount(0);
+  await expect(selectedRing).toHaveCount(0);
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
 

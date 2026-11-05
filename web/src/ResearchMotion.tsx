@@ -53,5 +53,6 @@ export function useResearchMotion<T extends HTMLElement = HTMLDivElement>(runnin
     observer.observe(region);
     return () => observer.disconnect();
   }, []);
-  return { ref, visible: visible && intersecting, active: running && !still && !reduced && visible && intersecting };
+  const enabled = !still && !reduced && visible && intersecting;
+  return { ref, visible: visible && intersecting, enabled, active: running && enabled };
 }

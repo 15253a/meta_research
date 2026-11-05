@@ -1605,6 +1605,12 @@ class CodexDeepFetchAdapter:
                 checkpoint=checkpoint,
                 runtime_binding_hash=runtime_binding_hash,
             )
+            checkpoint = self._restore_inherited_terminal_acquisitions(
+                request,
+                public_root=public_root,
+                checkpoint=checkpoint,
+                runtime_binding_hash=runtime_binding_hash,
+            )
         except DeepFetchUnavailable as error:
             if error.durable_outcome != "unknown":
                 raise
@@ -1744,7 +1750,11 @@ class CodexDeepFetchAdapter:
             elif raw.get("action") == "finalize":
                 _validate_final_envelope_shape(raw)
                 if turn_number != checkpoint.next_turn_number - 1:
-                    raise ValueError("deepfetch reconciliation finalized early")
+                    next_operation = self._root_provider_job_ref(
+                        checkpoint.turn_sources[turn_number + 1]["job_ref"]
+                    )
+                    if next_operation == operation_ref:
+                        raise ValueError("deepfetch reconciliation finalized early")
             else:
                 raise ValueError("deepfetch reconciliation action invalid")
 
@@ -1901,6 +1911,78 @@ class CodexDeepFetchAdapter:
                 "phase": _resident_mcp_phase(request, f"turn-{checkpoint.next_turn_number}"), "kind": "work"}),
             next_prompt=None,
             final_envelope=raw,
+        )
+
+    def _restore_inherited_terminal_acquisitions(
+        self,
+        request: DeepFetchProviderRequest,
+        *,
+        public_root: Path,
+        checkpoint: _DeepFetchProtocolCheckpoint,
+        runtime_binding_hash: str,
+    ) -> _DeepFetchProtocolCheckpoint:
+        """Recover an uncheckpointed predecessor turn from its signed spool.
+
+        A terminal validation failure can leave only the preceding Gate durable.
+        A successor keeps the original public files, so its final answer must also
+        retain that exact predecessor's acquisition provenance. Nothing is
+        dispatched, and the normal Owner and artifact checks still run afterwards.
+        """
+        source_job = checkpoint.public_root_job_ref
+        if source_job is None or source_job == request.job_ref or checkpoint.phase != "finalized":
+            return checkpoint
+        source_root = self._select_reconciliation_root(
+            self._workspace / "runs",
+            identity_leaf=self._provider_execution_key(source_job),
+            runtime_binding_hash=runtime_binding_hash,
+        )
+        assert source_root is not None
+        source_private = source_root / "private"
+        if source_private.is_symlink() or not source_private.is_dir():
+            raise ValueError("deepfetch reconciliation inherited source invalid")
+        source = _read_protocol_checkpoint(
+            source_private / "protocol.json", _deepfetch_protocol_identity(request)
+        )
+        if source.public_root_job_ref not in {None, source_job}:
+            raise ValueError("deepfetch reconciliation inherited source cycle")
+        source = self._verify_existing_protocol_turns(
+            replace(request, job_ref=source_job, native_session_ref=source.native_session_ref),
+            public_root=public_root,
+            checkpoint=source,
+            runtime_binding_hash=runtime_binding_hash,
+        )
+        if source.phase != "finalized":
+            raise ValueError("deepfetch reconciliation inherited turn incomplete")
+        common = 0
+        for old, current in zip(source.turn_sources, checkpoint.turn_sources):
+            if old != current:
+                break
+            if source.evidence_parts[common] != checkpoint.evidence_parts[common]:
+                raise ValueError("deepfetch reconciliation inherited evidence mismatch")
+            common += 1
+        if common == len(source.turn_sources):
+            return checkpoint
+        # Only the original terminal turn may be missing from the inherited
+        # prefix; never infer or stitch together unrelated source histories.
+        if common != len(source.turn_sources) - 1 or common >= len(checkpoint.turn_sources):
+            raise ValueError("deepfetch reconciliation inherited prefix mismatch")
+        if self._root_provider_job_ref(source.turn_sources[-1]["job_ref"]) == self._root_provider_job_ref(
+            checkpoint.turn_sources[common]["job_ref"]
+        ):
+            raise ValueError("deepfetch reconciliation inherited successor mismatch")
+        merged = replace(checkpoint, acquisition_request_ids=source.acquisition_request_ids,
+                         acquisition_item_proofs=source.acquisition_item_proofs)
+        batches: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for proof in checkpoint.acquisition_item_proofs:
+            batches.setdefault((cast(str, proof["phase"]), cast(str, proof["effect_id"])), []).append(proof)
+        for batch in batches.values():
+            merged = _append_acquisition_proofs(merged, tuple(batch))
+        sources = (*source.turn_sources, *checkpoint.turn_sources[common:])
+        return replace(
+            merged,
+            next_turn_number=len(sources),
+            turn_sources=sources,
+            evidence_parts=(*source.evidence_parts, *checkpoint.evidence_parts[common:]),
         )
 
     def _read_existing_turn(
@@ -2567,7 +2649,7 @@ class CodexDeepFetchAdapter:
                     arguments={"effect_id": effect_id},
                 )
                 if execution.get("status") == "unknown_outcome":
-                    raise DeepFetchUnavailable("deepfetch_acquisition_reattestation_required")
+                    raise DeepFetchUnavailable("deepfetch_provider_reconciliation_pending")
                 item_proofs = _semantic_acquisition_item_proofs(
                     execution,
                     effect_id=effect_id,
@@ -2615,7 +2697,7 @@ class CodexDeepFetchAdapter:
                 )
                 if execution.get("status") == "unknown_outcome":
                     raise DeepFetchUnavailable(
-                        "deepfetch_acquisition_reattestation_required"
+                        "deepfetch_provider_reconciliation_pending"
                     )
                 proofs.extend(
                     _semantic_acquisition_item_proofs(
@@ -4625,7 +4707,12 @@ def _import_v4_public_artifacts(
             key: proof[key]
             for key in ("path", "format", "sha256", "bytes")
         }
-        if previous is not None and previous != artifact:
+        # Separate Owner requests can retain identical bytes at different
+        # verified paths. Each proof keeps its exact path for reattestation;
+        # the public copy is bound to the paper's content, not that location.
+        if previous is not None and any(
+            previous[key] != artifact[key] for key in ("format", "sha256", "bytes")
+        ):
             raise DeepFetchUnavailable(
                 "deepfetch_hosted_acquisition_artifact_mismatch"
             )
@@ -5196,28 +5283,91 @@ def _validated_prototype_evidence(value: object) -> dict[str, object]:
 
 def _native_acquisition_effects(stdout: str) -> tuple[dict[str, object], ...]:
     """Read native calls from the verified provider stream, not model prose/results."""
-    effects: dict[str, dict[str, object]] = {}
-    for line in stdout.splitlines():
+    calls: list[tuple[int, dict[str, object], bool]] = []
+    unfinished: dict[tuple[int, str], tuple[int, dict[str, object]]] = {}
+    turn = 0
+    for position, line in enumerate(stdout.splitlines()):
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type in ("thread.started", "turn.started"):
+            # Native item IDs can be reused after a turn or durable resume.
+            turn += 1
+            continue
+        if event_type not in ("item.started", "item.completed"):
             continue
         item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if event_type == "item.completed" and isinstance(item_id, str):
+            # Any terminal response resolves its start, including rejection.
+            unfinished.pop((turn, item_id), None)
         if (
-            not isinstance(item, dict)
-            or item.get("type") != "mcp_tool_call"
+            item.get("type") != "mcp_tool_call"
             or item.get("server") != "meta_research"
-            or item.get("tool") != ROOT_AGENT_ACQUISITION_OPERATION_IDS[0]
-            or item.get("status") != "completed"
-            or item.get("error") is not None
         ):
             continue
+        if event_type == "item.started":
+            if (item.get("tool") == ROOT_AGENT_ACQUISITION_OPERATION_IDS[0]
+                and item.get("status") == "in_progress"
+                and isinstance(item_id, str) and item_id):
+                unfinished[(turn, item_id)] = (position, item)
+        else:
+            calls.append((position, item, False))
+    calls.extend((position, item, True) for position, item in unfinished.values())
+    calls.sort(key=lambda call: call[0])
+    reconciled_effect_ids = {
+        arguments["effect_id"]
+        for _position, item, interrupted in calls
+        if not interrupted and item.get("tool") == ROOT_AGENT_ACQUISITION_OPERATION_IDS[1]
+        and item.get("status") == "completed"
+        and item.get("error") is None
+        and isinstance(arguments := item.get("arguments"), dict)
+        and isinstance(arguments.get("effect_id"), str)
+    }
+    effects: dict[str, dict[str, object]] = {}
+    for _position, item, interrupted in calls:
+        if item.get("tool") != ROOT_AGENT_ACQUISITION_OPERATION_IDS[0]:
+            continue
         arguments = item.get("arguments")
+        error = item.get("error")
+        transport_timeout = (
+            isinstance(error, dict)
+            and isinstance(error.get("message"), str)
+            and "timed out awaiting tools/call" in error["message"].lower()
+        )
+        completed = (
+            not interrupted
+            and item.get("status") == "completed"
+            and item.get("error") is None
+        )
+        recovered = interrupted or (
+            item.get("status") == "failed"
+            and isinstance(arguments, dict)
+            and isinstance(arguments.get("effect_id"), str)
+            and (transport_timeout or arguments.get("effect_id") in reconciled_effect_ids)
+        )
+        if not completed and not recovered:
+            continue
         if not isinstance(arguments, dict):
-            raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
-        effect = _acquisition_effect_from_checkpoint(arguments)
+            if completed:
+                raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
+            continue
+        try:
+            effect = _acquisition_effect_from_checkpoint(arguments)
+        except DeepFetchUnavailable:
+            if completed:
+                raise
+            # A rejected malformed request is not evidence of an Owner effect.
+            continue
+        # A missing response or transport timeout leaves the Owner outcome
+        # unknown. Reattest the observed targets; a tool result claim alone
+        # never authorizes their acceptance.
         effect_id = cast(str, effect["effect_id"])
         if effect_id in effects and effects[effect_id] != effect:
             raise DeepFetchUnavailable("deepfetch_acquisition_identity_duplicate")

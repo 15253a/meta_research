@@ -86,7 +86,7 @@ test("real server selection and explicit receipts cover every material consumer"
   if (await requestClose.isVisible()) await requestClose.click();
 
   const guidance = page.getByRole("complementary", { name: "研究助手", exact: true });
-  await guidance.getByText("指导力度与可选材料", { exact: true }).click();
+  await guidance.getByText("指导与材料", { exact: true }).click();
   await guidance.getByLabel("给研究助手发消息", { exact: true }).fill("Guidance keeps its exact text and strength.");
   await guidance.getByLabel("指导力度", { exact: true }).selectOption("4");
   await choose(page, guidance, fixture.small_file, "Exact guidance source description.");

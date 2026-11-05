@@ -120,7 +120,7 @@ try {
         `QuestionTree uses wrong ${viewport.width}px layout`,
       );
 
-      await tree.getByRole("button", { name: "问题历史 ↗" }).click();
+      await tree.getByRole("button", { name: "问题历史" }).click();
       const questionHistory = tree.getByRole("region", { name: "问题历史" });
       await contains(questionHistory, expected.question_ref, "installed Question history identity");
       assert.equal(

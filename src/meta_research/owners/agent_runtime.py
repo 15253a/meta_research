@@ -311,7 +311,12 @@ _NON_CANDIDATE_COMPLETION_DETAILS = frozenset(
 )
 DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
 _DEEPFETCH_FINALIZATION_RECONCILABLE_CODES = frozenset(
-    {"deepfetch_workflow_evidence_invalid", "deepfetch_oa_only_limitation_invalid"}
+    {
+        "deepfetch_workflow_evidence_invalid",
+        "deepfetch_oa_only_limitation_invalid",
+        "deepfetch_hosted_acquisition_proof_missing",
+        "deepfetch_hosted_acquisition_proof_mismatch",
+    }
 )
 _BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX = "bundle-target-"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"

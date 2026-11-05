@@ -1,0 +1,70 @@
+/* Keep the assistant readable at its narrowest supported panel width. */
+.lumen-companion { border-color: #e0e3ef; background: linear-gradient(180deg, #f6f5ff, #fff 210px); box-shadow: 0 8px 28px #3f416009; }
+.lumen-companion .lumen-companion-head { padding: 16px 20px; border-bottom-color: #e7e8f2; background: #ffffff80; }
+.lumen-companion .lumen-companion-head b { font-size: 16px; }
+.lumen-companion .lumen-companion-head small,
+.lumen-companion .lumen-companion-head code { font-size: 12px; color: #60657c; }
+.lumen-companion .lumen-companion-head .research-panel-hide { margin-left: auto; }
+.lumen-companion .companion-session-state { padding: 10px 20px; border-bottom: 0; font-size: 13px; color: #545b73; }
+.lumen-companion .companion-session-state > summary { color: #657089; font-weight: 500; }
+.lumen-companion .companion-session-state code { font-size: 12px; }
+.lumen-companion .companion-files { margin: 0; border: 0; border-bottom: 1px solid #e7e8f2; border-radius: 0; background: transparent; font-size: 13px; }
+.lumen-companion .companion-files > summary { padding: 9px 20px 12px; color: #657089; }
+.lumen-companion .companion-files > div { padding: 0 20px 14px; }
+.lumen-companion .lumen-chat { padding: 20px; gap: 18px; }
+.lumen-companion .lumen-chat > article { flex-shrink: 0; }
+.lumen-companion .lumen-chat > details { flex-shrink: 0; }
+.lumen-companion .lumen-message { padding: 14px 16px; font-size: 14px; line-height: 1.75; max-width: 100%; }
+.lumen-companion .lumen-message > small { font-size: 12px; font-weight: 500; letter-spacing: 0; color: #626780; }
+.lumen-companion .lumen-message.me > small { color: #f0efff; }
+.lumen-companion .lumen-message-state { font-size: 12px; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) { padding: 16px; border-radius: 12px; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) > b { font-size: 15px; line-height: 1.6; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) p { font-size: 14px; line-height: 1.7; color: #4d546c; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) small { font-size: 12px; line-height: 1.5; letter-spacing: 0; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) > button,
+.lumen-companion .guidance-confirmation-actions button { padding: 8px 12px; font-size: 13px; line-height: 1.5; }
+.lumen-companion .lumen-command > details > summary { min-height: 0; padding: 10px 0; font-size: 13px; line-height: 1.5; font-weight: 500; color: #6a5049; }
+.lumen-companion .lumen-command :is(code, pre) { font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.lumen-companion .lumen-command dl { font-size: 12px; line-height: 1.6; }
+.lumen-companion .lumen-command-identity { margin: 10px 0; }
+.lumen-companion .lumen-command-identity pre { max-height: 260px; overflow: auto; }
+.lumen-companion :is(.lumen-confirmed, .lumen-authorized) { font-size: 13px; line-height: 1.6; }
+.lumen-companion :is(.lumen-confirmed, .lumen-authorized) b { font-size: 13px; }
+.lumen-companion :is(.lumen-command, .guidance-confirmation) details > summary { cursor: pointer; }
+.lumen-companion .guidance-confirmation label { font-size: 13px; color: #41495f; }
+.lumen-companion .guidance-confirmation :is(textarea, select) { font-size: 14px; line-height: 1.6; background: #fff; }
+.lumen-companion .guidance-confirmation details { font-size: 13px; color: #545b73; }
+.lumen-companion .lumen-compose { padding: 12px 18px 16px; border-top-color: #e7e8f2; background: #fff; }
+.lumen-companion .guidance-options > summary { width: fit-content; min-height: 28px; line-height: 28px; font-size: 13px; color: #657089; }
+.lumen-companion .guidance-options[open] { max-height: min(320px, 40dvh); overflow: auto; }
+.lumen-companion .guidance-options label { font-size: 13px; }
+.lumen-companion .guidance-options select { width: 100%; min-height: 38px; font: inherit; }
+.lumen-companion .server-material-picker button { width: auto; height: auto; min-height: 38px; padding: 8px 12px; border: 1px solid #d3d7e8; border-radius: 8px; background: #f8f9fd; color: #3e4762; font-size: 13px; line-height: 1.5; }
+.lumen-companion .server-material-picker__actions { flex-wrap: wrap; }
+.lumen-companion .lumen-compose > .lumen-compose-input { align-items: flex-end; padding: 8px 10px; border-color: #dce1ec; background: #fafbfe; transition: border-color 140ms ease, box-shadow 140ms ease; }
+.lumen-companion .lumen-compose > .lumen-compose-input:focus-within { border-color: #afa8d9; box-shadow: 0 0 0 3px #eeecf9; }
+.lumen-companion .lumen-compose > .lumen-compose-input > textarea { color: #30384c; font-size: 14px; line-height: 1.6; }
+.lumen-companion .lumen-compose > .lumen-compose-input > textarea::placeholder { color: #697188; }
+.lumen-companion .lumen-compose > .lumen-compose-input > button { width: 38px; height: 38px; flex: 0 0 38px; }
+.lumen-companion .lumen-compose > .lumen-compose-input > button:disabled { background: #e8ebf2; color: #8d96a8; }
+.lumen-companion .lumen-compose > .lumen-compose-input > button:not(:disabled):hover { background: #333e57; }
+.lumen-companion .lumen-compose > small[role=alert] { font-size: 13px; color: #a32929; }
+.lumen-companion :is(.lumen-command, .lumen-proposal, .lumen-constraint) em[role=status] { font-size: 13px; }
+.lumen-companion .lumen-research-control > details > summary { font-size: 13px; font-weight: 500; }
+.lumen-companion .lumen-research-control-body :is(p, span, small, label, select, input, button) { font-size: 13px; line-height: 1.6; }
+.lumen-companion .lumen-research-control-body > b { font-size: 15px; }
+.lumen-companion .lumen-human-attention :is(p, button, small) { font-size: 13px; line-height: 1.6; }
+.lumen-companion .lumen-human-attention > b { font-size: 15px; }
+.lumen-companion .assistant-operation-history { min-width: 0; border-top: 1px solid #e4e7ef; color: #657089; }
+.lumen-companion .assistant-operation-history > summary { cursor: pointer; padding: 13px 0; font-size: 13px; line-height: 1.6; }
+.lumen-companion .assistant-operation-history > summary > span:last-child { float: right; min-width: 24px; text-align: center; border-radius: 7px; background: #f0f2f7; color: #67718a; font-variant-numeric: tabular-nums; }
+.lumen-companion .assistant-operation-history > div { display: grid; gap: 12px; padding-bottom: 4px; }
+.lumen-companion .lumen-command[data-command-resolved=true] { border-color: #e1e5ee; background: #fafbfd; }
+.lumen-companion .lumen-command[data-command-resolved=true] > small { color: #627486; }
+.lumen-companion .lumen-command[data-command-resolved=true] > details { border-color: #e1e5ee; }
+.lumen-companion .lumen-command[data-command-resolved=true] > details > summary,
+.lumen-companion .lumen-command > .lumen-command-receipts > summary { color: #657089; }
+.lumen-companion .lumen-command-receipts :is(.lumen-confirmed, .lumen-authorized) { margin-top: 8px; padding: 10px 0; border: 0; border-top: 1px solid #e4e7ef; background: transparent; }
+.lumen-companion .lumen-command-receipts :is(.lumen-confirmed, .lumen-authorized):first-of-type { margin-top: 0; border-top: 0; }
+.lumen-companion .lumen-command-receipts :is(.lumen-confirmed, .lumen-authorized) > details { margin-top: 6px; }

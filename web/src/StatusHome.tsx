@@ -162,11 +162,13 @@ export function StatusHome() {
   }, [rootScope]);
   const targetObservation = observedActiveTarget(rawStatus, rootObservation?.scope === rootScope ? rootObservation.data : null);
   const status = targetObservation?.status ?? rawStatus;
+  const executing = !error && status?.state === "running"
+    && Boolean(status.current_task && ["active", "executing", "running"].includes(status.current_task.status));
   const unhealthy = status?.health.checks.filter(check => check.status !== "ready") ?? [];
   return <div className="status-home">
     <header className="status-home-header">
       <a href="/" aria-label="Meta Research 首页"><span className="lumen-logo" aria-hidden="true"><MetaTrace variant="signature" /></span><span><b>Meta Research</b><small>LUMEN WORKSPACE</small></span></a>
-      <nav aria-label="工作台导航"><a className="is-active" href="/" aria-current="page">工作台</a><a href="/?workspace=1">研究现场</a><a href="/?workspace=1&companion=1">研究助手 <span>↗</span></a></nav>
+      <nav aria-label="工作台导航"><a className="is-active" href="/" aria-current="page">工作台</a><a href="/?workspace=1">研究现场</a><a href="/?workspace=1&companion=1">研究助手 <MetaTrace variant="entry" /></a></nav>
       <ResearchMotionControl />
       <HostResources />
     </header>
@@ -174,7 +176,7 @@ export function StatusHome() {
       <div className="status-home-intro"><div><p className="home-eyebrow">从一个问题，到新的发现</p><h2>研究工作台<span> / Workspace</span></h2></div><p className="home-intro-note">思路、验证、证据与判断。<br />在同一条研究脉络里，继续探索。</p></div>
       <section className="status-home-current" aria-labelledby="current-task-title" data-testid="runtime-status">
         <SpectrumStages current={spectrumStage(status?.foreground?.stage)} stale={error}
-          running={!error && status?.state === "running" && Boolean(status.current_task && ["active", "executing", "running"].includes(status.current_task.status))} />
+          running={executing} />
         <div className="home-task-panel">
         <div className="home-task-copy">
         <div className="status-home-topline">
@@ -186,8 +188,8 @@ export function StatusHome() {
         <h1 id="current-task-title">{status?.current_task?.title ?? (status ? "还没有运行中的研究任务" : error ? "暂时无法读取运行状态" : "正在读取当前任务")}</h1>
         {error ? <p className="status-home-error" role="status">暂时无法更新状态，将自动重试。{status ? "下面保留上次成功读取的状态，不代表此刻的最新进度。" : "尚未取得有效状态。"}</p> : null}
         <div className="status-home-primary">
-          <a className="status-home-primary-link" href={status?.state === "idle" ? "/?panel=create-quest" : "/?workspace=1"}>{status?.state === "idle" ? "开始研究" : "当前任务与实验日志"} <span>↗</span></a>
-          {status && status.pending_requests > 0 ? <a className="status-home-response" href="/?panel=human-requests">需要你回应 · {status.pending_requests} 项 ↗</a> : null}
+          <a className="status-home-primary-link" href={status?.state === "idle" ? "/?panel=create-quest" : "/?workspace=1"}>{status?.state === "idle" ? "开始研究" : "当前任务与实验日志"} <MetaTrace variant="entry" working={executing} /></a>
+          {status && status.pending_requests > 0 ? <a className="status-home-response" href="/?panel=human-requests">需要你回应 · {status.pending_requests} 项 <MetaTrace variant="entry" /></a> : null}
         </div>
         </div>
         <div className="home-task-details">
@@ -202,9 +204,9 @@ export function StatusHome() {
         </div>
       </section>
       <nav className="status-home-links" aria-label="按需查看研究详情">
-        <a href="/?panel=question-tree&inspector=history"><ResearchIcon glyph="↺" /><div><b>研究历史 <span>↗</span></b><p>回看问题、轮次与研究发现</p></div></a>
-        <a href="/?panel=research-assets"><ResearchIcon glyph="▤" /><div><b>研究资料 <span>↗</span></b><p>整理数据、文献与证据</p></div></a>
-        <a href="/?panel=writing"><ResearchIcon glyph="✎" /><div><b>报告与写作 <span>↗</span></b><p>查看交付物与写作进展</p></div></a>
+        <a href="/?panel=question-tree&inspector=history"><ResearchIcon glyph="↺" /><div><b>研究历史 <MetaTrace variant="entry" /></b><p>回看问题、轮次与研究发现</p></div></a>
+        <a href="/?panel=research-assets"><ResearchIcon glyph="▤" /><div><b>研究资料 <MetaTrace variant="entry" /></b><p>整理数据、文献与证据</p></div></a>
+        <a href="/?panel=writing"><ResearchIcon glyph="✎" /><div><b>报告与写作 <MetaTrace variant="entry" /></b><p>查看交付物与写作进展</p></div></a>
       </nav>
       <footer className="status-home-footer">
         <div><b>{status ? error ? "工作器状态 · 上次记录" : status.health.status === "ready" ? "工作器在线" : "部分工作器暂不可用" : "工作器状态待确认"}</b>

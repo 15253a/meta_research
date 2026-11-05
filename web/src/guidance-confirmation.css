@@ -5,7 +5,8 @@
 .guidance-confirmation dd { margin: 4px 0 0; overflow-wrap: anywhere; }
 .guidance-confirmation code { overflow-wrap: anywhere; }
 .guidance-confirmation-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.lumen-compose .guidance-options { display: grid; gap: 8px; margin-bottom: 10px; }
+.lumen-compose .guidance-options { margin-bottom: 10px; }
+.lumen-compose .guidance-options[open] > :not(summary) { margin-top: 12px; }
 .lumen-compose .guidance-options > summary { cursor: pointer; font-size: 12px; }
 .lumen-compose .guidance-options label { display: grid; gap: 5px; font-size: 12px; }
 .lumen-compose .guidance-options select { padding: 7px; border: 1px solid var(--line, #d8ded5); background: var(--bg, #fffdf8); border-radius: 7px; color: inherit; }

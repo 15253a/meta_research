@@ -24,18 +24,19 @@ const curves = [
 ];
 
 /** A decorative spectrum, never a measurement or a completion percentage. */
-function SpectrumChart({ current }: { current: SpectrumStage | null }) {
+function SpectrumChart({ current, motionEnabled }: { current: SpectrumStage | null; motionEnabled: boolean }) {
   const id = useId().replace(/:/g, "");
-  return <svg className="spectrum-chart" viewBox="0 0 800 76" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+  return <svg className="spectrum-chart" data-ambient-motion={motionEnabled} viewBox="0 0 800 76" preserveAspectRatio="none" aria-hidden="true" focusable="false">
     <defs>{spectrumStages.map(stage => <linearGradient key={stage.id} id={`${id}-${stage.id}`} x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stopColor={stage.color} stopOpacity={stage.id === current ? ".23" : ".1"} />
       <stop offset="1" stopColor={stage.color} stopOpacity=".015" />
     </linearGradient>)}</defs>
     <line x1="0" y1="72" x2="800" y2="72" stroke="#dce3ee" strokeWidth="1" />
-    {spectrumStages.map((stage, index) => <g key={stage.id}>
+    {spectrumStages.map((stage, index) => <g key={stage.id} className="spectrum-wave" data-wave={stage.id}>
       <path d={`${curves[index]}Z`} fill={`url(#${id}-${stage.id})`} />
-      <path d={curves[index]} stroke={stage.color} strokeOpacity={stage.id === current ? ".8" : ".45"} strokeWidth="1.2" fill="none" vectorEffect="non-scaling-stroke" />
-      {stage.id === current && <path className="spectrum-flow" d={curves[index]} stroke={stage.color} strokeWidth="2.8" fill="none" strokeLinecap="round" vectorEffect="non-scaling-stroke" />}
+      <path d={curves[index]} stroke={stage.color} strokeOpacity={stage.id === current ? ".8" : ".55"} strokeWidth={stage.id === current ? "2" : "1.2"} fill="none" vectorEffect="non-scaling-stroke" />
+      {stage.id === current && <path className="spectrum-light" pathLength="100" d={curves[index]} color={stage.color}
+        strokeWidth="2.6" fill="none" strokeLinecap="round" vectorEffect="non-scaling-stroke" />}
     </g>)}
   </svg>;
 }
@@ -57,18 +58,18 @@ export function SpectrumStages({ current, labels, onSelect, compact = false, sta
   const motion = useResearchMotion<HTMLElement>(running && !stale);
   return <section ref={motion.ref} data-spectrum-choice="D" data-motion-active={motion.active} className={`research-spectrum${compact ? " is-compact" : ""}`} aria-label="研究光谱">
     {goal ? <QuestGoalEvolution goal={goal} stale={goalStale || stale} scopeKey={goalScope} /> : null}
-    <SpectrumChart current={current} />
+    <SpectrumChart current={current} motionEnabled={motion.enabled && !stale} />
     <nav className="spectrum-stages" aria-label="本轮阶段与历史结果">{spectrumStages.map((stage, index) => {
       const active = current === stage.id;
       const label = labels?.[stage.id] ?? (active ? stale ? "上次记录的阶段" : "当前阶段" : "查看阶段");
       const content = <><span className="spectrum-stage-top"><span className="spectrum-stage-number">0{index + 1}</span><span className="spectrum-stage-state"><i />{label}</span></span>
-        <span className="spectrum-stage-name">{stage.name}{active ? <MetaTrace variant="spectrum" active={motion.active} /> : <span aria-hidden="true">↗</span>}</span>
+        <span className="spectrum-stage-name">{stage.name}<MetaTrace variant="spectrum" working={active} active={active && motion.active} /></span>
         <span className="spectrum-stage-label">{stage.label}</span><span className="spectrum-stage-description">{stage.description}</span></>;
       const props = { className: "spectrum-stage", "data-stage": stage.id, "data-current": active, "aria-current": active ? "step" as const : undefined, "aria-label": `${stage.name} · ${stage.label}，${label}` };
       if (stageContent) return <div key={stage.id} {...props} className="spectrum-stage has-root-sessions" data-selected={selected === stage.id}>
         <button type="button" className="spectrum-stage-open" aria-label={props["aria-label"]} aria-pressed={selected === stage.id} onClick={() => onSelect?.(stage.id)}>{content}</button>
         {stageContent(stage.id)}
-        {onResult ? <button type="button" className="spectrum-stage-result" onClick={() => onResult(stage.id)} aria-label={`查看 ${stage.name} 结果与历史`}>查看结果 ↗</button> : null}
+        {onResult ? <button type="button" className="spectrum-stage-result" onClick={() => onResult(stage.id)} aria-label={`查看 ${stage.name} 结果与历史`}>查看结果 <MetaTrace variant="entry" /></button> : null}
       </div>;
       return onSelect ? <button key={stage.id} type="button" {...props} onClick={() => onSelect(stage.id)}>{content}</button>
         : <a key={stage.id} {...props} href={`/?workspace=1&stage=${stage.id}`}>{content}</a>;

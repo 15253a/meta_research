@@ -60,6 +60,14 @@ test("timeline keeps the reader position through a new Cycle and provides keyboa
   await expect(timeline.locator('[data-cycle-ref="cycle-scroll-38"]')).toBeVisible();
   for (const viewport of [{ width: 1440, height: 420 }, { width: 390, height: 520 }]) {
     await page.setViewportSize(viewport);
+    if (viewport.width === 390) {
+      const metrics = await scroll.evaluate(node => ({ height: node.clientHeight, content: node.scrollHeight,
+        overflow: getComputedStyle(node).overflowY, maxHeight: getComputedStyle(node).maxHeight }));
+      expect(metrics.overflow).toBe("visible");
+      expect(metrics.maxHeight).toBe("none");
+      expect(metrics.content).toBeLessThanOrEqual(metrics.height + 1);
+      continue;
+    }
     await scroll.focus();
     await scroll.press("End");
     await expect.poll(() => scroll.evaluate(node => node.scrollTop)).toBeGreaterThan(100);
@@ -71,6 +79,7 @@ test("timeline keeps the reader position through a new Cycle and provides keyboa
     expect(["auto", "scroll"]).toContain(metrics.overflow);
     expect(metrics.scrollbar).not.toBe("auto");
   }
+  await page.setViewportSize({ width: 1440, height: 420 });
   await scroll.evaluate(node => { node.scrollTop = 17; });
   Object.assign(snapshot.research_control.foreground, { cycle_ref: "cycle-scroll-39" });
   Object.assign(overview, { cycle_ref: "cycle-scroll-39", cycle_ordinal: 39 });
@@ -81,6 +90,27 @@ test("timeline keeps the reader position through a new Cycle and provides keyboa
   await timeline.getByRole("button", { name: "返回当前工作", exact: true }).click();
   await expect.poll(() => scroll.evaluate(node => node.scrollTop)).toBeGreaterThan(100);
   await expect(timeline.locator('[data-cycle-ref="cycle-scroll-39"] > details')).toHaveAttribute("open", "");
+});
+
+test("a previously closed question and cycle open when they become current without collapsing other history", async ({ page }) => {
+  const { timeline, snapshot, overview, errors } = await openTimeline(page);
+  const firstQuestion = timeline.locator('.research-timeline-question[data-question-ref="question-r1"] > details');
+  await firstQuestion.locator(":scope > summary").click();
+  await expect(firstQuestion).toHaveAttribute("open", "");
+  const nextQuestion = timeline.locator('.research-timeline-question[data-question-ref="question-r2"] > details');
+  await expect(nextQuestion).not.toHaveAttribute("open");
+  Object.assign(snapshot.research_control.foreground, { cycle_ref: "cycle-r2", question_ref: "question-r2" });
+  Object.assign(overview, { cycle_ref: "cycle-r2", question_ref: "question-r2", cycle_ordinal: 2 });
+  await advanceSnapshot(page, snapshot);
+  await expect(nextQuestion).toHaveAttribute("open", "");
+  const nextCycle = timeline.locator('[data-cycle-ref="cycle-r2"] > details');
+  await expect(nextCycle).toHaveAttribute("open", "");
+  await expect(firstQuestion).toHaveAttribute("open", "");
+  await nextCycle.locator(":scope > summary").click();
+  await expect(nextCycle).not.toHaveAttribute("open");
+  await advanceSnapshot(page, snapshot);
+  await expect(nextCycle).not.toHaveAttribute("open");
+  expect(errors).toEqual([]);
 });
 
 function updateSummary(recorder: { data: TimelineSummaries }, key: string, patch: Partial<TimelineSummaryNode>) {

@@ -20,6 +20,7 @@ export type RootSession = {
   owner_session_ref: string | null; status: RootSessionStatus; is_executing: boolean; is_current: boolean | null;
   run_ref: string | null; target_ref: string | null; cycle_ref: string | null; question_ref: string | null;
   created_at: number | null; updated_at: number | null; operations: RootOperation[];
+  limited?: boolean;
   children?: DelegatedChild[];
 };
 export type RootSessions = {

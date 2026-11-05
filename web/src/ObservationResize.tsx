@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Keyb
 import "./observation-resize.css";
 
 const storageKey = "meta-research.observation-split";
-const defaultRatio = 1 / 3;
+const defaultRatio = 0.45;
 const handleWidth = 8;
 const clamp = (value: number, minimum: number, maximum: number) => Math.min(maximum, Math.max(minimum, value));
 
@@ -30,7 +30,7 @@ export function useObservationSplit() {
   }, []);
   // Preserve both readable panes in narrow desktop layouts, without replacing
   // the user's preferred proportion when the viewport temporarily shrinks.
-  const minimum = Math.min(220, available * 0.4);
+  const minimum = Math.min(280, available * 0.4);
   const maximum = available - Math.min(280, available * 0.4);
   const width = clamp(available * preferred, minimum, maximum);
   const save = useCallback((ratio: number) => {

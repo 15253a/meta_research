@@ -13,7 +13,7 @@
 .experiment-log-history { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 5px; }
 .experiment-log-window button:disabled { opacity: .48; cursor: default; }
 .experiment-log-select { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-.experiment-log-select select { min-width: 0; flex: 1; height: 33px; border: 1px solid #414b65; border-radius: 6px; padding: 4px 8px; background: #1b2130; color: #e0e7f3; font: 12px var(--utility, ui-monospace, monospace); }
+.experiment-log-select select { min-width: 0; flex: 1; height: 33px; border: 1px solid #414b65; border-radius: 6px; padding: 4px 8px; background: #1b2130; color: #e0e7f3; font: 12px var(--utility); }
 .experiment-log-select select:disabled { color: #98a5bd; opacity: 1; }
 .experiment-log-wrap { display: flex; align-items: center; gap: 5px; white-space: nowrap; cursor: pointer; }
 .experiment-log-wrap input { accent-color: #aaa3ef; }
@@ -23,7 +23,7 @@
 .experiment-log-states [data-connection="error"] i { background: #dc997a; }
 .experiment-log-states [data-connection="paused"] i { background: #8b96ab; }
 .experiment-log-file-facts { flex: 0 0 auto; display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 3px 15px; color: #8393ae; font-size: 11px; line-height: 1.6; }
-.experiment-log-file-facts code { min-width: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #b5c1d6; font: 11px/1.6 var(--utility, ui-monospace, monospace); }
+.experiment-log-file-facts code { min-width: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #b5c1d6; font: 11px/1.6 var(--utility); }
 .experiment-log-notice { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: wrap; gap: 5px 10px; max-height: 85px; overflow: auto; font-size: 12px; line-height: 1.6; color: #aab9d4; background: #1d2434; padding: 7px 10px; border-radius: 5px; }
 .experiment-log-notice > span { flex: 1; min-width: 180px; }
 .experiment-log-notice.is-error { color: #e0b295; background: #302721; }
@@ -31,7 +31,7 @@
 .experiment-log-notice details { font-size: 11px; }
 .experiment-log-notice summary { cursor: pointer; }
 .experiment-log-notice details code { overflow-wrap: anywhere; }
-.experiment-log-text { flex: 1 1 auto; min-width: 0; min-height: 80px; width: 100%; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 9px 4px; color: #d5ded9; background: #10131b; font: 12px/1.7 var(--utility, ui-monospace, monospace); white-space: pre; tab-size: 4; }
+.experiment-log-text { flex: 1 1 auto; min-width: 0; min-height: 80px; width: 100%; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 9px 4px; color: #d5ded9; background: #10131b; font: 12px/1.7 var(--utility); white-space: pre; tab-size: 4; }
 .experiment-log-text[data-wrap="true"] { white-space: pre-wrap; overflow-wrap: anywhere; }
 .experiment-log-text:focus-visible { outline-offset: -2px; }
 .experiment-log-empty { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; min-height: 90px; padding: 15px; color: #a4b1c8; font-size: 12px; line-height: 1.8; }

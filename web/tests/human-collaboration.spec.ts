@@ -668,7 +668,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
   expect(posted).toBeNull();
   expect(explicitWrites).toEqual([]);
   await expect(companion).toContainText("DF-09 只有一篇全文等待图书馆访问");
-  await expect(companion).toContainText("YOU · CONVERSATION");
+  await expect(companion).toContainText("你");
   await expect(companion).toContainText("人类指导 · 生效中");
   await expect(companion).toContainText("建议复核证据边界");
   await expect(companion).toContainText("接受建议最多形成草案，不直接改变研究");
@@ -676,7 +676,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
   await expect(companion).not.toContainText("capability_unavailable");
   await expect(companion).not.toContainText("REQUEST-ONLY");
 
-  await companion.getByRole("button", { name: "建立精确 Command Draft" }).click();
+  await companion.getByRole("button", { name: "审阅操作草案" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/agent-proposals/proposal-command-1/command-draft",
     body: {
@@ -685,8 +685,8 @@ test("the persistent Quest Companion sends ordinary conversation without command
     },
   });
   const createdCommand = companion.locator(".lumen-command").filter({ hasText: "archive_export" });
-  await expect(createdCommand).toContainText("source · proposal-command-1");
-  await createdCommand.getByText("修订精确 Command Draft", { exact: true }).click();
+  await expect(createdCommand).toContainText("来源 · proposal-command-1");
+  await createdCommand.getByText("修改操作草案", { exact: true }).click();
   await createdCommand.getByLabel("Command intent-2 exact scope").fill(JSON.stringify({
     destination: "archive.example.invalid",
     collection_ref: "collection-2",
@@ -729,13 +729,13 @@ test("the persistent Quest Companion sends ordinary conversation without command
   });
 
   const existingCommand = companion.locator(".lumen-command").filter({ hasText: "external_publish" });
-  await existingCommand.getByRole("button", { name: "生成 Owner Impact Preview" }).click();
+  await existingCommand.getByRole("button", { name: "查看操作影响" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands/intent-1/previews",
     body: { draft_revision: 1, draft_hash: "a".repeat(64) },
   });
   await expect(companion).toContainText("confirmation alone will not grant the capability");
-  await existingCommand.getByText("查看精确草案与 Owner Impact Preview", { exact: true }).click();
+  await existingCommand.getByText("查看操作与影响", { exact: true }).click();
   await existingCommand.getByRole("button", { name: "确认当前草案与预览" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands/intent-1/confirmations",
@@ -746,8 +746,8 @@ test("the persistent Quest Companion sends ordinary conversation without command
       preview_hash: "b".repeat(64),
     },
   });
-  await expect(companion).toContainText("确认没有执行命令，也没有签发 Capability Authorization");
-  await existingCommand.getByRole("button", { name: "签发独立 Capability Authorization" }).click();
+  await expect(companion).toContainText("尚未签发权限，请核对后执行");
+  await existingCommand.getByRole("button", { name: "执行已确认的权限操作" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands/intent-1/authorizations",
     body: {
@@ -760,7 +760,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
       confirmation_receipt_ref: "confirmation-1",
     },
   });
-  await expect(companion).toContainText("Capability Authorization · granted");
+  await expect(companion).toContainText("权限状态 · 已授予");
 
   await companion.getByLabel("给研究助手发消息").fill("为什么这里只是局部等待？");
   await companion.getByRole("button", { name: "发送消息" }).click();
@@ -935,10 +935,10 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
   const commandCard = companion.locator(".lumen-command").filter({
     hasText: "revoked · broad_research",
   });
-  await commandCard.getByRole("button", { name: "生成 Owner Impact Preview" }).click();
-  await commandCard.getByText("查看精确草案与 Owner Impact Preview", { exact: true }).click();
+  await commandCard.getByRole("button", { name: "查看操作影响" }).click();
+  await commandCard.getByText("查看操作与影响", { exact: true }).click();
   await commandCard.getByRole("button", { name: "确认当前草案与预览" }).click();
-  await commandCard.getByRole("button", { name: "签发独立 Capability Authorization" }).click();
+  await commandCard.getByRole("button", { name: "执行已确认的权限操作" }).click();
   await expect.poll(() => writes.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands/intent-broad-revoke/authorizations",
     body: {
@@ -948,7 +948,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
       confirmation_receipt_ref: "confirmation-broad-revoke",
     },
   });
-  await expect(commandCard).toContainText("Capability Authorization · revoked");
+  await expect(commandCard).toContainText("权限状态 · 已撤销");
   await expect(companion).not.toContainText("当前研究授权");
 });
 
@@ -2313,7 +2313,7 @@ test("human guidance reviews original words and local scope through real Compani
   const before = await (await page.request.get(product.baseUrl + "/api/v1/snapshot")).json();
   expect(before.human_collaboration.companion.soft_constraints).toEqual([]);
   expect(before.human_collaboration.companion.agent_proposals).toEqual([]);
-  await sidebar.getByText("指导力度与可选材料", { exact: true }).click();
+  await sidebar.getByText("指导与材料", { exact: true }).click();
   await expect(sidebar.getByLabel("指导力度", { exact: true })).toHaveValue("3");
   await sidebar.getByLabel("指导力度", { exact: true }).selectOption("5");
   const original = "  GUIDANCE CONFIRMATION 本问题严格只换学习率，总目标不变。  ";

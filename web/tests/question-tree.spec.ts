@@ -558,7 +558,7 @@ test("QuestionTree evidence and history entries expose real read-only facts at e
     await expect(evidence).toContainText("asset-version-tree-evidence-1");
     await expect(evidence).toContainText("rg-role-receipt-tree-1");
 
-    const historyButton = tree.getByRole("button", { name: "问题历史 ↗" });
+    const historyButton = tree.getByRole("button", { name: "问题历史" });
     await expect(historyButton).toBeEnabled();
     await historyButton.click();
     const history = tree.getByRole("region", { name: "问题历史" });
@@ -612,7 +612,7 @@ test("QuestionTree fails closed when Question history pagination contradicts lif
     }),
   });
   await tree.locator('[data-question-ref="question_tree_branch"]').click();
-  await tree.getByRole("button", { name: "问题历史 ↗" }).click();
+  await tree.getByRole("button", { name: "问题历史" }).click();
   const history = tree.getByRole("region", { name: "问题历史" });
   await expect(history).toContainText("只读查询失败");
   await expect(history).toContainText(
@@ -651,7 +651,7 @@ test("History rail opens the accepted current Question through the same read-onl
   await expect(page.getByRole("region", { name: "问题历史" })).toBeHidden();
   await expect(historyRail).not.toHaveClass(/active/);
   expect(new URL(page.url()).searchParams.get("inspector")).toBeNull();
-  await expect(tree.getByRole("button", { name: "问题历史 ↗" })).toBeFocused();
+  await expect(tree.getByRole("button", { name: "问题历史" })).toBeFocused();
   await historyRail.click();
   await expect(page.getByRole("region", { name: "问题历史" })).toContainText(
     "Root unknown",
@@ -681,7 +681,7 @@ test("History rail opens the accepted current Question through the same read-onl
     );
     await expect(historyRail).not.toHaveClass(/active/);
     expect(new URL(page.url()).searchParams.get("inspector")).toBe("evidence");
-    await page.getByRole("button", { name: "问题历史 ↗" }).click();
+    await page.getByRole("button", { name: "问题历史" }).click();
     await expect(page.getByRole("region", { name: "问题历史" })).toContainText(
       "Root unknown",
     );
@@ -801,7 +801,7 @@ test("Question history follows bounded read pages without repeating the first qu
       reason: null,
     });
   });
-  await tree.getByRole("button", { name: "问题历史 ↗" }).click();
+  await tree.getByRole("button", { name: "问题历史" }).click();
   const history = tree.getByRole("region", { name: "问题历史" });
   const more = history.getByRole("button", { name: /继续读取历史/ });
   await expect(more).toHaveText("继续读取历史 · 1/3");

@@ -8,3 +8,6 @@
 .meta-trace-brief[data-motion-active=true],.meta-trace-spectrum[data-motion-active=true]{animation:meta-trace-breathe 2.4s ease-in-out infinite}
 @keyframes meta-trace-breathe{0%,100%{opacity:.9}50%{opacity:.42}}
 @media(prefers-reduced-motion:reduce){.meta-trace{animation:none!important;transition:none!important}}
+
+.meta-trace-entry{width:20px;height:20px;color:inherit}
+.meta-trace-entry[data-motion-active=true]{animation:meta-trace-breathe 2.4s ease-in-out infinite}

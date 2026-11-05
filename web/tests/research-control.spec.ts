@@ -392,13 +392,13 @@ test("Foreground controls require draft preview confirmation and execution in th
   await composer.getByRole("button", { name: "查看操作草案" }).click();
 
   const card = companion.locator(".lumen-command").filter({ hasText: "强制切换" });
-  await card.getByRole("button", { name: "生成 Owner Impact Preview" }).click();
-  await card.getByText("查看精确草案与 Owner Impact Preview", { exact: true }).click();
+  await card.getByRole("button", { name: "查看操作影响" }).click();
+  await card.getByText("查看操作与影响", { exact: true }).click();
   await expect(card).toContainText("durable Safe Point");
   await card.getByRole("button", { name: "确认当前草案与预览" }).click();
   await expect(card).toContainText("确认已记录，控制尚未执行");
   await card.getByRole("button", { name: "执行已确认控制" }).click();
-  await expect(card).toContainText("CONTROL EXECUTION · COMPLETED");
+  await expect(card).toContainText("执行结果 · 已完成");
   expect(writes).toEqual(["draft:forced_switch", "preview", "confirm", "execute"]);
 
   await composer.getByLabel("控制动作").selectOption("pause");
@@ -680,18 +680,18 @@ test("production control seam preserves Companion order, focus, and responsive g
     hasText: "暂停当前 Quest",
   });
   await expect(card).toBeVisible();
-  await card.getByRole("button", { name: "生成 Owner Impact Preview" }).click();
+  await card.getByRole("button", { name: "查看操作影响" }).click();
   await expect(card.getByRole("button", {
-    name: "先展开并检查 Owner Impact Preview",
+    name: "请先查看操作与影响",
   })).toBeVisible();
   await card.getByText(
-    "查看精确草案与 Owner Impact Preview",
+    "查看操作与影响",
     { exact: true },
   ).click();
   await expect(card.locator(".lumen-owner-previews")).toBeVisible();
   await card.getByRole("button", { name: "确认当前草案与预览" }).click();
   await expect(card).toContainText("确认已记录，控制尚未执行");
   await card.getByRole("button", { name: "执行已确认控制" }).click();
-  await expect(card).toContainText("CONTROL EXECUTION · COMPLETED");
+  await expect(card).toContainText("执行结果 · 已完成");
   await expect(control).toContainText("suspended");
 });

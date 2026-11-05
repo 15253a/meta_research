@@ -216,7 +216,7 @@ test("OpenTelemetry opt-in starts as an exact Web Command Draft", async ({ page 
   });
   await expect(command).toBeVisible();
   await expect(command).toContainText("http://127.0.0.1:4318/v1/logs");
-  await expect(command).toContainText("COMMAND DRAFT · NO AUTHORITY");
+  await expect(command).toContainText("待确认 · 尚未执行");
 });
 
 test("technical details expose only the runtime observability allowlist", async ({ page }) => {

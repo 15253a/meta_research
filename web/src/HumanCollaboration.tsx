@@ -16,6 +16,7 @@ import { MetaTrace } from "./MetaTrace";
 import { usePageDraft, usePageReadingPosition } from "./pageDraft";
 import { GuidanceConfirmation } from "./GuidanceConfirmation";
 import { sendGuidanceConversation } from "./guidanceApi";
+import "./assistant-readability.css";
 import {
   authorizeHumanCommand,
   confirmHumanCommand,
@@ -440,6 +441,14 @@ export function QuestCompanion({
       item.draft.command_kind,
     )
   ) ?? [];
+  const commandAuthorization = (command: HumanCommand) => collaboration?.commands.authorizations.find((item) =>
+    item.confirmation_receipt_ref === command.confirmation_receipt?.receipt_ref,
+  ) ?? command.authorization;
+  const commandResolved = (command: HumanCommand) => command.executed || Boolean(command.control_execution)
+    || command.status === "cancelled" || Boolean(commandAuthorization(command));
+  const pendingCommands = commands.filter(command => !commandResolved(command));
+  const completedCommands = commands.filter(commandResolved);
+  const [operationHistoryOpen, setOperationHistoryOpen] = useState(false);
   const broadAuthorizationHistory = scopeRef
     ? collaboration?.commands.authorizations.filter((item) =>
       item.scope_ref === scopeRef
@@ -457,6 +466,7 @@ export function QuestCompanion({
 
   useEffect(() => {
     setVisibleMessageCount(COMPANION_MESSAGE_PAGE_SIZE);
+    setOperationHistoryOpen(false);
   }, [scopeRef]);
 
   const newestMessageRef = visibleOptimisticMessages.at(-1)?.localRef
@@ -564,11 +574,9 @@ export function QuestCompanion({
         <span className="lumen-orb" aria-hidden="true"><MetaTrace variant="assistant" /></span>
         <div>
           <b>研究助手</b>
-          <small>{questionContext
-            ? `正在跟随 ${questionContext.question_ref}`
-            : "随时询问正在发生的研究"}</small>
+          {questionContext ? <small>当前问题 · {questionContext.title ?? "已选中"}</small> : null}
         </div>
-        <code>{ready ? "可交流" : "暂不可用"}</code>
+        {!ready ? <code>暂不可用</code> : null}
         {onHide ? <button type="button" className="research-panel-hide" aria-label="隐藏研究助手" title="隐藏研究助手" aria-controls="research-companion" aria-expanded={true} onClick={onHide}>−</button> : null}
       </header>
       <CompanionSessionState companion={sessionSwitch.session} switching={sessionSwitch.switching} busy={sessionSwitch.busy} />
@@ -617,12 +625,11 @@ export function QuestCompanion({
             >
               <small>
                 {message.role === "user"
-                  ? "YOU · CONVERSATION"
+                  ? "你"
                   : message.role === "system"
-                    ? "SYSTEM · STATUS"
-                    : "COMPANION · INDEPENDENT WORK"}
+                    ? "状态"
+                    : "研究助手"}
               </small>
-              {message.native_session_generation !== undefined ? <small>会话 {message.native_session_generation}</small> : null}
               {message.role === "assistant" ? (
                 <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
               ) : messageText(message)}
@@ -645,7 +652,7 @@ export function QuestCompanion({
             className="lumen-message me"
             data-message-status={message.status}
           >
-            <small>YOU · CONVERSATION</small>
+            <small>你</small>
             {message.content}
             <span className="lumen-message-state">
               {message.status === "sending" ? "消息正在发送…" : "消息已发送"}
@@ -658,7 +665,7 @@ export function QuestCompanion({
             className="lumen-message lumen-companion-thinking"
             data-message-status="processing"
           >
-            <small>COMPANION · INDEPENDENT WORK</small>
+            <small>研究助手</small>
             <PendingCompanionReply message={message} onChanged={onChanged} />
           </article>
         ))}
@@ -689,17 +696,21 @@ export function QuestCompanion({
             onChanged={onChanged}
           />
         )) : null}
-        {ready ? commands.map((command) => (
+        {ready ? pendingCommands.map((command) => (
           <HumanCommandCard
             key={command.intent_id}
             command={command}
-            authorization={collaboration?.commands.authorizations.find((item) =>
-              item.confirmation_receipt_ref
-                === command.confirmation_receipt?.receipt_ref,
-            ) ?? command.authorization}
+            authorization={commandAuthorization(command)}
             onChanged={onChanged}
+            onResolved={() => setOperationHistoryOpen(true)}
           />
         )) : null}
+        {ready && completedCommands.length ? <details className="assistant-operation-history" open={operationHistoryOpen}
+          onToggle={event => setOperationHistoryOpen(event.currentTarget.open)}>
+          <summary><span>已处理操作</span><span>{completedCommands.length}</span></summary>
+          <div>{completedCommands.map(command => <HumanCommandCard key={command.intent_id} command={command}
+            authorization={commandAuthorization(command)} onChanged={onChanged} />)}</div>
+        </details> : null}
         {ready && researchControl?.status === "ready" && researchControl.foreground ? (
           <ResearchControlComposer
             control={researchControl}
@@ -718,18 +729,17 @@ export function QuestCompanion({
       </div>
       <form className="lumen-compose" onSubmit={(event) => void submit(event)}>
         <details className="guidance-options">
-          <summary>指导力度与可选材料</summary>
+          <summary>指导与材料</summary>
           <GuidanceStrengthSelect value={strength} onChange={value => updateComposer({ strength: value })} disabled={!canSend || sending} />
           <WorkMaterialFields draft={materialFields} disabled={!canSend || sending} />
-          <small>解释与讨论直接回答；影响研究时，先核对理解与范围再明确确认。主动材料仍可独立提交。</small>
         </details>
-        <div>
+        <div className="lumen-compose-input">
           <textarea
             aria-label="给研究助手发消息"
             disabled={!canSend || sending || sessionSwitch.switching}
             rows={1}
             placeholder={canSend
-              ? "调查、执行或核验已授权工作；/new 开启新会话"
+              ? "询问进展，或交代需要做的事…"
               : ready
                 ? "创建 Quest 后开始对话"
                 : "研究助手尚未启用"}
@@ -745,7 +755,7 @@ export function QuestCompanion({
             ↑
           </button>
         </div>
-        <small>{error ? `发送失败 · ${error}` : "Enter 发送 · Shift+Enter 换行 · /new 保留工作空间并更换会话"}</small>
+        {error ? <small role="alert">发送失败 · {error}</small> : null}
       </form>
     </aside>
   );
@@ -1473,10 +1483,9 @@ function ResearchControlComposer({
       <details>
         <summary>
           <span>研究控制</span>
-          <small>按需建立精确 Command Draft</small>
         </summary>
         <div className="lumen-research-control-body">
-          <small>FOREGROUND CONTROL · PREVIEW FIRST</small>
+          <small>查看影响后再确认执行</small>
           <b>{researchControlLabels[action]}</b>
           <p>
             Epoch {foreground.epoch} · {foreground.stage} · {foreground.status}
@@ -1643,10 +1652,12 @@ function HumanCommandCard({
   command,
   authorization: projectedAuthorization,
   onChanged,
+  onResolved,
 }: {
   command: HumanCommand;
   authorization?: HumanCapabilityAuthorization | null;
   onChanged: () => void;
+  onResolved?: () => void;
 }) {
   const capabilityCommand = command.draft.command_kind === "capability_authorization"
     ? command.draft
@@ -1684,7 +1695,8 @@ function HumanCommandCard({
     setPending(true);
     setError(null);
     try {
-      await operation();
+      const updated = await operation();
+      if (updated.executed || updated.control_execution) onResolved?.();
       onChanged();
     } catch (caught) {
       setError(reasonCode(caught));
@@ -1704,12 +1716,14 @@ function HumanCommandCard({
   const authorization = capabilityCommand
     ? projectedAuthorization ?? recordedAuthorization
     : null;
+  const resolved = command.executed || Boolean(command.control_execution) || command.status === "cancelled" || Boolean(authorization);
   const authorize = async () => {
     setPending(true);
     setError(null);
     try {
       const recorded = await authorizeHumanCommand(command);
       setRecordedAuthorization(recorded);
+      onResolved?.();
       onChanged();
     } catch (caught) {
       setError(reasonCode(caught));
@@ -1744,43 +1758,39 @@ function HumanCommandCard({
     }));
   };
   return (
-    <article className="lumen-command" data-command-status={command.status}>
-      <small>COMMAND DRAFT · NO AUTHORITY</small>
+    <article className="lumen-command" data-command-status={command.status} data-command-resolved={resolved} data-command-ref={command.intent_id}>
+      <small>{authorization ? "权限操作已记录" : command.executed ? "已执行" : command.status === "cancelled" ? "已取消" : command.confirmation_receipt ? "已确认 · 待执行" : "待确认 · 尚未执行"}</small>
       {controlCommand ? (
         <>
           <b>{researchControlLabels[controlCommand.payload.action]}</b>
-          <p>
-            Quest {controlCommand.payload.target.quest_ref} · Cycle {controlCommand.payload.target.cycle_ref}
-            {` · Epoch ${controlCommand.payload.target.epoch}`}
-          </p>
-          <code>{stringify(controlCommand.payload)}</code>
+          <p>作用范围 · {controlCommand.payload.target.target_question_ref ? "所选问题" : controlCommand.payload.target.target_scope === "run" ? "所选执行" : controlCommand.payload.target.target_scope === "stage" ? "所选阶段" : "所选轮次"}</p>
         </>
       ) : capabilityCommand ? (
         <>
-          <b>{capabilityCommand.payload.decision} · {capabilityCommand.payload.capability}</b>
-          <p>{stringify(capabilityCommand.payload.scope)}</p>
+          <b>{{ granted: "授予权限", denied: "拒绝权限", revoked: "撤销权限" }[capabilityCommand.payload.decision]} · {capabilityCommand.payload.capability}</b>
         </>
-      ) : null}
-      {command.source_proposal_ref ? (
-        <code className="lumen-source-proposal">source · {command.source_proposal_ref}</code>
       ) : null}
       <details ref={previewDetailsRef} onToggle={(event) => {
         if (event.currentTarget.open && currentPreview && preview) {
           setReviewedPreviewRef(preview.preview_ref);
         }
       }}>
-        <summary>查看精确草案与 Owner Impact Preview</summary>
+        <summary>查看操作与影响</summary>
+        {controlCommand ? <p>{controlCommand.payload.reason}</p> : null}
+        <details className="lumen-command-identity"><summary>技术详情</summary>
+          <pre>{JSON.stringify(command.draft, null, 2)}</pre>
+          {command.source_proposal_ref ? <p>来源 · {command.source_proposal_ref}</p> : null}
         <dl>
           <Detail label="Intent" value={command.intent_id} />
           <Detail label="Current draft" value={`r${command.draft_revision} · ${command.draft_hash}`} />
           <Detail label="Executed" value={String(command.executed)} />
         </dl>
+        </details>
         {preview ? (
           <div className="lumen-owner-previews">
             {preview.owner_previews.map((owner) => (
               <section key={owner.digest}>
-                <small>{owner.source_owner} · TARGET ASSERTION</small>
-                <code>{stringify(owner.target_assertion)}</code>
+                <details><summary>接收方与范围</summary><p>{owner.source_owner}</p><code>{stringify(owner.target_assertion)}</code></details>
                 <b>会发生</b><p>{owner.will_happen.join("；")}</p>
                 <b>不会发生</b><p>{owner.will_not_happen.join("；")}</p>
                 <b>风险 / 陈旧条件</b><p>{[...owner.risks, ...owner.stale_conditions].join("；")}</p>
@@ -1789,9 +1799,9 @@ function HumanCommandCard({
           </div>
         ) : null}
       </details>
-      {!command.confirmation_receipt && capabilityCommand ? (
+      {!resolved && !command.confirmation_receipt && capabilityCommand ? (
         <details className="lumen-command-revision">
-          <summary>修订精确 Command Draft</summary>
+          <summary>修改操作草案</summary>
           <form onSubmit={(event) => void revise(event)}>
             <label>
               Capability
@@ -1829,12 +1839,12 @@ function HumanCommandCard({
           </form>
         </details>
       ) : null}
-      {!command.confirmation_receipt && !currentPreview ? (
+      {!resolved && !command.confirmation_receipt && !currentPreview ? (
         <button type="button" disabled={pending} onClick={() => void act(() => previewHumanCommand(command))}>
-          生成 Owner Impact Preview
+          查看操作影响
         </button>
       ) : null}
-      {!command.confirmation_receipt && currentPreview ? (
+      {!resolved && !command.confirmation_receipt && currentPreview ? (
         <button
           type="button"
           disabled={pending || reviewedPreviewRef !== preview?.preview_ref}
@@ -1842,21 +1852,10 @@ function HumanCommandCard({
         >
           {reviewedPreviewRef === preview?.preview_ref
             ? "确认当前草案与预览"
-            : "先展开并检查 Owner Impact Preview"}
+            : "请先查看操作与影响"}
         </button>
       ) : null}
-      {command.confirmation_receipt ? (
-        <div className="lumen-confirmed">
-          <b>Human Confirmation 已记录</b>
-          <span>{command.confirmation_receipt.receipt_ref}</span>
-          <p>{controlCommand
-            ? command.executed
-              ? "确认与 Owner execution receipts 均已持久化。"
-              : "确认已记录，控制尚未执行。"
-            : "确认没有执行命令，也没有签发 Capability Authorization。"}</p>
-        </div>
-      ) : null}
-      {command.confirmation_receipt && controlCommand && !command.executed ? (
+      {command.confirmation_receipt && controlCommand && !resolved ? (
         <button
           type="button"
           disabled={pending}
@@ -1865,23 +1864,28 @@ function HumanCommandCard({
           执行已确认控制
         </button>
       ) : null}
-      {command.control_execution ? (
-        <div className="lumen-authorized lumen-control-executed">
-          <b>CONTROL EXECUTION · {command.control_execution.status.toUpperCase()}</b>
-          <span>{command.control_execution.receipt_ref}</span>
-        </div>
-      ) : null}
-      {command.confirmation_receipt && capabilityCommand && !authorization ? (
+      {command.confirmation_receipt && capabilityCommand && !resolved ? (
         <button type="button" disabled={pending} onClick={() => void authorize()}>
-          签发独立 Capability Authorization
+          执行已确认的权限操作
         </button>
       ) : null}
-      {authorization ? (
-        <div className="lumen-authorized">
-          <b>Capability Authorization · {authorization.decision}</b>
-          <span>{authorization.receipt_ref}</span>
-        </div>
-      ) : null}
+      {command.confirmation_receipt || command.control_execution || authorization ? <details className="lumen-command-receipts">
+        <summary>操作回执</summary>
+        {command.confirmation_receipt ? <div className="lumen-confirmed">
+          <b>已记录你的确认</b>
+          <details><summary>确认回执</summary><code>{command.confirmation_receipt.receipt_ref}</code></details>
+          <p>{controlCommand ? command.executed ? "操作已执行，回执已保存。" : "确认已记录，控制尚未执行。"
+            : authorization ? "权限操作已记录，回执已保存。" : "尚未签发权限，请核对后执行。"}</p>
+        </div> : null}
+        {command.control_execution ? <div className="lumen-authorized lumen-control-executed">
+          <b>执行结果 · {command.control_execution.status === "completed" ? "已完成" : command.control_execution.status}</b>
+          <details><summary>执行回执</summary><code>{command.control_execution.receipt_ref}</code></details>
+        </div> : null}
+        {authorization ? <div className="lumen-authorized">
+          <b>权限状态 · {{ granted: "已授予", denied: "已拒绝", revoked: "已撤销" }[authorization.decision]}</b>
+          <details><summary>权限回执</summary><code>{authorization.receipt_ref}</code></details>
+        </div> : null}
+      </details> : null}
       {error ? <em role="status">控制失败 · {error}</em> : null}
     </article>
   );
@@ -2018,18 +2022,18 @@ function AgentProposalCard({
   if (proposalKind !== "command_draft") return <GuidanceConfirmation proposal={proposal} onChanged={onChanged} />;
   return (
     <article className="lumen-proposal">
-      <small>{proposalKind === "command_draft" ? "COMMAND DRAFT · NO AUTHORITY" : "AGENT PROPOSAL"}</small>
+      <small>操作建议 · 尚未执行</small>
       <b>{proposal.title ?? documentText(proposal.proposal, "title") ?? "Agent 建议"}</b>
       <p>{proposal.summary ?? proposal.content ?? documentText(proposal.proposal, "summary", "description", "text")}</p>
       {proposal.impact_preview ? <ImpactPreview preview={proposal.impact_preview} /> : null}
       {convertedTo ? (
         <span role="status">
-          已原子转换为 {convertedTo === "command_draft" ? "Command Draft" : "人类指导"}；原 Proposal 不可重复转换。
+          操作草案已建立，请查看并确认。
         </span>
       ) : null}
       {!convertedTo && proposal.status === "proposed" && proposalKind === "command_draft" && proposal.scope_ref && proposal.proposal_ref && proposal.proposal_hash && proposedCommand ? (
         <button type="button" disabled={pending} onClick={() => void createCommandDraft()}>
-          建立精确 Command Draft
+          审阅操作草案
         </button>
       ) : null}
       {proposal.status === "proposed" && !proposal.proposal_hash ? (

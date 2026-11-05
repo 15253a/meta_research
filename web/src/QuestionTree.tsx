@@ -18,6 +18,7 @@ import {
   type QuestionTreeItem,
 } from "./api";
 import "./QuestionTree.css";
+import { MetaTrace } from "./MetaTrace";
 
 export type QuestionTreeProps = {
   items: readonly QuestionTreeItem[];
@@ -1272,7 +1273,7 @@ export function QuestionTree({
                   aria-expanded={inspectorQuery?.mode === "history"}
                   onClick={() => void loadInspector("history", selected)}
                 >
-                  问题历史 ↗
+                  问题历史 <MetaTrace variant="entry" />
                 </button>
               </div>
               {inspectorQuery ? (

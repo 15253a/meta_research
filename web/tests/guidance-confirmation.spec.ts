@@ -45,7 +45,7 @@ test("sidebar reviews understanding and scope before confirming the exact revise
   });
   await page.goto(`${baseUrl}/?workspace=1`);
   const sidebar = page.getByRole("complementary", { name: "研究助手" });
-  await sidebar.getByText("指导力度与可选材料", { exact: true }).click();
+  await sidebar.getByText("指导与材料", { exact: true }).click();
   await expect(sidebar.getByLabel("指导力度", { exact: true })).toHaveValue("3");
   await expect(sidebar.getByRole("button", { name: "保存指导", exact: true })).toHaveCount(0);
   await sidebar.getByLabel("指导力度", { exact: true }).selectOption("5");
@@ -102,7 +102,7 @@ test("unsent sidebar drafts remain isolated when the projected Quest changes and
   const sidebar = page.getByRole("complementary", { name: "研究助手" });
   const input = sidebar.getByLabel("给研究助手发消息");
   await input.fill("第一项研究未发送的原文");
-  await sidebar.getByText("指导力度与可选材料", { exact: true }).click();
+  await sidebar.getByText("指导与材料", { exact: true }).click();
   await sidebar.getByLabel("指导力度", { exact: true }).selectOption("5");
   companion.scope_ref = "quest:second"; snapshot.revision += 1;
   await page.evaluate(() => {

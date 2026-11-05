@@ -114,7 +114,7 @@ test("timeline and output share a desktop row, logs follow beneath, and mobile s
   expect(writes).toEqual([]);
 });
 
-test("each observation panel can be hidden and restored without losing timeline expansion, selection, or reading position", async ({ page }) => {
+test("the timeline stays visible when output is hidden and restored without losing reading position", async ({ page }) => {
   const { timeline, errors } = await openFocusWorkspace(page, true);
   await page.setViewportSize({ width: 1440, height: 720 });
   const historical = await expandCycle(timeline, "cycle-r1");
@@ -181,18 +181,16 @@ test("each observation panel can be hidden and restored without losing timeline 
   const scrollTop = await scroll.evaluate(node => node.scrollTop);
   expect(scrollTop).toBeGreaterThan(0);
   const initialWidth = (await output(page).boundingBox())!.width;
+  const initialTimelineWidth = (await timeline.boundingBox())!.width;
   await expect(observationResize(page)).toBeVisible();
-  await timeline.getByRole("button", { name: "隐藏研究时间线", exact: true }).click();
-  await expect(timeline).toBeHidden();
-  await expect(observationResize(page)).toBeHidden();
-  expect((await output(page).boundingBox())!.width).toBeGreaterThan(initialWidth);
+  await expect(timeline.getByRole("button", { name: "隐藏研究时间线", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "隐藏研究过程", exact: true }).click();
   await expect(output(page)).toBeHidden();
+  await expect(timeline).toBeVisible();
   await expect(page.getByRole("region", { name: "实验日志区域" })).toBeVisible();
-  await page.getByRole("button", { name: "展开研究时间线" }).click();
   await expect(observationResize(page)).toBeHidden();
   await expect(historical.locator(":scope > details")).toHaveAttribute("open", "");
-  expect((await timeline.boundingBox())!.width).toBeGreaterThan(initialWidth);
+  expect((await timeline.boundingBox())!.width).toBeGreaterThan(initialTimelineWidth);
   await page.getByRole("button", { name: "展开研究过程" }).click();
   await expect(observationResize(page)).toBeVisible();
   expect(Math.abs((await output(page).boundingBox())!.width - initialWidth)).toBeLessThanOrEqual(2);
@@ -275,6 +273,7 @@ test("timeline summaries remain complete at different widths and result details 
       await expect(summary).toHaveText(originalText[index]);
       expect(await summary.getAttribute("title")).toContain(originalText[index]);
       expect((await summary.boundingBox())!.width, `${width}px summary remains wide enough to read`).toBeGreaterThan(60);
+      expect(await summary.evaluate(node => getComputedStyle(node).getPropertyValue("-webkit-line-clamp"))).toBe("none");
     }
     expect(await timeline.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
@@ -400,8 +399,8 @@ test("the clean workspace keeps its core in the first desktop screen and details
   await expect(details).not.toHaveAttribute("open", "");
   await expect(main.locator(".spectrum-stage")).toHaveCount(4);
   await expect(main.getByRole("region", { name: "研究目标版本", exact: true })).toBeVisible();
-  const mainBox = (await main.boundingBox())!, gridBox = (await main.locator(".research-observation-grid").boundingBox())!;
-  expect(gridBox.y, "the observation panes begin within the first desktop screen").toBeLessThan(mainBox.y + mainBox.height * 0.8);
+  const mainBox = (await main.boundingBox())!, stagesBox = (await main.locator(".spectrum-stages").boundingBox())!;
+  expect(stagesBox.y + stagesBox.height, "all four stages fit within the first desktop screen").toBeLessThanOrEqual(mainBox.y + mainBox.height);
   const fonts = await page.locator(".lumen-main h1, .spectrum-stage-name, .root-session-scroll, .lumen-rail-button small").evaluateAll(nodes => nodes.map(node => getComputedStyle(node).fontFamily));
   expect(fonts.length).toBeGreaterThan(3);
   for (const font of fonts) {
@@ -429,7 +428,9 @@ test("summary notes stay readable without moving the timeline browser when opene
   const explanation = note.locator(":scope > p");
   for (const viewport of [{ width: 1440, height: 900 }, { width: 900, height: 720 }, { width: 390, height: 844 }]) {
     await page.setViewportSize(viewport);
-    await timeline.scrollIntoViewIfNeeded();
+    // On mobile the full timeline is taller than the viewport; bring the
+    // keyboard target into view before measuring whether opening it moves rows.
+    await summary.scrollIntoViewIfNeeded();
     const before = (await timeline.locator(".research-timeline-browse").boundingBox())!;
     await summary.press("Enter");
     await expect(note).toHaveAttribute("open", "");
@@ -458,7 +459,7 @@ test("research motion follows real execution and respects still pictures, visibi
   const spectrum = page.getByRole("region", { name: "研究光谱", exact: true });
   await spectrum.scrollIntoViewIfNeeded();
   await expect(spectrum).toHaveAttribute("data-motion-active", "true");
-  await expect.poll(() => spectrum.locator(".spectrum-flow").evaluate(node => getComputedStyle(node).animationPlayState)).toBe("running");
+  await expect(spectrum.locator(".meta-trace-spectrum[data-motion-active=true]")).toHaveCSS("animation-play-state", "running");
   const still = page.getByRole("button", { name: "静止画面", exact: true });
   await still.click();
   await expect(still).toHaveAttribute("aria-pressed", "true");
@@ -491,6 +492,23 @@ test("research motion follows real execution and respects still pictures, visibi
   await expect(spectrum).toHaveAttribute("data-motion-active", "false");
   expect(errors).toEqual([]);
   expect(writes).toEqual([]);
+});
+
+test("verified stage activity survives incomplete history but unknown index failures stop execution motion", async ({ page }) => {
+  const { catalog, errors } = await openTimeline(page, { runningBundle: true });
+  catalog.sessions = catalog.sessions.map(session => ({ ...withOperation(session), limited: true }));
+  catalog.limited = true;
+  catalog.reasons = [{ code: "deepfetch_root_operation_unavailable" },
+    { code: "root_session_operations_limited" }, { code: "root_session_operations_limited" }];
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const spectrum = page.getByRole("region", { name: "研究光谱", exact: true });
+  await spectrum.scrollIntoViewIfNeeded();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "true");
+  catalog.reasons.push({ code: "root_session_index_part_unavailable" });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await spectrum.scrollIntoViewIfNeeded();
+  await expect(spectrum).toHaveAttribute("data-motion-active", "false");
+  expect(errors).toEqual([]);
 });
 
 test("other Quests use their own output and stages with no session never fall back to current execution", async ({ page }) => {

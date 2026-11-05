@@ -1,7 +1,7 @@
 .research-observation-resize { display: none; }
 @media (min-width: 881px) {
   .research-observation-grid[data-timeline-visible=true][data-output-visible=true] {
-    grid-template-columns: minmax(0, var(--timeline-width, 33.333%)) 8px minmax(0, 1fr);
+    grid-template-columns: minmax(0, var(--timeline-width, 45%)) 8px minmax(0, 1fr);
   }
   .research-observation-grid[data-timeline-visible=true][data-output-visible=true] .research-output-panel { border-left: 0; }
   .research-observation-resize {

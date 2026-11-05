@@ -1,4 +1,4 @@
-.lumen-header .codex-account-entry { flex: 0 1 210px; min-width: 100px; max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 9px 12px; border: 1px solid #d8deea; border-radius: 10px; color: #35405b; background: #fff; font-size: 12px; cursor: pointer; }
+.codex-account-entry { cursor: pointer; }
 .codex-account-entry:disabled { opacity: .5; cursor: default; }
 .codex-account-dialog { width: min(520px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow: auto; border: 1px solid #d8deea; border-radius: 18px; padding: 24px; color: #172033; background: #fff; box-shadow: 0 24px 90px #15213c40; }
 .codex-account-dialog::backdrop { background: #17203366; }
@@ -25,6 +25,5 @@
 }
 @media (max-width: 600px) {
   .lumen-header:has(.codex-account-entry) .lumen-quest-context { flex: 1 1 calc(100% - 54px); min-width: 0; }
-  .lumen-header .codex-account-entry { flex: 1 1 100px; padding: 7px 9px; font-size: 11px; max-width: none; }
   .codex-account-dialog { padding: 18px; }
 }
