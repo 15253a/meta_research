@@ -4,7 +4,7 @@
 
 `registered-tools.json` 保留每项实际注册对象、完整 input/output schema、合同摘要 hash、handler 定位、角色目录成员关系及相关测试文件索引；测试文件索引只用于定位，不表示已执行。`collect_tools.py` 可重新生成清单，实例使用仓库确定性 provider/platform fixtures，实际 production composition/Owner 注册，未调用业务 handler、未发放 grant、未调用模型。
 
-复现（Linux、仓库测试依赖）：`python docs/implementation/issue-263/collect_tools.py`。本次清单实际取自隔离 Linux，未执行业务 handler/模型调用或发放 grant。最终清单 snapshot `1aa8471a7500b8f79f7fec7e71a446d9921c1bb677ac71fae47e0f3a39005de5`，原始记录 `.issue-291/runs/inventory-linux-263/`；与交付源码 hash 的核对见交付验证报告；本次原清单、刷新清单均为 96 项（24 effect/24 reconcile/47 read/1 verify）。
+复现（Linux、仓库测试依赖）：`python docs/implementation/issue-263/collect_tools.py`。本次清单实际取自隔离 Linux，未执行业务 handler/模型调用或发放 grant。最终清单 snapshot `6db92d7b22f14c58badb3bc657a7e61c642c665dd591c08cc3cb5d7c562552b2`，原始记录 `.issue-291/runs/inventory-reviewed-263/`；与交付源码 hash 的核对见交付验证报告；本次原清单、刷新清单均为 96 项（24 effect/24 reconcile/47 read/1 verify）。
 
 ## 调用链与证据边界
 
@@ -131,9 +131,13 @@
 
 ## Native、外部 MCP 和共用 Skill 边界
 
-对当前可访问的 **8771** 安装目录执行了只读检查：`meta_research_8771_v1_test/runtime/provider-tools/codex-cli/installs/0.159.0` 存在，实际 `--version` 返回 `codex-cli 0.159.0`；其 `data/external-mcp/config.json` 不存在。按照 `ExternalMcpRuntime.read_config`，这个 data root 当前显式配置的外部 MCP service 为零。没有读取或输出凭据。**这不是 #263 所指 8770 目标配置验收**，也不能推断未检查实例、原生用户配置或未来任务的外部工具为空。隔离 production composition 同样为零服务；受控外部 schema 测试是公共入口验证，不是已配置真实供应商业务验收。
+2026-11-09 00:43（Asia/Shanghai）沿部署记录定位并实际只读检查 **8770**：`/mnt/wl2605001/projects/meta-research-8770-v1-test`。正在运行的 pid 3681139 是 `meta_research.daemon`，命令的 data root 与 cwd 均匹配该部署，端口 8770。磁盘源码为 `a74e91fbeb848f744714f8826f13acdc7c0d29ba`，有 23 个已有 dirty files，全部保持不变；它不是本次基于 ea42152 的修复交付版本。安全元数据和关键源码 hash 见 [target-8770-inventory.json](target-8770-inventory.json)。
 
-已安装 CLI 的 `debug --help` 与 `app-server --help` 没有列出可直接导出完整最终原生工具目录的子命令；隔离 `debug prompt-input` 只返回 3 项消息，不返回工具 schema。没有为取得目录启动真实研究或调用模型。**最终实际 Harness/8770 原生工具逐项清单尚未实测取得**，下面按已检查的配置入口逐项保留适用/未知边界，不能视作全部原生工具通过。
+**目标实例当前外部配置已核对：** `data/external-mcp/config.json` 不存在，按 `ExternalMcpRuntime.read_config` 为零显式服务；operation snapshots 为 0。`data/search-sources/registry.sqlite3` 使用 `mode=ro` 读取元数据和计数，versions、heads、selections、manifests、jobs、receipts 等均为 0，没有已配置 supplemental API/website/MCP 来源工具身份。没有读取凭据文件或输出连接内容，也没有配置新服务。这个结论来自实际 8770，不再用 8771 代替；不推广到未来配置或其它实例。受控外部 schema 测试仍是公共入口验证，不能称为真实供应商验收。
+
+**原生工具目录的具体获取边界：** 8770 安装的 CLI 实际返回 `codex-cli 0.159.0`；默认 feature inventory 确认 hooks/multi_agent/plugins/remote_plugin/shell_tool/skill_search/unified_exec=true。功能开关不等于最终每角色工具名与 schema。实际 managed home `data/provider-homes/codex` 下递归无 config.toml，sessions/archived_sessions JSONL 均为 0；只读 `state_5.sqlite` 的 threads 与 thread_dynamic_tools 均为 0，因此没有现存原根会话或动态工具记录可提取实际工具身份。旧 `.all-tool-feedback-20261105` 只有内置装配探针，没有目标实例 native catalog；其 Claude/Gemini 参与是独立源码审查，不能作为本产品角色工具记录。
+
+进一步用该安装可执行文件在隔离临时目录运行 `app-server generate-json-schema --experimental`（440 个 schema，退出 0），检查方法枚举：有 mcpServerStatus/list、mcpServer/tool/call 和 item/tool/call，但没有完整原生工具 catalog 导出方法。`debug app-server --help` 只提供 send-message-v2；`debug prompt-input` 仅导出消息，不能代替 tool schema。未为补目录启动真实模型或研究会话，未改变正在运行的服务、授权或研究数据。**修复版每角色实际原生工具完整清单仍未验证**；具体缺口是当前 8770 没有原生会话记录，可用离线 CLI/协议检查也不提供最终 native catalog，不能写成全部原生工具通过。
 
 | 原生能力／已见配置身份 | 实际装配及角色 | 错误和修正消费 | 证据边界 |
 |---|---|---|---|
@@ -152,7 +156,7 @@
 | Claude `WebFetch` | 同上 allowedTools | 同上 | 同上 |
 | Claude `Skill` | 同上 allowedTools | Skill 使用原会话已有能力 | 同上 |
 | `mcp__meta_research__*` | Codex/Claude Harness 对本表 96 项的 runtime grant 子集 | G；禁止把前缀通配权限当 96 项都对每根可用 | 96 项 registry 完整；逐根最终 live grant 未逐一采样 |
-| `mcp__meta_research_external__*` | 仅逻辑操作冻结了配置服务时提供；service.allowed_root_kinds 过滤 | external_mcp dispatch 保留服务/工具/操作/阶段、schema 和 transport 诊断 | 8771 当前显式配置为空；8770 及真实配置目录未验证 |
+| `mcp__meta_research_external__*` | 仅逻辑操作冻结了配置服务时提供；service.allowed_root_kinds 过滤 | external_mcp dispatch 保留服务/工具/操作/阶段、schema 和 transport 诊断 | 实际 8770 显式配置、冻结操作及 supplemental 来源均为空；修复版最终配置/真实供应商未验证 |
 | Recorder `timeline.sources.read` | 唯一 job-scoped 研究数据入口，原生 CLI 读权限配置见 timeline_summary_provider | 原 basis/node/source/hash；不提供研究写入/实验/子 Agent 权限 | 本表独立计入；原生 sandbox 合规不由登记证明 |
 
 共用 Skill 逐项静态核对：Idea、Plan、Bundle、Reasoning 的阶段 Skill 使用当前角色的 G/native 能力；Target execution 使用原生文件/命令和观察工具，正式接纳归宿主；DeepFetch 使用 `deepfetch_source_action` 及已获授来源，Acquisition 使用 nature-downloader 与原生下载能力、正式 HumanRequest；Writing 沿 W；Recorder 沿 T。nature-downloader 中的具体 publisher/API/browser 调用取决于请求、访问模式和实际可用连接，不能凭 Skill 文本凭空登记已配置外部 MCP 工具。
@@ -163,7 +167,7 @@
 
 本轮对可直接转发的 OwnerConflict 包装保留 code 与 details；刻意的授权范围粗化以及无 details 属性的 SearchSourceError/ExperimentLogError 保持原合同。受控 Owner 故障回归 `tests/test_owner_diagnostic_propagation.py`：真实 admitted Idea root/生产 Harness grant/Owner 注册文献，受控 query 抛出生产 retired-version 诊断形状，验证 text/structured 同时拿到定位，然后在同一 channel 改用准确引用读到原已接纳内容，并用原 effect 对账保留既有接纳。它证明 adapter 信息传播与同通道接口续接，**不是模型自行修正行为证明**。
 
-已复现 red：基线 overlay 本测试在 `details` 缺失处失败（`.issue-291/runs/owner-diagnostics-red-263`）。初版该回归及普通 Literature/Bundle exhaustion 共 8 passed（`.issue-291/runs/owner-diagnostics-green2-263`）；初次 green 命令包含不存在的 test_human_guidance.py，未收集测试，已更正重跑。随后将回归加强为实际 admitted Idea + 生产 Harness grant，`owner-idea-green-263` 为 1 passed；同一最终测试在基线的对照见 `owner-idea-red-263`。每个 Owner 独有拒绝和真模型消费并未逐一实测；原生最终目录、8770 真实配置、真实供应商限流/超时后的 Agent 处置、所有角色真实模型同根修正仍需 #274 同版验收。接口探针、静态调用链、已存在测试与实际执行结果保持区分。
+已复现 red：基线 overlay 本测试在 `details` 缺失处失败（`.issue-291/runs/owner-diagnostics-red-263`）。初版该回归及普通 Literature/Bundle exhaustion 共 8 passed（`.issue-291/runs/owner-diagnostics-green2-263`）；初次 green 命令包含不存在的 test_human_guidance.py，未收集测试，已更正重跑。随后将回归加强为实际 admitted Idea + 生产 Harness grant，`owner-idea-green-263` 为 1 passed；同一最终测试在基线的对照见 `owner-idea-red-263`。每个 Owner 独有拒绝和真模型消费并未逐一实测；原生最终目录、修复版部署后的 8770 配置、真实供应商限流/超时后的 Agent 处置、所有角色真实模型同根修正仍需 #274 同版验收。接口探针、静态调用链、已存在测试与实际执行结果保持区分。
 
 ## 有区分力的逐工具证据索引
 

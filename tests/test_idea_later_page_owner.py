@@ -186,7 +186,9 @@ class _IdeaDiscoveryRunner(_SignedRunner):
             "path": [], "offset": 0, "limit": 128, "index_offset": 32,
         }})
         assert denied["isError"] is True
-        assert denied["structuredContent"] == {"code": "stage_context_ref_unbound"}
+        assert denied["structuredContent"]["code"] == "stage_context_ref_unbound"
+        assert "context_pack_ref" in denied["structuredContent"]["details"]["message"]
+        assert json.loads(denied["content"][0]["text"]) == denied["structuredContent"]
         draft = _DeterministicIdeaSkill().generate_draft(request).draft
         draft["candidates"][0]["evidence_boundary"]["accepted_evidence_refs"] = [self.selected_ref]
         self.output = _provider_idea_message(draft)

@@ -3,8 +3,17 @@ import json
 
 import pytest
 
-from meta_research.semantic_mcp import SemanticMcpGateway, SemanticOperation
+from meta_research.semantic_mcp import SemanticMcpError, SemanticMcpGateway, SemanticOperation
 from test_tool_discovery_registry import call, make_channel
+
+
+@pytest.mark.parametrize("bounds", [{"minimum": "zero"}, {"maximum": False}, {"minimum": 3, "maximum": 2}])
+def test_invalid_numeric_contract_is_rejected_before_any_channel(bounds):
+    with pytest.raises(SemanticMcpError, match="semantic_operation_schema_invalid"):
+        SemanticMcpGateway((SemanticOperation("invalid.read", "example", "Invalid numeric contract.",
+            lambda context, arguments: {},
+            {"type": "object", "properties": {"count": {"type": "integer", **bounds}}},
+            {"type": "object"}),))
 
 
 def gateway_with_reader():

@@ -2710,7 +2710,7 @@
       ],
       "handler": {
         "file": "src/meta_research/writing_content.py",
-        "line": 126,
+        "line": 138,
         "function": "content_model_operation.<locals>.call"
       },
       "availability": null,

@@ -1,0 +1,484 @@
+{
+  "baseline_ref": "ea421520434afcc32047ed35c937c64aa9cb9bbd",
+  "baseline_identity": {
+    "base": "ea421520434afcc32047ed35c937c64aa9cb9bbd",
+    "snapshot": "d12fe9a58772369d9de9807e33601321c31b6c5f13bc84063eeeb4a6b821f7d4",
+    "source_tests_count": 936,
+    "differences": [],
+    "workers": 24
+  },
+  "full_run": {
+    "candidate_head_at_freeze": "787bf71be5b612508c0f91e4099ee887bf89fa3e",
+    "candidate_snapshot": "f032bad4c4b94a145798c726b6aaeec009f29894762fbbacacdd8820cf5bf1eb",
+    "collected": 4787,
+    "counts": {
+      "passed": 4303,
+      "failed": 482,
+      "skipped": 2,
+      "incomplete": 0
+    },
+    "elapsed_seconds": 1156.3480327501893,
+    "phase_comparison_counts": {
+      "same_failed_phase_and_message": 429,
+      "same_failed_phase_changed_message": 52,
+      "candidate_only_failure": 1,
+      "baseline_only_failure": 2
+    }
+  },
+  "preexisting_failed_nodes_in_candidate": 481,
+  "changed_diagnostic_category_counts": {
+    "same_failed_predicate_volatile_values": 22,
+    "existing_profile_hash_assertion_current_identity": 25,
+    "existing_obsolete_status_assertion_plus_requested_diagnostics": 2,
+    "existing_bundle_binding_assertion_current_identity": 2,
+    "existing_later_assertion_after_timing_sensitive_guard": 1
+  },
+  "changed_diagnostics": [
+    {
+      "nodeid": "tests/test_public_manual_question_lifecycle.py::test_window_close_keeps_the_context_but_explicit_cancel_is_terminal",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[deepfetch]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[acquisition]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[companion]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[idea]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[plan]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[bundle]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[target]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[reasoning]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[deepfetch]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[acquisition]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[companion]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[idea]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[plan]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[bundle]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[target]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[reasoning]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_prompt_binding_compatibility.py::test_actual_pair_changes_only_reviewed_research_text",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_quest_goal_concurrent_roots.py::test_two_authenticated_roots_conflict_then_replay_exact_effect_after_head_moves",
+      "when": "call",
+      "category": "existing_obsolete_status_assertion_plus_requested_diagnostics",
+      "explanation": "The assertion already expected the removed top-level capability_unavailable status and failed on baseline. The candidate preserves the original code and additionally returns the requested effect/reconciliation details."
+    },
+    {
+      "nodeid": "tests/test_public_research_assets.py::test_healthy_managed_handoff_alias_keeps_projection_revision_atomic",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_quest_goal_history.py::test_public_goal_history_preserves_conditions_and_supersession_review",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_checkpoint_selection_recovery.py::test_frozen_data_checkpoint_returns_revision_and_same_run_can_complete[move-state]",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_checkpoint_selection_recovery.py::test_frozen_data_checkpoint_returns_revision_and_same_run_can_complete[keep-attributed-data-copy]",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_reasoning_stage_cancel_preserves_target.py::test_stage_cancel_resume_keeps_completed_target_and_five_originals",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_provider_usage_limit.py::test_bundle_quota_wait_stops_retries_and_explicit_resume_keeps_native",
+      "when": "call",
+      "category": "existing_bundle_binding_assertion_current_identity",
+      "explanation": "The same bundle_bindings_compatible assertion fails with current packaged-skill/runtime binding hashes. Preserve the failed outcome; no newly passing/failing predicate was inferred."
+    },
+    {
+      "nodeid": "tests/test_creation_basis_lifecycle.py::test_creation_basis_blocks_retirement_before_and_after_confirmation[direct]",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_creation_basis_lifecycle.py::test_creation_basis_blocks_retirement_before_and_after_confirmation[deepfetch]",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_creation_basis_lifecycle.py::test_basis_only_material_failure_is_readable_and_recovers_without_new_sources",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_question_stage_identity_migration.py::test_0036_root_stage_rows_survive_polymorphic_question_upgrade",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_root_human_request_lifecycle.py::test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect",
+      "when": "call",
+      "category": "existing_obsolete_status_assertion_plus_requested_diagnostics",
+      "explanation": "The assertion already expected the removed top-level capability_unavailable status and failed on baseline. The candidate preserves the original code and additionally returns the requested effect/reconciliation details."
+    },
+    {
+      "nodeid": "tests/test_bundle_operator_pause_resume.py::test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history[same-native-new-call]",
+      "when": "call",
+      "category": "existing_later_assertion_after_timing_sensitive_guard",
+      "explanation": "Baseline full run stopped at stage_provider_hard_ceiling_stale; candidate advances and fails Fresh pagination guidance. #291 bundle-candidate-recheck already failed this exact later assertion; all 936 source/test bytes match the ea42152 starting tree. See bundle-guidance-reuse.json."
+    },
+    {
+      "nodeid": "tests/test_binding_compatibility.py::test_compatibility_preserves_exact_equality_hashes_and_inputs",
+      "when": "call",
+      "category": "existing_bundle_binding_assertion_current_identity",
+      "explanation": "The same bundle_bindings_compatible assertion fails with current packaged-skill/runtime binding hashes. Preserve the failed outcome; no newly passing/failing predicate was inferred."
+    },
+    {
+      "nodeid": "tests/test_reasoning_content_preparation_snapshot.py::test_content_acceptance_prepares_reused_evidence_before_fresh_write",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[deepfetch]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[acquisition]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[companion]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[idea]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[plan]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[bundle]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[target]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[reasoning]",
+      "when": "call",
+      "category": "existing_profile_hash_assertion_current_identity",
+      "explanation": "The same historical profile/hash assertion fails; its observed current research prompt/profile hash differs. This is not a newly failing node or a demonstrated repair."
+    },
+    {
+      "nodeid": "tests/test_root_workspace_native.py::test_real_hc_initialization_dispatch_preserves_directory_across_turns",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_corrected_quest_initialization.py::test_cancel_fences_a_claimed_proposal_before_provider_spawn",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_corrected_quest_initialization.py::test_confirm_fences_a_claimed_intent_turn_before_provider_spawn",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_existing_project_creation.py::test_existing_folder_is_read_selectively_then_confirmed_and_read_by_idea[direct-False]",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_existing_project_creation.py::test_existing_folder_is_read_selectively_then_confirmed_and_read_by_idea[deepfetch-False]",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_existing_project_creation.py::test_existing_folder_is_read_selectively_then_confirmed_and_read_by_idea[deepfetch-True]",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_existing_project_creation.py::test_literature_revision_updates_source_coverage_without_changing_the_prepared_basis",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_existing_project_creation.py::test_draft_change_keeps_generation_basis_distinct_from_explicit_human_review",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_public_quest_initialization.py::test_injected_async_success_auto_previews_and_recovers_owner_receipts",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_public_human_collaboration_ladder.py::test_companion_ack_loss_recovers_without_a_second_provider_job_or_thread",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    },
+    {
+      "nodeid": "tests/test_public_human_collaboration_ladder.py::test_companion_unknown_outcome_keeps_hold_and_spool_without_blind_replay",
+      "when": "call",
+      "category": "same_failed_predicate_volatile_values",
+      "explanation": "Compared before/after diagnostic: failed predicate and missing/differing data remain the same; differences are generated refs/hashes, addresses, timestamps/timings, or isolated workspace names. The original failed outcome is retained."
+    }
+  ],
+  "candidate_only_failure": {
+    "nodeid": "tests/test_idea_later_page_owner.py::test_idea_discovers_later_evidence_through_its_actual_resident_mcp_grant",
+    "full_run_status": "failed",
+    "classification": "intended_additive_diagnostic_invalidated_exact_dictionary_test",
+    "stable_code": "stage_context_ref_unbound",
+    "resolution": "Test now asserts stable code, actionable context_pack_ref explanation and text/structured parity. Same whole-file final rerun passed 2 tests. Initial full-run outcome remains failed.",
+    "evidence": "D:/meta_research/test/Funtation_model/.issue-291/runs/263-idea-regression-fixed",
+    "followup": {
+      "summary": {
+        "snapshot": "fdc5b8db8ce8fd41979d767bd8f3a11e3e6bba24abe5eb8b8bdf92b555123966",
+        "head": "787bf71be5b612508c0f91e4099ee887bf89fa3e",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 17.480935364961624
+      },
+      "counts": {
+        "collected": 2,
+        "failed": 0,
+        "skipped": 0,
+        "passed": 2
+      }
+    }
+  },
+  "old_failures_currently_passed": [
+    "tests/test_bundle_operator_pause_resume.py::test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history[reject-tampered-stop]",
+    "tests/test_reconciliation_worker.py::test_web_lifespan_stops_provider_before_waiting_for_drafting_worker"
+  ],
+  "old_passes_note": "The two known timing-sensitive cases passing this run do not erase #291 failed outcomes or establish timing-frequency equivalence.",
+  "collection_change": {
+    "additional_nodes": 33,
+    "no_longer_matching_ids": [
+      "tests/test_external_mcp.py::test_frozen_schema_validation_never_fetches_remote_references[unresolvable_input-external_mcp_arguments_invalid-0]",
+      "tests/test_external_mcp.py::test_frozen_schema_validation_never_fetches_remote_references[unresolvable_output-external_mcp_result_invalid-1]"
+    ],
+    "interpretation": "Both absent IDs are renamed parameter combinations for unresolved input/output schemas: old arguments_invalid/result_invalid expectations now schema_invalid. Both replacement cases passed; no case was deleted. Net +31 collected cases."
+  },
+  "boundaries": {
+    "no_timeouts": true,
+    "no_incomplete": true,
+    "no_failed_phase_shifts": true,
+    "same_pinned_dependencies": true,
+    "unresolved_new_regressions_observed": 0,
+    "meaning": "No unexplained newly failing node remains after the targeted correction; suite is not green and final runtime changes were checked by targeted 78-test evidence, not a second full suite."
+  },
+  "bundle_later_failure_reuse": {
+    "nodeid": "tests/test_bundle_operator_pause_resume.py::test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history[same-native-new-call]",
+    "baseline_full_snapshot": "d12fe9a58772369d9de9807e33601321c31b6c5f13bc84063eeeb4a6b821f7d4",
+    "evidence": [
+      {
+        "directory": ".issue-291\\runs\\bundle-baseline-recheck",
+        "manifest_head": "b01d6c43851267ea090a1f952f1e307a85ef06f3",
+        "manifest_ref": "b01d6c4",
+        "snapshot": "8cff91bdbca9e2275dc2f6ef8775086bb8eb9057f4c5e0a6884dd5098b8b5329",
+        "files_checked": 936,
+        "source_test_differences_from_starting_bytes": [
+          "src/meta_research/accepted_materials.py",
+          "src/meta_research/human_research_input.py",
+          "src/meta_research/owners/research_graph.py",
+          "src/meta_research/research_content.py",
+          "src/meta_research/semantic_mcp.py",
+          "tests/test_human_input_page_reuse.py",
+          "tests/test_selected_material_directory.py",
+          "tests/test_tool_contract_snapshot.py"
+        ],
+        "nodeid": "tests/test_bundle_operator_pause_resume.py::test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history[same-native-new-call]",
+        "when": "call",
+        "outcome": "failed",
+        "message": "AssertionError: assert 'Fresh pagination guidance' in '[meta-research runtime conditions v1; characters=1698]\\n本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。同类旧运行条件以本段为准；已经接纳的研...ted keys, no duplicate keys, and no surrounding prose. The adapter decodes it before the frozen domain validator runs.'\n +  where '[meta-research runtime conditions v1; characters=1698]\\n本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。同类旧运行条件以本段为准；已经接纳的研...ted keys, no duplicate keys, and no surrounding prose. The adapter decodes it before the frozen domain validator runs.' = read_text()\n +    where read_text = (PosixPath('/dev/shm/issue-291-dN2mcxHU/data/test_hc_resume_stopped_bundle_0/data/bundle-skill-provider/provider-operations/a059e5136399cae96aa87cddecdab5ccc50bcd79cb58b8f314e17446b39fd982/primary') / 'prompt.txt').read_text",
+        "failure_location": {
+          "path": "/dev/shm/issue-291-dN2mcxHU/source/tests/test_bundle_operator_pause_resume.py",
+          "line": 117
+        }
+      },
+      {
+        "directory": ".issue-291\\runs\\bundle-candidate-recheck",
+        "manifest_head": "b01d6c43851267ea090a1f952f1e307a85ef06f3",
+        "manifest_ref": null,
+        "snapshot": "f654a29678955eb6ae19bda7fb968aa6132a14e7ecc33f7fc87875544d6843d3",
+        "files_checked": 936,
+        "source_test_differences_from_starting_bytes": [],
+        "nodeid": "tests/test_bundle_operator_pause_resume.py::test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history[same-native-new-call]",
+        "when": "call",
+        "outcome": "failed",
+        "message": "AssertionError: assert 'Fresh pagination guidance' in '[meta-research runtime conditions v1; characters=1698]\\n本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。同类旧运行条件以本段为准；已经接纳的研...ted keys, no duplicate keys, and no surrounding prose. The adapter decodes it before the frozen domain validator runs.'\n +  where '[meta-research runtime conditions v1; characters=1698]\\n本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。同类旧运行条件以本段为准；已经接纳的研...ted keys, no duplicate keys, and no surrounding prose. The adapter decodes it before the frozen domain validator runs.' = read_text()\n +    where read_text = (PosixPath('/dev/shm/issue-291-aulfu8xk/data/test_hc_resume_stopped_bundle_0/data/bundle-skill-provider/provider-operations/c4921c908fc54e3ba9c074e642247d073f4bf8c8b4e54eae5d160474d0470eb7/primary') / 'prompt.txt').read_text",
+        "failure_location": {
+          "path": "/dev/shm/issue-291-aulfu8xk/source/tests/test_bundle_operator_pause_resume.py",
+          "line": 117
+        }
+      }
+    ],
+    "interpretation": "The original full-run hard-ceiling race and later missing-guidance assertion remain separate recorded failures. The later assertion already occurred on byte-identical starting source/tests in #291 candidate recheck; this establishes pre-existence, not timing-frequency equivalence or overall correctness."
+  },
+  "final_runtime_evidence": {
+    "tested_runtime_snapshot": "3816b875d55d16dd725ebe2025a454dad9d733393311e3bb436f64dc093bcab6",
+    "runtime_files": 373,
+    "differences": [],
+    "followups": {
+      "263-review-final": {
+        "summary": {
+          "snapshot": "3816b875d55d16dd725ebe2025a454dad9d733393311e3bb436f64dc093bcab6",
+          "head": "787bf71be5b612508c0f91e4099ee887bf89fa3e",
+          "ref": null,
+          "exitcode": 0,
+          "elapsed_seconds": 69.39166276156902
+        },
+        "counts": {
+          "collected": 78,
+          "failed": 0,
+          "skipped": 0,
+          "passed": 78
+        }
+      },
+      "263-idea-regression-fixed": {
+        "summary": {
+          "snapshot": "fdc5b8db8ce8fd41979d767bd8f3a11e3e6bba24abe5eb8b8bdf92b555123966",
+          "head": "787bf71be5b612508c0f91e4099ee887bf89fa3e",
+          "ref": null,
+          "exitcode": 0,
+          "elapsed_seconds": 17.480935364961624
+        },
+        "counts": {
+          "collected": 2,
+          "failed": 0,
+          "skipped": 0,
+          "passed": 2
+        }
+      }
+    },
+    "head_at_runtime_verification": "faedba9a3e63c4d00a2d9a3a16811ad132aeb35b"
+  },
+  "raw_phase_comparison": "D:/meta_research/test/Funtation_model/.issue-263/full-validation/phase-comparison.json",
+  "full_evidence": "D:/meta_research/test/Funtation_model/.issue-291/runs/263-full-final",
+  "baseline_evidence": "D:/meta_research/test/Funtation_model/.issue-291/runs/full-final",
+  "scope_note": "The full suite tested candidate 787bf71; subsequent reviewed runtime fixes passed 78 targeted tests with all 373 runtime files matching the final implementation. The Idea assertion update passed its two-test file. Final documentation-only commits do not change those runtime bytes. Raw full-suite failures remain recorded."
+}

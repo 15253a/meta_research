@@ -31,9 +31,33 @@ class ExternalMcpError(ValueError):
         super().__init__(code if details is None else code + "\n" + canonical_json(details))
 
 
+def _schema_field_path(error: ValidationError) -> list[str | int]:
+    """Keep declared fields/array positions; dynamic object keys are input data."""
+    remaining = iter(error.absolute_path)
+    schema_path = iter(error.absolute_schema_path)
+    path: list[str | int] = []
+    for keyword in schema_path:
+        if keyword == "properties":
+            declared = next(schema_path, None)
+            actual = next(remaining, None)
+            if actual is not None:
+                path.append(declared if actual == declared else "<dynamic-key>")
+        elif keyword in {"additionalProperties", "unevaluatedProperties", "patternProperties"}:
+            if keyword == "patternProperties":
+                next(schema_path, None)
+            if next(remaining, None) is not None:
+                path.append("<dynamic-key>")
+        elif keyword in {"items", "prefixItems", "contains", "unevaluatedItems"}:
+            actual = next(remaining, None)
+            if actual is not None:
+                path.append(actual if isinstance(actual, int) else "<dynamic-key>")
+    path.extend(part if isinstance(part, int) else "<dynamic-key>" for part in remaining)
+    return path
+
+
 def _schema_diagnostic(error: ValidationError, depth: int = 0) -> dict[str, Any]:
     """Describe contract requirements, never jsonschema's instance-bearing message."""
-    path = list(error.absolute_path)
+    path = _schema_field_path(error)
     requirement = error.validator
     expected = error.validator_value
     alternatives = {}

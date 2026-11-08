@@ -23,22 +23,30 @@
 
 | 路径 | 修复前证据 | 修复后证据 |
 | --- | --- | --- |
-| 公共参数与原 effect 对账 | `263-gateway-red`：7 failed，缺 details | `263-gateway-last`：8 项；含效果实际存在/不存在两种坏回执，均先报告 unknown 后对账 |
+| 公共参数与原 effect 对账 | `263-gateway-red`：7 failed，缺 details | `263-gateway-last`：8 passed；含效果实际存在/不存在两种坏回执，均先报告 unknown 后对账 |
 | 真实 notes/content、分页、撤权、业务拒绝 | 复用 #291/原 #263 行为；4 个旧断言需接纳新增诊断 | `263-gateway-final-focused`：16 passed |
 | Bundle 原因与 Resident 桥 | `i263-bridge-red3`、`i263-bundle-red`：吞 details/原 code | `i263-bridge-final`：10 passed；原提案/原回执保持 |
 | DeepFetch 持久诊断 | `i263-deepfetch-durable-red`：REST 缺 details | `i263-deepfetch-durable-green`：worker→REST→重启保持原 run/attempt/session，Provider 仅调用一次 |
 | Idea 原授权通道 | `owner-idea-red-263`：Owner details 丢失 | `owner-idea-green-263`：纠正引用后继续、原注册结果对账；Owner 故障为受控注入 |
 | Writing 实际 Companion grant | `issue263-content-config-red`：配置缺失无方向；其他网络分类 red 记录保留 | `issue263-content-config-green`：27 passed；恢复原配置/服务后同通道继续 |
-| 外部 schema 与 DeepFetch source receipt | `issue263-external-red`、source red：误分类/吞因 | `issue263-source-green`：5 文件 88 passed；加强 gateway 入口后 `issue263-source-gateway-valid`：27 passed |
+| 外部 schema 与 DeepFetch source receipt | `issue263-external-red`、source red：误分类/吞因 | `issue263-source-green`：5 文件 88 passed；最终增强 oneOf/anyOf 与上游失败处置后 `issue263-external-details-green`：50 passed |
+| 双轴审查后的修复 | `263-review-red`：8 failed；`263-numeric-red`：3 failed | `263-review-final`：5 文件 78 passed；RPC 内部错误、内容 HTTP 分类、动态键安全、注册数值边界均验证 |
+| Idea 原生适配器后续消费 | 全套候选发现新增 details 导致旧整对象断言失败，原错误码没变 | `263-idea-regression-fixed`：2 passed，验证原 code、具体原因与文本/结构化一致 |
 
 ## 基线复用与完整验证
 
 #291 `full-final` 的 936 个 `src/`、`tests/` 文件与本次基线 `ea42152` 的 Git 字节全部一致。旧 manifest 的 HEAD 是 b01d6c4，但冻结的修改随后提交为 ea42152；按内容核对，未使用当前 dirty 工作树推断基线。其全套为 4756 collected：4271 passed、483 failed、2 skipped。480 个失败在更早基线复现；另 3 个竞态记录及未知因素保持，不改写为通过。
 
-本轮全套、与旧证据对照、双轴审查和最终快照记录在本节收口。Python 项目没有配置 mypy/pyright 或 backend typecheck 命令；编译检查不冒充类型检查。未改前端源码。
+全套运行冻结初始候选 `787bf71`（源码归档 SHA256 `f032bad4c4b94a145798c726b6aaeec009f29894762fbbacacdd8820cf5bf1eb`）。审查后 4 个运行文件的窄修复另以 `263-review-final` 的 78 passed 复验（归档 `3816b875d55d16dd725ebe2025a454dad9d733393311e3bb436f64dc093bcab6`）；不能把初始全套快照说成包含之后修复。双轴初审发现及复核分别见 [代码审查](review.md)。Python 项目没有配置 mypy/pyright 或 backend typecheck 命令；编译检查不冒充类型检查。未改前端源码。
+
+全套完成 **4787 collected：4303 passed、482 failed、2 skipped、0 incomplete**，532 个测试文件全部完成，1156.35 秒，无超时和收集错误。与 #291 精确节点/阶段对照：429 项失败阶段及诊断相同，52 项同阶段但诊断变化；1 项新增失败是 Idea 旧整对象断言（已修正，整文件 2 passed）。另 2 个旧竞态节点本次通过，保留旧失败，不据此宣称竞态已修复。两项外部 schema 参数化测试因错误码纠正而改变 node id，实际场景仍执行，未删除覆盖。
+
+Bundle `same-native-new-call` 从旧 hard-ceiling 竞态推进到缺少 `Fresh pagination guidance` 的断言，不归作随机文本差异：#291 `bundle-candidate-recheck` 在与本次起点全部 936 文件一致的快照 `f654a29678955eb6ae19bda7fb968aa6132a14e7ecc33f7fc87875544d6843d3` 已复现同一后续断言。两种历史失败均保留，未测量竞态发生频率。
+
+最终 373 个运行文件与审查后 78 passed 的冻结快照逐字节一致；Idea 测试调整另有 2 passed。**没有把全套原始 482 个失败改写为通过，也没有宣称最终修复后重新运行了全部 4787 项。** 精确对照和修正处置见 [验证记录](validation.json)；完整原始日志、JUnit、phase 对照在工作空间 `.issue-291/runs/263-full-final/` 与 `.issue-263/full-validation/`。
 
 ## 未验证与限制
 
 已证明同一授权入口的参数/引用修正、业务拒绝、先对账、保留结果和后续调用；没有声称真实模型已自主读懂并改正提交。最终同版本真实角色/模型消费仍需 #274；接口探针不替代该验收。
 
-8770 的最终 Harness 原生工具完整身份及真实外部配置尚未取得。只读检查了明确命名的 8771 安装，不能视为 8770 验收；真实供应商故障处置、全部角色的独有恢复分支、原生文件/命令/子 Agent 工具逐项实跑仍未验证。适用但未验证项保留在覆盖表，不算通过。本次不关闭 #263/#262/#274，不部署。
+已只读核对实际 8770：当前无已配置外部 MCP 或 supplemental 搜索源，但其运行源码为另一版本且保留已有修改。其 managed native home 没有现存 sessions／threads／dynamic-tools，离线 CLI 协议不提供完整 native catalog；最终修复版各角色原生工具完整目录仍未取得。详情见 [实例元数据](target-8770-inventory.json)。真实供应商故障处置、全部角色独有恢复、原生文件/命令/子 Agent 逐项实跑仍未验证。适用但未验证项保留，不算通过；Spec 审查因这一范围缺口仍有 1 项 P1。本次不关闭 #263/#262/#274，不部署。

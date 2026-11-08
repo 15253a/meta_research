@@ -92,6 +92,10 @@ def generate(config_ref: str, request: dict, *, environment=None, opener=None) -
             reason, category, message, correction = ("rate_limited", "temporary_unavailable",
                 "The selected provider rejected the request because of a rate or quota limit.",
                 "Check the selected provider's rate/quota limit before another call; keep the draft and do not switch models without authorization.")
+        elif error.code in {408, 504}:
+            reason, category, message, correction = ("timeout", "temporary_unavailable",
+                "The selected provider or its gateway timed out.",
+                "The remote generation outcome is unknown. Check the selected service before another call; preserve existing draft output and model choice.")
         elif error.code >= 500:
             reason, category, message, correction = ("service_unavailable", "temporary_unavailable",
                 "The selected provider returned a server failure.",
@@ -100,10 +104,18 @@ def generate(config_ref: str, request: dict, *, environment=None, opener=None) -
             reason, category, message, correction = ("endpoint_redirect_rejected", "tool_contract",
                 "The configured endpoint redirected the request; credentials were not forwarded.",
                 "Ask the configuration owner to verify the exact endpoint; do not send credentials to the redirect location.")
-        else:
+        elif error.code in {404, 405, 410, 415}:
+            reason, category, message, correction = ("configuration_rejected", "tool_contract",
+                "The configured model endpoint, model name or request method/media type was not accepted.",
+                "Ask the configuration owner to verify the exact endpoint, selected model and request contract; changing research messages cannot repair this configuration.")
+        elif error.code in {400, 413, 422}:
             reason, category, message, correction = ("request_rejected", "submission",
                 "The selected provider rejected the content request.",
                 "Check the submitted messages and the selected model's supported request contract; preserve the scientific evidence.")
+        else:
+            reason, category, message, correction = ("request_rejected", "provider_rejection",
+                "The provider rejected the call; its HTTP status does not establish a repairable submission error.",
+                "Check the selected provider's documented status and configuration before deciding whether the submission can be corrected; preserve the current draft.")
         raise ContentModelError(reason, category, message, correction, http_status=error.code) from None
     except (urllib.error.URLError, OSError) as error:
         timed_out = isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)

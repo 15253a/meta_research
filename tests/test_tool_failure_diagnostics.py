@@ -15,6 +15,10 @@ from meta_research.writing_content import generate
     (503, "service_unavailable", "temporary_unavailable", "service"),
     (302, "endpoint_redirect_rejected", "tool_contract", "endpoint"),
     (400, "request_rejected", "submission", "messages"),
+    (404, "configuration_rejected", "tool_contract", "endpoint"),
+    (405, "configuration_rejected", "tool_contract", "endpoint"),
+    (408, "timeout", "temporary_unavailable", "unknown"),
+    (504, "timeout", "temporary_unavailable", "unknown"),
     ("timeout", "timeout", "temporary_unavailable", "unknown"),
     ("unreachable", "unreachable", "temporary_unavailable", "connection"),
     ("bad_response", "invalid_response", "tool_contract", "response"),
@@ -198,3 +202,37 @@ def test_external_alternative_schema_explains_each_failed_shape(tmp_path, choice
         assert "DO_NOT_ECHO" not in json.dumps(failed)
         repaired = runtime.dispatch_http(access.token, request("tools/call", name=name, arguments={"sensor": "A"}))[1]
         assert repaired["result"]["structuredContent"] == {"observed": True}
+
+
+@pytest.mark.parametrize("dynamic_schema", [
+    {"additionalProperties": {"type": "integer"}},
+    {"patternProperties": {"^credential-": {"type": "integer"}}},
+])
+@pytest.mark.parametrize("nested_choice", [False, True])
+def test_external_schema_diagnostics_mask_dynamic_keys_at_real_gateway(tmp_path, dynamic_schema, nested_choice):
+    from test_external_mcp import service, request
+    from meta_research.external_mcp import ExternalMcpRuntime, exposed_tool_name, parse_services
+
+    class Provider:
+        def discover(self, connection):
+            schema = {"type": "object", "properties": {"tokens": {"type": "object", **dynamic_schema}}}
+            return {"server_instructions": "", "tools": [{"name": "lookup",
+                "inputSchema": {"oneOf": [schema]} if nested_choice else schema}]}
+
+        def call(self, connection, name, arguments):
+            return {"content": [], "structuredContent": {"observed": True}}
+
+    runtime = ExternalMcpRuntime(tmp_path, client=Provider())
+    runtime.configure_endpoint("http://127.0.0.1:9999")
+    runtime.save_config(services=parse_services([service(tmp_path)]), expected_revision=runtime.read_config().revision)
+    snapshot = runtime.operation_snapshot(operation_identity="dynamic-key", root_kind="idea", task_prompt="Observe")
+    with runtime.channel(snapshot) as access:
+        result = runtime.dispatch_http(access.token, request("tools/call", name=exposed_tool_name("lab", "lookup"),
+            arguments={"tokens": {"credential-secret-canary": "bad"}}))[1]
+        assert "credential-secret-canary" not in json.dumps(result)
+        details = result["error"]["data"]
+        if nested_choice:
+            details = details["alternatives"][0]
+        assert details["path"] == ["tokens", "<dynamic-key>"]
+        assert details["requirement"] == "type"
+        assert details["expected"] == "integer"

@@ -1,0 +1,97 @@
+{
+  "observed_at": "2026-11-09T00:43:49+08:00",
+  "scope": "Read-only current 8770 metadata; not deployment or acceptance of the #263 implementation",
+  "deployment_root": "/mnt/wl2605001/projects/meta-research-8770-v1-test",
+  "source_head": "a74e91fbeb848f744714f8826f13acdc7c0d29ba",
+  "source_dirty_file_count": 23,
+  "process": {
+    "pid": 3681139,
+    "module": "meta_research.daemon",
+    "data_root": "/mnt/wl2605001/projects/meta-research-8770-v1-test/data",
+    "cwd": "/mnt/wl2605001/projects/meta-research-8770-v1-test",
+    "executable": "/usr/bin/python3.12",
+    "host": "127.0.0.1",
+    "port": 8770,
+    "status": "running"
+  },
+  "codex_cli_version": "codex-cli 0.159.0",
+  "external_mcp": {
+    "config_exists": false,
+    "operation_snapshot_count": 0,
+    "configured_service_count": 0,
+    "basis": "ExternalMcpRuntime.read_config returns no services when data/external-mcp/config.json is absent"
+  },
+  "supplemental_search_sources": {
+    "database": "data/search-sources/registry.sqlite3",
+    "connection_mode": "ro",
+    "counts": {
+      "versions": 0,
+      "heads": 0,
+      "tests": 0,
+      "adopted_tests": 0,
+      "selections": 0,
+      "bases": 0,
+      "transfers": 0,
+      "manifests": 0,
+      "jobs": 0,
+      "receipts": 0
+    }
+  },
+  "native_home": {
+    "path": "data/provider-homes/codex",
+    "config_toml_files": 0,
+    "session_jsonl_files": 0,
+    "archived_session_jsonl_files": 0,
+    "state_database": "state_5.sqlite",
+    "threads": 0,
+    "thread_dynamic_tools": 0,
+    "observed_tool_call_names": []
+  },
+  "installed_default_features": {
+    "hooks": true,
+    "multi_agent": true,
+    "plugins": true,
+    "remote_plugin": true,
+    "shell_tool": true,
+    "skill_search": true,
+    "unified_exec": true
+  },
+  "protocol_inventory_attempt": {
+    "command": "codex app-server generate-json-schema --experimental --out <isolated temporary directory>",
+    "exit": 0,
+    "schema_file_count": 440,
+    "native_tool_catalog_method_found": false,
+    "tool_related_methods": [
+      "config/mcpServer/reload",
+      "item/mcpToolCall/progress",
+      "item/tool/call",
+      "item/tool/requestUserInput",
+      "mcpServer/elicitation/request",
+      "mcpServer/event/stream/notification",
+      "mcpServer/event/stream/start",
+      "mcpServer/event/stream/stop",
+      "mcpServer/oauth/login",
+      "mcpServer/oauthLogin/completed",
+      "mcpServer/resource/read",
+      "mcpServer/startupStatus/updated",
+      "mcpServer/tool/call",
+      "mcpServerStatus/list"
+    ]
+  },
+  "source_hashes": {
+    "src/meta_research/root_capabilities.py": "8d37705a0deb5f41525a0b3ff6ad545f6cc6de634d031deaeb3feb28cf261ed0",
+    "src/meta_research/harness_adapters.py": "4aa0782b02320b3310c396c1f636183ebb4a4289b33b3485d08f1a8eeeb7c3ee",
+    "src/meta_research/semantic_mcp.py": "cb4b75e27fdf8379b3978b70b16dc99326762e84a19ee17a783010ba7fec789d",
+    "src/meta_research/external_mcp.py": "dd121dfe41fcc12aa8ec51f03d00b208705f39e0591621a6ba85587da4151ecf"
+  },
+  "boundaries": [
+    "No service, research, authentication or existing configuration mutation",
+    "No credential file contents or request/result task payloads read or emitted",
+    "SQLite metadata/count queries used mode=ro",
+    "CLI help/version used installed executable; feature/schema generation used isolated temporary CODEX_HOME",
+    "No model or native research session started",
+    "Feature availability does not enumerate final native tool identities",
+    "No configured external services or supplemental search sources at this target observation; future configuration and other instances are separate",
+    "No current native session or dynamic-tool row exists for actual realized catalog extraction; final per-role native tool inventory remains unverified"
+  ]
+}

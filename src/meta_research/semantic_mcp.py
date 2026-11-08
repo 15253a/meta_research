@@ -726,6 +726,11 @@ def _valid_schema_contract(schema: object) -> bool:
         and minimum_length > maximum_length
     ):
         return False
+    for key in ("minimum", "maximum"):
+        if key in schema and (not isinstance(schema[key], (int, float)) or isinstance(schema[key], bool)):
+            return False
+    if "minimum" in schema and "maximum" in schema and schema["minimum"] > schema["maximum"]:
+        return False
     if schema_type == "object":
         required = schema.get("required", [])
         properties = schema.get("properties", {})

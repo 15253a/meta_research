@@ -77,6 +77,10 @@ def test_resident_preserves_owner_rejection_and_continues_original_scope(monkeyp
     (200, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "secret-token"}},
      "semantic_mcp_protocol_error", "host_contract"),
     (503, None, "semantic_mcp_unavailable", "temporarily_unavailable"),
+    (503, {"error": {"code": -32000, "message": "secret-token"}},
+     "semantic_mcp_unavailable", "temporarily_unavailable"),
+    (200, {"error": {"code": -32603, "message": "secret-token"}},
+     "semantic_mcp_protocol_error", "host_failure"),
     (200, {"result": {}}, "semantic_mcp_response_invalid", "host_contract"),
 ])
 def test_resident_distinguishes_protocol_auth_and_unavailable(monkeypatch, status, payload, code, category):
@@ -96,7 +100,11 @@ def test_resident_distinguishes_protocol_auth_and_unavailable(monkeypatch, statu
     if category == "host_contract":
         assert caught.value.details["operation_id"] == "agent_runtime.acquisition.request"
     if code == "semantic_mcp_protocol_error":
-        assert caught.value.details["protocol_code"] == -32602
+        assert caught.value.details["protocol_code"] == payload["error"]["code"]
+    if category in {"host_failure", "temporarily_unavailable"}:
+        assert caught.value.details["effect_id"] == "original-effect"
+        assert caught.value.details["effect_state"] == "unknown"
+        assert "reconcile" in caught.value.details["correction"]
 
 
 def test_bundle_conflict_preserves_reason_then_reconciles_original_proposal(tmp_path):
