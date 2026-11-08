@@ -435,7 +435,7 @@ class ReasoningStageWorker:
                 self._transient_error = None
                 return _CycleStep(True, provider_boundary_attempted=True)
             if error.rejected_candidate is not None:
-                self._reject_completion_candidate(unit_ref=unit_ref, run=run, operation_name="autonomous-resume", native_session_ref=error.rejected_native_session_ref or run.native_session_ref, candidate=error.rejected_candidate, failure_code=error.code, detail_code=error.rejected_detail_code or error.code, continuation_phase="summary-decision")
+                self._reject_completion_candidate(unit_ref=unit_ref, run=run, operation_name="autonomous-resume", native_session_ref=error.rejected_native_session_ref or run.native_session_ref, candidate=error.rejected_candidate, failure_code=error.code, detail_code=error.rejected_detail_code or error.code, feedback=error.rejected_feedback, continuation_phase="summary-decision")
                 safe = False
                 self._transient_error = error.code
                 return _CycleStep(True, provider_boundary_attempted=True)
@@ -448,7 +448,7 @@ class ReasoningStageWorker:
             return _CycleStep(False, provider_boundary_attempted=True)
         except (ReasoningContractError, ReasoningSkillContractError) as error:
             if decision is not None:
-                self._reject_completion_candidate(unit_ref=unit_ref, run=run, operation_name="autonomous-resume", native_session_ref=run.native_session_ref, candidate=decision, failure_code="reasoning_review_result_contract_invalid", detail_code=str(error), continuation_phase="summary-decision")
+                self._reject_completion_candidate(unit_ref=unit_ref, run=run, operation_name="autonomous-resume", native_session_ref=run.native_session_ref, candidate=decision, failure_code="reasoning_review_result_contract_invalid", detail_code=error.diagnostic, continuation_phase="summary-decision")
                 safe = False
                 self._transient_error = str(error)
                 return _CycleStep(True, provider_boundary_attempted=True)
@@ -462,7 +462,17 @@ class ReasoningStageWorker:
         rejected = self._agent_runtime.query_reasoning_continuation_rejections(run.autonomous_checkpoint.checkpoint_ref, phase)
         operation_ref = "reasoning-continuation_" + canonical_hash({"base_job_ref": base_job_ref, "phase": phase, "revision": len(rejected)})
         job_ref = self._agent_runtime.root_provider_continuation_job_ref(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, root_session_ref=run.root_session_ref, base_job_ref=operation_ref)
-        return replace(self._skill_request(request, run, job_ref=job_ref), continuation_feedback=tuple("The previous completion was rejected: " + item["detail_code"] + ". Correct the full output and resubmit in this same Session." for item in rejected))
+        return replace(
+            self._skill_request(request, run, job_ref=job_ref),
+            continuation_feedback=tuple(
+                feedback
+                for item in rejected
+                for feedback in item.get("feedback", [
+                    "The previous completion was rejected: " + item["detail_code"]
+                    + ". Correct the full output and resubmit in this same Session."
+                ])
+            ),
+        )
 
     def _execute_attempt(
         self,
@@ -561,6 +571,7 @@ class ReasoningStageWorker:
                             candidate=error.rejected_candidate,
                             failure_code=error.code,
                             detail_code=error.rejected_detail_code,
+                            feedback=error.rejected_feedback,
                         )
                         provider_safe = False
                         self._transient_error = error.code
@@ -607,7 +618,7 @@ class ReasoningStageWorker:
                         native_session_ref=draft.primary_session_ref,
                         candidate=asdict(draft),
                         failure_code=failure_code,
-                        detail_code=str(error),
+                        detail_code=error.diagnostic,
                     )
                     provider_safe = False
                     self._transient_error = failure_code
@@ -765,6 +776,7 @@ class ReasoningStageWorker:
                         candidate=error.rejected_candidate,
                         failure_code=error.code,
                         detail_code=error.rejected_detail_code,
+                        feedback=error.rejected_feedback,
                     )
                     provider_safe = False
                     self._transient_error = error.code
@@ -807,7 +819,7 @@ class ReasoningStageWorker:
                     native_session_ref=result.primary_session_ref,
                     candidate=asdict(result),
                     failure_code=failure_code,
-                    detail_code=str(error),
+                    detail_code=error.diagnostic,
                 )
                 provider_safe = False
                 self._transient_error = failure_code
@@ -990,6 +1002,7 @@ class ReasoningStageWorker:
             domain_candidate_ref = candidate.submission_ref
             domain_receipt_ref = checkpoint_rejection_receipt.receipt_ref
 
+        completion_feedback: tuple[str, ...] = ()
         if completion_rejection is not None:
             if (
                 not completion_rejection.feedback
@@ -1005,6 +1018,12 @@ class ReasoningStageWorker:
                 != completion_rejection.attempt_ref
             ):
                 raise OwnerConflict("completion_rejection_lineage_invalid")
+            # The Owner verifies this candidate's hash and receipt on read.
+            # Oversized diagnostics use that existing durable payload instead
+            # of exceeding the bounded feedback summary fields.
+            completion_feedback = tuple(cast(list[str] | tuple[str, ...], completion_rejection.candidate.get(
+                "diagnostic_feedback", completion_rejection.feedback
+            )))
         if domain_candidate_ref is not None or completion_rejection is not None:
             return (
                 (
@@ -1018,12 +1037,7 @@ class ReasoningStageWorker:
                     else domain_receipt_ref
                 ),
                 "domain" if domain_candidate_ref is not None else "completion",
-                domain_feedback
-                + (
-                    ()
-                    if completion_rejection is None
-                    else completion_rejection.feedback
-                ),
+                domain_feedback + completion_feedback,
             )
 
         if (
@@ -1127,6 +1141,7 @@ class ReasoningStageWorker:
                         candidate=error.rejected_candidate,
                         failure_code=error.code,
                         detail_code=error.rejected_detail_code,
+                        feedback=error.rejected_feedback,
                     )
                     provider_safe = False
                     self._transient_error = error.code
@@ -1170,7 +1185,7 @@ class ReasoningStageWorker:
                     native_session_ref=result.primary_session_ref,
                     candidate=asdict(result),
                     failure_code=failure_code,
-                    detail_code=str(error),
+                    detail_code=error.diagnostic,
                 )
                 provider_safe = False
                 self._transient_error = failure_code
@@ -1278,36 +1293,37 @@ class ReasoningStageWorker:
         candidate: dict[str, object],
         failure_code: str,
         detail_code: str,
+        feedback: tuple[str, ...] = (),
         continuation_phase: str | None = None,
     ) -> None:
+        diagnostic = ReasoningContractError(detail_code)
+        correction = tuple(
+            "Return a corrected structured completion that satisfies "
+            f"{detail}, then resubmit it in this Root Session."
+            for detail in (feedback or (diagnostic.diagnostic,))
+        )
         if continuation_phase is not None:
-            job_ref = self._agent_runtime.record_reasoning_continuation_rejection(checkpoint_ref=run.autonomous_checkpoint.checkpoint_ref, phase=continuation_phase, unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=native_session_ref, candidate=candidate, failure_code=failure_code, detail_code=detail_code)
+            job_ref = self._agent_runtime.record_reasoning_continuation_rejection(checkpoint_ref=run.autonomous_checkpoint.checkpoint_ref, phase=continuation_phase, unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=native_session_ref, candidate=candidate, failure_code=failure_code, detail_code=diagnostic.detail_code, feedback=correction)
             self._finish_provider_job(job_ref)
             return
-        detail = detail_code
-        # This contract error carries field/supplied/expected evidence after
-        # its stable code. Preserve that evidence in feedback, not in the
-        # Owner's bounded machine-code field.
-        for code in (
-            "scientific_outcome_authoritative_metadata_conflict",
-            "scientific_outcome_evidence_invalid",
-        ):
-            if detail_code.startswith(code + ":"):
-                detail_code = code
-                break
+        rejected_candidate: dict[str, object] = {"phase": operation_name, "result": candidate}
+        if len(correction) > 32 or any(len(item) > 4096 for item in correction):
+            rejected_candidate["diagnostic_feedback"] = list(correction)
+            correction = (
+                f"Correct {diagnostic.detail_code} and resubmit in this Root Session. "
+                "The complete diagnostic is retained in this candidate and "
+                "will be delivered with the correction request.",
+            )
         self._agent_runtime.reject_stage_completion_candidate(
             unit_ref=unit_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
             native_session_ref=native_session_ref,
-            candidate={"phase": operation_name, "result": candidate},
+            candidate=rejected_candidate,
             reason_code=failure_code,
-            detail_code=detail_code,
-            feedback=(
-                "Return a corrected structured completion that satisfies "
-                f"{detail}, then resubmit it in this Root Session.",
-            ),
+            detail_code=diagnostic.detail_code,
+            feedback=correction,
         )
 
     def _accepted_checkpoint_facts(self, checkpoint_ref: str):
@@ -1620,7 +1636,7 @@ def _assemble_provider_document(
             frozen_research_context=cast(dict[str, object], request.context_pack["research_context"]),
         )
     except ReasoningContractError as error:
-        raise RecoverableReasoningSkillCandidateError(str(error)) from error
+        raise RecoverableReasoningSkillCandidateError(error.diagnostic) from error
 
 
 def _assemble_provider_result(

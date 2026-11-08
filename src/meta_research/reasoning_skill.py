@@ -342,7 +342,7 @@ def validate_reasoning_skill_draft(
             historical_resolver=request.historical_evidence_resolver,
         )
     except ReasoningSkillContractError as error:
-        raise RecoverableReasoningSkillCandidateError(str(error)) from error
+        raise RecoverableReasoningSkillCandidateError(error.diagnostic) from error
 
 
 def validate_reasoning_autonomous_checkpoint_result(
@@ -397,7 +397,7 @@ def validate_reasoning_autonomous_checkpoint_result(
             final_output_hash=checkpoint_hash,
         )
     except ReasoningSkillContractError as error:
-        raise RecoverableReasoningSkillCandidateError(str(error)) from error
+        raise RecoverableReasoningSkillCandidateError(error.diagnostic) from error
     return checkpoint_hash, outcome_hash, scope_hash, canonical_hash(review)
 
 
@@ -479,7 +479,7 @@ def validate_reasoning_autonomous_resume_result(
             final_output_hash=final_hash,
         )
     except ReasoningSkillContractError as error:
-        raise RecoverableReasoningSkillCandidateError(str(error)) from error
+        raise RecoverableReasoningSkillCandidateError(error.diagnostic) from error
     checkpoint_outcome = checkpoint.get("scientific_outcome")
     checkpoint_scope = checkpoint.get("autonomous_scope")
     anchor = creation_result.get("question_anchor")
@@ -573,7 +573,7 @@ def validate_reasoning_skill_result(
             final_output_hash=final_hash,
         )
     except ReasoningSkillContractError as error:
-        raise RecoverableReasoningSkillCandidateError(str(error)) from error
+        raise RecoverableReasoningSkillCandidateError(error.diagnostic) from error
     return (
         draft_hash,
         final_hash,
@@ -831,6 +831,29 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
 
     _provider_transport_limits = REASONING_PROVIDER_TRANSPORT_LIMITS
 
+    def _sealed_result_failure(
+        self,
+        *,
+        job_ref: str | None,
+        operation_name: str,
+        native_session_ref: str,
+        failure_code: str,
+        detail_code: str | None = None,
+        rejected_candidate: dict[str, object] | None = None,
+    ) -> ReasoningSkillUnavailable:
+        diagnostic = ReasoningContractError(detail_code or failure_code)
+        failure = super()._sealed_result_failure(
+            job_ref=job_ref,
+            operation_name=operation_name,
+            native_session_ref=native_session_ref,
+            failure_code=failure_code,
+            detail_code=diagnostic.detail_code,
+            rejected_candidate=rejected_candidate,
+        )
+        if rejected_candidate is not None:
+            failure.rejected_feedback = (diagnostic.diagnostic,)
+        return failure
+
     def _assemble_provider_output(
         self,
         request: ReasoningSkillRequest,
@@ -855,9 +878,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 operation_name=operation_name,
                 native_session_ref=native_session_ref,
                 failure_code=self._transport_contract_failure_code(operation_name),
-                detail_code=str(error) + (
-                    ": " + error.feedback if hasattr(error, "feedback") else ""
-                ),
+                detail_code=error.diagnostic,
                 rejected_candidate=output,
             ) from error
 
@@ -1402,7 +1423,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         try:
             validate_reasoning_deepfetch_decision(request, decision, facts)
         except (ReasoningContractError, ReasoningSkillContractError) as error:
-            raise self._sealed_result_failure(job_ref=request.job_ref, operation_name="autonomous-resume", native_session_ref=request.native_session_ref, failure_code="reasoning_review_result_contract_invalid", detail_code=str(error), rejected_candidate=decision) from error
+            raise self._sealed_result_failure(job_ref=request.job_ref, operation_name="autonomous-resume", native_session_ref=request.native_session_ref, failure_code="reasoning_review_result_contract_invalid", detail_code=error.diagnostic, rejected_candidate=decision) from error
         return decision
 
     def resume_after_autonomous_creation(

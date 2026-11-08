@@ -242,6 +242,7 @@ class IdeaSkillUnavailable(RuntimeError):
         rejected_candidate: dict[str, object] | None = None,
         rejected_native_session_ref: str | None = None,
         rejected_detail_code: str | None = None,
+        rejected_feedback: tuple[str, ...] = (),
         native_session_ref: str | None = None,
     ) -> None:
         super().__init__(code)
@@ -254,6 +255,7 @@ class IdeaSkillUnavailable(RuntimeError):
         )
         self.rejected_native_session_ref = rejected_native_session_ref
         self.rejected_detail_code = rejected_detail_code
+        self.rejected_feedback = rejected_feedback
         self.native_session_ref = native_session_ref or rejected_native_session_ref
 
 
@@ -3436,6 +3438,7 @@ def _with_failed_native_session(
         rejected_candidate=error.rejected_candidate,
         rejected_native_session_ref=error.rejected_native_session_ref,
         rejected_detail_code=error.rejected_detail_code,
+        rejected_feedback=error.rejected_feedback,
         native_session_ref=native_session_ref,
     )
 

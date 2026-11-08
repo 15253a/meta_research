@@ -19949,13 +19949,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             raise OwnerConflict("reasoning_continuation_rejection_integrity_invalid")
         return tuple(record for record in records if record["phase"] == phase)
 
-    def record_reasoning_continuation_rejection(self, *, checkpoint_ref: str, phase: str, unit_ref: str, run_ref: str, attempt_ref: str, fence_ref: str, native_session_ref: str, candidate: dict, failure_code: str, detail_code: str) -> str:
+    def record_reasoning_continuation_rejection(self, *, checkpoint_ref: str, phase: str, unit_ref: str, run_ref: str, attempt_ref: str, fence_ref: str, native_session_ref: str, candidate: dict, failure_code: str, detail_code: str, feedback: tuple[str, ...] = ()) -> str:
         """Persist a malformed continuation and resume that phase in the same Session.
 
         These provider operations follow the immutable draft checkpoint; they
         are not the initial review invocation and cannot replace its receipt.
         """
-        if phase not in {"summary-decision", "creation-final"} or not detail_code:
+        if (phase not in {"summary-decision", "creation-final"}
+            or not isinstance(detail_code, str) or not detail_code or len(detail_code) > 128
+            or type(feedback) is not tuple
+            or any(not isinstance(item, str) or not item.strip() for item in feedback)):
             raise OwnerConflict("reasoning_continuation_rejection_invalid")
         checkpoint = self.query_reasoning_autonomous_checkpoint(checkpoint_ref)
         if checkpoint is None or checkpoint.run_ref != run_ref or checkpoint.native_session_ref != native_session_ref:
@@ -19973,6 +19976,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                       "attempt_ref": attempt_ref, "fence_ref": fence_ref, "native_session_ref": native_session_ref,
                       "unit_ref": unit_ref, "job_ref": unit.operation_ref, "candidate": candidate,
                       "candidate_hash": canonical_hash(candidate), "failure_code": failure_code, "detail_code": detail_code}
+            if feedback:
+                record["feedback"] = list(feedback)
             row = connection.execute(text("SELECT reasoning_provider_rejections_json, reasoning_provider_rejections_hash FROM ar_stage_attempts WHERE reasoning_checkpoint_ref = :ref"), {"ref": checkpoint_ref}).one()
             records = [] if row.reasoning_provider_rejections_json is None else json.loads(row.reasoning_provider_rejections_json)
             if row.reasoning_provider_rejections_json is not None and canonical_hash(records) != row.reasoning_provider_rejections_hash:

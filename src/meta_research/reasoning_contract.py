@@ -164,6 +164,19 @@ _CANDIDATE_COMPLETION_FIELDS = _REASONING_SOURCE_FIELDS | {
 class ReasoningContractError(ValueError):
     """A Reasoning candidate or one of its frozen bindings is invalid."""
 
+    def __init__(self, message: str, *, feedback: str = "") -> None:
+        super().__init__(message)
+        self.feedback = feedback
+
+    @property
+    def detail_code(self) -> str:
+        """The machine identifier before any field/value diagnostic."""
+        return str(self).partition(":")[0]
+
+    @property
+    def diagnostic(self) -> str:
+        return str(self) + (": " + self.feedback if self.feedback else "")
+
 
 def validate_new_reasoning_successor_entry(output: dict[str, object]) -> None:
     """Apply current entry policy to new outputs, not immutable history reads."""
