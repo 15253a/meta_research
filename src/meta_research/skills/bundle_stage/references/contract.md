@@ -12,11 +12,13 @@
 
 首轮完整阅读 FormalPlan 的 answer_contract、coverage、experiment_briefs、notes 及 source_bindings.selected_evidence_bindings，并保留其精确身份与来源；这些必要正文由装配层完整交付，不经通用 preview 的深度、列表或字节裁剪。EvidenceReuseSet 只表达 EvidenceUse 的派生结果，不用于重建或裁剪全部采用来源。Question、前驱接续目的、本轮 cycle_focus 及来源、适用指导与授权说明当前研究背景；frontier、在途工作和已接纳结果说明当前执行事实，二者分别对待。
 
+首轮直接提供与冻结 `AcceptedQuestionBinding` 的 content_ref／content_hash 匹配的完整 Question：`title`、`unknown_statement`、`answer_shape`、`applicability_scope`、`background_context`、`requirements_constraints`。后两项按合同允许为空字符串，保留字段和原值；本次绑定的有效 Goal、完成标准与持续条件也完整提供。必要补读使用 `research_memory.stage_context.read` 的 `source=question` 及输入中准确的 Goal 入口，不从 latest 拼出首包。原根续接只追加新材料、指导或修订反馈，已有正文沿原冻结输入继续使用。
+
 原 IdeaSet 在首轮保留准确绑定和读取入口，遇到构想用意、依据或适用边界需要核实时回读原文；首轮不额外展开整份 IdeaSet。完整 FormalPlan 的正式科学承诺继续作为安排工作的依据，按需读取不省略必要核对。
 
 Plan 提供每份 Brief 的 goal、characteristics、boundary_constraints、semantic_delta；Bundle 原样承接这些语义，并在 normalization_inputs 为全部 Brief 推导 required_measurement_unit_keys 与 held_fixed_slots。cell 描述所列 Brief 中应完成和报告的工作责任，不预设正向结果或达标；Brief 可以只推进关联 gap 的一部分。未安排 gap 不生成虚假 Brief、cell 或 Target；它们保留在完整 Plan 中，其真实不足和不安排理由不因 Bundle 工作而丢失。准备工作可有自己的责任，但它只覆盖准备事实；实质研究义务仍须由对应研究结果支撑。Protocol 把实际评价、缺测、停止和汇总规则说清，保持 Plan 已明确的比较条件；未被固定的实施细节按研究需要决定。
 
-cells 的切分在首次规范化接纳前由 Bundle 确定；现行滚动合同接纳后保留同一 completion_contract_hash，后续批次追加候选，不重写已冻结的 cell 身份或已接纳 Target spec。尚未提交的候选、实施选择与顺序可据结果调整。一 Target 恰一个 cell 是当前接口的粒度，不是对研究工作本质或 Brief 数量的规定；本设计沿用该接口，不新增修改已接纳规范化合同的路径。
+cells 的切分在首次规范化接纳前由 Bundle 确定；现行滚动合同接纳后保留同一 completion_contract_hash，后续批次追加候选，不重写已冻结的 cell 身份或已接纳 Target spec。尚未提交的候选、实施选择与顺序可据结果调整。每个 Target 的 measurement_unit_keys 恰含一个 cell；该粒度约束正式提交，不限定研究工作本质或 Brief 数量。需要改变已冻结科学承诺时，通过 replan_required 交给 Reasoning 与后继 Cycle。
 
 ## 策略、粒度与风险
 

@@ -22,13 +22,13 @@
 
 ## 上下文装配与准确读取
 
-首轮通过正式 ContextPack 呈现完整 Question、Goal／指导、FormalPlan 及全部采用来源绑定、Bundle 最后非空已接纳策略 notes，以及每项 Target 的关键结果和限制。已交付装配沿 `context_presentation`、`stage_context_access` 和研究主链的冻结输入进行；按返回 reader 展开准确原文与分页，不用 latest 替换。正式修订保留当前声明与原依据。
+首轮输入直接提供冻结 Question 的六字段正文，以及有效 Goal、完成标准和持续条件；ContextPack 同时呈现 FormalPlan 及全部采用来源绑定、Bundle 最后非空已接纳策略 notes，以及每项 Target 的关键结果和限制。正文、身份和按需 reader 对应同一冻结来源，具体交付与续接规则见[上下文与准确材料](contract.md#上下文与准确材料)。按返回 reader 展开准确原文与分页，正式修订保留当前声明与原依据。
 
 `cycle_focus` 已由 Reasoning 的输出 schema、原接纳及后继装配接通；正文随 transition 保存与读取，各根沿实际前驱或首轮来源取得同一重心。恢复仍在原根、原目录和准确冻结输入上进行。按[语义契约](contract.md)修正缺失或冲突，不能补造首轮前驱。
 
 Target 文献整理继承共享材料保管与导航合同。DeepFetch → LiteratureSnapshot → QuestionLiteratureRevision 保持；普通文献沿 research_memory.literature.register 保存外部来源和已接纳原件 binding，再用 .reference 关联 Question、research_ref、用途和真实 research_notes binding。用 .read 查回记录、content.read 取得原件与分析，文献原作与本次阅读各自保留来源。未取得全文如实登记 missing／waiting_user，不虚构 DeepFetch Run 或专用 literature_candidates。接口不可用、部分失败和未完成按实际步骤交接，不当成无候选；空候选或无保留价值可不登记。
 
-历史跨轮发现、三轮目录和回收、材料保管及工具目录的新增能力分别按实际目录和 reader 可用性使用；文件中的设计语义不授予额外权限。
+历史按 Question／Cycle 关系及准确 reader 追溯，工作目录按本次获授路径使用。需要保管选定材料时调用 `research_memory.assets.intake`，以返回的准确版本和 reader 接续；需要查明可用操作或参数时，沿[当前获授工具与准确入口](../../references/research-navigation.md#当前获授工具与准确入口)读取本根合同。权限不足、原件不可读或结果未知时，按实际失败与对账入口处理。
 
 ## 写入权限与资源登记
 

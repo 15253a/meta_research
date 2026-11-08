@@ -128,6 +128,14 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                 "path": [str(key) for key in path], "offset": 0, "limit": 8192}
 
     def preview(value: object, path: list[str | int], depth: int = 0) -> object:
+        if stage == "reasoning" and path == ["research_context", "quest_goal_revision"]:
+            # Current direction is scientific input, even when its frozen
+            # source sits alongside optional graph history. Keep one complete
+            # copy outside both the field and aggregate preview budgets.
+            required_material["quest_goal_revision"] = value
+            mark_preview(path)
+            return {"provided_as": "required_material.quest_goal_revision",
+                    "reader": reader(path)}
         if isinstance(value, str):
             if len(value.encode()) > 2048:
                 mark_preview(path)

@@ -40,7 +40,7 @@
 
 已有准确引用、导航或 reader 时直接使用；需要发现正式资产时，用 `research_memory.stage_context.read` 的 `source=evidence_index` 在本次输入绑定的 Quest 范围内分页发现。当前该 reader 查询调用时的证据页，不能称作重放初始目录；使用返回的精确版本继续读取。读取目录由研究需要触发，不要求先取得固定首页才能开始构想。已有首页只作导航，来源总量、当前展示量与实际采用量分别理解；某页没列出、分页未完、授权范围内无记录、无权限与原件不可读各按实际返回说明，不能由一次未命中推断研究积累不存在。精确材料沿返回的版本与 reader 继续读取。
 
-这个目录只覆盖本 Quest 的证据记录分页，没有相关性或自由搜索参数；其他研究积累、文献及关系发现沿 RG 的实际入口使用，增强能力按接通状态说明。
+这个目录只覆盖本 Quest 的证据记录分页，没有相关性或自由搜索参数。其他研究积累按用途使用当前获授的 `research_graph.questions.page`、`research_graph.baselines.page`、`research_memory.literature.page` 及 Dataset／Environment 入口，沿返回的准确 reader 展开正文与关系；各入口的查询范围和分页以本次返回为准。
 
 本次结果的 `evidence_boundary.accepted_evidence_refs` 与 `NoViableCandidate.candidate_families_considered[].evidence_refs` 合计最多 100 个不同引用，沿既有结果与接纳合同处理；这个范围针对实际采用／已考虑路线所列引用，不是目录必须展示或 Agent 必须读满的数量。索引服务发现，科学依据回到相关原文。
 

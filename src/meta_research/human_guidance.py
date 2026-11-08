@@ -138,7 +138,8 @@ class FrozenGuidanceCut:
         }
 
 
-def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True, include_body: bool = False) -> str:
+def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True,
+                    include_body: bool = False, include_direction: bool = False) -> str:
     items = [{
         "delivery_ref": item.delivery_ref,
         "constraint_ref": decoded_object(item.guide_json)["constraint_ref"],
@@ -165,4 +166,13 @@ def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True, include_bo
         rendered += "\n本次授权内的冻结指导原文与既有处理如下。\n" + canonical_json(cut.as_dict())
     elif not resident:
         rendered += "\n冻结原文如下。工具通道未建立时，不记录收到、读取或反馈事实。\n" + canonical_json(cut.as_dict())
+    elif include_direction and cut.direction_cut is not None:
+        rendered += (
+            "\n以下当前有效 Goal 与持续条件完整来自本次操作的冻结指导；"
+            "保持各条件的来源与适用范围。其他工作详情与历史仍按需读取。\n"
+            "current_goal_and_conditions=" + canonical_json({
+                "goal": cut.direction_cut["goal"],
+                "conditions": cut.direction_cut["conditions"],
+            })
+        )
     return rendered

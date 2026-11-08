@@ -6,6 +6,7 @@ import re
 
 from meta_research.bundle_skill import BundleSkillRequest, CodexBundleSkillAdapter
 from meta_research.owners.common import canonical_hash, canonical_json
+from test_bundle_skill_adapter import _question_content
 from test_bundle_skill_adapter import (
     _FullConformanceAuthority, _SequenceRunner, _fake_codex,
     _inbox_checkpoint, _plan_document, _target_plan,
@@ -39,7 +40,7 @@ def test_bundle_initial_and_rejection_keep_methods_resident_and_references_reada
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1", "cycle_ref": "cycle:bundle-1",
         "cycle_position": {"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
-        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_question_binding": {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())},
         "accepted_formal_plan_binding": {"formal_plan_ref": "formal-plan:bundle-1", "plan_document": plan, "plan_document_hash": canonical_hash(plan), "answer_contract_hash": "a" * 64},
     }
     delegate = _SequenceRunner([{"target_plan": _target_plan(plan, canonical_hash(context))}] * 2)
@@ -47,13 +48,14 @@ def test_bundle_initial_and_rejection_keep_methods_resident_and_references_reada
 
     def runner(argv, prompt, timeout, environment=None):
         observed.append(_read_role(argv, prompt, "bundle_stage", "# Bundle：组织实际研究", ("references/contract.md", "references/owner-operations.md")))
-        assert canonical_json(plan) in prompt
+        assert (canonical_json(plan) in prompt) == (len(observed) == 1)
         return delegate(argv, prompt, timeout, environment)
 
     adapter = CodexBundleSkillAdapter(tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
     adapter.bind_full_conformance_authority(_FullConformanceAuthority())
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-1", run_ref="bundle-run:1", attempt_ref="bundle-attempt:1",
         fence_ref="bundle-fence:1", cycle_ref="cycle:bundle-1", question_ref="question:bundle-1",
         formal_plan_ref="formal-plan:bundle-1", context_pack_ref="context-pack:bundle-1",

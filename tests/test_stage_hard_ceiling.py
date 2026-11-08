@@ -1705,6 +1705,8 @@ def test_bundle_production_adapter_persists_primary_without_second_review_turn(
         run = runtime.owners.agent_runtime.query_bundle_stage_run(request.request_ref)
         assert run is not None
         skill_request = BundleSkillRequest(
+            accepted_question_content=runtime.owners.research_memory.read_question_content(
+                request.accepted_question.content_ref, request.accepted_question.content_hash),
             stage_request_ref=request.request_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
@@ -1782,6 +1784,8 @@ def test_bundle_rolling_invalid_result_is_terminal_without_replay(
         )
         assert request.accepted_formal_plan is not None and run is not None
         skill_request = BundleSkillRequest(
+            accepted_question_content=runtime.owners.research_memory.read_question_content(
+                request.accepted_question.content_ref, request.accepted_question.content_hash),
             stage_request_ref=request.request_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
@@ -1915,6 +1919,8 @@ def test_bundle_exhaustion_primary_assessment_reaches_owner_acceptance(
         )
         assert request.accepted_formal_plan is not None and run is not None
         skill_request = BundleSkillRequest(
+            accepted_question_content=runtime.owners.research_memory.read_question_content(
+                request.accepted_question.content_ref, request.accepted_question.content_hash),
             stage_request_ref=request.request_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,

@@ -41,6 +41,11 @@ from meta_research.semantic_mcp import McpConnection, ResidentMcpBinding
 
 
 def _request() -> ReasoningSkillRequest:
+    question = {
+        "title": "Compare explanations", "unknown_statement": "Which explanation holds?",
+        "answer_shape": "Bounded evidence", "applicability_scope": "Frozen observations",
+        "background_context": "", "requirements_constraints": "",
+    }
     context_pack: dict[str, object] = {
         "cycle_position": {"cycle_ref": "cycle:1", "round": 1, "cycle_focus": "Compare evidence and limitations", "focus_source": {"draft_hash": "a" * 64}},
         "schema_ref": "meta-research/reasoning-context-pack/v1",
@@ -49,6 +54,8 @@ def _request() -> ReasoningSkillRequest:
         "accepted_question_binding": {
             "question_ref": "question:1",
             "quest_ref": "quest:1",
+            "content_ref": "question-content:1",
+            "content_hash": canonical_hash(question),
         },
         "question_literature_input": {"kind": "revision"},
         "upstream_stage_closure": [
@@ -96,6 +103,7 @@ def _request() -> ReasoningSkillRequest:
         },
     }
     return ReasoningSkillRequest(
+        accepted_question_content=question,
         stage_request_ref="stage-request:reasoning:1",
         run_ref="reasoning-run:1",
         attempt_ref="reasoning-attempt:1",

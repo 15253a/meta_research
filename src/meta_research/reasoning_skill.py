@@ -206,6 +206,7 @@ class ReasoningSkillRequest:
     context_pack_ref: str
     context_pack_hash: str
     context_pack: dict[str, object]
+    accepted_question_content: dict[str, object]
     frozen_evidence_closure: tuple[dict[str, object], ...]
     root_session_ref: str
     runtime_binding: ReasoningRuntimeBinding
@@ -633,6 +634,8 @@ def _validate_request(request: ReasoningSkillRequest) -> None:
         or research_context.get("quest_ref") != request.quest_ref
     ):
         raise ReasoningContractError("reasoning_context_pack_binding_mismatch")
+    if canonical_hash(request.accepted_question_content) != binding.get("content_hash"):
+        raise ReasoningContractError("accepted_question_content_mismatch")
     if not isinstance(request.frozen_evidence_closure, tuple):
         raise ReasoningContractError("reasoning_evidence_closure_invalid")
     reused_leaves = plan_evidence_reuse_leaves(request.context_pack)
@@ -983,6 +986,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
             runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
             job_ref=request.job_ref, operation_name=operation_name, prompt=prompt,
+            include_direction=native_session_ref is None,
         )
         authority = self._full_conformance_authority
         base_url = self._resident_mcp_base_url
@@ -1232,6 +1236,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "human_request.open.reconcile，读取 resolution 后再判断"
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
+        scientific_input = (
+            f"accepted_question={canonical_json(request.accepted_question_content)}\n"
+            f"provider_context_view={stage_context_json('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}\n"
+            if request.native_session_ref is None else
+            "继续本原根已交付的准确科学输入；必要时按 context_pack_ref 沿准确 reader 补读。\n"
+        )
         prompt = (
             stage_position_prompt(request, "reasoning") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{_reasoning_skill_instructions(request)}\n\n"
@@ -1281,7 +1291,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"foreground_epoch={request.foreground_epoch}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
-            f"provider_context_view={stage_context_json('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}\n"
+            f"{scientific_input}"
             "Additional exact sources are available through the authenticated stage context reader. "
             "The literature preview is not a citation limit: use source=literature_records "
             "to page the exact frozen revision and cite any verified record in that revision; "
@@ -1683,6 +1693,7 @@ def _schema_template_request() -> ReasoningSkillRequest:
         context_pack_ref="__context_pack_ref__",
         context_pack_hash=canonical_hash(context_pack),
         context_pack=context_pack,
+        accepted_question_content={},
         frozen_evidence_closure=(),
         root_session_ref="__root_session_ref__",
         runtime_binding=ReasoningRuntimeBinding(

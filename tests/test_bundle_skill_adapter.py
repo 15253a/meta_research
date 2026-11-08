@@ -77,6 +77,17 @@ from meta_research.quest_drafting import (
 )
 
 
+def _question_content() -> dict[str, object]:
+    return {
+        "title": "结构冻结与结果复现",
+        "unknown_statement": "结构变化是否改变复现结果？",
+        "answer_shape": "比较结果并说明不确定性。",
+        "applicability_scope": "冻结输入与协议。",
+        "background_context": "",
+        "requirements_constraints": "",
+    }
+
+
 def _inbox_checkpoint(
     *, run_ref: str, attempt_ref: str, fence_ref: str
 ) -> dict[str, object]:
@@ -136,7 +147,7 @@ def _plan_document() -> dict[str, object]:
 
 def test_bundle_successor_request_carries_owner_rejection_feedback() -> None:
     plan = _plan_document()
-    question_binding = {"question_ref": "question:bundle-1"}
+    question_binding = {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())}
     formal_plan_binding = {
         "formal_plan_ref": "formal-plan:bundle-1",
         "plan_document": plan,
@@ -151,6 +162,7 @@ def test_bundle_successor_request_carries_owner_rejection_feedback() -> None:
         "accepted_formal_plan_binding": formal_plan_binding,
     }
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-1",
         run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:2",
@@ -717,7 +729,7 @@ def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-1",
         "cycle_position": {"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
-        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_question_binding": {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
             "plan_document": plan,
@@ -737,6 +749,7 @@ def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
     adapter.bind_full_conformance_authority(_FullConformanceAuthority())
     adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-1",
         run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:2",
@@ -776,7 +789,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     tmp_path: Path,
 ) -> None:
     plan = _plan_document()
-    question_binding = {"question_ref": "question:bundle-1"}
+    question_binding = {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())}
     formal_plan_binding = {
         "formal_plan_ref": "formal-plan:bundle-1",
         "plan_document": plan,
@@ -860,6 +873,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
         f"result={BUNDLE_PROVIDER_TRANSPORT_LIMITS.result_max_bytes}"
     ) in binding.resource_bindings
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-1",
         run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:1",
@@ -1159,7 +1173,7 @@ def test_production_adapter_fails_before_provider_without_resident_mcp(
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-1",
         "cycle_position": {"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
-        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_question_binding": {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
             "plan_document": plan,
@@ -1168,6 +1182,7 @@ def test_production_adapter_fails_before_provider_without_resident_mcp(
         },
     }
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-1",
         run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:1",
@@ -1245,7 +1260,7 @@ def test_production_exhaustion_acceptance_does_not_require_child_trace(
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-exhaustion",
         "cycle_position": {"cycle_ref": "cycle:bundle-exhaustion", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
-        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_question_binding": {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
             "plan_document": plan,
@@ -1333,6 +1348,7 @@ def test_production_exhaustion_acceptance_does_not_require_child_trace(
     adapter = configured_adapter(runner, "exhaustion-provider")
     binding = adapter.runtime_binding()
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-exhaustion",
         run_ref="bundle-run:exhaustion",
         attempt_ref="bundle-attempt:exhaustion",
@@ -1486,7 +1502,7 @@ def test_invalid_provider_transport_is_terminal_and_never_replayed(
         "schema_ref": "meta-research/bundle-context-pack/v1",
         "cycle_ref": "cycle:bundle-transport",
         "cycle_position": {"cycle_ref": "cycle:bundle-transport", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
-        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_question_binding": {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())},
         "accepted_formal_plan_binding": {
             "formal_plan_ref": "formal-plan:bundle-1",
             "plan_document": plan,
@@ -1519,6 +1535,7 @@ def test_invalid_provider_transport_is_terminal_and_never_replayed(
     adapter.bind_full_conformance_authority(_FullConformanceAuthority())
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-transport",
         run_ref="bundle-run:transport",
         attempt_ref="bundle-attempt:transport",
@@ -1574,7 +1591,7 @@ def test_bundle_adapter_transports_a_legal_target_plan_larger_than_one_mib(
     tmp_path: Path,
 ) -> None:
     plan = _plan_document()
-    question_binding = {"question_ref": "question:bundle-1"}
+    question_binding = {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())}
     formal_plan_binding = {
         "formal_plan_ref": "formal-plan:bundle-1",
         "plan_document": plan,
@@ -1606,6 +1623,7 @@ def test_bundle_adapter_transports_a_legal_target_plan_larger_than_one_mib(
     adapter.bind_full_conformance_authority(_FullConformanceAuthority())
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:bundle-large",
         run_ref="bundle-run:large",
         attempt_ref="bundle-attempt:large",

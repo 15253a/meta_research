@@ -20,12 +20,14 @@ Bundle 因 Brief 为空而跳过时，完整 Plan 仍是本轮输入；跳过可
 
 同根研究过程：认真分析本 Cycle，经 RG 放回整体路线作抽象综合，判断关键处并选择下一步。过程以[主 Skill](../SKILL.md)为准，现有输入、科学综合与 notes 承载所需材料和判断；不新增阶段、全局快照或输出字段。每轮承担全局审视，准确读取按需展开并允许回看。
 
-首轮资料取舍：完整 Plan／Bundle 交接及各项 Target 的关键结果与限制直接给出，其余准确原文按需读取。实际能力与仍待接通的入口列在 Owner 操作中。首轮按科学用途直接组织：
+首轮资料取舍：完整 Plan／Bundle 交接及各项 Target 的关键结果与限制直接给出，其余准确原文按需读取。需要补读或执行 Owner 操作时，按[Owner 操作](owner-operations.md)选择当前获授入口。首轮按科学用途直接组织：
 
 - 本次 Cycle／阶段／重心与来源、请求绑定，完整 Question、当前有效 Goal 与持续条件，以及适用的人类指导。保留本逻辑操作的冻结工作切面；后到指导与当前 Goal 的差异据实说明。
 - 当前已接纳的完整 FormalPlan 科学正文、完整采用来源集合，及已接纳 BundleReport、各 Target 真实结果和完整 Bundle 策略交接 notes。阶段合法跳过时显示原因和精确依据，Bundle 无 Brief 跳过仍完整保留 Plan 的实际 gap 及不安排理由；缺失应有材料时显示实际阻塞。未产生的 Plan、Bundle 或 Target 不以旧轮对象填补。
 - 本轮每项实际工作的用途、真实执行／评价状态、关键具名结果、单位与比较对象（适用时）、缺测或失败原因、影响解释的限制，以及准确 TargetCommit／结果／说明入口。含无评价工作与负结果；长说明分段保留完整可读入口，不能把任何一项工作或决定性限制裁成不可见。它们是既有结果与研究说明的阅读呈现，不新增结果卡存储或统一指标清单。
 - 真实前驱必要交接、当前 Question 已有认识及相关历史的准确入口与分页范围。首批历史说明其范围，不能冒充全部历史；原 IdeaSet 及更早材料按当前判断需要展开。
+
+Question 正文沿本请求冻结的 `AcceptedQuestionBinding.content_ref`／`content_hash` 取得，六字段原样交付，允许为空的两项补充仍保留为空字符串；`research_memory.stage_context.read` 的 `source=question` 返回同一准确内容。有效 Goal、完成标准与持续条件沿本次冻结的 Goal revision 完整交付，不受普通辅助 context 的字节、深度或列表预览限制。较长历史和辅助材料仍按需展开；原根续接、拒绝修订与恢复沿原冻结请求及必要增量继续，不以重复全文或查询 latest 替换原依据。
 
 审视其他路线时，通过获授 RG Question 发现入口找到同 Quest 的相关或暂放问题、准确正文及历史，再按需要展开关系和依据。工具可发现的材料不表示已经读取或采用；不把所有问题和历史全文追加为首轮必给内容。
 
@@ -58,7 +60,7 @@ candidate_completion: CandidateCompletion | null
 
 每个冻结父 Question 的 `impact` 与 `statement` 仍由 Agent 独立判断，保持 `question_ref` 将判断明确关联到其对象，系统再按冻结父链顺序整理。这个引用承载判断对象的语义，不能从无对象的正文推定。系统携带当前 Question 的已知历史 outcome 身份，认识变化由 `progress` 表达。错误来源、错版本和冲突身份会指出具体对象并拒绝，沿反馈修订真实声明。
 
-历史操作及其原契约仅作只读证据。新版从头创建任务，执行与恢复沿新版自身的冻结输入和真实操作记录；历史 `research_context/v2` 的兼容执行不属于本设计。
+当前执行与恢复使用 `meta-research/reasoning-research-context/v3` 冻结输入和本次真实操作记录。历史操作及其原契约仅作只读证据，恢复沿原 request／operation 对账，保持当时的来源与版本。
 
 `support_scope`、`limitations`、`causal_interpretation` 和四尺度 `research_synthesis` 表达认识和继续／改变／等待理由，允许认识未变。AE 冻结 graph revision、活动问题、父链、当前 Question 历史页、Goal revision、上游 Commit 和 Target 来源；有界历史页含总量与继续入口，不代表完整历史。正文按当前冻结版本核验，恢复不切换 latest。
 

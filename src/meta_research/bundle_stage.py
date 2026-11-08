@@ -2766,6 +2766,11 @@ class BundleStageWorker:
             owner_rejection_kind,
             owner_feedback,
         ) = self._owner_rejection_context(request, run)
+        accepted_question_content = self._research_memory.read_question_content(
+            request.accepted_question.content_ref, request.accepted_question.content_hash
+        )
+        if canonical_hash(accepted_question_content) != request.accepted_question.content_hash:
+            raise OwnerConflict("accepted_question_content_mismatch")
         skill_request = BundleSkillRequest(
             native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
                 run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),
@@ -2779,6 +2784,7 @@ class BundleStageWorker:
             context_pack_ref=request.context_pack_ref,
             context_pack_hash=request.context_pack_hash,
             context_pack=request.context_pack,
+            accepted_question_content=accepted_question_content,
             plan_document=accepted_formal_plan.plan_document,
             root_session_ref=run.root_session_ref,
             runtime_binding=run.runtime_binding,

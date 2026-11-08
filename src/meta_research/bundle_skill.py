@@ -241,6 +241,7 @@ class BundleSkillRequest:
     context_pack_ref: str
     context_pack_hash: str
     context_pack: dict[str, object]
+    accepted_question_content: dict[str, object]
     plan_document: dict[str, object]
     root_session_ref: str
     runtime_binding: BundleRuntimeBinding
@@ -772,6 +773,8 @@ def _validate_request(request: BundleSkillRequest) -> None:
     formal_plan = request.context_pack.get("accepted_formal_plan_binding")
     if not isinstance(question, dict) or not isinstance(formal_plan, dict):
         raise BundleSkillContractError("bundle_context_pack_invalid")
+    if canonical_hash(request.accepted_question_content) != question.get("content_hash"):
+        raise BundleSkillContractError("accepted_question_content_mismatch")
     plan = validate_bundle_context_pack(
         request.context_pack,
         cycle_ref=request.cycle_ref,
@@ -1071,6 +1074,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             fence_ref=fence_ref, runtime_binding_hash=canonical_hash(runtime_binding.as_dict()),
             job_ref=job_ref, operation_name=operation_name, prompt=prompt,
             include_body=inline_guidance,
+            include_direction=native_session_ref is None,
         )
         authority = self._full_conformance_authority
         base_url = self._resident_mcp_base_url
@@ -1354,6 +1358,15 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "human_request.open.reconcile，读取 resolution 后再判断"
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
+        scientific_input = (
+            f"accepted_question={canonical_json(request.accepted_question_content)}\n"
+            + STAGE_CONTEXT_DELIVERY_GUIDANCE
+            + f"provider_context_view={stage_context_json('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
+            if request.native_session_ref is None
+            else "继续本原根已收到的准确 Question、FormalPlan 与采用来源；本回合只追加当前反馈。"
+            "需要恢复正文时，用 research_memory.stage_context.read 和本请求的 context_pack_ref，"
+            "以 source=question 或 source=context_pack 读取原冻结材料，不能以 latest 替换。\n"
+        )
         prompt = (
             stage_position_prompt(request, "bundle") + stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
@@ -1362,7 +1375,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "本回合按角色方法及 references/contract.md 的正式输出合同形成完整候选，"
             f"{_bundle_output_assembly_prompt()}"
             "完成独立子智能体审阅并由根自主修订后，返回 target_plan 或 exhaustion_assessment。"
-            "保持下列准确 FormalPlan、完整采用来源与当前反馈；核验未知效果后再决定是否可提交。\n"
+            "保持本请求绑定的准确 FormalPlan、完整采用来源与当前反馈；核验未知效果后再决定是否可提交。\n"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"cycle_ref={request.cycle_ref}\n"
@@ -1375,8 +1388,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{canonical_hash(list(request.predecessor_rejections))}\n"
             "predecessor_rejections="
             f"{canonical_json(list(request.predecessor_rejections))}\n"
-            + STAGE_CONTEXT_DELIVERY_GUIDANCE +
-            f"provider_context_view={stage_context_json('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
+            + scientific_input
         )
         output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
@@ -1976,6 +1988,7 @@ def _schema_template_request() -> BundleSkillRequest:
         context_pack_ref="__context__",
         context_pack_hash="0" * 64,
         context_pack=context,
+        accepted_question_content={},
         plan_document=plan,
         root_session_ref="__root_session__",
         runtime_binding=BundleRuntimeBinding(

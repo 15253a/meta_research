@@ -13,6 +13,7 @@ from meta_research.runtime_binding_compatibility import bundle_bindings_compatib
 from meta_research.runtime_conditions import split_runtime_prompt
 from test_binding_compatibility import request as dispatch_request
 from test_bundle_runtime_conditions_compatibility import _SignedDispatchRunner
+from test_bundle_skill_adapter import _question_content
 from test_bundle_skill_adapter import _FullConformanceAuthority, _fake_codex, _inbox_checkpoint, _plan_document, _target_plan
 from test_bundle_frozen_input_recovery_compatibility import FIXTURES, _binding
 from test_public_guidance_delivery import _developer
@@ -78,7 +79,7 @@ def test_completed_signed_operation_replays_without_rewriting_frozen_inputs(seal
     position = {"cycle_ref": "cycle:current", "round": 1, "cycle_focus": "New authorized work", "focus_source": {"request_ref": "fixture-current"}}
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1", "cycle_ref": "cycle:current", "cycle_position": position,
-        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_question_binding": {"question_ref": "question:bundle-1", "content_hash": canonical_hash(_question_content())},
         "accepted_formal_plan_binding": {"formal_plan_ref": "formal-plan:bundle-1", "plan_document": plan,
             "plan_document_hash": canonical_hash(plan), "answer_contract_hash": "a" * 64},
     }
@@ -100,6 +101,7 @@ def test_completed_signed_operation_replays_without_rewriting_frozen_inputs(seal
     new_provider.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     new_binding = new_provider.runtime_binding()
     new_request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
         stage_request_ref="stage-request:current", cycle_ref="cycle:current", run_ref="bundle-run:current",
         attempt_ref="bundle-attempt:current", fence_ref="bundle-fence:current", root_session_ref="ar-session:current",
         question_ref="question:bundle-1", formal_plan_ref="formal-plan:bundle-1",

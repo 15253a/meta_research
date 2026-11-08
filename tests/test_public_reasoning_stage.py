@@ -902,6 +902,11 @@ def test_reasoning_affirmed_next_cycle_keeps_owner_acceptance_layers_distinct(
 
         assert len(reasoning_skill.requests) == 1
         provider_request = reasoning_skill.requests[0]
+        assert provider_request.accepted_question_content == (
+            runtime.owners.research_memory.read_question_content(
+                request.accepted_question.content_ref, request.accepted_question.content_hash
+            )
+        )
         assert provider_request.stage_request_ref == request.request_ref
         assert provider_request.run_ref == run["run_ref"]
         assert provider_request.attempt_ref == run["attempt_ref"]
