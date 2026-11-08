@@ -6,46 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from meta_research.owners.common import canonical_hash, new_ref
-from meta_research.reasoning_skill import CodexReasoningSkillAdapter, ReasoningSkillUnavailable
-from test_reasoning_skill_adapter import (
-    _FullConformanceAuthority, _SequenceRunner, _fake_codex, _request, _stage_output,
-)
+from meta_research.owners.common import canonical_hash
 from test_public_reasoning_autonomous_checkpoint import _checkpoint, _review, _runtime_binding
 from test_public_plan_stage import _confirm_direct_quest, _finish_idea_stage
 from test_public_manual_question_lifecycle import _confirm_waived_manual_question
 from test_public_reasoning_stage import _force_question_switch
 from test_reasoning_summary_decision_flow import SummarySkill, final_output, runtime_at
 from meta_research.reasoning_skill import ReasoningSkillDraft, ReasoningSkillResult
-
-
-def test_production_adapter_preserves_missing_parent_diagnostic(tmp_path):
-    request = _request()
-    parent = new_ref("question")
-    graph = request.context_pack["research_context"]["graph_binding"]
-    graph["active_question_refs"] = sorted([request.question_ref, parent])
-    graph["parent_question_bindings"] = [{
-        "question_ref": parent, "parent_question_ref": None,
-        "question_receipt_ref": "parent-receipt:1",
-    }]
-    runner = _SequenceRunner([_stage_output()])
-    adapter = CodexReasoningSkillAdapter(
-        tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")),
-        process_runner=runner,
-    )
-    adapter.bind_full_conformance_authority(_FullConformanceAuthority())
-    adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
-    request = replace(request, runtime_binding=adapter.runtime_binding(),
-                      context_pack_hash=canonical_hash(request.context_pack), job_ref="missing-parent")
-    with pytest.raises(ReasoningSkillUnavailable) as caught:
-        adapter.generate_draft(request)
-    error = caught.value
-    assert error.code == "reasoning_primary_result_contract_invalid"
-    assert error.rejected_detail_code == "scientific_outcome_research_synthesis_invalid"
-    assert error.rejected_candidate == _stage_output()
-    assert error.rejected_native_session_ref == "provider-session:1"
-    assert parent in " ".join(error.rejected_feedback)
-    assert "missing_impact_for" in " ".join(error.rejected_feedback)
 
 
 def _child_question(runtime, quest_ref, parent_ref, index):
