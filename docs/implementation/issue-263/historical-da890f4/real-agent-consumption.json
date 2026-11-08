@@ -1,0 +1,1106 @@
+{
+  "summary": {
+    "status": "passed",
+    "scenario": "both",
+    "source_head": "da890f44336783c71c19070ca1f799f47c4a5bd8",
+    "source_head_basis": "caller-verified archive",
+    "source_manifest_files": 940,
+    "source": "/tmp/issue263-agent-1Cwk5Riz/source",
+    "model": "gpt-6.1-sol",
+    "boundary": "Fixture-created accepted initial state and deterministic platform lease; real model/CLI, live role grant, real gateway and Owners. Not deployed-service or full-stage acceptance.",
+    "scope": {
+      "run_ref": "idea_run_8ee7df6dfac44279a155478a5f3a6f86",
+      "attempt_ref": "idea_attempt_57aae4a4ca1044f68c3face653345176",
+      "root_session_ref": "idea_session_8419a24a832c4d07aa22cb14b5f34b23",
+      "fence_ref": "idea_fence_ae78db715855410bb67edfabc48937fa",
+      "capability_binding_hash": "8ffe5a4d077aef23868ceceaa954b0356aed1c807c1e819e6134630a8693e944",
+      "root_kind": "idea",
+      "phase": "primary"
+    },
+    "granted_operation_ids": [
+      "assistant.content.generate",
+      "human_guidance.read",
+      "human_guidance.read.reconcile",
+      "human_guidance.feedback",
+      "human_guidance.feedback.reconcile",
+      "research_graph.quest_goal.read",
+      "research_graph.quest_goal.evolve",
+      "research_graph.quest_goal.evolve.reconcile",
+      "research_memory.research_notes.read",
+      "research_memory.stage_context.read",
+      "tools.catalog.page",
+      "tools.contracts.read",
+      "research_workspace.materials.discover",
+      "research_workspace.materials.read",
+      "research_workspace.materials.copy",
+      "research_workspace.materials.copy.reconcile",
+      "research_workspace.materials.feedback",
+      "research_workspace.materials.feedback.reconcile",
+      "research_workspace.materials.acquire",
+      "research_workspace.materials.acquire.reconcile",
+      "research_memory.assets.page",
+      "research_memory.assets.lifecycle",
+      "research_memory.assets.current",
+      "research_memory.assets.intake",
+      "research_memory.assets.intake.reconcile",
+      "research_memory.assets.retire",
+      "research_memory.assets.retire.reconcile",
+      "research_graph.questions.page",
+      "research_memory.literature.page",
+      "research_memory.content.read",
+      "research_memory.creation_basis.read",
+      "human_request.read",
+      "research_graph.baselines.page",
+      "research_graph.baselines.read",
+      "research_graph.target_formal_results.read",
+      "research_graph.formal_results.read",
+      "research_graph.question_history.read",
+      "research_graph.question_relations.read",
+      "research_graph.artifact_roles.adjust",
+      "research_graph.artifact_roles.adjust.reconcile",
+      "research_graph.datasets.page",
+      "research_graph.datasets.read",
+      "research_graph.datasets.register",
+      "research_graph.datasets.register.reconcile",
+      "research_graph.datasets.register_version",
+      "research_graph.datasets.register_version.reconcile",
+      "research_graph.datasets.reference",
+      "research_graph.datasets.reference.reconcile",
+      "research_graph.datasets.derive",
+      "research_graph.datasets.derive.reconcile",
+      "research_graph.environments.page",
+      "research_graph.environments.read",
+      "research_graph.environments.register",
+      "research_graph.environments.register.reconcile",
+      "research_graph.environments.reference",
+      "research_graph.environments.reference.reconcile",
+      "research_memory.literature.register",
+      "research_memory.literature.register.reconcile",
+      "research_memory.literature.reference",
+      "research_memory.literature.reference.reconcile",
+      "research_memory.literature.read",
+      "agent_runtime.acquisition.request",
+      "agent_runtime.acquisition.request.reconcile",
+      "human_request.open",
+      "human_request.open.reconcile"
+    ],
+    "reader_native_session_ref": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+    "reader": {
+      "status": "passed",
+      "rejection_sequence": 3,
+      "corrected_sequences": [
+        5
+      ],
+      "exact_version_ref": "memory_content_348dc4889fa044edb3bf53253adf4a95",
+      "same_scope": true
+    },
+    "effect_native_session_ref": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+    "effect": {
+      "status": "passed",
+      "write_calls": 1,
+      "owner_handler_calls": 1,
+      "effect_id": "issue263-original-effect",
+      "accepted_result": {
+        "asset_bindings": [],
+        "fulltext_status": "missing",
+        "metadata": {},
+        "quest_ref": "quest_c2e55dae759149be9e4ed15ba4fb5640",
+        "record_ref": "doi:10.1000/issue263-acceptance",
+        "source": "Controlled acceptance fixture; metadata only",
+        "title": "Isolated diagnostic evidence",
+        "ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+        "kind": "register",
+        "payload_hash": "1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06",
+        "receipt": {
+          "status": "accepted",
+          "issuer": "research_graph",
+          "kind": "literature_register_acceptance",
+          "receipt_ref": "rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2",
+          "subject_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+          "payload_hash": "21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c"
+        },
+        "accepted_at": 1794159241.9023948
+      },
+      "reconcile_sequences": [
+        10
+      ],
+      "continued_read_sequences": [
+        12
+      ]
+    },
+    "native_session_ref": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+    "http_calls": 13,
+    "actual_adapter_parity": {
+      "verified_tool_calls": 7,
+      "error_tool_calls": 2,
+      "text_matches_structured_and_http_response": true
+    }
+  },
+  "prompts": {
+    "reader": "You are the admitted Idea researcher in an isolated acceptance task. Use only the granted meta_research MCP tools for this task. Do not use shell/files/network/subagents or inspect service internals. First try the inherited research_memory.content.read pointer exactly as supplied: {\"source_ref\": \"question_968b391883ce416b933f8a93fc603d18\", \"version_ref\": \"inherited-stale-version\"}. Obtain the complete current accepted question and briefly summarize its research goal. If that pointer is rejected, use the returned explanation and legitimate current tools to correct your own reader submission, then continue in this session. Do not change research facts, authorization, source code or validation rules. The successful follow-up must read actual content, not merely describe what you would do.",
+    "effect": "Continue this same Idea session. Use only granted meta_research MCP tools, no shell/files/network/subagents. Register this metadata once using research_memory.literature.register: {\"effect_id\": \"issue263-original-effect\", \"record_ref\": \"doi:10.1000/issue263-acceptance\", \"title\": \"Isolated diagnostic evidence\", \"source\": \"Controlled acceptance fixture; metadata only\", \"fulltext_status\": \"missing\"}. Report the actual registered literature ref and retained fulltext status. Use tool feedback to establish the actual result; preserve the original identity and valid existing work. Do not invent full text, change the scientific metadata or bypass validation. After the result is established, read the accepted record to confirm it remains usable."
+  },
+  "actual_http_tool_calls": [
+    {
+      "at_monotonic": 11182078.823292704,
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "_meta": {
+            "callId": "exec-306c6eac-b08f-44a7-8e41-67703dcbc263",
+            "x-codex-turn-metadata": {
+              "session_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "reasoning_effort": "ultra",
+              "turn_id": "01a1bc38-cccd-7273-beb2-35aed9349213",
+              "model": "gpt-6.1-sol",
+              "thread_source": "user",
+              "turn_trigger": "exec",
+              "sandbox": "none",
+              "sandbox_mode": "danger-full-access",
+              "auto_review_enabled": false,
+              "node_repl_auto_review_required": true,
+              "node_repl_disabled": false,
+              "turn_started_at_unix_ms": 1794159201487,
+              "codex_version": "0.159.0"
+            },
+            "threadId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "sessionId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "windowId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2:0",
+            "itemId": "ctc_0e554f8dba75e633016af0b26d20d087d08bb1659dc08ee2f5",
+            "progressToken": 1
+          },
+          "name": "research_memory.content.read",
+          "arguments": {
+            "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+            "version_ref": "inherited-stale-version"
+          }
+        }
+      },
+      "http_status": 200,
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"code\":\"content_version_unbound\",\"details\":{\"message\":\"This source_ref/version_ref pair is not bound in the authorized scope; other content may exist. Reopen the source's directory entry (research_graph.questions.page, research_memory.literature.page or research_memory.assets.page as applicable) and copy its exact returned reader arguments, retaining source_quest_ref when provided. Do not replace an accepted version with latest content.\"}}"
+            }
+          ],
+          "structuredContent": {
+            "code": "content_version_unbound",
+            "details": {
+              "message": "This source_ref/version_ref pair is not bound in the authorized scope; other content may exist. Reopen the source's directory entry (research_graph.questions.page, research_memory.literature.page or research_memory.assets.page as applicable) and copy its exact returned reader arguments, retaining source_quest_ref when provided. Do not replace an accepted version with latest content."
+            }
+          },
+          "isError": true
+        }
+      },
+      "sequence": 3
+    },
+    {
+      "at_monotonic": 11182083.956819268,
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+          "_meta": {
+            "callId": "exec-0ec13252-20a6-483b-a76b-7e48d3ba7f46",
+            "x-codex-turn-metadata": {
+              "session_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "reasoning_effort": "ultra",
+              "turn_id": "01a1bc38-cccd-7273-beb2-35aed9349213",
+              "model": "gpt-6.1-sol",
+              "thread_source": "user",
+              "turn_trigger": "exec",
+              "sandbox": "none",
+              "sandbox_mode": "danger-full-access",
+              "auto_review_enabled": false,
+              "node_repl_auto_review_required": true,
+              "node_repl_disabled": false,
+              "turn_started_at_unix_ms": 1794159201487,
+              "codex_version": "0.159.0"
+            },
+            "threadId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "sessionId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "windowId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2:0",
+            "itemId": "ctc_0e554f8dba75e633016af0b2729ae887d097b87e70c329ae2e",
+            "progressToken": 2
+          },
+          "name": "research_graph.questions.page",
+          "arguments": {
+            "entry_kind": "questions",
+            "limit": 20,
+            "offset": 0
+          }
+        }
+      },
+      "http_status": 200,
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"items\":[{\"question_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"name\":\"低照度显微图像中的稀有形态保真\",\"summary\":\"尚不明确哪种自监督去噪条件能保留稀有形态。\",\"status\":\"active\",\"reader\":{\"source_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"version_ref\":\"memory_content_348dc4889fa044edb3bf53253adf4a95\"},\"history_reader\":{\"operation\":\"research_graph.question_history.read\",\"question_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"offset\":0,\"limit\":12}}],\"offset\":0,\"next_offset\":null,\"query_revision\":\"323708e213774551b9336afd76e187e6fc0d6799a6857d86d3ced0942b878e80\",\"result_state\":\"matches\",\"scan_complete\":true}"
+            }
+          ],
+          "structuredContent": {
+            "items": [
+              {
+                "question_ref": "question_968b391883ce416b933f8a93fc603d18",
+                "name": "低照度显微图像中的稀有形态保真",
+                "summary": "尚不明确哪种自监督去噪条件能保留稀有形态。",
+                "status": "active",
+                "reader": {
+                  "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+                  "version_ref": "memory_content_348dc4889fa044edb3bf53253adf4a95"
+                },
+                "history_reader": {
+                  "operation": "research_graph.question_history.read",
+                  "question_ref": "question_968b391883ce416b933f8a93fc603d18",
+                  "offset": 0,
+                  "limit": 12
+                }
+              }
+            ],
+            "offset": 0,
+            "next_offset": null,
+            "query_revision": "323708e213774551b9336afd76e187e6fc0d6799a6857d86d3ced0942b878e80",
+            "result_state": "matches",
+            "scan_complete": true
+          },
+          "isError": false
+        }
+      },
+      "sequence": 4
+    },
+    {
+      "at_monotonic": 11182086.491304727,
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+          "_meta": {
+            "callId": "exec-b435a5da-9763-49dc-9fc7-f1dab83e8cd7",
+            "x-codex-turn-metadata": {
+              "session_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "reasoning_effort": "ultra",
+              "turn_id": "01a1bc38-cccd-7273-beb2-35aed9349213",
+              "model": "gpt-6.1-sol",
+              "thread_source": "user",
+              "turn_trigger": "exec",
+              "sandbox": "none",
+              "sandbox_mode": "danger-full-access",
+              "auto_review_enabled": false,
+              "node_repl_auto_review_required": true,
+              "node_repl_disabled": false,
+              "turn_started_at_unix_ms": 1794159201487,
+              "codex_version": "0.159.0"
+            },
+            "threadId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "sessionId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "windowId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2:0",
+            "itemId": "ctc_0e554f8dba75e633016af0b27485a487d083d592b47434ee80",
+            "progressToken": 3
+          },
+          "name": "research_memory.content.read",
+          "arguments": {
+            "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+            "version_ref": "memory_content_348dc4889fa044edb3bf53253adf4a95"
+          }
+        }
+      },
+      "http_status": 200,
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"text\":\"{\\\"answer_shape\\\":\\\"形成带反例和证据边界的比较结论。\\\",\\\"applicability_scope\\\":\\\"低照度荧光显微公开数据。\\\",\\\"background_context\\\":\\\"研究稀有细胞形态。\\\",\\\"requirements_constraints\\\":\\\"两周内，使用获准 GPU。\\\",\\\"title\\\":\\\"低照度显微图像中的稀有形态保真\\\",\\\"unknown_statement\\\":\\\"尚不明确哪种自监督去噪条件能保留稀有形态。\\\"}\",\"encoding\":\"canonical-json-utf8-bytes\",\"content_hash\":\"dc7eea1fea68e2af63da61f6b1a7ecf1cadc0fe43c19b2ae9d880fc6863dd989\",\"path\":[],\"offset\":0,\"offset_unit\":\"utf8_bytes\",\"returned_bytes\":382,\"total_bytes\":382,\"next_offset\":null,\"complete\":true,\"source_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"version_ref\":\"memory_content_348dc4889fa044edb3bf53253adf4a95\"}"
+            }
+          ],
+          "structuredContent": {
+            "text": "{\"answer_shape\":\"形成带反例和证据边界的比较结论。\",\"applicability_scope\":\"低照度荧光显微公开数据。\",\"background_context\":\"研究稀有细胞形态。\",\"requirements_constraints\":\"两周内，使用获准 GPU。\",\"title\":\"低照度显微图像中的稀有形态保真\",\"unknown_statement\":\"尚不明确哪种自监督去噪条件能保留稀有形态。\"}",
+            "encoding": "canonical-json-utf8-bytes",
+            "content_hash": "dc7eea1fea68e2af63da61f6b1a7ecf1cadc0fe43c19b2ae9d880fc6863dd989",
+            "path": [],
+            "offset": 0,
+            "offset_unit": "utf8_bytes",
+            "returned_bytes": 382,
+            "total_bytes": 382,
+            "next_offset": null,
+            "complete": true,
+            "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+            "version_ref": "memory_content_348dc4889fa044edb3bf53253adf4a95"
+          },
+          "isError": false
+        }
+      },
+      "sequence": 5
+    },
+    {
+      "at_monotonic": 11182106.624507587,
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "_meta": {
+            "callId": "exec-7d7a05a8-8dca-4b37-9085-078b17471726",
+            "x-codex-turn-metadata": {
+              "session_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "reasoning_effort": "ultra",
+              "turn_id": "01a1bc39-47b7-7173-92fb-d4012c847036",
+              "model": "gpt-6.1-sol",
+              "thread_source": "user",
+              "turn_trigger": "exec",
+              "sandbox": "none",
+              "sandbox_mode": "danger-full-access",
+              "auto_review_enabled": false,
+              "node_repl_auto_review_required": true,
+              "node_repl_disabled": false,
+              "turn_started_at_unix_ms": 1794159232955,
+              "codex_version": "0.159.0"
+            },
+            "threadId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "sessionId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "windowId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2:0",
+            "itemId": "ctc_0a8547e83c80bba0016af0b288980887d0a797dff157fdf545",
+            "progressToken": 1
+          },
+          "name": "research_memory.literature.register",
+          "arguments": {
+            "effect_id": "issue263-original-effect",
+            "record_ref": "doi:10.1000/issue263-acceptance",
+            "title": "Isolated diagnostic evidence",
+            "source": "Controlled acceptance fixture; metadata only",
+            "fulltext_status": "missing"
+          }
+        }
+      },
+      "http_status": 200,
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"code\":\"semantic_output_schema_mismatch\",\"details\":{\"operation_id\":\"research_memory.literature.register\",\"category\":\"tool_contract\",\"execution_stage\":\"output_validation\",\"message\":\"The handler returned a result outside its registered output contract.\",\"correction\":\"Reconcile the original operation with its unchanged original submission and effect identity first. Preserve accepted work; do not change the submission under the same identity or create a replacement effect while its result is unknown.\",\"effect_status\":\"unknown\",\"reconciliation_operation_id\":\"research_memory.literature.register.reconcile\",\"effect_id\":\"issue263-original-effect\",\"path\":[],\"requirement\":\"type\",\"expected\":\"object\"}}"
+            }
+          ],
+          "structuredContent": {
+            "code": "semantic_output_schema_mismatch",
+            "details": {
+              "operation_id": "research_memory.literature.register",
+              "category": "tool_contract",
+              "execution_stage": "output_validation",
+              "message": "The handler returned a result outside its registered output contract.",
+              "correction": "Reconcile the original operation with its unchanged original submission and effect identity first. Preserve accepted work; do not change the submission under the same identity or create a replacement effect while its result is unknown.",
+              "effect_status": "unknown",
+              "reconciliation_operation_id": "research_memory.literature.register.reconcile",
+              "effect_id": "issue263-original-effect",
+              "path": [],
+              "requirement": "type",
+              "expected": "object"
+            }
+          },
+          "isError": true
+        }
+      },
+      "sequence": 9
+    },
+    {
+      "at_monotonic": 11182111.716669252,
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+          "_meta": {
+            "callId": "exec-251aae95-e619-4c63-8c9a-2a9e8e90e2c7",
+            "x-codex-turn-metadata": {
+              "session_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "reasoning_effort": "ultra",
+              "turn_id": "01a1bc39-47b7-7173-92fb-d4012c847036",
+              "model": "gpt-6.1-sol",
+              "thread_source": "user",
+              "turn_trigger": "exec",
+              "sandbox": "none",
+              "sandbox_mode": "danger-full-access",
+              "auto_review_enabled": false,
+              "node_repl_auto_review_required": true,
+              "node_repl_disabled": false,
+              "turn_started_at_unix_ms": 1794159232955,
+              "codex_version": "0.159.0"
+            },
+            "threadId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "sessionId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "windowId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2:0",
+            "itemId": "ctc_0a8547e83c80bba0016af0b28e660c87d0ba68ea97a28b6dd6",
+            "progressToken": 2
+          },
+          "name": "research_memory.literature.register.reconcile",
+          "arguments": {
+            "effect_id": "issue263-original-effect"
+          }
+        }
+      },
+      "http_status": 200,
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"status\":\"accepted\",\"result\":{\"asset_bindings\":[],\"fulltext_status\":\"missing\",\"metadata\":{},\"quest_ref\":\"quest_c2e55dae759149be9e4ed15ba4fb5640\",\"record_ref\":\"doi:10.1000/issue263-acceptance\",\"source\":\"Controlled acceptance fixture; metadata only\",\"title\":\"Isolated diagnostic evidence\",\"ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"kind\":\"register\",\"payload_hash\":\"1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06\",\"receipt\":{\"status\":\"accepted\",\"issuer\":\"research_graph\",\"kind\":\"literature_register_acceptance\",\"receipt_ref\":\"rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2\",\"subject_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"payload_hash\":\"21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c\"},\"accepted_at\":1794159241.9023948}}"
+            }
+          ],
+          "structuredContent": {
+            "status": "accepted",
+            "result": {
+              "asset_bindings": [],
+              "fulltext_status": "missing",
+              "metadata": {},
+              "quest_ref": "quest_c2e55dae759149be9e4ed15ba4fb5640",
+              "record_ref": "doi:10.1000/issue263-acceptance",
+              "source": "Controlled acceptance fixture; metadata only",
+              "title": "Isolated diagnostic evidence",
+              "ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+              "kind": "register",
+              "payload_hash": "1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06",
+              "receipt": {
+                "status": "accepted",
+                "issuer": "research_graph",
+                "kind": "literature_register_acceptance",
+                "receipt_ref": "rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2",
+                "subject_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                "payload_hash": "21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c"
+              },
+              "accepted_at": 1794159241.9023948
+            }
+          },
+          "isError": false
+        }
+      },
+      "sequence": 10
+    },
+    {
+      "at_monotonic": 11182117.32920198,
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+          "_meta": {
+            "callId": "exec-e42801af-3f8c-46a7-9ddf-6c785d04c222",
+            "x-codex-turn-metadata": {
+              "session_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "reasoning_effort": "ultra",
+              "turn_id": "01a1bc39-47b7-7173-92fb-d4012c847036",
+              "model": "gpt-6.1-sol",
+              "thread_source": "user",
+              "turn_trigger": "exec",
+              "sandbox": "none",
+              "sandbox_mode": "danger-full-access",
+              "auto_review_enabled": false,
+              "node_repl_auto_review_required": true,
+              "node_repl_disabled": false,
+              "turn_started_at_unix_ms": 1794159232955,
+              "codex_version": "0.159.0"
+            },
+            "threadId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "sessionId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "windowId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2:0",
+            "itemId": "ctc_0a8547e83c80bba0016af0b293bfa087d0adf4848cca773837",
+            "progressToken": 3
+          },
+          "name": "research_memory.literature.page",
+          "arguments": {
+            "record_ref": "doi:10.1000/issue263-acceptance",
+            "offset": 0,
+            "limit": 10
+          }
+        }
+      },
+      "http_status": 200,
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"items\":[{\"record_ref\":\"doi:10.1000/issue263-acceptance\",\"literature_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"name\":\"Isolated diagnostic evidence\",\"source\":\"Controlled acceptance fixture; metadata only\",\"fulltext_status\":\"missing\",\"reader\":{\"operation\":\"research_memory.literature.read\",\"literature_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\"},\"readers\":[],\"judgments\":[]}],\"offset\":0,\"next_offset\":null,\"query_revision\":\"1b7710451b4ee9fd2609eea862a9265011597236b0e1aca71d785dae07fa1e9e\",\"result_state\":\"matches\",\"scan_complete\":true}"
+            }
+          ],
+          "structuredContent": {
+            "items": [
+              {
+                "record_ref": "doi:10.1000/issue263-acceptance",
+                "literature_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                "name": "Isolated diagnostic evidence",
+                "source": "Controlled acceptance fixture; metadata only",
+                "fulltext_status": "missing",
+                "reader": {
+                  "operation": "research_memory.literature.read",
+                  "literature_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e"
+                },
+                "readers": [],
+                "judgments": []
+              }
+            ],
+            "offset": 0,
+            "next_offset": null,
+            "query_revision": "1b7710451b4ee9fd2609eea862a9265011597236b0e1aca71d785dae07fa1e9e",
+            "result_state": "matches",
+            "scan_complete": true
+          },
+          "isError": false
+        }
+      },
+      "sequence": 11
+    },
+    {
+      "at_monotonic": 11182123.515942674,
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+          "_meta": {
+            "callId": "exec-ef391297-8566-4285-b5bd-8096914eb4ab",
+            "x-codex-turn-metadata": {
+              "session_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+              "reasoning_effort": "ultra",
+              "turn_id": "01a1bc39-47b7-7173-92fb-d4012c847036",
+              "model": "gpt-6.1-sol",
+              "thread_source": "user",
+              "turn_trigger": "exec",
+              "sandbox": "none",
+              "sandbox_mode": "danger-full-access",
+              "auto_review_enabled": false,
+              "node_repl_auto_review_required": true,
+              "node_repl_disabled": false,
+              "turn_started_at_unix_ms": 1794159232955,
+              "codex_version": "0.159.0"
+            },
+            "threadId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "sessionId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2",
+            "windowId": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2:0",
+            "itemId": "ctc_0a8547e83c80bba0016af0b299d0d887d08d95ce9436661930",
+            "progressToken": 4
+          },
+          "name": "research_memory.literature.read",
+          "arguments": {
+            "literature_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e"
+          }
+        }
+      },
+      "http_status": 200,
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"status\":\"accepted\",\"result\":{\"asset_bindings\":[],\"fulltext_status\":\"missing\",\"metadata\":{},\"quest_ref\":\"quest_c2e55dae759149be9e4ed15ba4fb5640\",\"record_ref\":\"doi:10.1000/issue263-acceptance\",\"source\":\"Controlled acceptance fixture; metadata only\",\"title\":\"Isolated diagnostic evidence\",\"ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"kind\":\"register\",\"payload_hash\":\"1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06\",\"receipt\":{\"status\":\"accepted\",\"issuer\":\"research_graph\",\"kind\":\"literature_register_acceptance\",\"receipt_ref\":\"rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2\",\"subject_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"payload_hash\":\"21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c\"},\"accepted_at\":1794159241.9023948}}"
+            }
+          ],
+          "structuredContent": {
+            "status": "accepted",
+            "result": {
+              "asset_bindings": [],
+              "fulltext_status": "missing",
+              "metadata": {},
+              "quest_ref": "quest_c2e55dae759149be9e4ed15ba4fb5640",
+              "record_ref": "doi:10.1000/issue263-acceptance",
+              "source": "Controlled acceptance fixture; metadata only",
+              "title": "Isolated diagnostic evidence",
+              "ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+              "kind": "register",
+              "payload_hash": "1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06",
+              "receipt": {
+                "status": "accepted",
+                "issuer": "research_graph",
+                "kind": "literature_register_acceptance",
+                "receipt_ref": "rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2",
+                "subject_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                "payload_hash": "21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c"
+              },
+              "accepted_at": 1794159241.9023948
+            }
+          },
+          "isError": false
+        }
+      },
+      "sequence": 12
+    }
+  ],
+  "public_native_events": [
+    {
+      "file": "cli-02.jsonl",
+      "event": {
+        "type": "thread.started",
+        "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2"
+      }
+    },
+    {
+      "file": "cli-02.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_0",
+          "type": "agent_message",
+          "text": "我会先按原样读取继承的指针；若被拒绝，再依据返回说明，通过获准的研究工具取得当前已接纳的问题全文并概述目标。"
+        }
+      }
+    },
+    {
+      "file": "cli-02.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_1",
+          "type": "mcp_tool_call",
+          "server": "meta_research",
+          "tool": "research_memory.content.read",
+          "arguments": {
+            "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+            "version_ref": "inherited-stale-version"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\":\"content_version_unbound\",\"details\":{\"message\":\"This source_ref/version_ref pair is not bound in the authorized scope; other content may exist. Reopen the source's directory entry (research_graph.questions.page, research_memory.literature.page or research_memory.assets.page as applicable) and copy its exact returned reader arguments, retaining source_quest_ref when provided. Do not replace an accepted version with latest content.\"}}"
+              }
+            ],
+            "structured_content": {
+              "code": "content_version_unbound",
+              "details": {
+                "message": "This source_ref/version_ref pair is not bound in the authorized scope; other content may exist. Reopen the source's directory entry (research_graph.questions.page, research_memory.literature.page or research_memory.assets.page as applicable) and copy its exact returned reader arguments, retaining source_quest_ref when provided. Do not replace an accepted version with latest content."
+              }
+            }
+          },
+          "error": null,
+          "status": "failed"
+        }
+      }
+    },
+    {
+      "file": "cli-02.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_2",
+          "type": "mcp_tool_call",
+          "server": "meta_research",
+          "tool": "research_graph.questions.page",
+          "arguments": {
+            "entry_kind": "questions",
+            "limit": 20,
+            "offset": 0
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"items\":[{\"question_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"name\":\"低照度显微图像中的稀有形态保真\",\"summary\":\"尚不明确哪种自监督去噪条件能保留稀有形态。\",\"status\":\"active\",\"reader\":{\"source_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"version_ref\":\"memory_content_348dc4889fa044edb3bf53253adf4a95\"},\"history_reader\":{\"operation\":\"research_graph.question_history.read\",\"question_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"offset\":0,\"limit\":12}}],\"offset\":0,\"next_offset\":null,\"query_revision\":\"323708e213774551b9336afd76e187e6fc0d6799a6857d86d3ced0942b878e80\",\"result_state\":\"matches\",\"scan_complete\":true}"
+              }
+            ],
+            "structured_content": {
+              "items": [
+                {
+                  "question_ref": "question_968b391883ce416b933f8a93fc603d18",
+                  "name": "低照度显微图像中的稀有形态保真",
+                  "summary": "尚不明确哪种自监督去噪条件能保留稀有形态。",
+                  "status": "active",
+                  "reader": {
+                    "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+                    "version_ref": "memory_content_348dc4889fa044edb3bf53253adf4a95"
+                  },
+                  "history_reader": {
+                    "operation": "research_graph.question_history.read",
+                    "question_ref": "question_968b391883ce416b933f8a93fc603d18",
+                    "offset": 0,
+                    "limit": 12
+                  }
+                }
+              ],
+              "offset": 0,
+              "next_offset": null,
+              "query_revision": "323708e213774551b9336afd76e187e6fc0d6799a6857d86d3ced0942b878e80",
+              "result_state": "matches",
+              "scan_complete": true
+            }
+          },
+          "error": null,
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "file": "cli-02.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_3",
+          "type": "mcp_tool_call",
+          "server": "meta_research",
+          "tool": "research_memory.content.read",
+          "arguments": {
+            "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+            "version_ref": "memory_content_348dc4889fa044edb3bf53253adf4a95"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"text\":\"{\\\"answer_shape\\\":\\\"形成带反例和证据边界的比较结论。\\\",\\\"applicability_scope\\\":\\\"低照度荧光显微公开数据。\\\",\\\"background_context\\\":\\\"研究稀有细胞形态。\\\",\\\"requirements_constraints\\\":\\\"两周内，使用获准 GPU。\\\",\\\"title\\\":\\\"低照度显微图像中的稀有形态保真\\\",\\\"unknown_statement\\\":\\\"尚不明确哪种自监督去噪条件能保留稀有形态。\\\"}\",\"encoding\":\"canonical-json-utf8-bytes\",\"content_hash\":\"dc7eea1fea68e2af63da61f6b1a7ecf1cadc0fe43c19b2ae9d880fc6863dd989\",\"path\":[],\"offset\":0,\"offset_unit\":\"utf8_bytes\",\"returned_bytes\":382,\"total_bytes\":382,\"next_offset\":null,\"complete\":true,\"source_ref\":\"question_968b391883ce416b933f8a93fc603d18\",\"version_ref\":\"memory_content_348dc4889fa044edb3bf53253adf4a95\"}"
+              }
+            ],
+            "structured_content": {
+              "text": "{\"answer_shape\":\"形成带反例和证据边界的比较结论。\",\"applicability_scope\":\"低照度荧光显微公开数据。\",\"background_context\":\"研究稀有细胞形态。\",\"requirements_constraints\":\"两周内，使用获准 GPU。\",\"title\":\"低照度显微图像中的稀有形态保真\",\"unknown_statement\":\"尚不明确哪种自监督去噪条件能保留稀有形态。\"}",
+              "encoding": "canonical-json-utf8-bytes",
+              "content_hash": "dc7eea1fea68e2af63da61f6b1a7ecf1cadc0fe43c19b2ae9d880fc6863dd989",
+              "path": [],
+              "offset": 0,
+              "offset_unit": "utf8_bytes",
+              "returned_bytes": 382,
+              "total_bytes": 382,
+              "next_offset": null,
+              "complete": true,
+              "source_ref": "question_968b391883ce416b933f8a93fc603d18",
+              "version_ref": "memory_content_348dc4889fa044edb3bf53253adf4a95"
+            }
+          },
+          "error": null,
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "file": "cli-02.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_4",
+          "type": "agent_message",
+          "text": "已完整读取当前已接纳问题《低照度显微图像中的稀有形态保真》。\n\n研究目标：在两周内使用获准 GPU，基于公开低照度荧光显微数据，比较哪些自监督去噪条件能够保留稀有细胞形态，形成包含反例和证据边界的比较结论。\n\n继承指针因版本未绑定被拒绝；已按返回说明，从问题目录取得精确读取参数，并成功读取全文（`complete=true`）。"
+        }
+      }
+    },
+    {
+      "file": "cli-05.jsonl",
+      "event": {
+        "type": "thread.started",
+        "thread_id": "01a1bc38-c90b-79b2-91af-5aeb2ea402e2"
+      }
+    },
+    {
+      "file": "cli-05.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_0",
+          "type": "agent_message",
+          "text": "我会按给定参数提交一次登记，依据工具回执报告文献引用和全文状态，再读取已接纳记录，确认它仍可使用。"
+        }
+      }
+    },
+    {
+      "file": "cli-05.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_1",
+          "type": "mcp_tool_call",
+          "server": "meta_research",
+          "tool": "research_memory.literature.register",
+          "arguments": {
+            "effect_id": "issue263-original-effect",
+            "record_ref": "doi:10.1000/issue263-acceptance",
+            "title": "Isolated diagnostic evidence",
+            "source": "Controlled acceptance fixture; metadata only",
+            "fulltext_status": "missing"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\":\"semantic_output_schema_mismatch\",\"details\":{\"operation_id\":\"research_memory.literature.register\",\"category\":\"tool_contract\",\"execution_stage\":\"output_validation\",\"message\":\"The handler returned a result outside its registered output contract.\",\"correction\":\"Reconcile the original operation with its unchanged original submission and effect identity first. Preserve accepted work; do not change the submission under the same identity or create a replacement effect while its result is unknown.\",\"effect_status\":\"unknown\",\"reconciliation_operation_id\":\"research_memory.literature.register.reconcile\",\"effect_id\":\"issue263-original-effect\",\"path\":[],\"requirement\":\"type\",\"expected\":\"object\"}}"
+              }
+            ],
+            "structured_content": {
+              "code": "semantic_output_schema_mismatch",
+              "details": {
+                "operation_id": "research_memory.literature.register",
+                "category": "tool_contract",
+                "execution_stage": "output_validation",
+                "message": "The handler returned a result outside its registered output contract.",
+                "correction": "Reconcile the original operation with its unchanged original submission and effect identity first. Preserve accepted work; do not change the submission under the same identity or create a replacement effect while its result is unknown.",
+                "effect_status": "unknown",
+                "reconciliation_operation_id": "research_memory.literature.register.reconcile",
+                "effect_id": "issue263-original-effect",
+                "path": [],
+                "requirement": "type",
+                "expected": "object"
+              }
+            }
+          },
+          "error": null,
+          "status": "failed"
+        }
+      }
+    },
+    {
+      "file": "cli-05.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_2",
+          "type": "mcp_tool_call",
+          "server": "meta_research",
+          "tool": "research_memory.literature.register.reconcile",
+          "arguments": {
+            "effect_id": "issue263-original-effect"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"status\":\"accepted\",\"result\":{\"asset_bindings\":[],\"fulltext_status\":\"missing\",\"metadata\":{},\"quest_ref\":\"quest_c2e55dae759149be9e4ed15ba4fb5640\",\"record_ref\":\"doi:10.1000/issue263-acceptance\",\"source\":\"Controlled acceptance fixture; metadata only\",\"title\":\"Isolated diagnostic evidence\",\"ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"kind\":\"register\",\"payload_hash\":\"1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06\",\"receipt\":{\"status\":\"accepted\",\"issuer\":\"research_graph\",\"kind\":\"literature_register_acceptance\",\"receipt_ref\":\"rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2\",\"subject_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"payload_hash\":\"21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c\"},\"accepted_at\":1794159241.9023948}}"
+              }
+            ],
+            "structured_content": {
+              "status": "accepted",
+              "result": {
+                "asset_bindings": [],
+                "fulltext_status": "missing",
+                "metadata": {},
+                "quest_ref": "quest_c2e55dae759149be9e4ed15ba4fb5640",
+                "record_ref": "doi:10.1000/issue263-acceptance",
+                "source": "Controlled acceptance fixture; metadata only",
+                "title": "Isolated diagnostic evidence",
+                "ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                "kind": "register",
+                "payload_hash": "1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06",
+                "receipt": {
+                  "status": "accepted",
+                  "issuer": "research_graph",
+                  "kind": "literature_register_acceptance",
+                  "receipt_ref": "rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2",
+                  "subject_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                  "payload_hash": "21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c"
+                },
+                "accepted_at": 1794159241.9023948
+              }
+            }
+          },
+          "error": null,
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "file": "cli-05.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_3",
+          "type": "mcp_tool_call",
+          "server": "meta_research",
+          "tool": "research_memory.literature.page",
+          "arguments": {
+            "record_ref": "doi:10.1000/issue263-acceptance",
+            "offset": 0,
+            "limit": 10
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"items\":[{\"record_ref\":\"doi:10.1000/issue263-acceptance\",\"literature_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"name\":\"Isolated diagnostic evidence\",\"source\":\"Controlled acceptance fixture; metadata only\",\"fulltext_status\":\"missing\",\"reader\":{\"operation\":\"research_memory.literature.read\",\"literature_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\"},\"readers\":[],\"judgments\":[]}],\"offset\":0,\"next_offset\":null,\"query_revision\":\"1b7710451b4ee9fd2609eea862a9265011597236b0e1aca71d785dae07fa1e9e\",\"result_state\":\"matches\",\"scan_complete\":true}"
+              }
+            ],
+            "structured_content": {
+              "items": [
+                {
+                  "record_ref": "doi:10.1000/issue263-acceptance",
+                  "literature_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                  "name": "Isolated diagnostic evidence",
+                  "source": "Controlled acceptance fixture; metadata only",
+                  "fulltext_status": "missing",
+                  "reader": {
+                    "operation": "research_memory.literature.read",
+                    "literature_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e"
+                  },
+                  "readers": [],
+                  "judgments": []
+                }
+              ],
+              "offset": 0,
+              "next_offset": null,
+              "query_revision": "1b7710451b4ee9fd2609eea862a9265011597236b0e1aca71d785dae07fa1e9e",
+              "result_state": "matches",
+              "scan_complete": true
+            }
+          },
+          "error": null,
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "file": "cli-05.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_4",
+          "type": "mcp_tool_call",
+          "server": "meta_research",
+          "tool": "research_memory.literature.read",
+          "arguments": {
+            "literature_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"status\":\"accepted\",\"result\":{\"asset_bindings\":[],\"fulltext_status\":\"missing\",\"metadata\":{},\"quest_ref\":\"quest_c2e55dae759149be9e4ed15ba4fb5640\",\"record_ref\":\"doi:10.1000/issue263-acceptance\",\"source\":\"Controlled acceptance fixture; metadata only\",\"title\":\"Isolated diagnostic evidence\",\"ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"kind\":\"register\",\"payload_hash\":\"1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06\",\"receipt\":{\"status\":\"accepted\",\"issuer\":\"research_graph\",\"kind\":\"literature_register_acceptance\",\"receipt_ref\":\"rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2\",\"subject_ref\":\"literature_4beae92bfa804eec8d3f8fe0436d9b0e\",\"payload_hash\":\"21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c\"},\"accepted_at\":1794159241.9023948}}"
+              }
+            ],
+            "structured_content": {
+              "status": "accepted",
+              "result": {
+                "asset_bindings": [],
+                "fulltext_status": "missing",
+                "metadata": {},
+                "quest_ref": "quest_c2e55dae759149be9e4ed15ba4fb5640",
+                "record_ref": "doi:10.1000/issue263-acceptance",
+                "source": "Controlled acceptance fixture; metadata only",
+                "title": "Isolated diagnostic evidence",
+                "ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                "kind": "register",
+                "payload_hash": "1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06",
+                "receipt": {
+                  "status": "accepted",
+                  "issuer": "research_graph",
+                  "kind": "literature_register_acceptance",
+                  "receipt_ref": "rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2",
+                  "subject_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+                  "payload_hash": "21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c"
+                },
+                "accepted_at": 1794159241.9023948
+              }
+            }
+          },
+          "error": null,
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "file": "cli-05.jsonl",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "id": "item_5",
+          "type": "agent_message",
+          "text": "登记已接纳，并已成功回读确认记录可用。\n\n- 文献引用：`literature_4beae92bfa804eec8d3f8fe0436d9b0e`\n- 保留的全文状态：`missing`\n\n首次调用返回输出校验错误；随后使用原始 `effect_id` 对账，确认实际已接纳，未重复登记或更改元数据。"
+        }
+      }
+    }
+  ],
+  "controlled_output_fault": {
+    "boundary": "Real Owner succeeded; wrapper corrupted one output only.",
+    "owner_results": [
+      {
+        "arguments": {
+          "effect_id": "issue263-original-effect",
+          "record_ref": "doi:10.1000/issue263-acceptance",
+          "title": "Isolated diagnostic evidence",
+          "source": "Controlled acceptance fixture; metadata only",
+          "fulltext_status": "missing"
+        },
+        "result": {
+          "status": "accepted",
+          "result": {
+            "asset_bindings": [],
+            "fulltext_status": "missing",
+            "metadata": {},
+            "quest_ref": "quest_c2e55dae759149be9e4ed15ba4fb5640",
+            "record_ref": "doi:10.1000/issue263-acceptance",
+            "source": "Controlled acceptance fixture; metadata only",
+            "title": "Isolated diagnostic evidence",
+            "ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+            "kind": "register",
+            "payload_hash": "1b05d6f2846da3e55cc193fe0e1be45dca08bfa51910514f0b4e9b734fa58d06",
+            "receipt": {
+              "status": "accepted",
+              "issuer": "research_graph",
+              "kind": "literature_register_acceptance",
+              "receipt_ref": "rg_receipt_6801d6eafb954dd78cb35ef2e9de1cd2",
+              "subject_ref": "literature_4beae92bfa804eec8d3f8fe0436d9b0e",
+              "payload_hash": "21f6ed7fcb552ade1841dfc6e038d4d8e9e80436c43f508956f3284e7b80176c"
+            },
+            "accepted_at": 1794159241.9023948
+          }
+        }
+      }
+    ]
+  },
+  "raw_evidence_sha256": {
+    "cli-00-command.json": "d36b52b53ccf45a6c3db226491b17f5310f30fc3a5644bf306650e265f33e8f0",
+    "cli-00.jsonl": "8a8469ab9e45cda52908dc6f57b933a00f602e2dce766709df60161368440a1d",
+    "cli-00.stderr": "62d725b13cc6477dc801c98ab589f875cd0ad393bb93364a25b3ed579750678c",
+    "cli-01-command.json": "71e1cc7662933d82b2c6585eb8f15a87a35602fd1b47a99886b9c87475b3492e",
+    "cli-01.jsonl": "b11fdfa3000a4efdc8124041dadb446d584c0c34a42970b6eb26f78b5e622eda",
+    "cli-01.stderr": "62d725b13cc6477dc801c98ab589f875cd0ad393bb93364a25b3ed579750678c",
+    "cli-02-command.json": "9a92c068f7f9fca6c93c09be3642cea25a686555ec898486aa764bf0668aa87f",
+    "cli-02.jsonl": "8b4348490dbdc7e121d99472c80e4ffb68e29f67682e873280acd6d4baee3b22",
+    "cli-02.stderr": "62d725b13cc6477dc801c98ab589f875cd0ad393bb93364a25b3ed579750678c",
+    "cli-03-command.json": "f1b7cd1a764d13c61fffbe1bd0f20d408ad64e5f291caad5102ca4760bd207fb",
+    "cli-03.jsonl": "8a8469ab9e45cda52908dc6f57b933a00f602e2dce766709df60161368440a1d",
+    "cli-03.stderr": "62d725b13cc6477dc801c98ab589f875cd0ad393bb93364a25b3ed579750678c",
+    "cli-04-command.json": "e4fc69d2669f719fc93cd586a8a5d16b51daea5f9ab90707280a468f0e51aaa9",
+    "cli-04.jsonl": "b11fdfa3000a4efdc8124041dadb446d584c0c34a42970b6eb26f78b5e622eda",
+    "cli-04.stderr": "62d725b13cc6477dc801c98ab589f875cd0ad393bb93364a25b3ed579750678c",
+    "cli-05-command.json": "2b4289c4069242948b39d19acf73e31b4c1c4f6e0da638bbf6876968b46211f7",
+    "cli-05.jsonl": "b130e4abefaee1aa41ce07e82c2619e5a8b6d3069c97d90eabaff4b000f86d84",
+    "cli-05.stderr": "62d725b13cc6477dc801c98ab589f875cd0ad393bb93364a25b3ed579750678c",
+    "controlled-fault.json": "c8d708bc077ea53e1ffc73e5da8e04c415438d0722f6f2e5cad4db5e74de24fb",
+    "effect-adapter-evidence.json": "13e8d74466fafa9945adcbc9a33e4c3a098e8f92fb637d6e1f355bbcacb27d6e",
+    "effect-prompt.json": "6127b3fb520ee3b6d509a8ed8db1e2bd01e18a9efad4c710773c7a03d02faf34",
+    "mcp-audit.jsonl": "ea0293d9fedc29b7dc9261a617418c36ebdca49e8d21f7773b98ba6fb5390269",
+    "reader-adapter-evidence.json": "dc206ee59c41d745a9d542943d840387e0b8773427727752016dddb004fbd362",
+    "reader-prompt.json": "1f932fe36fd61c2f587f6c8755f558bf41eeeab3511f7613fe3e3676be6efd2b",
+    "source-file-sha256.json": "0bb1a0e60fc0d691852a2d25e75bd4c52bf49007d4969cf175cca46a3e89bdcb",
+    "summary.json": "9d234cb8689a5e664cb12f4b802b11c6af9e1145785704e8e93fbe044b69b51a"
+  },
+  "boundaries": [
+    "Actual Codex 0.159.0 and gpt-6.1-sol; actual CodexHarnessAdapter and production gateway.",
+    "Research state and platform lease were initialized using deterministic fixtures.",
+    "The effect scenario deliberately corrupts one wrapper output after a real Owner succeeds.",
+    "No scripted retry, no fabricated model output, no production service/data change.",
+    "This is discriminating same-session consumer acceptance, not a complete scientific Cycle."
+  ]
+}

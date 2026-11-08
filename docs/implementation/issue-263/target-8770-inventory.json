@@ -92,6 +92,22 @@
     "No model or native research session started",
     "Feature availability does not enumerate final native tool identities",
     "No configured external services or supplemental search sources at this target observation; future configuration and other instances are separate",
-    "No current native session or dynamic-tool row exists for actual realized catalog extraction; final per-role native tool inventory remains unverified"
-  ]
+    "Initial observation had no native sessions. Followup candidate isolated native assembly and real model evidence is recorded separately; existing 8770 service was not deployed or mutated."
+  ],
+  "followup_candidate_probe": {
+    "source_head": "da890f44336783c71c19070ca1f799f47c4a5bd8",
+    "isolated_root": "/tmp/issue263-native-EoFiK1cB",
+    "native_inventory": "native-tools.json",
+    "real_native_recovery": "native-recovery-summary.json",
+    "installed_cli_reused": true,
+    "running_service_and_research_data_unchanged": true,
+    "existing_service_proxy_port_7890_unavailable": true,
+    "isolated_reverse_proxy_used_and_removed": 17892,
+    "temporary_credentials_removed": true,
+    "live_harness_rows": {
+      "ar_harness_runs": 0,
+      "ar_target_harness_admissions": 0
+    },
+    "production_adapter_scope": "Daemon invokes default build_production_runtime; default composition installs CodexHarnessAdapter only and FULL_CONFORMANCE_FAMILIES=(codex,). Claude source adapter is not enabled by this composition; Gemini has no production adapter. Source audit and empty harness tables do not claim historical executions."
+  }
 }

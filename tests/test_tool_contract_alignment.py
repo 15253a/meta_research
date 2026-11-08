@@ -174,7 +174,11 @@ def test_public_content_keeps_three_distinct_pagination_endings_and_exact_errors
         bad_version = _call(gateway, channel, operation, {**source, "version_ref": "wrong-version"})
         assert bad_version["isError"] is True
         assert bad_version["structuredContent"]["code"] == "content_version_unbound"
-        assert "authorized scope" in bad_version["structuredContent"]["details"]["message"]
+        diagnosis = bad_version["structuredContent"]["details"]["message"]
+        assert "source/version" in diagnosis
+        assert "research_graph.questions.page" in diagnosis
+        assert "exact reader arguments" in diagnosis and "source_quest_ref" in diagnosis
+        assert "Other content may exist" in diagnosis
         assert json.loads(bad_version["content"][0]["text"]) == bad_version["structuredContent"]
         assert _call(gateway, channel, operation, source)["isError"] is False
         for unavailable in ("research_memory.literature.page", "unregistered.read"):

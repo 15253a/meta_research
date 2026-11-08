@@ -1,0 +1,91 @@
+{
+  "observed_native_source": "da890f44336783c71c19070ca1f799f47c4a5bd8",
+  "final_working_head": "beef1479d46b8639c747a9edbb54e78d9412d2b9",
+  "boundary": "Native adapter assembly/source equivalence only; not equivalence of changed business diagnostics.",
+  "files": [
+    {
+      "file": "src/meta_research/harness_adapters.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "4aa0782b02320b3310c396c1f636183ebb4a4289b33b3485d08f1a8eeeb7c3ee",
+      "final_sha256": "4aa0782b02320b3310c396c1f636183ebb4a4289b33b3485d08f1a8eeeb7c3ee",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/idea_skill.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "a4f3dc8021e57aafed79ba7d8df1b797cbad047ebca376985c69a1af0d80c9b0",
+      "final_sha256": "a4f3dc8021e57aafed79ba7d8df1b797cbad047ebca376985c69a1af0d80c9b0",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/companion.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "9e124b39dfb8efd71c9b8d44713d4205f3ebd923001df7e0882e5052b5687906",
+      "final_sha256": "9e124b39dfb8efd71c9b8d44713d4205f3ebd923001df7e0882e5052b5687906",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/plan_skill.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "1e7fec37431dc6bae3064d33b4a3a61cbf1c615214530a503f115b39c092778c",
+      "final_sha256": "1e7fec37431dc6bae3064d33b4a3a61cbf1c615214530a503f115b39c092778c",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/bundle_skill.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "86a1b7fbed18aaa1497d1928236c99c88415b3424dafe4baf6a2255e406ad028",
+      "final_sha256": "86a1b7fbed18aaa1497d1928236c99c88415b3424dafe4baf6a2255e406ad028",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/reasoning_skill.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "bc71bf92317788a932048575ee52f6a05c0854cbc40e7732ca8a1d8e603d73ce",
+      "final_sha256": "bc71bf92317788a932048575ee52f6a05c0854cbc40e7732ca8a1d8e603d73ce",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/acquisition_root.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "0b56c983b38fbea4294145642c45595e40f639a8b7bb19d1ad2702274241321f",
+      "final_sha256": "0b56c983b38fbea4294145642c45595e40f639a8b7bb19d1ad2702274241321f",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/deepfetch.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "b609785380266bcc5d4e6e64cec8137c5b94edac7de979d27c4c0e014e7217b2",
+      "final_sha256": "b609785380266bcc5d4e6e64cec8137c5b94edac7de979d27c4c0e014e7217b2",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/timeline_summary_provider.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "6012978ddf4723b5b4f8a0e645d430e89bf66e5d6331f830279a08c94ceafaf1",
+      "final_sha256": "6012978ddf4723b5b4f8a0e645d430e89bf66e5d6331f830279a08c94ceafaf1",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/root_capabilities.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "8d37705a0deb5f41525a0b3ff6ad545f6cc6de634d031deaeb3feb28cf261ed0",
+      "final_sha256": "8d37705a0deb5f41525a0b3ff6ad545f6cc6de634d031deaeb3feb28cf261ed0",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/quest_drafting.py",
+      "scope": "whole module, LF-normalized",
+      "observed_sha256": "43a429381c0a691b18c422d781b582bb048fb4ffcb52c118de8eda7f0b88e6cb",
+      "final_sha256": "43a429381c0a691b18c422d781b582bb048fb4ffcb52c118de8eda7f0b88e6cb",
+      "unchanged": true
+    },
+    {
+      "file": "src/meta_research/recorder_sources.py",
+      "scope": "RecorderChannels.operation AST (reader diagnostics changed; native contract did not)",
+      "observed_sha256": "f6f1b55b34db811e15fd8ad224294c77fd651fcdfac175d099f5a0186bee8663",
+      "final_sha256": "f6f1b55b34db811e15fd8ad224294c77fd651fcdfac175d099f5a0186bee8663",
+      "unchanged": true
+    }
+  ]
+}

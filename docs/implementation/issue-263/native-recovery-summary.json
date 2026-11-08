@@ -1,0 +1,43 @@
+{
+  "builder": "CodexCompanionAdapter._invoke_once",
+  "sandbox": "danger-full-access",
+  "turns": [
+    {
+      "number": 1,
+      "exit": 0,
+      "native_session_ref": "01a1bc3d-e23c-73c0-812f-cf47873644e9",
+      "turn_completed": true,
+      "event_count": 22
+    },
+    {
+      "number": 2,
+      "exit": 0,
+      "native_session_ref": "01a1bc3d-e23c-73c0-812f-cf47873644e9",
+      "turn_completed": true,
+      "event_count": 9
+    }
+  ],
+  "same_session": true,
+  "retained_work_unchanged": true,
+  "draft": "status=verified\nretained=KEEP_263\n",
+  "absent_input_not_created": true,
+  "boundary": "Real model and installed CLI with exact Companion adapter argv; empty MCP fixture; no semantic/business authorization",
+  "source_head": "da890f44336783c71c19070ca1f799f47c4a5bd8",
+  "cli_version": "codex-cli 0.159.0",
+  "model": "gpt-6.1-sol",
+  "child_task": "/root/read_fixture_263",
+  "child_native_session_ref": "01a1bc3e-6a26-70c1-b5e7-4570d6816313",
+  "retained_work_sha256": "7f68c2ea2a33706033fc0f35d3c6ccd450b498fb10739b0b9694a8bff36ca6b6",
+  "observed_failure_reasons": [
+    "cat: absent-input.txt: No such file or directory; exit 1",
+    "apply_patch verification failed: Failed to find expected lines in draft.txt: status=stale",
+    "agent_name must use only lowercase letters, digits, and underscores"
+  ],
+  "correction_evidence": [
+    "Original session lists workspace and reads existing correct-input.txt",
+    "Original session reads draft.txt and applies only status=draft -> status=verified",
+    "Original session spawns real /root/read_fixture_263 and waits; second turn calls followup_task with same target and waits"
+  ],
+  "tool_events": "native-recovery-tool-events.json",
+  "scope_note": "Genuine instructed error/correction acceptance fixture. Does not claim spontaneous business recovery or all native failure branches."
+}

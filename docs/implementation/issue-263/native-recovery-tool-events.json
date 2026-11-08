@@ -1,0 +1,305 @@
+[
+  {
+    "session_file": "rollout-2026-11-08T17-38-55-01a1bc3d-e23c-73c0-812f-cf47873644e9.jsonl",
+    "items": [
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_00c9539b581c29be016af0b3b4d6bc87d083bb03e379491fce",
+        "status": "completed",
+        "call_id": "call_c17b02a3f99e4b96a1ccea6a93e5f0e1",
+        "name": "exec",
+        "input": "text(await tools.exec_command({cmd:\"cat absent-input.txt\",max_output_tokens:1000}));\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3d-fc3e-7243-a6fc-b9c0a2980cf2",
+        "call_id": "call_c17b02a3f99e4b96a1ccea6a93e5f0e1",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"c4d7e8\",\"wall_time_seconds\":0.000027991,\"exit_code\":1,\"original_token_count\":13,\"output\":\"cat: absent-input.txt: No such file or directory\\n\"}"
+          }
+        ]
+      },
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_00c9539b581c29be016af0b3bedf1087d095b3ab31ac3d233c",
+        "status": "completed",
+        "call_id": "call_7f244f5464c24946a38dc91acdf42a57",
+        "name": "exec",
+        "input": "text(await tools.exec_command({cmd:\"ls -la\",max_output_tokens:2000}));\ntext(await tools.exec_command({cmd:\"cat correct-input.txt\",max_output_tokens:2000}));\ntext(await tools.exec_command({cmd:\"sha256sum retained-work.txt\",max_output_tokens:1000}));\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3e-24d6-7751-a812-ec94ac33c94f",
+        "call_id": "call_7f244f5464c24946a38dc91acdf42a57",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"b7402b\",\"wall_time_seconds\":0.000005967,\"exit_code\":0,\"original_token_count\":64,\"output\":\"total 12\\ndrwxr-xr-x 2 root root 89 Nov  8 17:38 .\\ndrwxr-xr-x 4 root root 91 Nov  8 17:38 ..\\n-rw-r--r-- 1 root root 19 Nov  8 17:38 correct-input.txt\\n-rw-r--r-- 1 root root 31 Nov  8 17:38 draft.txt\\n-rw-r--r-- 1 root root 24 Nov  8 17:38 retained-work.txt\\n\"}"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"adf0ef\",\"wall_time_seconds\":0.000003006,\"exit_code\":0,\"original_token_count\":5,\"output\":\"NATIVE_FIXTURE_263\\n\"}"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"cde653\",\"wall_time_seconds\":0.00000214,\"exit_code\":0,\"original_token_count\":21,\"output\":\"7f68c2ea2a33706033fc0f35d3c6ccd450b498fb10739b0b9694a8bff36ca6b6  retained-work.txt\\n\"}"
+          }
+        ]
+      },
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_00c9539b581c29be016af0b3c1554c87d09b7a0e9e52d529af",
+        "status": "completed",
+        "call_id": "call_c83b81913b25433980f986ffbd381dc5",
+        "name": "exec",
+        "input": "text(await tools.apply_patch(\"*** Begin Patch\\n*** Update File: draft.txt\\n@@\\n-status=stale\\n+status=verified\\n*** End Patch\"));\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3e-2df7-73c1-a2ef-66fd89257cc7",
+        "call_id": "call_c83b81913b25433980f986ffbd381dc5",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script failed\nWall time 0.0 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "Script error:\napply_patch verification failed: Failed to find expected lines in /tmp/issue263-native-EoFiK1cB/recovery-01/adapter/research-workspace/draft.txt:\nstatus=stale"
+          }
+        ]
+      },
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_00c9539b581c29be016af0b3c3901887d08327c4cf837eeee7",
+        "status": "completed",
+        "call_id": "call_4020371870de4ee8930c6eaf65708059",
+        "name": "exec",
+        "input": "text(await tools.exec_command({cmd:\"cat draft.txt\",max_output_tokens:1000}));\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3e-35e8-76e1-9a8b-dc5d7fd9caed",
+        "call_id": "call_4020371870de4ee8930c6eaf65708059",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"1c59d5\",\"wall_time_seconds\":0.000006477,\"exit_code\":0,\"original_token_count\":8,\"output\":\"status=draft\\nretained=KEEP_263\\n\"}"
+          }
+        ]
+      },
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_00c9539b581c29be016af0b3c5e22887d0986390e1efd0b1b4",
+        "status": "completed",
+        "call_id": "call_630a3d826bb64eb2bc7c7dd3d0734906",
+        "name": "exec",
+        "input": "text(await tools.apply_patch(\"*** Begin Patch\\n*** Update File: draft.txt\\n@@\\n-status=draft\\n+status=verified\\n*** End Patch\"));\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3e-425d-7680-bf08-4fc1fa1a57b4",
+        "call_id": "call_630a3d826bb64eb2bc7c7dd3d0734906",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.0 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{}"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "id": "fc_00c9539b581c29be016af0b3c8d55487d0b16e41df4e74c43c",
+        "name": "send_message",
+        "namespace": "collaboration",
+        "arguments": "{\"target\": \"native-missing-agent-263\", \"message\": {\"native_encrypted_message_omitted\": true, \"sha256\": \"21d296ec4f4679d994944a247ea31c24a4961ead57b7aa589c2bd5ac8c82a602\"}}",
+        "call_id": "call_e78d6b4d352a4411995dfd7ce50efa07"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_01a1bc3e-4b8f-7222-925c-c2dcb65e4ce7",
+        "call_id": "call_e78d6b4d352a4411995dfd7ce50efa07",
+        "output": "agent_name must use only lowercase letters, digits, and underscores"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_00c9539b581c29be016af0b3cf1b4c87d09bbd69108455a3a7",
+        "name": "spawn_agent",
+        "namespace": "collaboration",
+        "arguments": "{\"task_name\": \"read_fixture_263\", \"fork_turns\": \"none\", \"message\": {\"native_encrypted_message_omitted\": true, \"sha256\": \"f81ff11e60cc17bb616994b6877cb98a165d585dd148a550a7ab025f472b1b6e\"}}",
+        "call_id": "call_0fa1a907831e4ba695be5c0d04f43e18"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_01a1bc3e-6a60-7861-b7da-9561cfd41b96",
+        "call_id": "call_0fa1a907831e4ba695be5c0d04f43e18",
+        "output": "{\"task_name\":\"/root/read_fixture_263\"}"
+      },
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_00c9539b581c29be016af0b3dcd02487d09a2fe49526c82b61",
+        "status": "completed",
+        "call_id": "call_e12b4cfc4f8947bea1a705a5e7c501bc",
+        "name": "exec",
+        "input": "store(\"fixture_263_child_identifier\",\"/root/read_fixture_263\");\ntext(await tools.exec_command({cmd:\"python -c 'from pathlib import Path; import hashlib, json; p=Path(\\\"draft.txt\\\"); digest=hashlib.sha256(Path(\\\"retained-work.txt\\\").read_bytes()).hexdigest(); assert p.read_bytes() == b\\\"status=verified\\\\nretained=KEEP_263\\\\n\\\"; assert digest == \\\"7f68c2ea2a33706033fc0f35d3c6ccd450b498fb10739b0b9694a8bff36ca6b6\\\"; assert not Path(\\\"absent-input.txt\\\").exists(); print(json.dumps({\\\"draft_exact\\\": True, \\\"retained_work_bytes_unchanged\\\": True, \\\"retained_work_sha256\\\": digest, \\\"absent_input_exists\\\": False}))'\",\"max_output_tokens\":1000}));\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3e-a025-7023-9372-2e701616f482",
+        "call_id": "call_e12b4cfc4f8947bea1a705a5e7c501bc",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"99843e\",\"wall_time_seconds\":0.00000606,\"exit_code\":0,\"original_token_count\":46,\"output\":\"{\\\"draft_exact\\\": true, \\\"retained_work_bytes_unchanged\\\": true, \\\"retained_work_sha256\\\": \\\"7f68c2ea2a33706033fc0f35d3c6ccd450b498fb10739b0b9694a8bff36ca6b6\\\", \\\"absent_input_exists\\\": false}\\n\"}"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "id": "fc_00c9539b581c29be016af0b3e0ce4c87d0b0a149298741798c",
+        "name": "wait_agent",
+        "namespace": "collaboration",
+        "arguments": "{\"timeout_ms\": 10000}",
+        "call_id": "call_bcf45abf2cc34af386d454a24c70889f"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_01a1bc3e-a7c1-7712-9be0-66bb89eb2f4a",
+        "call_id": "call_bcf45abf2cc34af386d454a24c70889f",
+        "output": "{\"message\":\"Wait completed.\",\"timed_out\":false}"
+      },
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_00c9539b581c29be016af0b3f102f087d0a1a42afa65406e04",
+        "status": "completed",
+        "call_id": "call_fe6e5528a32b47acb4752d3c3b8f8ccd",
+        "name": "exec",
+        "input": "text(await tools.exec_command({cmd:\"cat draft.txt retained-work.txt\",max_output_tokens:1000}));\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3e-e777-7af2-91ab-282b616fe29f",
+        "call_id": "call_fe6e5528a32b47acb4752d3c3b8f8ccd",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"6bad18\",\"wall_time_seconds\":0.000027007,\"exit_code\":0,\"original_token_count\":15,\"output\":\"status=verified\\nretained=KEEP_263\\nEXISTING_VALID_WORK_263\\n\"}"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "id": "fc_00c9539b581c29be016af0b3f2e51087d0a9f7dde322a54b19",
+        "name": "followup_task",
+        "namespace": "collaboration",
+        "arguments": "{\"target\": \"/root/read_fixture_263\", \"message\": {\"native_encrypted_message_omitted\": true, \"sha256\": \"ebc9b29b0a3eb8280765ab9352a48ac79ef6dcd7d6b111b080dda11c17740333\"}}",
+        "call_id": "call_5be30146aab9496db32ded73282be91f"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_01a1bc3e-f7da-7372-a8a3-cca4b919277f",
+        "call_id": "call_5be30146aab9496db32ded73282be91f",
+        "output": ""
+      },
+      {
+        "type": "function_call",
+        "id": "fc_00c9539b581c29be016af0b3f7b6f087d0abedc84ec4042714",
+        "name": "wait_agent",
+        "namespace": "collaboration",
+        "arguments": "{\"timeout_ms\": 10000}",
+        "call_id": "call_5141bc88c579439aac596e01e7e78f2f"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_01a1bc3f-25b7-7383-92b8-506d11c5d09b",
+        "call_id": "call_5141bc88c579439aac596e01e7e78f2f",
+        "output": "{\"message\":\"Wait completed.\",\"timed_out\":false}"
+      }
+    ]
+  },
+  {
+    "session_file": "rollout-2026-11-08T17-39-29-01a1bc3e-6a26-70c1-b5e7-4570d6816313.jsonl",
+    "items": [
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_0b354b84ef027e82016af0b3dc6f2c87d0850bed4eba46ea52",
+        "status": "completed",
+        "call_id": "call_62f5d5f883034e58bca745d4173250bf",
+        "name": "exec",
+        "input": "const results = await Promise.allSettled([\n  tools.exec_command({cmd:\"cat -- draft.txt\",workdir:\"/tmp/issue263-native-EoFiK1cB/recovery-01/adapter/research-workspace\",max_output_tokens:10000}),\n  tools.exec_command({cmd:\"cat -- retained-work.txt\",workdir:\"/tmp/issue263-native-EoFiK1cB/recovery-01/adapter/research-workspace\",max_output_tokens:10000})\n]);\nfor (let i = 0; i < results.length; i++) text({file:[\"draft.txt\",\"retained-work.txt\"][i],result:results[i]});\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3e-9afb-73e3-b95b-6545a24e4e77",
+        "call_id": "call_62f5d5f883034e58bca745d4173250bf",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"file\":\"draft.txt\",\"result\":{\"status\":\"fulfilled\",\"value\":{\"chunk_id\":\"10a69d\",\"wall_time_seconds\":0.000003465,\"exit_code\":0,\"original_token_count\":9,\"output\":\"status=verified\\nretained=KEEP_263\\n\"}}}"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"file\":\"retained-work.txt\",\"result\":{\"status\":\"fulfilled\",\"value\":{\"chunk_id\":\"3e5f23\",\"wall_time_seconds\":0.000006022,\"exit_code\":0,\"original_token_count\":6,\"output\":\"EXISTING_VALID_WORK_263\\n\"}}}"
+          }
+        ]
+      },
+      {
+        "type": "custom_tool_call",
+        "id": "ctc_0ea788ca641909b8016af0b3fa7c0087d0a180f6de558c408b",
+        "status": "completed",
+        "call_id": "call_87420c142afa400b96ef4944a97009e1",
+        "name": "exec",
+        "input": "const results = await Promise.allSettled([\n  tools.exec_command({cmd:\"cat -- draft.txt\",workdir:\"/tmp/issue263-native-EoFiK1cB/recovery-01/adapter/research-workspace\",max_output_tokens:10000}),\n  tools.exec_command({cmd:\"cat -- retained-work.txt\",workdir:\"/tmp/issue263-native-EoFiK1cB/recovery-01/adapter/research-workspace\",max_output_tokens:10000})\n]);\nfor (let i = 0; i < results.length; i++) text({file:[\"draft.txt\",\"retained-work.txt\"][i],result:results[i]});\n"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a1bc3f-164f-73c3-af88-c18cb077aa58",
+        "call_id": "call_87420c142afa400b96ef4944a97009e1",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"file\":\"draft.txt\",\"result\":{\"status\":\"fulfilled\",\"value\":{\"chunk_id\":\"75d926\",\"wall_time_seconds\":0.000003936,\"exit_code\":0,\"original_token_count\":9,\"output\":\"status=verified\\nretained=KEEP_263\\n\"}}}"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"file\":\"retained-work.txt\",\"result\":{\"status\":\"fulfilled\",\"value\":{\"chunk_id\":\"8ca203\",\"wall_time_seconds\":0.000006496,\"exit_code\":0,\"original_token_count\":6,\"output\":\"EXISTING_VALID_WORK_263\\n\"}}}"
+          }
+        ]
+      }
+    ]
+  }
+]

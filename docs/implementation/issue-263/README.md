@@ -1,52 +1,73 @@
-# #263 诊断与修正链交付记录
+# #263 诊断与修正链验收记录
 
-基线：`origin/v1-test@ea421520434afcc32047ed35c937c64aa9cb9bbd`，本地分支 `codex/issue-263-diagnostics`。按 2026-11-09 读取的 [#263 当前重开范围](https://github.com/15253a/meta_research/issues/263) 和 [#262](https://github.com/15253a/meta_research/issues/262) 实施。#263 为 open、负责人 15253a、原生 blocked-by 为空；#262 为 open、无负责人。仅有的开放 PR #221 是独立 DeepFetch 工作；未修改负责人、Issue、PR、运行服务或研究数据。
+基线为 `origin/v1-test@ea421520434afcc32047ed35c937c64aa9cb9bbd`，实现分支为 `codex/issue-263-diagnostics`，范围按 [#263 当前重开要求](https://github.com/15253a/meta_research/issues/263) 和 [#262](https://github.com/15253a/meta_research/issues/262)。工作开始及收口前均读取远端状态：#263 负责人 15253a，无原生 blocked-by；开放 PR #221 是独立 DeepFetch 工作。独立 checkout 保留 `.issue-291/source` 原有未提交修改及未跟踪文件，没有把它们合入候选。
 
-实现使用独立 clone；来源 `.issue-291/source` 的未提交修改和未跟踪测试未被合入或改写。托管 worktree 调用未返回，改用独立 checkout；当前工作目录明确，不以原 dirty checkout 作为验证源码。
+**#263 本票源码验收完成。** 运行源码冻结为 `beef1479d46b8639c747a9edbb54e78d9412d2b9`，全套、实际模型复验和失败归因已完成。后续仅修正一项匹配旧长句的测试断言，373 个运行源码文件未变。发布目标为 `v1-test`，实际推送及关闭状态以 GitHub 为准；本记录不将源码验收等同于已发布或已部署。
 
-## 实际行为
+## 实现与反馈长度
 
-- 公共网关保留原错误码；输入错误给出字段路径、合同要求、期望及修正方向。文本返回同一份 JSON 诊断。正常 Owner 业务状态不改变。
-- handler 异常、返回值违反合同以及 effect 的业务错误保留原 operation/effect 和对账入口；无法确认的效果明确为 unknown。输入拒绝只说明本次 handler 未执行，不否定先前操作。对账使用原完整提交，保留授权、版本、幂等身份及有效工作。
-- Bundle exhaustion 的提交、对账与提案解析保留真实 OwnerConflict；原提案冲突后可在同一通道对账既有 accepted 回执。
-- Resident 宿主桥区分认证、协议、临时不可达和坏回执，保留 details；DeepFetch 的包装及既有失败事件/REST 查询继续携带诊断，重启不丢。诊断不参与重试许可或状态判断。
-- 外部 MCP 参数错误与损坏 schema/引用分开；direct-call 和搜索源 receipt 保留具体原因及冻结操作定位。任意供应商错误正文不能当作安全字段直接回显。
-- Writing 共用内容模型工具保留稳定 `content_model_call_failed`，区分凭据、权限、限流、服务、超时、连接和坏响应，给出配置方或调用者的实际处置；无自动切模型或重试。现有 Owner 包装保留已提供的 details。
+- 参数拒绝给出相关字段、具体约束及简短修正方向；Owner 的稳定错误码和有用 details 到达文本与结构化消费者，两种返回表达同一诊断。
+- 区分业务拒绝、认证、协议、网络、宿主异常和坏回执。条件参数、互斥引用、精确版本及分页错误使用真实公开字段名，不用内部别名指导调用者。
+- handler 未运行只描述本次调用，不推断同一 effect 的历史结果。结果未知保留原 operation、effect 和对账定位；先用原完整提交对账，再决定后续工作。授权、版本、幂等和已有效成果不变。
+- Bundle／Plan／Dataset／上下文 reader 等包装保留 Owner 原因；DeepFetch 的失败事件、REST 和重启仍保留原 run/attempt/session 及诊断。外部 MCP 区分参数错误与损坏合同；Writing 指明配置或服务处置责任。
+- 原因和修正方向控制为够用的短说明，不重复整份 schema、提交或供应商正文。没有新增通用错误平台、自动重试器、权限或状态迁移。
 
-没有新增通用错误平台、自动重试器、权限、迁移或原生 RW 包装。共享材料说明与 `tools.contracts.read` 同步当前错误合同。
+## 实际工具清单
 
-## 逐工具覆盖与可复现证据
+| 清单 | 实际观察与边界 | 证据 |
+|---|---|---|
+| 内置语义操作 | 96 项：47 read、24 effect、24 reconcile、1 verify；逐项给出 handler、角色、合同、修正／对账方向及覆盖状态 | [逐工具覆盖](tool-coverage.md)、[实际注册清单](registered-tools.json)、[生成脚本](collect_tools.py) |
+| 安装 Harness 原生工具 | 13 个实际装配变体；普通场景 23 项，provided_only 22 项，Recorder 3 项，合并 26 个原生身份。包含 code mode 的嵌套／延迟工具，不仅统计顶层 tools | [原生清单](native-tools.json)、[采集脚本](collect_native_tools.py) |
+| 现场外部工具 | 8770 观察时点没有已配置外部 MCP 或 supplemental 搜索源；不假造供应商实测成功 | [实例元数据](target-8770-inventory.json) |
+| 共享 Skill 与特例 | Writing 使用调用方 grant；创建材料 Companion、Recorder、Harness conformance 各有独立授权边界 | [角色调用链](role-chain-validation.md) |
 
-详见 [逐工具覆盖](tool-coverage.md)、[实际注册清单](registered-tools.json) 和 [清单生成脚本](collect_tools.py)。96 项内置操作全部登记；清单与公共包装验证不代表各 Owner 的每种业务拒绝通过。
+最终 96 项注册清单取自 `beef1479` 的 945 个源码／测试文件，归档 SHA256 为 `3b71ab76fb4c635057dd965a1f0ba826de1933e0f9e7689c9f4beb688bb622d3`；后续只有一项测试断言改动，运行源码未变。注册不等于每个业务分支都已执行；相同网关机制复用验证，独有组参、包装及恢复路径单独列出。原生装配与恢复证据取自 `da890f4`；[源码复用核对](native-source-reuse.json) 比较 11 个完整装配模块及 Recorder operation AST，证明这些装配路径未改变，不据此推定其余业务源码未改变。
 
-所有 backend 行为验证在 Linux 新建隔离目录执行，Python 3.12.13、锁文件依赖精确一致，真实生产装配和临时 Owner 数据；部分供应商/Owner 故障受控注入，报告明确注明。原始日志保存在工作空间 `.issue-291/runs/`，没有修改 #291 旧目录。以下测试集有重叠，不能相加计数。
+工具目前有授权目录、分页／搜索／Owner 筛选和精确合同读取，**尚未实现 #269 的按目的分层发现**。本票修复错误反馈，不把目录层级工作记为完成。
 
-| 路径 | 修复前证据 | 修复后证据 |
-| --- | --- | --- |
-| 公共参数与原 effect 对账 | `263-gateway-red`：7 failed，缺 details | `263-gateway-last`：8 passed；含效果实际存在/不存在两种坏回执，均先报告 unknown 后对账 |
-| 真实 notes/content、分页、撤权、业务拒绝 | 复用 #291/原 #263 行为；4 个旧断言需接纳新增诊断 | `263-gateway-final-focused`：16 passed |
-| Bundle 原因与 Resident 桥 | `i263-bridge-red3`、`i263-bundle-red`：吞 details/原 code | `i263-bridge-final`：10 passed；原提案/原回执保持 |
-| DeepFetch 持久诊断 | `i263-deepfetch-durable-red`：REST 缺 details | `i263-deepfetch-durable-green`：worker→REST→重启保持原 run/attempt/session，Provider 仅调用一次 |
-| Idea 原授权通道 | `owner-idea-red-263`：Owner details 丢失 | `owner-idea-green-263`：纠正引用后继续、原注册结果对账；Owner 故障为受控注入 |
-| Writing 实际 Companion grant | `issue263-content-config-red`：配置缺失无方向；其他网络分类 red 记录保留 | `issue263-content-config-green`：27 passed；恢复原配置/服务后同通道继续 |
-| 外部 schema 与 DeepFetch source receipt | `issue263-external-red`、source red：误分类/吞因 | `issue263-source-green`：5 文件 88 passed；最终增强 oneOf/anyOf 与上游失败处置后 `issue263-external-details-green`：50 passed |
-| 双轴审查后的修复 | `263-review-red`：8 failed；`263-numeric-red`：3 failed | `263-review-final`：5 文件 78 passed；RPC 内部错误、内容 HTTP 分类、动态键安全、注册数值边界均验证 |
-| Idea 原生适配器后续消费 | 全套候选发现新增 details 导致旧整对象断言失败，原错误码没变 | `263-idea-regression-fixed`：2 passed，验证原 code、具体原因与文本/结构化一致 |
+## 实际修复证据
 
-## 基线复用与完整验证
+以下均在 Linux 隔离目录、Python 3.12.13 及锁定依赖下执行，使用生产装配、真实 grant 和临时 Owner 数据。受控故障明确标注；各测试集有重叠，不相加为总量。完整红绿历史、归档 hash 和基线对照见 [validation.json](validation.json)。
 
-#291 `full-final` 的 936 个 `src/`、`tests/` 文件与本次基线 `ea42152` 的 Git 字节全部一致。旧 manifest 的 HEAD 是 b01d6c4，但冻结的修改随后提交为 ea42152；按内容核对，未使用当前 dirty 工作树推断基线。其全套为 4756 collected：4271 passed、483 failed、2 skipped。480 个失败在更早基线复现；另 3 个竞态记录及未知因素保持，不改写为通过。
+| 独有边界 | 已观察到的修复和继续行为 | 证据入口 |
+|---|---|---|
+| 公共网关 | 参数路径／上下界；真实效果存在或不存在时坏回执均先报告 unknown，再查原 effect；text/structuredContent 一致 | `test_semantic_failure_diagnostics.py`、`test_owner_diagnostic_propagation.py` |
+| Dataset／Environment／Literature／Baseline | 条件筛选、精确引用、全文绑定和 query revision 指出可改字段；实际修正后原 grant 继续，原登记仍可对账 | `test_discovery_failure_diagnostics.py`、`test_additional_tool_diagnostics.py` |
+| Plan evidence／Bundle implementation | 原版误报宿主失败；现在保留 Owner 原码和简短原因。Plan 三处受控 I/O 故障恢复后按原精确绑定读；Bundle 冲突后原 payload 对账/read 保留原结果 | `263-owner-family-red`：2 failed；`263-owner-family-green`：新增 2 例通过，合跑 12 passed、1 既有 catalog 失败；`test_owner_family_diagnostics.py` |
+| 上下文／Question history/relations／创建依据 | 保留 Owner details，分页提示使用 index_offset 等公开字段并重置字节 offset；缺少 source selector 指明 material_key | `test_additional_tool_diagnostics.py` 新增节点及最终全套对应节点通过 |
+| Target／材料／HumanRequest／Guidance／资产入库 | 模式条件、来源互斥、授权条件与 reader 选择器给具体原因；11 处前置拒绝保留历史效果 unknown，原参数对账及有效工作保留 | `263-effect-prior-state-red`：真实先接纳再同 effect 畸形提交失败；`263-effect-prior-state-green`：整文件 10 passed，945 个源码／测试文件与 `beef1479` 一致 |
+| 创建材料 Companion／Recorder | 真实 chroot/grant 的复制限额修正与对账，已编辑副本不覆盖；Recorder 原 job/basis/source/hash 暂不可读后恢复，正文及 Owner revision 不变 | `test_role_chain_diagnostics.py`；初始 2 red→2 green，后续复制大小分支另有红绿记录 |
+| Resident／DeepFetch／外部 MCP／Writing | 认证／协议／服务故障分类，失败事件重启保持，外部合同和参数分开；实际 Companion grant 中恢复原配置继续 | `test_tool_bridge_diagnostics.py`、`test_tool_failure_diagnostics.py`、`test_companion_writing_request.py` |
 
-全套运行冻结初始候选 `787bf71`（源码归档 SHA256 `f032bad4c4b94a145798c726b6aaeec009f29894762fbbacacdd8820cf5bf1eb`）。审查后 4 个运行文件的窄修复另以 `263-review-final` 的 78 passed 复验（归档 `3816b875d55d16dd725ebe2025a454dad9d733393311e3bb436f64dc093bcab6`）；不能把初始全套快照说成包含之后修复。双轴初审发现及复核分别见 [代码审查](review.md)。Python 项目没有配置 mypy/pyright 或 backend typecheck 命令；编译检查不冒充类型检查。未改前端源码。
+## 原 Agent 修正、对账并继续
 
-全套完成 **4787 collected：4303 passed、482 failed、2 skipped、0 incomplete**，532 个测试文件全部完成，1156.35 秒，无超时和收集错误。与 #291 精确节点/阶段对照：429 项失败阶段及诊断相同，52 项同阶段但诊断变化；1 项新增失败是 Idea 旧整对象断言（已修正，整文件 2 passed）。另 2 个旧竞态节点本次通过，保留旧失败，不据此宣称竞态已修复。两项外部 schema 参数化测试因错误码纠正而改变 node id，实际场景仍执行，未删除覆盖。
+`beef1479` 真实模型复验使用安装的 Codex CLI 0.159.0、`gpt-6.1-sol`、实际 `CodexHarnessAdapter`、生产 gateway 与 Idea grant。当次 945 个源码／测试文件与该提交逐项 SHA256 相同，差异为 0；最终交付只多一项测试断言修正，373 个运行源码文件仍相同。隔离初态和平台租约由 fixture 建立，模型决定后续工具调用。
 
-Bundle `same-native-new-call` 从旧 hard-ceiling 竞态推进到缺少 `Fresh pagination guidance` 的断言，不归作随机文本差异：#291 `bundle-candidate-recheck` 在与本次起点全部 936 文件一致的快照 `f654a29678955eb6ae19bda7fb968aa6132a14e7ecc33f7fc87875544d6843d3` 已复现同一后续断言。两种历史失败均保留，未测量竞态发生频率。
+- 最终原会话 `01a1bc62-b09a-7932-8c27-8b8ad0fd8d36`：过期 `content.read` → 具体诊断 → 自行查 `questions.page` → 精确版本读取成功；真实 literature Owner 接纳后注入一次坏回执 → unknown → 原 effect reconcile → 目录／正文读取。7 次真实 CLI 工具结果（含 2 次失败）与 HTTP 参数、text/structuredContent 逐项一致，写入和 Owner 执行各一次。两份完整错误文本分别为 285、563 字符，保留可执行修正和原对账定位。
+- 原生会话 `01a1bc3d-e23c-73c0-812f-cf47873644e9`：文件不存在后查目录读实际文件，patch 旧上下文后读文件改正，子 Agent 名错误后有效 spawn/wait；第二回合 followup 同一子 Agent。已有文件 hash 不变，只修改目标 draft 字段，未创建虚假缺失输入。见 [原生恢复结果](native-recovery-summary.json) 与 [事件](native-recovery-tool-events.json)。
 
-最终 373 个运行文件与审查后 78 passed 的冻结快照逐字节一致；Idea 测试调整另有 2 passed。**没有把全套原始 482 个失败改写为通过，也没有宣称最终修复后重新运行了全部 4787 项。** 精确对照和修正处置见 [验证记录](validation.json)；完整原始日志、JUnit、phase 对照在工作空间 `.issue-291/runs/263-full-final/` 与 `.issue-263/full-validation/`。
+[模型消费记录](real-agent-consumption.json)、[源码清单](real-agent-source-files.json) 与 [探针](verify_real_agent.py) 对应最终运行源码；旧 `da890f4` 模型证据保留在 [历史记录](historical-da890f4/real-agent-consumption.json)。探针结束后临时凭据剩余 0，本次专用隧道已停止，原凭据及部署未改动；见 [语义探针清理](real-agent-credential-cleanup.json) 和 [原生探针清理](native-credential-cleanup.json)。
 
-## 未验证与限制
+## 全套测试与代码审查
 
-已证明同一授权入口的参数/引用修正、业务拒绝、先对账、保留结果和后续调用；没有声称真实模型已自主读懂并改正提交。最终同版本真实角色/模型消费仍需 #274；接口探针不替代该验收。
+复用 #291 `full-final`：936 个源码／测试文件与 `ea42152` Git 字节一致；4756 collected，4271 passed、483 failed、2 skipped。旧 manifest 的 HEAD 与后续提交不同，复用依据为内容 hash，不能使用当前 dirty 工作树推断。480 个失败有更早基线复现，另外 3 个竞态记录仍保留。
 
-已只读核对实际 8770：当前无已配置外部 MCP 或 supplemental 搜索源，但其运行源码为另一版本且保留已有修改。其 managed native home 没有现存 sessions／threads／dynamic-tools，离线 CLI 协议不提供完整 native catalog；最终修复版各角色原生工具完整目录仍未取得。详情见 [实例元数据](target-8770-inventory.json)。真实供应商故障处置、全部角色独有恢复、原生文件/命令/子 Agent 逐项实跑仍未验证。适用但未验证项保留，不算通过；Spec 审查因这一范围缺口仍有 1 项 P1。本次不关闭 #263/#262/#274，不部署。
+| 版本／运行 | 完整结果 | 用途 |
+|---|---|---|
+| 初始 `787bf71` | 4787 collected，4303 passed、482 failed、2 skipped | 历史全套；其中 1 个新增 Idea 整对象断言已修复并复验 |
+| 中间 `da890f4` | 4800 collected，4318 passed、480 failed、2 skipped、0 incomplete | 两段内容相同的冻结运行覆盖全部 532 文件；与 #291 比较 428 同阶段同诊断、52 同阶段诊断变化、0 新增失败。中断日志保留，不算另一完整成功运行 |
+| 最终 `beef1479`／`263-final-reviewed-full` | 4840 collected，4356 passed、482 failed、2 skipped、0 incomplete；537 文件全部完成，1149.47 秒 | 归档 `854bf482080ed54563ae8470e29615ddfa8861bb5da691f48a8eeaa03a390454`；完整原始失败记录保留，不因后续专项结果改写 |
+
+最后补齐的 5 个诊断测试文件共 38 个节点在最终全套全部通过。最终交付的 373 个运行源码文件与该冻结提交一致；572 个测试文件中只有下述断言文件随后变化。
+
+482 项失败中，480 项在基线已失败；另外 2 项逐一处理。`test_tool_contract_alignment` 匹配旧长句的断言改为核对短诊断的 source/version、questions.page、准确 reader/source_quest_ref 和其他内容仍可能存在，保留错误码、双通道一致、原 grant 成功及撤权检查；`263-concise-contract-assertion` 整文件 5 passed，Spec 确认未削弱，归档 `ac1417f60ba32bafe2547e556d8e156f07d9c1580fbfd7f5ea9daee2574da4d9`。未重跑全套，原始 482 failed 保留。
+
+另一项 `test_target_progress.busy_logs` 的 19/20 为本次新观察到的既有分页缺陷，未修复：该测试直调 collector，不经过本票修改的 semantic 包装；6 个相关文件从基线到 `beef1479` 字节相同。`263-progress-order-baseline` 和 `263-progress-order-candidate` 用真实文件及受控 mtime 排序均复现 8→16→19，不能将其计作已修复或通过。完整节点／阶段对照、旧 catalog 与 Bundle 失败及夹具接线记录见 `validation.json`。
+
+Standards 正式终审 0 项；Spec 对源码、实际模型、清单及上述测试断言修正无未解决发现，审查结论见 [代码审查](review.md)。项目没有配置 Python typecheck 命令，编译检查不冒充类型检查。基线 `ea42152` 的 Response time CI run `42498124848` 已有 npm test 40 passed、5 failed（`MetaTrace is not defined`）；本票 `web/` 与 `.github/` 树精确未变，不宣称 CI 全绿。
+
+## 验收与发布边界
+
+#263 的实际工具清单、独有角色链、原 Agent 修正／先对账并继续及回归对照已齐备；旧失败和未修复的 collector 缺陷保留明确记录。按用户授权向 `v1-test` 非强制推送并关闭 [#263](https://github.com/15253a/meta_research/issues/263)，发布结果以该分支和票据的远端状态为准。
+
+8770 现有服务仍为原部署及已有修改，本票没有修改服务或研究数据。隔离源码验收不等于部署验收。[#274](https://github.com/15253a/meta_research/issues/274) 负责联合版本完整科研 Cycle、阶段接纳／交接与界面消费，不代替本票工具错误验收。后续分层工具发现由 [#269](https://github.com/15253a/meta_research/issues/269) 实现。
