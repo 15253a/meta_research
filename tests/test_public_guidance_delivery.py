@@ -181,7 +181,9 @@ def test_harness_maintains_role_scoped_reference_access(tmp_path, root_kind, ent
     ))
     assert len(reading.observed) == 1
     developer = reading.observed[0][1]
-    assert ("cycle-work.md" in developer) == ("cycle-work.md" in names)
+    shared_navigation = developer.split("Shared reference root:", 1)[1].split("Role skill source:", 1)[0]
+    listed_references = set(re.findall(r"(?m)^- .*?references/([a-z-]+\.md)", shared_navigation))
+    assert listed_references == set(names)
     assert result.profile["root_capability_diagnostics"]["side_effect_authorization"]["operation_ids"] == list(operation_ids)
 
 

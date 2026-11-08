@@ -32,7 +32,7 @@ def test_real_root_adapter_passes_human_request_instructions(tmp_path, root_kind
     assert "本回合输出语言：zh。" in language_instructions
     assert "直接使用中文" in language_instructions
     assert "委派时传递同一语言要求" in language_instructions
-    assert "HumanRequest" in RESEARCH_SYSTEM_PROMPT
+    assert "HumanRequest" in shared_reference_resources()["references/human-guidance.md"]
 
 
 def test_all_lifecycle_paths_bind_the_same_instructions():
