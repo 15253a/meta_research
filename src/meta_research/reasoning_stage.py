@@ -889,8 +889,6 @@ class ReasoningStageWorker:
         accepted_content = self._research_memory.read_question_content(
             request.accepted_question.content_ref, request.accepted_question.content_hash
         )
-        if canonical_hash(accepted_content) != request.accepted_question.content_hash:
-            raise OwnerConflict("accepted_question_content_mismatch")
         return ReasoningSkillRequest(
             native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
                 run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),

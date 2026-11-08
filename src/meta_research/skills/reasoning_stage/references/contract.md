@@ -27,7 +27,7 @@ Bundle 因 Brief 为空而跳过时，完整 Plan 仍是本轮输入；跳过可
 - 本轮每项实际工作的用途、真实执行／评价状态、关键具名结果、单位与比较对象（适用时）、缺测或失败原因、影响解释的限制，以及准确 TargetCommit／结果／说明入口。含无评价工作与负结果；长说明分段保留完整可读入口，不能把任何一项工作或决定性限制裁成不可见。它们是既有结果与研究说明的阅读呈现，不新增结果卡存储或统一指标清单。
 - 真实前驱必要交接、当前 Question 已有认识及相关历史的准确入口与分页范围。首批历史说明其范围，不能冒充全部历史；原 IdeaSet 及更早材料按当前判断需要展开。
 
-Question 正文沿本请求冻结的 `AcceptedQuestionBinding.content_ref`／`content_hash` 取得，六字段原样交付，允许为空的两项补充仍保留为空字符串；`research_memory.stage_context.read` 的 `source=question` 返回同一准确内容。有效 Goal、完成标准与持续条件沿本次冻结的 Goal revision 完整交付，不受普通辅助 context 的字节、深度或列表预览限制。较长历史和辅助材料仍按需展开；原根续接、拒绝修订与恢复沿原冻结请求及必要增量继续，不以重复全文或查询 latest 替换原依据。
+Question 正文沿本请求冻结的 `AcceptedQuestionBinding.content_ref`／`content_hash` 取得，六字段原样交付，允许为空的两项补充仍保留为空字符串；`research_memory.stage_context.read` 的 `source=question` 返回同一准确内容。请求冻结的 Goal revision 与完成标准完整保留；本次 operation 冻结指导中的当前有效 Goal 和持续条件也完整直给，各自保留实际来源，持续条件可在同一 Goal revision 下更新。这些必要正文不受普通辅助 context 的字节、深度或列表预览限制。较长历史和辅助材料仍按需展开；原根续接、拒绝修订与恢复沿原冻结请求及必要增量继续，不以重复全文或查询 latest 替换原依据。
 
 审视其他路线时，通过获授 RG Question 发现入口找到同 Quest 的相关或暂放问题、准确正文及历史，再按需要展开关系和依据。工具可发现的材料不表示已经读取或采用；不把所有问题和历史全文追加为首轮必给内容。
 
