@@ -1,0 +1,213 @@
+{
+  "issue": "https://github.com/15253a/meta_research/issues/269",
+  "base": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+  "base_ref_at_branch_creation": "origin/v1-test",
+  "branch": "codex/issue-269-purpose-catalog",
+  "source_identity_note": "Receipts were frozen before the implementation commit. Their archive/per-file hashes identify candidate bytes; their Git HEAD names the base only.",
+  "python_full_suite": {
+    "run": "269-full",
+    "snapshot_sha256": "6f3f082d3ccc8c3ea1569f1369d58ccff719e13c4babce91f674fac6bc9bcd04",
+    "collected": 4856,
+    "counts": {
+      "passed": 4373,
+      "failed": 481,
+      "skipped": 2,
+      "incomplete": 0
+    },
+    "exitcode": 1,
+    "file_count": 538,
+    "elapsed_seconds": 1142.2265415601432,
+    "snapshot_boundary": "The full run was frozen before final review fixes. Six runtime-file differences are recorded in full-suite-final-source-delta.json; their changed behaviors/contracts have the separate regressions below. A subsequently corrected test-only markdown-fragment assertion has its own 10-test regression. The full-run counts are not rewritten as a synthetic final full-suite pass."
+  },
+  "baseline": {
+    "run": "263-final-reviewed-full",
+    "head": "beef1479d46b8639c747a9edbb54e78d9412d2b9",
+    "counts": {
+      "passed": 4356,
+      "failed": 482,
+      "skipped": 2,
+      "incomplete": 0
+    },
+    "collected": 4840,
+    "reuse_proof": "baseline-reuse-proof.json",
+    "failure_comparison": "failure-comparison.json",
+    "boundary": "All common production bytes match the task base; one baseline test was subsequently corrected. Inherited failures are not counted as fixed or successful tests."
+  },
+  "separate_regressions": [
+    {
+      "run": "269-external-final-reviewed",
+      "coverage": "External MCP provider surfaces, current authorization, service recovery, exact contracts, bad configuration and malformed JSON-RPC methods",
+      "snapshot_sha256": "827e4bc0f0d3b386dd6b282e671ba39763024386e90676e527b3bcd5ea95ec29",
+      "pytest_arguments": [
+        "tests/test_external_mcp.py",
+        "tests/test_external_mcp_providers.py",
+        "tests/test_external_mcp_public_providers.py",
+        "tests/test_external_mcp_target.py",
+        "tests/test_external_mcp_web.py",
+        "-q"
+      ],
+      "counts": {
+        "tests": 47,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "exitcode": 0
+    },
+    {
+      "run": "269-wf-recovery",
+      "coverage": "WF reconcile discovery, eight-role authorized navigation and public waiting-root/receipt recovery",
+      "snapshot_sha256": "6790a03237121e7e4fd3fae03665d9d7a1b5209917ff00c587006f7bc5d6d042",
+      "pytest_arguments": [
+        "tests/test_tool_purpose_navigation.py",
+        "tests/test_tool_discovery.py",
+        "tests/test_tool_discovery_integration.py",
+        "-q"
+      ],
+      "counts": {
+        "tests": 14,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "exitcode": 0
+    },
+    {
+      "run": "269-asset-contract-green",
+      "coverage": "Exact content contract, discovery and contract alignment",
+      "snapshot_sha256": "ff2be924a25bbb7667fcd4b2e079587e3f5e05df38d1b84bbc313ac2c0350cb0",
+      "pytest_arguments": [
+        "tests/test_tool_discovery.py",
+        "tests/test_tool_contract_snapshot.py",
+        "tests/test_tool_contract_alignment.py",
+        "-q"
+      ],
+      "counts": {
+        "tests": 16,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "exitcode": 0
+    },
+    {
+      "run": "269-final-resources",
+      "coverage": "Actual packaged shared guidance resources",
+      "snapshot_sha256": "4231799aa1d1dc21e7690beaabc334553bfd50454a829fac122e0df7efbdba54",
+      "pytest_arguments": [
+        "tests/test_shared_research_guidance.py",
+        "-q"
+      ],
+      "counts": {
+        "tests": 2,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "exitcode": 0
+    },
+    {
+      "run": "269-consumer-final-fixes",
+      "coverage": "Public HTTP malformed projected calls and creation discovery",
+      "snapshot_sha256": "b8a305e83aff77c35b0bfabf71b2fcb40072377bf760986ab34fbbc4e3c34a93",
+      "pytest_arguments": [
+        "tests/test_creation_material_copy.py",
+        "tests/test_tool_discovery_integration.py",
+        "-q"
+      ],
+      "counts": {
+        "tests": 4,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "exitcode": 0
+    },
+    {
+      "run": "269-guidance-final",
+      "coverage": "Packaged human reply guidance, including markdown document links with section fragments",
+      "snapshot_sha256": "bc4db5bf4a61bacdc089b834285c4ae1801e75cace2b245f08cace66510d083b",
+      "pytest_arguments": [
+        "tests/test_human_reply_guidance.py",
+        "-q"
+      ],
+      "counts": {
+        "tests": 10,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "exitcode": 0
+    }
+  ],
+  "regression_count_note": "These runs have different scopes and may overlap; do not add their test counts into a single claimed suite.",
+  "frontend": {
+    "typecheck": {
+      "command": "npm run typecheck",
+      "result": "passed app and e2e TypeScript projects",
+      "local_log": "web-typecheck-ready.log"
+    },
+    "tests": {
+      "command": "node --test tests/*.test.mjs",
+      "total": 45,
+      "passed": 40,
+      "failed": 5,
+      "failure": "ReferenceError: MetaTrace is not defined",
+      "file": "tests/experiment-log-fallback.test.mjs",
+      "baseline_check": "All five reproduced from an exact b98d744 archive with the same installed dependencies; no frontend files changed.",
+      "local_logs": [
+        "web-tests-ready.log",
+        "web-baseline-failures.log"
+      ]
+    }
+  },
+  "other_checks": {
+    "python_syntax": "py -3.10 -m py_compile passed for changed production Python files and the actual Agent probe; this is syntax validation, not static typing",
+    "python_static_typecheck": "No project Python static typechecker is configured",
+    "git_diff_check": "passed",
+    "runtime_guidance_placeholder_search": "No remaining matches for the checked obsolete not-yet-connected implementation phrases in runtime skills"
+  },
+  "real_agent": {
+    "report": "REAL_AGENT.md",
+    "full_consumer": "full-consumer/real-agent-consumption.json",
+    "final_discovery": "final-discovery/real-agent-consumption.json",
+    "source_reuse": "source-reuse.json",
+    "final_runtime_files_matching_current_candidate": 374,
+    "scope": "Actual installed Codex CLI/model, admitted Idea root, production Owners, native file/shell and one configured controlled stdio service; isolated fixture/data/lease, not a deployed full Cycle"
+  },
+  "independent_review": {
+    "standards": {
+      "result": "no remaining actionable findings after fixes and rereview",
+      "resolved": [
+        "Waiting-root projected operation_id must be a string before membership checks",
+        "External JSON-RPC method must be a string before method dispatch"
+      ],
+      "final_test_review": "The human-reply test permits a section fragment while retaining document path, packaging, and contract-content checks"
+    },
+    "spec": {
+      "result": "no remaining blocking spec issues or unintended scope expansion after fixes and rereview",
+      "resolved": [
+        "Discovery-failed/zero-tool external services expose actionable recovery guidance on their reachable service page",
+        "Unreadable/invalid current external configuration returns a truthful typed not-called diagnostic",
+        "WF discovers the original registered reconciliation identity and the actual model consumes its committed result"
+      ],
+      "final_contract_review": "AssetVersion reader descriptions match the existing exact-version handler without changing other source types or authorization"
+    }
+  },
+  "preservation": {
+    "original_checkout_head": "7e5c38928006af6bef63392bf7f54cd0a86f7b66",
+    "original_checkout_status_matches_retained_receipt": true,
+    "worktree_isolation": true,
+    "existing_deployment_or_data_changed": false
+  },
+  "remaining_ownership": {
+    "262": "overall optimization integration",
+    "274": "full same-version Cycle acceptance",
+    "293": "dynamic remaining budget and extension approval"
+  },
+  "publication": "Local implementation commit only; no remote push, issue close, merge or deployment performed",
+  "raw_evidence": {
+    "local_root": "D:\\meta_research\\test\\Funtation_model\\.issue-269",
+    "test_runs_root": "D:\\meta_research\\test\\Funtation_model\\.issue-291\\runs"
+  }
+}

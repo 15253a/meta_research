@@ -30,11 +30,11 @@ def test_live_disabled_dependency_invalidates_page_and_contract_without_granting
         unavailable_reason=lambda context: None if service["enabled"] else "service_disabled")
     gateway = SemanticMcpGateway((operation,))
     channel = make_channel(gateway, (*DISCOVERY, "test.reader"))
-    first = call(gateway, channel, "tools.catalog.page", limit=1)["structuredContent"]
+    first = call(gateway, channel, "tools.catalog.page", view="operations", limit=1)["structuredContent"]
     assert first["items"][0]["operation_id"] == "test.reader"
     assert call(gateway, channel, "tools.contracts.read", operation_id="test.reader")["isError"] is False
     service["enabled"] = False
-    later = call(gateway, channel, "tools.catalog.page", offset=first["next_offset"],
+    later = call(gateway, channel, "tools.catalog.page", view="operations", offset=first["next_offset"],
                  catalog_hash=first["catalog_hash"], limit=1)
     assert later["structuredContent"]["code"] == "tool_catalog_changed"
     for name, args in (("tools.contracts.read", {"operation_id": "test.reader"}), ("test.reader", {})):
@@ -50,7 +50,7 @@ def test_live_disabled_dependency_invalidates_page_and_contract_without_granting
     assert call(gateway, restricted, "tools.contracts.read", operation_id="test.reader")["structuredContent"]["details"]["reason"] == "not_granted"
     assert call(gateway, restricted, "tools.contracts.read", operation_id="not.registered")["structuredContent"]["details"]["reason"] == "not_registered"
     assert call(gateway, restricted, "test.reader")["isError"] is True
-    assert call(gateway, restricted, "tools.catalog.page", offset=first["next_offset"],
+    assert call(gateway, restricted, "tools.catalog.page", view="operations", offset=first["next_offset"],
                 catalog_hash=first["catalog_hash"])["structuredContent"]["code"] == "tool_catalog_changed"
 
 

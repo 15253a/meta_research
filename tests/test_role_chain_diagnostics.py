@@ -1,4 +1,6 @@
 """Distinct Recorder/creation interfaces; these are not real-model probes."""
+
+from tool_catalog_helpers import catalog_operations
 import json
 import os
 
@@ -92,7 +94,8 @@ def test_creation_grant_corrects_copy_limit_and_reconciles_without_overwriting_w
             gateway = runtime.harnesses._gateway
             status, catalog = gateway.dispatch(connection.token, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
             assert status == 200
-            assert {tool["name"] for tool in catalog["result"]["tools"]} == {
+            assert {tool["name"] for tool in catalog["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+            assert {item["operation_id"] for item in catalog_operations(gateway.dispatch, connection.token)} == {
                 *TOOL_DISCOVERY_OPERATION_IDS, *CREATION_MATERIAL_OPERATION_IDS}
             entry = _value(_call(gateway, connection, CREATION_MATERIAL_OPERATION_IDS[0],
                 reference_ref=reference["reference_ref"]))["entries"][0]

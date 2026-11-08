@@ -2,7 +2,7 @@
 
 当前 scoped 工具目录决定实际可用能力，输入已有内容不要求按固定顺序再读。按需要选择以下阶段入口及共享发现／reader：
 
-工作资料的读取、加工和保管按[材料与保管](../../references/materials-and-custody.md)处理；研究积累及实际用途从 RG 对应入口发现，涉及人类协作时沿实际提供的 human_request.read／human_guidance.read 与精确资料入口读取；统一 Human Interact 历史发现尚待接通。当前根交接未读、待验证部分及影响；需要上游重做或继续投入时，由本 Reasoning 按现有后继入口决定，不从材料反馈直接创建 Cycle。
+工作资料的读取、加工和保管按[材料与保管](../../references/materials-and-custody.md)处理；研究积累及实际用途从 RG 对应入口发现，涉及人类协作时从 RG 的 Human Interact 用途找到 `human_request.read`，沿返回的精确 reader 读取历史指导与处理记录；当前指导与反馈由 HC 的 `human_guidance.read`／`human_guidance.feedback` 处理。当前根交接未读、待验证部分及影响；需要上游重做或继续投入时，由本 Reasoning 按现有后继入口决定，不从材料反馈直接创建 Cycle。
 
 | 操作 | 用途 |
 | --- | --- |

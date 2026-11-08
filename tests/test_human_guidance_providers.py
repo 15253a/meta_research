@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tool_catalog_helpers import catalog_operations
+
 import hashlib
 import json
 import subprocess
@@ -38,7 +40,7 @@ _SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}},
 def _tool(runtime, token, operation, **arguments):
     status, response, _ = runtime.harnesses.dispatch_mcp_http(token, {
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": operation, "arguments": arguments},
+        "params": {"name": "tools.call", "arguments": {"operation_id": operation, "arguments": arguments}},
     }, mcp_session_id=None)
     assert status == 200, response
     result = response["result"]
@@ -49,7 +51,7 @@ def _tool(runtime, token, operation, **arguments):
 def _tool_error(runtime, token, operation, expected_code, **arguments):
     status, response, _ = runtime.harnesses.dispatch_mcp_http(token, {
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": operation, "arguments": arguments},
+        "params": {"name": "tools.call", "arguments": {"operation_id": operation, "arguments": arguments}},
     }, mcp_session_id=None)
     assert status == 200, response
     result = response["result"]
@@ -75,7 +77,8 @@ class _GuidanceRunner(_SignedRunner):
         status, catalog = self.runtime.harnesses.dispatch_mcp(token, {
             "jsonrpc": "2.0", "id": 0, "method": "tools/list"})
         assert status == 200
-        assert {item["name"] for item in catalog["result"]["tools"]} >= {
+        assert {item["name"] for item in catalog["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+        assert {item["operation_id"] for item in catalog_operations(self.runtime.harnesses.dispatch_mcp, token, purpose="HC")} >= {
             "human_guidance.read", "human_guidance.feedback",
             "human_guidance.read.reconcile", "human_guidance.feedback.reconcile"}
         inbox = _tool(self.runtime, token, "human_guidance.read")

@@ -1,6 +1,8 @@
 """Shared research tools do not grant helpers authority to evolve a Quest goal."""
 from __future__ import annotations
 
+from tool_catalog_helpers import catalog_operations
+
 import pytest
 from jsonschema import Draft202012Validator
 
@@ -123,21 +125,22 @@ def _assert_role_denies_goal_writes(runtime, root_kind, scope, arguments):
 
     try:
         tools = dispatch("tools/list")["tools"]
-        names = {tool["name"] for tool in tools}
+        assert {tool["name"] for tool in tools} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+        names = {item["operation_id"] for item in catalog_operations(runtime.harnesses.dispatch_mcp, token)}
         assert names == set(ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind])
         assert "research_graph.questions.page" in names
         # The operation exists in this production gateway; its absence from the
         # real helper grant, rather than a nonexistent tool, must cause denial.
         assert set(GOAL_OPERATION_IDS) <= set(runtime.harnesses._gateway.operation_ids)
         readable = dispatch("tools/call", {
-            "name": "research_graph.questions.page", "arguments": {},
+            "name": "tools.call", "arguments": {"operation_id": "research_graph.questions.page", "arguments": {}},
         })
         assert readable["isError"] is False, readable
         assert readable["structuredContent"]["items"]
         for operation in GOAL_OPERATION_IDS[1:]:
             assert operation not in names
             denied = dispatch("tools/call", {
-                "name": operation, "arguments": arguments,
+                "name": "tools.call", "arguments": {"operation_id": operation, "arguments": arguments},
             })
             assert denied["isError"] is True, denied
             assert denied["structuredContent"] == {"code": "capability_unavailable"}

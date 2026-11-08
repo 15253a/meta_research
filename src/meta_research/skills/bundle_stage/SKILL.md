@@ -21,13 +21,13 @@ Plan 的 goal、characteristics、boundary_constraints、semantic_delta 保留�
 
 局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。同根滚动工作先给出 Cycle／Bundle 阶段／重心的简短定位，再接收本轮任务、新结果与变化，按[Owner 操作](references/owner-operations.md#同根后续输入)沿准确输入继续；需要回读时使用本次绑定的材料。
 
-当前 Cycle 的相关工作材料沿实际获授入口核对，包括 Idea、Plan、已启用 Target 暂存材料和本工作已交付文件。前两轮原生目录窗口尚待目录能力接通；跨 Cycle 正式资产沿 RG／RM 准确入口读取，不以设计窗口扩大当前授权。加工、保管或跨 Cycle 文件交接时读[材料与保管](../references/materials-and-custody.md)，按其中三轮窗口与原件保留规则处理。在途观察可指导安排，正式结果与冻结执行输入继续沿原交接流程。
+当前 Cycle 的相关工作材料沿实际获授入口核对，包括 Idea、Plan、已启用 Target 暂存材料和本工作已交付文件。宿主提供当前及前两轮实际可达的目录、工作归属与读写范围，按[材料与保管](../references/materials-and-custody.md#当前工作目录与回复材料)使用原生文件／shell；跨 Cycle 正式资产沿 RG／RM 准确入口读取。在途观察可指导安排，正式结果与冻结执行输入继续沿原交接流程。
 
 `stage_context.read` 首次按 reader 传入 `offset=0`；后续仅在返回的 `next_offset` 为整数时将其作为下一页 offset。`next_offset=null` 即结束该正文的分页，按顺序拼接各页 text 后解析 JSON；`complete` 只表示当前响应是否含完整正文，尾页可仍为 false。遇 `semantic_input_schema_mismatch` 时查当前目录的参数 schema，修正具体字段后再调用，不原样重复失败请求。
 
 需要复用方法或核验实施时，按[研究导航](../references/research-navigation.md)展开精确 Baseline、Variant、真实 Run 和适用评价，沿各自 reader 与分页读取；参数以当前工具 schema 为准，目录条目与正文分页分别处理。Plan 的完整采用来源同时包含科学支持与计划复用材料，以 Brief 的 reuse_material_refs 定位来源并按实际用途选择；派给 Target 前按[准确材料交接](references/contract.md#准确材料交接)落实关键情况说明与可读取内容。
 
-需要回顾人类要求或协作历史时，经 当前获授的人类输入／协作 reader（human_request.read、human_guidance.read；统一历史发现尚待接通） 返回的准确入口读取原文与实际处理，不把可见历史要求自动扩大为本轮约束。
+需要回顾人类要求或协作历史时，经 RG 的 Human Interact 用途下 `human_request.read`（历史原文与处理）及 HC 的 `human_guidance.read`（当前指导） 返回的准确入口读取原文与实际处理，不把可见历史要求自动扩大为本轮约束。
 
 仅 Bundle 经正式候选接纳与调度启用 Target；其他阶段、Target 和子智能体提供后续建议。Target 有独立可验目的、完成 cells、输入和实际依赖。一份 Brief 可由多个 Target 实现，一个 Target 也可履行多个 Brief 共有的责任；按实际责任和 cells 组织，不预设一对一或强行合并。获取、采集、清洗、整理可独立成 Target，也可与相关研究合并；粒度由研究需要、复用产物和真实依赖决定，湿实验、论证和辅助材料同样适用。
 
@@ -63,4 +63,4 @@ Target 正式接纳后，按[资源整理与正式登记](../references/material
 
 全部完成 cells 有 current accepted TargetCommit 覆盖时为 `realized`；需改变冻结语义时说明 `replan_required` 与剩余义务；真实阻塞、在途工作和未知效果保持实际状态。完成条件是本轮承诺已核对、结果与未决项已交接，Owner 接纳链可验证；执行结束、保存、TargetCommit 和科学结论分别成立。
 
-需要人补足判断、资源或行动，或接续正式答复时，按[主动发起与接续 HumanRequest](../references/human-guidance.md#主动发起与接续-humanrequest)处理。查询原文与处理记录使用 当前获授的人类输入／协作 reader（human_request.read、human_guidance.read；统一历史发现尚待接通） 返回的准确入口；实际依赖仅阻碍相应工作，其余 ready 工作继续安排。未知请求效果先沿原操作对账。
+需要人补足判断、资源或行动，或接续正式答复时，按[主动发起与接续 HumanRequest](../references/human-guidance.md#主动发起与接续-humanrequest)处理。查询原文与处理记录使用 RG 的 Human Interact 用途下 `human_request.read`（历史原文与处理）及 HC 的 `human_guidance.read`（当前指导） 返回的准确入口；实际依赖仅阻碍相应工作，其余 ready 工作继续安排。未知请求效果先沿原操作对账。

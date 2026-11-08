@@ -4,6 +4,6 @@
 
 确需人修复外部服务或选择替代路线时，用既有 `human_request.open` 和 `request_kind=external_material_api_access` 请求人的明确文本答复。记录已知情况、实际尝试、未明原因、受影响研究、可行替代及其限制和取舍；说明人应修复哪项条件或明确选择哪条路线。请求的 local waiter 只等待发起的根工作；仅某个 Target 受影响时由该 Target 请求，Bundle 继续安排不依赖答复的 ready 工作。调查和研究助手建议供人判断，以人在原请求页面正式提交的选择为准。
 
-原根恢复后，用原 `effect_id` 调用 `human_request.open.reconcile`，按精确 `request_ref`／`resolution.response_ref` 调用 `human_request.read`，读取正式选择与 delivery 的原文。Owner 接纳答复和消费 waiter 说明回复已交回原工作，服务是否可用仍由原根核验。原服务在同一连接上修复后可按已授权范围验证；人改端点、凭据或选择获准替代服务时，系统在 HumanRequest 续接的新逻辑操作读取当前配置，再核对提供的服务、工具和研究使用说明。每个操作的连接、catalog、说明及失败记录保持原快照，恢复或重放旧操作时沿原配置对账。
+原根恢复后，用原 `effect_id` 调用 `human_request.open.reconcile`，按精确 `request_ref`／`resolution.response_ref` 调用 `human_request.read`，读取正式选择与 delivery 的原文。Owner 接纳答复和消费 waiter 说明回复已交回原工作，服务是否可用仍由原根核验。原服务在同一连接上修复后可按已授权范围验证；人改端点、凭据或选择获准替代服务时，系统在 HumanRequest 续接的新逻辑操作读取当前配置，再核对提供的服务、工具和研究使用说明。每个操作的连接、catalog、说明及失败记录保持原快照，修改连接或说明不替换旧操作的合同。冻结快照不冻结授权：服务被移除、当前根角色授权被撤回或根通道失效后，目录、合同与调用均按当前原因拒绝；仍获授权的旧操作沿原快照对账，缺少权限时请求恢复实际访问条件。
 
 核验先用初始化与发现确认连接，连接测试只做这两项；业务动作按实际研究授权有界进行，未知副作用先对账。所选路线仍不可用或答复不足时，保留真实失败与限制，并沿既有 successor HumanRequest 说明还缺什么；具备实际可行依据后继续原研究。重复答复沿原幂等身份对账，已消费的 waiter 保留原恢复事实。

@@ -1,0 +1,32 @@
+[
+  {
+    "path": "src/meta_research/external_mcp.py",
+    "full_suite_sha256": "fcbafe77de770ae577214b1a53f42b30ad3dcbe92d92c2c34378751897fc8d7d",
+    "final_sha256": "0012e13b9d4428da839dce931051eaf21cb13e5fb12754499732e0b9f0a703f3"
+  },
+  {
+    "path": "src/meta_research/research_content.py",
+    "full_suite_sha256": "76d32c4caa0f2a47f3183c838dd4b2e6e2aa7aea6f09ee65c88f8c8d401196e2",
+    "final_sha256": "28ae07ad0fe5adfefb2544ce6f1b8cd87386d44176e953a8008d1f751e224ccc"
+  },
+  {
+    "path": "src/meta_research/semantic_mcp.py",
+    "full_suite_sha256": "35df1fda7e0970ce7999031bf2479cb56d7c2faa71df20a378fccff05ecc61d9",
+    "final_sha256": "8af8984084ef5ea462d4663657837344c0021cebb32288602c850215ea262f51"
+  },
+  {
+    "path": "src/meta_research/skills/plan_stage/references/contract.md",
+    "full_suite_sha256": "455073d54b417f442ec729d869f2344c862ffce594a8ac482b33ed0a1eaa4127",
+    "final_sha256": "28dfe058842dceac4945877ea4889ac1f306c257198b06c27b0a83e9daf9cb02"
+  },
+  {
+    "path": "src/meta_research/skills/plan_stage/references/owner-operations.md",
+    "full_suite_sha256": "10c98b804e1a7d4d2b8c904a52815a9e690df7a5e94ed252628ec5fe19ab638c",
+    "final_sha256": "9d3027d9f815a9df8c0821e96a701141fd2c61e69db79fea37c7abe40be38319"
+  },
+  {
+    "path": "src/meta_research/tool_navigation.py",
+    "full_suite_sha256": "b27d537ad370accc7b27e03e2010928b07153172d4d020e3876f362effb3aa74",
+    "final_sha256": "a820ba42808fb5f8c7aa2a71d99bdaef2f1df29690825e1710a0d51090b6e275"
+  }
+]

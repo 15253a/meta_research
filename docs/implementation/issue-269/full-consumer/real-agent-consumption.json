@@ -1,0 +1,806 @@
+{
+  "status": "passed",
+  "source_head": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+  "model": "gpt-6.1-sol",
+  "boundary": "Fixture initial state and deterministic platform lease; real admitted Idea unit, real model/CLI and production Owners. Real controlled external MCP subprocess. Not full Cycle or production deployment acceptance.",
+  "scope": {
+    "root_kind": "idea",
+    "run_ref": "idea_run_68173301ee05417f8f81a870678a849a",
+    "attempt_ref": "idea_attempt_5f1c0e29c67a4088927ac04672a33143",
+    "root_session_ref": "idea_session_4cca5ec358994a81ba866ef3da7f8bc7",
+    "fence_ref": "idea_fence_d1894f7574fa4ad082118bc572227a79",
+    "runtime_binding_hash": "8ffe5a4d077aef23868ceceaa954b0356aed1c807c1e819e6134630a8693e944"
+  },
+  "guidance_binding": {
+    "identity": {
+      "root_kind": "idea",
+      "run_ref": "idea_run_68173301ee05417f8f81a870678a849a",
+      "operation_ref": "guidance_op_c775ae3f02a780c7d76bbdef54637a80c172710d27e9845cf7b0a6525cc90251"
+    },
+    "quest_ref": "quest_f6a107dfe35e488fb6c1af2d72be8213",
+    "snapshot_ref": "guidance_snapshot_0363d1ed5d18421795e35abf3aa52e1d",
+    "snapshot_hash": "b6cd005ef704d07c5ad351fa6004abb93f9e5fe0f5b8ef6744aa79e004b69603"
+  },
+  "discovery_session": "01a1bc93-f5fc-72b3-8a69-5f853a769961",
+  "discovery": {
+    "status": "passed",
+    "catalog_calls": 4,
+    "contract_calls": 6,
+    "material_read_sequences": [
+      23
+    ],
+    "feedback_sequences": [
+      24
+    ],
+    "impact_read_sequences": [
+      25
+    ],
+    "workspace_unchanged": true
+  },
+  "direct-reader_session": "01a1bc93-f5fc-72b3-8a69-5f853a769961",
+  "direct_reader": {
+    "status": "passed",
+    "sequence": 33
+  },
+  "repair_session": "01a1bc93-f5fc-72b3-8a69-5f853a769961",
+  "repair": {
+    "status": "passed",
+    "failure_sequence": 37
+  },
+  "workflow_session": "01a1bc93-f5fc-72b3-8a69-5f853a769961",
+  "workflow": {
+    "status": "passed",
+    "owner_writes": 1,
+    "catalog_sequences": [
+      52
+    ],
+    "reconcile_sequences": [
+      53
+    ]
+  },
+  "external_session": "01a1bc93-f5fc-72b3-8a69-5f853a769961",
+  "external": {
+    "status": "passed",
+    "service": "controlled real stdio MCP subprocess",
+    "business_calls": [
+      {
+        "name": "read_temperature",
+        "sensor": "acceptance-269"
+      }
+    ],
+    "call_sequences": [
+      61,
+      62,
+      63,
+      64
+    ]
+  },
+  "native_session_ref": "01a1bc93-f5fc-72b3-8a69-5f853a769961",
+  "initial_semantic_tool_names": [
+    "tools.call",
+    "tools.catalog.page",
+    "tools.contracts.read"
+  ],
+  "current_workspace_count": 1,
+  "http_calls": 65,
+  "source_archive_sha256": "e8ab71ea9c992a60031ceadafb68ea1ebd19a51e4e92df1c86284a61a92dbde3",
+  "source_manifest_files": 948,
+  "cli_http_results_matched": 47,
+  "failed_tool_calls": 3,
+  "root_cli_calls": 47,
+  "child_mcp_calls": 0,
+  "native_commands": [
+    {
+      "file": "cli-02.jsonl",
+      "command": "/bin/bash -lc 'cat working-copy.txt'",
+      "exit_code": 0,
+      "output_sha256": "eec81bd3e3547d7858435709ca0e417eefefb3477fddc56eea1fa77cdee2045a",
+      "working_copy_observed": true
+    },
+    {
+      "file": "cli-02.jsonl",
+      "command": "/bin/bash -lc 'cat /tmp/issue269-agent-hxz4ATcf/source/src/meta_research/skills/references/research-guidance.md /tmp/issue269-agent-hxz4ATcf/source/src/meta_research/skills/references/research-navigation.md /tmp/issue269-agent-hxz4ATcf/source/src/meta_research/skills/references/human-guidance.md /tmp/issue269-agent-hxz4ATcf/source/src/meta_research/skills/references/materials-and-custody.md'",
+      "exit_code": 0,
+      "output_sha256": "39ec04311d25a98b29d0538875678145970f1e57c7d2177e2c581ef42bb1b990",
+      "working_copy_observed": false
+    },
+    {
+      "file": "cli-02.jsonl",
+      "command": "/bin/bash -lc 'cat /tmp/issue269-agent-hxz4ATcf/source/src/meta_research/skills/references/human-guidance.md'",
+      "exit_code": 0,
+      "output_sha256": "987d7d3c076f73ab6be1c039b5d4384cb87c3d64b83d1a9bfb6a561d3d3209c7",
+      "working_copy_observed": false
+    }
+  ],
+  "calls": [
+    {
+      "sequence": 3,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "RG"
+      },
+      "isError": false,
+      "result_sha256": "6878ab9b0ce5e821af2f00909c2f7ee5eef7a212e294a10a14d348232121fa81",
+      "code": null
+    },
+    {
+      "sequence": 4,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "HC"
+      },
+      "isError": false,
+      "result_sha256": "75b8b7885b401942441601992a9fc38d6ec68705da94a02e8b61ade9345110b5",
+      "code": null
+    },
+    {
+      "sequence": 5,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "RG",
+        "topic": "Human Interact"
+      },
+      "isError": false,
+      "result_sha256": "ba341ed58598eadf8c696be470b097dffa9f2f11d4db952c90e593867ae5fdd9",
+      "code": null
+    },
+    {
+      "sequence": 6,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "human_request.read"
+      },
+      "isError": false,
+      "result_sha256": "13dc6090636bb8cabbaccf703e099d4c6193afbe3dce4440221ec8dc360c0447",
+      "code": null
+    },
+    {
+      "sequence": 7,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "human_guidance.read"
+      },
+      "isError": false,
+      "result_sha256": "ffc3c05c4050a22c773aa848d7e9493cf3f2cbc887ada104e257e5e775bf971d",
+      "code": null
+    },
+    {
+      "sequence": 8,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_guidance.read",
+      "arguments": {
+        "operation_id": "human_guidance.read",
+        "arguments": {}
+      },
+      "isError": false,
+      "result_sha256": "d7dc979d418c28be7f1a07a8a0c45613b1c27b43f2bf676d18dbc7a311172dd5",
+      "code": null
+    },
+    {
+      "sequence": 9,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_request.read",
+      "arguments": {
+        "operation_id": "human_request.read",
+        "arguments": {
+          "query": "negative observation",
+          "limit": 16384
+        }
+      },
+      "isError": false,
+      "result_sha256": "91c7cb0e19011dba376cf7ee52a75a2ec1b31f2983c524b67d92a195da388544",
+      "code": null
+    },
+    {
+      "sequence": 10,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_guidance.read",
+      "arguments": {
+        "operation_id": "human_guidance.read",
+        "arguments": {
+          "delivery_ref": "guidance_delivery_044c194fe20241629f7ebf2641f25eeb",
+          "effect_id": "issue269-guidance-read-20261108-1",
+          "limit": 65536
+        }
+      },
+      "isError": false,
+      "result_sha256": "2e932f4b9fd43aa92c7e954146be49622d397647d0f8737ee5b4f8569dd476f0",
+      "code": null
+    },
+    {
+      "sequence": 11,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_request.read",
+      "arguments": {
+        "operation_id": "human_request.read",
+        "arguments": {
+          "entry_kind": "guidance",
+          "query": "negative observation",
+          "limit": 16384
+        }
+      },
+      "isError": false,
+      "result_sha256": "494412b4818540fca1ec19d0f27c5837515b174868e4c506214d416ce8b9132d",
+      "code": null
+    },
+    {
+      "sequence": 12,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "human_guidance.feedback"
+      },
+      "isError": false,
+      "result_sha256": "3b97bb165a9252e32ca917bc2afe4d6300ffcd53d6803f6b46ed682ad1a6ea5d",
+      "code": null
+    },
+    {
+      "sequence": 13,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "research_memory.content.read"
+      },
+      "isError": false,
+      "result_sha256": "933cf08cbc03fd34b9ccac227f813b30bc36d1efeb4693346f5221cf2b6548d2",
+      "code": null
+    },
+    {
+      "sequence": 14,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_request.read",
+      "arguments": {
+        "operation_id": "human_request.read",
+        "arguments": {
+          "constraint_ref": "soft_constraint_c1dbcc720a11433ca8a2e7ce92bb8012",
+          "version_ref": "643534d6e5db33f0e7bc47548baaacbe9e785bca37ffb28cbaf834fa0ac8152a",
+          "limit": 16384
+        }
+      },
+      "isError": false,
+      "result_sha256": "bd72b2f5f1b2876ef5bbc88afb5e359c13e225e4f771b0372c3e0bf9ad45ee11",
+      "code": null
+    },
+    {
+      "sequence": 15,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_request.read",
+      "arguments": {
+        "operation_id": "human_request.read",
+        "arguments": {
+          "request_ref": "human_request_0e20a9d48def4094a14d22b8b33025da:r1",
+          "response_ref": "human_response_3916aa6fd42a4b619a31c2577c10dccd",
+          "version_ref": "3d1ddcc0a716b7d9fbb1577ea71dbcbbaf070d965b44bf611152bc6540241879",
+          "offset": 0,
+          "limit": 8192
+        }
+      },
+      "isError": false,
+      "result_sha256": "cd440fe6745b53191bbb42b10f57fbe3f929a584d1fd78a9122bf581e3784945",
+      "code": null
+    },
+    {
+      "sequence": 16,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_request.read",
+      "arguments": {
+        "operation_id": "human_request.read",
+        "arguments": {
+          "request_ref": "human_request_0e20a9d48def4094a14d22b8b33025da:r1",
+          "version_ref": "307f76038500352b755f5d2d338f606e87e899d291b1f11421218eb50825c2f7",
+          "offset": 0,
+          "limit": 8192
+        }
+      },
+      "isError": false,
+      "result_sha256": "20043c0bff427ce2007104c328e91e8251f8ce57f061dde00ea22e9f19c80f4b",
+      "code": null
+    },
+    {
+      "sequence": 17,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.content.read",
+      "arguments": {
+        "operation_id": "research_memory.content.read",
+        "arguments": {
+          "source_ref": "human_input_735d322867de4f73bb498b8a814edabb",
+          "version_ref": "7419d070a654cd5841f9d5a450bf0dc799bcbecc132aac51f52f22dad43f1432",
+          "limit": 65536
+        }
+      },
+      "isError": false,
+      "result_sha256": "3e5e28cbb305b2e029fac026d60fbe2846a37d8e44b54f7eb61a1afd3954e8b8",
+      "code": null
+    },
+    {
+      "sequence": 18,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.content.read",
+      "arguments": {
+        "operation_id": "research_memory.content.read",
+        "arguments": {
+          "source_ref": "asset_07cc6c8cb38d4310ae2c8021d242aa80",
+          "version_ref": "asset_version_76344cde1c3149a48b227b8d5a7f7f7a",
+          "limit": 65536
+        }
+      },
+      "isError": true,
+      "result_sha256": "c813aadb1728e645b776043fe9f5d62745419cb080e73ae821fd4d95b1ac6c9f",
+      "code": "content_source_unbound"
+    },
+    {
+      "sequence": 19,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "RM",
+        "query": "assets.page"
+      },
+      "isError": false,
+      "result_sha256": "4667578387f20820b9aa617b8efcb869dd365572741318ca80d9e9a6e91c9480",
+      "code": null
+    },
+    {
+      "sequence": 20,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "research_memory.assets.page"
+      },
+      "isError": false,
+      "result_sha256": "fd96ff53780df1e784df5148da7800fd447cac78cbd5624c889fddd16bccd157",
+      "code": null
+    },
+    {
+      "sequence": 21,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.assets.page",
+      "arguments": {
+        "operation_id": "research_memory.assets.page",
+        "arguments": {
+          "query": "negative",
+          "limit": 50
+        }
+      },
+      "isError": false,
+      "result_sha256": "ba1d3018e3e85fae556625896d98bd49bae4eda65177d09a1e7ec05768d6e1a4",
+      "code": null
+    },
+    {
+      "sequence": 22,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.assets.page",
+      "arguments": {
+        "operation_id": "research_memory.assets.page",
+        "arguments": {
+          "limit": 50
+        }
+      },
+      "isError": false,
+      "result_sha256": "2c7b50e90efc427b5e008f6c815907345d864b2700f5764f268821b82e077ca6",
+      "code": null
+    },
+    {
+      "sequence": 23,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.content.read",
+      "arguments": {
+        "operation_id": "research_memory.content.read",
+        "arguments": {
+          "source_ref": "asset_version_76344cde1c3149a48b227b8d5a7f7f7a",
+          "version_ref": "asset_version_76344cde1c3149a48b227b8d5a7f7f7a",
+          "limit": 65536
+        }
+      },
+      "isError": false,
+      "result_sha256": "a327be597c0eef2a38f42661da1af8c2da34876ace6c491d63d0dc3eb08aef25",
+      "code": null
+    },
+    {
+      "sequence": 24,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_guidance.feedback",
+      "arguments": {
+        "operation_id": "human_guidance.feedback",
+        "arguments": {
+          "delivery_ref": "guidance_delivery_044c194fe20241629f7ebf2641f25eeb",
+          "effect_id": "issue269-guidance-feedback-20261108-1",
+          "understanding": "历史正式指导的准确原文是“Retain the negative observation and distinguish accepted evidence from working guesses.”，力度为3，scope_confirmation=legacy_unconfirmed；本次当前指导读取明确返回 applies_to_work=true、background_only=false、needs_treatment=true。我据此在本次工作保留负面观察，区分已接纳原件、暂定工作笔记和当前请求答复，不将历史指导误作新请求，也不补造历史范围确认。",
+          "changes": "已沿原始主动提交材料的精确版本追到RM保留附件，并完整读取 current 且有 asset_acceptance accepted 回执的 field-notes.txt（asset_version_76344cde1c3149a48b227b8d5a7f7f7a）：ACCEPTED_ORIGINAL_269: the negative control did not reproduce the effect. 已与 working-copy.txt 的“UNACCEPTED_WORKING_COPY_269: tentative 91 percent; not the retained observation.”核对；本次以RM接纳原件交代保留观察，工作副本不能替代它。已分别完整读取当前请求和其真实答复“CURRENT_REPLY_269: instrument recalibration is complete.”，并保留答复注明不替代负面观察的限制。未修改两份材料。",
+          "continuing_work": "继续依照这项适用指导保留精确原件和来源边界，完成本次反馈的实际 treatment/impact 读回并交接。当前校准答复仅作为新的协作输入，进一步调查仍须后续证据；不据此声称负面观察已消失、效果已复现或科学问题已解决。不创建重复请求，不修改Quest目标或完成标准。",
+          "reasons": "RM原件的接纳回执、当前生命周期和完整正文支持其作为保留原始观察；接纳与保管不等同于对科学结论的独立验证。当前答复虽有accepted回复回执，读取仍显示请求open、owner_disposition=null、used_by_owner_evaluation=false，不能声明Owner已完成实质处理或评价。该指导对本次工作的实际影响是保留观察并纠正版本使用边界，没有要求或证据需要改变整体研究目标及完成标准，因此本次目标影响判断为none。",
+          "disposition": "applied",
+          "goal_impact": "none"
+        }
+      },
+      "isError": false,
+      "result_sha256": "2aa61b7521c6c6cb5246537f5688271b9d597268b67b780be6a57178a6741dc0",
+      "code": null
+    },
+    {
+      "sequence": 25,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_guidance.read",
+      "arguments": {
+        "operation_id": "human_guidance.read",
+        "arguments": {
+          "delivery_ref": "guidance_delivery_044c194fe20241629f7ebf2641f25eeb",
+          "effect_id": "issue269-guidance-readback-20261108-1",
+          "limit": 65536
+        }
+      },
+      "isError": false,
+      "result_sha256": "d2773e7d60b33b032e945bc0692234d64ae3feea49f4762806fb72c90e3445e9",
+      "code": null
+    },
+    {
+      "sequence": 26,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_request.read",
+      "arguments": {
+        "operation_id": "human_request.read",
+        "arguments": {
+          "constraint_ref": "soft_constraint_c1dbcc720a11433ca8a2e7ce92bb8012",
+          "version_ref": "643534d6e5db33f0e7bc47548baaacbe9e785bca37ffb28cbaf834fa0ac8152a",
+          "limit": 16384
+        }
+      },
+      "isError": false,
+      "result_sha256": "bd72b2f5f1b2876ef5bbc88afb5e359c13e225e4f771b0372c3e0bf9ad45ee11",
+      "code": null
+    },
+    {
+      "sequence": 27,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_guidance.read",
+      "arguments": {
+        "operation_id": "human_guidance.read",
+        "arguments": {}
+      },
+      "isError": false,
+      "result_sha256": "d7dc979d418c28be7f1a07a8a0c45613b1c27b43f2bf676d18dbc7a311172dd5",
+      "code": null
+    },
+    {
+      "sequence": 28,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "human_guidance.feedback.reconcile"
+      },
+      "isError": false,
+      "result_sha256": "fdf5a0711b356c08a208ed6d99bb0a27c057af9da63637ea7e29fc6c8c39692b",
+      "code": null
+    },
+    {
+      "sequence": 29,
+      "cli_file": "cli-02.jsonl",
+      "tool": "tools.call",
+      "operation": "human_guidance.feedback.reconcile",
+      "arguments": {
+        "operation_id": "human_guidance.feedback.reconcile",
+        "arguments": {
+          "delivery_ref": "guidance_delivery_044c194fe20241629f7ebf2641f25eeb",
+          "effect_id": "issue269-guidance-feedback-20261108-1",
+          "understanding": "历史正式指导的准确原文是“Retain the negative observation and distinguish accepted evidence from working guesses.”，力度为3，scope_confirmation=legacy_unconfirmed；本次当前指导读取明确返回 applies_to_work=true、background_only=false、needs_treatment=true。我据此在本次工作保留负面观察，区分已接纳原件、暂定工作笔记和当前请求答复，不将历史指导误作新请求，也不补造历史范围确认。",
+          "changes": "已沿原始主动提交材料的精确版本追到RM保留附件，并完整读取 current 且有 asset_acceptance accepted 回执的 field-notes.txt（asset_version_76344cde1c3149a48b227b8d5a7f7f7a）：ACCEPTED_ORIGINAL_269: the negative control did not reproduce the effect. 已与 working-copy.txt 的“UNACCEPTED_WORKING_COPY_269: tentative 91 percent; not the retained observation.”核对；本次以RM接纳原件交代保留观察，工作副本不能替代它。已分别完整读取当前请求和其真实答复“CURRENT_REPLY_269: instrument recalibration is complete.”，并保留答复注明不替代负面观察的限制。未修改两份材料。",
+          "continuing_work": "继续依照这项适用指导保留精确原件和来源边界，完成本次反馈的实际 treatment/impact 读回并交接。当前校准答复仅作为新的协作输入，进一步调查仍须后续证据；不据此声称负面观察已消失、效果已复现或科学问题已解决。不创建重复请求，不修改Quest目标或完成标准。",
+          "reasons": "RM原件的接纳回执、当前生命周期和完整正文支持其作为保留原始观察；接纳与保管不等同于对科学结论的独立验证。当前答复虽有accepted回复回执，读取仍显示请求open、owner_disposition=null、used_by_owner_evaluation=false，不能声明Owner已完成实质处理或评价。该指导对本次工作的实际影响是保留观察并纠正版本使用边界，没有要求或证据需要改变整体研究目标及完成标准，因此本次目标影响判断为none。",
+          "disposition": "applied",
+          "goal_impact": "none"
+        }
+      },
+      "isError": false,
+      "result_sha256": "9b03c4c2e10a97c6e7e1eee67ead00753c6de6eeb28723e073ff43b1e2bf4d2b",
+      "code": null
+    },
+    {
+      "sequence": 33,
+      "cli_file": "cli-05.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.content.read",
+      "arguments": {
+        "operation_id": "research_memory.content.read",
+        "arguments": {
+          "source_ref": "asset_version_76344cde1c3149a48b227b8d5a7f7f7a",
+          "version_ref": "asset_version_76344cde1c3149a48b227b8d5a7f7f7a"
+        }
+      },
+      "isError": false,
+      "result_sha256": "a327be597c0eef2a38f42661da1af8c2da34876ace6c491d63d0dc3eb08aef25",
+      "code": null
+    },
+    {
+      "sequence": 37,
+      "cli_file": "cli-08.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.content.read",
+      "arguments": {
+        "operation_id": "research_memory.content.read",
+        "arguments": {
+          "source_ref": "question_5b7a251dd55d41f9aae5638848e58cf9",
+          "version_ref": "inherited-stale-version"
+        }
+      },
+      "isError": true,
+      "result_sha256": "f255975e241f9377636b87ebb00169c4d0b17b3e9e327c0b8edc786d235caf47",
+      "code": "content_version_unbound"
+    },
+    {
+      "sequence": 38,
+      "cli_file": "cli-08.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "research_graph.questions.page"
+      },
+      "isError": false,
+      "result_sha256": "35366820050e75912cc353887f4883b519d379f4b1ee07064a109c3c1645af7f",
+      "code": null
+    },
+    {
+      "sequence": 39,
+      "cli_file": "cli-08.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "RG",
+        "topic": "Question"
+      },
+      "isError": false,
+      "result_sha256": "2bd68e00e0390b2fb66ab8bfc2e169dea6ba78c69ff121776e08374f4aa603b2",
+      "code": null
+    },
+    {
+      "sequence": 40,
+      "cli_file": "cli-08.jsonl",
+      "tool": "tools.call",
+      "operation": "research_graph.questions.page",
+      "arguments": {
+        "operation_id": "research_graph.questions.page",
+        "arguments": {}
+      },
+      "isError": false,
+      "result_sha256": "6fc8afd113fd7123a763f0d38d5068c90f8aa644484d61702d90e67939ccabac",
+      "code": null
+    },
+    {
+      "sequence": 41,
+      "cli_file": "cli-08.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.content.read",
+      "arguments": {
+        "operation_id": "research_memory.content.read",
+        "arguments": {
+          "source_ref": "question_5b7a251dd55d41f9aae5638848e58cf9",
+          "version_ref": "memory_content_14695ab1518c4191b5dd7eade9ebad22"
+        }
+      },
+      "isError": false,
+      "result_sha256": "ee2bbf3bc2e33e7e73fcc53fc1a04b8abe43e5931680d5c9480fb16c51faa77c",
+      "code": null
+    },
+    {
+      "sequence": 45,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "WF"
+      },
+      "isError": false,
+      "result_sha256": "9dc554d29bd8d04bc7d394f9d31beef87d9d84552bf60f4dc0fc6c982f6d9872",
+      "code": null
+    },
+    {
+      "sequence": 46,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "WF",
+        "topic": "Unknown outcomes and recovery"
+      },
+      "isError": false,
+      "result_sha256": "7e186e82520203d5ffc0480090d5deb13f6a06f0abfa3f5d7917169240f80fc9",
+      "code": null
+    },
+    {
+      "sequence": 47,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "RG",
+        "topic": "Literature"
+      },
+      "isError": false,
+      "result_sha256": "830bfc53e15aa698add602bc2a7b1856f2f2f9883224fcba289ebaa40c30a940",
+      "code": null
+    },
+    {
+      "sequence": 48,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "research_memory.literature.register.reconcile"
+      },
+      "isError": false,
+      "result_sha256": "40d4742afe31289adf52d790e3645f4408e90c30815ec6515ac9405048ddc558",
+      "code": null
+    },
+    {
+      "sequence": 49,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "research_memory.literature.read"
+      },
+      "isError": false,
+      "result_sha256": "198726e5cab0348c15d8dbcfe5d69ebb252616e2cbcb3b81aa563f8915a1ee25",
+      "code": null
+    },
+    {
+      "sequence": 50,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.contracts.read",
+      "operation": "tools.contracts.read",
+      "arguments": {
+        "operation_id": "research_memory.literature.register"
+      },
+      "isError": false,
+      "result_sha256": "21909aea06476deed9a56d69b0e5109053b17eae2620752b161f96cef3cdedb0",
+      "code": null
+    },
+    {
+      "sequence": 51,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.literature.register",
+      "arguments": {
+        "operation_id": "research_memory.literature.register",
+        "arguments": {
+          "effect_id": "issue269-original-effect",
+          "record_ref": "doi:10.1000/issue269-acceptance",
+          "title": "Isolated catalog acceptance metadata",
+          "source": "Controlled acceptance; metadata only",
+          "fulltext_status": "missing"
+        }
+      },
+      "isError": true,
+      "result_sha256": "91d46c138eaae7f6079d3afb6368b60b23523ec98d711e7c47224bad7e643b75",
+      "code": "semantic_output_schema_mismatch"
+    },
+    {
+      "sequence": 52,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.catalog.page",
+      "operation": "tools.catalog.page",
+      "arguments": {
+        "purpose": "WF",
+        "query": "research_memory.literature.register.reconcile"
+      },
+      "isError": false,
+      "result_sha256": "44f986b66536c835483fc3c28ec480f555b83002f29121f9182c07f362c87778",
+      "code": null
+    },
+    {
+      "sequence": 53,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.literature.register.reconcile",
+      "arguments": {
+        "operation_id": "research_memory.literature.register.reconcile",
+        "arguments": {
+          "effect_id": "issue269-original-effect"
+        }
+      },
+      "isError": false,
+      "result_sha256": "f1e09d20b2034d94d7af2a8cc00d52683bd74b2ab3733778be2c09085e299206",
+      "code": null
+    },
+    {
+      "sequence": 54,
+      "cli_file": "cli-11.jsonl",
+      "tool": "tools.call",
+      "operation": "research_memory.literature.read",
+      "arguments": {
+        "operation_id": "research_memory.literature.read",
+        "arguments": {
+          "literature_ref": "literature_bfbcb8f1728d4c719b4f9cee772089a1"
+        }
+      },
+      "isError": false,
+      "result_sha256": "f1e09d20b2034d94d7af2a8cc00d52683bd74b2ab3733778be2c09085e299206",
+      "code": null
+    },
+    {
+      "sequence": 61,
+      "cli_file": "cli-14.jsonl",
+      "tool": "external_tools_catalog",
+      "operation": "external_tools_catalog",
+      "arguments": {},
+      "isError": false,
+      "result_sha256": "a90c9a402ab38aabcaac31147d7b0ce1b1ec1852265de1bdb3a3f561a1c94426",
+      "code": null
+    },
+    {
+      "sequence": 62,
+      "cli_file": "cli-14.jsonl",
+      "tool": "external_tools_catalog",
+      "operation": "external_tools_catalog",
+      "arguments": {
+        "service_id": "lab"
+      },
+      "isError": false,
+      "result_sha256": "9bd1c511cc1fa8795def5a22d2abb08471ea06b7ed5201e474d4004640d726e1",
+      "code": null
+    },
+    {
+      "sequence": 63,
+      "cli_file": "cli-14.jsonl",
+      "tool": "external_tools_contract",
+      "operation": "external_tools_contract",
+      "arguments": {
+        "name": "external_lab__d9bb808376a72bdf0896"
+      },
+      "isError": false,
+      "result_sha256": "8844e2b8dbd79e0cf70eb797ef8f66fa103f17d88c3cfb18125884050bf015ff",
+      "code": null
+    },
+    {
+      "sequence": 64,
+      "cli_file": "cli-14.jsonl",
+      "tool": "external_tools_call",
+      "operation": "external_tools_call",
+      "arguments": {
+        "name": "external_lab__d9bb808376a72bdf0896",
+        "arguments": {
+          "sensor": "acceptance-269"
+        }
+      },
+      "isError": false,
+      "result_sha256": "d3f75c192d61c36856888e4c7f2f02866bddaa13623c20ac51f1009644cf465e",
+      "code": null
+    }
+  ],
+  "cleanup": {
+    "temporary_auth_remaining": 0,
+    "root": "/tmp/issue269-agent-hxz4ATcf"
+  },
+  "raw_evidence": "D:\\meta_research\\test\\Funtation_model\\.issue-269\\consumer-final01",
+  "provider_surface_basis": "Installed CLI requested these actual MCP initialize/list results, then its completed tool events match every HTTP argument and result; no raw Responses request capture is claimed."
+}

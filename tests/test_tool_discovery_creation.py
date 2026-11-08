@@ -35,12 +35,16 @@ def test_protected_creation_can_load_its_readers_contract_without_research_grant
             }))
             assert 'UTF-8 byte offsets' in contract['returns']
             assert 'content_version_unbound' in contract['errors']['operation_codes']
-            catalog = _structured(call('tools.catalog.page', {}))
+            catalog = _structured(call('tools.catalog.page', {'view': 'operations'}))
             assert {item['operation_id'] for item in catalog['items']} == set(access.operation_ids)
             assert call('tools.contracts.read', {
                 'operation_id': 'research_graph.datasets.register',
             })['structuredContent']['code'] == 'capability_unavailable'
             assert call('research_graph.datasets.register', {})['structuredContent']['code'] == 'capability_unavailable'
+            assert call('tools.call', {'operation_id': 'research_workspace.materials.discover',
+                                      'arguments': {'reference_ref': reference['reference_ref']}})['isError'] is False
+            assert call('tools.call', {'operation_id': 'research_graph.datasets.register',
+                                      'arguments': {}})['structuredContent']['code'] == 'capability_unavailable'
     finally:
         if work is not None:
             work.fail()

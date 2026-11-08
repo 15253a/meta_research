@@ -12,6 +12,9 @@ from meta_research import __version__
 from meta_research.owners.common import canonical_hash, new_ref
 from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
 from meta_research.work_material_contract import RUNTIME_MATERIAL_OPERATION_IDS
+from meta_research.tool_navigation import (
+    PURPOSES, call_tool, common_operations, operation_summary, purpose_overview, purpose_paths,
+)
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -457,8 +460,10 @@ class SemanticMcpGateway:
                         "通过本服务的高层语义操作读取或改变 Owner 权威状态；其他研究工作按当前授予的原生工具和阶段规则进行。"
                         "以对应 Owner 验证的接纳事实与真实回执确认结果；工具可见或普通执行成功不扩大授权，也不替代领域接纳。"
                         "工具调用失败以 isError=true 和 structuredContent.code 为准，可选 details 保留具体诊断与原操作对账信息；正常 Owner status 仍是业务状态。"
-                        "按需使用 tools.catalog.page 与 tools.contracts.read；已知 reader 可直接调用，无需先发现。"
+                        "沿本次 tools/list 提供的入口操作：有用途目录时用 tools.catalog.page 展开，再按需 tools.contracts.read；已知 reader 可直接调用，或用 tools.call(operation_id, arguments)，无需先发现。"
                         "capability_unavailable 表示操作未注册、未获授或当前服务不可用；content_version_unbound 表示本次精确版本在当前范围未绑定，不表示全库不存在。"
+                        "近期 workspace 沿宿主提供的实际路径与读写范围使用原生文件/shell；外部 MCP 沿宿主当前提供的服务入口。\n"
+                        + json.dumps(self._overview(context), ensure_ascii=False)
                     ),
                 },
             }
@@ -469,10 +474,7 @@ class SemanticMcpGateway:
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "tools": [
-                        self._operations[item].tool() for item in operation_ids
-                        if self._unavailable_reason(item, context) is None
-                    ]
+                    "tools": self._provider_tools(context)
                 },
             }
         if method != "tools/call":
@@ -484,6 +486,15 @@ class SemanticMcpGateway:
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
             return 200, _jsonrpc_error(request_id, -32602, "invalid_params")
+        if operation_id == "tools.call":
+            problem = _schema_problem(arguments, call_tool()["inputSchema"])
+            if problem is not None:
+                return 200, {"jsonrpc": "2.0", "id": request_id,
+                             "result": _tool_error("semantic_input_schema_mismatch", problem)}
+            # Select the original identity before all existing authorization,
+            # validation and dispatch. Never recurse or create an effect identity.
+            operation_id = str(arguments["operation_id"])
+            arguments = arguments["arguments"]
         operation = self._operations.get(operation_id)
         if operation is None or operation_id not in operation_ids:
             return 200, {
@@ -574,11 +585,14 @@ class SemanticMcpGateway:
         return (
             SemanticOperation(
                 "tools.catalog.page", "harness",
-                "Page currently granted, available semantic operations. Use query or owning_module to narrow the list. "
+                "Start with currently available research purposes and a few common operations. Select purpose/topic to expand relevant operations; query searches directly; view=operations enumerates all granted operations. "
                 "Continue using next_offset and catalog_hash from this page; tool_catalog_changed requires restarting at offset 0. "
                 "Discovery grants no permission and is never required before a known reader call.",
                 self._catalog_page,
                 {"type": "object", "additionalProperties": False, "properties": {
+                    "purpose": {"type": "string", "enum": list(PURPOSES), "description": "Research purpose from the overview; expands only this purpose's registered operations."},
+                    "topic": {"type": "string", "minLength": 1, "description": "Exact topic from a purpose page, e.g. Human Interact or Literature."},
+                    "view": {"type": "string", "enum": ["overview", "operations"], "description": "Default overview without filters; operations explicitly enumerates all granted operations."},
                     "offset": {"type": "integer", "minimum": 0, "default": 0,
                                "description": "Entry offset. A nonzero offset requires this filtered page's catalog_hash."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20,
@@ -594,7 +608,7 @@ class SemanticMcpGateway:
                  "properties": {"items": {"type": "array", "items": {"type": "object"}},
                     "offset": {"type": "integer"}, "next_offset": {"type": ["integer", "null"]},
                     "total": {"type": "integer"}, "catalog_hash": {"type": "string"}}},
-                return_description="items are compact summaries ordered by operation_id. next_offset=null ends this filtered catalog; total counts available operations only.",
+                return_description="The overview returns purposes with callable readers and a few common items, not all operations. A purpose/filter or view=operations returns compact operation summaries and related topics. next_offset=null ends that view; total counts available operations in the selected scope. Preserve all filters/view and catalog_hash on continuation.",
                 error_descriptions={"tool_catalog_changed": "A continuation omitted its hash or the grant, filters or available contracts changed. Restart from offset 0."}),
             SemanticOperation(
                 "tools.contracts.read", "harness",
@@ -605,18 +619,43 @@ class SemanticMcpGateway:
                 {"type": "object", "additionalProperties": False, "required": ["operation_id"],
                  "properties": {"operation_id": {"type": "string", "minLength": 1, "maxLength": 256}}},
                 {"type": "object", "required": ["operation_id", "name", "inputSchema", "outputSchema", "returns", "errors"]},
-                return_description="Returns the same live tool schema and description as tools/list plus operation ownership, mode, reconciliation, return and error documentation.",
+                return_description="Returns the registered operation's exact input/output schema and description plus ownership, mode, reconciliation, return and error documentation. Call its unchanged identity through tools.call or directly through MCP tools/call.",
                 error_descriptions={"capability_unavailable": "details.reason distinguishes not_registered, not_granted and the current service's unavailable reason; no hidden contract is returned."}),
         )
+
+    def _available_operations(self, context: SemanticCallContext):
+        return [operation for name, operation in self._operations.items()
+                if self._unavailable_reason(name, context) is None]
+
+    def _overview(self, context: SemanticCallContext) -> dict[str, object]:
+        operations = self._available_operations(context)
+        if not set(TOOL_DISCOVERY_OPERATION_IDS) <= {op.semantic_operation_id for op in operations}:
+            return {}
+        return {"purposes": purpose_overview(operations), "common_operations": common_operations(operations)}
+
+    def _provider_tools(self, context: SemanticCallContext) -> list[dict[str, object]]:
+        operations = self._available_operations(context)
+        names = {op.semantic_operation_id for op in operations}
+        if set(TOOL_DISCOVERY_OPERATION_IDS) <= names:
+            return [self._operations[name].tool() for name in TOOL_DISCOVERY_OPERATION_IDS] + [call_tool()]
+        # Narrow host channels (e.g. the recorder's one read-only source) have
+        # no discovery grant. Keep their actual contracts directly usable.
+        return [operation.tool() for operation in operations]
 
     def _catalog_page(self, context: SemanticCallContext, arguments: dict[str, object]) -> dict[str, object]:
         query = str(arguments.get("query", "")).casefold()
         module = arguments.get("owning_module")
-        operations = [operation for name, operation in self._operations.items()
-                      if self._unavailable_reason(name, context) is None
+        purpose, topic = arguments.get("purpose"), arguments.get("topic")
+        available = self._available_operations(context)
+        operations = [operation for operation in available
+                      if (purpose is None or any(p == purpose for p, _ in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)))
+                      and (topic is None or any(t == topic and (purpose is None or p == purpose)
+                           for p, t in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)))
                       and (module is None or operation.owning_module == module)
-                      and query in (name + " " + operation.owning_module + " " + operation.description).casefold()]
+                      and query in (operation.semantic_operation_id + " " + operation.owning_module + " " + operation.description).casefold()]
+        view = arguments.get("view", "operations" if purpose or topic or query or module else "overview")
         catalog_hash = canonical_hash({"grant": context.channel_grant_ref, "query": query, "owning_module": module,
+            "purpose": purpose, "topic": topic, "view": view,
             "registered_catalog": self._catalog_hash,
             "operations": [operation.semantic_operation_id for operation in operations]})
         offset, limit = int(arguments.get("offset", 0)), int(arguments.get("limit", 20))
@@ -625,11 +664,14 @@ class SemanticMcpGateway:
         expected = arguments.get("catalog_hash")
         if (offset > 0 and expected is None) or (expected is not None and expected != catalog_hash):
             raise SemanticMcpError("tool_catalog_changed", {"restart_offset": 0})
-        return {"items": [{"operation_id": operation.semantic_operation_id,
-                           "owning_module": operation.owning_module,
-                           "access_mode": operation.access_mode,
-                           "summary": operation.description.split(". ", 1)[0]}
-                          for operation in operations[offset:offset + limit]],
+        if view == "overview":
+            return {"purposes": purpose_overview(operations), "items": common_operations(operations),
+                    "offset": 0, "next_offset": None, "total": len(operations), "catalog_hash": catalog_hash}
+        topics = sorted({t for operation in operations for p, t in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)
+                         if p == purpose}) if purpose else []
+        return {"items": [operation_summary(operation) for operation in operations[offset:offset + limit]],
+                "topics": [{"topic": value, "reader": {"operation": "tools.catalog.page", "arguments": {"purpose": purpose, "topic": value}}}
+                           for value in topics],
                 "offset": offset, "next_offset": offset + limit if offset + limit < len(operations) else None,
                 "total": len(operations), "catalog_hash": catalog_hash}
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tool_catalog_helpers import catalog_operations
+
 from pathlib import Path
 
 import pytest
@@ -85,9 +87,8 @@ def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
         assert status == 200
         assert response is not None
         tools = response["result"]["tools"]
-        assert [item["name"] for item in tools] == list(
-            BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
-        )
+        assert {item["name"] for item in tools} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+        assert {item["operation_id"] for item in catalog_operations(runtime.harnesses.dispatch_mcp, channel.connection.token)} == set(BUNDLE_ROOT_SEMANTIC_OPERATION_IDS)
 
         with pytest.raises(
             HarnessAdmissionError, match="mcp_channel_scope_invalid"

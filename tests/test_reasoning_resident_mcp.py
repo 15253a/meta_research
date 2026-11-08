@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tool_catalog_helpers import catalog_operations
+
 from dataclasses import replace
 from pathlib import Path
 
@@ -314,9 +316,8 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
         )
         assert status == 200
         assert response is not None
-        assert [
-            tool["name"] for tool in response["result"]["tools"]
-        ] == list(REASONING_ROOT_SEMANTIC_OPERATION_IDS)
+        assert {tool["name"] for tool in response["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+        assert {item["operation_id"] for item in catalog_operations(runtime.harnesses.dispatch_mcp, channel.connection.token)} == set(REASONING_ROOT_SEMANTIC_OPERATION_IDS)
 
         # Exercise the public provider adapter with the live Harness binding,
         # not the older hand-built eight-field binding used by unit fixtures.

@@ -1,4 +1,6 @@
 """#270 exact Literature readers coexist with #271 read-only Companion grants."""
+
+from tool_catalog_helpers import catalog_operations
 from meta_research.composition import build_production_runtime
 from meta_research.paths import prepare_data_root
 from meta_research.semantic_mcp import SemanticCallContext
@@ -39,7 +41,8 @@ def test_production_companion_reads_exact_other_quest_literature_but_cannot_writ
         companion = _channel(runtime, _external_context(_scope(runtime, quest_ref=current)))
         _, listing, _ = runtime.harnesses.dispatch_mcp_http(companion.connection.token,
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, mcp_session_id=None)
-        names = {item["name"] for item in listing["result"]["tools"]}
+        assert {item["name"] for item in listing["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+        names = {item["operation_id"] for item in catalog_operations(runtime.harnesses.dispatch_mcp, companion.connection.token)}
         assert {"research_memory.literature.page", "research_memory.literature.read", "assistant.content.generate"} <= names
         assert not {"research_memory.literature.register", "research_memory.literature.reference",
             "research_memory.literature.register.reconcile", "research_memory.literature.reference.reconcile"} & names

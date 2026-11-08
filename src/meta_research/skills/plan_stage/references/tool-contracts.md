@@ -4,7 +4,7 @@
 
 ## 当前工具入口
 
-按需用 `tools.catalog.page` 发现本根当前可用的操作，以 `tools.contracts.read(operation_id)` 读取准确 schema、返回及错误说明；分页和授权变化的处理见[当前获授工具与准确入口](../../references/research-navigation.md#当前获授工具与准确入口)。`tools/list` 仍提供本根当前可用的操作与 schema；已知 reader 可直接调用。RG、RM、RW、WF、HC 是研究用途分组，不构成新的 Owner。下面保留研究用途与读取语义，参数范围以当前合同为准。
+按任务需要从用途概览展开相关操作，以 `tools.contracts.read(operation_id)` 取得准确合同，再用 `tools.call(operation_id, arguments)` 执行；已知 reader 可直接调用。发现、分页与当前授权见[当前获授工具与准确入口](../../references/research-navigation.md#当前获授工具与准确入口)。下面说明研究用途与读取语义，参数范围以当前合同为准。
 
 | 需要 | 当前入口和边界 |
 | --- | --- |
@@ -33,9 +33,9 @@ Plan 接受 TargetCommit、HumanInput、ScientificOutcome、AssetVersion 和 Lit
 
 每次业务输入保留同一请求绑定的 Cycle／Plan／focus 定位；已有科学输入不从 latest 补造。原生同根继续研究、独立审阅、聚合和修订，收到正式反馈后只重审实际受影响工作。Harness 维持适用指令、工具、权限和 schema；引用的资源读不到时报告准确文件与影响，不退回另一版文案。
 
-## 原生工作文件与待接通范围
+## 原生工作文件
 
-普通文件沿本次实际给出的目录和授权使用原生工具。当前路径绑定、HumanRequest 材料递交与 inbox 的现有职责继续使用；当前及前两轮的完整路径、旧普通文件包装退出和窗口外条件回收由 #268 接通。不要根据目标生命周期假定未提供目录已可访问，或代系统清理历史。正式保管原件沿 RM 精确版本，研究关系沿 RG，协作按 HC，工作接续按实际 WF 入口。
+普通文件沿宿主提供的当前及前两轮实际目录、工作归属与读写范围，用原生文件／shell 按需查找。自己的工作空间与 RM 正式版本分别使用；HumanRequest 材料递交与 inbox 保留原归属。目录与 Session 回收由宿主按实际窗口和恢复依赖处理，Agent 不代系统清理历史。准确版本和回复材料的用法见[当前工作目录与回复材料](../../references/materials-and-custody.md#当前工作目录与回复材料)。
 
 ## 求助、回复与有效指导
 

@@ -35,8 +35,9 @@ def test_bundle_review_channel_discovers_only_its_grant_and_revocation_is_live(t
                                   arguments=arguments, request_id=10)
 
             # A known reader works before either discovery operation is called.
+            assert call("tools.call", {"operation_id": "research_graph.datasets.page", "arguments": {}})["isError"] is False
             assert call("research_graph.datasets.page", {})["isError"] is False
-            catalog = _structured(call("tools.catalog.page", {}))
+            catalog = _structured(call("tools.catalog.page", {"view": "operations"}))
             assert {item["operation_id"] for item in catalog["items"]} == set(operations)
             listed = client.post("/mcp", headers=headers, json={
                 "jsonrpc": "2.0", "id": 11, "method": "tools/list",
@@ -46,13 +47,20 @@ def test_bundle_review_channel_discovers_only_its_grant_and_revocation_is_live(t
             contract = _structured(call("tools.contracts.read", {
                 "operation_id": "research_graph.datasets.page",
             }))
-            assert contract["inputSchema"] == tools["research_graph.datasets.page"]["inputSchema"]
-            assert contract["outputSchema"] == tools["research_graph.datasets.page"]["outputSchema"]
+            assert set(tools) == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+            assert contract["inputSchema"]["type"] == "object"
+            assert contract["outputSchema"]["type"] == "object"
+            invalid = call("tools.call", {"operation_id": "research_graph.datasets.page",
+                                         "arguments": {"limit": 0}})
+            assert invalid["structuredContent"]["code"] == "semantic_input_schema_mismatch"
+            assert call("tools.call", {"operation_id": "research_graph.datasets.page",
+                                       "arguments": {"limit": 1}})["isError"] is False
 
             # The full root has this effect; the review channel never inherits it.
             for name, arguments in (
                 ("tools.contracts.read", {"operation_id": "research_graph.datasets.register"}),
                 ("research_graph.datasets.register", {}),
+                ("tools.call", {"operation_id": "research_graph.datasets.register", "arguments": {}}),
             ):
                 denied = call(name, arguments)
                 assert denied["isError"] is True
@@ -63,6 +71,7 @@ def test_bundle_review_channel_discovers_only_its_grant_and_revocation_is_live(t
                 ("tools.catalog.page", {}),
                 ("tools.contracts.read", {"operation_id": "research_graph.datasets.page"}),
                 ("research_graph.datasets.page", {}),
+                ("tools.call", {"operation_id": "research_graph.datasets.page", "arguments": {}}),
             ):
                 revoked = client.post("/mcp", headers=headers, json={
                     "jsonrpc": "2.0", "id": 12, "method": "tools/call",
@@ -86,20 +95,19 @@ def test_bundle_discovery_tracks_human_wait_and_same_root_resume(tmp_path):
                 return _tool_call(client, headers, operation_id=name,
                                   arguments=arguments, request_id=20)
 
-            before = _structured(call("tools.catalog.page", {"limit": 100}))
+            before = _structured(call("tools.catalog.page", {"view": "operations", "limit": 100}))
             before_ids = {item["operation_id"] for item in before["items"]}
-            first_page = _structured(call("tools.catalog.page", {"limit": 1}))
+            first_page = _structured(call("tools.catalog.page", {"view": "operations", "limit": 1}))
             assert first_page["next_offset"] == 1
             reader = "research_graph.datasets.page"
             assert reader in before_ids
-            opened = _structured(call("human_request.open", _open_arguments(
-                "wait-for-required-material", "offline_action",
-            )))
+            opened = _structured(call("tools.call", {"operation_id": "human_request.open",
+                "arguments": _open_arguments("wait-for-required-material", "offline_action")}))
             assert opened["operation_binding"]["task_ref"] == run.run_ref
             assert opened["condition"]["request_status"] == "open"
             assert opened["task_yield"]["status"] == "yielded"
 
-            waiting = _structured(call("tools.catalog.page", {"limit": 100}))
+            waiting = _structured(call("tools.catalog.page", {"view": "operations", "limit": 100}))
             waiting_ids = {item["operation_id"] for item in waiting["items"]}
             assert waiting_ids < before_ids
             assert {"tools.catalog.page", "tools.contracts.read",
@@ -108,6 +116,7 @@ def test_bundle_discovery_tracks_human_wait_and_same_root_resume(tmp_path):
             assert "human_request.open" not in waiting_ids
             assert waiting["catalog_hash"] != before["catalog_hash"]
             stale_page = call("tools.catalog.page", {
+                "view": "operations",
                 "offset": first_page["next_offset"], "limit": 1,
                 "catalog_hash": first_page["catalog_hash"],
             })
@@ -117,7 +126,7 @@ def test_bundle_discovery_tracks_human_wait_and_same_root_resume(tmp_path):
                 "jsonrpc": "2.0", "id": 22, "method": "tools/list",
             })
             assert listed.status_code == 200
-            assert {tool["name"] for tool in listed.json()["result"]["tools"]} == waiting_ids
+            assert {tool["name"] for tool in listed.json()["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
             contract = _structured(call("tools.contracts.read", {
                 "operation_id": "human_request.open.reconcile",
             }))
@@ -127,12 +136,19 @@ def test_bundle_discovery_tracks_human_wait_and_same_root_resume(tmp_path):
             assert denied_contract["structuredContent"]["code"] == "capability_unavailable"
             denied_reader = client.post("/mcp", headers=headers, json={
                 "jsonrpc": "2.0", "id": 21, "method": "tools/call",
-                "params": {"name": reader, "arguments": {}},
+                "params": {"name": "tools.call", "arguments": {"operation_id": reader, "arguments": {}}},
             })
             assert denied_reader.status_code == 401
-            reconciled = _structured(call("human_request.open.reconcile", {
-                "effect_id": "wait-for-required-material",
-            }))
+            for invalid_identity in ([], {}, None):
+                malformed = client.post("/mcp", headers=headers, json={
+                    "jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                    "params": {"name": "tools.call", "arguments": {
+                        "operation_id": invalid_identity, "arguments": {}}},
+                })
+                assert malformed.status_code == 401
+                assert malformed.json()["error"]["code"] == "mcp_channel_authentication_required"
+            reconciled = _structured(call("tools.call", {"operation_id": "human_request.open.reconcile",
+                "arguments": {"effect_id": "wait-for-required-material"}}))
             assert reconciled["request_ref"] == opened["request_ref"]
 
             # A real HC response releases this exact root without inventing a new grant.
@@ -143,8 +159,9 @@ def test_bundle_discovery_tracks_human_wait_and_same_root_resume(tmp_path):
                 idempotency_key="resume-discovery-root",
             )
             assert response["decision"] == "deferred"
-            resumed = _structured(call("tools.catalog.page", {"limit": 100}))
+            resumed = _structured(call("tools.catalog.page", {"view": "operations", "limit": 100}))
             assert {item["operation_id"] for item in resumed["items"]} == before_ids
             assert call(reader, {})["isError"] is False
+            assert call("tools.call", {"operation_id": reader, "arguments": {}})["isError"] is False
     finally:
         runtime.close()

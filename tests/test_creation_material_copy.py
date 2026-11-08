@@ -1,6 +1,7 @@
 import hashlib
 import os
 
+from tool_catalog_helpers import catalog_operations
 from fastapi.testclient import TestClient
 import pytest
 
@@ -44,7 +45,8 @@ def test_requested_copy_is_independent_bounded_and_replay_preserves_edits(tmp_pa
             response = client.post("/mcp", headers=mcp_headers,
                 json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
             assert response.status_code == 200, response.text
-            assert {tool["name"] for tool in response.json()["result"]["tools"]} == set(CREATION_MATERIAL_OPERATION_IDS)
+            assert {tool["name"] for tool in response.json()["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+            assert set(CREATION_MATERIAL_OPERATION_IDS) <= {item["operation_id"] for item in catalog_operations(runtime.harnesses.dispatch_mcp, access.token)}
             class Connection:
                 token = access.token
             connection = Connection()

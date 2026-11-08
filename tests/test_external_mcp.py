@@ -35,6 +35,112 @@ def request(method, **parameters):
     return {"jsonrpc": "2.0", "id": 1, "method": method, "params": parameters}
 
 
+def test_progressive_service_discovery_contract_and_real_call(tmp_path):
+    runtime = configured(tmp_path, allowed_root_kinds=["idea"])
+    snapshot = runtime.operation_snapshot(operation_identity="progressive", root_kind="idea", task_prompt="Read a temperature")
+    context = json.loads(split_external_mcp_prompt(compose_external_mcp_prompt("Read a temperature", snapshot))[0])
+    assert "inputSchema" not in json.dumps(context)
+    assert "Frozen" in context["availability"]
+    with runtime.channel(snapshot) as access:
+        def call(name, arguments):
+            return runtime.dispatch_http(access.token, request("tools/call", name=name, arguments=arguments))[1]
+        tools = runtime.dispatch_http(access.token, request("tools/list"))[1]["result"]["tools"]
+        assert {tool["name"] for tool in tools} == {"external_tools_catalog", "external_tools_contract", "external_tools_call"}
+        overview = call("external_tools_catalog", {})["result"]["structuredContent"]
+        assert overview["services"][0]["service_id"] == "lab"
+        page = call("external_tools_catalog", {"service_id": "lab"})["result"]["structuredContent"]
+        summary = next(item for item in page["items"] if "temperature" in item["summary"])
+        contract = call("external_tools_contract", {"name": summary["name"]})["result"]["structuredContent"]
+        assert contract["inputSchema"]["required"] == ["sensor"]
+        assert contract["service_id"] == "lab"
+        assert "host" in contract["errors"]["external_mcp_config_invalid"]
+        invalid = call("external_tools_call", {"name": summary["name"], "arguments": {}})
+        assert invalid["error"]["data"]["code"] == "external_mcp_arguments_invalid"
+        assert invalid["error"]["data"]["path"] == ["sensor"]
+        result = call("external_tools_call", {"name": summary["name"], "arguments": {"sensor": "discovered"}})
+        assert result["result"]["structuredContent"] == {"sensor": "discovered", "temperature": 23.75}
+
+
+@pytest.mark.parametrize("revocation", ["remove", "role"])
+def test_current_service_revocation_overrides_a_frozen_operation(tmp_path, revocation):
+    runtime = configured(tmp_path, allowed_root_kinds=["idea"], research_instructions="Original contract")
+    snapshot = runtime.operation_snapshot(operation_identity="revocable", root_kind="idea", task_prompt="Inspect lab")
+    name = exposed_tool_name("lab", "read_temperature")
+    with runtime.channel(snapshot) as access:
+        def call(tool, arguments):
+            return runtime.dispatch_http(access.token, request("tools/call", name=tool, arguments=arguments))[1]
+        assert call("external_tools_contract", {"name": name})["result"]["structuredContent"]["research_instructions"] == "Original contract"
+        values = [] if revocation == "remove" else [service(tmp_path, allowed_root_kinds=["plan"])]
+        runtime.save_config(services=parse_services(values), expected_revision=runtime.read_config().revision)
+        initialized = runtime.dispatch_http(access.token, request("initialize"))[1]["result"]
+        assert json.loads(initialized["instructions"].split("Current services: ", 1)[1]) == []
+        assert runtime.dispatch_http(access.token, request("tools/list"))[1]["result"] == {"tools": []}
+        assert call("external_tools_catalog", {})["result"]["structuredContent"] == {"services": []}
+        for tool, arguments in [("external_tools_contract", {"name": name}),
+                                ("external_tools_call", {"name": name, "arguments": {"sensor": "denied"}}),
+                                (name, {"sensor": "denied"})]:
+            assert call(tool, arguments)["error"]["message"] == "capability_unavailable"
+    assert runtime.restore_snapshot(snapshot.binding(), root_kind="idea") == snapshot
+    assert not (tmp_path / "calls.jsonl").exists()
+
+
+def test_external_catalog_continuation_and_frozen_contract_with_updated_instructions(tmp_path):
+    runtime = configured(tmp_path, research_instructions="Original instructions")
+    snapshot = runtime.operation_snapshot(operation_identity="page-tools", root_kind="idea", task_prompt="Inspect lab")
+    with runtime.channel(snapshot) as access:
+        def call(tool, arguments):
+            return runtime.dispatch_http(access.token, request("tools/call", name=tool, arguments=arguments))[1]
+        page = call("external_tools_catalog", {"service_id": "lab", "limit": 1})["result"]["structuredContent"]
+        assert page["next_offset"] == 1 and page["total"] == 2
+        missing_hash = call("external_tools_catalog", {"service_id": "lab", "offset": 1})
+        assert missing_hash["error"]["data"]["code"] == "tool_catalog_changed"
+        runtime.save_config(services=parse_services([service(tmp_path, research_instructions="New operation instructions")]), expected_revision=runtime.read_config().revision)
+        continuation = {"service_id": "lab", "offset": 1, "catalog_hash": page["catalog_hash"]}
+        last = call("external_tools_catalog", continuation)["result"]["structuredContent"]
+        assert last["next_offset"] is None
+        assert page["items"][0]["name"] != last["items"][0]["name"]
+        contract = call("external_tools_contract", {"name": page["items"][0]["name"]})["result"]["structuredContent"]
+        assert contract["research_instructions"] == "Original instructions"
+        assert call("external_tools_catalog", {**continuation, "query": "temperature"})["error"]["data"]["code"] == "tool_catalog_changed"
+    assert runtime.dispatch_http(access.token, request("tools/list"))[0] == 401
+
+
+@pytest.mark.parametrize("method", [[], {}, None, 1])
+def test_malformed_protocol_method_is_rejected_without_a_business_call(tmp_path, method):
+    runtime = configured(tmp_path)
+    snapshot = runtime.operation_snapshot(operation_identity="invalid-method", root_kind="idea", task_prompt="Inspect lab")
+    with runtime.channel(snapshot) as access:
+        status, result, _ = runtime.dispatch_http(access.token, request(method))
+        assert status == 400
+        assert result["error"]["code"] == "external_mcp_request_invalid"
+        assert not (tmp_path / "calls.jsonl").exists()
+        assert runtime.dispatch_http(access.token, request("tools/list"))[0] == 200
+
+
+@pytest.mark.parametrize("method", ["initialize", "tools/list", "tools/call"])
+def test_invalid_host_configuration_is_diagnosed_and_original_operation_can_resume(tmp_path, method):
+    runtime = configured(tmp_path)
+    snapshot = runtime.operation_snapshot(operation_identity="configuration-repair", root_kind="idea", task_prompt="Inspect lab")
+    configuration = tmp_path / "external-mcp/config.json"
+    original_configuration = configuration.read_bytes()
+    configuration.write_text("not valid JSON")
+    with runtime.channel(snapshot) as access:
+        parameters = {"name": "external_tools_call", "arguments": {
+            "name": exposed_tool_name("lab", "read_temperature"), "arguments": {"sensor": "after-repair"}}}
+        status, failed, _ = runtime.dispatch_http(access.token, request(method, **(parameters if method == "tools/call" else {})))
+        assert status == 200
+        diagnosis = failed["error"]["data"]
+        assert diagnosis["code"] == "external_mcp_config_invalid"
+        assert diagnosis["category"] == "host_configuration"
+        assert diagnosis["outcome"] == "not_called"
+        assert diagnosis["business_action_attempted"] is False
+        assert "host" in diagnosis["correction"]
+        assert not (tmp_path / "calls.jsonl").exists()
+        configuration.write_bytes(original_configuration)
+        result = runtime.dispatch_http(access.token, request("tools/call", **parameters))[1]["result"]
+        assert result["structuredContent"] == {"sensor": "after-repair", "temperature": 23.75}
+
+
 def test_previous_operation_context_keeps_its_original_prompt_contract():
     snapshot = ExternalMcpOperationSnapshot("a" * 64, "target", "b" * 64, "Original work", (), "c" * 64)
     context, task = split_external_mcp_prompt(compose_external_mcp_prompt("Original work", snapshot))
@@ -46,7 +152,8 @@ def test_previous_operation_context_keeps_its_original_prompt_contract():
 def test_failed_service_discovery_reaches_root_without_stopping_unrelated_work(tmp_path, stage):
     failure_file = tmp_path / "failure.txt"
     failure_file.write_text(stage)
-    failed = service(tmp_path, research_instructions="Use only if this experiment needs a temperature.")
+    instructions = "Use only if this experiment needs a temperature. " + "Lab context. " * 30 + "Ask the operator to restore the sensor before retrying."
+    failed = service(tmp_path, research_instructions=instructions)
     failed["connection"]["environment"]["EXTERNAL_MCP_FAILURE_FILE"] = str(failure_file)
     if stage == "initialize":
         failed["connection"]["command"] = str(tmp_path / "missing-command")
@@ -63,9 +170,17 @@ def test_failed_service_discovery_reaches_root_without_stopping_unrelated_work(t
     assert problem["tools"] == []
     assert context["operation_key"] == snapshot.operation_key
     assert context["root_kind"] == "target"
+    assert instructions not in json.dumps(context)
     with runtime.channel(snapshot) as access:
-        tools = runtime.dispatch_http(access.token, request("tools/list"))[1]["result"]["tools"]
-        assert {tool["name"] for tool in tools} == {exposed_tool_name("other", "read_temperature"), exposed_tool_name("other", "connectivity_action")}
+        recovery = runtime.dispatch_http(access.token, request("tools/call", **problem["reader"]))[1]["result"]["structuredContent"]
+        assert recovery["items"] == [] and recovery["total"] == 0
+        assert recovery["failure"] == problem["failure"]
+        assert recovery["research_instructions"] == instructions
+        assert "human_request.open.reconcile" in recovery["recovery_guidance"]
+        assert "human_request.read" in recovery["recovery_guidance"]
+        assert not (tmp_path / "calls.jsonl").exists()
+        catalog = runtime.dispatch_http(access.token, request("tools/call", name="external_tools_catalog", arguments={"service_id": "other"}))[1]["result"]["structuredContent"]
+        assert {tool["name"] for tool in catalog["items"]} == {exposed_tool_name("other", "read_temperature"), exposed_tool_name("other", "connectivity_action")}
         measured = runtime.dispatch_http(access.token, request("tools/call", name=exposed_tool_name("other", "read_temperature"), arguments={"sensor": "unrelated"}))[1]
         assert measured["result"]["structuredContent"]["temperature"] == 23.75
     failure_file.write_text("")
@@ -110,7 +225,8 @@ def test_direct_search_service_is_independent_and_restores_its_original_connecti
 
 
 @pytest.mark.parametrize("failure_stage", ["tools/call", "initialize"])
-def test_call_failure_identifies_original_work_and_requires_a_verified_repair(tmp_path, failure_stage):
+@pytest.mark.parametrize("projected", [False, True])
+def test_call_failure_identifies_original_work_and_requires_a_verified_repair(tmp_path, failure_stage, projected):
     failure_file = tmp_path / "failure.txt"
     failure_file.write_text("")
     draft = service(tmp_path)
@@ -122,6 +238,8 @@ def test_call_failure_identifies_original_work_and_requires_a_verified_repair(tm
     failure_file.write_text(failure_stage)
     with runtime.channel(snapshot) as access:
         message = request("tools/call", name=exposed_tool_name("lab", "read_temperature"), arguments={"sensor": "A"})
+        if projected:
+            message = request("tools/call", name="external_tools_call", arguments=message["params"])
         failed = runtime.dispatch_http(access.token, message)[1]
         failure = failed["result"]["structuredContent"]["failure"] if "result" in failed else failed["error"]["data"]
         expected = {"service_id": "lab", "service": "Lab instruments", "stage": failure_stage,
@@ -149,8 +267,7 @@ def test_allowed_discovery_call_and_denied_guessed_call(tmp_path):
     assert split_external_mcp_prompt(prompt)[1] == "Inspect lab"
     name = exposed_tool_name("lab", "read_temperature")
     with runtime.channel(snapshot) as access:
-        discovered = runtime.dispatch_http(access.token, request("tools/list"))[1]["result"]["tools"]
-        temperature = next(tool for tool in discovered if tool["name"] == name)
+        temperature = runtime.dispatch_http(access.token, request("tools/call", name="external_tools_contract", arguments={"name": name}))[1]["result"]["structuredContent"]
         assert temperature["description"] == "Read the fixture temperature in Celsius."
         assert temperature["inputSchema"]["required"] == ["sensor"]
         result = runtime.dispatch_http(access.token, request("tools/call", name=name, arguments={"sensor": "A"}))[1]["result"]

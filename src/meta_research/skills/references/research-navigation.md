@@ -69,13 +69,15 @@ HC 保存协作原记录与流程，RG 组织研究关联。HC、系统工作和
 
 目标演化后，回到工作当时的背景，理解什么证据促成了转向、哪些认识在新目标下仍然适用。保留旧目标、历史依据与真实分歧，使新的理解能够解释自己的来路。登记与保管见 [材料与保管](materials-and-custody.md#资源整理与正式登记)。
 
-面向 Agent 的工具按 RG（研究发现与关系）、RM（正文读取与保管）、RW（工作区）、WF（流程与交接）、HC（人类协作）并列组织，外部 MCP、原生文件、shell 和子 Agent 能力共同服务研究。工具分组不要求各自新增后端模块或 MCP 服务；RG、RM、AE、AR、HC 的实现职责仍按既有边界承担。具体操作沿本次实际获授能力、准确入口和合同进行。
+工具按研究用途提供渐进索引：RG 查研究积累与关系，RM 读准确正文和保管材料，WF 查流程、交接与原操作结果，HC 处理当前人类协作。用途可跨 Owner，同一真实操作可从相关用途到达。工作目录使用宿主给出的路径和原生文件／shell，外部 MCP 使用实际已配置且获授的服务；各能力仍沿原职责和授权。
 
 ## 当前获授工具与准确入口
 
-需要寻找操作时，调用 `tools.catalog.page`，可按 `query` 或 `owning_module` 筛选当前根获授且当前可用的操作摘要。按返回的 `next_offset` 与同一 `catalog_hash` 续页，保留原筛选；`next_offset=null` 才表示本次目录已读完。收到 `tool_catalog_changed` 时从首条重新读取，目录不冻结后续许可。
+首包给当前根的用途概览和少量常用操作摘要。需要寻找操作时，`tools.catalog.page` 返回同一概览；按返回的 `reader` 展开某个 `purpose`，再按需选择 `topic`。RG 的 Question、Baseline、Literature、Dataset、Environment、Human Interact 连接研究历史与准确 reader；HC 面向当前求助、回复和正式指导。已知线索可直接按 `query` 搜索，或按 `owning_module` 筛选；确需枚举全部获授操作才用 `view="operations"`。操作页沿 `next_offset` 与同一 `catalog_hash` 继续，保留原筛选；`next_offset=null` 表示本次目录已读完。`tool_catalog_changed` 要求从首条重读，目录不冻结后续许可。
 
-需要核对参数、返回或错误时，以准确 `operation_id` 调 `tools.contracts.read`，读取现行 `inputSchema`、`outputSchema`、返回说明及错误合同。目录、合同与 `tools/list`、`tools/call` 使用同一注册及当前授权；不存在的、未接通的、被禁用的或当前未获授的操作按真实原因反馈，不能当作合法空结果。已知准确 operation、参数与 reader 可直接调用，无须先发现或重复读取合同。原生文件、shell、子 Agent 和外部 MCP 沿宿主实际提供的工具合同使用。
+需要核对参数、返回或错误时，以准确 `operation_id` 调 `tools.contracts.read`，读取现行 `inputSchema`、`outputSchema`、返回说明及错误合同。执行用 `tools.call(operation_id, arguments)`；reader 的 `operation` 是操作身份，其余原参数放入 `arguments`。已知准确入口可直接执行，无须先发现或重复读取合同；原操作名的协议调用同样有效。模型工具列表只提供这些入口，目录、合同和执行共用原注册、当前授权与 handler。未注册、禁用或未获授按真实原因反馈，不当作合法空结果。参数可修正时沿具体诊断修改自己的提交；效果未知先按准确合同对账原操作。原生文件、shell、子 Agent 沿宿主实际合同使用，不增加 RW 导航层。
+
+外部 MCP 先按已配置服务发现：`external_tools_catalog` 给服务及少量操作摘要，沿返回入口展开；`external_tools_contract` 按准确工具身份读取 schema 与服务说明，`external_tools_call` 调用真实工具。已知身份可直接调用。未配置、未获授和服务故障保持实际状态，外部结果不替代 Owner 接纳；恢复见[外部 MCP 故障协作与恢复](../external-mcp-recovery.md)。
 
 先读当前研究交接。当前 Quest 内可跨 Question、跨 Cycle 检索已接纳材料，包括暂放问题的历史；按实际研究需要选择入口，不要求每轮遍历全部入口。Question 用 research_graph.questions.page 从名称/关键词发现，再用 research_graph.question_history.read 分页看历史 Cycle 与各阶段；沿阶段 reader 读取准确 RM 内容，Bundle 沿 AE 已存 closure／report／notes 读取，保留原同轮交接；Baseline 用 research_graph.baselines.page/read 展开方法、Variant、Run 和评价；Dataset 用 research_graph.datasets.page/read 查含义、版本与派生关系；Environment 用 research_graph.environments.page/read 查环境、设备设施及现实资源的含义、来源、条件和精确内容引用；Literature 用 research_memory.literature.page 查原文和不同 Question 的阅读判断；人类输入用 human_request.read 查看请求、回复与主动提交。目录沿 next_offset 与 query_revision 继续，保持查询、过滤与页大小；请求目录沿 next_cursor 继续；各请求的 responses_reader 用 entry_kind=responses、request_ref、response_offset/query_revision 独立查看全部回复。相关 Owner 记录插入、删除或变化时返回 research_query_changed，从首项重开查询；无关 Quest 的变化不使当前续页失效。result_state=page_pending 表示仍在扫描，exhausted 表示本次续页结束；只有首个完整空查询才可报告 no_match（有检索词）或 no_records（无检索词）。不可见、content_unavailable、content_drifted 分别是授权或材料问题，不等于没有研究积累。reader 含 operation 时调用其指明的工具及参数，如 history_reader／formal_results reader；共用正文 reader 的 source_ref／version_ref 才交给 research_memory.content.read，并沿返回的字节偏移读取精确原件。大文件与 linked_local 直接使用受控原位置，不为参考阅读复制全份材料；发现与读取限于当前 Quest 可见范围，已知 Environment 的显式跨 Quest 引用按下文规则办理，其他资产仍沿原 Owner 权限与接纳边界。结论摘要、结果 JSON 或 hash 不等于可继续实施的完整材料：复用时核对实际需要的数据、划分、预测、方法实现和协议，经现有 Owner 引用与执行输入流程交接精确资产。六入口按查看或复用目的组织：Question 汇总研究进展，Baseline 展开真实方法与实施，人类输入保留协作过程与经验，Literature、Dataset、Environment 便于复用已有资源；入口不是互斥分类，同一原件可关联多个入口。只带入本阶段需要的内容与来源，保留完整历史的按需读取入口。
 

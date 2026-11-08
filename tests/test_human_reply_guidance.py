@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,8 @@ def test_actual_packaged_stage_guidance_selects_reply_readers_and_optional_intak
     source = Path(developer.split("Role skill source: ", 1)[1].splitlines()[0])
     skill = source.read_text(encoding="utf-8")
     assert skill == resources["SKILL.md"] and skill.strip() in developer
-    assert "(../references/materials-and-custody.md)" in skill
+    linked_resources = {target.partition("#")[0] for target in re.findall(r"\]\(([^)]+)\)", skill)}
+    assert "../references/materials-and-custody.md" in linked_resources
     actual = (source.parent / "../references/materials-and-custody.md").read_text(encoding="utf-8")
     assert actual == resources["references/materials-and-custody.md"]
     assert actual not in developer

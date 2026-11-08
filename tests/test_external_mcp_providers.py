@@ -53,9 +53,16 @@ def discover_and_call(argv, environment):
     url = json.loads(item.split("=", 1)[1])
     headers = {"Authorization": "Bearer " + environment["META_RESEARCH_EXTERNAL_MCP_TOKEN"]}
     catalog = httpx.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=headers).json()["result"]["tools"]
-    tool = next(tool for tool in catalog if tool["description"] == "Read the fixture temperature in Celsius.")
+    assert {tool["name"] for tool in catalog} == {"external_tools_catalog", "external_tools_contract", "external_tools_call"}
+    def call(name, arguments):
+        return httpx.post(url, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}}, headers=headers).json()["result"]
+    overview = call("external_tools_catalog", {})["structuredContent"]
+    operations = call("external_tools_catalog", overview["services"][0]["reader"]["arguments"])["structuredContent"]["items"]
+    summary = next(tool for tool in operations if "temperature" in tool["summary"])
+    tool = call("external_tools_contract", {"name": summary["name"]})["structuredContent"]
     result = httpx.post(url, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": tool["name"], "arguments": {"sensor": "provider"}}}, headers=headers).json()["result"]
+        "params": {"name": "external_tools_call", "arguments": {"name": tool["name"], "arguments": {"sensor": "provider"}}}}, headers=headers).json()["result"]
     return tool, result
 
 

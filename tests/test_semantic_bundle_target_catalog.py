@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tool_catalog_helpers import catalog_tools
+
 from dataclasses import replace
 import json
 from types import SimpleNamespace
@@ -486,7 +488,7 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
         ),
     }
 
-    for tool in response["result"]["tools"]:
+    for tool in catalog_tools(gateway.dispatch, connection.token):
         try:
             # Metadata/provenance and exact Owner-issued asset bindings are
             # content payloads; their surrounding command remains closed.

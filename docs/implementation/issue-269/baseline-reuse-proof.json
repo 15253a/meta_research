@@ -1,0 +1,9 @@
+{
+  "baseline_test_run": "263-final-reviewed-full",
+  "baseline_head": "beef1479d46b8639c747a9edbb54e78d9412d2b9",
+  "task_base": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+  "different_existing_source_or_test_files": [
+    "tests/test_tool_contract_alignment.py"
+  ],
+  "scope": "All common src/tests files compared against the exact task base archive; existing test failures remain failures."
+}

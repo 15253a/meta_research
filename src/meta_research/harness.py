@@ -4179,9 +4179,13 @@ def _resident_reconcile_dispatch_allowed(message: object) -> bool:
     }:
         return True
     params = message.get("params")
+    if isinstance(params, dict) and params.get("name") == "tools.call":
+        arguments = params.get("arguments")
+        params = {"name": arguments.get("operation_id")} if isinstance(arguments, dict) else None
     return (
         method == "tools/call"
         and isinstance(params, dict)
+        and isinstance(params.get("name"), str)
         and params.get("name")
         in {
             "tools.catalog.page",

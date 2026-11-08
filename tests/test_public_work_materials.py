@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 
+from tool_catalog_helpers import catalog_operations
+
 from meta_research.web import create_app
 from test_root_workspace import _make
 from test_public_human_reply_delivery import _login
@@ -159,7 +161,8 @@ def test_original_request_reference_is_readable_through_actual_root_and_child_mc
         status, catalog, _ = runtime.harnesses.dispatch_mcp_http(channel.connection.token,
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, mcp_session_id=None)
         assert status == 200
-        assert {"research_workspace.materials.discover", "research_workspace.materials.read"}.issubset({item["name"] for item in catalog["result"]["tools"]})
+        assert {item["name"] for item in catalog["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+        assert {"research_workspace.materials.discover", "research_workspace.materials.read"}.issubset({item["operation_id"] for item in catalog_operations(runtime.harnesses.dispatch_mcp, channel.connection.token, purpose="RM")})
         listed = _accepted(_call(runtime, channel, "research_workspace.materials.discover"))
         assert [item["reference_ref"] for item in listed["references"]] == [reference_ref]
         page = _accepted(_call(runtime, channel, "research_workspace.materials.discover", reference_ref=reference_ref))
@@ -184,10 +187,9 @@ def call(payload):
         'Accept': 'application/json, text/event-stream', 'MCP-Protocol-Version': '2025-06-18'})
     return json.loads(urllib.request.urlopen(request, timeout=10).read())
 catalog = call({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
-assert {'research_workspace.materials.discover', 'research_workspace.materials.read'}.issubset(
-    {item['name'] for item in catalog['result']['tools']})
+assert {item['name'] for item in catalog['result']['tools']} == {'tools.catalog.page', 'tools.contracts.read', 'tools.call'}
 print(json.dumps(call({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
-    'params': {'name': 'research_workspace.materials.read', 'arguments': json.loads(arguments)}})))
+    'params': {'name': 'tools.call', 'arguments': {'operation_id': 'research_workspace.materials.read', 'arguments': json.loads(arguments)}}})))
 """
         output = subprocess.check_output([sys.executable, "-c", child, f"http://127.0.0.1:{sock.getsockname()[1]}/mcp", channel.connection.token, json.dumps(child_arguments)], text=True, timeout=20)
         value = json.loads(output)["result"]["structuredContent"]

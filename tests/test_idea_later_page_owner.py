@@ -129,7 +129,9 @@ class _IdeaDiscoveryRunner(_SignedRunner):
         rpc("initialize", {"protocolVersion": "2025-06-18",
             "capabilities": {}, "clientInfo": {"name": "idea-discovery-test", "version": "1"}})
         catalog = rpc("tools/list", {})["tools"]
-        reader = next(item for item in catalog if item["name"] == "research_memory.stage_context.read")
+        assert {item["name"] for item in catalog} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
+        reader = rpc("tools/call", {"name": "tools.contracts.read", "arguments": {
+            "operation_id": "research_memory.stage_context.read"}})["structuredContent"]
         assert reader["name"] in ROOT_AGENT_SEMANTIC_OPERATION_IDS["idea"]
         assert "evidence_index" in reader["inputSchema"]["properties"]["source"]["enum"]
 
@@ -138,10 +140,10 @@ class _IdeaDiscoveryRunner(_SignedRunner):
             offset = 0
             expected_hash = None
             while True:
-                result = rpc("tools/call", {"name": reader["name"], "arguments": {
+                result = rpc("tools/call", {"name": "tools.call", "arguments": {"operation_id": reader["name"], "arguments": {
                     "context_pack_ref": request.context_pack_ref, "source": "evidence_index",
                     "path": [], "offset": offset, "limit": 128, "index_offset": index_offset,
-                }})
+                }}})
                 assert result["isError"] is False, result
                 page = result["structuredContent"]
                 assert page["context_pack_ref"] == request.context_pack_ref

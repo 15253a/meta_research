@@ -1,0 +1,257 @@
+{
+  "issue": 269,
+  "comparison_method": {
+    "tool": ".issue-291/compare_tests.py",
+    "matching": "Exact pytest nodeid and phase; compare normalized message. Normalization only replaces isolated runner roots, case data roots and literal object memory addresses.",
+    "manual_changed_signature_audit": "All 51 changed-message records have identical recorded frames between baseline and candidate. The raw before/after messages remain in the original comparison file.",
+    "full_raw_comparison": ".issue-269/full-failure-comparison.json",
+    "full_raw_comparison_sha256": "9fd63f74d0b8eca2f7c7b75ce4aa55a34b375fcf3b599422433c61d92759448e"
+  },
+  "baseline": {
+    "snapshot": "854bf482080ed54563ae8470e29615ddfa8861bb5da691f48a8eeaa03a390454",
+    "head": "beef1479d46b8639c747a9edbb54e78d9412d2b9",
+    "ref": "beef1479d46b8639c747a9edbb54e78d9412d2b9",
+    "collected": 4840,
+    "counts": {
+      "passed": 4356,
+      "failed": 482,
+      "skipped": 2,
+      "incomplete": 0
+    },
+    "exitcode": 1,
+    "elapsed_seconds": 1149.4712976925075,
+    "label": "263-final-reviewed-full"
+  },
+  "candidate_full_before_link_assertion_correction": {
+    "snapshot": "6f3f082d3ccc8c3ea1569f1369d58ccff719e13c4babce91f674fac6bc9bcd04",
+    "head": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+    "ref": null,
+    "collected": 4856,
+    "counts": {
+      "passed": 4373,
+      "failed": 481,
+      "skipped": 2,
+      "incomplete": 0
+    },
+    "exitcode": 1,
+    "elapsed_seconds": 1142.2265415601432,
+    "label": "269-full"
+  },
+  "baseline_reuse": {
+    "baseline_test_run": "263-final-reviewed-full",
+    "baseline_head": "beef1479d46b8639c747a9edbb54e78d9412d2b9",
+    "task_base": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+    "different_existing_source_or_test_files": [
+      "tests/test_tool_contract_alignment.py"
+    ],
+    "scope": "All common src/tests files compared against the exact task base archive; existing test failures remain failures."
+  },
+  "exact_failure_groups": {
+    "same_failed_phase_and_message": 429,
+    "same_failed_phase_changed_message": 51,
+    "candidate_only_failure": 1,
+    "baseline_only_failure": 2
+  },
+  "changed_signature_classification": [
+    {
+      "category": "existing_historical_digest_assertion",
+      "count": 27,
+      "explanation": "Same existing historical prompt/profile or bundle compatibility assertion and stack. Current prompt/profile/packaged-skill digest differs after the documented resource changes; historical expected values and failing predicates remain. These failures are still unresolved, not fixed compatibility checks.",
+      "nodes": [
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[deepfetch]",
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[acquisition]",
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[companion]",
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[idea]",
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[plan]",
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[bundle]",
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[target]",
+        "tests/test_root_prompt_binding_compatibility.py::test_quest_goal_prompt_reads_only_exact_reviewed_historical_profiles[reasoning]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[deepfetch]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[acquisition]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[companion]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[idea]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[plan]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[bundle]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[target]",
+        "tests/test_root_prompt_binding_compatibility.py::test_workspace_guidance_preserves_exact_historical_read_profiles[reasoning]",
+        "tests/test_root_prompt_binding_compatibility.py::test_actual_pair_changes_only_reviewed_research_text",
+        "tests/test_provider_usage_limit.py::test_bundle_quota_wait_stops_retries_and_explicit_resume_keeps_native",
+        "tests/test_binding_compatibility.py::test_compatibility_preserves_exact_equality_hashes_and_inputs",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[deepfetch]",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[acquisition]",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[companion]",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[idea]",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[plan]",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[bundle]",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[target]",
+        "tests/test_model_upgrade_20260930.py::test_exact_new_profile_changes_only_model_and_preserves_root_floor[reasoning]"
+      ]
+    },
+    {
+      "category": "generated_identity_path_or_basis_digest_repr",
+      "count": 18,
+      "explanation": "Only generated identity, path component, basis digest, or its abbreviated repr differs in the failure message. The failing assertion and stack are identical; this classification does not claim the hidden object states are equivalent or the failure is repaired.",
+      "nodes": [
+        "tests/test_public_manual_question_lifecycle.py::test_window_close_keeps_the_context_but_explicit_cancel_is_terminal",
+        "tests/test_quest_goal_history.py::test_public_goal_history_preserves_conditions_and_supersession_review",
+        "tests/test_checkpoint_selection_recovery.py::test_frozen_data_checkpoint_returns_revision_and_same_run_can_complete[move-state]",
+        "tests/test_checkpoint_selection_recovery.py::test_frozen_data_checkpoint_returns_revision_and_same_run_can_complete[keep-attributed-data-copy]",
+        "tests/test_creation_basis_lifecycle.py::test_creation_basis_blocks_retirement_before_and_after_confirmation[direct]",
+        "tests/test_creation_basis_lifecycle.py::test_creation_basis_blocks_retirement_before_and_after_confirmation[deepfetch]",
+        "tests/test_creation_basis_lifecycle.py::test_basis_only_material_failure_is_readable_and_recovers_without_new_sources",
+        "tests/test_bundle_operator_pause_resume.py::test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history[same-native-new-call]",
+        "tests/test_reasoning_content_preparation_snapshot.py::test_content_acceptance_prepares_reused_evidence_before_fresh_write",
+        "tests/test_root_workspace_native.py::test_real_hc_initialization_dispatch_preserves_directory_across_turns",
+        "tests/test_existing_project_creation.py::test_existing_folder_is_read_selectively_then_confirmed_and_read_by_idea[direct-False]",
+        "tests/test_existing_project_creation.py::test_existing_folder_is_read_selectively_then_confirmed_and_read_by_idea[deepfetch-False]",
+        "tests/test_existing_project_creation.py::test_existing_folder_is_read_selectively_then_confirmed_and_read_by_idea[deepfetch-True]",
+        "tests/test_existing_project_creation.py::test_literature_revision_updates_source_coverage_without_changing_the_prepared_basis",
+        "tests/test_existing_project_creation.py::test_draft_change_keeps_generation_basis_distinct_from_explicit_human_review",
+        "tests/test_public_quest_initialization.py::test_injected_async_success_auto_previews_and_recovers_owner_receipts",
+        "tests/test_public_human_collaboration_ladder.py::test_companion_ack_loss_recovers_without_a_second_provider_job_or_thread",
+        "tests/test_public_human_collaboration_ladder.py::test_companion_unknown_outcome_keeps_hold_and_spool_without_blind_replay"
+      ]
+    },
+    {
+      "category": "clock_or_elapsed_diagnostics",
+      "count": 3,
+      "explanation": "Same failure and stack with changed query elapsed/observed-at diagnostics, monotonic deadline values, or database parameter timestamp.",
+      "nodes": [
+        "tests/test_public_research_assets.py::test_healthy_managed_handoff_alias_keeps_projection_revision_atomic",
+        "tests/test_reasoning_stage_cancel_preserves_target.py::test_stage_cancel_resume_keeps_completed_target_and_five_originals",
+        "tests/test_question_stage_identity_migration.py::test_0036_root_stage_rows_survive_polymorphic_question_upgrade"
+      ]
+    },
+    {
+      "category": "event_address_repr",
+      "count": 2,
+      "explanation": "Same failed Event.wait assertion and stack; displayed Event memory address changes.",
+      "nodes": [
+        "tests/test_corrected_quest_initialization.py::test_cancel_fences_a_claimed_proposal_before_provider_spawn",
+        "tests/test_corrected_quest_initialization.py::test_confirm_fences_a_claimed_intent_turn_before_provider_spawn"
+      ]
+    },
+    {
+      "category": "existing_stream_coverage_failure_with_changed_observation",
+      "count": 1,
+      "explanation": "Same test and line 79 assertion len(refs) == 20: baseline full run observed 19, candidate full run observed 17. Both exact task-base and current candidate isolated reruns pass. Relevant production modules and fixtures are unchanged. The run-context or nondeterministic variation remains unresolved, and isolated passes do not replace either full-run failure.",
+      "nodes": [
+        "tests/test_target_progress.py::test_busy_logs_do_not_starve_later_streams"
+      ]
+    }
+  ],
+  "candidate_only_failure": {
+    "nodeid": "tests/test_human_reply_guidance.py::test_actual_packaged_stage_guidance_selects_reply_readers_and_optional_intake[_bundle_skill_resources]",
+    "phase": "call",
+    "failure": "Packaged Bundle skill link assertion required the unanchored exact Markdown link; the resource now links to the existing section fragment in materials-and-custody.md.",
+    "exact_task_base_verification": {
+      "snapshot": "6de4022624089d9f7eadf2cbdfe4068ef5e70caeca9cbcad5601e8fc2159fbb5",
+      "head": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+      "ref": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+      "exitcode": 0,
+      "elapsed_seconds": 3.8610138073563576,
+      "label": "269-packaged-link-baseline",
+      "collected": 1,
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    "correction": "Accept the documented section-fragment link while retaining the test of packaged guidance, reply reader selection and optional intake.",
+    "corrected_file_verification": {
+      "snapshot": "bc4db5bf4a61bacdc089b834285c4ae1801e75cace2b245f08cace66510d083b",
+      "head": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+      "ref": null,
+      "exitcode": 0,
+      "elapsed_seconds": 3.147433280944824,
+      "label": "269-guidance-final",
+      "collected": 10,
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    "status": "Corrected and verified by a separate 10-test file run; original full suite still records 481 failures."
+  },
+  "baseline_only_failures": [
+    {
+      "nodeid": "tests/test_tool_contract_alignment.py::test_public_content_keeps_three_distinct_pagination_endings_and_exact_errors",
+      "phase": "call",
+      "candidate_outcome": "passed",
+      "attribution": "Already corrected between the reused baseline commit and the exact task base; not a #269 fix."
+    },
+    {
+      "nodeid": "tests/test_creation_material_copy.py::test_requested_copy_is_independent_bounded_and_replay_preserves_edits",
+      "phase": "call",
+      "candidate_outcome": "passed",
+      "attribution": "Discovery transport assertion adapted to the purpose catalog; bounded independent copy and replay behavior remain exercised and this test now passes."
+    }
+  ],
+  "stream_coverage_follow_up": {
+    "nodeid": "tests/test_target_progress.py::test_busy_logs_do_not_starve_later_streams",
+    "baseline_full_observed_streams": 19,
+    "candidate_full_observed_streams": 17,
+    "expected_streams": 20,
+    "exact_task_base_isolated_run": {
+      "snapshot": "531ba453e8eadbc30521469975f613a22876a27f3939f9781dec1f492fe0b0a1",
+      "head": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+      "ref": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+      "exitcode": 0,
+      "elapsed_seconds": 4.189459264278412,
+      "label": "269-busy-progress-baseline",
+      "collected": 1,
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    "current_candidate_isolated_run": {
+      "snapshot": "6c7ec838aab900db239bb6377c3cc276b7c5e44d5abfa3e22cf151fb55af9a40",
+      "head": "b98d7443ebbb4ddd27b79d6ecc6c48c44cfaa567",
+      "ref": null,
+      "exitcode": 0,
+      "elapsed_seconds": 3.4498279951512814,
+      "label": "269-busy-progress-candidate",
+      "collected": 1,
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    "unchanged_source_and_fixtures": [
+      {
+        "path": "src/meta_research/experiment_logs.py",
+        "same_lf_bytes": true,
+        "sha256": "0d23f89e8a48bebea6da772df42dab45ce7c663c2e9f3ea14a9d76cf26e6f57a"
+      },
+      {
+        "path": "src/meta_research/target_progress.py",
+        "same_lf_bytes": true,
+        "sha256": "30004b5cd26bc0cc879629853361a63707a8dbaacec05a63fbd3e0758c5ab195"
+      },
+      {
+        "path": "tests/test_target_progress.py",
+        "same_lf_bytes": true,
+        "sha256": "2ba8e387e358cb2cc465c102157ace90cc0c6421f92e5483dab32fe05f9f7db6"
+      },
+      {
+        "path": "tests/test_experiment_logs.py",
+        "same_lf_bytes": true,
+        "sha256": "0c37e23033d1a5e3489015d282cb8c91b14f35e3db24839e9d3500cccd6fb9c9"
+      }
+    ],
+    "status": "Existing full-run failure with differing observation; both isolated reruns pass. Cause of run-to-run variation not established."
+  },
+  "limitations": [
+    "The candidate full suite is not green: 4373 passed, 481 failed, 2 skipped, 0 incomplete out of 4856 collected.",
+    "429 equal failure signatures and 51 changed signatures remain failures. Baseline matching is attribution evidence, not repair.",
+    "The 263 full suite is reused with the recorded common-source/test equivalence proof; the known test_tool_contract_alignment.py delta is disclosed.",
+    "Only the newly failing packaged-link node was independently confirmed passing at exact b98d744; the 51 existing changed signatures were audited and the stream-coverage outlier was rerun on both task base and candidate.",
+    "Post-correction targeted runs establish the documented file/node results; no post-correction full suite was run, and full-suite counts have not been rewritten.",
+    "Generated-value classifications are based on recorded failure messages and identical stacks, not a proof of equivalence of all runtime state."
+  ]
+}
