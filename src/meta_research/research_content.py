@@ -44,6 +44,9 @@ def _reading_quest(agent_runtime, context, *, source_quest_ref=None, human_colla
 def read_content(graph, memory, *, quest_ref, source_ref, version_ref, **arguments):
     page = _read_content(graph, memory, quest_ref=quest_ref,
                          source_ref=source_ref, version_ref=version_ref, **arguments)
+    if source_ref.startswith("human_input_"):
+        # Its adoption binding was projected from the same verified read.
+        return page
     # Return the Owner's exact adoption identity once the source is read. A
     # discovery title or a work-folder path never creates this authority.
     leaf = graph.resolve_reasoning_historical_evidence_leaf(quest_ref=quest_ref, ref=source_ref)
@@ -96,10 +99,18 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
                 "source_ref": source_ref, "version_ref": version_ref,
                 "source_binding": leaf}
     if source_ref.startswith("human_input_"):
-        from meta_research.human_research_input import read_research_input
+        from meta_research.human_research_input import read_research_input, research_input_leaf
         value=read_research_input(memory._database,source_ref,quest_ref=quest_ref)
         if value is None or value["content_hash"]!=version_ref:raise OwnerConflict("content_version_unbound")
-        return {**context_read_page(value,path=[],offset=offset,limit=min(limit,16384)),"source_ref":source_ref,"version_ref":version_ref}
+        # The verified body hash does not cover the live material projection.
+        # Receipt identity covers the remaining envelope (including created_at).
+        identity = (quest_ref, source_ref, version_ref, 'canonical-json',
+                    value["receipt"]["payload_hash"], canonical_hash(value["work_materials"]))
+        page = context_read_page(value, path=[], offset=offset, limit=min(limit,16384),
+                                 cache=page_cache, identity=identity)
+        return {**page, "source_ref": source_ref, "version_ref": version_ref,
+                "selected_evidence_binding": adopted_source_binding(graph, quest_ref=quest_ref,
+                    source_ref=source_ref, leaf=research_input_leaf(value))}
     if human_collaboration is not None:
         with memory._database.read_snapshot() as c:
             response=c.execute(text("SELECT request_ref FROM hc_human_request_responses WHERE response_ref=:ref"),{"ref":source_ref}).first()

@@ -36,9 +36,13 @@ def selected_material_path(memory, asset, workspace_root: Path, input_key: str, 
                 if hashlib.file_digest(stream, "sha256").hexdigest() != entry.sha256:
                     raise ValueError()
         if description.kind == "directory":
-            if any(path.is_symlink() for path in destination.rglob("*")):
-                raise ValueError()
-            if {path for path in destination.rglob("*") if path.is_file()} != expected:
+            actual = set()
+            for path in destination.rglob("*"):
+                if path.is_symlink():
+                    raise ValueError()
+                if path.is_file():
+                    actual.add(path)
+            if actual != expected:
                 raise ValueError()
     except (OSError, ValueError):
         raise OwnerConflict(error_prefix + "_changed") from None

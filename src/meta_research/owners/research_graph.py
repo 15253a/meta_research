@@ -16473,11 +16473,10 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         contract.
         """
         if ref.startswith("human_input_"):
-            from meta_research.human_research_input import read_research_input
+            from meta_research.human_research_input import read_research_input, research_input_leaf
             record=read_research_input(self._database,ref,quest_ref=quest_ref)
             if record is None:return None
-            return {"kind":"HumanInput","ref":ref,"input_ref":ref,"content_hash":record["content_hash"],
-                    "owner_acceptance_receipt_ref":record["receipt"]["receipt_ref"]}
+            return research_input_leaf(record)
         row = connection.execute(
             text(
                 "SELECT request_ref FROM hc_human_request_responses WHERE "

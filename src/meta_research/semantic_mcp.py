@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Callable, Literal
 
@@ -201,8 +202,8 @@ class SemanticOperation:
             "name": self.semantic_operation_id,
             "title": self.semantic_operation_id,
             "description": self.description,
-            "inputSchema": self.input_schema,
-            "outputSchema": self.output_schema,
+            "inputSchema": deepcopy(self.input_schema),
+            "outputSchema": deepcopy(self.output_schema),
         }
 
     def binding(self) -> dict[str, object]:
@@ -276,19 +277,29 @@ class _ChannelGrant:
 
 
 class SemanticMcpGateway:
-    """A narrow MCP facade over registered high-level Owner operations."""
+    """A narrow MCP facade over registered high-level Owner operations.
+
+    Construction registers an owned contract snapshot. Changes to a caller's
+    schema dictionaries take effect only in a new gateway registration, with
+    its own server and grants. Handlers and availability checks remain live.
+    """
 
     def __init__(self, operations: tuple[SemanticOperation, ...]) -> None:
         if not operations:
             raise SemanticMcpError("semantic_operation_catalog_empty")
-        ordered = tuple(sorted((*operations, *self._discovery_operations()),
-                               key=lambda item: item.semantic_operation_id))
+        ordered = tuple(sorted((replace(item,
+            input_schema=deepcopy(item.input_schema),
+            output_schema=deepcopy(item.output_schema),
+            error_descriptions=deepcopy(item.error_descriptions))
+            for item in (*operations, *self._discovery_operations())),
+            key=lambda item: item.semantic_operation_id))
         if len({item.semantic_operation_id for item in ordered}) != len(ordered):
             raise SemanticMcpError("semantic_operation_id_duplicate")
         self._operations = {item.semantic_operation_id: item for item in ordered}
         self._validate_catalog(ordered)
         self._catalog_revision = 1
-        self._catalog_hash = canonical_hash([item.binding() for item in ordered])
+        self._operation_bindings = {item.semantic_operation_id: item.binding() for item in ordered}
+        self._catalog_hash = canonical_hash(list(self._operation_bindings.values()))
         self._server_instance_ref = new_ref("mcp_server")
         self._health_receipt_ref = new_ref("mcp_health")
         self._grants: dict[str, _ChannelGrant] = {}
@@ -337,7 +348,7 @@ class SemanticMcpGateway:
             raise SemanticMcpError(
                 "required_semantic_reconciliation_unavailable"
             )
-        return tuple(self._operations[item].binding() for item in operation_ids)
+        return tuple(dict(self._operation_bindings[item]) for item in operation_ids)
 
     def issue_channel(
         self,
@@ -366,7 +377,7 @@ class SemanticMcpGateway:
             or len(phase) > 128
         ):
             raise SemanticMcpError("mcp_channel_scope_invalid")
-        self.required_bindings(operation_ids)
+        bindings = self.required_bindings(operation_ids)
         token = secrets.token_urlsafe(32)
         grant_ref = new_ref("mcp_grant")
         grant = _ChannelGrant(
@@ -382,7 +393,6 @@ class SemanticMcpGateway:
             guidance_binding=guidance_binding,
         )
         self._grants[_token_hash(token)] = grant
-        bindings = tuple(self._operations[item].binding() for item in operation_ids)
         return (
             McpConnection(token=token, grant_ref=grant_ref),
             ResidentMcpBinding(
@@ -589,9 +599,8 @@ class SemanticMcpGateway:
                       and (module is None or operation.owning_module == module)
                       and query in (name + " " + operation.owning_module + " " + operation.description).casefold()]
         catalog_hash = canonical_hash({"grant": context.channel_grant_ref, "query": query, "owning_module": module,
-            "operations": [{**operation.binding(), "description": operation.description,
-                            "returns": operation.return_description, "errors": operation.error_descriptions}
-                           for operation in operations]})
+            "registered_catalog": self._catalog_hash,
+            "operations": [operation.semantic_operation_id for operation in operations]})
         offset, limit = int(arguments.get("offset", 0)), int(arguments.get("limit", 20))
         if offset < 0 or not 1 <= limit <= 100:
             raise SemanticMcpError("semantic_input_schema_mismatch")
@@ -623,7 +632,7 @@ class SemanticMcpGateway:
                            "Owner codes/details remain intact; normal Owner status is business state, not a transport failure. "
                            "A revoked or stale channel returns HTTP 401 mcp_channel_authentication_required. "
                            "For an uncertain effect result, use reconciliation_operation_id with the original effect identity.",
-                           "operation_codes": operation.error_descriptions,
+                           "operation_codes": dict(operation.error_descriptions),
                            "gateway_codes": ["capability_unavailable", "semantic_input_schema_mismatch",
                                              "semantic_output_schema_mismatch", "semantic_operation_failed"]}}
 

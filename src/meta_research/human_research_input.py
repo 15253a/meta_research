@@ -19,6 +19,13 @@ def read_research_input(database, input_ref, *, quest_ref=None):
                            "subject_ref":row.input_ref,"payload_hash":row.receipt_hash}}
 
 
+def research_input_leaf(record):
+    """Project the adoption identity from this call's verified Owner record."""
+    return {"kind": "HumanInput", "ref": record["input_ref"],
+            "input_ref": record["input_ref"], "content_hash": record["content_hash"],
+            "owner_acceptance_receipt_ref": record["receipt"]["receipt_ref"]}
+
+
 def _verified_input_value(row):
     try:
         value=json.loads(row.payload_json)
