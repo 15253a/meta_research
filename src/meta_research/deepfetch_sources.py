@@ -72,7 +72,9 @@ def source_action(owner, registry: SearchSourceRegistry | None, context: Semanti
         return registry.act(manifest=manifest,
                             job_ref=f"{operation_ref}:v4-turn:{turn.group(1)}",
                             command=arguments)
-    except (OwnerConflict, SearchSourceError) as error:
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
+    except SearchSourceError as error:
         raise SemanticMcpError(error.code) from error
 
 

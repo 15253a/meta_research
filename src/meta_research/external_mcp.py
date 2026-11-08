@@ -25,9 +25,41 @@ from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
 
 
 class ExternalMcpError(ValueError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, details: dict[str, Any] | None = None) -> None:
         self.code = code
-        super().__init__(code)
+        self.details = details
+        super().__init__(code if details is None else code + "\n" + canonical_json(details))
+
+
+def _schema_diagnostic(error: ValidationError, depth: int = 0) -> dict[str, Any]:
+    """Describe contract requirements, never jsonschema's instance-bearing message."""
+    path = list(error.absolute_path)
+    requirement = error.validator
+    expected = error.validator_value
+    alternatives = {}
+    if requirement in {"oneOf", "anyOf"}:
+        expected = "exactly one permitted shape" if requirement == "oneOf" else "at least one permitted shape"
+        if error.context and depth < 4:
+            alternatives = {"alternatives": [
+                {**_schema_diagnostic(child, depth + 1), "schema_path": list(child.absolute_schema_path)}
+                for child in error.context[:8]], "alternatives_truncated": len(error.context) > 8}
+        elif not error.context:
+            # A failed oneOf with no failed branches means several shapes matched.
+            expected = "exactly one permitted shape; multiple shapes matched"
+            alternatives = {"alternative_required_fields": [
+                branch.get("required", []) for branch in error.validator_value[:8] if isinstance(branch, dict)]}
+    elif requirement == "required" and isinstance(error.instance, dict):
+        path.append(next(name for name in expected if name not in error.instance))
+        expected = "present"
+    elif requirement not in {"type", "enum", "const", "minimum", "maximum", "exclusiveMinimum",
+                             "exclusiveMaximum", "minLength", "maxLength", "minItems", "maxItems",
+                             "minProperties", "maxProperties", "additionalProperties", "pattern"}:
+        # oneOf/anyOf and other nested contracts are discovered from the frozen tool.
+        expected = "satisfy the " + str(requirement) + " requirement in the frozen inputSchema"
+    location = "$" + "".join(f"[{part}]" if isinstance(part, int) else "." + part for part in path)
+    return {"path": path, "requirement": requirement, "expected": expected, **alternatives,
+            "message": f"{location} does not satisfy {requirement}.",
+            "correction": f"Correct {location} to satisfy {requirement}: {canonical_json(expected)} in the current tool contract."}
 
 
 @dataclass(frozen=True)
@@ -339,7 +371,9 @@ class ExternalMcpRuntime:
             if response is None:
                 raise ExternalMcpError("external_mcp_result_invalid")
             if "error" in response:
-                raise ExternalMcpError(response["error"]["message"])
+                error = response["error"]
+                details = error.get("data")
+                raise ExternalMcpError(details["code"] if details else error["message"], details)
             return response["result"]
         finally:
             with self._lock:
@@ -434,7 +468,11 @@ class ExternalMcpRuntime:
             "stage": stage, "reason_code": reason_code, "root_kind": grant.snapshot.root_kind,
             "operation_key": grant.snapshot.operation_key, "configuration_revision": grant.snapshot.configuration_revision,
             "tool": tool["name"], "outcome": "unknown" if attempted else "not_called",
-            "business_action_attempted": attempted}
+            "business_action_attempted": attempted,
+            **({"provider_diagnostic_status": "unstructured_not_forwarded",
+                "message": "The service reported a tool error. Its unstructured text has no agreed safe diagnostic contract and is not included in this receipt.",
+                "correction": "Reconcile the original service operation identified here before repeating a business action. If its status or cause remains unclear, request the service owner's diagnosis; preserve existing results and the original operation identity."}
+               if reason_code == "tool_error" else {})}
 
     @contextmanager
     def channel(self, snapshot: ExternalMcpOperationSnapshot, *, resident_token: str | None = None) -> Iterator[ExternalMcpAccess]:
@@ -459,7 +497,8 @@ class ExternalMcpRuntime:
         def failure(code: int, reason: str, data: dict[str, Any] | None = None) -> tuple[int, dict[str, Any], None]:
             error = {"code": code, "message": reason}
             if data is not None:
-                error["data"] = data
+                error["data"] = {"code": reason, **data}
+                error["message"] += "\n" + canonical_json(data)
             return 200, {"jsonrpc": "2.0", "id": identifier, "error": error}, None
         if method == "notifications/initialized":
             return 202, None, None
@@ -482,8 +521,15 @@ class ExternalMcpRuntime:
             arguments = parameters.get("arguments", {})
             try:
                 Draft202012Validator(tool["inputSchema"], registry=Registry()).validate(arguments)
-            except (ValidationError, Unresolvable):
-                return failure(-32602, "external_mcp_arguments_invalid")
+            except ValidationError as error:
+                return failure(-32602, "external_mcp_arguments_invalid", {
+                    **self._call_failure(grant, frozen, tool, stage="input_validation", reason_code="external_mcp_arguments_invalid"),
+                    "category": "submission", **_schema_diagnostic(error)})
+            except (Unresolvable, SchemaError):
+                return failure(-32000, "external_mcp_schema_invalid", {
+                    **self._call_failure(grant, frozen, tool, stage="input_validation", reason_code="external_mcp_schema_invalid"),
+                    "category": "tool_contract", "message": "The external tool input schema is invalid or contains an unresolved reference.",
+                    "correction": "Ask the service provider to repair the tool schema; changing submitted arguments cannot resolve this contract defect."})
             try:
                 result = self._client.call(json.loads(frozen.service.connection_json), tool["name"], arguments)
                 if result.get("isError", False):
@@ -493,9 +539,12 @@ class ExternalMcpRuntime:
                 if not result.get("isError", False) and "outputSchema" in tool:
                     try:
                         Draft202012Validator(tool["outputSchema"], registry=Registry()).validate(result.get("structuredContent"))
-                    except (ValidationError, Unresolvable):
-                        return failure(-32000, "external_mcp_result_invalid", self._call_failure(grant, frozen, tool,
-                            stage="tools/call", reason_code="external_mcp_result_invalid"))
+                    except (ValidationError, Unresolvable, SchemaError) as error:
+                        reason = "external_mcp_result_invalid" if isinstance(error, ValidationError) else "external_mcp_schema_invalid"
+                        return failure(-32000, reason, {
+                            **self._call_failure(grant, frozen, tool, stage="tools/call", reason_code=reason),
+                            "category": "tool_contract", "message": "The external tool returned a result that could not be validated against its output contract.",
+                            "correction": "The business outcome is unknown. Reconcile the original operation with the service before repeating it; ask the provider to repair its output/schema contract."})
             except ExternalMcpClientError as error:
                 return failure(-32000, error.code, self._call_failure(grant, frozen, tool, stage=error.stage, reason_code=error.code))
         else:

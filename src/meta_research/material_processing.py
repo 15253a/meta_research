@@ -278,7 +278,7 @@ def material_processing_operations(human):
             return method(context=context,
                 reconcile=context.operation_id.endswith(".reconcile"), **arguments)
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
     return (
         SemanticOperation(PROCESSING_OPERATION_IDS[0], "human_collaboration",
             "Declare the material's actual understanding, adopted/considered/deferred/not_used disposition, "

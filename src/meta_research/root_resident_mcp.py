@@ -21,9 +21,10 @@ _OPERATION_BINDING_RESOURCE_PREFIX = "harness-artifact:operation-binding-"
 
 
 class RootResidentMcpError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, details: dict[str, object] | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.details = details
 
 
 class _OperationBinding(Protocol):
@@ -381,11 +382,38 @@ class RootResidentMcpChannels:
                 or not isinstance(result, dict)
                 or not isinstance(structured, dict)
             ):
-                raise RootResidentMcpError("semantic_mcp_call_failed")
+                details: dict[str, object] = {"operation_id": operation_id, "http_status": status}
+                if status in {401, 403}:
+                    raise RootResidentMcpError("mcp_channel_authentication_required", {
+                        **details, "category": "authorization",
+                        "message": "The resident MCP channel is not currently authorized.",
+                        "correction": "Restore a current scope-bound channel through the host; do not change the research submission or bypass authorization.",
+                    })
+                protocol_error = payload.get("error") if isinstance(payload, dict) else None
+                if isinstance(protocol_error, dict) and type(protocol_error.get("code")) is int:
+                    raise RootResidentMcpError("semantic_mcp_protocol_error", {
+                        **details, "category": "host_contract",
+                        "protocol_code": protocol_error["code"],
+                        "message": "The resident MCP rejected the host protocol request.",
+                        "correction": "Repair the host's JSON-RPC request envelope; changing research content cannot fix a protocol error.",
+                    })
+                unavailable = status == 429 or status >= 500
+                details.update({
+                    "category": "temporarily_unavailable" if unavailable else "host_contract",
+                    "message": "The resident MCP service did not return a usable operation receipt.",
+                    "effect_state": "unknown",
+                    "correction": "Restore service access or repair the host response contract, then reconcile the original operation before submitting any effect again. Preserve its original identity and payload.",
+                })
+                effect_id = arguments.get("effect_id") if isinstance(arguments, dict) else None
+                if isinstance(effect_id, str) and 0 < len(effect_id) <= 128:
+                    details["effect_id"] = effect_id
+                raise RootResidentMcpError(
+                    "semantic_mcp_unavailable" if unavailable else "semantic_mcp_response_invalid", details)
             if result.get("isError") is True:
                 code = structured.get("code")
                 raise RootResidentMcpError(
-                    code if isinstance(code, str) else "semantic_mcp_call_failed"
+                    code if isinstance(code, str) else "semantic_mcp_call_failed",
+                    structured.get("details") if isinstance(structured.get("details"), dict) else None,
                 )
             return structured
         finally:

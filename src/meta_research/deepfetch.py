@@ -321,9 +321,11 @@ class DeepFetchUnavailable(RuntimeError):
         *,
         durable_outcome: Literal["unknown", "pending", "terminal"] = "unknown",
         native_session_ref: str | None = None,
+        details: dict[str, object] | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
+        self.details = details
         self.durable_outcome = durable_outcome
         self.native_session_ref = native_session_ref
 
@@ -334,6 +336,7 @@ class DeepFetchUnavailable(RuntimeError):
 
         return DeepFetchUnavailable(
             self.code,
+            details=self.details,
             durable_outcome="terminal",
             native_session_ref=native_session_ref,
         )
@@ -760,13 +763,13 @@ class CodexDeepFetchAdapter:
         try:
             self._root_resident_mcp.bind_authority(authority)
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         try:
             self._root_resident_mcp.configure_endpoint(base_url)
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
 
     def bind_root_operation_diagnostics_recorder(
         self, recorder: RootOperationDiagnosticRecorder
@@ -1078,7 +1081,7 @@ class CodexDeepFetchAdapter:
                 job_ref, include_children=True
             )
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
         return True
 
     def _provider_operation_root(
@@ -1394,7 +1397,7 @@ class CodexDeepFetchAdapter:
         try:
             resident_mcp_facts = self._root_resident_mcp.runtime_facts()
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
         return DeepFetchRuntimeBinding(
             provider_ref="meta_research.deepfetch.CodexDeepFetchAdapter",
             provider_version=DEEPFETCH_PROTOTYPE_COMMIT,
@@ -2394,7 +2397,7 @@ class CodexDeepFetchAdapter:
             finally:
                 self._root_resident_mcp.release(channel_key)
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
 
     def _execute_protocol(
         self,
@@ -2452,6 +2455,7 @@ class CodexDeepFetchAdapter:
                     # DeepFetch attempt or replaying the Acquisition Provider.
                     raise DeepFetchUnavailable(
                         error.code,
+                        details=error.details,
                         durable_outcome="pending",
                         native_session_ref=checkpoint.native_session_ref,
                     ) from error
@@ -2662,7 +2666,7 @@ class CodexDeepFetchAdapter:
                 checkpoint = _append_acquisition_proofs(checkpoint, item_proofs)
         except DeepFetchUnavailable as error:
             raise DeepFetchUnavailable(
-                error.code, durable_outcome="pending",
+                error.code, details=error.details, durable_outcome="pending",
                 native_session_ref=native_session_ref,
             ) from error
         return checkpoint
@@ -2716,6 +2720,7 @@ class CodexDeepFetchAdapter:
         except DeepFetchUnavailable as error:
             raise DeepFetchUnavailable(
                 error.code,
+                details=error.details,
                 durable_outcome="pending",
                 native_session_ref=native_session_ref,
             ) from error
@@ -2744,7 +2749,7 @@ class CodexDeepFetchAdapter:
                 arguments=arguments,
             )
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
 
     def _provided_materials(self, request: DeepFetchProviderRequest) -> list[dict]:
         if request.creation_context_kind != "quest_initialization" or not request.accepted_material_bindings:
@@ -2962,7 +2967,7 @@ class CodexDeepFetchAdapter:
                 job_ref=request.job_ref,
             )
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
         try:
             result = self._invoke_with_access(
                 request,
@@ -2987,7 +2992,7 @@ class CodexDeepFetchAdapter:
         try:
             self._root_resident_mcp.release(channel_key)
         except RootResidentMcpError as error:
-            raise DeepFetchUnavailable(error.code) from error
+            raise DeepFetchUnavailable(error.code, details=error.details) from error
         return result
 
     def _invoke_with_access(

@@ -829,6 +829,7 @@ class DeepFetchRun:
     attempt_started_at: float | None = None
     attempt_completed_at: float | None = None
     recent_activity_events: tuple[dict[str, object], ...] = ()
+    failure_details: dict[str, object] | None = None
 
     def as_public_dict(self) -> dict[str, object]:
         return {
@@ -851,7 +852,8 @@ class DeepFetchRun:
                 else self.execution_receipt.as_public_dict()
             ),
             "failure": (
-                None if self.failure_code is None else {"code": self.failure_code}
+                None if self.failure_code is None else {"code": self.failure_code,
+                    **({} if self.failure_details is None else {"details": self.failure_details})}
             ),
         }
 
@@ -15298,6 +15300,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     generation=generation,
                     fence_ref=fence_ref,
                     failure_code=error.code,
+                    failure_details=error.details,
                     provider_operation_retry_permitted=(
                         error.code
                         != "deepfetch_acquisition_owner_proof_legacy_missing"
@@ -16826,6 +16829,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         failure_code: str,
         provider_operation_retry_permitted: bool,
         native_session_ref: str | None,
+        failure_details: dict[str, object] | None = None,
     ) -> None:
         now = time.time()
         with self._database.write() as connection:
@@ -16865,6 +16869,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 ).one()
                 if session.native_session_ref not in {None, native_session_ref}:
                     failure_code = "deepfetch_native_session_changed"
+                    failure_details = None
                     provider_operation_retry_permitted = False
                     # Preserve the admitted session identity on the Attempt;
                     # the conflicting provider value is rejected evidence.
@@ -16944,6 +16949,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "run_ref": run_ref,
                     "attempt_ref": attempt_ref,
                     "reason_code": failure_code,
+                    **({} if failure_details is None else {"details": failure_details}),
                 },
             )
 
@@ -16979,6 +16985,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if row is None:
             return None
         run = _deepfetch_run_from_row(row)
+        if run.status == "failed" and run.attempt_ref is not None:
+            # Advisory explanation from the same fenced failure transaction.
+            # The Owner row alone determines state, identity and retry permission.
+            with self._database.read() as connection:
+                diagnostic_json = connection.execute(text(
+                    "SELECT payload_json FROM durable_feed "
+                    "WHERE event_type = 'agent_runtime.deepfetch_failed' "
+                    "AND json_extract(payload_json, '$.run_ref') = :run_ref "
+                    "AND json_extract(payload_json, '$.attempt_ref') = :attempt_ref "
+                    "AND json_extract(payload_json, '$.reason_code') = :failure_code "
+                    "ORDER BY revision DESC LIMIT 1"),
+                    {"run_ref": run.run_ref, "attempt_ref": run.attempt_ref,
+                     "failure_code": run.failure_code}).scalar_one_or_none()
+            if diagnostic_json is not None:
+                details = decoded_object(diagnostic_json).get("details")
+                if isinstance(details, dict):
+                    run = replace(run, failure_details=details)
         if run.status not in {"admitted", "running"}:
             return run
         with self._deepfetch_provider_lock:

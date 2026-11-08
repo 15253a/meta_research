@@ -110,7 +110,11 @@ selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保
 
 常规资产页只附所选版本的当前／被替换／退役状态、适用说明及 history_reader；详细变更沿该入口按需读取。资产语义状态不代替实际原件可用性，历史精确引用保留原义。
 
-reader 指针只把 operation 以外的参数交给指定工具；summary_only 是外层展示标志，不是 research_notes_reader 的调用参数。序列化 JSON 的 offset/limit 按 UTF-8 字节计，以 next_offset=null 结束；complete 仅说明单页是否包含全部来源，尾页仍可能为 false。资产文件页按字节计，以 complete=true 结束；目录页按 entries 计，以 next_offset=null 结束。不要混用这三种结束条件。公共 MCP 工具错误按 isError 和 structuredContent.code 判断，保留 details 中的原操作与对账信息；正常 Owner status 仍表达业务状态。capability_unavailable 表示操作未注册或未获 grant；content_version_unbound 表示本次 source/version 在授权范围内未绑定，应核对精确引用或重新发现适用版本，不能据此断言全库不存在。重试或对账继续使用原 operation/effect 身份。
+reader 指针只把 operation 以外的参数交给指定工具；summary_only 是外层展示标志，不是 research_notes_reader 的调用参数。序列化 JSON 的 offset/limit 按 UTF-8 字节计，以 next_offset=null 结束；complete 仅说明单页是否包含全部来源，尾页仍可能为 false。资产文件页按字节计，以 complete=true 结束；目录页按 entries 计，以 next_offset=null 结束。不要混用这三种结束条件。
+
+公共 MCP 工具错误按 isError 和 code 判断；文本 JSON 与 structuredContent 保留同一 details。参数错误按 path、requirement、expected 修改自己的字段或材料；正常 Owner status 仍表达业务状态。capability_unavailable 表示操作未注册、未获 grant 或依赖当前不可用；content_version_unbound 表示本次 source/version 在授权范围内未绑定，应核对精确引用或重新发现适用版本，不能据此断言全库不存在。授权不足、宿主漏参、损坏合同和服务故障按实际原因交给相应负责方处理，不修改工具、校验规则或科研事实来绕过拒绝。
+
+失败若未确定原效果，先保留原提交及 operation/effect 身份，沿返回的 reconciliation_operation_id 和该操作合同对账；部分对账需要原完整提交，不能只传 effect_id。接纳结果继续复用，不重跑有效工作；未知时既不更改原提交盲重试，也不换身份重复写入。输入校验只证明本次调用未执行 handler，不证明更早的操作未生效。
 
 ## 当前工作目录与回复材料
 

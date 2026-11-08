@@ -15,6 +15,16 @@ import urllib.request
 from urllib.parse import urlsplit
 
 
+class ContentModelError(ValueError):
+    """Stable failure code with diagnostics safe to return to the caller."""
+
+    def __init__(self, reason_code: str, category: str, message: str, correction: str,
+                 **context: object) -> None:
+        super().__init__("content_model_call_failed")
+        self.details = {"reason_code": reason_code, "category": category,
+                        "message": message, "correction": correction, **context}
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
         # A configured endpoint never delegates its credential to another URL.
@@ -67,9 +77,45 @@ def generate(config_ref: str, request: dict, *, environment=None, opener=None) -
         if not isinstance(result, str) or not result.strip():
             raise ValueError()
         return result
-    except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError):
-        # Provider error bodies may contain credentials or submitted content.
-        raise ValueError("content_model_call_failed") from None
+    except urllib.error.HTTPError as error:
+        error.close()
+        if error.code == 401:
+            raise ContentModelError("authentication_failed", "authorization",
+                "The selected content provider rejected its configured credentials.",
+                "Ask the configuration owner to repair the selected model credentials; preserve the current draft and model choice.",
+                http_status=error.code) from None
+        if error.code == 403:
+            reason, category, message, correction = ("authorization_denied", "authorization",
+                "The selected provider denied access to this model.",
+                "Ask the configuration owner to check permission for the selected model; preserve the current draft.")
+        elif error.code == 429:
+            reason, category, message, correction = ("rate_limited", "temporary_unavailable",
+                "The selected provider rejected the request because of a rate or quota limit.",
+                "Check the selected provider's rate/quota limit before another call; keep the draft and do not switch models without authorization.")
+        elif error.code >= 500:
+            reason, category, message, correction = ("service_unavailable", "temporary_unavailable",
+                "The selected provider returned a server failure.",
+                "Check the selected service's availability before another call; retain the draft and selected model.")
+        elif 300 <= error.code < 400:
+            reason, category, message, correction = ("endpoint_redirect_rejected", "tool_contract",
+                "The configured endpoint redirected the request; credentials were not forwarded.",
+                "Ask the configuration owner to verify the exact endpoint; do not send credentials to the redirect location.")
+        else:
+            reason, category, message, correction = ("request_rejected", "submission",
+                "The selected provider rejected the content request.",
+                "Check the submitted messages and the selected model's supported request contract; preserve the scientific evidence.")
+        raise ContentModelError(reason, category, message, correction, http_status=error.code) from None
+    except (urllib.error.URLError, OSError) as error:
+        timed_out = isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
+        raise ContentModelError("timeout" if timed_out else "unreachable", "temporary_unavailable",
+            "The selected provider timed out." if timed_out else "The selected provider connection failed.",
+            "The remote generation outcome is unknown. Check the connection/service before another call; preserve existing draft output and model choice.",
+            outcome="unknown") from None
+    except (ValueError, KeyError, IndexError, TypeError):
+        # Never include provider bodies, submitted messages or credentials.
+        raise ContentModelError("invalid_response", "tool_contract",
+            "The selected provider did not return a bounded, nonempty choices[0].message.content string.",
+            "Ask the configuration owner to check the selected endpoint's response contract; keep existing draft output.") from None
 
 
 
@@ -85,7 +131,7 @@ def content_model_operation(agent_runtime):
         try:
             result = generate(arguments["config_ref"], {"messages": arguments["messages"]})
         except ValueError as error:
-            raise SemanticMcpError(str(error)) from None
+            raise SemanticMcpError(str(error), getattr(error, "details", None)) from None
         return {"config_ref": arguments["config_ref"], "content": result}
     return SemanticOperation(semantic_operation_id="assistant.content.generate",
         owning_module="agent_runtime", access_mode="read",
@@ -98,4 +144,10 @@ def content_model_operation(agent_runtime):
                     "content": {"type": "string", "maxLength": 1000000}},
                 "required": ["role", "content"], "additionalProperties": False}}},
             "required": ["config_ref", "messages"], "additionalProperties": False},
-        output_schema={"type": "object"}, handler=call)
+        output_schema={"type": "object"}, handler=call,
+        error_descriptions={
+            "content_model_configuration_invalid": "config_ref must be the user's selected configured name: 1–64 letters, digits, underscores or hyphens. Correct that reference; do not substitute an unapproved model.",
+            "content_model_configuration_unavailable": "No usable configuration is available for config_ref. Verify the selected reference; if it is correct, ask the configuration owner to restore its META_RESEARCH_CONTENT_MODELS entry, valid endpoint/model and api_key_env credential. No provider call was made; keep the draft and selected model.",
+            "content_model_request_invalid": "messages must be a nonempty array of objects containing only role and content; role is system, user or assistant and content is text. Correct the submitted messages without changing the evidence or tool contract.",
+            "content_model_request_too_large": "The serialized model plus messages request exceeds 8 MiB of UTF-8 JSON. Reduce the submitted messages to the needed authorized excerpts or divide the writing task while retaining the original evidence and existing draft.",
+        })

@@ -138,7 +138,7 @@ class RootWorkspaces:
                 "root_session_ref": context.root_session_ref, "fence_ref": context.fence_ref,
                 "runtime_binding_hash": context.capability_binding_hash}))
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
 
     def _runtime_location(self, run_ref: str) -> WorkspaceLocation:
         managed = self._ar.query_managed_run(run_ref)
@@ -280,7 +280,7 @@ class RootWorkspaces:
         try:
             creation = self._hc.query_manual_question_creation(context_ref)
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
         session = creation.get("drafting_session")
         if (creation.get("context_ref") != context_ref
             or creation.get("generation") != context_generation
@@ -349,7 +349,7 @@ class RootWorkspaces:
         try:
             facts = self._hc.query_companion_work_context(root_session_ref)
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
         if (facts is None or facts["session_ref"] != root_session_ref
             or facts["scope_ref"] != scope_ref or require_open and facts["status"] != "open"):
             raise SemanticMcpError("workspace_companion_scope_invalid")

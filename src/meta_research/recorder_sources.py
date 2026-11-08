@@ -110,7 +110,7 @@ class RecorderChannels:
                 try:
                     body = self.reader.read_source(basis["quest_ref"], node, ref)
                 except OwnerConflict as error:
-                    raise SemanticMcpError(error.code) from error
+                    raise SemanticMcpError(error.code, error.details) from error
                 serialized = active.documents[key] = canonical_json(body)
         offset = arguments.get("offset", 0)
         if offset >= len(serialized):

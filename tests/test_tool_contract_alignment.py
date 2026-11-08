@@ -79,7 +79,9 @@ def test_stage_note_pointer_is_callable_without_stripping_display_arguments(tmp_
         assert catalog["summary_only"] is True
         assert catalog["items"] == []
         malformed = _call(gateway, channel, operation, {**pointer, "summary_only": True})
-        assert malformed["structuredContent"] == {"code": "semantic_input_schema_mismatch"}
+        assert malformed["structuredContent"]["code"] == "semantic_input_schema_mismatch"
+        assert malformed["structuredContent"]["details"]["requirement"] == "additionalProperties"
+        assert "summary_only" not in malformed["structuredContent"]["details"]["expected"]
     finally:
         runtime.close()
 
@@ -109,7 +111,9 @@ def test_target_note_pointer_uses_its_real_authorized_owner_handler(tmp_path):
         assert result["isError"] is False, result
         assert json.loads(result["structuredContent"]["text"])["items"] == []
         malformed = _call(gateway, channel, operation, {**pointer, "summary_only": True})
-        assert malformed["structuredContent"] == {"code": "semantic_input_schema_mismatch"}
+        assert malformed["structuredContent"]["code"] == "semantic_input_schema_mismatch"
+        assert malformed["structuredContent"]["details"]["requirement"] == "additionalProperties"
+        assert "summary_only" not in malformed["structuredContent"]["details"]["expected"]
     finally:
         runtime.close()
 
@@ -169,7 +173,9 @@ def test_public_content_keeps_three_distinct_pagination_endings_and_exact_errors
 
         bad_version = _call(gateway, channel, operation, {**source, "version_ref": "wrong-version"})
         assert bad_version["isError"] is True
-        assert bad_version["structuredContent"] == {"code": "content_version_unbound"}
+        assert bad_version["structuredContent"]["code"] == "content_version_unbound"
+        assert "authorized scope" in bad_version["structuredContent"]["details"]["message"]
+        assert json.loads(bad_version["content"][0]["text"]) == bad_version["structuredContent"]
         assert _call(gateway, channel, operation, source)["isError"] is False
         for unavailable in ("research_memory.literature.page", "unregistered.read"):
             error = _call(gateway, channel, unavailable, {})

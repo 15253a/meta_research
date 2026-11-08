@@ -159,18 +159,40 @@ def test_configured_model_is_callable_through_the_actual_assistant_grant(tmp_pat
         assert provider["calls"] == [{"body": {"model": "explicit-model", "messages": messages},
             "authorization": "Bearer test-private-key"}]
         assert runtime.owners.research_graph.query_snapshot() == before
+        configured_models = config.read_text()
+        config.write_text("{}")
         failure = _call(runtime, channel, "assistant.content.generate",
-            config_ref="unknown", messages=messages)
+            config_ref="selected", messages=messages)
         assert failure["isError"] is True
         assert "content_model_configuration_unavailable" in str(failure)
+        explanation = failure["structuredContent"]["details"]["message"]
+        assert "config_ref" in explanation
+        assert "configuration owner" in explanation
+        assert explanation in failure["content"][0]["text"]
         assert len(provider["calls"]) == 1
+        config.write_text(configured_models)
+        restored = _accepted(_call(runtime, channel, "assistant.content.generate",
+            config_ref="selected", messages=messages))
+        assert restored["content"] == "Selected model content."
+        assert len(provider["calls"]) == 2
         provider["status"] = 503
         unavailable = _call(runtime, channel, "assistant.content.generate",
             config_ref="selected", messages=messages)
         assert unavailable["isError"] is True
         assert "content_model_call_failed" in str(unavailable)
-        assert len(provider["calls"]) == 2  # No silent model retry or fallback.
+        details = unavailable["structuredContent"]["details"]
+        assert details["reason_code"] == "service_unavailable"
+        assert details["category"] == "temporary_unavailable"
+        assert details["message"] in unavailable["content"][0]["text"]
+        assert details["correction"] in unavailable["content"][0]["text"]
+        assert len(provider["calls"]) == 3  # No silent model retry or fallback.
         assert "test-private-key" not in str(reply) + str(failure)
         assert "test-private-key" not in str(unavailable)
+        provider["status"] = 200
+        continued = _accepted(_call(runtime, channel, "assistant.content.generate",
+            config_ref="selected", messages=messages))
+        assert continued["content"] == "Selected model content."
+        assert len(provider["calls"]) == 4
+        assert runtime.owners.research_graph.query_snapshot() == before
     finally:
         runtime.close()

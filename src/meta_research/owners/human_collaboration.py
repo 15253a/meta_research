@@ -12252,7 +12252,11 @@ def _public_deepfetch(
         "literature_snapshot": (
             None if snapshot is None else snapshot.as_public_dict()
         ),
-        "failure": (None if failure_code is None else {"code": failure_code}),
+        "failure": (None if failure_code is None else {
+            "code": failure_code,
+            **({"details": run.failure_details} if run is not None
+               and run.failure_code == failure_code and run.failure_details is not None else {}),
+        }),
     }
 
 

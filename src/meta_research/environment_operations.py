@@ -60,7 +60,7 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
             result = handler(**payload, idempotency_key=key, effect_scope=effect_scope)
             return {"status": "accepted", "result": result}
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
 
     def read(context, arguments, page):
         try:
@@ -76,7 +76,7 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
             result = handler(ref, quest_ref=quest_ref)
             return {"status": "not_found" if result is None else "accepted", "result": result}
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
 
     operations = []
     for action, (properties, required) in schemas.items():

@@ -378,9 +378,10 @@ def _now() -> str:
 
 
 class _ReadFailure(Exception):
-    def __init__(self, reason: str, *, connected: bool = False) -> None:
+    def __init__(self, reason: str, *, connected: bool = False, details: dict | None = None) -> None:
         self.reason = reason
         self.connected = connected
+        self.details = details
 
 
 class _BoundedRedirects(HTTPRedirectHandler):
@@ -963,6 +964,7 @@ class SearchSourceRegistry:
         records: list[dict] = []
         content = None
         limitation = None
+        failure_details = None
         outcome = "results"
         result_kind = "opaque_mcp_result" if isinstance(source, _Mcp) else "page_content"
         try:
@@ -980,10 +982,14 @@ class SearchSourceRegistry:
                 try:
                     content = self._external_mcp.call_direct(binding=stored["source_mcp_snapshot"],
                         service_id=source_id, tool_name=tool_name, arguments=arguments)
-                except (ExternalMcpError, ExternalMcpClientError, OSError, TimeoutError):
+                except ExternalMcpError as error:
+                    raise _ReadFailure(error.code, details=error.details) from None
+                except (ExternalMcpClientError, OSError, TimeoutError):
                     raise _ReadFailure("mcp_call_failed") from None
                 if content.get("isError") is True:
-                    raise _ReadFailure("mcp_tool_error", connected=True)
+                    details = content.get("structuredContent", {}).get("failure")
+                    raise _ReadFailure("mcp_tool_error", connected=True,
+                        details=details if isinstance(details, dict) else None)
                 encoded = canonical_json(content)
                 if len(encoded.encode()) > _MAX_BYTES:
                     raise _ReadFailure("response_too_large", connected=True)
@@ -991,6 +997,7 @@ class SearchSourceRegistry:
                 outcome = "limited"
         except _ReadFailure as failure:
             outcome, limitation = "failed", failure.reason
+            failure_details = failure.details
             content = None
         private = _private_values(source)
         records, content = _redact(records, private), _redact(content, private)
@@ -999,6 +1006,8 @@ class SearchSourceRegistry:
             "safe_request": _redact(safe_request, private), "started_at": started, "finished_at": _now(),
             "outcome": outcome, "result_kind": result_kind, "result_digest": canonical_hash({"records": records, "content": content}),
             "result_count": len(records) if isinstance(source, _Api) else None, "limitation": limitation, "records": records}
+        if failure_details is not None:
+            receipt["failure"] = _redact(failure_details, private)
         with self._transaction() as db:
             db.execute("INSERT INTO receipts(receipt_ref,manifest_ref,document) VALUES (?,?,?)",
                 (receipt["receipt_ref"], stored["manifest_ref"], canonical_json(receipt)))

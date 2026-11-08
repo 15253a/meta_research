@@ -72,4 +72,4 @@ def _call(method, context, arguments, reconcile):
         return method(scope=scope, binding=context.guidance_binding,
             reconcile=reconcile, **arguments)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error

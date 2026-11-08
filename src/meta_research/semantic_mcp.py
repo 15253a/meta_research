@@ -495,38 +495,56 @@ class SemanticMcpGateway:
         if unavailable is not None:
             return 200, {"jsonrpc": "2.0", "id": request_id,
                          "result": _tool_error("capability_unavailable", {"reason": unavailable})}
-        if not _matches_schema(
-            arguments, operation.input_schema
-        ) and not _matches_bound_target_human_request(
+        problem = _schema_problem(arguments, operation.input_schema)
+        if problem is not None and not _matches_bound_target_human_request(
             operation_id, arguments
         ):
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error("semantic_input_schema_mismatch"),
+                "result": _tool_error("semantic_input_schema_mismatch", {
+                    **problem, "operation_id": operation_id,
+                    "category": "arguments", "execution_stage": "input_validation",
+                    "call_execution": "not_started",
+                    "message": "The submitted field does not satisfy the registered input contract. No handler ran for this call; this does not establish any earlier effect's outcome.",
+                    "correction": "Correct the indicated field using requirement and expected, then submit again on the current channel. If an earlier effect's outcome was already uncertain, reconcile that original unchanged submission before modifying it.",
+                }),
             }
         try:
             context = replace(context, operation_id=operation_id)
             result = operation.handler(context, arguments)
         except SemanticMcpError as error:
+            details = dict(error.details or {})
+            if error.code in operation.error_descriptions:
+                details.setdefault("message", operation.error_descriptions[error.code])
+            if operation.access_mode in {"effect", "reconcile"}:
+                # The wrapper cannot infer transaction outcome from an Owner code.
+                # Keep any more precise phase/outcome supplied by that Owner.
+                recovery = _post_handler_failure(operation, arguments, "handler")
+                for key in ("operation_id", "execution_stage", "effect_status",
+                            "effect_id", "reconciliation_operation_id", "correction"):
+                    if key in recovery:
+                        details.setdefault(key, recovery[key])
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error(error.code, error.details),
+                "result": _tool_error(error.code, details or None),
             }
         except Exception:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error("semantic_operation_failed"),
+                "result": _tool_error("semantic_operation_failed",
+                    _post_handler_failure(operation, arguments, "handler")),
             }
-        if not isinstance(result, dict) or not _matches_schema(
-            result, operation.output_schema
-        ):
+        output_problem = _schema_problem(result, operation.output_schema)
+        if output_problem is not None:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error("semantic_output_schema_mismatch"),
+                "result": _tool_error("semantic_output_schema_mismatch", {
+                    **_post_handler_failure(operation, arguments, "output_validation"),
+                    **output_problem}),
             }
         encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         return 200, {
@@ -628,10 +646,12 @@ class SemanticMcpGateway:
                 "returns": "Success: isError=false; structuredContent matches outputSchema. content contains the same JSON. "
                            "Operation-specific pagination, units and acceptance semantics are in description and schemas. "
                            + operation.return_description,
-                "errors": {"description": "Failure: isError=true with structuredContent.code and optional details. "
+                "errors": {"description": "Failure: isError=true; text contains the same JSON code/details as structuredContent. "
                            "Owner codes/details remain intact; normal Owner status is business state, not a transport failure. "
                            "A revoked or stale channel returns HTTP 401 mcp_channel_authentication_required. "
-                           "For an uncertain effect result, use reconciliation_operation_id with the original effect identity.",
+                           "Input diagnostics identify path, requirement and expected without echoing submitted values. "
+                           "For an uncertain effect result, use reconciliation_operation_id with the original unchanged submission and effect identity before any new write. "
+                           "Handler failures do not establish whether an effect committed. Host/tool contract defects require host repair, not changing research conclusions.",
                            "operation_codes": dict(operation.error_descriptions),
                            "gateway_codes": ["capability_unavailable", "semantic_input_schema_mismatch",
                                              "semantic_output_schema_mismatch", "semantic_operation_failed"]}}
@@ -729,54 +749,102 @@ def _valid_schema_contract(schema: object) -> bool:
 
 
 def _matches_schema(value: object, schema: dict[str, object]) -> bool:
+    return _schema_problem(value, schema) is None
+
+
+def _schema_problem(
+    value: object, schema: dict[str, object], path: tuple[str | int, ...] = (),
+) -> dict[str, object] | None:
+    """Explain the first failed contract check without echoing submitted values."""
+    def problem(requirement: str, expected: object, at=path):
+        return {"path": list(at), "requirement": requirement, "expected": expected}
+
     enum = schema.get("enum")
     if isinstance(enum, list) and value not in enum:
-        return False
+        return problem("enum", enum)
     schema_type = schema["type"]
     if isinstance(schema_type, list):
-        return any(_matches_schema(value, {**schema, "type": member}) for member in schema_type)
+        if any(_matches_schema(value, {**schema, "type": member}) for member in schema_type):
+            return None
+        # Preserve the actual constraint when the value has an allowed type.
+        for member in schema_type:
+            candidate = _schema_problem(value, {**schema, "type": member}, path)
+            if candidate is not None and candidate["requirement"] != "type":
+                return candidate
+        return problem("type", schema_type)
     if schema_type == "object":
         if not isinstance(value, dict):
-            return False
-        required = schema.get("required", [])
+            return problem("type", "object")
         properties = schema.get("properties", {})
-        if not isinstance(required, list) or not isinstance(properties, dict):
-            return False
-        if any(item not in value for item in required):
-            return False
-        if schema.get("additionalProperties") is False and any(
-            item not in properties for item in value
-        ):
-            return False
-        return all(
-            name not in value
-            or not isinstance(property_schema, dict)
-            or _matches_schema(value[name], property_schema)
-            for name, property_schema in properties.items()
-        )
+        for name in schema.get("required", []):
+            if name not in value:
+                return problem("required", "present", (*path, name))
+        if schema.get("additionalProperties") is False and any(name not in properties for name in value):
+            # Unknown property names can themselves contain secrets; show allowed names.
+            return problem("additionalProperties", list(properties))
+        for name, child in properties.items():
+            if name in value:
+                failure = _schema_problem(value[name], child, (*path, name))
+                if failure is not None:
+                    return failure
+        return None
     if schema_type == "array":
         if not isinstance(value, list):
-            return False
+            return problem("type", "array")
         items = schema.get("items")
-        return not isinstance(items, dict) or all(
-            _matches_schema(item, items) for item in value
-        )
+        if isinstance(items, dict):
+            for index, item in enumerate(value):
+                failure = _schema_problem(item, items, (*path, index))
+                if failure is not None:
+                    return failure
+        return None
     if schema_type == "string":
-        return (
-            isinstance(value, str)
-            and len(value) >= int(schema.get("minLength", 0))
-            and (
-                "maxLength" not in schema
-                or len(value) <= int(schema["maxLength"])
-            )
-        )
-    if schema_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if schema_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if not isinstance(value, str):
+            return problem("type", "string")
+        for key, failed in (("minLength", len(value) < schema.get("minLength", 0)),
+                            ("maxLength", len(value) > schema.get("maxLength", len(value)))):
+            if failed:
+                return problem(key, schema[key])
+        return None
+    if schema_type in {"integer", "number"}:
+        kinds = (int,) if schema_type == "integer" else (int, float)
+        if not isinstance(value, kinds) or isinstance(value, bool):
+            return problem("type", schema_type)
+        for key, failed in (("minimum", value < schema.get("minimum", value)),
+                            ("maximum", value > schema.get("maximum", value))):
+            if failed:
+                return problem(key, schema[key])
+        return None
     if schema_type == "boolean":
-        return isinstance(value, bool)
-    return value is None
+        return None if isinstance(value, bool) else problem("type", "boolean")
+    return None if value is None else problem("type", "null")
+
+
+def _post_handler_failure(
+    operation: SemanticOperation, arguments: dict[str, object], stage: str,
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "operation_id": operation.semantic_operation_id,
+        "category": "tool_contract" if stage == "output_validation" else "host_failure",
+        "execution_stage": stage,
+        "message": ("The handler returned a result outside its registered output contract."
+                    if stage == "output_validation" else "The handler failed without a valid operation receipt."),
+        "correction": "Report this host/tool failure with the operation id; changing research conclusions cannot repair it.",
+    }
+    if operation.access_mode == "effect":
+        details.update({
+            "effect_status": "unknown",
+            "reconciliation_operation_id": operation.reconciliation_operation_id,
+            "correction": "Reconcile the original operation with its unchanged original submission and effect identity first. Preserve accepted work; do not change the submission under the same identity or create a replacement effect while its result is unknown.",
+        })
+        if isinstance(arguments.get("effect_id"), str):
+            details["effect_id"] = arguments["effect_id"]
+    elif operation.access_mode == "reconcile":
+        details.update({"effect_status": "unknown",
+                        "correction": "The reconciliation did not establish the original outcome. Preserve the original identity and submission; restore this read path before considering another effect."})
+        if isinstance(arguments.get("effect_id"), str):
+            details["effect_id"] = arguments["effect_id"]
+    return details
 
 
 def _matches_bound_target_human_request(
@@ -807,10 +875,10 @@ def _jsonrpc_error(
 
 
 def _tool_error(code: str, details: dict[str, object] | None = None) -> dict[str, object]:
+    payload = {"code": code, **({"details": details} if details is not None else {})}
     return {
-        "content": [{"type": "text", "text": code}],
-        "structuredContent": {"code": code,
-                              **({"details": details} if details is not None else {})},
+        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}],
+        "structuredContent": payload,
         "isError": True,
     }
 

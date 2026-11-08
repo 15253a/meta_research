@@ -411,12 +411,12 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
                     history_reader["args"] = _reader(history_reader["args"], selected_quest)
             return result
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
     operations=[SemanticOperation(semantic_operation_id="research_memory.content.read",owning_module="research_memory",
         description="Read an exact authorized source using its returned source_ref/version_ref. Before Quest creation, DeepFetch may read only its current HC request's accepted input versions using the supplied version/version reader. Companion may explicitly select source_quest_ref outside the page selection when current HC authority grants it; other roots retain their current Quest scope. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
         return_description="Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Asset file pages use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. A hash names complete digital content, not a physical resource or its verified condition. Preserve returned exact source bindings and readers.",
         error_descriptions={
-            "content_version_unbound": "This exact source/version is not bound within the authorized scope; this does not mean all research content is absent.",
+            "content_version_unbound": "This source_ref/version_ref pair is not bound in the authorized scope; other content may exist. Reopen the source's directory entry (research_graph.questions.page, research_memory.literature.page or research_memory.assets.page as applicable) and copy its exact returned reader arguments, retaining source_quest_ref when provided. Do not replace an accepted version with latest content.",
             "content_source_unbound": "The supplied source has no readable binding in the current scope.",
             "content_quest_not_authorized": "The requested Quest is not currently authorized for this Companion read; page visibility grants no permission.",
             "content_receipt_invalid": "The stored stage source does not match its accepted receipt; do not substitute latest content.",
@@ -444,7 +444,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
                     source_quest_ref=selected_quest, human_collaboration=human_collaboration)
                 return reader(research_graph, research_memory, quest_ref=quest_ref,
                     source_quest_ref=selected_quest, **arguments)
-            except OwnerConflict as error:raise SemanticMcpError(error.code) from error
+            except OwnerConflict as error:raise SemanticMcpError(error.code, error.details) from error
         properties={"source_quest_ref":{"type":"string","minLength":1,"maxLength":256}, "query":{"type":"string","maxLength":1024},"offset":{"type":"integer","minimum":0},
                     "limit":{"type":"integer","minimum":1,"maximum":100},
                     "query_revision":{"type":"string","pattern":"^[0-9a-f]{64}$"}}

@@ -419,7 +419,7 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
                                     descriptor["source_quest_ref"] = selected_quest
             return {"status": "not_found" if result is None else "accepted", "result": result}
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
 
     return (
         SemanticOperation(
@@ -503,7 +503,7 @@ def _artifact_role_adjust(research_graph, agent_runtime, context, arguments):
             **payload, idempotency_key=effect_key, quest_ref=quest_ref,
             effect_scope=effect_scope)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     return {"status": "accepted", "result": result}
 
 
@@ -514,7 +514,7 @@ def _artifact_role_adjust_reconcile(research_graph, agent_runtime, context, argu
         result = research_graph.reconcile_artifact_role_adjustment(
             idempotency_key=effect_key)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     return {"status": "not_found" if result is None else "accepted", "result": result}
 
 
@@ -525,7 +525,7 @@ def _formal_results_read(research_graph, agent_runtime, context, arguments, huma
         result = research_graph.query_target_result_handoff(arguments["target_ref"], quest_ref=quest_ref)
         return _target_content_readers(result, arguments.get("source_quest_ref"))
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
 
 
 def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments, human_collaboration=None):
@@ -535,7 +535,7 @@ def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments
         result = research_graph.query_formal_result_by_ref(
             arguments["ref"], quest_ref=quest_ref)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     return {"status": "not_found" if result is None else "accepted",
             "result": None if result is None else _target_fact_readers(result, arguments.get("source_quest_ref"))}
 
@@ -655,7 +655,7 @@ def _dataset_scope(agent_runtime, context, *, reconcile=False):
                       root_session_ref=context.root_session_ref, fence_ref=context.fence_ref,
                       runtime_binding_hash=context.capability_binding_hash)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
 
 
 def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *, reconcile):
@@ -688,7 +688,7 @@ def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *
     try:
         result = handler(**payload, idempotency_key=effect_key, effect_scope=effect_scope)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     return {"status": "accepted", "result": result}
 
 
@@ -699,7 +699,7 @@ def _dataset_read(research_graph, agent_runtime, context, arguments, *, page, hu
         quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=source_quest_ref,
             human_collaboration=human_collaboration)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     if page:
         result = research_graph.query_datasets(**arguments, quest_ref=quest_ref)
         return {**result, "items": [_dataset_content_readers(item, source_quest_ref) for item in result["items"]]}
@@ -1239,7 +1239,7 @@ def _request_root_agent_acquisition(
         else:
             execution = recorded
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     return _root_agent_acquisition_result(
         effect_id=effect_id,
         execution=execution,
@@ -1261,7 +1261,7 @@ def _reconcile_root_agent_acquisition(
     try:
         execution = owner.query_acquisition_request(session_ref, request_id)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     if execution is None:
         return {
             "effect_id": effect_id,
@@ -1311,7 +1311,7 @@ def _root_agent_acquisition_session_ref(
         else:
             raise SemanticMcpError("root_agent_acquisition_effect_unauthorized")
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     if session is None:
         raise SemanticMcpError("acquisition_session_not_found")
     return session.session_ref
@@ -1515,7 +1515,7 @@ def _open_root_agent_human_request(
             required_authorization=required_authorization,
         )
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     return _root_human_request_result(
         request=request,
         context=context,
@@ -1561,7 +1561,7 @@ def _reconcile_root_agent_human_request(
     try:
         request = owner.reconcile_human_request_effect(effect_key)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     open_effect = request.get("open_effect")
     if not isinstance(open_effect, dict) or open_effect.get("effect_id") != effect_id:
         raise SemanticMcpError("human_request_open_effect_invalid")
@@ -1595,7 +1595,7 @@ def _root_agent_human_request_scope(
             runtime_binding_hash=context.capability_binding_hash,
         )
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
 
 
 def _root_human_request_command(
@@ -2358,7 +2358,7 @@ def _submit_bundle_exhaustion(
             idempotency_key=effect_key,
         )
     except OwnerConflict as error:
-        raise SemanticMcpError("bundle_exhaustion_submission_invalid") from error
+        raise _bundle_exhaustion_owner_error(error, proposal) from error
     return _bundle_exhaustion_public(effect_id, proposal, result)
 
 
@@ -2378,7 +2378,7 @@ def _reconcile_bundle_exhaustion(
             expected_proposal_hash=proposal.proposal_hash,
         )
     except OwnerConflict as error:
-        raise SemanticMcpError("bundle_exhaustion_reconciliation_invalid") from error
+        raise _bundle_exhaustion_owner_error(error, proposal) from error
     if result is None:
         return {
             "status": "outcome_unknown",
@@ -2389,12 +2389,27 @@ def _reconcile_bundle_exhaustion(
     return _bundle_exhaustion_public(effect_id, proposal, result)
 
 
+def _bundle_exhaustion_owner_error(
+    error: OwnerConflict, proposal: BundleExhaustionProposal,
+) -> SemanticMcpError:
+    details = dict(error.details or {})
+    details.update({"proposal_identity": proposal.proposal_identity,
+                    "proposal_hash": proposal.proposal_hash})
+    if error.code in {"bundle_exhaustion_proposal_conflict", "idempotency_conflict"}:
+        details.setdefault("category", "precondition")
+        details.setdefault("message", "This proposal identity or idempotency key already names a different submission.")
+        details.setdefault("correction", "Reconcile the original effect_id and original unchanged proposal through advancement_engine.bundle_exhaustion.reconcile. Do not alter that submission or choose a new identity to repeat accepted work.")
+    return SemanticMcpError(error.code, details)
+
+
 def _bundle_exhaustion_proposal(
     arguments: dict[str, object],
 ) -> BundleExhaustionProposal:
     try:
         return bundle_exhaustion_proposal_from_dict(arguments["proposal"])
-    except (KeyError, OwnerConflict, TypeError, ValueError) as error:
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
+    except (KeyError, TypeError, ValueError) as error:
         raise SemanticMcpError("bundle_exhaustion_proposal_invalid") from error
 
 
@@ -2606,7 +2621,7 @@ def _read_target_launch_request(
     try:
         request = research_graph.query_target_launch_request(target_ref)
     except OwnerConflict as error:
-        raise SemanticMcpError(error.code) from error
+        raise SemanticMcpError(error.code, error.details) from error
     try:
         validate_target_launch_request(request)
     except BundleProtocolError as error:

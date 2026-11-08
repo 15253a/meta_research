@@ -124,11 +124,16 @@ def test_call_failure_identifies_original_work_and_requires_a_verified_repair(tm
         message = request("tools/call", name=exposed_tool_name("lab", "read_temperature"), arguments={"sensor": "A"})
         failed = runtime.dispatch_http(access.token, message)[1]
         failure = failed["result"]["structuredContent"]["failure"] if "result" in failed else failed["error"]["data"]
-        assert failure == {"service_id": "lab", "service": "Lab instruments", "stage": failure_stage,
+        expected = {"service_id": "lab", "service": "Lab instruments", "stage": failure_stage,
+            **({"code": "timeout"} if "error" in failed else {}),
             "reason_code": "tool_error" if failure_stage == "tools/call" else "timeout", "root_kind": "target",
             "operation_key": snapshot.operation_key, "configuration_revision": snapshot.configuration_revision,
             "tool": "read_temperature", "outcome": "unknown" if failure_stage == "tools/call" else "not_called",
             "business_action_attempted": failure_stage == "tools/call"}
+        assert expected.items() <= failure.items()
+        if failure_stage == "tools/call":
+            assert failure["provider_diagnostic_status"] == "unstructured_not_forwarded"
+            assert "Reconcile" in failure["correction"]
         assert not (tmp_path / "calls.jsonl").exists()
         failure_file.write_text("")
         repaired = runtime.dispatch_http(access.token, message)[1]
@@ -150,7 +155,7 @@ def test_allowed_discovery_call_and_denied_guessed_call(tmp_path):
         assert temperature["inputSchema"]["required"] == ["sensor"]
         result = runtime.dispatch_http(access.token, request("tools/call", name=name, arguments={"sensor": "A"}))[1]["result"]
         assert result["structuredContent"] == {"sensor": "A", "temperature": 23.75}
-        assert runtime.dispatch_http(access.token, request("tools/call", name=name, arguments={}))[1]["error"]["message"] == "external_mcp_arguments_invalid"
+        assert runtime.dispatch_http(access.token, request("tools/call", name=name, arguments={}))[1]["error"]["data"]["code"] == "external_mcp_arguments_invalid"
     denied = runtime.operation_snapshot(operation_identity="operation-b", root_kind="plan", task_prompt="Inspect lab")
     with runtime.channel(denied) as access:
         assert runtime.dispatch_http(access.token, request("tools/list"))[1]["result"] == {"tools": []}
@@ -230,8 +235,8 @@ def test_discovery_preserves_nested_protocol_failure_codes(tmp_path, failure):
 
 
 @pytest.mark.parametrize("schema_case, reason, business_calls", [
-    ("unresolvable_input", "external_mcp_arguments_invalid", 0),
-    ("unresolvable_output", "external_mcp_result_invalid", 1),
+    ("unresolvable_input", "external_mcp_schema_invalid", 0),
+    ("unresolvable_output", "external_mcp_schema_invalid", 1),
     ("mismatched_output", "external_mcp_result_invalid", 1),
 ])
 def test_frozen_schema_validation_never_fetches_remote_references(tmp_path, schema_case, reason, business_calls):
@@ -260,7 +265,9 @@ def test_frozen_schema_validation_never_fetches_remote_references(tmp_path, sche
         snapshot = runtime.operation_snapshot(operation_identity=schema_case, root_kind="idea", task_prompt="read")
         with runtime.channel(snapshot) as access:
             response = runtime.dispatch_http(access.token, request("tools/call", name=exposed_tool_name("lab", "read_temperature"), arguments={"sensor": "A"}))[1]
-        assert response["error"]["message"] == reason
+        assert response["error"]["data"]["code"] == reason
+        assert response["error"]["data"]["outcome"] == ("unknown" if business_calls else "not_called")
+        assert "provider" in response["error"]["message"]
         ledger = tmp_path / "calls.jsonl"
         assert (len(ledger.read_text().splitlines()) if ledger.exists() else 0) == business_calls
         assert schema_requests == []

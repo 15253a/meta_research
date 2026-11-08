@@ -37,7 +37,7 @@ def literature_operations(graph, agent_runtime, human_collaboration=None):
                     idempotency_key=key,effect_scope=verify)
             return {"status":"not_found" if result is None else "accepted","result":result}
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
 
     def read(context, arguments):
         try:
@@ -46,7 +46,7 @@ def literature_operations(graph, agent_runtime, human_collaboration=None):
             result = graph.query_literature(arguments["literature_ref"],quest_ref=quest)
             return {"status":"not_found" if result is None else "accepted","result":result}
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
 
     operations=[]
     for action,(properties,required) in schemas.items():

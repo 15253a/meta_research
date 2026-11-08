@@ -535,7 +535,7 @@ def material_operations(human):
                 return human.copy_creation_material(context=context, **arguments)
             return human.reconcile_creation_copy(context=context, **arguments)
         except OwnerConflict as error:
-            raise SemanticMcpError(error.code) from error
+            raise SemanticMcpError(error.code, error.details) from error
     properties = {"reference_ref": {"type": "string", "maxLength": 96}, "path": {"type": "string", "maxLength": 4096}}
     return (*material_processing_operations(human), SemanticOperation(WORK_MATERIAL_OPERATION_IDS[0], "human_collaboration",
         "Discover saved work material references visible to this actual root and eligible earlier work. Human directory references stay read-only and visible to current authorized roots throughout their Quest while their original receiver remains unchanged. A registered Quest Companion also sees submitted inputs for its Quest. Expand one original server directory at a time without preloading, hashing, copying or formal RM intake. Entries and unexpanded scope do not prove reading or understanding. Use observation_ref from an entry for a bounded read.", call,

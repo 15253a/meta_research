@@ -40,14 +40,15 @@ def test_live_disabled_dependency_invalidates_page_and_contract_without_granting
     for name, args in (("tools.contracts.read", {"operation_id": "test.reader"}), ("test.reader", {})):
         result = call(gateway, channel, name, **args)
         assert result["isError"] is True
-        assert result["structuredContent"] == {"code": "capability_unavailable", "details": {"reason": "service_disabled"}}
+        assert result["structuredContent"]["code"] == "capability_unavailable"
+        assert result["structuredContent"]["details"]["reason"] == "service_disabled"
     assert not calls
     assert "test.reader" not in str(call(gateway, channel, "tools.catalog.page")["structuredContent"]["items"])
     service["enabled"] = True
     assert call(gateway, channel, "test.reader")["structuredContent"] == {"text": "retained evidence"}
     restricted = make_channel(gateway, DISCOVERY)
-    assert call(gateway, restricted, "tools.contracts.read", operation_id="test.reader")["structuredContent"]["details"] == {"reason": "not_granted"}
-    assert call(gateway, restricted, "tools.contracts.read", operation_id="not.registered")["structuredContent"]["details"] == {"reason": "not_registered"}
+    assert call(gateway, restricted, "tools.contracts.read", operation_id="test.reader")["structuredContent"]["details"]["reason"] == "not_granted"
+    assert call(gateway, restricted, "tools.contracts.read", operation_id="not.registered")["structuredContent"]["details"]["reason"] == "not_registered"
     assert call(gateway, restricted, "test.reader")["isError"] is True
     assert call(gateway, restricted, "tools.catalog.page", offset=first["next_offset"],
                 catalog_hash=first["catalog_hash"])["structuredContent"]["code"] == "tool_catalog_changed"
