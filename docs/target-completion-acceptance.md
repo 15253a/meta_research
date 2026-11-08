@@ -19,6 +19,28 @@ Replay must still match the handle, Harness operation and evidence, and preserve
 issuer receipts; it does not reopen current input/output files. An AR-only retry
 without an accepted manifest still checks inputs before accepting a new snapshot.
 
+Same-root revisions of retained research notes and final statements supply RM
+with an explicit change, the exact predecessor, and that predecessor's accepted
+revision. Retrying a partially retained completion uses the same request even
+if its first artifact has already advanced the asset's current version. Unchanged
+content reuses its verified binding; both old and revised bodies remain readable
+by exact version through the TargetCommit and Bundle research-note reader.
+
+Intake rejection preserves the actual RM failure code. A missing `change` is a
+host request defect: preserve the scientific work and resume the same root after
+the host is repaired. An already recorded generic intake rejection permits the
+same scientific snapshot only after RM reconciles the original request hash and
+confirms `asset_change_required`; its signed rejection stays unchanged. Other
+generic failures do not qualify. Migration `0078_target_host_intake_retry` permits
+this AR completion history while preserving RM manifest uniqueness and all
+operation, evidence, generation and idempotency constraints.
+
+Exhausted storage remains pending on its original completion
+and requires the existing authorized storage-resume path. It is not a request to
+rewrite research outputs. These paths, duplicate submissions, and unchanged
+content are covered by `tests/test_target_note_revision.py` with real RM/RG owners
+and isolated provider evidence and storage fault injection.
+
 The September 16 Target 3 repair reproduced both repeated graph admission and a
 workspace-only cache incorrectly rejected as frozen-input drift. An isolated
 replay of the original Harness completion, 19.6 GB of frozen inputs and 3.15 GB of

@@ -107,6 +107,13 @@ _SYSTEM_TARGET_COMPLETION_OPTIONAL_ARTIFACTS = (
 # Retain old rejection text so historical signed rejections remain replayable.
 # New path-backed artifacts do not use the historical byte/directory ceilings.
 _RM_RECOVERABLE_CANDIDATE_FEEDBACK = {
+    "asset_change_required": (
+        "The Target host's revision intake request is missing change metadata "
+        "required by Research Memory. The host must supply change with the exact "
+        "predecessor and revision. Preserve the existing research outputs; do not "
+        "rewrite the research explanation to repair this host field. After the "
+        "host is corrected, finish another normal turn in this same root."
+    ),
     "target_root_retained_artifacts_invalid": (
         "retained_artifacts must contain at most 100 unique canonical workspace paths, "
         "each with exactly relative_path and role (log, analysis, data or checkpoint). "
@@ -339,6 +346,12 @@ class TargetRootCompletionEvidenceReader(Protocol):
 
 
 class TargetRootAssetMemory(Protocol):
+    def query_asset_lifecycle(self, asset_ref: str) -> dict[str, object]: ...
+
+    def query_asset_intake_by_idempotency_key(
+        self, idempotency_key: str, request: AssetIntakeRequest,
+    ) -> object | None: ...
+
     def submit_asset_intake(
         self,
         request: AssetIntakeRequest,
@@ -433,6 +446,33 @@ class _PinnedWorkspaceRoot:
     workspace_ref: str
     path: Path
     descriptor: int
+
+
+def _artifact_intake_key(completion, artifact) -> str:
+    return "target-root-artifact:" + canonical_hash({
+        "completion_ref": completion.completion_ref, **artifact.snapshot_value(),
+    })
+
+
+def _artifact_intake_request(completion, artifact, predecessor, *, change=None):
+    return AssetIntakeRequest(
+        source_kind="local_path" if artifact.source_path is not None else "file",
+        custody_mode="managed",
+        display_name=f"target-root-artifact-{artifact.ordinal:04d}",
+        media_type=artifact.media_type,
+        content=artifact.content,
+        source_locator=str(artifact.source_path) if artifact.source_path else None,
+        asset_ref=predecessor.asset_ref if predecessor else None,
+        change=change,
+        provenance={
+            "schema_ref": "meta-research/target-root-artifact-provenance/v1",
+            "completion_ref": completion.completion_ref,
+            "target_ref": completion.handle.target_ref,
+            "target_run_ref": completion.handle.target_run_ref,
+            **artifact.snapshot_value(),
+            **({"predecessor_version_ref": predecessor.version_ref} if predecessor else {}),
+        },
+    )
 
 
 class SQLiteTargetRootCompletionMemoryAuthority:
@@ -546,6 +586,41 @@ class SQLiteTargetRootCompletionMemoryAuthority:
         from meta_research.research_notes import query_target_research_notes
         return query_target_research_notes(self._database, self._asset_memory, target_ref)
 
+    def verify_host_intake_rejection(
+        self, completion: AcceptedTargetRootCompletion, *, frozen: _FrozenWorkspace,
+        workspace_parent: Path,
+    ) -> bool:
+        """Reconcile a wrapped rejection against its exact durable RM request."""
+        if (completion.workspace_ref != frozen.workspace_ref
+                or completion.artifact_snapshot_hash != frozen.artifact_snapshot_hash
+                or self.query_for_completion(completion.completion_ref) is not None):
+            return False
+        for artifact in frozen.artifacts:
+            predecessor = self._research_note_predecessor(completion, artifact)
+            if predecessor is None:
+                continue
+            # Failed requests may have scrubbed their payload. Reconstruct the
+            # original missing-change request, including its stable locator,
+            # so RM can verify the stored hash without reopening old files.
+            if artifact.source_path is not None:
+                artifact = replace(artifact, source_path=_frozen_artifact_path(
+                    workspace_parent, completion, artifact.ordinal,
+                ))
+            request = _artifact_intake_request(completion, artifact, predecessor)
+            try:
+                intake = self._asset_memory.query_asset_intake_by_idempotency_key(
+                    _artifact_intake_key(completion, artifact), request,
+                )
+            except OwnerConflict as error:
+                if error.code != "asset_intake_idempotency_conflict":
+                    raise
+                continue
+            if (getattr(intake, "status", None) == "failed"
+                    and getattr(intake, "failure_code", None) == "asset_change_required"
+                    and getattr(intake, "asset", None) is None):
+                return True
+        return False
+
     def accept(
         self,
         *,
@@ -590,51 +665,52 @@ class SQLiteTargetRootCompletionMemoryAuthority:
         entries: list[TargetRootCompletionManifestEntry] = []
         for artifact in frozen.artifacts:
             predecessor = self._research_note_predecessor(completion, artifact)
-            intake_key = "target-root-artifact:" + canonical_hash(
-                {
-                    "completion_ref": completion.completion_ref,
-                    **artifact.snapshot_value(),
-                }
-            )
+            intake_key = _artifact_intake_key(completion, artifact)
             try:
-                request = AssetIntakeRequest(
-                        source_kind=("local_path" if artifact.source_path is not None else "file"),
-                        custody_mode="managed",
-                        display_name=f"target-root-artifact-{artifact.ordinal:04d}",
-                        media_type=artifact.media_type,
-                        content=artifact.content,
-                        source_locator=str(artifact.source_path) if artifact.source_path else None,
-                        asset_ref=predecessor.get("asset_ref") if predecessor else None,
-                        provenance={
-                            "schema_ref": (
-                                "meta-research/target-root-artifact-provenance/v1"
+                if predecessor is not None and predecessor.content_hash == artifact.content_hash:
+                    binding = predecessor
+                else:
+                    change = None
+                    if predecessor is not None:
+                        history = self._asset_memory.query_asset_lifecycle(predecessor.asset_ref)
+                        # Bind the request to the predecessor's acceptance, not the
+                        # mutable head: an earlier artifact may already have been
+                        # retained when this completion is retried after a failure.
+                        revision = next((item["revision"] for item in history["changes"]
+                                         if item["version_ref"] == predecessor.version_ref
+                                         and item["kind"] != "retirement"), 0)
+                        change = {
+                            "kind": "substantive_change",
+                            "predecessor_version_ref": predecessor.version_ref,
+                            "expected_revision": revision,
+                            "explanation": (
+                                f"Target root revised {artifact.declared_relative_path} "
+                                f"in completion {completion.completion_ref}: {completion.handoff.summary}"
                             ),
-                            "completion_ref": completion.completion_ref,
-                            "target_ref": completion.handle.target_ref,
-                            "target_run_ref": completion.handle.target_run_ref,
-                            **artifact.snapshot_value(),
-                            **({"predecessor_version_ref": predecessor["version_ref"]}
-                               if predecessor else {}),
-                        },
+                        }
+                    request = _artifact_intake_request(
+                        completion, artifact, predecessor, change=change,
                     )
-                intake = self._asset_memory.submit_asset_intake(
-                    request, idempotency_key=intake_key,
-                )
-                if (getattr(intake, "status", None) == "failed"
-                        and getattr(intake, "failure_code", None) == "asset_intake_retry_exhausted"):
-                    intake = self._asset_memory.retry_asset_intake_after_resume(
+                    intake = self._asset_memory.submit_asset_intake(
                         request, idempotency_key=intake_key,
                     )
+                    if (getattr(intake, "status", None) == "failed"
+                            and getattr(intake, "failure_code", None) == "asset_intake_retry_exhausted"):
+                        intake = self._asset_memory.retry_asset_intake_after_resume(
+                            request, idempotency_key=intake_key,
+                        )
+                        if (getattr(intake, "status", None) == "failed"
+                                and getattr(intake, "failure_code", None) == "asset_intake_retry_exhausted"):
+                            # Storage recovery is an operator boundary, not a new
+                            # scientific candidate for the root agent to recreate.
+                            raise OwnerConflict("target_root_artifact_intake_unavailable")
+                    asset = getattr(intake, "asset", None)
                     if getattr(intake, "status", None) == "failed":
-                        # Storage recovery is an operator boundary, not a new
-                        # scientific candidate for the root agent to recreate.
+                        raise OwnerConflict(getattr(intake, "failure_code", None)
+                                            or "target_root_artifact_intake_unavailable")
+                    if getattr(intake, "status", None) != "accepted" or asset is None:
                         raise OwnerConflict("target_root_artifact_intake_unavailable")
-                asset = getattr(intake, "asset", None)
-                if getattr(intake, "status", None) == "failed":
-                    raise OwnerConflict("target_root_artifact_intake_failed")
-                if getattr(intake, "status", None) != "accepted" or asset is None:
-                    raise OwnerConflict("target_root_artifact_intake_unavailable")
-                binding = asset.as_binding()
+                    binding = asset.as_binding()
                 self._verify_binding_hash(binding, expected_hash=artifact.content_hash)
             except OwnerConflict:
                 raise
@@ -828,7 +904,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
         for entry in json.loads(row.entries_json):
             if (entry.get("role") == artifact.role and
                 entry.get("declared_relative_path") == artifact.declared_relative_path):
-                return entry["binding"]
+                return _entry_from_value(entry).binding
         return None
 
     @staticmethod
@@ -1400,6 +1476,9 @@ class TargetRunFinalizer:
                     implementation_tree_hash=frozen.implementation_tree_hash,
                     result_document_hash=frozen.result_document_hash,
                     artifact_snapshot_hash=frozen.artifact_snapshot_hash,
+                    verify_host_intake_rejection=lambda previous: self._memory.verify_host_intake_rejection(
+                        previous, frozen=frozen, workspace_parent=pinned_workspace.path.parent,
+                    ),
                     idempotency_key="target-root-completion:"
                     + canonical_hash(
                         {
@@ -2211,6 +2290,11 @@ def _frozen_sources_root(workspace_parent: Path,
     })
 
 
+def _frozen_artifact_path(workspace_parent: Path,
+                          completion: AcceptedTargetRootCompletion, ordinal: int) -> Path:
+    return _frozen_sources_root(workspace_parent, completion) / f"artifact-{ordinal:04d}"
+
+
 def _reuse_frozen_artifact(root: Path, ordinal: int, role: str,
                           relative_path: str) -> _FrozenArtifact | None:
     """Read private custody without recopying it; AR still checks the whole snapshot.
@@ -2274,7 +2358,7 @@ def _publish_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTarget
         if artifact.source_path is None:
             artifacts.append(artifact)
             continue
-        destination = root / f"artifact-{artifact.ordinal:04d}"
+        destination = _frozen_artifact_path(workspace_parent, completion, artifact.ordinal)
         try:
             existing = destination.lstat()
         except FileNotFoundError:
