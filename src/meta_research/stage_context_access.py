@@ -1,5 +1,5 @@
 """Authenticated, paged reading of a stage's frozen inputs and scoped history."""
-from meta_research.context_presentation import ExactContextPages, context_read_page, literature_reference, reasoning_handoff_reference
+from meta_research.context_presentation import ContextReadError, ExactContextPages, context_read_page, literature_reference, reasoning_handoff_reference
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.bundle_source_projection import target_projection, target_commit_projection
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
@@ -189,10 +189,20 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
             request.context_pack_ref, request.context_pack_hash, source, source_ref, arguments.get('version_ref'))
         page=context_read_page(value,path=arguments.get('path',[]),offset=arguments.get('offset',0),limit=arguments.get('limit',8192),
             cache=page_cache, identity=identity)
+    except ContextReadError as error:
+        raise SemanticMcpError(error.code, error.details) from error
     except ValueError as error:
         raise SemanticMcpError(str(error)) from error
     except OwnerConflict as error:
-        raise SemanticMcpError(str(error)) from error
+        details = error.details
+        if source == 'question_history' and error.code in {'research_query_changed', 'research_query_revision_required'}:
+            details = dict(details or {})
+            if error.code == 'research_query_changed':
+                details['path'] = ['index_offset']
+                details['correction'] = 'Restart at index_offset=0 and offset=0 without query_revision.'
+            else:
+                details['correction'] = 'Keep the first index page query_revision; otherwise restart index_offset=0 and offset=0.'
+        raise SemanticMcpError(error.code, details) from error
     return {**page,'context_pack_ref':request.context_pack_ref,'context_pack_hash':request.context_pack_hash,
         'source':source,'source_ref':source_ref,'index_page':index_page}
 

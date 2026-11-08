@@ -258,7 +258,9 @@ class ResearchEnvironmentOwnerMixin:
         filters = {field: value for field, value in (("environment_ref", environment_ref),
                     ("question_ref", question_ref), ("semantic_key", semantic_key)) if value is not None}
         if len(filters) > 1 or query and filters:
-            raise OwnerConflict("environment_page_filter_invalid")
+            raise OwnerConflict("environment_page_filter_invalid", {
+                "message": "Use query alone or one of environment_ref, question_ref, semantic_key.",
+                "correction": "Keep one filter and remove the conflicting fields."})
         operation = "reference" if environment_ref is not None or question_ref is not None else "register"
         table, key, _ = _FACTS[operation]
         clauses, params = [], {"limit": limit, "offset": offset, "quest": quest_ref}

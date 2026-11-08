@@ -24,9 +24,14 @@ class QuestionRelationOwnerMixin:
                                  left_question_ref, right_question_ref, notes):
         if (not isinstance(effect_id, str) or not 1 <= len(effect_id) <= 128
             or not isinstance(notes, str) or not notes.strip() or len(notes) > 8000
-            or not isinstance(left_question_ref, str) or not isinstance(right_question_ref, str)
-            or left_question_ref == right_question_ref):
+            or not isinstance(left_question_ref, str) or not isinstance(right_question_ref, str)):
             raise OwnerConflict("question_relation_invalid")
+        if left_question_ref == right_question_ref:
+            raise OwnerConflict("question_relation_invalid", {
+                "fields": ["left_question_ref", "right_question_ref"],
+                "message": "The two Question references must be different.",
+                "correction": "Select two existing Questions; do not invent one for this relation.",
+            })
         left_question_ref, right_question_ref = sorted((left_question_ref, right_question_ref))
         payload = {"quest_ref": quest_ref, "source_run_ref": source_run_ref,
                    "effect_id": effect_id, "left_question_ref": left_question_ref,
@@ -154,7 +159,7 @@ def question_history_operations(*, research_graph, agent_runtime, human_collabor
                                 stage[key] = {**stage[key], "source_quest_ref": quest_ref}
             return {"status": "accepted", "question": asdict(question), **history}
         except OwnerConflict as error:
-            raise SemanticMcpError(str(error)) from error
+            raise SemanticMcpError(error.code, error.details) from error
 
     return SemanticOperation(
         semantic_operation_id=QUESTION_HISTORY_OPERATION_ID, owning_module="research_graph",
@@ -187,7 +192,7 @@ def question_relation_operations(*, research_graph, agent_runtime, human_collabo
                         "relation": result["items"][0] if result["items"] else None}
             return research_graph.query_question_relations(quest_ref=quest_ref, **arguments)
         except OwnerConflict as error:
-            raise SemanticMcpError(str(error)) from error
+            raise SemanticMcpError(error.code, error.details) from error
     ref = {"type": "string", "minLength": 1, "maxLength": 96}
     effect = {"type": "string", "minLength": 1, "maxLength": 128}
     schemas = (

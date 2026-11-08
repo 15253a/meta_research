@@ -187,7 +187,13 @@ class MaterialProcessingMixin:
         if not isinstance(description, str) or not description.strip() or len(description) > 4000:
             raise OwnerConflict("material_acquisition_description_invalid")
         if (selection is None) == (absolute_path is None):
-            raise OwnerConflict("material_acquisition_source_invalid")
+            raise OwnerConflict("material_acquisition_source_invalid", {
+                "category": "arguments",
+                "message": "Supply exactly one of selection or absolute_path.",
+                "correction": "Use an inspected selection or a server absolute_path.",
+                "execution_stage": "before_effect_reservation",
+                "effect_status": "not_recorded",
+            })
         if absolute_path is not None:
             selection = self._root_workspaces.server_files.inspect(absolute_path, description=description)
         self._root_workspaces.server_files.validate_selection(selection)

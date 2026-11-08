@@ -114,7 +114,11 @@ class RecorderChannels:
                 serialized = active.documents[key] = canonical_json(body)
         offset = arguments.get("offset", 0)
         if offset >= len(serialized):
-            raise SemanticMcpError("content_offset_invalid")
+            raise SemanticMcpError("content_offset_invalid", {
+                "path": ["offset"], "maximum": len(serialized) - 1,
+                "message": "offset is beyond this source.",
+                "correction": "Use 0 or the previous page's next_offset.",
+            })
         end = min(offset + PAGE_CHARS, len(serialized))
         return {
             "node_key": node["node_key"],

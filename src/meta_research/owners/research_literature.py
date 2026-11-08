@@ -35,7 +35,10 @@ class ResearchLiteratureOwnerMixin:
         payload.update(fulltext_status=fulltext_status, asset_bindings=self._literature_bindings(asset_bindings),
                        metadata=dataset_metadata(metadata))
         if (fulltext_status == "obtained") != bool(payload["asset_bindings"]):
-            raise OwnerConflict("literature_fulltext_binding_required")
+            raise OwnerConflict("literature_fulltext_binding_required", {
+                "path": ["asset_bindings"],
+                "message": "asset_bindings must be nonempty exactly when fulltext_status=obtained.",
+                "correction": "Make status and bindings match the full text actually available; do not invent acquisition."})
         return self._accept_literature("register", payload, idempotency_key, effect_scope)
 
     def reference_literature(self, *, quest_ref, literature_ref, question_ref, purpose,

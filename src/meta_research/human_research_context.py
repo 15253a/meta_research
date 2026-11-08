@@ -15,6 +15,7 @@ def human_research_reader() -> dict[str, object]:
 
 def read_human_research_context(agent_runtime, human_collaboration, context, arguments):
     """Read human records within the root or the selected HC-authorized Quest."""
+    page_fields = None
     try:
         scope = agent_runtime.verify_root_agent_runtime_scope(
             root_kind=context.root_kind, run_ref=context.run_ref,
@@ -29,7 +30,10 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
         constraint_ref = arguments.get("constraint_ref")
         if constraint_ref is not None:
             if request_ref is not None or response_ref is not None or arguments.get("cursor") is not None:
-                raise OwnerConflict("research_help_selection_invalid")
+                raise OwnerConflict("research_help_selection_invalid", {
+                    "message": "constraint_ref cannot be combined with request_ref, response_ref or cursor.",
+                    "correction": "Read the exact guidance with constraint_ref/version_ref only.",
+                })
             if not quest_ref:
                 raise OwnerConflict("content_source_unbound")
             value = human_collaboration.read_research_guidance(
@@ -37,14 +41,22 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
             source_ref = constraint_ref
         elif arguments.get("entry_kind") == "guidance":
             if not quest_ref or request_ref is not None or response_ref is not None or arguments.get("cursor") is not None:
-                raise OwnerConflict("research_help_selection_invalid")
+                raise OwnerConflict("research_help_selection_invalid", {
+                    "message": "Guidance listing requires a Quest and no request_ref, response_ref or cursor.",
+                    "correction": "Use entry_kind=guidance in the authorized Quest; omit exact-request selectors.",
+                })
+            page_fields = ("guidance_offset", "query_revision")
             value = human_collaboration.query_research_guidance(quest_ref=quest_ref,
                 query=arguments.get("query", ""), offset=arguments.get("guidance_offset", 0),
                 query_revision=arguments.get("query_revision"))
             source_ref = quest_ref
         elif arguments.get("entry_kind") == "responses":
             if not quest_ref or request_ref is None or response_ref is not None or arguments.get("cursor") is not None:
-                raise OwnerConflict("research_help_selection_invalid")
+                raise OwnerConflict("research_help_selection_invalid", {
+                    "message": "entry_kind=responses requires request_ref in a Quest; response_ref and cursor are not allowed.",
+                    "correction": "Supply request_ref; use response_offset/query_revision for response pages.",
+                })
+            page_fields = ("response_offset", "query_revision")
             value = human_collaboration.query_research_response_page(quest_ref=quest_ref,
                 request_ref=request_ref, offset=arguments.get("response_offset", 0),
                 query_revision=arguments.get("query_revision"))
@@ -54,10 +66,15 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
             if not isinstance(quest_ref, str) or not quest_ref:
                 raise OwnerConflict("research_help_request_required")
             if response_ref is not None:
-                raise OwnerConflict("research_help_response_unbound")
+                raise OwnerConflict("research_help_response_unbound", {
+                    "message": "response_ref requires its request_ref.",
+                    "correction": "Use both references from the exact response reader.",
+                })
+            page_fields = ("cursor", "cursor")
             page = human_collaboration.query_research_help_page(
                 quest_ref=quest_ref, cursor=arguments.get("cursor"),
                 **({"query": arguments["query"]} if arguments.get("query") else {}))
+            page_fields = ("input_offset", "input_query_revision")
             inputs = human_collaboration.query_research_inputs(quest_ref=quest_ref,
                 offset=arguments.get("input_offset",0),limit=12,query=arguments.get("query",""),
                 **({"query_revision": arguments["input_query_revision"]} if "input_query_revision" in arguments else {}))
@@ -72,7 +89,10 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
             source_ref = quest_ref
         else:
             if arguments.get("cursor") is not None:
-                raise OwnerConflict("research_help_cursor_invalid")
+                raise OwnerConflict("research_help_cursor_invalid", {
+                    "message": "cursor cannot be combined with an exact request_ref.",
+                    "correction": "Omit cursor; use offset/limit for the selected request's bytes.",
+                })
             request = (human_collaboration.query_research_help_request(request_ref, quest_ref=quest_ref)
                        if quest_ref else human_collaboration.query_human_request(request_ref, materialize_expiration=False))
             if request is None or request.get("quest_ref") != quest_ref:
@@ -125,7 +145,20 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
         chunk = context_read_page(value, path=[], offset=arguments.get("offset", 0),
                                   limit=arguments.get("limit", 8192))
     except (OwnerConflict, ValueError) as error:
-        raise SemanticMcpError(str(error)) from error
+        code = getattr(error, "code", str(error))
+        details = getattr(error, "details", None)
+        if page_fields is not None and code in {"research_query_changed", "research_query_revision_required"}:
+            offset_field, revision_field = page_fields
+            details = dict(details or {})
+            details["path"] = [offset_field if code == "research_query_changed" else revision_field]
+            if offset_field == "cursor":
+                details["correction"] = "Restart without cursor and with offset=0; use the new next_cursor."
+            elif code == "research_query_revision_required":
+                details["message"] = f"Continuation requires the first page's {revision_field}."
+                details["correction"] = f"Keep {revision_field}; otherwise restart with {offset_field}=0 and offset=0."
+            else:
+                details["correction"] = f"Restart with {offset_field}=0 and offset=0, without {revision_field}; use the new revision."
+        raise SemanticMcpError(code, details) from error
     return {key: item for key, item in {
         **chunk, "quest_ref": quest_ref, "source_ref": source_ref,
         "next_cursor": value.get("next_cursor")}.items() if item is not None}

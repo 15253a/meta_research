@@ -268,7 +268,9 @@ class ResearchDatasetOwnerMixin:
                 or query and any(value is not None for value in (dataset_ref, question_ref, dataset_version_ref))
                 or direction not in {"sources", "derived", "both"}
                 or dataset_version_ref is None and direction != "both"):
-            raise OwnerConflict("dataset_page_filter_invalid")
+            raise OwnerConflict("dataset_page_filter_invalid", {
+                "message": "Use query alone or one of dataset_ref, question_ref, dataset_version_ref. direction=sources/derived requires dataset_version_ref.",
+                "correction": "Keep one filter; use direction=both unless reading version lineage."})
         operation, clauses, params = "register", [], {"offset": offset, "limit": limit}
         if dataset_ref is not None:
             dataset_text(dataset_ref, "ref")

@@ -370,14 +370,28 @@ class ExactContextPages:
             return value
 
 
+class ContextReadError(ValueError):
+    """A repairable selection error for this exact context reader."""
+
+    def __init__(self, code, field, message, correction):
+        super().__init__(code)
+        self.code = code
+        self.details = {"path": [field], "message": message, "correction": correction}
+
+
 def context_read_page(value: object, *, path: list[str | int], offset: int,
                       limit: int, cache: ExactContextPages | None = None,
                       identity: tuple | None = None) -> dict[str, object]:
     """Exact JSON text byte page, not a filesystem path or object truncation."""
-    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 16384:
-        raise ValueError("stage_context_page_invalid")
+    if type(offset) is not int or offset < 0:
+        raise ContextReadError("stage_context_page_invalid", "offset",
+            "offset must be a nonnegative integer.", "Use 0 or the returned next_offset.")
+    if type(limit) is not int or not 1 <= limit <= 16384:
+        raise ContextReadError("stage_context_page_invalid", "limit",
+            "limit must be between 1 and 16384 bytes.", "Use limit=8192.")
     if not isinstance(path, list) or len(path) > 16:
-        raise ValueError("stage_context_path_invalid")
+        raise ContextReadError("stage_context_path_invalid", "path",
+            "path must be a JSON path with at most 16 segments.", "Use path=[] to read the root.")
     node: Any = value
     for key in path:
         if isinstance(node, dict) and isinstance(key, str) and key in node:
@@ -385,19 +399,22 @@ def context_read_page(value: object, *, path: list[str | int], offset: int,
         elif isinstance(node, list) and (type(key) is int or isinstance(key, str) and key.isdecimal()) and 0 <= int(key) < len(node):
             node = node[int(key)]
         else:
-            raise ValueError("stage_context_path_invalid")
+            raise ContextReadError("stage_context_path_invalid", "path",
+                "path does not select an existing value.", "Read path=[] and select an existing key or index.")
     if cache is not None and identity is not None:
         raw, content_hash = cache.representation(node, identity, path)
     else:
         raw = _json(node).encode("utf-8")
         content_hash = hashlib.sha256(raw).hexdigest()
     if offset > len(raw) or (offset < len(raw) and raw[offset] & 0xC0 == 0x80):
-        raise ValueError("stage_context_offset_invalid")
+        raise ContextReadError("stage_context_offset_invalid", "offset",
+            "offset is outside the source or splits a UTF-8 character.", "Use 0 or the returned next_offset.")
     chunk = raw[offset:offset + limit]
     text = chunk.decode("utf-8", errors="ignore")
     consumed = len(text.encode())
     if not consumed and offset < len(raw):
-        raise ValueError("stage_context_limit_too_small")
+        raise ContextReadError("stage_context_limit_too_small", "limit",
+            "limit cannot fit the next UTF-8 character.", "Keep offset and use limit=8192.")
     return {"text": text, "encoding": "canonical-json-utf8-bytes",
             "content_hash": content_hash, "path": path,
             "offset": offset, "offset_unit": "utf8_bytes", "returned_bytes": consumed, "total_bytes": len(raw),

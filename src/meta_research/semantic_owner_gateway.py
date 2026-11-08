@@ -402,7 +402,9 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
                 return research_graph.query_baselines(**arguments, quest_ref=quest_ref)
             if "relation" not in arguments and any(key in arguments for key in (
                     "variant_run_ref", "evaluation_ref", "evaluation_attempt_ref")):
-                raise OwnerConflict("baseline_query_invalid")
+                raise OwnerConflict("baseline_query_invalid", {"path": ["relation"],
+                    "message": "variant_run_ref/evaluation_ref/evaluation_attempt_ref filters require relation.",
+                    "correction": "Select the intended relation or remove its deeper filters."})
             result = research_graph.query_baseline(arguments["baseline_ref"], quest_ref=quest_ref)
             if result is not None:
                 reader = (research_graph.query_baseline_relations if "relation" in arguments
@@ -662,7 +664,10 @@ def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *
     effect_key = context.dataset_effect_key(arguments["effect_id"])
     if reconcile:
         _dataset_scope(agent_runtime, context, reconcile=True)
-        result = research_graph.reconcile_dataset_operation(operation=action, idempotency_key=effect_key)
+        try:
+            result = research_graph.reconcile_dataset_operation(operation=action, idempotency_key=effect_key)
+        except OwnerConflict as error:
+            raise SemanticMcpError(error.code, error.details) from error
         return {"status": "not_found" if result is None else "accepted", "result": result}
     payload = {key: value for key, value in arguments.items() if key != "effect_id"}
     def effect_scope():
@@ -698,19 +703,21 @@ def _dataset_read(research_graph, agent_runtime, context, arguments, *, page, hu
     try:
         quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=source_quest_ref,
             human_collaboration=human_collaboration)
+        if page:
+            result = research_graph.query_datasets(**arguments, quest_ref=quest_ref)
+            return {**result, "items": [_dataset_content_readers(item, source_quest_ref) for item in result["items"]]}
+        if len(arguments) != 1:
+            raise SemanticMcpError("dataset_read_ref_invalid", {
+                "message": "Provide exactly one of dataset_ref, dataset_version_ref, dataset_reference_ref, dataset_derivation_ref.",
+                "correction": "Use the single reference returned by the dataset directory."})
+        readers = {"dataset_ref": research_graph.query_dataset,
+                   "dataset_version_ref": research_graph.query_dataset_version,
+                   "dataset_reference_ref": research_graph.query_dataset_reference,
+                   "dataset_derivation_ref": research_graph.query_dataset_derivation}
+        field, ref = next(iter(arguments.items()))
+        result = readers[field](ref, quest_ref=quest_ref)
     except OwnerConflict as error:
         raise SemanticMcpError(error.code, error.details) from error
-    if page:
-        result = research_graph.query_datasets(**arguments, quest_ref=quest_ref)
-        return {**result, "items": [_dataset_content_readers(item, source_quest_ref) for item in result["items"]]}
-    if len(arguments) != 1:
-        raise SemanticMcpError("dataset_read_ref_invalid")
-    readers = {"dataset_ref": research_graph.query_dataset,
-               "dataset_version_ref": research_graph.query_dataset_version,
-               "dataset_reference_ref": research_graph.query_dataset_reference,
-               "dataset_derivation_ref": research_graph.query_dataset_derivation}
-    field, ref = next(iter(arguments.items()))
-    result = readers[field](ref, quest_ref=quest_ref)
     return {"status": "not_found" if result is None else "accepted",
             "result": None if result is None else _dataset_content_readers(result, source_quest_ref)}
 
@@ -789,11 +796,14 @@ def _plan_evidence_request(advancement_engine, agent_runtime, context):
 
 def _read_plan_evidence_page(advancement_engine, agent_runtime, research_graph, context, arguments):
     request = _plan_evidence_request(advancement_engine, agent_runtime, context)
-    page, catalog = research_graph.query_plan_evidence_page(
-        quest_ref=request.accepted_question.quest_ref,
-        question_ref=request.accepted_question.question_ref,
-        offset=arguments["offset"], limit=arguments["limit"],
-    )
+    try:
+        page, catalog = research_graph.query_plan_evidence_page(
+            quest_ref=request.accepted_question.quest_ref,
+            question_ref=request.accepted_question.question_ref,
+            offset=arguments["offset"], limit=arguments["limit"],
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
     return {
         "context_pack_ref": request.context_pack_ref, "page": page,
         "evidence_catalog": list(catalog),
@@ -814,15 +824,21 @@ def _read_plan_evidence_content(advancement_engine, agent_runtime, research_grap
     frozen = next((item for item in request.context_pack["evidence_catalog"] if exact(item)), None)
     # Query only issuer-backed roots in this Quest. An arbitrary RM version
     # supplied by the caller never grants content access.
-    _revision, catalog = research_graph.query_plan_evidence_catalog(
-        quest_ref=request.accepted_question.quest_ref,
-        target_commit_refs=(arguments["target_commit_ref"],), current_only=frozen is None,
-        role_refs=(arguments["role_ref"],),
-    )
+    try:
+        _revision, catalog = research_graph.query_plan_evidence_catalog(
+            quest_ref=request.accepted_question.quest_ref,
+            target_commit_refs=(arguments["target_commit_ref"],), current_only=frozen is None,
+            role_refs=(arguments["role_ref"],),
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
     binding = next((item for item in catalog if exact(item)), None)
     if binding is None:
         raise SemanticMcpError("plan_evidence_ref_unbound")
-    materialized = research_memory.materialize_asset(str(binding["asset_version_ref"]))
+    try:
+        materialized = research_memory.materialize_asset(str(binding["asset_version_ref"]))
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
     import hashlib
     if hashlib.sha256(materialized.content).hexdigest() != binding["content_hash"]:
         raise SemanticMcpError("plan_evidence_content_mismatch")
@@ -1608,6 +1624,20 @@ def _root_human_request_command(
     acceptance_conditions = arguments.get("acceptance_conditions")
     authorization = arguments.get("required_authorization")
     predecessor_request_ref = arguments.get("predecessor_request_ref")
+    if request_kind == "capability_authorization" and authorization is None:
+        raise SemanticMcpError("root_agent_human_request_condition_invalid", {
+            "category": "arguments",
+            "message": "capability_authorization requires required_authorization.",
+            "correction": "If previously submitted, reconcile the original arguments first. Describe the exact capability, destination, duration and exclusions being authorized.",
+            "execution_stage": "before_owner_submission", "call_execution": "not_started", "effect_status": "unknown",
+        })
+    if request_kind != "capability_authorization" and authorization is not None:
+        raise SemanticMcpError("root_agent_human_request_condition_invalid", {
+            "category": "arguments",
+            "message": "required_authorization is only valid for request_kind=capability_authorization.",
+            "correction": "If previously submitted, reconcile the original arguments first. Omit required_authorization or select the matching request_kind.",
+            "execution_stage": "before_owner_submission", "call_execution": "not_started", "effect_status": "unknown",
+        })
     if (
         request_kind not in HUMAN_REQUEST_KINDS
         or not isinstance(obligation, str)
@@ -1655,7 +1685,11 @@ def _root_human_request_command(
         str(item).strip() for item in acceptance_conditions
     )
     if len(set(normalized_conditions)) != len(normalized_conditions):
-        raise SemanticMcpError("root_agent_human_request_condition_invalid")
+        raise SemanticMcpError("root_agent_human_request_condition_invalid", {
+            "category": "arguments", "message": "acceptance_conditions must be unique after trimming.",
+            "correction": "If previously submitted, reconcile the original arguments first. Remove repeated conditions.",
+            "execution_stage": "before_owner_submission", "call_execution": "not_started", "effect_status": "unknown",
+        })
     return _RootHumanRequestCommand(
         request_kind=str(request_kind),
         obligation=obligation,
@@ -2476,10 +2510,13 @@ def _accept_implementation_content(
 ) -> dict[str, object]:
     _verify_bundle_scope(agent_runtime, context)
     effect_id, effect_key = _semantic_effect_key(context, arguments)
-    accepted = research_memory.accept_implementation_content(
-        **_implementation_content_arguments(arguments),
-        idempotency_key=effect_key,
-    )
+    try:
+        accepted = research_memory.accept_implementation_content(
+            **_implementation_content_arguments(arguments),
+            idempotency_key=effect_key,
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
     _require_exact_implementation_content(accepted, arguments)
     return {
         "status": "effect_confirmed",
@@ -2496,9 +2533,12 @@ def _reconcile_implementation_content(
 ) -> dict[str, object]:
     _verify_bundle_scope(agent_runtime, context)
     effect_id, _effect_key = _semantic_effect_key(context, arguments)
-    accepted = research_memory.query_implementation_content(
-        str(arguments["implementation_revision_ref"])
-    )
+    try:
+        accepted = research_memory.query_implementation_content(
+            str(arguments["implementation_revision_ref"])
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
     if accepted is None:
         return {"status": "unknown_outcome", "effect_id": effect_id}
     _require_exact_implementation_content(accepted, arguments)
@@ -2516,9 +2556,12 @@ def _read_implementation_content(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     _verify_bundle_scope(agent_runtime, context)
-    accepted = research_memory.query_implementation_content(
-        str(arguments["implementation_revision_ref"])
-    )
+    try:
+        accepted = research_memory.query_implementation_content(
+            str(arguments["implementation_revision_ref"])
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code, error.details) from error
     if accepted is None:
         return {"status": "absent"}
     return {
@@ -2548,8 +2591,13 @@ def _require_exact_implementation_content(
     arguments: dict[str, object],
 ) -> None:
     expected = _implementation_content_arguments(arguments)
-    if any(getattr(accepted, name) != value for name, value in expected.items()):
-        raise SemanticMcpError("implementation_content_reconciliation_conflict")
+    fields = [name for name, value in expected.items() if getattr(accepted, name) != value]
+    if fields:
+        raise SemanticMcpError("implementation_content_reconciliation_conflict", {
+            "fields": fields,
+            "message": "These fields differ from the accepted implementation content.",
+            "correction": "Reconcile with the original submission; keep its accepted revision and payload.",
+        })
     expected_content = {
         name: expected[name]
         for name in (
@@ -2569,7 +2617,10 @@ def _require_exact_implementation_content(
         or accepted.content_acceptance_receipt.subject_ref
         != accepted.content_hash_ref
     ):
-        raise SemanticMcpError("implementation_content_reconciliation_conflict")
+        raise SemanticMcpError("implementation_content_reconciliation_conflict", {
+            "message": "Accepted content, hash or receipts do not match the exact binding.",
+            "correction": "Inspect the retained content and receipts; keep the original submission unchanged.",
+        })
 
 
 def _implementation_content_public(accepted: object) -> dict[str, object]:

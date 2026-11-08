@@ -3108,7 +3108,11 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             if replay is not None or existing_revision is not None:
                 row = replay if replay is not None else existing_revision
                 if row.request_hash != request_hash:
-                    raise OwnerConflict("implementation_content_conflict")
+                    raise OwnerConflict("implementation_content_conflict", {
+                        "implementation_revision_ref": implementation_revision_ref,
+                        "message": "This effect or revision already has different accepted content.",
+                        "correction": "Reconcile the original submission; retain its accepted revision and payload.",
+                    })
             else:
                 now = time.time()
                 source_receipt_ref = new_ref("rm_reuse_source_receipt")
@@ -3159,7 +3163,11 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 except IntegrityError as error:
                     # Uniqueness on exact version/content makes identity relabel
                     # fail closed even under concurrent callers.
-                    raise OwnerConflict("implementation_content_conflict") from error
+                    raise OwnerConflict("implementation_content_conflict", {
+                        "implementation_revision_ref": implementation_revision_ref,
+                        "message": "This exact content is already bound to an accepted identity.",
+                        "correction": "Reconcile the original submission; reuse its accepted identity without relabelling.",
+                    }) from error
                 connection.execute(
                     text(
                         "UPDATE research_memory_state SET revision = revision + 1, "

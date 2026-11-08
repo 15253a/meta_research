@@ -63,15 +63,18 @@ def _schema_diagnostic(error: ValidationError, depth: int = 0) -> dict[str, Any]
     alternatives = {}
     if requirement in {"oneOf", "anyOf"}:
         expected = "exactly one permitted shape" if requirement == "oneOf" else "at least one permitted shape"
-        if error.context and depth < 4:
+        if error.context and depth < 2:
             alternatives = {"alternatives": [
                 {**_schema_diagnostic(child, depth + 1), "schema_path": list(child.absolute_schema_path)}
-                for child in error.context[:8]], "alternatives_truncated": len(error.context) > 8}
+                for child in error.context[:4]], "alternatives_truncated": len(error.context) > 4}
+        elif error.context:
+            alternatives = {"alternatives_truncated": True}
         elif not error.context:
             # A failed oneOf with no failed branches means several shapes matched.
             expected = "exactly one permitted shape; multiple shapes matched"
             alternatives = {"alternative_required_fields": [
-                branch.get("required", []) for branch in error.validator_value[:8] if isinstance(branch, dict)]}
+                branch.get("required", []) for branch in error.validator_value[:4] if isinstance(branch, dict)],
+                "alternatives_truncated": len(error.validator_value) > 4}
     elif requirement == "required" and isinstance(error.instance, dict):
         path.append(next(name for name in expected if name not in error.instance))
         expected = "present"
@@ -81,9 +84,14 @@ def _schema_diagnostic(error: ValidationError, depth: int = 0) -> dict[str, Any]
         # oneOf/anyOf and other nested contracts are discovered from the frozen tool.
         expected = "satisfy the " + str(requirement) + " requirement in the frozen inputSchema"
     location = "$" + "".join(f"[{part}]" if isinstance(part, int) else "." + part for part in path)
-    return {"path": path, "requirement": requirement, "expected": expected, **alternatives,
-            "message": f"{location} does not satisfy {requirement}.",
-            "correction": f"Correct {location} to satisfy {requirement}: {canonical_json(expected)} in the current tool contract."}
+    details = {"path": path, "requirement": requirement, "expected": expected, **alternatives}
+    if depth == 0:
+        correction = f"Correct {location} using expected."
+        if requirement in {"oneOf", "anyOf"}:
+            correction += " Read the frozen inputSchema for remaining alternatives."
+        details.update(message=f"{location} does not satisfy {requirement}.",
+                       correction=correction)
+    return details
 
 
 @dataclass(frozen=True)
@@ -494,8 +502,8 @@ class ExternalMcpRuntime:
             "tool": tool["name"], "outcome": "unknown" if attempted else "not_called",
             "business_action_attempted": attempted,
             **({"provider_diagnostic_status": "unstructured_not_forwarded",
-                "message": "The service reported a tool error. Its unstructured text has no agreed safe diagnostic contract and is not included in this receipt.",
-                "correction": "Reconcile the original service operation identified here before repeating a business action. If its status or cause remains unclear, request the service owner's diagnosis; preserve existing results and the original operation identity."}
+                "message": "The service reported an error without a safe structured diagnosis.",
+                "correction": "Reconcile the original operation first. If still unclear, ask the service owner; preserve existing results."}
                if reason_code == "tool_error" else {})}
 
     @contextmanager
@@ -552,8 +560,8 @@ class ExternalMcpRuntime:
             except (Unresolvable, SchemaError):
                 return failure(-32000, "external_mcp_schema_invalid", {
                     **self._call_failure(grant, frozen, tool, stage="input_validation", reason_code="external_mcp_schema_invalid"),
-                    "category": "tool_contract", "message": "The external tool input schema is invalid or contains an unresolved reference.",
-                    "correction": "Ask the service provider to repair the tool schema; changing submitted arguments cannot resolve this contract defect."})
+                    "category": "tool_contract", "message": "The tool schema is invalid or has an unresolved reference.",
+                    "correction": "Ask the provider to repair the schema; changing arguments cannot fix it."})
             try:
                 result = self._client.call(json.loads(frozen.service.connection_json), tool["name"], arguments)
                 if result.get("isError", False):
@@ -567,8 +575,8 @@ class ExternalMcpRuntime:
                         reason = "external_mcp_result_invalid" if isinstance(error, ValidationError) else "external_mcp_schema_invalid"
                         return failure(-32000, reason, {
                             **self._call_failure(grant, frozen, tool, stage="tools/call", reason_code=reason),
-                            "category": "tool_contract", "message": "The external tool returned a result that could not be validated against its output contract.",
-                            "correction": "The business outcome is unknown. Reconcile the original operation with the service before repeating it; ask the provider to repair its output/schema contract."})
+                            "category": "tool_contract", "message": "The result cannot be validated against the output contract.",
+                            "correction": "Outcome unknown: reconcile the original operation first, then ask the provider to repair its output contract."})
             except ExternalMcpClientError as error:
                 return failure(-32000, error.code, self._call_failure(grant, frozen, tool, stage=error.stage, reason_code=error.code))
         else:

@@ -506,8 +506,8 @@ class SemanticMcpGateway:
                     **problem, "operation_id": operation_id,
                     "category": "arguments", "execution_stage": "input_validation",
                     "call_execution": "not_started",
-                    "message": "The submitted field does not satisfy the registered input contract. No handler ran for this call; this does not establish any earlier effect's outcome.",
-                    "correction": "Correct the indicated field using requirement and expected, then submit again on the current channel. If an earlier effect's outcome was already uncertain, reconcile that original unchanged submission before modifying it.",
+                    "message": "Input violates this field constraint; this call did not run.",
+                    "correction": "Fix the indicated field using expected. Reconcile any earlier uncertain effect unchanged before modifying its submission.",
                 }),
             }
         try:
@@ -714,7 +714,7 @@ def _valid_schema_contract(schema: object) -> bool:
         return False
     for key in ("minLength", "maxLength"):
         value = schema.get(key)
-        if value is not None and (
+        if key in schema and (
             not isinstance(value, int) or isinstance(value, bool) or value < 0
         ):
             return False
@@ -832,21 +832,21 @@ def _post_handler_failure(
         "operation_id": operation.semantic_operation_id,
         "category": "tool_contract" if stage == "output_validation" else "host_failure",
         "execution_stage": stage,
-        "message": ("The handler returned a result outside its registered output contract."
-                    if stage == "output_validation" else "The handler failed without a valid operation receipt."),
-        "correction": "Report this host/tool failure with the operation id; changing research conclusions cannot repair it.",
+        "message": ("Handler output violates its contract."
+                    if stage == "output_validation" else "Handler failed without a valid receipt."),
+        "correction": "Report this operation to the tool owner; do not alter research facts to bypass it.",
     }
     if operation.access_mode == "effect":
         details.update({
             "effect_status": "unknown",
             "reconciliation_operation_id": operation.reconciliation_operation_id,
-            "correction": "Reconcile the original operation with its unchanged original submission and effect identity first. Preserve accepted work; do not change the submission under the same identity or create a replacement effect while its result is unknown.",
+            "correction": "Reconcile the original unchanged submission and effect first. Preserve accepted work; do not resubmit while the outcome is unknown.",
         })
         if isinstance(arguments.get("effect_id"), str):
             details["effect_id"] = arguments["effect_id"]
     elif operation.access_mode == "reconcile":
         details.update({"effect_status": "unknown",
-                        "correction": "The reconciliation did not establish the original outcome. Preserve the original identity and submission; restore this read path before considering another effect."})
+                        "correction": "Restore reconciliation first. Keep the original identity and submission; the outcome is still unknown."})
         if isinstance(arguments.get("effect_id"), str):
             details["effect_id"] = arguments["effect_id"]
     return details

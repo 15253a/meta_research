@@ -11,7 +11,7 @@ from typing import Literal
 
 from sqlalchemy import text
 
-from meta_research.context_presentation import context_read_page
+from meta_research.context_presentation import ContextReadError, context_read_page
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from meta_research.resource_preparation import prepared_resource
@@ -931,6 +931,11 @@ def creation_basis_operations(memory, runtime, collaboration):
             else:
                 raise OwnerConflict("creation_basis_unbound")
             if arguments["view"] == "source":
+                if "material_key" not in arguments:
+                    raise SemanticMcpError("semantic_input_schema_mismatch", {
+                        "path": ["material_key"], "message": "material_key is required for view=source.",
+                        "correction": "Use a material_key from this basis's sources.",
+                    })
                 page = memory.creation_bases.read_source(basis, arguments["material_key"], arguments.get("offset", 0), arguments.get("limit", 8192))
                 content = page.pop("content")
                 if isinstance(content, bytes):
@@ -957,8 +962,10 @@ def creation_basis_operations(memory, runtime, collaboration):
                     basis["predecessor"]["basis_ref"], basis["predecessor"]["basis_hash"])["understanding"])}
             return {**context_read_page(value, path=[], offset=arguments.get("offset", 0), limit=min(arguments.get("limit", 8192), 16384)),
                 "basis_ref": basis["basis_ref"], "basis_hash": basis["basis_hash"]}
-        except (OwnerConflict, KeyError) as error:
-            raise SemanticMcpError(getattr(error, "code", "creation_basis_unbound")) from error
+        except (OwnerConflict, ContextReadError) as error:
+            raise SemanticMcpError(error.code, error.details) from error
+        except KeyError as error:
+            raise SemanticMcpError("creation_basis_unbound") from error
     return (SemanticOperation(semantic_operation_id="research_memory.creation_basis.read", owning_module="research_memory",
         description="Read the exact authorized existing-work basis, source or prior literature. Applicability distinguishes retained claims, changed scope and unresolved creation limits. Protected reassessment can read only its exact historical predecessor. DeepFetch can read its bound basis and exact prior snapshots with view=literature and snapshot_ref; reuse never creates a new run or snapshot binding. Unselected or linked historical bytes may be unavailable. Imported work retains external provenance.",
         input_schema={"type": "object", "additionalProperties": False, "properties": {

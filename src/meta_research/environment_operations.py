@@ -70,7 +70,11 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
             if page:
                 return graph.query_environments(**arguments, quest_ref=quest_ref)
             if len(arguments) != 1:
-                raise OwnerConflict("environment_read_ref_invalid")
+                raise OwnerConflict("environment_read_ref_invalid", {
+                    "fields": ["environment_ref", "environment_reference_ref"],
+                    "message": "Expected exactly one Environment reference.",
+                    "correction": "Pass environment_ref or environment_reference_ref, not both.",
+                })
             field, ref = next(iter(arguments.items()))
             handler = graph.query_environment if field == "environment_ref" else graph.query_environment_reference
             result = handler(ref, quest_ref=quest_ref)

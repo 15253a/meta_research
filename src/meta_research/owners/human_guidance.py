@@ -244,7 +244,12 @@ class HumanGuidanceMixin:
             cut = self._authorize_guidance(scope, binding, reconcile=reconcile)
             if delivery_ref is None:
                 if reconcile or effect_id is not None or offset != 0:
-                    raise OwnerConflict("guidance_delivery_required")
+                    raise OwnerConflict("guidance_delivery_required", {
+                        "category": "arguments",
+                        "message": "delivery_ref is required with effect_id, offset or reconciliation.",
+                        "correction": "If previously submitted, reconcile the original arguments first. List without effect_id at offset=0, then select a delivery_ref.",
+                        "execution_stage": "before_effect_lookup", "call_execution": "not_started", "effect_status": "unknown",
+                    })
                 return {"binding": binding.as_dict(), "summary_only": True,
                     "deliveries": [_summary(item) for item in cut.deliveries]}
             delivery = _delivery(cut, delivery_ref)
@@ -567,7 +572,12 @@ def _assessment_summary(receipt):
 
 def _effect_key(binding, kind, effect_id):
     if not isinstance(effect_id, str) or not effect_id or len(effect_id) > 128:
-        raise OwnerConflict("guidance_effect_id_invalid")
+        raise OwnerConflict("guidance_effect_id_invalid", {
+            "category": "arguments",
+            "message": "effect_id must contain 1–128 characters.",
+            "correction": "If previously submitted, reconcile the original arguments first. Supply a stable effect_id for this read or feedback.",
+            "execution_stage": "before_effect_lookup", "call_execution": "not_started", "effect_status": "unknown",
+        })
     return "guidance_effect_" + canonical_hash({"identity": vars(binding.identity),
         "snapshot_ref": binding.snapshot_ref, "kind": kind, "effect_id": effect_id})
 

@@ -389,8 +389,8 @@ class RootResidentMcpChannels:
                 if status in {401, 403}:
                     raise RootResidentMcpError("mcp_channel_authentication_required", {
                         **details, "category": "authorization",
-                        "message": "The resident MCP channel is not currently authorized.",
-                        "correction": "Restore a current scope-bound channel through the host; do not change the research submission or bypass authorization.",
+                        "message": "This channel is not authorized.",
+                        "correction": "Ask the host to restore the current scoped grant; do not bypass authorization.",
                     })
                 protocol_error = payload.get("error") if isinstance(payload, dict) else None
                 protocol_code = protocol_error.get("code") if isinstance(protocol_error, dict) else None
@@ -401,15 +401,15 @@ class RootResidentMcpChannels:
                     raise RootResidentMcpError("semantic_mcp_protocol_error", {
                         **details, "category": "host_contract",
                         "protocol_code": protocol_code,
-                        "message": "The resident MCP rejected the host protocol request.",
-                        "correction": "Repair the host's JSON-RPC request envelope; changing research content cannot fix a protocol error.",
+                        "message": "The host's JSON-RPC request was rejected.",
+                        "correction": "Repair the host request envelope, not the research submission.",
                     })
                 details.update({
                     "category": ("temporarily_unavailable" if unavailable else
                                  "host_failure" if type(protocol_code) is int else "host_contract"),
-                    "message": "The resident MCP service did not return a usable operation receipt.",
+                    "message": "No usable operation receipt was returned.",
                     "effect_state": "unknown",
-                    "correction": "Restore service access or repair the host response contract, then reconcile the original operation before submitting any effect again. Preserve its original identity and payload.",
+                    "correction": "Restore service/host access, then reconcile the original unchanged operation before resubmitting.",
                 })
                 raise RootResidentMcpError(
                     "semantic_mcp_unavailable" if unavailable else

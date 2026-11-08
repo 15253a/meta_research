@@ -467,7 +467,10 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
                 if observed["kind"] != "file" or observed["observation_ref"] != observation_ref:
                     raise OwnerConflict("material_source_changed")
                 if int(observed["size"]) > max_bytes:
-                    raise OwnerConflict("creation_copy_too_large")
+                    raise OwnerConflict("creation_copy_too_large", {"path": ["max_bytes"],
+                        "required_bytes": int(observed["size"]), "maximum": 8 * 1024**2,
+                        "message": "The observed file exceeds max_bytes.",
+                        "correction": "Reconcile first. If failed, use paged reads or a new copy with a sufficient allowed limit."})
             suffix = Path(path or reference["source"]["absolute_path"]).suffix
             if len(suffix) > 24 or not all(character.isalnum() or character == "." for character in suffix):
                 suffix = ""
@@ -479,7 +482,10 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
                     content = material_bytes(page)
                     offset += len(content)
                     if offset > max_bytes:
-                        raise OwnerConflict("creation_copy_too_large")
+                        raise OwnerConflict("creation_copy_too_large", {"path": ["max_bytes"],
+                            "required_bytes_at_least": offset, "maximum": 8 * 1024**2,
+                            "message": "Reading the file exceeded max_bytes.",
+                            "correction": "Reconcile first. If failed, rediscover the file and use paged reads or a new copy."})
                     stream.write(content)
                     digest.update(content)
                     witnesses.append(page.get("read_witness") or {"reference_ref": reference_ref, "path": path,

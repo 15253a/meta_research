@@ -64,9 +64,17 @@ def _progress_operation(target_agent) -> SemanticOperation:
         raw = arguments.get('mode', 'progress') == 'raw'
         if raw:
             if 'cursor' in arguments or not all(key in arguments for key in ('log_ref', 'stream_ref', 'before')):
-                raise SemanticMcpError('experiment_log_cursor_invalid')
+                raise SemanticMcpError('experiment_log_cursor_invalid', {
+                    'category': 'arguments',
+                    'message': 'mode=raw requires log_ref, stream_ref and before; cursor is not allowed.',
+                    'correction': 'Use the returned log_ref/stream_ref and before offset; omit cursor.',
+                })
         elif any(key in arguments for key in ('log_ref', 'stream_ref', 'before')):
-            raise SemanticMcpError('experiment_log_cursor_invalid')
+            raise SemanticMcpError('experiment_log_cursor_invalid', {
+                'category': 'arguments',
+                'message': 'mode=progress does not accept log_ref, stream_ref or before.',
+                'correction': 'Omit raw fields and use cursor, or select mode=raw.',
+            })
         try:
             result = target_agent.query_target_progress(target_ref, target_run_ref=context.run_ref,
                 **{key: arguments[key] for key in ('cursor', 'log_ref', 'stream_ref', 'before') if key in arguments})

@@ -132,7 +132,11 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
             if action == "intake":
                 values = dict(arguments["intake"])
                 if sum(name in values for name in ("text", "source", "target_workspace_note")) != 1:
-                    raise OwnerConflict("asset_source_payload_ambiguous")
+                    raise OwnerConflict("asset_source_payload_ambiguous", {
+                        "message": "intake requires exactly one of text, source or target_workspace_note.",
+                        "correction": "If previously submitted, reconcile the original arguments first. Keep only the payload matching the intended source.",
+                        "execution_stage": "before_source_resolution", "call_execution": "not_started", "effect_status": "unknown",
+                    })
                 selector = values.pop("target_workspace_note", None)
                 source_selector = values.pop("source", None)
                 selected_source = None

@@ -81,21 +81,21 @@ def generate(config_ref: str, request: dict, *, environment=None, opener=None) -
         error.close()
         if error.code == 401:
             raise ContentModelError("authentication_failed", "authorization",
-                "The selected content provider rejected its configured credentials.",
-                "Ask the configuration owner to repair the selected model credentials; preserve the current draft and model choice.",
+                "The provider rejected the configured credentials.",
+                "Ask the configuration owner to repair credentials; keep the draft and selected model.",
                 http_status=error.code) from None
         if error.code == 403:
             reason, category, message, correction = ("authorization_denied", "authorization",
                 "The selected provider denied access to this model.",
-                "Ask the configuration owner to check permission for the selected model; preserve the current draft.")
+                "Ask the configuration owner to restore model permission; keep the draft.")
         elif error.code == 429:
             reason, category, message, correction = ("rate_limited", "temporary_unavailable",
-                "The selected provider rejected the request because of a rate or quota limit.",
-                "Check the selected provider's rate/quota limit before another call; keep the draft and do not switch models without authorization.")
+                "The provider's rate or quota limit was reached.",
+                "Check rate/quota limits before another call; keep the draft and selected model.")
         elif error.code in {408, 504}:
             reason, category, message, correction = ("timeout", "temporary_unavailable",
                 "The selected provider or its gateway timed out.",
-                "The remote generation outcome is unknown. Check the selected service before another call; preserve existing draft output and model choice.")
+                "Outcome unknown: check the service before another call; keep existing output and model choice.")
         elif error.code >= 500:
             reason, category, message, correction = ("service_unavailable", "temporary_unavailable",
                 "The selected provider returned a server failure.",
@@ -106,8 +106,8 @@ def generate(config_ref: str, request: dict, *, environment=None, opener=None) -
                 "Ask the configuration owner to verify the exact endpoint; do not send credentials to the redirect location.")
         elif error.code in {404, 405, 410, 415}:
             reason, category, message, correction = ("configuration_rejected", "tool_contract",
-                "The configured model endpoint, model name or request method/media type was not accepted.",
-                "Ask the configuration owner to verify the exact endpoint, selected model and request contract; changing research messages cannot repair this configuration.")
+                "The endpoint, model, method or media type was rejected.",
+                "Ask the configuration owner to fix the selected endpoint/model contract; changing messages cannot fix it.")
         elif error.code in {400, 413, 422}:
             reason, category, message, correction = ("request_rejected", "submission",
                 "The selected provider rejected the content request.",
@@ -158,8 +158,8 @@ def content_model_operation(agent_runtime):
             "required": ["config_ref", "messages"], "additionalProperties": False},
         output_schema={"type": "object"}, handler=call,
         error_descriptions={
-            "content_model_configuration_invalid": "config_ref must be the user's selected configured name: 1–64 letters, digits, underscores or hyphens. Correct that reference; do not substitute an unapproved model.",
-            "content_model_configuration_unavailable": "No usable configuration is available for config_ref. Verify the selected reference; if it is correct, ask the configuration owner to restore its META_RESEARCH_CONTENT_MODELS entry, valid endpoint/model and api_key_env credential. No provider call was made; keep the draft and selected model.",
-            "content_model_request_invalid": "messages must be a nonempty array of objects containing only role and content; role is system, user or assistant and content is text. Correct the submitted messages without changing the evidence or tool contract.",
-            "content_model_request_too_large": "The serialized model plus messages request exceeds 8 MiB of UTF-8 JSON. Reduce the submitted messages to the needed authorized excerpts or divide the writing task while retaining the original evidence and existing draft.",
+            "content_model_configuration_invalid": "config_ref must name the selected model using 1–64 letters, digits, underscores or hyphens; do not substitute another model.",
+            "content_model_configuration_unavailable": "config_ref has no usable configuration; no provider call ran. Verify the reference or ask the configuration owner to restore META_RESEARCH_CONTENT_MODELS, endpoint/model and api_key_env; keep the draft.",
+            "content_model_request_invalid": "messages must be nonempty, with only role (system/user/assistant) and text content. Correct the message shape, preserving evidence.",
+            "content_model_request_too_large": "The model/messages JSON exceeds 8 MiB. Send smaller authorized excerpts or split the writing task; retain the draft and original evidence.",
         })

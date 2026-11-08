@@ -16,6 +16,15 @@ def test_invalid_numeric_contract_is_rejected_before_any_channel(bounds):
             {"type": "object"}),))
 
 
+@pytest.mark.parametrize("bound", ["minLength", "maxLength"])
+def test_null_string_bound_is_rejected_before_a_caller_can_reach_it(bound):
+    with pytest.raises(SemanticMcpError, match="semantic_operation_schema_invalid"):
+        SemanticMcpGateway((SemanticOperation("invalid.read", "example", "Invalid string contract.",
+            lambda context, arguments: {},
+            {"type": "object", "properties": {"label": {"type": "string", bound: None}}},
+            {"type": "object"}),))
+
+
 def gateway_with_reader():
     return SemanticMcpGateway((SemanticOperation(
         "evidence.read", "research_memory", "Read retained evidence.",

@@ -17,16 +17,39 @@ class SelectedIntakeSource:
 
 def _selector_parts(selector):
     if not isinstance(selector, dict):
-        raise OwnerConflict("asset_source_selector_invalid")
-    parts = relative_parts(selector.get("path"))
+        raise OwnerConflict("asset_source_selector_invalid", {
+            "message": "source must be a workspace or material selector object.",
+            "correction": "If previously submitted, reconcile the original arguments first. Provide kind, path and the matching workspace_ref or reference_ref.",
+            "execution_stage": "source_selection", "call_execution": "not_started", "effect_status": "unknown",
+        })
+    try:
+        parts = relative_parts(selector.get("path"))
+    except OwnerConflict as error:
+        raise OwnerConflict(error.code, {
+            "message": "source.path must be a safe relative path.",
+            "correction": "If previously submitted, reconcile the original arguments first. Supply path without absolute, parent or dot components.",
+            "execution_stage": "source_selection", "call_execution": "not_started", "effect_status": "unknown",
+        }) from error
     if selector.get("kind") not in ("workspace", "material"):
-        raise OwnerConflict("asset_source_selector_invalid")
+        raise OwnerConflict("asset_source_selector_invalid", {
+            "message": "source.kind must be workspace or material.",
+            "correction": "If previously submitted, reconcile the original arguments first. Select the source kind and its matching reference field.",
+            "execution_stage": "source_selection", "call_execution": "not_started", "effect_status": "unknown",
+        })
     reference_name = {"workspace": "workspace_ref", "material": "reference_ref"}.get(selector.get("kind"))
     if reference_name is None or set(selector) != {"kind", reference_name, "path"}:
-        raise OwnerConflict("asset_source_selector_invalid")
+        raise OwnerConflict("asset_source_selector_invalid", {
+            "message": f"This source.kind requires only kind, {reference_name} and path.",
+            "correction": f"If previously submitted, reconcile the original arguments first. Supply {reference_name} and path; omit fields for other source kinds.",
+            "execution_stage": "source_selection", "call_execution": "not_started", "effect_status": "unknown",
+        })
     reference = selector[reference_name]
     if not isinstance(reference, str) or not reference or len(reference) > 16000:
-        raise OwnerConflict("asset_source_selector_invalid")
+        raise OwnerConflict("asset_source_selector_invalid", {
+            "message": f"source.{reference_name} must contain 1–16000 characters.",
+            "correction": "If previously submitted, reconcile the original arguments first. Use the reference returned by the authorized source reader.",
+            "execution_stage": "source_selection", "call_execution": "not_started", "effect_status": "unknown",
+        })
     if selector["kind"] == "workspace" and (not parts or any(
         part.startswith(".delivery-") or part in {".delivery.json", ".creation-context"} for part in parts
     )):
