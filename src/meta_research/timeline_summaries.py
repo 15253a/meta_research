@@ -26,7 +26,7 @@ MAX_SCAN_SECONDS = 7200
 # Version the prose policy independently from scheduling instructions. Preserve
 # the original policy hash so a cadence-only update does not regenerate history.
 # Change this value when the factual summarization policy itself changes.
-SUMMARY_CONTENT_VERSION = 'research-recorder-independent-read-20261102'
+SUMMARY_CONTENT_VERSION = 'research-recorder-readable-summary-20261109'
 
 
 def _scan_interval(value):
