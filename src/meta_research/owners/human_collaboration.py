@@ -277,6 +277,8 @@ class HumanCollaborationInterface(Protocol):
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
 
+    def query_companion_writing_model(self, interaction_ref: str) -> dict[str, object] | None: ...
+
     def start_new_companion_session(self, scope_ref: str, idempotency_key: str) -> dict[str, object]: ...
 
     def query_companion_work_context(self, session_ref: str) -> dict[str, object] | None: ...
@@ -2239,6 +2241,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             guidance_options=guidance_options, writing_request=writing_request,
             prepare_writing=prepare_writing if writing_request is not None else None,
         )
+
+    def query_companion_writing_model(self, interaction_ref: str) -> dict[str, object] | None:
+        return self._collaboration_ladder.query_companion_writing_model(interaction_ref)
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
         session = self._collaboration_ladder.query_companion(scope_ref)

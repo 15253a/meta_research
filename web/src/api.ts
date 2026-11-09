@@ -1661,7 +1661,14 @@ export type CompanionWritingRequest = {
   task_scope: "full_document" | "outline" | "revision";
   requirements: string;
   materials: CompanionWritingMaterial[];
-  model: { kind: "current" } | { kind: "configured_api"; config_ref: string };
+  model: { kind: "current" } | { kind: "configured_api"; config_ref: string } | {
+    kind: "task_api";
+    endpoint: string;
+    model: string;
+    protocol: "openai_chat_completions" | "openai_responses" | "anthropic_messages";
+    api_key_ref: string;
+    instructions?: string;
+  };
   output_directory: string | null;
 };
 
@@ -3055,6 +3062,27 @@ export function sendCompanionMessage(
     ...(viewContext ? { view_context: viewContext } : {}),
     ...(writingRequest ? { writing_request: writingRequest } : {}),
   });
+}
+
+export async function provisionCompanionContentCredential(input: {
+  scope_ref: string; endpoint: string; model: string; api_key: string; api_key_ref?: string;
+}): Promise<{ api_key_ref: string }> {
+  const csrfToken = readCookie("meta_research_csrf");
+  if (!csrfToken) throw new ProductError("csrf_token_unavailable");
+  // Credentials bypass pending-write storage and never become a chat message.
+  const response = await fetch("/api/v1/companion/content-credentials", {
+    method: "POST", credentials: "same-origin", cache: "no-store",
+    headers: { Accept: "application/json", "Content-Type": "application/json",
+      "X-CSRF-Token": csrfToken, "Idempotency-Key": crypto.randomUUID() },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new ProductError("writing_credential_not_saved", undefined, response.status);
+  const payload: unknown = await response.json();
+  if (!payload || typeof payload !== "object" || !("api_key_ref" in payload)
+      || typeof payload.api_key_ref !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(payload.api_key_ref)) {
+    throw new ProductError("writing_credential_not_saved");
+  }
+  return { api_key_ref: payload.api_key_ref };
 }
 
 export type CompanionFile = {

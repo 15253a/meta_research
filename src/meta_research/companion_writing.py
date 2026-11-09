@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path, PurePosixPath
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -20,14 +21,43 @@ class WritingMaterial(BaseModel):
 
 class ContentModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["current", "configured_api"] = "current"
+    kind: Literal["current", "configured_api", "task_api"] = "current"
     config_ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    endpoint: str | None = Field(default=None, max_length=2048)
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+    protocol: Literal["openai_chat_completions", "openai_responses", "anthropic_messages"] | None = None
+    api_key_ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    instructions: str | None = Field(default=None, max_length=12000)
 
     @model_validator(mode="after")
     def configuration(self):
         if (self.kind == "configured_api") != (self.config_ref is not None):
             raise ValueError("content_model_configuration_required")
+        fields = (self.endpoint, self.model, self.protocol, self.api_key_ref)
+        if self.kind == "task_api":
+            if any(value is None for value in fields):
+                raise ValueError("content_model_task_configuration_required")
+            validate_content_endpoint(self.endpoint)
+            if not self.model.strip():
+                raise ValueError("content_model_task_configuration_required")
+        elif any(value is not None for value in (*fields, self.instructions)):
+            raise ValueError("content_model_configuration_ambiguous")
         return self
+
+
+def validate_content_endpoint(endpoint: str) -> None:
+    parsed = urlsplit(endpoint)
+    if (parsed.scheme not in {"https", "http"} or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or any(char.isspace() or ord(char) < 32 for char in endpoint)):
+        raise ValueError("content_model_endpoint_invalid")
+    # Plain HTTP is reserved for explicitly local protocol/testing services.
+    if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("content_model_endpoint_requires_https")
+    try:
+        parsed.port
+    except ValueError:
+        raise ValueError("content_model_endpoint_invalid") from None
 
 
 class WritingRequest(BaseModel):
@@ -76,6 +106,7 @@ def writing_message(request: WritingRequest, message: str, memory, *, science=No
             "media_type": asset.media_type, "manifest_hash": asset.manifest_hash,
             "path": str(path), "source_receipt": asset.receipt.as_public_dict()})
     task = request.model_dump()
+    task["model"] = request.model.model_dump(exclude_none=True)
     task["materials"] = materials
     task["scientific_context"] = science
     task["output_directory"] = request.output_directory or "deliverables"
@@ -91,8 +122,9 @@ def writing_message(request: WritingRequest, message: str, memory, *, science=No
           "在本 Quest 持久助手目录内制作文件，交付源文件和必要依赖；正式成品安排独立审阅、"
           "修订、真实渲染和视觉检查。提纲或局部修改只检查所需范围。"
           "独立写作交付现有证据支撑的版本，实验建议另列，不向 Cycle 派工。"
-          "current 使用当前助手模型；configured_api 必须调用 "
-          "assistant.content.generate，传所选 config_ref 及 messages:[{role,content}]；"
+          "current 使用当前助手模型；configured_api 和 task_api 必须调用 "
+          "assistant.content.generate，普通 Writing 任务只需传 messages:[{role,content}]，服务沿原任务绑定选定模型。"
+          "研究内显式选择时传 config_ref 或完整 model 对象。"
           "消息仅含本任务所需且获授权的相关材料。"
           "配置和凭据沿受限环境提供；调用失败如实报告，不能改用当前模型代写。"
           "外部返回文本仍须由助手核对、修订并制作文件。正文采用正常学术引用，内部来源、"

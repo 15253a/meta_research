@@ -2,12 +2,48 @@
 import json
 from dataclasses import replace
 
+import pytest
+
 from meta_research.companion import CodexCompanionAdapter
 from meta_research.quest_drafting import IntentTurnRequest
 from test_public_manual_question_lifecycle import (
     QUESTION, DeterministicDraftingAdapter, _accept_root_question, _build_runtime, _open_and_confirm_seed,
 )
 from test_quest_drafting_adapters import RecordingRunner
+
+
+@pytest.mark.parametrize("branch", ("conversation", "quest_initialization", "manual_question_creation"))
+def test_companion_explanation_contract_reaches_new_and_continued_turns(tmp_path, branch):
+    """Observe actual adapter input; factual reply quality needs live acceptance."""
+    conversation = branch == "conversation"
+    output = {"reply": "Only the observed trial is available; the other device is untested."}
+    if conversation:
+        output["agent_proposal"] = None
+    runner = RecordingRunner(output, thread_id="reader-root")
+    adapter = CodexCompanionAdapter(tmp_path / "provider", process_runner=runner)
+    request = IntentTurnRequest(initialization_id="quest:reader", draft_revision=4,
+        draft_hash="a" * 64, draft={"interaction_kind": branch,
+            "reviewed_text": "Keep the overall goal; change only the sampling interval."},
+        message="What can we conclude?", native_session_ref=None,
+        creation_context_kind="manual_question_creation" if branch == "manual_question_creation" else "quest_initialization")
+    first = adapter.reply(request)
+    second = adapter.reply(replace(request, native_session_ref=first.native_session_ref,
+        message="Explain the technical uncertainty and prepare guidance for this trial only."))
+    for _, prompt, _ in runner.calls:
+        assert "对话说明默认面向不熟悉领域的用户" in prompt
+        assert "技术追问再展开" in prompt
+        assert "关键限制、准确来源和待确认全文" in prompt
+        assert "Keep the overall goal; change only the sampling interval." in prompt
+        assert "current_draft_revision=4" in prompt
+        assert "current_draft_hash=" + "a" * 64 in prompt
+    assert first.native_session_ref == second.native_session_ref == "reader-root"
+    assert second.reply == output["reply"]
+    assert second.agent_proposal is None
+    if conversation:
+        assert "Assume the human is seeking help" in runner.calls[0][1]
+        assert "<!-- bundled resource: companion-work.md -->" not in runner.calls[1][1]
+    else:
+        assert "Explain findings and preparation choices in connected, everyday language" in runner.calls[0][1]
 
 
 def test_quest_companion_continues_preparation_files_without_copy_or_cleanup(tmp_path):

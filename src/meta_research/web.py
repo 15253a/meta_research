@@ -1543,6 +1543,27 @@ def create_app(
     def session_status() -> dict[str, str]:
         return {"status": "authenticated"}
 
+    @app.post("/api/v1/companion/content-credentials", status_code=201)
+    async def save_writing_credential(request: Request):
+        # Parse manually: validation responses must never echo the secret input.
+        from meta_research.writing_credentials import WritingCredentials
+        try:
+            value = await request.json()
+            if (not isinstance(value, dict)
+                    or not {"scope_ref", "endpoint", "model", "api_key"} <= set(value)
+                    or set(value) - {"scope_ref", "endpoint", "model", "api_key", "api_key_ref"}
+                    or any(not isinstance(item, str) for item in value.values())):
+                return _error(422, "content_model_credential_invalid")
+            scope = require_current_collaboration_scope(value["scope_ref"], conflict_code="companion_scope_stale")
+            if not scope.startswith("quest:"):
+                return _error(422, "writing_quest_required")
+            reference = WritingCredentials(runtime.data_root.root).save(
+                quest_ref=scope.removeprefix("quest:"), endpoint=value["endpoint"],
+                model=value["model"], api_key=value["api_key"], api_key_ref=value.get("api_key_ref"))
+            return {"api_key_ref": reference}
+        except (ValueError, TypeError, OSError):
+            return _error(422, "content_model_credential_invalid")
+
     @app.post("/api/v1/companion/messages", status_code=202)
     def send_companion_message(
         request: Request, message: CompanionMessageRequest

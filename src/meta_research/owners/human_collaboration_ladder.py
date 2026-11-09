@@ -561,13 +561,14 @@ class SQLiteHumanCollaborationLadder:
                         "ordinal, message, message_hash, view_context_json, "
                         "view_context_hash, guidance_options_json, guidance_options_hash, assistant_status, "
                         "attempt_count, idempotency_key, command_hash, created_at, "
-                        "updated_at, native_session_generation, native_session_ref) VALUES (:interaction_ref, :session_ref, :ordinal, "
+                        "updated_at, native_session_generation, native_session_ref, writing_model_json) VALUES (:interaction_ref, :session_ref, :ordinal, "
                         ":message, :message_hash, :view_context_json, "
                         ":view_context_hash, :guidance_options_json, :guidance_options_hash, 'queued', 0, :idempotency_key, "
-                        ":command_hash, :now, :now, :native_session_generation, :native_session_ref)"
+                        ":command_hash, :now, :now, :native_session_generation, :native_session_ref, :writing_model_json)"
                     ),
                     {
                         "interaction_ref": interaction_ref,
+                        "writing_model_json": None if writing_request is None else canonical_json(writing_request.get("model", {"kind": "current"})),
                         "session_ref": session_ref,
                         "native_session_generation": int(native.native_session_generation),
                         "native_session_ref": native.native_session_ref,
@@ -1259,6 +1260,19 @@ class SQLiteHumanCollaborationLadder:
         if session["session_ref"] != session_ref:
             raise OwnerConflict("companion_session_invalid")
         return session
+
+    def query_companion_writing_model(self, interaction_ref: str) -> dict[str, object] | None:
+        # A follow-up/recovered turn uses the Writing selection in its native
+        # generation; /new cannot inherit a previous generation's selection.
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT original.writing_model_json FROM hc_companion_turns current "
+                "JOIN hc_companion_turns original ON original.session_ref=current.session_ref "
+                "AND original.native_session_generation=current.native_session_generation "
+                "AND original.ordinal<=current.ordinal WHERE current.interaction_ref=:ref "
+                "AND original.writing_model_json IS NOT NULL ORDER BY original.ordinal DESC LIMIT 1"
+            ), {"ref": interaction_ref}).first()
+        return None if row is None else decoded_object(row.writing_model_json)
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")

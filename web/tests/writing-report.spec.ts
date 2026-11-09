@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 
-async function workspace(page: Page, fail = false) {
+async function workspace(page: Page, fail = false, failCredential = false) {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];
   const companion = snapshot.human_collaboration.companion;
@@ -14,6 +14,7 @@ async function workspace(page: Page, fail = false) {
   ];
   snapshot.research_assets.has_more = false;
   const writes: Array<{ path: string; body: Record<string, any> }> = [];
+  const credentials: Array<Record<string, unknown>> = [];
   await page.context().addCookies([{ name: "meta_research_csrf", value: "test-csrf", domain: "127.0.0.1", path: "/" }]);
   const webRoot = process.env.META_RESEARCH_WEB_DIST ?? resolve(import.meta.dirname, "../../src/meta_research/web_dist");
   await page.route("**/*", async route => {
@@ -22,6 +23,12 @@ async function workspace(page: Page, fail = false) {
     const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     if (url.pathname === "/api/v1/snapshot") return json(snapshot);
     if (url.pathname === "/api/v1/preferences") return json({ output_language: "zh" });
+    if (url.pathname === "/api/v1/companion/content-credentials") {
+      expect(request.headers()["x-csrf-token"]).toBe("test-csrf");
+      credentials.push(request.postDataJSON());
+      if (failCredential) return json({ detail: { code: request.postDataJSON().api_key } }, 503);
+      return json({ api_key_ref: request.postDataJSON().api_key_ref ?? "private-task-credential" });
+    }
     if (url.pathname === "/api/v1/companion/messages") {
       const body = request.postDataJSON();
       writes.push({ path: url.pathname, body });
@@ -36,7 +43,7 @@ async function workspace(page: Page, fail = false) {
     const file = resolve(webRoot, url.pathname === "/" ? "index.html" : `.${url.pathname}`);
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
   });
-  return { snapshot, writes };
+  return { snapshot, writes, credentials };
 }
 
 for (const kind of ["report", "paper"]) test(`${kind} with PPT submits exact versions to ordinary companion`, async ({ page }) => {
@@ -89,9 +96,155 @@ test("local revision preserves scope and requirements when selected model fails"
   await dialog.getByLabel("工作范围").selectOption("revision");
   await dialog.getByLabel("写作要求").fill("只改摘要最后两句。");
   await dialog.getByRole("button", { name: "开始写作" }).click();
-  await expect(dialog.getByRole("alert")).toContainText("writing_model_unavailable");
+  await expect(dialog.getByRole("alert")).toContainText("所选模型暂时不可用");
   await expect(dialog.getByLabel("写作要求")).toHaveValue("只改摘要最后两句。");
   expect(state.writes).toHaveLength(1);
   expect(state.writes[0].body.writing_request.task_scope).toBe("revision");
   expect(state.writes[0].body.writing_request.model).toEqual({ kind: "current" });
+});
+
+for (const [protocol, endpoint] of [
+  ["openai_chat_completions", "https://writing.example/v1/chat/completions"],
+  ["openai_responses", "https://writing.example/v1/responses"],
+  ["anthropic_messages", "https://writing.example/v1/messages"],
+]) test(`task API ${protocol} submits the chosen protocol and only a credential reference`, async ({ page }) => {
+  const state = await workspace(page);
+  await page.goto("http://127.0.0.1:18768/?workspace=1&panel=writing");
+  const dialog = page.getByRole("dialog", { name: "交给研究助手写作" });
+  await dialog.getByLabel("工作范围").selectOption("outline");
+  await dialog.getByLabel("写作要求").fill("给跨专业读者写提纲，保留证据限制。");
+  await dialog.getByLabel("内容模型").selectOption("task_api");
+  await dialog.getByLabel("API 地址", { exact: true }).fill(endpoint);
+  await dialog.getByLabel("模型名称", { exact: true }).fill("chosen-science-model");
+  await dialog.getByLabel("接口协议").selectOption(protocol);
+  await dialog.getByLabel("凭据来源").selectOption("reference");
+  await dialog.getByLabel("凭据引用", { exact: true }).fill("writing-key");
+  await dialog.getByLabel("调用说明（可选）", { exact: true }).fill("先组织论据，再写结论。不要输出推理草稿。");
+  await dialog.getByRole("button", { name: "开始写作" }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(state.writes).toHaveLength(1);
+  expect(state.writes[0].body.writing_request.model).toEqual({
+    kind: "task_api", endpoint, model: "chosen-science-model",
+    protocol, api_key_ref: "writing-key", instructions: "先组织论据，再写结论。不要输出推理草稿。",
+  });
+});
+
+for (const width of [1440, 390]) test(`task API failure and closing retain the task and exact draft at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const state = await workspace(page, true);
+  await page.goto("http://127.0.0.1:18768/?workspace=1&panel=writing");
+  const dialog = page.getByRole("dialog", { name: "交给研究助手写作" });
+  await dialog.getByLabel("工作范围").selectOption("revision");
+  await dialog.getByLabel("写作要求").fill("仅修改所选前稿的摘要，保留其他内容。");
+  await dialog.getByLabel("材料用途").selectOption("draft");
+  await dialog.getByLabel("选择材料版本").selectOption("draft-v1");
+  await dialog.getByRole("button", { name: "加入本次写作" }).click();
+  await dialog.getByLabel("内容模型").selectOption("task_api");
+  await dialog.getByLabel("API 地址", { exact: true }).fill("https://writing.example/v1/messages");
+  await dialog.getByLabel("模型名称", { exact: true }).fill("chosen-science-model");
+  await dialog.getByLabel("接口协议").selectOption("anthropic_messages");
+  await dialog.getByLabel("凭据来源").selectOption("reference");
+  await dialog.getByLabel("凭据引用", { exact: true }).fill("writing-key");
+  await dialog.getByLabel("调用说明（可选）", { exact: true }).fill("保留反证和必要专业术语。");
+  await dialog.getByLabel("输出子目录").fill("revisions");
+  await dialog.getByRole("button", { name: "开始写作" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("所选模型暂时不可用");
+  expect(state.writes).toHaveLength(1);
+  await dialog.getByRole("button", { name: "关闭写作" }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(state.writes).toHaveLength(1);
+  await page.getByRole("button", { name: "写作", exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("工作范围")).toHaveValue("revision");
+  await expect(dialog.getByLabel("写作要求")).toHaveValue("仅修改所选前稿的摘要，保留其他内容。");
+  await expect(dialog.getByLabel("API 地址", { exact: true })).toHaveValue("https://writing.example/v1/messages");
+  await expect(dialog.getByLabel("模型名称", { exact: true })).toHaveValue("chosen-science-model");
+  await expect(dialog.getByLabel("接口协议")).toHaveValue("anthropic_messages");
+  await expect(dialog.getByLabel("凭据引用", { exact: true })).toHaveValue("writing-key");
+  await expect(dialog.getByLabel("调用说明（可选）")).toHaveValue("保留反证和必要专业术语。");
+  await expect(dialog.getByLabel("输出子目录")).toHaveValue("revisions");
+  expect(state.writes[0].body.writing_request.materials).toEqual([
+    { version_ref: "draft-v1", content_hash: "b".repeat(64), role: "draft" },
+  ]);
+  await dialog.getByLabel("内容模型").scrollIntoViewIfNeeded();
+  expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath("task-api-restored.png") });
+  await dialog.getByRole("region", { name: "本次 API 模型" }).evaluate(element => element.scrollIntoView({ block: "start" }));
+  await page.screenshot({ path: test.info().outputPath("task-api-fields.png") });
+});
+
+test("closing clears an unsubmitted key and a credential error cannot expose it or submit writing", async ({ page }) => {
+  const state = await workspace(page, false, true);
+  await page.goto("http://127.0.0.1:18768/?workspace=1&panel=writing");
+  const dialog = page.getByRole("dialog", { name: "交给研究助手写作" });
+  await dialog.getByLabel("写作要求").fill("保留本次要求。");
+  await dialog.getByLabel("内容模型").selectOption("task_api");
+  await dialog.getByLabel("API 地址", { exact: true }).fill("https://writing.example/v1/responses");
+  await dialog.getByLabel("模型名称", { exact: true }).fill("chosen-science-model");
+  const keyInput = dialog.getByLabel("API 密钥", { exact: true });
+  const key = "test-key-that-must-not-be-shown";
+  await keyInput.fill(key);
+  await dialog.getByRole("button", { name: "关闭写作" }).click();
+  expect(state.credentials).toHaveLength(0);
+  expect(state.writes).toHaveLength(0);
+  await page.getByRole("button", { name: "写作", exact: true }).click();
+  await expect(keyInput).toHaveValue("");
+  await keyInput.fill(key);
+  await dialog.getByRole("button", { name: "开始写作" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("凭据未确认保存");
+  await expect(dialog).not.toContainText(key);
+  await expect(keyInput).toHaveValue("");
+  await expect(dialog.getByLabel("写作要求")).toHaveValue("保留本次要求。");
+  expect(state.writes).toHaveLength(0);
+  expect(state.credentials).toHaveLength(1);
+});
+
+test("new API key is provisioned privately and only its reference survives a failed task submission", async ({ page }) => {
+  const state = await workspace(page, true);
+  await page.goto("http://127.0.0.1:18768/?workspace=1&panel=writing");
+  const dialog = page.getByRole("dialog", { name: "交给研究助手写作" });
+  await dialog.getByLabel("写作要求").fill("根据已选材料写报告。");
+  await dialog.getByLabel("内容模型").selectOption("task_api");
+  await dialog.getByLabel("API 地址", { exact: true }).fill("https://writing.example/v1/responses");
+  await dialog.getByLabel("模型名称", { exact: true }).fill("chosen-science-model");
+  await dialog.getByLabel("接口协议").selectOption("openai_responses");
+  const key = "test-key-sensitive-do-not-retain";
+  const keyInput = dialog.getByLabel("API 密钥", { exact: true });
+  await expect(keyInput).toHaveAttribute("type", "password");
+  await keyInput.fill(key);
+  await dialog.getByRole("button", { name: "开始写作" }).click();
+  await expect(dialog.getByRole("alert")).toBeVisible();
+  expect(state.credentials).toEqual([{ scope_ref: state.snapshot.human_collaboration.companion.scope_ref,
+    endpoint: "https://writing.example/v1/responses", model: "chosen-science-model", api_key: key }]);
+  await expect(dialog.getByLabel("凭据引用", { exact: true })).toHaveValue("private-task-credential");
+  expect(JSON.stringify(state.writes)).not.toContain(key);
+  expect(state.writes[0].body.writing_request.model.api_key_ref).toBe("private-task-credential");
+  await dialog.getByRole("button", { name: "关闭写作" }).click();
+  await page.getByRole("button", { name: "写作", exact: true }).click();
+  await expect(dialog.getByLabel("凭据引用", { exact: true })).toHaveValue("private-task-credential");
+  await dialog.getByLabel("凭据来源").selectOption("key");
+  await expect(keyInput).toHaveValue("");
+  expect(await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }))).not.toContain(key);
+});
+
+test("repairing a credential preserves its reference without submitting a new writing task", async ({ page }) => {
+  const state = await workspace(page);
+  await page.goto("http://127.0.0.1:18768/?workspace=1&panel=writing");
+  const dialog = page.getByRole("dialog", { name: "交给研究助手写作" });
+  await dialog.getByLabel("内容模型").selectOption("task_api");
+  await dialog.getByLabel("API 地址", { exact: true }).fill("https://writing.example/v1/responses");
+  await dialog.getByLabel("模型名称", { exact: true }).fill("chosen-science-model");
+  await dialog.getByLabel("凭据来源").selectOption("reference");
+  const reference = "writing-0123456789abcdef0123456789abcdef";
+  await dialog.getByLabel("凭据引用", { exact: true }).fill(reference);
+  await dialog.getByLabel("凭据来源").selectOption("key");
+  await expect(dialog).toContainText("替换此引用的密钥");
+  await dialog.getByLabel("API 密钥", { exact: true }).fill("test-repaired-private-key");
+  await dialog.getByRole("button", { name: "保存密钥", exact: true }).click();
+  await expect(dialog.getByRole("status")).toContainText("在原对话中继续");
+  await expect(dialog.getByLabel("凭据引用", { exact: true })).toHaveValue(reference);
+  expect(state.credentials).toEqual([{ scope_ref: state.snapshot.human_collaboration.companion.scope_ref,
+    endpoint: "https://writing.example/v1/responses", model: "chosen-science-model",
+    api_key: "test-repaired-private-key", api_key_ref: reference }]);
+  expect(state.writes).toHaveLength(0);
 });

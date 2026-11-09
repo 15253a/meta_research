@@ -491,6 +491,9 @@ class CodexCompanionAdapter(
                 )
         prompt = (
             role_instruction
+            + "对话说明默认面向不熟悉领域的用户，直接连贯回答当前问题；"
+            "必要术语简短解释，技术追问再展开。保留关键限制、准确来源和待确认全文，"
+            "缺资料时说明不知道的部分。"
             + CHAT_REPLY_PROGRESS_INSTRUCTION
             + "\n\n"
             + context_identity

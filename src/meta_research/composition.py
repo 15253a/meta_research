@@ -990,7 +990,9 @@ def build_production_runtime(
         from meta_research.accepted_materials import DeepFetchAcceptedMaterials
         bind_materials(DeepFetchAcceptedMaterials(agent_runtime, human_collaboration, research_memory))
     recorder_channels = RecorderChannels()
+    from meta_research.writing_credentials import WritingCredentials
     semantic_gateway = create_semantic_owner_gateway(
+        writing_credentials=WritingCredentials(data_root.root),
         recorder_channels=recorder_channels,
         research_graph=owners.research_graph,
         advancement_engine=owners.advancement_engine,
