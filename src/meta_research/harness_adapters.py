@@ -1570,8 +1570,30 @@ class HarnessSupervisorTransport:
             raise OSError("provider operation identity unavailable")
         matches: list[str] = []
         operation_root = self._workspace / "provider-operations"
-        for receipt_path in operation_root.glob("*/*/supervisor-exit.json"):
-            directory = receipt_path.parent
+        owner_hash = environment.get(_OWNER_INVOCATION_HASH_ENV)
+        if owner_hash is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", owner_hash) is None:
+                raise OSError("owner invocation identity unavailable")
+            binding_path = self._workspace / "owner-invocation-bindings" / owner_hash[:2] / (owner_hash + ".json")
+            if binding_path.exists():
+                try:
+                    binding = read_transport_envelope(binding_path, self._transport_key)
+                except ProviderSupervisorError as error:
+                    raise OSError("owner invocation binding invalid") from error
+                digest = binding.get("transport_invocation_hash")
+                if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                        or binding != {"schema_ref": "meta-research/harness-operation-binding/v1",
+                            "owner_invocation_hash": owner_hash, "transport_invocation_hash": digest,
+                            "provider_operation_ref": operation_ref, "family": family}):
+                    raise OSError("owner invocation binding invalid")
+                directory = operation_root / digest[:2] / digest
+                if any(not (directory / name).is_file() for name in (
+                    "supervisor-request.json", "supervisor-exit.json", "prompt.txt",
+                )):
+                    raise OSError("provider outcome remains unknown")
+        for request_path in operation_root.glob("*/*/supervisor-request.json"):
+            directory = request_path.parent
+            receipt_path = directory / "supervisor-exit.json"
             if (
                 re.fullmatch(r"[0-9a-f]{64}", directory.name) is None
                 or directory.parent.name != directory.name[:2]
@@ -1605,6 +1627,11 @@ class HarnessSupervisorTransport:
                     argv, ensure_ascii=False, separators=(",", ":")
                 ):
                     raise OSError("terminal provider argv invalid")
+                if not receipt_path.is_file():
+                    # A frozen Owner prompt is sufficient only before transport
+                    # exists. An issued spool without its terminal receipt may
+                    # still be running and must never be launched again.
+                    raise OSError("provider outcome remains unknown")
                 read_verified_exit_receipt(
                     receipt_path, key=self._transport_key,
                     invocation_hash=invocation_hash, prompt_path=prompt_path,

@@ -63,6 +63,7 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
     request, monkeypatch, changed,
 ):
     conditions = ["Selected GPU: GPU-A; time budget: 30d"]
+    original_conditions = conditions[0]
     monkeypatch.setattr(
         "meta_research.harness.render_runtime_conditions",
         lambda _workspace, **_scope: conditions[0],
@@ -83,7 +84,7 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
     if changed == "conditions":
         conditions[0] = "Selected GPU: GPU-B; time budget: 7d"
     endpoint = "http://127.0.0.1:8998" if changed == "mcp_endpoint" else "http://127.0.0.1:8999"
-    expected = "harness_operation_conflict" if changed else "provider_outcome_unknown"
+    expected = "harness_operation_conflict" if changed == "mcp_endpoint" else "provider_outcome_unknown"
     with pytest.raises(HarnessAdmissionError, match=expected):
         runtime().run_or_resume_target_root(
             target_request.request_ref, prompt="Original frozen Target work.",
@@ -93,7 +94,7 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
     assert recovered.operation_ref == original.operation_ref
     assert recovered.invocation_hash == original.invocation_hash
     assert recovered.generation == original.generation == 1
-    if changed:
+    if changed == "mcp_endpoint":
         assert runner.calls == 0
         assert runner.request_path is None
         assert recovered.reconciliation_generation == 0
@@ -101,7 +102,7 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
     assert runner.calls == 1
     assert recovered.reconciliation_generation == 1
     assert split_runtime_prompt(runner.request_path.with_name("prompt.txt").read_text()) == (
-        conditions[0], "Original frozen Target work.",
+        original_conditions, "Original frozen Target work.",
     )
 
     def no_fresh_conditions(*_args, **_kwargs):

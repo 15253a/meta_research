@@ -765,6 +765,7 @@ class RuntimeConditionsRequest(BaseModel):
     research_style: Literal['focus', 'balanced', 'open'] | None = None
     literature_configuration: dict[str, object] | None = None
     stage_models: dict[str, str] | None = None
+    time_budget_change: dict[str, object] | None = None
 
 
 class CodexAccountAction(BaseModel):
@@ -831,6 +832,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await asyncio.to_thread(runtime.owners.advancement_engine.start_research_time_service)
+        worker_tasks["quest_research_time_clock"] = _start_background_worker(
+            lambda: _process_background_operation(
+                runtime.owners.advancement_engine.checkpoint_research_time_service,
+                health=ReconciliationHealth(), worker_label="Quest research time",
+                timeout_code="research_time_checkpoint_timeout", timeout_seconds=None,
+                on_health_change=None, idle_delay=1.0, active_delay=1.0,
+            )
+        )
         worker_tasks["harness_conformance_worker"] = _start_background_worker(
             lambda: _process_harness_conformance(runtime, base_url)
         )
@@ -872,6 +882,7 @@ def create_app(
                     )
                 except TimeoutError:
                     LOGGER.error("quest workers did not stop within 2 seconds")
+            await asyncio.to_thread(runtime.owners.advancement_engine.stop_research_time_service)
 
     app = FastAPI(
         title="Meta-research vNext",
@@ -2517,6 +2528,10 @@ def create_app(
     def get_runtime_conditions(quest_ref: str) -> dict[str, object]:
         from meta_research.runtime_conditions import read_runtime_conditions
         return read_runtime_conditions(runtime.data_root.root, quest_ref)
+
+    @app.get("/api/v1/quests/{quest_ref}/research-time")
+    def get_research_time(quest_ref: str) -> dict[str, object]:
+        return runtime.owners.advancement_engine.query_research_time(quest_ref)
 
     @app.get("/api/v1/quests/{quest_ref}/goal")
     def query_quest_goal(quest_ref: str) -> dict[str, object]:

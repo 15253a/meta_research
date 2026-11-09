@@ -4,6 +4,7 @@ from meta_research.bundle_source_projection import target_projection, target_com
 from meta_research.idea_skill import stage_provider
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
 from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
+from meta_research.quest_research_time import research_time_work_constraint
 
 import json
 import time
@@ -869,6 +870,14 @@ class BundleStageWorker:
                             return False
                         if selected in input_errors:
                             raise BundleSkillContractError(input_errors[selected])
+                        # This completed turn is a safe decision boundary. Keep
+                        # its original input/result, but return an unusable
+                        # dispatch through the existing same-root correction
+                        # path instead of persisting an endlessly retried launch.
+                        constraint = research_time_work_constraint(
+                            self._advancement_engine.query_research_time(graph.quest_ref))
+                        if constraint["status"] != "available":
+                            raise BundleSkillContractError("quest_time_budget_" + constraint["status"])
                 except BundleSkillUnavailable as error:
                     error = self._recover_stopped_error(error, run.run_ref)
                     if error.code == "codex_operation_reconciliation_pending":
@@ -1776,6 +1785,8 @@ class BundleStageWorker:
                     )
         return {
             "schema_ref": "meta-research/bundle-dispatch-state/v1",
+            "research_time_constraint": research_time_work_constraint(
+                self._advancement_engine.query_research_time(graph.quest_ref)),
             "target_commit_refs": [commit.commit_ref for commit in commits],
             "running_targets": running,
             "blocked_targets": blocked,

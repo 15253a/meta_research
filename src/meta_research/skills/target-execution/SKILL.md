@@ -32,7 +32,7 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 在既有授权内开展获取、整理、观察、访谈、档案或定性比较、理论推导、数据构建、计算或湿实验。选择能解决当前疑点的工具与检查；多次尝试、调整和意外观察可以属于同一 Target。Baseline／Variant 表达方法和配方，VariantRun 记录实际实施；ProtocolVersion／Evaluation 表达评价规则，EvaluationAttempt 记录对某个 Run 或其产物的真实评价，MetricResult 保存已声明的观察。实施与评价可以交替，已实施工作也可以等待评价。
 
-资料规模较大或需要分工时，读[研究指导](../references/research-guidance.md)，将聚焦检索、比较、实施、评价或整理委派给原生子智能体。按文件或对象划分并行写入，根负责最终研究判断；候选检索结果还需正式选择，才成为证据或执行输入。
+安排工作、需要分工或预计时间不足时，读[研究指导](../references/research-guidance.md)，据当前共用余额选择实施、核对与收口安排，必要时提出正式延时请求。将聚焦检索、比较、实施、评价或整理委派给原生子智能体。按文件或对象划分并行写入，根负责最终研究判断；候选检索结果还需正式选择，才成为证据或执行输入。
 
 长任务应在观察之间交还控制。用 `agent_runtime.target_run.progress` 和当前 `target_ref` 读取有界输出，后续沿返回 cursor 取增量。按运行阶段、异常、预期有效输出、干预成本和读取开销决定下次观察；`suggested_poll_seconds` 只是备用建议。启动、变更或异常后及时检查，稳定时拉开间隔并推进独立工作。读旧片段时用 `mode=raw`，同时给出 `log_ref`、`stream_ref` 和整数 `before`。完整原始日志仍保留。
 

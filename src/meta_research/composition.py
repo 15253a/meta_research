@@ -525,6 +525,7 @@ class ProductionRuntime:
 
     def close(self) -> None:
         try:
+            self.owners.advancement_engine.stop_research_time_service()
             self.request_stop()
         finally:
             try:

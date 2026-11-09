@@ -958,9 +958,10 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         with self._database.read() as connection:
             rows = connection.execute(
                 text(
-                    "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses AS responses "
+                    "SELECT responses.*, deliveries.receipt_json AS delivery_json, approvals.receipt_json AS time_budget_approval_json FROM hc_human_request_responses AS responses "
                     "LEFT JOIN hc_reply_deliveries AS deliveries ON deliveries.response_ref = responses.response_ref AND deliveries.state = 'ready' "
-                    "WHERE responses.request_ref = :request_ref ORDER BY responses.created_at, responses.response_ref"
+                    "LEFT JOIN ae_quest_time_budget_approvals approvals ON approvals.response_ref=responses.response_ref "
+                    "WHERE responses.request_ref = :request_ref ORDER BY responses.created_at, responses.rowid"
                 ),
                 {"request_ref": request_ref},
             ).all()
@@ -985,8 +986,9 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         with self._database.read() as connection:
             row = connection.execute(
                 text(
-                    "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses AS responses "
+                    "SELECT responses.*, deliveries.receipt_json AS delivery_json, approvals.receipt_json AS time_budget_approval_json FROM hc_human_request_responses AS responses "
                     "LEFT JOIN hc_reply_deliveries AS deliveries ON deliveries.response_ref = responses.response_ref AND deliveries.state = 'ready' "
+                    "LEFT JOIN ae_quest_time_budget_approvals approvals ON approvals.response_ref=responses.response_ref "
                     "WHERE responses.response_ref = :response_ref AND responses.request_ref = :request_ref"
                 ),
                 {"response_ref": response_ref, "request_ref": request_ref},
@@ -1008,6 +1010,15 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
             or receipt.get("human_request_ref") != request_ref or receipt.get("response_ref") != response_ref):
             raise OwnerConflict("human_response_delivery_unverified")
         return receipt
+
+    def verify_research_time_approval(self, *, request_ref: str, response_ref: str) -> dict[str, object]:
+        response = self.verify_human_response(request_ref=request_ref, response_ref=response_ref)
+        approval = response.get("time_budget_approval")
+        if (response["decision"] != "provided" or not isinstance(approval, dict)
+                or approval.get("request_ref") != request_ref
+                or approval.get("response_ref") != response_ref):
+            raise OwnerConflict("research_time_approval_unverified")
+        return approval
 
     def verify_guidance_snapshot(
         self,
@@ -2124,10 +2135,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             "SELECT count(*) FROM hc_human_request_responses WHERE request_ref=:ref"
         ), {"ref": row.request_ref}).scalar_one()
         latest = connection.execute(text(
-            "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses responses "
+            "SELECT responses.*, deliveries.receipt_json AS delivery_json, approvals.receipt_json AS time_budget_approval_json FROM hc_human_request_responses responses "
+            "LEFT JOIN ae_quest_time_budget_approvals approvals ON approvals.response_ref=responses.response_ref "
             "LEFT JOIN hc_reply_deliveries deliveries ON deliveries.response_ref=responses.response_ref "
             "AND deliveries.state='ready' WHERE responses.request_ref=:ref "
-            "ORDER BY responses.created_at DESC,responses.response_ref DESC LIMIT 1"
+            "ORDER BY responses.created_at DESC,responses.rowid DESC LIMIT 1"
         ), {"ref": row.request_ref}).first() if include_latest else None
         return {**{key: request[key] for key in (
             "request_ref", "quest_ref", "kind", "obligation", "business_purpose", "target_assertion",
@@ -2169,7 +2181,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             _verify_request_state_integrity(connection, row, disposition)
             request = _public_request(row, (), evaluation, disposition, {}, {}, (), ())
             response_row = connection.execute(text(
-                "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses responses "
+                "SELECT responses.*, deliveries.receipt_json AS delivery_json, approvals.receipt_json AS time_budget_approval_json FROM hc_human_request_responses responses "
+                "LEFT JOIN ae_quest_time_budget_approvals approvals ON approvals.response_ref=responses.response_ref "
                 "LEFT JOIN hc_reply_deliveries deliveries ON deliveries.response_ref=responses.response_ref "
                 "AND deliveries.state='ready' WHERE responses.request_ref=:ref AND responses.response_ref=:response"
             ), {"ref": request_ref, "response": response_ref}).first()
@@ -2201,10 +2214,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "request_ref": request_ref}, [list(row) for row in revisions],
                 offset=offset, query_revision=query_revision)
             rows = connection.execute(text(
-                "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses responses "
+                "SELECT responses.*, deliveries.receipt_json AS delivery_json, approvals.receipt_json AS time_budget_approval_json FROM hc_human_request_responses responses "
+                "LEFT JOIN ae_quest_time_budget_approvals approvals ON approvals.response_ref=responses.response_ref "
                 "LEFT JOIN hc_reply_deliveries deliveries ON deliveries.response_ref=responses.response_ref "
                 "AND deliveries.state='ready' WHERE responses.request_ref=:ref "
-                "ORDER BY responses.created_at DESC,responses.response_ref DESC LIMIT :limit OFFSET :offset"
+                "ORDER BY responses.created_at DESC,responses.rowid DESC LIMIT :limit OFFSET :offset"
             ), {"ref": request_ref, "limit": limit + 1, "offset": offset}).all()
             items = [_public_human_response(row) for row in rows[:limit]]
             next_offset = offset + limit if len(rows) > limit else None
@@ -4309,6 +4323,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                         "now": now,
                     },
                 )
+                self._apply_research_time_response(
+                    connection, request=request, response_ref=response_ref,
+                    decision=decision, facts=facts,
+                )
                 connection.execute(
                     text(
                         "UPDATE human_collaboration_state SET revision = revision + 1, "
@@ -4337,6 +4355,43 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         )
         self._reconcile_issuing_owner_human_request(request_ref)
         return response
+
+    def _apply_research_time_response(self, connection, *, request, response_ref, decision, facts):
+        """The human's explicit allowance and its response commit atomically."""
+        approval = facts.get("time_budget_decision")
+        if approval is None:
+            return
+        if request.get("kind") != "research_time_extension" or decision != "provided":
+            raise OwnerConflict("research_time_approval_request_invalid")
+        if (not isinstance(approval, dict) or approval.get("decision") != "approve"
+                or not isinstance(approval.get("expected_revision"), str)
+                or not approval["expected_revision"]
+                or set(approval) - {"confirmed_remaining_seconds", "correction_reason"} not in (
+                    {"decision", "expected_revision", "additional_seconds"},
+                    {"decision", "expected_revision", "total_seconds"},
+                )):
+            raise OwnerConflict("research_time_approval_invalid")
+        target = request.get("target_assertion", {})
+        condition = target.get("condition", {}) if isinstance(target, dict) else {}
+        extension = condition.get("time_extension", {}) if isinstance(condition, dict) else {}
+        if (not isinstance(extension, dict)
+                or extension.get("budget_revision") != approval["expected_revision"]
+                or not isinstance(request.get("quest_ref"), str)):
+            raise OwnerConflict("research_time_approval_request_mismatch")
+        from meta_research.quest_research_time import apply_quest_time_budget
+        amount = ({"additional_seconds": approval["additional_seconds"]}
+                  if "additional_seconds" in approval else {"new_total_seconds": approval["total_seconds"]})
+        amount.update({key: approval[key] for key in ("confirmed_remaining_seconds", "correction_reason") if key in approval})
+        receipt = apply_quest_time_budget(
+            connection, quest_ref=request["quest_ref"],
+            expected_revision=approval["expected_revision"],
+            approval_ref=response_ref, request_ref=request["request_ref"], response_ref=response_ref,
+            **amount,
+        )
+        self._feed.record(connection, "human_collaboration.research_time_budget_applied", {
+            "quest_ref": request["quest_ref"], "request_ref": request["request_ref"],
+            "response_ref": response_ref, "approval_ref": receipt["approval_ref"],
+        })
 
     def bind_reply_workspaces(self, workspaces) -> None:
         self._root_workspaces = workspaces
@@ -11435,6 +11490,12 @@ def _public_human_response(row) -> dict[str, object]:
     }
     if canonical_hash(payload) != row.receipt_hash:
         raise OwnerConflict("human_response_receipt_invalid")
+    approval = None
+    if row.time_budget_approval_json:
+        approval = decoded_object(row.time_budget_approval_json)
+        if (approval.get("request_ref") != row.request_ref
+                or approval.get("response_ref") != row.response_ref):
+            raise OwnerConflict("research_time_approval_unverified")
     return {
         "response_ref": row.response_ref,
         "request_ref": row.request_ref,
@@ -11454,6 +11515,7 @@ def _public_human_response(row) -> dict[str, object]:
         ).as_public_dict(),
         "created_at": float(row.created_at),
         **({"delivery": decoded_object(row.delivery_json)} if row.delivery_json else {}),
+        **({"time_budget_approval": approval} if approval is not None else {}),
     }
 
 

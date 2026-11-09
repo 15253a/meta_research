@@ -952,7 +952,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
   await expect(companion).not.toContainText("当前研究授权");
 });
 
-test("the HumanRequest surface keeps five raw Agent requests and their shortest response paths", async ({
+test("the HumanRequest surface keeps raw Agent requests across six categories and their shortest response paths", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -1153,7 +1153,9 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog).toBeVisible();
   const categories = dialog.getByRole("navigation", { name: "求助类别" });
   const category = (name: string) => categories.getByRole("button", { name: new RegExp(name) });
-  await expect(categories.getByRole("button")).toHaveCount(5);
+  await expect(categories.getByRole("button")).toHaveCount(6);
+  await expect(category("研究延时")).toBeVisible();
+  await expect(category("研究延时")).toBeDisabled();
   await expect(category("图书馆重连")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "恢复当前图书馆会话，或选择合法全文替代路线。",

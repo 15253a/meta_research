@@ -2161,6 +2161,7 @@ class HarnessRuntime:
             invocation_hash=invocation_hash,
             resume=resume,
             model_ref=request.model_ref,
+            frozen_prompt=prompt,
         )
         if consume_recovery_channel:
             self._recovered_target_requests.pop(request_ref, None)
@@ -2294,15 +2295,11 @@ class HarnessRuntime:
                 except HarnessAdapterUnavailable as error:
                     raise HarnessAdmissionError(error.code) from error
             terminal_replay_only = frozen_prompt is not None
-            if (
-                frozen_prompt is None
-                and isinstance(request, TargetHarnessRequest)
-                and working_directory is not None
-            ):
-                # A crash may precede transport spool creation. Reconstruct
-                # only a candidate; the complete original Owner hash below
-                # must match before continuing this same operation.
-                frozen_prompt = self._target_work_prompt(prompt, admission, request, workspace_ref, working_directory)
+            if frozen_prompt is None and isinstance(request, TargetHarnessRequest):
+                # The Owner records the first input before transport starts.
+                # Reconciliation must not sample a later clock, even if the
+                # process died before its signed transport spool was created.
+                frozen_prompt = operation.frozen_prompt
             if not isinstance(frozen_prompt, str) or not frozen_prompt:
                 raise HarnessAdmissionError("harness_operation_conflict")
             frozen_hash = canonical_hash(_turn_invocation_material(
@@ -3573,6 +3570,7 @@ class HarnessRuntime:
         invocation_hash: str,
         resume: bool,
         model_ref: str,
+        frozen_prompt: str,
     ) -> None:
         try:
             self._owner.start_operation(
@@ -3582,6 +3580,7 @@ class HarnessRuntime:
                 invocation_hash=invocation_hash,
                 resume=resume,
                 model_ref=model_ref,
+                frozen_prompt=frozen_prompt,
             )
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error

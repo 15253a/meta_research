@@ -5,6 +5,7 @@ from typing import Any
 from html import escape
 import re
 from io import BytesIO
+from datetime import datetime, timezone
 
 
 def build_human_request_handoff(request: dict[str, Any]) -> dict[str, Any]:
@@ -45,6 +46,12 @@ def build_human_request_handoff(request: dict[str, Any]) -> dict[str, Any]:
             "请回到本求助页面确认当前修订和精确授权范围，点击“接受”提交本次授权，或选择“拒绝”“稍后处理”。",
             "生成、预览和下载材料不会提交授权；无需启动研究助手。",
         ]
+    elif request["kind"] == "research_time_extension":
+        return_instructions = [
+            f"本材料绑定请求 {request['request_ref']}（修订 {request['revision']}）。",
+            "请回到本求助页面核对当前时长，明确批准增加时长或新的总时长，或选择拒绝、稍后处理。",
+            "普通说明、助手建议和下载材料都不批准时长；预算生效与研究实际继续分别查看页面回执。",
+        ]
     else:
         return_instructions = [
             recorded_text("safe_response", "请在 Meta Research 的本求助页面填写处理说明，并按需附上材料。"),
@@ -63,6 +70,34 @@ def build_human_request_handoff(request: dict[str, Any]) -> dict[str, Any]:
         ("impact", "对后续研究的影响", [recorded_text("impact", "发起时未单独记录后续影响。")]),
         ("return_instructions", "如何重试当前操作" if system_help else "如何处理本次授权" if capability_authorization else "如何交回回应", return_instructions),
     ]
+    if request["kind"] == "research_time_extension":
+        extension = condition.get("time_extension", {})
+        extension = extension if isinstance(extension, dict) else {}
+        snapshot = extension.get("snapshot", {})
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+
+        def duration(seconds):
+            if seconds is None:
+                return "尚不能准确核定"
+            if seconds and seconds % 3600 == 0:
+                return f"{seconds / 3600:g} 小时"
+            if seconds and seconds % 60 == 0:
+                return f"{seconds / 60:g} 分钟"
+            return f"{seconds:g} 秒"
+
+        approved = snapshot.get("approved_seconds")
+        unlimited = snapshot.get("budget_kind") == "unlimited"
+        observed = snapshot.get("observed_at")
+        observed_text = (datetime.fromtimestamp(observed, tz=timezone.utc).isoformat()
+                         if isinstance(observed, (int, float)) else "未记录")
+        sections.insert(4, ("research_time", "研究时长申请", [
+            "申请额外 " + duration(extension.get("requested_additional_seconds")) + "，由整个研究项目共用。",
+            "已批准总时长：" + ("无固定截止" if unlimited else duration(approved)) + "。",
+            "已用：" + duration(snapshot.get("used_seconds")) + "；已确认累计：" + duration(snapshot.get("confirmed_used_seconds")) + "。",
+            "剩余：" + ("无固定截止" if unlimited else duration(snapshot.get("remaining_seconds"))) + "。",
+            "申请时的观察时间：" + observed_text + "。",
+            "这是申请时记录的时长；等待回复仍计时，人工暂停和服务停机不计时。确认前请在当前页面核对最新余额。",
+        ]))
     return {
         "schema_ref": "meta-research/human-request-handoff/v1",
         "request_ref": request["request_ref"], "revision": request["revision"],

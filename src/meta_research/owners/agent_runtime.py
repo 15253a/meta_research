@@ -2298,7 +2298,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             "human_authorization_receipt_ref": human_authorization_receipt_ref,
         }
         request_hash = canonical_hash(command)
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = connection.execute(
                 text(
                     "SELECT * FROM ar_target_launches WHERE idempotency_key = "
@@ -2412,6 +2412,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
 
             # All request/currentness/dispatch checks above are read-only.  The
             # first persistent admission identity is allocated only here.
+            from meta_research.quest_research_time import require_time_for_new_work
+            require_time_for_new_work(connection, verification.quest_ref)
             launch_ref = new_ref("target_launch")
             if has_human_authorization:
                 assertion = target_execution_assertion(
@@ -9060,6 +9062,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
                     "bundle_operation_inputs_changed": "旧输出针对旧 frontier/state/commit 快照；根据当前快照重新判断并保留已接纳事实。这表示决策输入已变化，不表示科学证据无效或输出格式错误。",
+                    "quest_time_budget_exhausted": "已批准研究时间已用尽，所选 Target 尚未接纳。用 advancement_engine.research_time.read 读取当前额度，沿 human_request.open 明确申请 research_time_extension，或选择 wait/replan_required 有序收口；保留在途结果，不重复已发出工作。",
+                    "quest_time_budget_unconfirmed": "研究计时缺证，无法确认可用余额，所选 Target 尚未接纳。用 advancement_engine.research_time.read 查看依据，沿 human_request.open 申请 research_time_extension 并请人明确确认剩余额度和校正依据，或选择 wait/replan_required 收口；不把未知余额当作充足授权。",
                     "reuse_receipt_invalid": "candidate.route.reuse_receipt: use the verified reuse-eligibility receipt for this candidate; TargetCommit acceptance is a different receipt.",
                     "candidate_measurement_cell_not_required": "candidate.measurement_contract: select a measurement cell present in the frozen NormalizedCompletionContract.",
                     "candidate_held_fixed_binding_incomplete": "candidate.held_fixed: provide the bindings for every declared controlled variable.",
@@ -13015,6 +13019,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if not isinstance(facts, dict) or not isinstance(response_ref, str):
             return None
         kind = request.get("kind")
+        if kind == "research_time_extension":
+            verifier = self._authorization_verifier
+            if verifier is None:
+                return None
+            try:
+                approval = verifier.verify_research_time_approval(
+                    request_ref=str(request["request_ref"]), response_ref=response_ref,
+                )
+            except OwnerConflict:
+                return None
+            if approval.get("quest_ref") != request.get("quest_ref"):
+                return None
+            return "research_time_budget_applied", (str(approval["approval_ref"]),), None
         if kind == "library_reconnect":
             if facts.get("route") == "provided_material" and self._authorization_verifier is not None:
                 try:

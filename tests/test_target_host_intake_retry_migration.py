@@ -20,6 +20,23 @@ def test_host_intake_retry_migration_preserves_populated_owner_records(
         previous_schema.setattr(
             command, "upgrade", lambda config, _revision: upgrade(config, "0077_stage_model"),
         )
+        # Construct genuine pre-0081 records through the existing Owner fixture.
+        # That historical Owner had no research-clock hooks. Disable only those
+        # newer hooks while seeding; restore them before exercising migrations.
+        previous_schema.setattr(
+            "meta_research.owners.advancement_engine.begin_quest_research_time",
+            lambda *_args, **_kwargs: None,
+        )
+        previous_schema.setattr(
+            "meta_research.quest_research_time.require_time_for_new_work",
+            lambda *_args, **_kwargs: None,
+        )
+        previous_schema.setattr(
+            "meta_research.quest_research_time.QuestResearchTimeMixin.query_research_time",
+            # Pre-0081 dispatch did not have an elapsed-time admission gate.
+            # This seed-only observation creates no budget or clock records.
+            lambda *_args: {"budget_kind": "unlimited", "budget_revision": "pre-0081-unmetered"},
+        )
         runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         result_path = workspace / "outputs/metrics.json"
@@ -86,12 +103,19 @@ def test_host_intake_retry_migration_preserves_populated_owner_records(
     upgrade_database(database)
     after = snapshot()
 
-    assert after["revision"] == "0080_writing_display_message"
+    assert after["revision"] == "0081_quest_research_time"
     assert after["rows"] == before["rows"]
     assert after["foreign_key_errors"] == []
-    assert after["foreign_keys"] == before["foreign_keys"]
+    clock_tables = {
+        "ae_research_time_service", "ae_quest_time_budgets",
+        "ae_quest_time_budget_revisions", "ae_quest_time_budget_approvals",
+    }
+    assert clock_tables.isdisjoint(before["foreign_keys"])
+    assert after["foreign_keys"] == {
+        **before["foreign_keys"], **{table: [] for table in clock_tables},
+    }
     assert after["checks"] == before["checks"]
-    expected_unique = {**before["unique"], "ar_target_root_completions":
+    expected_unique = {**before["unique"], **{table: set() for table in clock_tables}, "ar_target_root_completions":
                        before["unique"]["ar_target_root_completions"] - {("artifact_snapshot_hash",)}}
     assert after["unique"] == expected_unique
     assert any(item["column_names"] == ["artifact_snapshot_hash"] and not item["unique"]

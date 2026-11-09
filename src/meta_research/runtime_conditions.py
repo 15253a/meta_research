@@ -14,6 +14,7 @@ from sqlalchemy import text as sql_text
 from meta_research.codex_runtime import DEFAULT_STAGE_MODEL, RESEARCH_STAGES, SUPPORTED_CODEX_MODEL_REFS
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.research_style import validate_research_style, render_research_style
+from meta_research.quest_research_time import read_quest_research_time
 
 
 _LOCK = threading.RLock()
@@ -366,6 +367,14 @@ def read_runtime_conditions(workspace: Path, quest_ref: str) -> dict[str, object
     return _editable_conditions(_read(root, *initial))
 
 
+def _with_research_time(root: Path, value):
+    # A live clock observation is not part of the editable scientific conditions
+    # revision. Replaying a provider operation retains its first observation.
+    if str(value["quest_ref"]).startswith(_INIT_PREFIX):
+        return value
+    return {**value, "research_time": read_quest_research_time(root, value["quest_ref"])}
+
+
 def _editable_conditions(value):
     return {**value, "stage_models": _stage_models(value.get("stage_models")),
             "available_stage_models": list(SUPPORTED_CODEX_MODEL_REFS)}
@@ -373,12 +382,13 @@ def _editable_conditions(value):
 
 def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
                             expected_revision: str, research_style: str | None = None,
-                            literature_configuration=None, stage_models=None) -> dict[str, object]:
+                            literature_configuration=None, stage_models=None,
+                            time_budget_change=None) -> dict[str, object]:
     if not isinstance(text, str) or not text.strip() or len(text) > _LIMIT:
         raise OwnerConflict("runtime_conditions_text_invalid")
     with _LOCK:
         current = read_runtime_conditions(workspace, quest_ref)
-        if expected_revision != current["revision"]:
+        if time_budget_change is None and expected_revision != current["revision"]:
             raise OwnerConflict("runtime_conditions_stale")
         root = _data_root(workspace)
         assert root is not None
@@ -386,43 +396,56 @@ def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
         saved = _value(scope, text, current['research_style'] if research_style is None else research_style,
                        current.get("literature_configuration") if literature_configuration is None else literature_configuration,
                        current["stage_models"] if stage_models is None else stage_models)
-        with closing(sqlite3.connect(root / "meta-research.sqlite3", timeout=5.0)) as db:
-            db.execute("PRAGMA foreign_keys=ON")
-            db.execute("PRAGMA busy_timeout=5000")
-            db.execute("BEGIN IMMEDIATE")
-            head = db.execute(
-                "SELECT current_revision FROM hc_runtime_condition_heads "
-                "WHERE scope_ref=?",
-                (scope,),
-            ).fetchone()
-            if head is None or head[0] != expected_revision:
-                raise OwnerConflict("runtime_conditions_stale")
-            now = time.time()
-            db.execute(
-                "INSERT OR IGNORE INTO hc_runtime_condition_versions "
-                "(scope_ref,revision,value_json,source_kind,created_at) "
-                "VALUES (?,?,?,?,?)",
-                (
-                    scope,
-                    saved["revision"],
-                    json.dumps(
-                        saved,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                    "human_update",
-                    now,
-                ),
-            )
-            changed = db.execute(
-                "UPDATE hc_runtime_condition_heads SET current_revision=?,updated_at=? "
-                "WHERE scope_ref=? AND current_revision=?",
-                (saved["revision"], now, scope, expected_revision),
-            ).rowcount
-            if changed != 1:
-                raise OwnerConflict("runtime_conditions_stale")
-            db.commit()
+        from meta_research.database import Database
+        database = Database(root / "meta-research.sqlite3")
+        try:
+            with database.fenced_write() as db:
+                approval_ref = None
+                if time_budget_change is not None:
+                    if (not isinstance(time_budget_change, dict)
+                            or set(time_budget_change) != {"expected_revision", "total_seconds"}
+                            or not isinstance(time_budget_change["expected_revision"], str)
+                            or scope.startswith(_INIT_PREFIX)):
+                        raise OwnerConflict("quest_time_budget_change_invalid")
+                    # The full human submission is the effect identity, including
+                    # the runtime-condition edit committed in this transaction.
+                    approval_ref = "conditions-time:" + canonical_hash({
+                        "quest_ref": scope, "text": text, "expected_revision": expected_revision,
+                        "research_style": research_style, "literature_configuration": literature_configuration,
+                        "stage_models": stage_models, "time_budget_change": time_budget_change,
+                    })
+                    replay = db.execute(sql_text(
+                        "SELECT response_ref FROM ae_quest_time_budget_approvals WHERE approval_ref=:ref"
+                    ), {"ref": approval_ref}).first()
+                    if replay is not None:
+                        recorded = read_runtime_conditions_in_transaction(db, scope, revision=replay.response_ref)
+                        return _editable_conditions(recorded)
+                head = db.execute(sql_text(
+                    "SELECT current_revision FROM hc_runtime_condition_heads WHERE scope_ref=:scope"
+                ), {"scope": scope}).first()
+                if head is None or head.current_revision != expected_revision:
+                    raise OwnerConflict("runtime_conditions_stale")
+                if approval_ref is not None:
+                    from meta_research.quest_research_time import apply_quest_time_budget
+                    apply_quest_time_budget(db, quest_ref=scope,
+                        expected_revision=time_budget_change["expected_revision"],
+                        approval_ref=approval_ref, request_ref="human-runtime-conditions",
+                        response_ref=saved["revision"], new_total_seconds=time_budget_change["total_seconds"])
+                now = time.time()
+                db.execute(sql_text(
+                    "INSERT OR IGNORE INTO hc_runtime_condition_versions "
+                    "(scope_ref,revision,value_json,source_kind,created_at) "
+                    "VALUES (:scope,:revision,:value,'human_update',:now)"
+                ), {"scope": scope, "revision": saved["revision"], "value": json.dumps(
+                    saved, ensure_ascii=False, sort_keys=True, separators=(",", ":")), "now": now})
+                changed = db.execute(sql_text(
+                    "UPDATE hc_runtime_condition_heads SET current_revision=:revision,updated_at=:now "
+                    "WHERE scope_ref=:scope AND current_revision=:prior"
+                ), {"revision": saved["revision"], "now": now, "scope": scope, "prior": expected_revision}).rowcount
+                if changed != 1:
+                    raise OwnerConflict("runtime_conditions_stale")
+        finally:
+            database.close()
         return _editable_conditions(saved)
 
 
@@ -435,11 +458,19 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
                                   initialization_id=initialization_id, target_ref=target_ref)
     if initial is None:
         return ""
-    current = _read(root, *initial)
+    current = _with_research_time(root, _read(root, *initial))
     public = {key: value for key, value in current.items() if key not in {"literature_configuration", "stage_models"}}
+    clock_guidance = (
+        "research_time 是 Quest 共用的当前计时观察，优先于正文中的初始总预算。安排新工作、长调用后及人类答复后，"
+        "按需用 advancement_engine.research_time.read 刷新；据余额、耗时估计、依赖与资源调整实际工作和委派，"
+        "计入核对、交接和求助耗时，首次预计不足时先申请 research_time_extension，再安排获批后的研究工作。"
+        "已发出操作先沿原输入对账。\n"
+        if "research_time" in public else ""
+    )
     return (
         "本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。"
         "同类旧运行条件以本段为准；已经接纳的研究成果、精确输入与正式授权仍按原记录核验。\n"
+        + clock_guidance
         + render_research_style(current['research_style']) + '\n'
         + json.dumps(public, ensure_ascii=False, separators=(",", ":"))
     )

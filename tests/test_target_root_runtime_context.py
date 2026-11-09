@@ -250,7 +250,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Pat
         guidance_path = (source.parent / "../references/research-guidance.md").resolve()
         assert guidance_path == reference_root / "references/research-guidance.md"
         guidance = guidance_path.read_text(encoding="utf-8")
-        assert "交代问题、范围、已授入口和完成条件" in guidance
+        assert "交代问题、范围、已授入口、所分配工作的时间约束、检查点和完成条件" in guidance
         assert guidance not in developer and guidance not in prompt
         assert "/var/lib/meta-research/target-frozen-inputs/manifest.json" in prompt
     (tmp_path / "target-context-observation.json").write_text(json.dumps(provider_calls), encoding="utf-8")

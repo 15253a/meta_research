@@ -2294,6 +2294,7 @@ export type HumanRequestItem = {
     | "external_material_api_access"
     | "offline_action"
     | "capability_authorization"
+    | "research_time_extension"
     | "system_operation_help";
   status:
     | "open"
@@ -2593,6 +2594,20 @@ export type QuestRuntimeConditions = {
   literature_configuration?: LiteratureConfiguration; stage_models: StageModels; available_stage_models: string[];
 };
 
+export type QuestResearchTime = {
+  quest_ref: string; budget_revision: string; budget_kind: "finite" | "unlimited";
+  approved_seconds: number | null; used_seconds: number | null; confirmed_used_seconds: number;
+  remaining_seconds: number | null; overrun_seconds: number | null; observed_at: number;
+  accuracy: "exact" | "unknown"; status: "not_started" | "running" | "paused" | "stopped" | "completed";
+  unknown_intervals: Array<Record<string, unknown>>; shared: boolean;
+  measurement_basis?: "recorded_intervals" | "human_confirmation";
+  accounting_corrections?: Array<Record<string, unknown>>;
+};
+
+export function fetchQuestResearchTime(questRef: string, signal?: AbortSignal): Promise<QuestResearchTime> {
+  return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/research-time`, signal);
+}
+
 export type QuestGoalRevisionDetail = {
   goal_revision_ref: string;
   sequence?: number;
@@ -2621,9 +2636,9 @@ export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSign
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
 }
 
-export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle, literatureConfiguration?: LiteratureConfiguration, stageModels?: StageModels): Promise<QuestRuntimeConditions> {
+export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle, literatureConfiguration?: LiteratureConfiguration, stageModels?: StageModels, timeBudgetChange?: { expected_revision: string; total_seconds: number | null }): Promise<QuestRuntimeConditions> {
   return writeJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, "PUT", {
-    text, expected_revision: expectedRevision, research_style: researchStyle, literature_configuration: literatureConfiguration, stage_models: stageModels,
+    text, expected_revision: expectedRevision, research_style: researchStyle, literature_configuration: literatureConfiguration, stage_models: stageModels, time_budget_change: timeBudgetChange,
   });
 }
 

@@ -1,4 +1,5 @@
 import { CompanionFiles } from "./CompanionFiles";
+import { QuestResearchTime, durationLabel } from "./QuestResearchTime";
 import { ServerMaterialPicker } from "./ServerMaterialPicker";
 import { useWorkMaterialDraft, WorkMaterialFields, WorkMaterialReferences, HumanRequestMaterialReferences } from "./WorkMaterialForm";
 import { currentMaterialReceiverPath, type ServerMaterialSelection } from "./workMaterialApi";
@@ -99,6 +100,10 @@ const requestCopy: Record<HumanRequestItem["kind"], {
     list: "系统操作协助",
     draftLabel: "就系统操作失败发消息",
     draftPlaceholder: "询问错误背景或确认将重试哪个操作……",
+  },
+  research_time_extension: {
+    list: "研究延时", draftLabel: "就延长研究时间发消息",
+    draftPlaceholder: "了解尚缺工作、预计耗时和不延长时可交付的内容……",
   },
 };
 
@@ -2467,7 +2472,7 @@ function HumanRequestView({
         )}
       </header>
       <nav className="hc-kind-navigation" aria-label="求助类别">
-        {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助"] as const).map((label, index) => {
+        {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助", "研究延时"] as const).map((label, index) => {
           const kind = (Object.keys(requestCopy) as HumanRequestItem["kind"][])[index];
           const sameKind = requests.filter(item => item.kind === kind);
           const next = sameKind.find(item => item.status === "open") ?? sameKind[0];
@@ -2497,6 +2502,10 @@ function HumanRequestView({
         <main className="hc-request-core">
           <header className="hc-formal-head"><small>请求任务与正式回应</small><b>审阅后明确提交</b><p>助手完成、选入回应、正式提交与原根接纳分别记录。</p></header>
           <RequestHandoff key={`${request.request_ref}:${request.revision}`} request={request} onChanged={onChanged} />
+          {request.kind === "research_time_extension" && <>
+            <QuestResearchTime questRef={request.quest_ref ?? null} refreshKey={String(request.responses?.length ?? 0)} />
+            <TimeExtensionReceipt request={request} />
+          </>}
           <RequestForm
             key={`${request.request_ref}:${request.revision}`}
             request={request}
@@ -3177,6 +3186,8 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
       {request.kind === "library_reconnect" ? (
         <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending || !!sealedResponse || !recoveryReady} workspacePath={workspacePath} />
       ) : null}
+      {request.kind === "research_time_extension" && <TimeExtensionForm request={request} note={note} setNote={setNote}
+        submit={submit} disabled={pending || !!sealedResponse || !recoveryReady} />}
       {request.kind === "external_material_api_access" ? (
         <NaturalLanguageMaterialForm
           request={request}
@@ -3273,6 +3284,16 @@ function HumanResponseReview({ request, response, pending, onClose, onConfirm }:
     <dl><dt>回应决定</dt><dd>{response.decision === "provided" ? "提供回应" : response.decision === "declined" ? "拒绝" : "暂缓"}</dd>
       <dt>实际反馈与已选助手说明</dt><dd>{response.note || "未提供文字"}</dd></dl>
     {response.facts?.authorization ? <section><b>本次精确授权</b><pre>{JSON.stringify(response.facts.authorization, null, 2)}</pre></section> : null}
+    {isRecord(response.facts.time_budget_decision) && <section><b>本次明确批准</b><p>
+      {typeof response.facts.time_budget_decision.additional_seconds === "number"
+        ? `增加 ${durationLabel(response.facts.time_budget_decision.additional_seconds)}`
+        : response.facts.time_budget_decision.total_seconds == null ? "不设固定截止"
+        : `新的总时长 ${durationLabel(Number(response.facts.time_budget_decision.total_seconds))}`}
+      。已用时间和申请等候消耗继续保留。</p></section>}
+    {isRecord(response.facts.time_budget_decision) && typeof response.facts.time_budget_decision.confirmed_remaining_seconds === "number" && <section>
+      <b>确认当前剩余 {durationLabel(response.facts.time_budget_decision.confirmed_remaining_seconds)}</b>
+      <p>{String(response.facts.time_budget_decision.correction_reason)}</p><p>保留原计时证据，并记录这次人工校正。</p>
+    </section>}
     {response.materials?.map((material, index) => material.kind === "server_reference" ? <p key={index}>
       {material.selection.server.hostname} · {material.selection.absolute_path}<br />{material.selection.description}
     </p> : null)}
@@ -3283,6 +3304,66 @@ function HumanResponseReview({ request, response, pending, onClose, onConfirm }:
 
 function RequestIntro({ children }: { children: ReactNode }) {
   return <section className="hc-request-intro"><small>你现在需要</small>{children}</section>;
+}
+
+function TimeExtensionReceipt({ request }: { request: HumanRequestItem }) {
+  const latest = request.responses?.at(-1);
+  if (!latest) return <p>延时申请中，当前仍使用原已批准额度。</p>;
+  const approval = isRecord(latest.time_budget_approval) ? latest.time_budget_approval : null;
+  const resumed = request.direct_waiters?.some(waiter => waiter.resume_validation?.consumption != null);
+  return <section aria-label="延时处理结果">
+    <p><b>{approval ? "预算已生效" : latest.decision === "declined" ? "已明确拒绝延时，预算保持不变"
+      : latest.decision === "deferred" ? "已暂缓决定，预算保持不变" : "回应已记录，尚无预算生效回执"}</b></p>
+    <p>{resumed ? "原研究根已消费回应；后续执行进展请查看研究时间线。" : "尚未确认研究已恢复。"}</p>
+    {approval && <details><summary>查看预算变更回执</summary><pre>{JSON.stringify(approval, null, 2)}</pre></details>}
+  </section>;
+}
+
+function TimeExtensionForm({ request, note, setNote, submit, disabled }: {
+  request: HumanRequestItem; note: string; setNote: (value: string) => void; submit: SubmitResponse; disabled: boolean;
+}) {
+  const condition = request.target_assertion?.condition;
+  const extension = isRecord(condition) && isRecord(condition.time_extension) ? condition.time_extension : {};
+  const revision = typeof extension.budget_revision === "string" ? extension.budget_revision : null;
+  const requested = typeof extension.requested_additional_seconds === "number" ? String(extension.requested_additional_seconds / 3600) : "";
+  const [hours, setHours] = usePageDraft(`hr-time-hours:${request.request_ref}`, requested);
+  const [mode, setMode] = usePageDraft<"additional" | "total" | "unlimited">(`hr-time-mode:${request.request_ref}`, "additional");
+  const [correct, setCorrect] = usePageDraft(`hr-time-correct:${request.request_ref}`, false);
+  const [remaining, setRemaining] = usePageDraft(`hr-time-remaining:${request.request_ref}`, "");
+  const [reason, setReason] = usePageDraft(`hr-time-reason:${request.request_ref}`, "");
+  const seconds = Math.round(Number(hours) * 3600);
+  const remainingSeconds = Math.round(Number(remaining) * 3600);
+  const valid = (mode === "unlimited" || /^\d+(?:\.\d{1,2})?$/.test(hours) && Number.isSafeInteger(seconds)
+    && (mode === "total" ? seconds >= 0 : seconds > 0))
+    && (!correct || mode !== "unlimited" && /^\d+(?:\.\d{1,2})?$/.test(remaining)
+      && Number.isSafeInteger(remainingSeconds) && remainingSeconds >= 0 && reason.trim().length > 0);
+  return <section aria-label="正式决定研究延时">
+    <p>请选择你同意增加的研究时间。助手建议、普通说明和暂缓决定均不增加额度。</p>
+    <label>批准额度方式<select value={mode} disabled={disabled}
+      onChange={event => setMode(event.currentTarget.value as typeof mode)}>
+      <option value="additional">增加时长</option><option value="total">设置新的总时长</option><option value="unlimited">不设固定截止</option>
+    </select></label>
+    {mode !== "unlimited" && <label>{mode === "additional" ? "增加研究时间（小时）" : "新的总时长（小时）"}<input type="number" min={mode === "total" ? "0" : "0.01"} step="0.01" value={hours}
+      disabled={disabled} onChange={event => setHours(event.currentTarget.value)} /></label>
+    }
+    {mode !== "unlimited" && <details><summary>缺少历史计时依据时，明确校正余额</summary>
+      <label><input type="checkbox" checked={correct} disabled={disabled} onChange={event => setCorrect(event.currentTarget.checked)} />同时确认缺证后的当前剩余额度</label>
+      {correct && <><label>确认当前剩余（小时）<input type="number" min="0" step="0.01" value={remaining}
+        disabled={disabled} onChange={event => setRemaining(event.currentTarget.value)} /></label>
+        <label>校正依据<textarea value={reason} maxLength={4000} disabled={disabled} onChange={event => setReason(event.currentTarget.value)} /></label></>}
+    </details>}
+    <label>延时处理说明（可选）<textarea value={note} maxLength={4000} disabled={disabled}
+      onChange={event => setNote(event.currentTarget.value)} /></label>
+    {!revision && <p role="alert">请求缺少预算修订依据，暂不能批准，请重新读取请求。</p>}
+    <button type="button" disabled={disabled || !valid || !revision} onClick={() => void submit({
+      time_budget_decision: { decision: "approve", expected_revision: revision,
+        ...(mode === "additional" ? { additional_seconds: seconds } : { total_seconds: mode === "unlimited" ? null : seconds }),
+        ...(correct && mode !== "unlimited" ? { confirmed_remaining_seconds: remainingSeconds, correction_reason: reason } : {}),
+      },
+    })}>{mode === "additional" ? "同意增加时间" : mode === "total" ? "同意新的总时长" : "同意不设固定截止"}</button>
+    <button type="button" disabled={disabled} onClick={() => void submit({}, "declined")}>拒绝延时</button>
+    <button type="button" disabled={disabled} onClick={() => void submit({}, "deferred")}>稍后决定</button>
+  </section>;
 }
 
 function OptionalNote({

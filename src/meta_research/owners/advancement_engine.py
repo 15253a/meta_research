@@ -38,6 +38,10 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
+from meta_research.quest_research_time import (
+    QuestResearchTimeMixin, begin_quest_research_time, set_quest_time_paused,
+    finish_quest_research_time,
+)
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.search_sources import QuestScope, SearchSourceRegistry
 from meta_research.feed import DurableFeed
@@ -2012,6 +2016,7 @@ class _SQLiteAutonomousAdvancementLifecycle:
                 )
                 if cycle_changed.rowcount != 1:
                     raise OwnerConflict("quest_completion_foreground_stale")
+                finish_quest_research_time(connection, quest_ref, observed_at=now)
                 connection.execute(
                     text(
                         "UPDATE advancement_engine_state SET revision = revision "
@@ -2166,7 +2171,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
 
 
 class SQLiteAdvancementEngine(
-    HumanRequestOwnerMixin, _SQLiteAutonomousAdvancementLifecycle
+    QuestResearchTimeMixin, HumanRequestOwnerMixin, _SQLiteAutonomousAdvancementLifecycle
 ):
     def __init__(
         self,
@@ -3656,6 +3661,14 @@ class SQLiteAdvancementEngine(
                         ),
                         {"quest_ref": head.quest_ref, "epoch": int(head.epoch)},
                     )
+            # This is the committed human-control transition, not an AR model
+            # suspension. Switching after a pause resumes the same Quest clock;
+            # cancel/abandon or pruning the foreground stops it. HumanRequest
+            # waits never pass through this boundary and continue to count.
+            set_quest_time_paused(
+                connection, operation.quest_ref,
+                paused=next_status != "active", observed_at=now,
+            )
             connection.execute(
                 text(
                     "UPDATE ae_foreground_heads SET status = :status, "
@@ -3949,6 +3962,9 @@ class SQLiteAdvancementEngine(
             receipt_ref = new_ref("ae_cycle_receipt")
             receipt_hash = _receipt_hash(CYCLE_RECEIPT_KIND, cycle_ref, bindings)
             activated_at = time.time()
+            begin_quest_research_time(connection, quest_ref=quest.quest_ref,
+                                     budget=quest.draft.get("time_budget", "open"),
+                                     started_at=activated_at)
             focus_field = "background_and_initial_direction"
             focus = quest.draft.get(focus_field)
             if not isinstance(focus, str) or not focus.strip():

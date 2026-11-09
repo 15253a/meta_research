@@ -28,6 +28,7 @@ HUMAN_REQUEST_KINDS = {
     "offline_action",
     "capability_authorization",
     "system_operation_help",
+    "research_time_extension",
 }
 HUMAN_EVALUATIONS = {
     "satisfied",
@@ -76,6 +77,10 @@ class HumanResponseVerifier(Protocol):
     ) -> dict[str, object]: ...
 
     def verify_reply_delivery(
+        self, *, request_ref: str, response_ref: str
+    ) -> dict[str, object]: ...
+
+    def verify_research_time_approval(
         self, *, request_ref: str, response_ref: str
     ) -> dict[str, object]: ...
 
@@ -347,7 +352,8 @@ class SQLiteHumanRequestOwner:
         }
         request_hash = canonical_hash(command)
         _validate_idempotency_key(idempotency_key)
-        with self._database.write() as connection:
+        write = self._database.fenced_write if request_kind == "research_time_extension" else self._database.write
+        with write() as connection:
             replay = _command_replay(
                 connection,
                 self._issuer,
@@ -358,6 +364,7 @@ class SQLiteHumanRequestOwner:
             if replay is not None:
                 request_ref = replay
             else:
+                contract, waiter = _freeze_research_time_request(connection, contract, waiter)
                 identity_hash = canonical_hash(contract)
                 row = connection.execute(
                     text(
@@ -475,7 +482,8 @@ class SQLiteHumanRequestOwner:
             "direct_waiter": waiter,
         }
         request_hash = canonical_hash(command)
-        with self._database.write() as connection:
+        write = self._database.fenced_write if request_kind == "research_time_extension" else self._database.write
+        with write() as connection:
             replay = _command_replay(
                 connection,
                 self._issuer,
@@ -493,6 +501,7 @@ class SQLiteHumanRequestOwner:
                 if effect is None or effect.request_ref != request_ref:
                     raise OwnerConflict("human_request_open_effect_invalid")
             else:
+                contract, waiter = _freeze_research_time_request(connection, contract, waiter)
                 predecessor = None
                 if predecessor_request_ref is not None:
                     predecessor = _verify_effect_successor_predecessor(
@@ -832,7 +841,8 @@ class SQLiteHumanRequestOwner:
                 "direct_waiters": list(waiters),
             }
         )
-        with self._database.write() as connection:
+        write = self._database.fenced_write if current.kind == "research_time_extension" else self._database.write
+        with write() as connection:
             replay = _command_replay(
                 connection,
                 self._issuer,
@@ -860,6 +870,11 @@ class SQLiteHumanRequestOwner:
                     or row.status != "open"
                 ):
                     raise OwnerConflict("human_request_revision_stale")
+                if current.kind == "research_time_extension":
+                    if any(waiter["target_assertion"] != contract["target_assertion"] for waiter in waiters):
+                        raise OwnerConflict("research_time_extension_invalid")
+                    contract, _ = _freeze_research_time_request(connection, contract, waiters[0])
+                    waiters = tuple({**waiter, "target_assertion": contract["target_assertion"]} for waiter in waiters)
                 if canonical_hash(contract) == row.identity_hash:
                     raise OwnerConflict("human_request_revision_unchanged")
                 now = time.time()
@@ -1585,6 +1600,31 @@ class SQLiteHumanRequestOwner:
         if self._response_verifier is None:
             raise OwnerConflict("human_collaboration_verifier_unavailable")
         return self._response_verifier
+
+
+def _freeze_research_time_request(connection, contract, waiter):
+    """Bind the first submission to system time without changing replay inputs."""
+    if contract["kind"] != "research_time_extension":
+        return contract, waiter
+    target = contract["target_assertion"]
+    condition = target.get("condition")
+    extension = condition.get("time_extension") if isinstance(condition, dict) else None
+    if (not isinstance(extension, dict)
+            or set(extension) != {"budget_revision", "requested_additional_seconds"}
+            or not isinstance(extension.get("budget_revision"), str)
+            or not contract.get("quest_ref")
+            or waiter["target_assertion"] != target):
+        raise OwnerConflict("research_time_extension_invalid")
+    seconds = extension["requested_additional_seconds"]
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or seconds <= 0):
+        raise OwnerConflict("research_time_extension_invalid")
+    from meta_research.quest_research_time import read_quest_research_time_in_transaction
+    snapshot = read_quest_research_time_in_transaction(connection, contract["quest_ref"])
+    if snapshot["budget_revision"] != extension["budget_revision"]:
+        raise OwnerConflict("research_time_budget_stale")
+    frozen = {**target, "condition": {**condition, "time_extension": {**extension, "snapshot": snapshot}}}
+    return {**contract, "target_assertion": frozen}, {**waiter, "target_assertion": frozen}
 
 
 def _validate_contract(

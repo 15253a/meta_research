@@ -137,6 +137,7 @@ class AgentRuntimeHarnessOperation:
     outcome_code: str | None
     reconciliation_generation: int = 0
     model_ref: str | None = None
+    frozen_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -417,6 +418,7 @@ class AgentRuntimeHarnessInterface(Protocol):
         invocation_hash: str,
         resume: bool,
         model_ref: str | None = None,
+        frozen_prompt: str | None = None,
     ) -> None: ...
 
     def checkpoint_target_root_human_request_session(
@@ -2526,6 +2528,7 @@ class SQLiteAgentRuntimeHarness:
         invocation_hash: str,
         resume: bool,
         model_ref: str | None = None,
+        frozen_prompt: str | None = None,
     ) -> None:
         now = time.time()
         with self._database.write() as connection:
@@ -2555,10 +2558,10 @@ class SQLiteAgentRuntimeHarness:
             connection.execute(
                 text(
                     "INSERT INTO ar_harness_provider_operations "
-                    "(operation_ref, run_ref, generation, invocation_hash, model_ref, "
+                    "(operation_ref, run_ref, generation, invocation_hash, model_ref, frozen_prompt, "
                     "status, outcome_code, created_at, completed_at) VALUES "
                     "(:operation_ref, :run_ref, :generation, "
-                    ":invocation_hash, :model_ref, 'running', NULL, :now, NULL)"
+                    ":invocation_hash, :model_ref, :frozen_prompt, 'running', NULL, :now, NULL)"
                 ),
                 {
                     "operation_ref": operation_ref,
@@ -2566,6 +2569,7 @@ class SQLiteAgentRuntimeHarness:
                     "generation": generation,
                     "invocation_hash": invocation_hash,
                     "model_ref": model_ref,
+                    "frozen_prompt": frozen_prompt,
                     "now": now,
                 },
             )
@@ -5146,6 +5150,7 @@ def _operation_from_row(row) -> AgentRuntimeHarnessOperation:
         ),
         reconciliation_generation=int(row.reconciliation_generation),
         model_ref=row.model_ref,
+        frozen_prompt=row.frozen_prompt,
     )
 
 

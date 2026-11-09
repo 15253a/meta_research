@@ -26,6 +26,8 @@ def purpose_paths(name: str, owner: str, access_mode: str) -> tuple[tuple[str, s
 def _primary_paths(name: str, owner: str) -> tuple[tuple[str, str], ...]:
     if name.startswith("tools."):
         return (("Tools", "Contracts"),)
+    if name == "advancement_engine.research_time.read":
+        return (("WF", "Research time and work planning"), ("HC", "Research time extensions"))
     if name.startswith(("human_request.", "human_guidance.", "human_collaboration.")):
         paths = [("HC", "Requests and replies" if name.startswith("human_request.") else "Guidance and feedback")]
         if name == "human_request.read":

@@ -142,7 +142,7 @@ def test_restart_reconciles_frozen_input_before_consuming_changed_prompt(
 
 
 @pytest.mark.parametrize("damage", (
-    "owner_hash", "mcp_endpoint", "request_seal", "missing_receipt", "exit_seal", "provider_argv",
+    "owner_hash", "mcp_endpoint", "request_seal", "missing_receipt", "missing_prompt", "exit_seal", "provider_argv",
 ))
 def test_changed_prompt_cannot_bypass_original_identity_or_integrity(interrupted_root, damage):
     from sqlalchemy import text
@@ -159,6 +159,8 @@ def test_changed_prompt_cannot_bypass_original_identity_or_integrity(interrupted
         runner.request_path.write_text(json.dumps(document))
     elif damage == "missing_receipt":
         (directory / "supervisor-exit.json").unlink()
+    elif damage == "missing_prompt":
+        (directory / "prompt.txt").unlink()
     elif damage == "exit_seal":
         document = json.loads((directory / "supervisor-exit.json").read_text())
         document["payload"]["returncode"] = 0

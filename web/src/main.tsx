@@ -270,6 +270,7 @@ const humanRequestPanelByKind: Record<HumanRequestItem["kind"], string> = {
   offline_action: "offline-operation",
   capability_authorization: "permission-request",
   system_operation_help: "system-operation-help",
+  research_time_extension: "research-time-extension",
 };
 
 function humanRequestKindFromPanel(

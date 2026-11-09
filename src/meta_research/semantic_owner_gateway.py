@@ -8,6 +8,7 @@ from meta_research.environment_operations import environment_operations
 from meta_research.literature_operations import literature_operations
 
 from collections.abc import Callable
+import math
 from dataclasses import dataclass, replace
 from typing import cast
 
@@ -354,6 +355,7 @@ def create_semantic_owner_gateway(
             raise ValueError("formal semantic catalog requires research memory")
         operations.extend(
             (
+                _research_time_operation(advancement_engine, agent_runtime),
                 *_bundle_target_operations(
                     advancement_engine=advancement_engine,
                     research_graph=research_graph,
@@ -390,6 +392,77 @@ def create_semantic_owner_gateway(
     if recorder_channels is not None:
         operations.append(recorder_channels.operation)
     return SemanticMcpGateway(tuple(operations))
+
+
+def _research_time_operation(advancement_engine, agent_runtime):
+    def read(context, arguments):
+        if context.root_kind not in {"idea", "plan", "bundle", "target", "reasoning"}:
+            raise SemanticMcpError("quest_research_time_root_unauthorized")
+        try:
+            quest_ref = _reading_quest(agent_runtime, context)
+            return advancement_engine.query_research_time(quest_ref)
+        except OwnerConflict as error:
+            raise SemanticMcpError(error.code, error.details) from error
+
+    return SemanticOperation(
+        semantic_operation_id="advancement_engine.research_time.read",
+        owning_module="advancement_engine",
+        description=(
+            "Read the authenticated root's current shared Quest research time before a new work decision, "
+            "after a long call or a human reply. Seconds are Quest elapsed effective time, shared by parallel "
+            "agents and cumulative across Cycles. Human pause and service downtime are excluded; HumanRequest "
+            "waiting counts. Returns approved, used, remaining/overrun, accuracy, observation time and budget "
+            "revision. Unlimited or unknown amounts are null, never a false zero. An observation is not a new "
+            "scientific input or permission to replay effects. If time is insufficient, use human_request.open "
+            "with request_kind=research_time_extension and the current revision; ordinary replies do not approve time."
+        ),
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        output_schema=_research_time_schema(),
+        handler=read,
+        error_descriptions={
+            "quest_research_time_root_unauthorized": "Only an authenticated research root can read this clock. Use the current root's granted channel.",
+            "quest_research_time_not_found": "No Quest clock exists for this scope. Keep remaining time unknown and report the missing start evidence.",
+            "content_quest_scope_required": "The current operation has no accepted Quest scope; do not substitute a foreground or other Quest.",
+        },
+    )
+
+
+def _research_time_schema():
+    seconds = {"type": "number", "minimum": 0}
+    nullable_seconds = {"type": ["number", "null"], "minimum": 0}
+    interval = {
+        "type": "object", "additionalProperties": False,
+        "required": ["start", "end", "reason"],
+        "properties": {"start": {"type": "number"}, "end": {"type": "number"},
+                       "reason": _string(max_length=256)},
+    }
+    correction = {
+        "type": "object", "additionalProperties": False,
+        "required": ["approval_ref", "confirmed_remaining_seconds", "reason", "observed_at",
+                     "previous_confirmed_used_seconds", "previous_unknown_intervals"],
+        "properties": {
+            "approval_ref": _string(max_length=256), "confirmed_remaining_seconds": seconds,
+            "reason": _string(max_length=4000), "observed_at": {"type": "number"},
+            "previous_confirmed_used_seconds": seconds,
+            "previous_unknown_intervals": {"type": "array", "items": interval},
+        },
+    }
+    properties = {
+        "quest_ref": _string(max_length=256), "budget_revision": _hash_schema(),
+        "approved_seconds": nullable_seconds, "used_seconds": nullable_seconds,
+        "confirmed_used_seconds": seconds, "remaining_seconds": nullable_seconds,
+        "overrun_seconds": nullable_seconds, "observed_at": {"type": "number"},
+        "last_accounted_at": {"type": "number"},
+        "accuracy": {"type": "string", "enum": ["exact", "unknown"]},
+        "status": {"type": "string", "enum": ["not_started", "running", "paused", "stopped", "completed"]},
+        "unknown_intervals": {"type": "array", "items": interval},
+        "budget_kind": {"type": "string", "enum": ["finite", "unlimited"]},
+        "shared": {"type": "boolean", "const": True}, "clock_policy": _string(),
+        "measurement_basis": {"type": "string", "enum": ["recorded_intervals", "human_confirmation"]},
+        "accounting_corrections": {"type": "array", "items": correction},
+    }
+    return {"type": "object", "additionalProperties": False, "properties": properties,
+            "required": [name for name in properties if name != "last_accounted_at"]}
 
 
 def _baseline_operations(research_graph, agent_runtime, human_collaboration=None):
@@ -1143,6 +1216,9 @@ def _root_agent_human_request_operations(
                 "problem 说明困难或缺少条件，requested_delivery 说明应交付内容；impact 与 safe_response 说明后续影响和本请求页面回传方式。"
                 "这些发起时事实与当前请求修订一起保存，页面与 Markdown/HTML/PDF 共用；导出不补造尝试，不自动提交答复，也不启动助手。"
                 "acceptance_conditions 提供 1–32 条非空、去除首尾空格后互不重复的条件。"
+                "research_time_extension 仅供五个研究根申请研究延时：先读取 advancement_engine.research_time.read，"
+                "在 condition.time_extension 提供 budget_revision 与 requested_additional_seconds；"
+                "说明已做工作、缺口、估计不确定性与不延长时的收口影响。等待仍计时，普通答复不等于额度获批。"
             ),
             input_schema=_root_human_request_open_input_schema(),
             output_schema=_root_human_request_output_schema(),
@@ -1154,6 +1230,11 @@ def _root_agent_human_request_operations(
                 context,
                 arguments,
             ),
+            error_descriptions={
+                "research_time_extension_invalid": "Supply condition.time_extension with the current budget_revision and a positive finite requested_additional_seconds. Keep the current root and waiter binding.",
+                "research_time_budget_stale": "The approved budget revision changed. Reconcile an uncertain original effect first; for new work read advancement_engine.research_time.read and submit a new effect against that revision. Elapsed time alone does not change the revision.",
+                "quest_research_time_root_unauthorized": "Only an authenticated Idea, Plan, Bundle, Target or Reasoning root can request time. Supporting roles return the need to their research root.",
+            },
         ),
         SemanticOperation(
             semantic_operation_id=reconcile_id,
@@ -1459,6 +1540,10 @@ def _open_root_agent_human_request(
     effect_id, effect_key = _semantic_effect_key(context, arguments)
     scope = _root_agent_human_request_scope(owner, context)
     command = _root_human_request_command(arguments)
+    if command.request_kind == "research_time_extension" and context.root_kind not in {
+        "idea", "plan", "bundle", "target", "reasoning",
+    }:
+        raise SemanticMcpError("quest_research_time_root_unauthorized")
     if (
         command.request_kind == "system_operation_help"
         and command.predecessor_request_ref is not None
@@ -1625,6 +1710,14 @@ def _root_human_request_command(
     acceptance_conditions = arguments.get("acceptance_conditions")
     authorization = arguments.get("required_authorization")
     predecessor_request_ref = arguments.get("predecessor_request_ref")
+    extension = condition.get("time_extension") if isinstance(condition, dict) else None
+    if (request_kind == "research_time_extension") != (extension is not None):
+        raise SemanticMcpError("root_agent_human_request_condition_invalid", {
+            "category": "arguments",
+            "message": "research_time_extension requires condition.time_extension; other kinds omit it.",
+            "correction": "Read advancement_engine.research_time.read and supply its budget_revision plus requested_additional_seconds. Reconcile an uncertain prior submission before changing it.",
+            "execution_stage": "before_owner_submission", "call_execution": "not_started", "effect_status": "unknown",
+        })
     if request_kind == "capability_authorization" and authorization is None:
         raise SemanticMcpError("root_agent_human_request_condition_invalid", {
             "category": "arguments",
@@ -1729,12 +1822,25 @@ def _valid_root_human_request_authorization(value: object) -> bool:
     )
 
 
+def _valid_time_extension(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"budget_revision", "requested_additional_seconds"}
+        and isinstance(value["budget_revision"], str)
+        and len(value["budget_revision"]) == 64
+        and all(character in "0123456789abcdef" for character in value["budget_revision"])
+        and type(value["requested_additional_seconds"]) in {int, float}
+        and math.isfinite(value["requested_additional_seconds"])
+        and 0 < value["requested_additional_seconds"] <= 9_007_199_254_740_991
+    )
+
+
 def _valid_root_human_request_condition(value: object) -> bool:
     if not isinstance(value, dict):
         return False
     generic_fields = {"impact", "safe_response"}
     help_fields = {"background", "attempted_work", "problem", "requested_delivery"}
-    if generic_fields <= set(value) <= generic_fields | help_fields | {"guidance_asset_ref"}:
+    if generic_fields <= set(value) <= generic_fields | help_fields | {"guidance_asset_ref", "time_extension"}:
         return all(
             isinstance(value.get(name), str) and bool(value.get(name))
             for name in ("impact", "safe_response")
@@ -1759,6 +1865,8 @@ def _valid_root_human_request_condition(value: object) -> bool:
             "guidance_asset_ref" not in value
             or isinstance(value.get("guidance_asset_ref"), str)
             and bool(value.get("guidance_asset_ref"))
+        ) and (
+            "time_extension" not in value or _valid_time_extension(value["time_extension"])
         )
     if set(value) - {"help_context"} != {"schema_ref", "root", "condition"}:
         return False
@@ -2147,6 +2255,7 @@ def _root_human_request_resolution(
         "reason_code": reason["code"],
         "accepted_evidence_refs": evidence_refs,
         **({"delivery": selected["delivery"]} if "delivery" in selected else {}),
+        **({"time_budget_approval": selected["time_budget_approval"]} if "time_budget_approval" in selected else {}),
     }
 
 
@@ -3007,6 +3116,7 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
                     "expert advice, fieldwork or physical/offline action; "
                     "capability_authorization for formal permission; "
                     "system_operation_help for a Meta Research runtime failure."
+                    " research_time_extension for explicit human approval of more Quest research time."
                 ),
             },
             "obligation": {
@@ -3045,6 +3155,10 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
                     },
                     "impact": _string(max_length=4000),
                     "safe_response": _string(max_length=4000),
+                    "time_extension": _closed_object({
+                        "budget_revision": _hash_schema(),
+                        "requested_additional_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 9_007_199_254_740_991},
+                    }, required=("budget_revision", "requested_additional_seconds")),
                     "guidance_asset_ref": {
                         **_string(max_length=96),
                         "description": "One already accepted Research Asset version.",
@@ -3212,6 +3326,7 @@ def _root_human_request_output_schema() -> dict[str, object]:
                         "items": _string(max_length=512),
                     },
                     "delivery": _workspace_reply_schema(),
+                    "time_budget_approval": {"type": "object"},
                 },
                 required=(
                     "response_ref",

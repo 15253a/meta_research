@@ -16,7 +16,8 @@ from meta_research.runtime_conditions import (
 
 
 @pytest.fixture
-def root(tmp_path):
+def root(tmp_path, monkeypatch):
+    monkeypatch.setattr("time.time", lambda: 1000.0)
     (tmp_path / "data-root.json").write_text("{}")
     with sqlite3.connect(tmp_path / "meta-research.sqlite3") as db:
         db.executescript("""
@@ -43,6 +44,13 @@ def root(tmp_path):
                 updated_at REAL NOT NULL,
                 FOREIGN KEY(scope_ref, current_revision)
                     REFERENCES hc_runtime_condition_versions(scope_ref, revision));
+            CREATE TABLE ae_research_time_service(singleton TEXT PRIMARY KEY, service_ref TEXT,
+                status TEXT, started_at REAL, last_observed_at REAL);
+            CREATE TABLE ae_quest_time_budgets(quest_ref TEXT PRIMARY KEY, budget_revision TEXT,
+                approved_seconds REAL, started_at REAL, confirmed_used_seconds REAL,
+                checkpoint_at REAL, paused BOOLEAN, completed BOOLEAN, unknown_intervals_json TEXT,
+                accounting_adjustment_seconds REAL DEFAULT 0, accounting_corrections_json TEXT DEFAULT '[]');
+            CREATE TABLE ae_initial_cycles(quest_ref TEXT, activated_at REAL);
         """)
         for name, count, accepted in (("one", 4, True), ("two", 1, True), ("draft", 0, False)):
             devices = [{"uuid": f"GPU-{name}-{i}", "name": "NVIDIA A100-SXM4-80GB",
@@ -63,6 +71,8 @@ def root(tmp_path):
                 db.execute("INSERT INTO rg_quests VALUES (?,?,?,?)",
                            (f"quest-{name}", f"init-{name}", json.dumps(draft), canonical_hash(draft)))
                 db.execute("INSERT INTO ar_run_controls VALUES (?,?)", (f"run-{name}", f"quest-{name}"))
+                db.execute("INSERT INTO ae_quest_time_budgets VALUES (?,?,2592000,0,0,0,0,0,'[]',0,'[]')",
+                           (f"quest-{name}", f"budget-{name}"))
                 db.execute("INSERT INTO rg_target_graphs VALUES (?,?)", (f"graph-{name}", f"quest-{name}"))
                 db.execute("INSERT INTO rg_targets VALUES (?,?)", (f"target-{name}", f"graph-{name}"))
         db.execute("INSERT INTO ar_run_controls VALUES ('deepfetch-draft',NULL)")
@@ -208,6 +218,7 @@ def test_initialization_edits_survive_acceptance_without_changing_other_scope(ro
     with sqlite3.connect(root / "meta-research.sqlite3") as db:
         db.execute("INSERT INTO rg_quests SELECT 'quest-new',initialization_id,draft_json,draft_hash "
                    "FROM hc_quest_initializations WHERE initialization_id='init-draft'")
+        db.execute("INSERT INTO ae_quest_time_budgets VALUES ('quest-new','budget-new',2592000,0,0,0,0,0,'[]',0,'[]')")
     inherited = read_runtime_conditions(root, "quest-new")
     assert inherited["text"] == "仅使用 CPU，预算三天。"
     assert read_runtime_conditions(root, scope) == inherited

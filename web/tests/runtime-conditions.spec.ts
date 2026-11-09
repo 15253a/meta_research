@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
+import type { QuestResearchTime } from "../src/api";
 
 const devices = [
   { uuid: "GPU-test-1", name: "NVIDIA A100-SXM4-80GB", memory_total_mib: 81920 },
@@ -27,7 +28,8 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
     [questRef]: { quest_ref: questRef, text, revision: "r1", research_style: researchStyle, stage_models: defaultModels, available_stage_models: ["gpt-6.1-sol", "gpt-5.6-sol"] },
   };
   const state = {
-    snapshot, questRef, reads: [] as string[], writes: [] as { questRef: string; text: string; expected_revision: string }[],
+    snapshot, questRef, reads: [] as string[], writes: [] as { questRef: string; text: string; expected_revision: string; time_budget_change?: { expected_revision: string; total_seconds: number | null } }[],
+    clocks: {} as Record<string, QuestResearchTime>,
     configs,
     catalogFailure: false, catalogQuest: questRef, catalogReads: 0,
     failure: 0, delayedQuest: "", release: null as (() => void) | null,
@@ -38,6 +40,14 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
     const request = route.request(), url = new URL(request.url());
     if (url.origin !== "http://127.0.0.1:18768") return route.abort();
     const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+    const clock = /^\/api\/v1\/quests\/([^/]+)\/research-time$/.exec(url.pathname);
+    if (clock) {
+      const selected = decodeURIComponent(clock[1]);
+      state.clocks[selected] ??= { quest_ref: selected, budget_revision: "budget-1", budget_kind: "finite",
+        approved_seconds: 2592000, used_seconds: 3600, confirmed_used_seconds: 3600, remaining_seconds: 2588400,
+        overrun_seconds: 0, observed_at: 1794232800, accuracy: "exact", status: "running", unknown_intervals: [], shared: true };
+      return json(state.clocks[selected]);
+    }
     const conditions = /^\/api\/v1\/quests\/([^/]+)\/runtime-conditions$/.exec(url.pathname);
     if (conditions) {
       const selected = decodeURIComponent(conditions[1]);
@@ -58,6 +68,11 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
         stage_models: body.stage_models ?? state.configs[selected].stage_models,
         research_style: body.research_style ?? state.configs[selected].research_style };
       state.configs[selected] = next;
+      if (body.time_budget_change && state.clocks[selected]) Object.assign(state.clocks[selected], {
+        approved_seconds: body.time_budget_change.total_seconds, budget_revision: `budget-${state.writes.length + 1}`,
+        budget_kind: body.time_budget_change.total_seconds == null ? "unlimited" : "finite",
+        remaining_seconds: body.time_budget_change.total_seconds == null ? null : Math.max(0, body.time_budget_change.total_seconds - 3600),
+      });
       return json(next);
     }
     if (request.method() !== "GET") return route.abort();
@@ -89,6 +104,21 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
 
 const dialog = (page: Page) => page.getByRole("dialog", { name: "修改配置", exact: true });
 const editor = (page: Page) => dialog(page).getByRole("textbox", { name: "运行条件内容" });
+
+test("an explicit total can match unchanged conditions after another HR budget revision", async ({ page }) => {
+  const state = await workspace(page, structuredText({ ...initialConditions, time_budget: "4h" }));
+  const open = page.getByRole("button", { name: "修改配置", exact: true });
+  await open.click();
+  const hours = dialog(page).getByRole("spinbutton", { name: "时间预算", exact: true });
+  await expect(hours).toHaveValue("720");
+  await hours.fill("4");
+  await expect(dialog(page).getByRole("button", { name: "保存运行条件" })).toBeEnabled();
+  await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
+  await open.click();
+  await expect(dialog(page)).toContainText("保存将把已批准总时长设为 4 小时");
+  await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
+  expect(state.writes[0]).toMatchObject({ time_budget_change: { expected_revision: "budget-1", total_seconds: 14400 } });
+});
 
 test("one model per research stage, with fixed Ultra and independent persisted choices", async ({ page }) => {
   const state = await workspace(page);
@@ -303,9 +333,13 @@ test("custom hour budgets validate and survive saving and reopening", async ({ p
   }
   expect(state.writes).toHaveLength(0);
   await budget.fill("2.5");
+  await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
+  await opener.click();
+  await expect(budget).toHaveValue("2.5");
   await save.click();
   await expect(dialog(page).getByRole("status")).toContainText("已保存");
   expect(savedJson(state.writes[0].text)).toEqual({ ...initialConditions, time_budget: "2.5h" });
+  expect(state.writes[0].time_budget_change).toEqual({ expected_revision: "budget-1", total_seconds: 9000 });
   await dialog(page).getByRole("button", { name: "关闭", exact: true }).click();
   await opener.click();
   await expect(budget).toHaveValue("2.5");
