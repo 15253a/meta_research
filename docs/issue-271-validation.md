@@ -1,5 +1,7 @@
 # #271 普通助手与共用 Writing
 
+2026-11-09 重开范围的任务级 API、受限凭据、通俗表达和当轮验收见[本轮验证记录](issue-271-task-api-validation.md)。下文保留原交付版本及其证据边界。
+
 实现基线：`v1-test@6a8767e9037eb8166edec89cfc9134618c005ac7`。范围以 [#271](https://github.com/15253a/meta_research/issues/271) 和 [#262](https://github.com/15253a/meta_research/issues/262) 为准。
 
 实现分支：`codex/issue-271-companion-writing-20261101`。代码提交依次为 `fbcd7a8`、`b166eac`、`2b9fa12`；`6566cb4` 仅清理旧原生测试合同，验证文档单独收尾。工作树与现有源码 checkout、服务和研究数据隔离。
