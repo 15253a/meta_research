@@ -86,7 +86,7 @@ def test_host_intake_retry_migration_preserves_populated_owner_records(
     upgrade_database(database)
     after = snapshot()
 
-    assert after["revision"] == "0078_target_host_intake_retry"
+    assert after["revision"] == "0080_writing_display_message"
     assert after["rows"] == before["rows"]
     assert after["foreign_key_errors"] == []
     assert after["foreign_keys"] == before["foreign_keys"]
