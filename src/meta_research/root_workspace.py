@@ -485,7 +485,16 @@ class RootWorkspaces:
         return self.native_directory_prompt(current)
 
     def native_directory_prompt(self, current: WorkspaceLocation) -> str:
+        scope = (
+            "For Cycle work, the current and previous two Cycles follow the Quest research sequence; "
+            "listed paths are limited to this root's scope. "
+            if current.cycle_ref is not None else
+            "This work follows its own workspace lifecycle, outside the three-Cycle window. "
+        )
         return ("\n\nUse native file or shell tools in these work directories. "
+                + scope
+                + "Unlisted paths are not granted and do not imply absent research history; "
+                "use authorized exact readers for relevant historical content. "
                 "Write only in your own read_write directory; other listed work is read-only. "
                 "Do not traverse parent directories, private spools or authority stores. "
                 "Presence does not admit a formal asset. Work directories: "

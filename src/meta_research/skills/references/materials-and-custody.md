@@ -74,7 +74,7 @@ Target 过程中发现、取得或阅读的 Literature 也进入整理范围。�
 
 ## 交接与工作区收尾
 
-各阶段及具体工作使用自己的 Workspace，按 Cycle 统筹生命周期。完整 Workspace 采用三轮滑窗，保留当前 Cycle 与前两轮；最初不足三轮时保留实际轮数。宿主提供窗口内实际可达的目录路径、所属 Cycle／阶段／工作及读写范围，Agent 用原生文件／shell 按需查读；未提供的目录不可由相邻路径推断可读。三个 Cycle 可以包含多个目录，无须复制或重排工作台，也不预先枚举全部文件或 hash。同一 Session 的技术重试或恢复继续原工作，不产生新的轮次。
+各阶段及具体工作使用自己的 Workspace，按 Quest 的正式研究序列统筹生命周期。近期窗口保留当前 Cycle 与前两轮；最初不足三轮时保留实际轮数，同一 Session 的技术重试、turn/job 变化或恢复不增加轮数。每轮可有多个阶段与 Target 目录；本根实际可读范围按[当前工作目录](#当前工作目录与回复材料)中的宿主路径提示确定，无须复制、重排工作台或预先枚举全部文件与 hash。
 
 三轮滑窗及会话回收由系统执行。新一轮进入后，退出窗口且工作已结束、没有恢复或读取依赖的临时文件、缓存和工作副本进入回收；Agent 无需代系统清理。已由 RM 正式以 `linked_local` 保管的原件留在原位置，只保留所需文件及必要父目录，其余符合回收条件的内容删除；无需迁移原件，也不因一份原件保留整轮 Workspace。语义退役不解除原位保护，也不表示物理回收；原件暂时离线仍保留其位置关系。残留原件目录按 RM 保管入口读取，不再作为完整工作台。人提供的只读原目录不属于临时清理对象。
 
@@ -118,7 +118,11 @@ reader 指针只把 operation 以外的参数交给指定工具；summary_only �
 
 ## 当前工作目录与回复材料
 
-宿主给出同一 Quest 当前与前两轮实际可用的工作目录、工作归属与读写范围；每轮可能有多个目录。用原生文件工具或 shell 在获授目录内按需查找。本工作可写，读取其他工作时不修改其内容，也不沿符号链接越出获授范围。目录表说明本次工作的授权用途，原生执行仍沿实例已有 Harness 权限；父目录、私有 spool 和内部数据库不因给出路径而获授权。正式研究历史沿 RG／RM 的准确入口读取。技术 turn 或 job 更换后继续使用原工作目录。
+宿主在本次输入的 `Work directories` 中列出实际可达且属于本根范围的工作目录；每项的 `directory` 是原生文件／shell 的入口，`workspace_ref`、`work_ref`、`root_kind`、`cycle_ref` 及适用的 `target_ref` 说明工作归属，`access` 说明读写范围。只在自己的 `read_write` 目录内编辑工作文件，`read` 目录用于只读参考；Target 的正式 inputs 等受保护内容仍按原合同使用。原生执行沿实例已有 Harness 权限，路径提示不扩大权限；父目录、私有 spool、内部数据库及越出获授范围的符号链接不在授权内。普通目录查找和读取直接用原生能力，无须经过专用 RW 工具或工具索引。
+
+Cycle 根的路径来自同一 Quest 当前及前两轮窗口，并按本根实际工作筛选：本轮列出自己的工作目录及已存在的上游阶段目录；Bundle／Reasoning 还可见本轮已启用 Target 的目录，Target 可见本 Target 的工作目录历史。窗口内较早轮次的可见阶段与 Target 目录可供参考。晚到的旧根仍受当前窗口与自身工作限制，不因恢复而取得更新轮次或重新开放完整第四轮。Companion、Acquisition 等不属于 Cycle 的工作只按自身获授范围访问，不套用三轮目录承诺。
+
+缺失、不可读或不在本根范围的目录不出现在路径提示中。未列出不等于没有历史、材料已删除或已被读完，也不能从相邻路径推断权限；需要相关内容时沿已有准确引用或 RG／RM 等正式 reader 核实，仍不可达则说明具体缺口。路径已经给出而读取失败时，保留实际失败与未读范围。目录可达不表示内容已被正式接纳；窗口外原件和研究历史沿准确 reader 读取，回收边界见[交接与工作区收尾](#交接与工作区收尾)。
 
 正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle。用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read；无 Quest 时须传精确 request_ref 与 response_ref。delivery.reply_file 与 uploaded_files 给出 workspace_ref、相对 path 与 sha256，在该工作实际目录用原生工具读取 reply.json 和需要的上传文件；核对字节后再作为准确依据。linked_locators 保留所选原件的位置说明；其目录或文件也进入 delivery.work_materials 的既有授权材料引用，按当前授权及实际可用性读取，先展开必要条目，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
 
