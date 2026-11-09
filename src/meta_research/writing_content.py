@@ -143,7 +143,10 @@ def generate(config_ref: str | dict, request: dict, *, environment=None, opener=
         if error.code == 401:
             raise ContentModelError("authentication_failed", "authorization",
                 "The provider rejected the configured credentials.",
-                "Ask the configuration owner to repair credentials; keep the draft and selected model.",
+                ("Use the Writing form's Save key action to replace the credential under the same reference, "
+                 "then continue the original conversation; keep the draft and selected model."
+                 if isinstance(config_ref, dict) else
+                 "Ask the configuration owner to repair credentials; keep the draft and selected model."),
                 http_status=error.code) from None
         if error.code == 403:
             reason, category, message, correction = ("authorization_denied", "authorization",
