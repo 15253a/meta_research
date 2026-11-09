@@ -34,4 +34,4 @@ Validation on 2026-11-09:
 - Wheel packaging verified all 377 package files against committed source bytes, including the five updated role/shared resources and four built frontend files.
 - Independent review found no confirmed specification defect or hard repository-standard violation. One low-priority suggestion concerns sharing the short, independent guidance/request pagination request lifecycles; no correctness defect was identified there.
 
-The implementation changes no deployed service or existing research data. The isolated acceptance service was stopped after verification. This delivery does not close #267/#274/#262 or publish a remote branch.
+The implementation changes no deployed service or existing research data. The isolated acceptance service was stopped after verification. Publishing the source does not establish the final deployed acceptance required by #274/#262; ticket status and the current delivery conclusion are maintained on GitHub.
