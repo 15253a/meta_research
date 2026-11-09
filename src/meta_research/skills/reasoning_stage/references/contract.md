@@ -20,7 +20,7 @@ Bundle 因 Brief 为空而跳过时，完整 Plan 仍是本轮输入；跳过可
 
 同根研究过程：认真分析本 Cycle，经 RG 放回整体路线作抽象综合，判断关键处并选择下一步。过程以[主 Skill](../SKILL.md)为准，现有输入、科学综合与 notes 承载所需材料和判断；不新增阶段、全局快照或输出字段。每轮承担全局审视，准确读取按需展开并允许回看。
 
-首轮资料取舍：完整 Plan／Bundle 交接及各项 Target 的关键结果与限制直接给出，其余准确原文按需读取。需要补读或执行 Owner 操作时，按[Owner 操作](owner-operations.md)选择当前获授入口。首轮按科学用途直接组织：
+首轮资料取舍：完整 Plan／Bundle 交接及各项 Target 的关键结果与限制直接给出，其余准确原文按需读取。需要补读或执行 Owner 操作时，按[Owner 操作](owner-operations.md)选择当前获授入口。人类协作历史沿[Human Interact](../../references/research-navigation.md#human-interact理解人类协作及其研究影响)的原文与处理 reader 按需读取，保留各根反馈的准确版本及当时目标判断，不用当前根处理摘要覆盖其他历史。首轮按科学用途直接组织：
 
 - 本次 Cycle／阶段／重心与来源、请求绑定，完整 Question、当前有效 Goal 与持续条件，以及适用的人类指导。保留本逻辑操作的冻结工作切面；后到指导与当前 Goal 的差异据实说明。
 - 当前已接纳的完整 FormalPlan 科学正文、完整采用来源集合，及已接纳 BundleReport、各 Target 真实结果和完整 Bundle 策略交接 notes。阶段合法跳过时显示原因和精确依据，Bundle 无 Brief 跳过仍完整保留 Plan 的实际 gap 及不安排理由；缺失应有材料时显示实际阻塞。未产生的 Plan、Bundle 或 Target 不以旧轮对象填补。

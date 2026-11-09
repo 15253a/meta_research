@@ -73,6 +73,10 @@
 
 适用且待处理的指导沿本次获授能力处理；已由冻结首包或在途原生输入提供准确同版正文时，直接据此判断与反馈。需要补取正文或当前未决评估时再读取；具体绑定和核实方式见下节。
 
+## 回顾协作历史
+
+追溯正式指导原文、采纳理由、研究变化或目标影响时，沿[Human Interact 的历史读取链](research-navigation.md#human-interact理解人类协作及其研究影响)展开各根、各次处理的准确版本。历史 reader 是纯读，不产生当前指导的已读或处理回执；`prior_treatment` 仅说明当前工作已有处理，不能代替完整历史。实际反馈与未决判断的解决继续按下节当前根合同执行，历史可读性不增加处理权限。
+
 ## 正式指导的冻结读取
 
 本次准确指导可由冻结首包或在途原生输入直接提供，包含 delivery_ref、原件版本、力度、semantic_scope、applies_to_work、needs_treatment、人的原文、助手理解及保留条件。已取得准确正文时，feedback 与 goal 直接使用该同版内容及实际 scope／hash／operation；工具读取记录不是机械前置。需要补取正文或反馈时调用 human_guidance.read，并沿 next_offset 读取必要的完整原文；摘要、索引、hash 或 prepared 不能替代正文。读取与反馈的重试用相同 effect_id 和相同参数；结果不确定时调用相应 .reconcile 查询原回执。

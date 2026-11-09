@@ -5689,7 +5689,7 @@ export type ResearchLibraryItem = Record<string, unknown> & {
   reader?: ResearchContentReader | null;
   history_reader?: ResearchContentReader | null;
 };
-export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; query_revision?: string; result_state?: string; total_count?: number; request_next_cursor?: string | null };
+export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; query_revision?: string; result_state?: string; total_count?: number; request_next_cursor?: string | null; guidance_next_offset?: number | null; guidance_query_revision?: string };
 export type ResearchContentPage = {
   text?: string; content?: unknown; next_offset: number | null; status?: string;
   [key: string]: unknown;

@@ -41,9 +41,14 @@ const server=createServer(async(req,res)=>{
         })),next_offset:offset===0?12:null});
       }
       if(entry==="human"&&u.searchParams.has("request_cursor"))return send({items:[{ref:"later-response",name:"Later request response",summary:"A second page of human guidance."}],next_offset:null,request_next_cursor:null});
-      if(entry==="human")return send({items:[{ref:"request-with-history",request_ref:"request-with-history",
+      if(entry==="human"&&u.searchParams.has("constraint_ref")) return send({items:[{ref:"treatment-1",treatment_ref:"treatment-1",name:"plan",root_kind:"plan",run_ref:"plan-retained",disposition:"considered",goal_impact:"none",reader:{source_ref:"treatment-1",version_ref:"receipt-1"}}],next_offset:null});
+      if(entry==="human"&&u.searchParams.has("guidance_offset")) {
+        assert.equal(u.searchParams.get("guidance_query_revision"),"b".repeat(64));
+        return send({items:[{ref:"guidance-pending",name:"Pending formal guidance",reader:{source_ref:"guidance-pending",version_ref:"guide-v2"}}],next_offset:null,guidance_next_offset:null});
+      }
+      if(entry==="human")return send({items:[{ref:"guidance-1",name:"Confirmed formal guidance",reader:{source_ref:"guidance-1",version_ref:"guide-v1"}},{ref:"request-with-history",request_ref:"request-with-history",
         name:"A request with preserved replies",summary:"Latest response summary.",response_count:13,
-        reader:{source_ref:"historical-response-12",version_ref:"response-version-12"}}],next_offset:null,request_next_cursor:"request-page-2"});
+        reader:{source_ref:"historical-response-12",version_ref:"response-version-12"}}],next_offset:null,request_next_cursor:"request-page-2",guidance_next_offset:12,guidance_query_revision:"b".repeat(64)});
       if(entry==="questions") return send({items:u.searchParams.has("question_ref")
         ?[{ref:"outcome-"+offset,name:"Preserved conclusion "+offset,summary:"A previous accepted research finding.",reader:{source_ref:"outcome-"+offset,version_ref:"outcome-"+offset}}]
         :[{question_ref:"question-library-"+offset,name:"questions material "+offset,reader:{source_ref:"question-library-"+offset,version_ref:"question-content-"+offset},history_reader:{operation:"research_graph.question_history.read",question_ref:"question-library-"+offset,offset:0,limit:12}}],next_offset:offset===0?12:null});
@@ -62,6 +67,9 @@ const server=createServer(async(req,res)=>{
     if(u.pathname==="/api/v1/research-content"){
       assert.ok(u.searchParams.get("source_ref")&&!['undefined','null'].includes(u.searchParams.get("source_ref")));
       assert.ok(u.searchParams.get("version_ref"));
+      if(u.searchParams.get("source_ref")==="guidance-1") return send({text:JSON.stringify({meaning:"formally_submitted_guidance",constraint_ref:"guidance-1",guidance_hash:"guide-v1",guidance:{text:"Compare uncertainty before selecting the method.",strength:3,semantic_scope:{kind:"quest",quest_ref:"quest-retained"}},treatment_count:1,treatments_reader:{constraint_ref:"guidance-1",version_ref:"guide-v1"}}),complete:true,next_offset:null});
+      if(u.searchParams.get("source_ref")==="guidance-pending") return send({text:JSON.stringify({meaning:"formally_submitted_guidance",constraint_ref:"guidance-pending",guidance_hash:"guide-v2",guidance:{text:"Untreated confirmed instruction.",strength:2},treatment_count:0}),complete:true,next_offset:null});
+      if(u.searchParams.get("source_ref")==="treatment-1") return send({text:JSON.stringify({disposition:"considered",understanding:"We compared the uncertainty.",reasons:"The evidence does not support changing methods.",changes:"The comparison now includes confidence intervals.",continuing_work:"Continue the original method.",goal_impact:"none",binding:{identity:{root_kind:"plan",run_ref:"plan-retained",operation_ref:"operation-retained"}},guide_ref:{constraint_ref:"guidance-1",guidance_hash:"guide-v1"},receipt:{payload_hash:"receipt-1"}}),complete:true,next_offset:null});
       if(u.searchParams.get("source_ref").startsWith("historical-response-")) {
         const index=u.searchParams.get("source_ref").slice("historical-response-".length);
         assert.equal(u.searchParams.get("version_ref"),"response-version-"+index);
@@ -171,6 +179,17 @@ try{
   await expect(dialog.getByRole("tab",{name:"Human input",exact:true})).toBeVisible();
   await expect(dialog.locator(".asset-header-chip")).toHaveText("Saved content versions: 1089");
   await dialog.getByRole("tab",{name:"Human input",exact:true}).click();
+  await dialog.locator(".library-card").filter({hasText:"Confirmed formal guidance"}).getByRole("button",{name:"Read original",exact:true}).click();
+  await expect(dialog.getByText("Compare uncertainty before selecting the method.",{exact:true})).toBeVisible();
+  await dialog.getByRole("button",{name:"View treatments (1)",exact:true}).click();
+  await dialog.locator(".library-card").filter({hasText:"Research planning"}).getByRole("button",{name:"Read original",exact:true}).click();
+  await expect(dialog.getByText("The evidence does not support changing methods.",{exact:true})).toBeVisible();
+  await expect(dialog.getByText("The comparison now includes confidence intervals.",{exact:true})).toBeVisible();
+  await expect(dialog.locator(".library-original").getByText("No goal change proposed",{exact:true})).toBeVisible();
+  await dialog.getByRole("button",{name:"Back",exact:true}).click();
+  await dialog.getByRole("button",{name:"More formal guidance",exact:true}).click();
+  await dialog.locator(".library-card").filter({hasText:"Pending formal guidance"}).getByRole("button",{name:"Read original",exact:true}).click();
+  await expect(dialog.getByText("No treatment recorded yet.",{exact:true})).toBeVisible();
   await dialog.getByRole("button",{name:"View all responses (13)",exact:true}).click();
   await expect(dialog.getByText("Historical response 0",{exact:true})).toBeVisible();
   await expect(dialog.locator(".library-card")).toHaveCount(12);

@@ -27,7 +27,7 @@ Plan 的 goal、characteristics、boundary_constraints、semantic_delta 保留�
 
 需要复用方法或核验实施时，按[研究导航](../references/research-navigation.md)展开精确 Baseline、Variant、真实 Run 和适用评价，沿各自 reader 与分页读取；参数以当前工具 schema 为准，目录条目与正文分页分别处理。Plan 的完整采用来源同时包含科学支持与计划复用材料，以 Brief 的 reuse_material_refs 定位来源并按实际用途选择；派给 Target 前按[准确材料交接](references/contract.md#准确材料交接)落实关键情况说明与可读取内容。
 
-需要回顾人类要求或协作历史时，经 RG 的 Human Interact 用途下 `human_request.read`（历史原文与处理）及 HC 的 `human_guidance.read`（当前指导） 返回的准确入口读取原文与实际处理，不把可见历史要求自动扩大为本轮约束。
+需要回顾人类要求或协作历史时，从 RG 的 Human Interact 用途取得 `human_request.read`，按[历史指导与处理读取](../references/research-navigation.md#human-interact理解人类协作及其研究影响)展开原文及各根、各次反馈的准确版本，核对采纳理由、研究变化与目标影响。可见历史要求仍按其确认范围判断是否适用于本轮。
 
 仅 Bundle 经正式候选接纳与调度启用 Target；其他阶段、Target 和子智能体提供后续建议。Target 有独立可验目的、完成 cells、输入和实际依赖。一份 Brief 可由多个 Target 实现，一个 Target 也可履行多个 Brief 共有的责任；按实际责任和 cells 组织，不预设一对一或强行合并。获取、采集、清洗、整理可独立成 Target，也可与相关研究合并；粒度由研究需要、复用产物和真实依赖决定，湿实验、论证和辅助材料同样适用。
 
@@ -63,4 +63,4 @@ Target 正式接纳后，按[资源整理与正式登记](../references/material
 
 全部完成 cells 有 current accepted TargetCommit 覆盖时为 `realized`；需改变冻结语义时说明 `replan_required` 与剩余义务；真实阻塞、在途工作和未知效果保持实际状态。完成条件是本轮承诺已核对、结果与未决项已交接，Owner 接纳链可验证；执行结束、保存、TargetCommit 和科学结论分别成立。
 
-需要人补足判断、资源或行动，或接续正式答复时，按[主动发起与接续 HumanRequest](../references/human-guidance.md#主动发起与接续-humanrequest)处理。查询原文与处理记录使用 RG 的 Human Interact 用途下 `human_request.read`（历史原文与处理）及 HC 的 `human_guidance.read`（当前指导） 返回的准确入口；实际依赖仅阻碍相应工作，其余 ready 工作继续安排。未知请求效果先沿原操作对账。
+需要人补足判断、资源或行动，或接续正式答复时，按[主动发起与接续 HumanRequest](../references/human-guidance.md#主动发起与接续-humanrequest)处理。历史查询沿上述 Human Interact 准确 reader 纯读；当前适用指导的处理沿 HC 的 `human_guidance.read`／`human_guidance.feedback` 合同；实际依赖仅阻碍相应工作，其余 ready 工作继续安排。未知请求效果先沿原操作对账。

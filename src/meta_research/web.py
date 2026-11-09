@@ -2614,7 +2614,11 @@ def create_app(
             baseline_ref: str|None=None,variant_ref: str|None=None,question_ref: str|None=None,
             query_revision: str|None=Query(default=None,pattern="^[0-9a-f]{64}$"),
             request_cursor: str|None=Query(default=None,max_length=512),
-            request_ref: str|None=Query(default=None,min_length=1,max_length=256)) -> dict[str,object]:
+            request_ref: str|None=Query(default=None,min_length=1,max_length=256),
+            constraint_ref: str|None=Query(default=None,min_length=1,max_length=256),
+            version_ref: str|None=Query(default=None,min_length=1,max_length=256),
+            guidance_offset: int|None=Query(default=None,ge=0),
+            guidance_query_revision: str|None=Query(default=None,pattern="^[0-9a-f]{64}$")) -> dict[str,object]:
         from meta_research.research_content import discover_questions,discover_literature
         graph=runtime.owners.research_graph;memory=runtime.owners.research_memory
         if graph.query_quest_by_ref(quest_ref) is None:raise OwnerConflict("research_library_quest_invalid")
@@ -2670,6 +2674,22 @@ def create_app(
             return page
         if entry=="human":
             hc=runtime.owners.human_collaboration
+            if sum(selector is not None for selector in (request_ref,request_cursor,constraint_ref,guidance_offset)) > 1:
+                raise OwnerConflict("research_help_selection_invalid")
+            if constraint_ref is not None:
+                treatments=hc.query_research_guidance_treatments(constraint_ref,quest_ref=quest_ref,
+                    version_ref=version_ref,offset=offset,limit=limit,query_revision=query_revision)
+                treatments["items"]=[{**item,"ref":item["treatment_ref"],
+                    "name":item["root_kind"],"reader":item["content_reader"]}
+                    for item in treatments["items"]]
+                return treatments
+            if guidance_offset is not None:
+                guidance=hc.query_research_guidance(quest_ref=quest_ref,query=query,
+                    offset=guidance_offset,limit=limit,query_revision=guidance_query_revision)
+                return {**guidance,"items":[{**item,"ref":item["constraint_ref"],
+                    "reader":item["content_reader"]} for item in guidance["items"]],
+                    "next_offset":None,"guidance_next_offset":guidance["next_offset"],
+                    "guidance_query_revision":guidance["query_revision"]}
             if request_ref is not None:
                 if request_cursor is not None:
                     raise OwnerConflict("research_help_cursor_invalid")
@@ -2682,7 +2702,14 @@ def create_app(
                     for response in responses["items"]]
                 return responses
             page=hc.query_research_inputs(**args) if request_cursor is None else {"items":[],"next_offset":None}
+            if offset==0 and request_cursor is None:
+                guidance=hc.query_research_guidance(quest_ref=quest_ref,query=query,limit=limit)
+                page["items"].extend({**item,"ref":item["constraint_ref"],
+                    "reader":item["content_reader"]} for item in guidance["items"])
+                page["guidance_next_offset"]=guidance["next_offset"]
+                page["guidance_query_revision"]=guidance["query_revision"]
             if offset==0 or request_cursor is not None:
+                from meta_research.human_research_context import _request_content_hash
                 requests=hc.query_research_help_page(quest_ref=quest_ref,cursor=request_cursor,query=query)
                 for request in requests["items"]:
                     latest=request["responses"][-1] if request["responses"] else None
@@ -2690,10 +2717,11 @@ def create_app(
                         "name":request.get("obligation","Human request"),"status":request["status"],
                         "response_count":request["response_count"],
                         "summary":(latest.get("note","") if latest is not None else request.get("business_purpose",""))[:1200],
-                        "reader":None if latest is None else {
-                            "source_ref":latest["response_ref"],"version_ref":canonical_hash(latest)}})
+                        "reader":{"source_ref":request["request_ref"],
+                            "version_ref":_request_content_hash(request)}})
                 page["request_next_cursor"]=requests["next_cursor"]
-                page["scan_complete"]=page["next_offset"] is None and requests["next_cursor"] is None
+                page["scan_complete"]=(page["next_offset"] is None and requests["next_cursor"] is None
+                    and page.get("guidance_next_offset") is None)
                 if page["items"]:
                     page["result_state"]="matches"
                 elif not page["scan_complete"]:

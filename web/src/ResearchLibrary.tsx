@@ -38,6 +38,9 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
   const [requestBusy, setRequestBusy] = useState(false);
   const [requestError, setRequestError] = useState<string | null>(null);
   const requestPage = useRef<AbortController | null>(null);
+  const [guidanceBusy, setGuidanceBusy] = useState(false);
+  const [guidanceError, setGuidanceError] = useState<string | null>(null);
+  const guidancePage = useRef<AbortController | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
@@ -68,7 +71,7 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
     setOffsets(value => ({ ...value, [entry]: [0] }));
   }
   useEffect(() => {
-    setPage(null); setSelected(null); setBody(""); setBodyMeta(null); bodyRequest.current?.abort(); requestPage.current?.abort(); setRequestBusy(false); setRequestError(null);
+    setPage(null); setSelected(null); setBody(""); setBodyMeta(null); bodyRequest.current?.abort(); requestPage.current?.abort(); guidancePage.current?.abort(); setRequestBusy(false); setRequestError(null); setGuidanceBusy(false); setGuidanceError(null);
     if (!questRef) return;
     const controller = new AbortController(); setBusy(true); setError(null);
     const queryKey = JSON.stringify([entry, questRef, query, filters]);
@@ -87,7 +90,21 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
     });
     return () => controller.abort();
   }, [entry, questRef, query, offset, revision, filters]);
-  useEffect(() => () => { bodyRequest.current?.abort(); requestPage.current?.abort(); }, []);
+  useEffect(() => () => { bodyRequest.current?.abort(); requestPage.current?.abort(); guidancePage.current?.abort(); }, []);
+  async function moreGuidance() {
+    if (!questRef || page?.guidance_next_offset == null || !page.guidance_query_revision) return;
+    guidancePage.current?.abort();
+    const controller = new AbortController(); guidancePage.current = controller;
+    setGuidanceBusy(true); setGuidanceError(null);
+    try {
+      const next = await fetchResearchLibrary("human", questRef, query, 0, controller.signal, {
+        guidance_offset: String(page.guidance_next_offset), guidance_query_revision: page.guidance_query_revision,
+      });
+      if (!controller.signal.aborted) setPage(prior => prior ? { ...prior, items: [...prior.items, ...next.items], guidance_next_offset: next.guidance_next_offset, guidance_query_revision: next.guidance_query_revision } : prior);
+    } catch (caught) {
+      if (!controller.signal.aborted) setGuidanceError(String(caught instanceof Error ? caught.message : caught));
+    } finally { if (!controller.signal.aborted) setGuidanceBusy(false); }
+  }
   async function moreRequests() {
     if (!questRef || !page?.request_next_cursor) return;
     requestPage.current?.abort();
@@ -109,6 +126,10 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
     try {
       const value = await fetchResearchContent(questRef, reader, next, controller.signal);
       if (controller.signal.aborted) return;
+      if (next > 0 && bodyMeta?.content_hash && value.content_hash !== bodyMeta.content_hash) {
+        setBodyNext(null);
+        throw new Error("content_drifted");
+      }
       const part = text(value.text) || text(value.content);
       setBody(prior => next === 0 ? part : prior + part);
       setBodyNext(value.complete === true ? null : value.next_offset ?? null);
@@ -159,17 +180,18 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
       <div className="library-columns">
         <div className="library-results" aria-busy={busy}>
           {busy ? <p role="status">{t("正在查找材料…", "Finding material…")}</p> : null}
-          {error ? <div role="alert"><p>{t("暂时无法读取此入口。请重试。", "This entry could not be loaded. Please retry.")}</p><button onClick={() => setRevision(value => value + 1)}>{t("重试", "Retry")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{error}</code></details></div> : null}
-          {page && page.items.length === 0 ? <p>{t("没有找到匹配材料。试试其他线索或入口。", "No matching material. Try another clue or entry.")}</p> : null}
+          {error ? <div role="alert"><p>{t("暂时无法读取此入口。请重新查找。", "This entry could not be loaded. Please restart the search.")}</p><button onClick={() => { setOffsets(value => ({ ...value, [entry]: [0] })); setRevision(value => value + 1); }}>{t("重新查找", "Restart search")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{error}</code></details></div> : null}
+          {page && page.items.length === 0 ? <p>{page.result_state === "page_pending" ? t("还有记录尚未查完，请继续翻页。", "More records remain to be checked. Continue to the next page.") : page.result_state === "no_records" ? t("此入口尚无已保存记录。", "No saved records in this entry yet.") : page.result_state === "exhausted" ? t("已读完此范围的记录。", "All records in this scope have been read.") : t("没有找到匹配材料。试试其他线索或入口。", "No matching material. Try another clue or entry.")}</p> : null}
           {page?.items.map((item, index) => {
             const isEnvironmentReference = entry === "environments" && Boolean(item.environment_reference_ref);
-            const name = itemName(item, isEnvironmentReference ? t("研究采用记录", "Research use") : item.variant_ref ? t("方法变体", "Method variant") : t("研究记录", "Research record"));
+            const name = item.treatment_ref ? humanLabel(text(item.root_kind), language) : itemName(item, isEnvironmentReference ? t("研究采用记录", "Research use") : item.variant_ref ? t("方法变体", "Method variant") : t("研究记录", "Research record"));
             const reader = item.reader;
             const judgments = Array.isArray(item.judgments) ? item.judgments as ResearchLibraryItem[] : [];
             return <article className="library-card" key={text(item.ref) || text(item.question_ref) || text(item.record_ref) || String(index)}>
               <h4>{name}</h4>
               {entry === "human" && (text(item.input_ref) || (text(item.ref).startsWith("research_input:") ? text(item.ref) : "")) ? <ResearchInputMaterialReferences inputRef={text(item.input_ref) || text(item.ref)} questRef={questRef} refreshRevision={refreshRevision} /> : null}
               {text(item.summary) ? <p>{text(item.summary)}</p> : null}
+              {item.treatment_ref ? <p>{t("处理结果：", "Treatment: ")}{humanLabel(text(item.disposition), language)} · {humanLabel(text(item.goal_impact), language)}</p> : null}
               {entry === "human" && item.request_ref && typeof item.response_count === "number" ? (
                 item.response_count > 0
                   ? <button type="button" onClick={() => expand(name, { request_ref: item.request_ref! })}>{t("查看全部回复", "View all responses")} ({item.response_count})</button>
@@ -196,6 +218,8 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
             </article>;
           })}
           {entry === "human" && page?.request_next_cursor ? <button disabled={requestBusy || busy} onClick={() => void moreRequests()}>{requestBusy ? t("正在读取回复…", "Reading responses…") : t("更多请求回复", "More request responses")}</button> : null}
+          {entry === "human" && page?.guidance_next_offset != null ? <button disabled={guidanceBusy || busy} onClick={() => void moreGuidance()}>{guidanceBusy ? t("正在读取指导…", "Reading guidance…") : t("更多正式指导", "More formal guidance")}</button> : null}
+          {guidanceError ? <div role="alert">{t("指导列表已变化或暂时不可读。请重新查找。", "The guidance list changed or is unavailable. Restart the search.")}<button onClick={() => { setOffsets(value => ({ ...value, [entry]: [0] })); setRevision(value => value + 1); }}>{t("重新查找", "Restart search")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{guidanceError}</code></details></div> : null}
           {requestError ? <div role="alert">{t("无法读取更多回复，请重试。", "Could not read more responses. Please retry.")}<details><summary>{t("技术详情", "Technical details")}</summary><code>{requestError}</code></details></div> : null}
           <nav className="library-pagination" aria-label={t("结果分页", "Result pages")}>
             <button disabled={busy || history.length < 2} onClick={() => setOffsets(value => ({ ...value, [entry]: history.slice(0, -1) }))}>{t("上一页", "Previous")}</button>
@@ -206,10 +230,10 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
           <h4>{selected?.name ?? t("精确原文", "Exact original")}</h4>
           {!selected ? <p className="library-muted">{t("选择一份材料，阅读保留的原始内容。", "Choose material to read its preserved content.")}</p> : <>
             {bodyMeta?.kind === "directory" ? <div><p>{t("这是一个资料目录，选择文件读取原文。", "This material is a directory. Choose a file to read.")}</p>{(Array.isArray(bodyMeta.entries) ? bodyMeta.entries as { path: string; size?: number }[] : []).map(value => <p key={value.path}><button onClick={() => void read({ ...selected.reader, entry_path: value.path }, value.path)}>{value.path}</button></p>)}</div> : null}
-            {bodyMeta?.encoding === "base64" ? <p>{t("这是二进制材料，可下载精确版本查看。", "This is binary material. Download the exact version to inspect it.")}<br /><a href={`/api/v1/research-assets/${encodeURIComponent(selected.reader.version_ref ?? "")}/content`}>{t("下载原件", "Download original")}</a></p> : body ? <ReadableOriginal body={body} language={language} /> : null}
+            {bodyMeta?.encoding === "base64" ? <p>{t("这是二进制材料，可下载精确版本查看。", "This is binary material. Download the exact version to inspect it.")}<br /><a href={`/api/v1/research-assets/${encodeURIComponent(selected.reader.version_ref ?? "")}/content`}>{t("下载原件", "Download original")}</a></p> : body ? <ReadableOriginal body={body} language={language} onTreatments={(constraintRef, versionRef) => expand(selected.name, { constraint_ref: constraintRef, version_ref: versionRef })} /> : null}
             {!body && bodyMeta?.complete === true && bodyMeta?.kind !== "directory" ? <p>{t("此原文为空。", "This original is empty.")}</p> : null}
             {bodyBusy ? <p role="status">{t("正在读取…", "Reading…")}</p> : null}
-            {bodyError ? <div role="alert"><p>{t("原文暂时不可读。已读内容保留，可重试。", "The original is temporarily unavailable. Previously read content is retained.")}</p><button onClick={() => void read(selected.reader, selected.name, bodyNext ?? 0)}>{t("重试读取", "Retry reading")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{bodyError}</code></details></div> : null}
+            {bodyError ? <div role="alert"><p>{bodyError === "content_drifted" ? t("读取期间记录已变化。请从头重读，避免混合不同版本。", "This record changed while reading. Restart to avoid mixing versions.") : t("原文暂时不可读。已读内容保留，可重试。", "The original is temporarily unavailable. Previously read content is retained.")}</p><button onClick={() => void read(selected.reader, selected.name, bodyNext ?? 0)}>{t("重试读取", "Retry reading")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{bodyError}</code></details></div> : null}
             {bodyNext != null ? <button disabled={bodyBusy} onClick={() => void read(selected.reader, selected.name, bodyNext)}>{t("继续读取", "Read more")}</button> : null}
             <details><summary>{t("精确引用", "Exact reference")}</summary><pre>{JSON.stringify(selected.reader, null, 2)}</pre></details>
           </>}
@@ -220,11 +244,35 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
 }
 
 
-function ReadableOriginal({ body, language }: { body: string; language: "zh" | "en" }) {
+function humanLabel(value: string, language: "zh" | "en"): string {
+  const labels: Record<string, [string, string]> = {
+    applied: ["已采纳", "Applied"], considered: ["已考虑", "Considered"], deferred: ["暂缓处理", "Deferred"],
+    goal_alignment_pending: ["目标调整待处理", "Goal alignment pending"],
+    none: ["未提出目标变化", "No goal change proposed"], undetermined: ["目标影响尚未确定", "Goal impact undetermined"],
+    requires_evolution: ["提出目标演化", "Goal evolution proposed"],
+    quest: ["整个研究项目", "This research project"], question: ["指定研究问题", "Selected question"],
+    cycle: ["指定研究轮次", "Selected cycle"], target: ["指定研究工作", "Selected work"],
+    active: ["有效", "Active"], withdrawn: ["已撤回", "Withdrawn"],
+    idea: ["研究构想", "Research ideas"], plan: ["研究计划", "Research planning"],
+    bundle: ["研究组织", "Research coordination"], reasoning: ["研究综合", "Research synthesis"],
+    companion: ["研究助手", "Research assistant"],
+  };
+  return labels[value]?.[language === "zh" ? 0 : 1] ?? value;
+}
+function ReadableOriginal({ body, language, onTreatments }: { body: string; language: "zh" | "en"; onTreatments: (constraintRef: string, versionRef: string) => void }) {
   let parsed: unknown;
   try { parsed = JSON.parse(body); } catch { return <pre className="library-prose">{body}</pre>; }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return <pre className="library-prose">{body}</pre>;
   const record = parsed as Record<string, unknown>;
+  const t = (zh: string, en: string) => language === "zh" ? zh : en;
+  const guidance = record.guidance && typeof record.guidance === "object" ? record.guidance as Record<string, unknown> : null;
+  const isGuidance = record.meaning === "formally_submitted_guidance";
+  const isTreatment = typeof record.disposition === "string" && Boolean(record.guide_ref);
+  const scope = guidance?.semantic_scope && typeof guidance.semantic_scope === "object" ? guidance.semantic_scope as Record<string, unknown> : null;
+  const binding = record.binding && typeof record.binding === "object" ? record.binding as Record<string, unknown> : null;
+  const identity = binding?.identity && typeof binding.identity === "object" ? binding.identity as Record<string, unknown> : null;
+  const incomplete = isGuidance ? !text(guidance?.text) || typeof record.treatment_count !== "number"
+    : isTreatment && ["understanding", "reasons", "changes", "continuing_work", "goal_impact"].some(key => !text(record[key]));
   const fields: [string, string, string][] = [
     ["title","标题","Title"],["name","名称","Name"],["text","原文","Original"],["summary","摘要","Summary"],
     ["note","说明","Note"],["body","正文","Body"],["markdown","正文","Body"],
@@ -232,10 +280,25 @@ function ReadableOriginal({ body, language }: { body: string; language: "zh" | "
     ["applicability_scope","适用范围","Scope"],["background_context","背景","Background"],
     ["requirements_constraints","要求与约束","Requirements and constraints"],
     ["claim","研究结论","Research finding"],["support_scope","证据支持范围","Supported scope"],
+    ["obligation","求助事项","Request"],["business_purpose","研究背景","Research context"],
+    ["understanding","对指导的理解","Understanding"],["reasons","处理理由","Reasons"],
+    ["changes","研究变化","Research changes"],["continuing_work","后续工作","Continuing work"],
   ];
   const visible = fields.filter(([key]) => typeof record[key] === "string");
-  return <div>{visible.map(([key, zh, en]) => <section key={key}><h5>{language === "zh" ? zh : en}</h5><pre className="library-prose">{String(record[key])}</pre></section>)}
-    {!visible.length ? <p>{language === "zh" ? "此来源保留了结构化研究记录，展开完整原文查看。" : "This source preserves a structured research record. Expand the complete original to inspect it."}</p> : null}
+  return <div>
+    {incomplete ? <p role="alert">{t("记录缺少必要内容，无法确认完整的处理与影响。请重新读取或查看完整原文。", "Required content is missing. The complete treatment and impact cannot be confirmed. Read again or inspect the complete original.")}</p> : null}
+    {isGuidance && guidance ? <section><h5>{t("正式指导原文", "Confirmed guidance")}</h5><pre className="library-prose">{text(guidance.text)}</pre>
+      <p>{t("当前状态：", "Current status: ")}{humanLabel(text(record.status), language) || t("未记录", "Not recorded")}</p>
+      <p>{t("约束力度：", "Strength: ")}{[t("供参考", "For reference"), t("有所倾向", "Some preference"), t("优先考虑", "Prioritize"), t("强烈要求", "Strong request"), t("按我设定", "Follow as specified")][Number(guidance.strength) - 1] ?? t("未记录", "Not recorded")}</p>
+      <p>{t("作用范围：", "Scope: ")}{scope ? humanLabel(text(scope.kind), language) : t("原记录未单独指定，请查看完整原文。", "Not separately specified in this record; inspect the complete original.")}</p>
+      {record.treatment_count === 0 ? <p>{t("尚无处理记录。", "No treatment recorded yet.")}</p> : typeof record.treatment_count === "number" && text(record.constraint_ref) && text(record.guidance_hash) ? <button onClick={() => onTreatments(text(record.constraint_ref), text(record.guidance_hash))}>{t("查看处理记录", "View treatments")} ({record.treatment_count})</button> : null}
+    </section> : null}
+    {isTreatment ? <section><h5>{t("处理结果与目标影响", "Treatment and goal impact")}</h5><p>{humanLabel(text(record.disposition), language)}</p><p>{humanLabel(text(record.goal_impact), language)}</p>
+      <p>{t("处理来源：", "Handled by: ")}{humanLabel(text(identity?.root_kind), language)}</p>
+      {record.goal_impact === "requires_evolution" ? <p>{t("这是处理者提出的目标影响判断，不等于目标已修改。", "This is the handler’s assessment; it does not establish that the goal has changed.")}</p> : null}
+    </section> : null}
+    {visible.map(([key, zh, en]) => <section key={key}><h5>{language === "zh" ? zh : en}</h5><pre className="library-prose">{String(record[key])}</pre></section>)}
+    {!visible.length && !isGuidance ? <p>{language === "zh" ? "此来源保留了结构化研究记录，展开完整原文查看。" : "This source preserves a structured research record. Expand the complete original to inspect it."}</p> : null}
     <details><summary>{language === "zh" ? "完整原文与技术字段" : "Complete original and technical fields"}</summary><pre>{JSON.stringify(record, null, 2)}</pre></details>
   </div>;
 }

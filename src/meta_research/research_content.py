@@ -112,6 +112,19 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
                 "selected_evidence_binding": adopted_source_binding(graph, quest_ref=quest_ref,
                     source_ref=source_ref, leaf=research_input_leaf(value))}
     if human_collaboration is not None:
+        if source_ref.startswith("soft_constraint_"):
+            value = human_collaboration.read_research_guidance(source_ref,
+                quest_ref=quest_ref, version_ref=version_ref)
+            if reader_source_quest_ref is not None:
+                value["treatments_reader"] = {**value["treatments_reader"], "source_quest_ref": reader_source_quest_ref}
+            # Current status and treatment count can change without changing the
+            # immutable guidance version. Do not cache that live projection by it.
+            page = context_read_page(value, path=[], offset=offset, limit=min(limit, 16384))
+            return {**page, "source_ref": source_ref, "version_ref": version_ref}
+        if source_ref.startswith("guidance_effect_"):
+            value = human_collaboration.read_research_guidance_treatment(source_ref,
+                quest_ref=quest_ref, version_ref=version_ref)
+            return {**exact_page(value), "source_ref": source_ref, "version_ref": version_ref}
         with memory._database.read_snapshot() as c:
             response=c.execute(text("SELECT request_ref FROM hc_human_request_responses WHERE response_ref=:ref"),{"ref":source_ref}).first()
         if response is not None:
@@ -120,6 +133,17 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
             value = selected["response"]
             if canonical_hash(value)!=version_ref:raise OwnerConflict("content_version_unbound")
             return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
+        if source_ref.startswith("human_request_"):
+            from meta_research.human_research_context import _request_content_hash
+            value = human_collaboration.query_research_help_request(source_ref, quest_ref=quest_ref)
+            if value is None:
+                raise OwnerConflict("content_source_unbound")
+            if _request_content_hash(value) != version_ref:
+                raise OwnerConflict("content_version_unbound")
+            if reader_source_quest_ref is not None and "responses_reader" in value:
+                value["responses_reader"] = {**value["responses_reader"], "source_quest_ref": reader_source_quest_ref}
+            page = context_read_page(value, path=[], offset=offset, limit=min(limit, 16384))
+            return {**page, "source_ref": source_ref, "version_ref": version_ref}
     if source_ref == version_ref and memory.query_asset_version(version_ref) is not None:
         graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
         return memory.read_asset_content_page(version_ref, entry_path=entry_path, offset=offset, limit=limit)

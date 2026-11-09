@@ -28,7 +28,25 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
         request_ref = arguments.get("request_ref")
         response_ref = arguments.get("response_ref")
         constraint_ref = arguments.get("constraint_ref")
-        if constraint_ref is not None:
+        treatment_ref = arguments.get("treatment_ref")
+        if treatment_ref is not None or arguments.get("entry_kind") == "treatments":
+            if (not quest_ref or constraint_ref is None or request_ref is not None
+                    or response_ref is not None or arguments.get("cursor") is not None):
+                raise OwnerConflict("research_help_selection_invalid", {
+                    "message": "Treatment history requires constraint_ref in an authorized Quest.",
+                    "correction": "Follow the guidance treatments_reader or an exact treatment reader; omit request selectors.",
+                })
+            if treatment_ref is not None:
+                value = human_collaboration.read_research_guidance_treatment(treatment_ref,
+                    quest_ref=quest_ref, constraint_ref=constraint_ref, version_ref=arguments.get("version_ref"))
+                source_ref = treatment_ref
+            else:
+                page_fields = ("treatment_offset", "query_revision")
+                value = human_collaboration.query_research_guidance_treatments(constraint_ref,
+                    quest_ref=quest_ref, version_ref=arguments.get("version_ref"),
+                    offset=arguments.get("treatment_offset", 0), query_revision=arguments.get("query_revision"))
+                source_ref = constraint_ref
+        elif constraint_ref is not None:
             if request_ref is not None or response_ref is not None or arguments.get("cursor") is not None:
                 raise OwnerConflict("research_help_selection_invalid", {
                     "message": "constraint_ref cannot be combined with request_ref, response_ref or cursor.",
@@ -136,7 +154,7 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
             # human text, response facts and delivery workspace bindings stay intact.
             entries = [value, *value.get("items", []), *value.get("research_inputs", {}).get("items", [])]
             for item in entries:
-                for key in ("reader", "responses_reader", "formal_guidance_reader"):
+                for key in ("reader", "responses_reader", "formal_guidance_reader", "treatments_reader", "content_reader"):
                     if key in item:
                         item[key] = {**item[key], "source_quest_ref": quest_ref}
                 latest = item.get("latest_response")
@@ -202,7 +220,10 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
                      "先沿 next_offset 读完当前 UTF-8 字节页，再用 next_cursor 翻旧请求；query 检索请求研究说明和主动材料，"
                      "按 research_inputs.next_offset 设置 input_offset，并携带 research_inputs.query_revision 为 input_query_revision 独立翻页。"
                      "正式指导沿 formal_guidance_reader 的 entry_kind=guidance 发现；以 guidance_offset 和 query_revision 续页，"
-                     "constraint_ref/version_ref 纯读已提交原文、力度、作用范围及当前状态，不产生已读回执或把助手讨论作为指导。"
+                     "constraint_ref/version_ref 纯读已提交原文、力度、作用范围及当前状态；"
+                     "沿 treatments_reader 的 entry_kind=treatments、constraint_ref/version_ref、treatment_offset/query_revision 读所有历史处理，"
+                     "保留实际 root/run/operation 归属，包括后来被解决的评估。沿 treatment_ref/version_ref 准确读取处理结果、理由、changes 与 goal_impact。"
+                     "无处理时明确 treatment_state=not_processed；历史纯读不产生已读回执或把助手讨论作为指导。"
                      "页间研究事实变化返回 research_query_changed，重启该范围查询。切换任一列表页时将字节 offset 归零。"
                      "主动材料的 reader 交给 research_memory.content.read；精确请求使用 request_ref，"
                      "精确回复同时提供 request_ref 和 response_ref，携带 reader 的 version_ref 并省略 cursor。offset／limit 按 UTF-8 字节重建原文与 hash。"
@@ -210,8 +231,10 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
                      "以 response_offset 和 query_revision 独立续页。每条回复提供准确 reader，目录不准备请求的完整执行生命周期。"
                      "正式回复的 delivery.reply_file／uploaded_files 给出原工作区的相对路径与 SHA-256，用原生文件工具从获授目录读取；外部原目录沿当前获授的工作材料引用读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
         input_schema={"type": "object", "properties": {"source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
-            "entry_kind": {"type": "string", "enum": ["guidance", "responses"]},
+            "entry_kind": {"type": "string", "enum": ["guidance", "responses", "treatments"]},
             "guidance_offset": {"type": "integer", "minimum": 0},
+            "treatment_offset": {"type": "integer", "minimum": 0},
+            "treatment_ref": {"type": "string", "minLength": 1, "maxLength": 96},
             "response_offset": {"type": "integer", "minimum": 0},
             "constraint_ref": {"type": "string", "minLength": 1, "maxLength": 96},
             "version_ref": {"type": "string", "minLength": 1, "maxLength": 256},
