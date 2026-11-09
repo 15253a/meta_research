@@ -14,7 +14,8 @@ class WritingCredentials:
     def __init__(self, data_root: Path):
         self.root = data_root / "writing-credentials"
 
-    def save(self, *, quest_ref: str, endpoint: str, model: str, api_key: str, api_key_ref: str | None = None) -> str:
+    def save(self, *, quest_ref: str, endpoint: str, model: str, api_key: str,
+             api_key_ref: str | None = None, restore_bound_reference: bool = False) -> str:
         validate_content_endpoint(endpoint)
         if (not isinstance(api_key, str) or not 1 <= len(api_key) <= 8192
                 or any(ord(c) < 32 or ord(c) > 126 for c in api_key)
@@ -24,8 +25,13 @@ class WritingCredentials:
         ref = "writing-" + secrets.token_hex(16)
         if api_key_ref is not None:
             # Replacing only key bytes keeps the original task binding usable.
-            if self.resolve(api_key_ref, quest_ref=quest_ref, endpoint=endpoint, model=model) is None:
+            if not re.fullmatch(r"writing-[a-f0-9]{32}", api_key_ref):
                 raise ValueError("content_model_credential_unavailable")
+            try:
+                self.resolve(api_key_ref, quest_ref=quest_ref, endpoint=endpoint, model=model)
+            except ValueError as error:
+                if str(error) != "content_model_credential_unavailable" or not restore_bound_reference:
+                    raise
         with os.fdopen(os.open(self.root / (ref + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as file:
             json.dump({"quest_ref": quest_ref, "endpoint": endpoint, "model": model, "api_key": api_key}, file)
         if api_key_ref is not None:
@@ -38,6 +44,9 @@ class WritingCredentials:
             return None
         try:
             value = json.loads((self.root / (ref + ".json")).read_text(encoding="utf-8"))
+            if (not isinstance(value, dict) or not all(isinstance(value.get(name), str)
+                    for name in ("quest_ref", "endpoint", "model", "api_key"))):
+                raise ValueError()
         except (OSError, ValueError):
             raise ValueError("content_model_credential_unavailable") from None
         if (value.get("quest_ref"), value.get("endpoint"), value.get("model")) != (quest_ref, endpoint, model):

@@ -1559,7 +1559,9 @@ def create_app(
                 return _error(422, "writing_quest_required")
             reference = WritingCredentials(runtime.data_root.root).save(
                 quest_ref=scope.removeprefix("quest:"), endpoint=value["endpoint"],
-                model=value["model"], api_key=value["api_key"], api_key_ref=value.get("api_key_ref"))
+                model=value["model"], api_key=value["api_key"], api_key_ref=value.get("api_key_ref"),
+                restore_bound_reference=("api_key_ref" in value and runtime.owners.human_collaboration.has_companion_writing_credential_binding(
+                    scope, value["api_key_ref"], value["endpoint"], value["model"])))
             return {"api_key_ref": reference}
         except (ValueError, TypeError, OSError):
             return _error(422, "content_model_credential_invalid")

@@ -49,11 +49,13 @@ test("sidebar reviews understanding and scope before confirming the exact revise
   await expect(sidebar.getByLabel("指导力度", { exact: true })).toHaveValue("3");
   await expect(sidebar.getByRole("button", { name: "保存指导", exact: true })).toHaveCount(0);
   await sidebar.getByLabel("指导力度", { exact: true }).selectOption("5");
-  await sidebar.getByLabel("给研究助手发消息").fill(body.text);
+  const request = "请起草一份只改本次实验学习率、保留总目标的指导，先给我审阅。";
+  await sidebar.getByLabel("给研究助手发消息").fill(request);
   await sidebar.getByRole("button", { name: "发送消息", exact: true }).click();
   const review = sidebar.getByRole("article", { name: "确认研究指导" });
   await expect(review).toBeVisible();
   expect(writes[0].body.guidance_options).toEqual({ strength: 5, work_materials: null });
+  expect(writes[0].body.message).toBe(request);
   await expect(review.getByLabel("指导原文", { exact: true })).toHaveValue(body.text);
   await expect(review).toContainText("target_history");
   await expect(review).not.toContainText("Quest 全局目标更新待对齐");
@@ -61,6 +63,8 @@ test("sidebar reviews understanding and scope before confirming the exact revise
   await expect(sidebar).toContainText("没有交给研究");
   expect(writes).toHaveLength(1);
   await sidebar.getByRole("button", { name: "继续审阅指导", exact: true }).click();
+  const finalText = "本次实验只改学习率，不重新采集数据，总目标不变。";
+  await review.getByLabel("指导原文", { exact: true }).fill(finalText);
   await review.getByLabel("助手理解", { exact: true }).fill("只在所选实验中改变学习率，保留其余条件。");
   await expect(review.getByRole("button", { name: "明确确认并交给研究", exact: true })).toBeDisabled();
   await review.getByRole("button", { name: "保存修改并重新审阅", exact: true }).click();
@@ -70,7 +74,7 @@ test("sidebar reviews understanding and scope before confirming the exact revise
   await review.getByRole("button", { name: "明确确认并交给研究", exact: true }).click();
   await expect(review).toContainText("已确认保存");
   expect(writes[1].body.expected_proposal_hash).toBe("a".repeat(64));
-  expect(writes[1].body.proposal).toMatchObject({ assistant_understanding: "只在所选实验中改变学习率，保留其余条件。", semantic_scope: body.semantic_scope });
+  expect(writes[1].body.proposal).toMatchObject({ text: finalText, assistant_understanding: "只在所选实验中改变学习率，保留其余条件。", semantic_scope: body.semantic_scope });
   expect(writes[2]).toMatchObject({ path: "/api/v1/human-collaboration/agent-proposals/proposal-revised/soft-constraint", body: { expected_scope_ref: companion.scope_ref, expected_proposal_hash: "b".repeat(64), strength: 5 } });
   expect(writes.every(write => Boolean(write.key))).toBe(true);
   expect(writes[3]).toEqual(writes[2]);

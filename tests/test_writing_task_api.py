@@ -356,6 +356,36 @@ def test_bound_current_model_cannot_silently_call_an_external_model(tmp_path, mo
         runtime.close()
 
 
+def test_missing_private_credential_can_be_restored_only_for_the_original_task(tmp_path):
+    from test_public_manual_question_lifecycle import _build_runtime, _accept_root_question
+    from test_public_human_collaboration_web import _authenticated_client
+    runtime = _build_runtime(tmp_path / "runtime")
+    client, headers = _authenticated_client(runtime)
+    try:
+        quest, _ = _accept_root_question(runtime, "restore-writing-key")
+        scope = "quest:" + quest
+        route = "/api/v1/companion/content-credentials"
+        body = {"scope_ref": scope, "endpoint": "https://writer.example/responses",
+                "model": "chosen", "api_key": "old-private-key"}
+        reference = client.post(route, json=body, headers=headers).json()["api_key_ref"]
+        task = {"kind": "task_api", "endpoint": body["endpoint"], "model": "chosen",
+                "protocol": "openai_responses", "api_key_ref": reference}
+        turn = runtime.owners.human_collaboration.send_companion_message(scope, "Write a paragraph.",
+            "restore-writing-task", writing_request={"requirements": "Preserve limits.", "model": task})
+        (runtime.data_root.root / "writing-credentials" / (reference + ".json")).unlink()
+        repair = {**body, "api_key": "new-private-key", "api_key_ref": reference}
+        wrong = client.post(route, json={**repair, "endpoint": "https://unselected.example/path"}, headers=headers)
+        assert wrong.status_code == 422
+        restored = client.post(route, json=repair, headers=headers)
+        assert restored.status_code == 201, restored.text
+        assert restored.json() == {"api_key_ref": reference}
+        assert runtime.owners.human_collaboration.query_companion_writing_model(turn["interaction_ref"]) == task
+        assert "new-private-key" not in restored.text
+    finally:
+        client.close()
+        runtime.close()
+
+
 @pytest.mark.parametrize("retire_at", ["before_request", "before_response"])
 def test_retired_root_cannot_call_or_deliver_a_content_result(tmp_path, monkeypatch, retire_at):
     from test_public_manual_question_lifecycle import _build_runtime, _accept_root_question

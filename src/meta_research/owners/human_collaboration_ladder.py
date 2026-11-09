@@ -819,7 +819,10 @@ class SQLiteHumanCollaborationLadder:
                 )
                 if agent_proposal.get("proposal_kind") == "soft_constraint":
                     selected = _turn_guidance_options(row) or {"strength": 3, "work_materials": None}
-                    agent_proposal = {**agent_proposal, "text": row.message, **selected}
+                    # The turn retains the human's request. A proposal may be a
+                    # complete draft prepared from it; only explicit review and
+                    # confirmation can adopt that draft as research guidance.
+                    agent_proposal = {**agent_proposal, **selected}
                 _reject_secret_content(agent_proposal)
             with self._database.fenced_write() as connection:
                 self._checkpoint_companion_native(connection, row, native_session_ref)
@@ -1260,6 +1263,17 @@ class SQLiteHumanCollaborationLadder:
         if session["session_ref"] != session_ref:
             raise OwnerConflict("companion_session_invalid")
         return session
+
+    def has_companion_writing_credential_binding(self, scope_ref: str, api_key_ref: str, endpoint: str, model: str) -> bool:
+        with self._database.read() as connection:
+            return connection.execute(text(
+                "SELECT 1 FROM hc_companion_turns turns JOIN hc_companion_sessions sessions "
+                "ON sessions.session_ref=turns.session_ref WHERE sessions.scope_ref=:scope "
+                "AND json_extract(turns.writing_model_json, '$.kind')='task_api' "
+                "AND json_extract(turns.writing_model_json, '$.api_key_ref')=:ref "
+                "AND json_extract(turns.writing_model_json, '$.endpoint')=:endpoint "
+                "AND json_extract(turns.writing_model_json, '$.model')=:model LIMIT 1"
+            ), {"scope": scope_ref, "ref": api_key_ref, "endpoint": endpoint, "model": model}).first() is not None
 
     def query_companion_writing_model(self, interaction_ref: str) -> dict[str, object] | None:
         # A follow-up/recovered turn uses the Writing selection in its native

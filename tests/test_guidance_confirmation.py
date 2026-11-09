@@ -70,7 +70,8 @@ def test_editing_a_proposal_invalidates_old_confirmation_and_late_edits(tmp_path
             "strength": 3, "preserve_conditions": ["保留总目标"], "work_materials": None,
         }
         proposal = human.record_agent_proposal(scope_ref, original, "edit-guidance-record")
-        edited = {**original, "assistant_understanding": "优先复核学习率，并保留总目标。", "strength": 5}
+        edited = {**original, "text": "只复核学习率；不启动新实验，保留总目标。",
+            "assistant_understanding": "优先复核学习率，并保留总目标。", "strength": 5}
         revision = human.revise_agent_proposal(
             proposal["proposal_ref"], expected_scope_ref=scope_ref,
             expected_proposal_hash=proposal["proposal_hash"], proposal=edited,
@@ -135,7 +136,12 @@ def test_guidance_web_requires_a_complete_confirmed_proposal(tmp_path: Path) -> 
         runtime.close()
 
 
-def test_companion_keeps_human_words_and_selected_strength_until_confirmation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("original,draft_text", [
+    ("  本次实验严格只换学习率，总目标不变。  ", "  本次实验严格只换学习率，总目标不变。  "),
+    ("请帮我起草指导：只复核学习率，保留总目标。现在不要提交。",
+        "本次研究仅复核已有学习率记录，不启动新实验；保留总体研究目标。"),
+])
+def test_companion_keeps_reviewable_draft_and_human_source_until_confirmation(tmp_path: Path, original, draft_text) -> None:
     provider = _DeterministicDraftingProvider()
     runtime = _runtime(tmp_path / "companion-guidance-intent", provider)
     try:
@@ -149,9 +155,8 @@ def test_companion_keeps_human_words_and_selected_strength_until_confirmation(tm
         human.send_companion_message(scope_ref, "解释一下学习率的作用。", "explain-learning-rate")
         assert human.process_drafting_once()
         assert human.query_collaboration_projection((scope_ref,))["agent_proposals"] == []
-        original = "  本次实验严格只换学习率，总目标不变。  "
         provider.agent_proposal = {
-            "proposal_kind": "soft_constraint", "text": "助手不准确的概括",
+            "proposal_kind": "soft_constraint", "text": draft_text,
             "assistant_understanding": "仅更换学习率，保留总目标。",
             "applies_to": ["当前研究的学习率复核"],
             "semantic_scope": {"kind": "quest", "quest_ref": quest_ref},
@@ -163,8 +168,9 @@ def test_companion_keeps_human_words_and_selected_strength_until_confirmation(tm
         projection = human.query_collaboration_projection((scope_ref,))
         proposal, = projection["agent_proposals"]
         assert {name: proposal["proposal"][name] for name in ("text", "strength", "work_materials")} == {
-            "text": original, "strength": 5, "work_materials": None}
+            "text": draft_text, "strength": 5, "work_materials": None}
         assert projection["soft_constraints"] == []
+        assert human.query_companion(scope_ref)["turns"][-1]["message"] == original
         assert human.query_companion(scope_ref)["turns"][-1]["guidance_options"] == {
             "strength": 5, "work_materials": None}
         assert provider.intent_requests[-1].draft["selected_guidance"] == {
