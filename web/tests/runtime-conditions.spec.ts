@@ -117,6 +117,7 @@ test("an explicit total can match unchanged conditions after another HR budget r
   await open.click();
   await expect(dialog(page)).toContainText("保存将把已批准总时长设为 4 小时");
   await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
+  await expect(dialog(page).getByRole("status")).toContainText("已保存");
   expect(state.writes[0]).toMatchObject({ time_budget_change: { expected_revision: "budget-1", total_seconds: 14400 } });
 });
 
