@@ -139,7 +139,20 @@ const fallbackCompanionCopy: Record<CompanionShellState, {
 };
 
 function messageText(message: CompanionMessage): string {
-  return message.content ?? message.message ?? message.text ?? "";
+  return (message.role === "user" ? message.display_message : null)
+    ?? message.content ?? message.message ?? message.text ?? "";
+}
+
+function CompanionHumanMessage({ message }: { message: CompanionMessage }) {
+  return <>
+    <span className="companion-human-message">{messageText(message)}</span>
+    {message.role === "user" && message.display_message != null ? (
+      <details className="companion-writing-input">
+        <summary>写作设置与来源</summary>
+        <pre>{message.content ?? message.message ?? message.text ?? ""}</pre>
+      </details>
+    ) : null}
+  </>;
 }
 
 type CompanionSessionProjection = HumanCollaborationProjection["companion"];
@@ -632,7 +645,7 @@ export function QuestCompanion({
               </small>
               {message.role === "assistant" ? (
                 <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
-              ) : messageText(message)}
+              ) : <CompanionHumanMessage message={message} />}
               {pending && message.role !== "assistant" ? (
                 <span className="lumen-message-state" role="status">
                   {message.role === "user" ? "消息正在发送…" : "Codex 正在思考…"}
@@ -2864,9 +2877,9 @@ function IntentDraftingSession({
           <article className={message.role === "user" ? "me" : ""} key={message.message_ref ?? index}>
             <small>{message.role === "user" ? "你" : "研究助手"}</small>
             {message.native_session_generation !== undefined ? <small>会话 {message.native_session_generation}</small> : null}
-            <p>{message.role === "assistant"
-              ? <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
-              : messageText(message)}</p>
+            {message.role === "assistant"
+              ? <p><CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} /></p>
+              : <CompanionHumanMessage message={message} />}
             {message.role === "assistant" && message.status === "completed" && message.message_ref && messageText(message).trim() ? <label className="hc-select-reply">
               <input type="checkbox" checked={selectedReplyRefs.includes(message.message_ref)} disabled={request.status !== "open"}
                 onChange={event => onSelectReply(message.message_ref!, event.target.checked)} />

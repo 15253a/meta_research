@@ -112,6 +112,25 @@ def test_task_api_reaches_selected_protocol_without_model_preconfiguration(tmp_p
     assert calls[0].get_header("Authorization") == "Bearer private-test-key"
 
 
+@pytest.mark.parametrize("kind", ["configured_api", "task_api"])
+def test_existing_explicit_http_endpoint_contract_is_preserved(tmp_path, kind):
+    url = "http://writer.internal/v1/chat/completions"
+    env = restricted_environment(tmp_path, url)
+    selected = task_selection(url)
+    if kind == "configured_api":
+        config = tmp_path / "models.json"
+        config.write_text(json.dumps({"selected": {"endpoint": url, "model": "chosen", "api_key_env": "WRITER_KEY"}}))
+        env["META_RESEARCH_CONTENT_MODELS"] = str(config)
+        selected = "selected"
+    calls = []
+    def endpoint(call, *, timeout):
+        calls.append(call.full_url)
+        return BytesIO(b'{"choices":[{"message":{"content":"Bounded result."}}]}')
+    assert generate(selected, {"messages": [{"role": "user", "content": "Evidence."}]},
+        environment=env, opener=endpoint) == "Bounded result."
+    assert calls == [url]
+
+
 @pytest.mark.parametrize("status, reason", [(401, "authentication_failed"),
     (403, "authorization_denied"), (429, "rate_limited"), (503, "service_unavailable"),
     (408, "timeout"), (504, "timeout"), (302, "endpoint_redirect_rejected")])

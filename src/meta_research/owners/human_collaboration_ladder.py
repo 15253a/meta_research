@@ -502,6 +502,7 @@ class SQLiteHumanCollaborationLadder:
             _reject_secret_content(
                 _document(resolved, "companion_context_invalid")
             )
+        display_message = message if writing_request is not None else None
         if writing_request is not None:
             _reject_secret_content(writing_request)
             if prepare_writing is None:
@@ -558,11 +559,11 @@ class SQLiteHumanCollaborationLadder:
                 connection.execute(
                     text(
                         "INSERT INTO hc_companion_turns (interaction_ref, session_ref, "
-                        "ordinal, message, message_hash, view_context_json, "
+                        "ordinal, message, display_message, message_hash, view_context_json, "
                         "view_context_hash, guidance_options_json, guidance_options_hash, assistant_status, "
                         "attempt_count, idempotency_key, command_hash, created_at, "
                         "updated_at, native_session_generation, native_session_ref, writing_model_json) VALUES (:interaction_ref, :session_ref, :ordinal, "
-                        ":message, :message_hash, :view_context_json, "
+                        ":message, :display_message, :message_hash, :view_context_json, "
                         ":view_context_hash, :guidance_options_json, :guidance_options_hash, 'queued', 0, :idempotency_key, "
                         ":command_hash, :now, :now, :native_session_generation, :native_session_ref, :writing_model_json)"
                     ),
@@ -574,6 +575,7 @@ class SQLiteHumanCollaborationLadder:
                         "native_session_ref": native.native_session_ref,
                         "ordinal": ordinal,
                         "message": message,
+                        "display_message": display_message,
                         "message_hash": canonical_hash(message),
                         "guidance_options_json": None if guidance_options is None else canonical_json(guidance_options),
                         "guidance_options_hash": None if guidance_options is None else canonical_hash(guidance_options),
@@ -1436,6 +1438,7 @@ class SQLiteHumanCollaborationLadder:
                         "scope_ref": scope_ref,
                         "role": "user",
                         "content": turn["message"],
+                        **({} if "display_message" not in turn else {"display_message": turn["display_message"]}),
                         "status": "completed",
                         "created_at": turn["created_at"],
                         **context_projection,
@@ -3270,6 +3273,7 @@ def _public_turn(row) -> dict[str, object]:
         "native_session_generation": int(row.native_session_generation),
         "native_session_ref": row.native_session_ref,
         "message": row.message,
+        **({} if row.display_message is None else {"display_message": row.display_message}),
         **({} if guidance_options is None else {"guidance_options": guidance_options}),
         **(
             {}

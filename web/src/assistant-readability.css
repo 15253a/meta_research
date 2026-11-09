@@ -1,4 +1,8 @@
 /* Keep the assistant readable at its narrowest supported panel width. */
+.companion-human-message { white-space: pre-wrap; overflow-wrap: anywhere; }
+.companion-writing-input { margin-top: 10px; padding-top: 8px; border-top: 1px solid currentColor; font-size: 12px; }
+.companion-writing-input > summary { cursor: pointer; }
+.companion-writing-input > pre { margin: 8px 0 0; max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .lumen-companion { border-color: #e0e3ef; background: linear-gradient(180deg, #f6f5ff, #fff 210px); box-shadow: 0 8px 28px #3f416009; }
 .lumen-companion .lumen-companion-head { padding: 16px 20px; border-bottom-color: #e7e8f2; background: #ffffff80; }
 .lumen-companion .lumen-companion-head b { font-size: 16px; }

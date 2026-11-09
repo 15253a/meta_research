@@ -2128,6 +2128,7 @@ export type CompanionMessage = {
   scope_ref?: string | null;
   role: "user" | "assistant" | "system";
   content?: string;
+  display_message?: string | null;
   message?: string;
   text?: string;
   status?: "queued" | "processing" | "running" | "completed" | "failed";

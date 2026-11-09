@@ -51,9 +51,6 @@ def validate_content_endpoint(endpoint: str) -> None:
             or parsed.username or parsed.password or parsed.query or parsed.fragment
             or any(char.isspace() or ord(char) < 32 for char in endpoint)):
         raise ValueError("content_model_endpoint_invalid")
-    # Plain HTTP is reserved for explicitly local protocol/testing services.
-    if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("content_model_endpoint_requires_https")
     try:
         parsed.port
     except ValueError:

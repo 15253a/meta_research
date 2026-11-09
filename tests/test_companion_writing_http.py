@@ -14,6 +14,46 @@ from test_public_manual_question_lifecycle import _build_runtime, _accept_root_q
 from test_public_human_collaboration_web import _authenticated_client
 
 
+def test_writing_snapshot_preserves_human_request_and_complete_model_input(tmp_path):
+    provider = DeterministicDraftingAdapter()
+    runtime = _build_runtime(tmp_path / "runtime", drafting=provider)
+    client, headers = _authenticated_client(runtime)
+    try:
+        quest_ref, _ = _accept_root_question(runtime, "writing-display")
+        scope = "quest:" + quest_ref
+        human = runtime.owners.human_collaboration
+        ordinary_text = "普通讨论也可以提到：写作任务（普通助手会话）：\n{保留这段原文}"
+        ordinary = human.send_companion_message(scope, ordinary_text, "ordinary-display")
+        assert human.process_drafting_once()
+        original = "  请只修改摘要。\n保留反证与原始数字。  "
+        body = {"scope_ref": scope, "message": original, "writing_request": {
+            "requirements": "Keep the original numbers and evidence limits.", "task_scope": "revision"}}
+        selected_headers = {**headers, "Idempotency-Key": "writing-display"}
+        response = client.post("/api/v1/companion/messages", json=body, headers=selected_headers)
+        assert response.status_code == 202, response.text
+        queued = response.json()
+        assert queued["display_message"] == original
+        assert queued["message"] != original
+        assert "Keep the original numbers and evidence limits." in queued["message"]
+        replay = client.post("/api/v1/companion/messages", json=body, headers=selected_headers)
+        assert replay.json() == queued
+        assert human.process_drafting_once()
+        assert provider.intent_requests[-1].message == queued["message"]
+        snapshot = client.get("/api/v1/snapshot", headers=headers)
+        assert snapshot.status_code == 200, snapshot.text
+        messages = {item["message_ref"]: item for item in snapshot.json()["human_collaboration"]["companion"]["messages"]}
+        displayed = messages[queued["interaction_ref"] + ":user"]
+        assert displayed["display_message"] == original
+        assert displayed["content"] == queued["message"]
+        ordinary_message = messages[ordinary["interaction_ref"] + ":user"]
+        assert "display_message" not in ordinary_message
+        assert ordinary_message["content"] == ordinary_text
+        assert "display_message" not in messages[queued["interaction_ref"] + ":assistant"]
+    finally:
+        client.close()
+        runtime.close()
+
+
 def test_assistant_files_read_only_the_requested_page(tmp_path, monkeypatch):
     import meta_research.root_workspace as module
     runtime = _build_runtime(tmp_path / "runtime")

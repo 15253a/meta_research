@@ -248,3 +248,39 @@ test("repairing a credential preserves its reference without submitting a new wr
     api_key: "test-repaired-private-key", api_key_ref: reference }]);
   expect(state.writes).toHaveLength(0);
 });
+
+test("writing conversation shows exact human request with complete input in collapsed details", async ({ page }) => {
+  const state = await workspace(page);
+  const original = "  只修改摘要最后两句。\n保留反证与原始数字。  ";
+  const complete = `${original}\n\n写作任务（普通助手会话）：\n${JSON.stringify({
+    model: { kind: "task_api", endpoint: "https://writing.example/v1/responses", api_key_ref: "writing-key" },
+    materials: [{ version_ref: "draft-v1", content_hash: "b".repeat(64), path: "/data/exact-draft.docx" }],
+  }, null, 2)}`;
+  const ordinary = "普通讨论提到：写作任务（普通助手会话）：\n{这段原文不能被解析删除}";
+  const scope_ref = state.snapshot.human_collaboration.companion.scope_ref;
+  state.snapshot.human_collaboration.companion.messages = [
+    { message_ref: "ordinary:user", scope_ref, role: "user", content: ordinary, status: "completed" },
+    { message_ref: "writing:user", scope_ref, role: "user", content: complete, display_message: original, status: "completed" },
+    { message_ref: "writing:assistant", scope_ref, role: "assistant", content: "已收到，将保留反证与数字。", status: "completed" },
+  ];
+  await page.goto("http://127.0.0.1:18768/?workspace=1&companion=1");
+  const assistant = page.getByRole("complementary", { name: "研究助手", exact: true });
+  const writing = assistant.locator("article.me").filter({ has: page.getByText("写作设置与来源", { exact: true }) });
+  expect(await writing.locator(".companion-human-message").textContent()).toBe(original);
+  const details = writing.locator("details");
+  await expect(details).not.toHaveAttribute("open", "");
+  await expect(details.locator("pre")).not.toBeVisible();
+  expect(await assistant.locator("article.me").first().locator(".companion-human-message").textContent()).toBe(ordinary);
+  await expect(assistant.locator("article.me").first().locator("details")).toHaveCount(0);
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await details.locator("summary").click();
+    await expect(details.locator("pre")).toBeVisible();
+    expect(await details.locator("pre").textContent()).toBe(complete);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: test.info().outputPath(`writing-details-${width}.png`), fullPage: true });
+    await details.locator("summary").click();
+    await expect(details.locator("pre")).not.toBeVisible();
+  }
+  expect(state.writes).toHaveLength(0);
+});
