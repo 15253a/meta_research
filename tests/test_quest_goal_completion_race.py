@@ -117,7 +117,7 @@ def _evolution_command(runtime, quest_ref: str, accepted):
         operation = connection.execute(
             text(
                 "SELECT operation_ref FROM ar_stage_provider_invocations "
-                "WHERE run_ref=:run_ref AND phase='review' "
+                "WHERE run_ref=:run_ref AND phase='primary' "
                 "ORDER BY completed_at DESC,invocation_ref DESC LIMIT 1"
             ),
             {"run_ref": run["run_ref"]},
@@ -430,9 +430,13 @@ def test_public_condition_edit_keeps_candidate_frozen_and_reopens_reasoning(tmp_
                 "SELECT * FROM hc_guidance_snapshots WHERE snapshot_ref=:ref"
             ), {"ref": source["conditions_snapshot_ref"]}).one()
             frozen = json.loads(snapshot.snapshot_json)
-            assert frozen["operation"]["operation_name"] == "review"
+            assert frozen["operation"]["operation_name"] == "primary"
             assert frozen["identity"]["run_ref"] == accepted["run"]["run_ref"]
-            assert frozen["direction_cut"]["conditions"]["runtime_conditions"] == initial
+            assert frozen["direction_cut"]["conditions"]["runtime_conditions"] == (
+                runtime_conditions.read_runtime_conditions_in_transaction(
+                    connection, quest_ref, revision=initial["revision"]
+                )
+            )
             assert snapshot.snapshot_hash == source["conditions_snapshot_hash"]
         committed = _finish_reasoning_stage(runtime)
         old_epoch = committed["stage_run_request"]["epoch"]
@@ -478,7 +482,9 @@ def test_completion_and_public_condition_edit_use_the_final_sqlite_writer_order(
 ):
     runtime = _runtime(tmp_path / winner)
     original_fenced_write = runtime._database.fenced_write
-    original_condition_lock = runtime_conditions._LOCK
+    from contextvars import ContextVar
+    writer_name = ContextVar("condition_completion_race_writer", default=None)
+    write_order = []
     reached = {name: Event() for name in ("completion", "conditions")}
     allowed = {name: Event() for name in reached}
     threads = {}
@@ -494,29 +500,29 @@ def test_completion_and_public_condition_edit_use_the_final_sqlite_writer_order(
 
         @contextmanager
         def ordered_fenced_write():
-            if current_thread().name == "completion":
-                reached["completion"].set()
-                assert allowed["completion"].wait(10)
+            # Context propagates through the public HTTP route's AnyIO worker.
+            # Both mutations now enter the same persistent SQLite write fence.
+            name = writer_name.get()
+            if name in reached:
+                reached[name].set()
+                assert allowed[name].wait(10)
             with original_fenced_write() as connection:
+                if name in reached:
+                    write_order.append(name)
                 yield connection
 
-        @contextmanager
-        def ordered_condition_write():
-            reached["conditions"].set()
-            assert allowed["conditions"].wait(10)
-            with original_condition_lock:
-                yield
-
         runtime._database.fenced_write = ordered_fenced_write
-        monkeypatch.setattr(runtime_conditions, "_LOCK", ordered_condition_write())
         results = {}
         errors = {}
 
         def call(name, operation):
+            token = writer_name.set(name)
             try:
                 results[name] = operation()
             except BaseException as error:
                 errors[name] = error
+            finally:
+                writer_name.reset(token)
 
         threads = {
             "completion": Thread(target=call, name="completion", args=(
@@ -541,6 +547,7 @@ def test_completion_and_public_condition_edit_use_the_final_sqlite_writer_order(
         allowed[loser].set()
         threads[loser].join(10)
         assert not threads[loser].is_alive()
+        assert write_order == [winner, loser]
         assert results["conditions"].status_code == 200, results["conditions"].text
         assert results["conditions"].json()["revision"] != source["runtime_conditions_revision"]
         historical = runtime.owners.research_graph.query_candidate_completion(
@@ -574,5 +581,4 @@ def test_completion_and_public_condition_edit_use_the_final_sqlite_writer_order(
         for thread in threads.values():
             thread.join(10)
         runtime._database.fenced_write = original_fenced_write
-        monkeypatch.setattr(runtime_conditions, "_LOCK", original_condition_lock)
         runtime.close()

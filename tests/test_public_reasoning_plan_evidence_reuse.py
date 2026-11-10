@@ -4,6 +4,8 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
+from stage_provider_fixture_helpers import ReasoningPrimaryGuidance
+
 import pytest
 
 from meta_research.composition import build_production_runtime
@@ -167,7 +169,7 @@ def _receipt(value: object) -> AcceptanceReceipt:
     )
 
 
-class _MetricReuseReasoningSkill:
+class _MetricReuseReasoningSkill(ReasoningPrimaryGuidance):
     def __init__(self) -> None:
         self.requests: list[ReasoningSkillRequest] = []
 
@@ -274,6 +276,7 @@ class _MetricReuseReasoningSkill:
         }
 
     def generate_draft(self, request: ReasoningSkillRequest) -> ReasoningSkillDraft:
+        self._freeze_primary_guidance(request)
         self.requests.append(request)
         return ReasoningSkillDraft(
             draft=self._output(request),

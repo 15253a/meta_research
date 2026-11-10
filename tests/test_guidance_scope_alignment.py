@@ -363,7 +363,11 @@ def test_inactive_question_guidance_waits_for_its_work_and_history_scope_survive
                 primary_session_ref="scoped-native-" + request.run_ref)
 
         def finalize_draft(self, request, draft):
-            consume(self.runtime.owners.human_collaboration, self.operation(request, "review"))
+            operation = self.operation(request, "primary")
+            cut = self.runtime.owners.human_collaboration.recover_operation_guidance(
+                operation.identity
+            )
+            assert cut.binding.identity == operation.identity
             return super().finalize_draft(request, draft)
 
     provider = Idea()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+
+from stage_provider_fixture_helpers import ReasoningPrimaryGuidance
 from types import SimpleNamespace
 
 import pytest
@@ -127,7 +129,7 @@ def test_reasoning_rejection_projection_includes_actionable_feedback() -> None:
     assert projection["domain"]["receipt"] == receipt.as_public_dict()
 
 
-class _DeterministicReasoningSkill:
+class _DeterministicReasoningSkill(ReasoningPrimaryGuidance):
     def __init__(self, *, entry_stage: str = "idea") -> None:
         self.requests: list[ReasoningSkillRequest] = []
         self.entry_stage = entry_stage
@@ -230,6 +232,7 @@ class _DeterministicReasoningSkill:
         return scientific_outcome, next_cycle
 
     def generate_draft(self, request: ReasoningSkillRequest) -> ReasoningSkillDraft:
+        self._freeze_primary_guidance(request)
         self.requests.append(request)
         scientific_outcome, next_cycle = self._result_parts(request)
         return ReasoningSkillDraft(

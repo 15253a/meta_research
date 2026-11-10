@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from stage_provider_fixture_helpers import ReasoningPrimaryGuidance
+
 import pytest
 
 from meta_research.composition import build_production_runtime
@@ -154,7 +156,7 @@ class _NoViableIdeaSkill:
         return self.finalize_draft(request, self.generate_draft(request))
 
 
-class _CandidateCompletionReasoningSkill:
+class _CandidateCompletionReasoningSkill(ReasoningPrimaryGuidance):
     """Model adapter which proposes, but cannot authorize, completion."""
 
     def runtime_binding(self) -> ReasoningRuntimeBinding:
@@ -262,6 +264,7 @@ class _CandidateCompletionReasoningSkill:
     def generate_draft(
         self, request: ReasoningSkillRequest
     ) -> ReasoningSkillDraft:
+        self._freeze_primary_guidance(request)
         return ReasoningSkillDraft(
             draft=self._output(request),
             primary_session_ref=request.native_session_ref

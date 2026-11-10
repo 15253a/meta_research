@@ -190,19 +190,17 @@ class _HumanRequestIdeaProvider(_IdeaProvider):
         self,
         *,
         invalid_first: bool = False,
-        phase: str = "primary",
     ) -> None:
         super().__init__()
         self.invalid_first = invalid_first
-        self.phase = phase
         self.owner = None
         self.human_request: dict[str, object] | None = None
-        self.review_requests: list[IdeaSkillRequest] = []
+        self.finalization_requests: list[IdeaSkillRequest] = []
         self.finished_jobs: list[str] = []
 
     def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
         draft = super().generate_draft(request)
-        if self.phase != "primary" or self.human_request is not None:
+        if self.human_request is not None:
             return draft
         self._open_human_request(request, phase="primary")
         if self.invalid_first:
@@ -216,10 +214,8 @@ class _HumanRequestIdeaProvider(_IdeaProvider):
     def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
-        self.review_requests.append(request)
+        self.finalization_requests.append(request)
         result = super().finalize_draft(request, draft)
-        if self.phase == "review" and self.human_request is None:
-            self._open_human_request(request, phase="review")
         return result
 
     def finish_job(self, job_ref: str) -> None:
@@ -350,35 +346,37 @@ class _NonzeroHumanRequestIdeaRunner:
                     {
                         "outcome": {
                             "kind": "IdeaSet",
-                            "question_ref": question_ref,
-                            "context_pack_ref": context_pack_ref,
-                            "candidates": [
-                                {
-                                    "candidate_key": "human-response-continuation",
-                                    "direction": "以跨增强拓扑一致性约束自监督去噪。",
-                                    "rationale": "拓扑约束可能比像素重建更保留稀有结构。",
-                                    "assumptions": [
-                                        "受控增强下稀有形态拓扑稳定。"
-                                    ],
-                                    "risks": ["约束可能保留传感器伪影。"],
-                                    "evidence_boundary": {
-                                        "accepted_evidence_refs": [],
-                                        "supported": "Question 限定了低照度形态保真。",
-                                        "inferred": "拓扑一致性可能提高稀有结构保真。",
-                                        "unknown": "跨设备稳健性仍未知。",
-                                    },
-                                    "falsification_hint": {
-                                        "test": "比较稀有形态召回率与伪影率。",
-                                        "would_refute": "召回未提高或伪影显著增加。",
-                                    },
-                                    "material_difference": {
-                                        "from_history": "不复用已接纳 Idea。",
-                                        "from_peers": "以拓扑而非像素误差组织机制。",
-                                        "plan_commitment_change": "Plan 比较拓扑干预轴与基线。",
-                                    },
-                                }
-                            ],
-                            "recommendation": None,
+                            "payload": {
+                                "question_ref": question_ref,
+                                "context_pack_ref": context_pack_ref,
+                                "candidates": [
+                                    {
+                                        "candidate_key": "human-response-continuation",
+                                        "direction": "以跨增强拓扑一致性约束自监督去噪。",
+                                        "rationale": "拓扑约束可能比像素重建更保留稀有结构。",
+                                        "assumptions": [
+                                            "受控增强下稀有形态拓扑稳定。"
+                                        ],
+                                        "risks": ["约束可能保留传感器伪影。"],
+                                        "evidence_boundary": {
+                                            "accepted_evidence_refs": [],
+                                            "supported": "Question 限定了低照度形态保真。",
+                                            "inferred": "拓扑一致性可能提高稀有结构保真。",
+                                            "unknown": "跨设备稳健性仍未知。",
+                                        },
+                                        "falsification_hint": {
+                                            "test": "比较稀有形态召回率与伪影率。",
+                                            "would_refute": "召回未提高或伪影显著增加。",
+                                        },
+                                        "material_difference": {
+                                            "from_history": "不复用已接纳 Idea。",
+                                            "from_peers": "以拓扑而非像素误差组织机制。",
+                                            "plan_commitment_change": "Plan 比较拓扑干预轴与基线。",
+                                        },
+                                    }
+                                ],
+                                "recommendation": None,
+                            },
                         }
                     },
                     ensure_ascii=False,
@@ -586,7 +584,7 @@ def test_restart_resumes_each_durable_boundary_without_provider_replay(
         runtime.idea_stage.start("recovery-stage-start")
         for expected_status, expected_feed_delta in (
             ("not_attempted", 3),
-            ("awaiting_content", 3),
+            ("awaiting_content", 1),
             ("awaiting_domain", 1),
             ("accepted", 1),
             ("accepted", 1),
@@ -606,6 +604,10 @@ def test_restart_resumes_each_durable_boundary_without_provider_replay(
                 )
             )
             assert len(core_events) == expected_feed_delta
+            if expected_status == "awaiting_content":
+                assert tuple(event.event_type for event in core_events) == (
+                    "agent_runtime.attempt_executed",
+                )
             assert runtime.idea_stage.query_current()["outcome_acceptance"][
                 "status"
             ] == expected_status
@@ -924,39 +926,61 @@ def test_real_idea_nonzero_after_human_request_resumes_same_session(
         runtime.close()
 
 
-def test_human_request_park_finishes_the_current_idea_review_job(
+def test_human_request_resume_finishes_the_current_idea_primary_job(
     tmp_path: Path,
 ) -> None:
-    provider = _HumanRequestIdeaProvider(phase="review")
+    provider = _HumanRequestIdeaProvider()
     runtime = _runtime(
-        prepare_data_root(tmp_path / "idea-review-human-request-finish"),
+        prepare_data_root(tmp_path / "idea-primary-human-request-finish"),
         provider,
     )
     provider.owner = runtime.owners.agent_runtime
     try:
-        completed = _confirm_question(runtime, "idea-review-human-request-finish")
-        runtime.idea_stage.start("idea-review-human-request-finish-start")
-
+        completed = _confirm_question(runtime, "idea-primary-human-request-finish")
+        runtime.idea_stage.start("idea-primary-human-request-finish-start")
         assert runtime.idea_stage.process_once()
         request = runtime.owners.advancement_engine.query_idea_stage_request(
             completed["cycle_ref"]
         )
-        assert request is not None
-        checkpointed = runtime.owners.agent_runtime.query_idea_stage_run(
-            request.request_ref
-        )
-        assert checkpointed is not None and checkpointed.primary_draft is not None
-
-        assert runtime.idea_stage.process_once()
-        parked = runtime.owners.agent_runtime.query_idea_stage_run(
-            request.request_ref
-        )
-        assert parked is not None and parked.native_session_ref is not None
+        assert request is not None and provider.human_request is not None
+        parked = runtime.owners.agent_runtime.query_idea_stage_run(request.request_ref)
+        assert parked is not None and parked.primary_draft is None
         assert runtime.owners.agent_runtime.query_managed_run(parked.run_ref)[
             "status"
         ] == "suspended"
-        assert len(provider.review_requests) == 1
-        assert provider.finished_jobs == [provider.review_requests[0].job_ref]
+        first_job = provider.requests[0].job_ref
+        assert provider.finished_jobs == [first_job]
+
+        runtime.owners.human_collaboration.respond_to_human_request(
+            str(provider.human_request["request_ref"]), decision="deferred",
+            facts={}, note="Continue without optional input.",
+            idempotency_key="idea-primary-finish-deferred",
+        )
+        assert runtime.idea_stage.process_once()
+        continued = runtime.owners.agent_runtime.query_idea_stage_run(request.request_ref)
+        assert continued is not None and continued.primary_draft is not None
+        current_job = provider.requests[-1].job_ref
+        assert current_job != first_job
+        assert str(current_job).startswith("root_hr_continuation_")
+        assert continued.native_session_ref == parked.native_session_ref
+        assert provider.finished_jobs == [first_job]
+
+        # Local finalization consumes the resumed primary. It finishes that
+        # current job without creating a review provider operation.
+        assert runtime.idea_stage.process_once()
+        assert len(provider.requests) == 2
+        assert len(provider.finalization_requests) == 1
+        assert provider.finalization_requests[0].job_ref == current_job
+        assert provider.finished_jobs == [first_job, current_job]
+        accepted = runtime.owners.agent_runtime.query_idea_stage_run(request.request_ref)
+        assert accepted is not None and accepted.execution is not None
+        assert accepted.primary_invocation == continued.primary_invocation
+        with runtime._database.read() as connection:
+            phases = connection.exec_driver_sql(
+                "SELECT DISTINCT phase FROM ar_stage_provider_invocations WHERE run_ref=?",
+                (parked.run_ref,),
+            ).scalars().all()
+        assert phases == ["primary"]
     finally:
         runtime.close()
 

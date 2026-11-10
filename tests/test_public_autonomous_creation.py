@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+from stage_provider_fixture_helpers import ReasoningPrimaryGuidance
+
 import pytest
 
 from meta_research.acquisition import (
@@ -138,7 +140,7 @@ def _outcome_analysis(
     }
 
 
-class _AutonomousReasoningSkill:
+class _AutonomousReasoningSkill(ReasoningPrimaryGuidance):
     """Deterministic provider with an explicit resumable internal checkpoint."""
 
     def __init__(
@@ -177,6 +179,7 @@ class _AutonomousReasoningSkill:
     def generate_draft(
         self, request: ReasoningSkillRequest
     ) -> ReasoningSkillDraft:
+        self._freeze_primary_guidance(request)
         self.requests.append(request)
         literature = next(
             (
