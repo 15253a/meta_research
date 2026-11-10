@@ -99,3 +99,68 @@ def test_changed_channel_authority_is_rejected_and_revoked(root_kind, drift):
             capability_binding_hash="3" * 64, phase="primary", job_ref="operation",
             guidance_binding=guidance if drift == "guidance" else None)
     authority.revoke_resident_mcp_channel.assert_called_once_with(channel)
+
+
+@pytest.mark.parametrize("root_kind", ["idea", "plan", "bundle", "reasoning"])
+@pytest.mark.parametrize("failure", ["owner_scope", "unexpected"])
+def test_failed_workspace_acquire_preserves_callers_channel_lifetime(tmp_path, monkeypatch, root_kind, failure):
+    from unittest.mock import Mock
+    from meta_research.owners.common import OwnerConflict
+    from meta_research.root_workspace import RootWorkspaces
+
+    channels = RootResidentMcpChannels(root_kind)
+    authority = _authority(root_kind, "primary")
+    template = authority.issue_resident_mcp_channel.return_value
+    issued = []
+    def issue(**_values):
+        grant = f"workspace-grant-{len(issued)}"
+        channel = SimpleNamespace(
+            connection=SimpleNamespace(token=f"workspace-token-{len(issued)}", grant_ref=grant),
+            binding=SimpleNamespace(**{**vars(template.binding), "connection_grant_ref": grant}),
+        )
+        issued.append(channel)
+        return channel
+    authority.issue_resident_mcp_channel.side_effect = issue
+    channels.bind_authority(authority)
+    channels.configure_endpoint("http://127.0.0.1:8765")
+    scope = _scope(root_kind)
+    immediate = root_kind in {"bundle", "reasoning"}
+    def acquire():
+        return channels.acquire(
+            run_ref=scope["run_ref"], attempt_ref=scope["attempt_ref"],
+            root_session_ref=scope["root_session_ref"], fence_ref=scope["fence_ref"],
+            capability_binding_hash=scope["runtime_binding_hash"], phase="primary",
+            job_ref="workspace-operation", **({"revoke_on_failure": True} if immediate else {}),
+        )
+    first_key, first_access = acquire()
+    agent_runtime = Mock()
+    agent_runtime.verify_root_agent_runtime_scope.side_effect = (
+        OwnerConflict("workspace_scope_stale") if failure == "owner_scope"
+        else RuntimeError("workspace_mount_failed")
+    )
+    workspaces = RootWorkspaces(advancement_engine=None, agent_runtime=agent_runtime,
+        human_collaboration=None, research_graph=None, target_run_agent=None,
+        bases={root_kind: tmp_path / root_kind})
+    channels.bind_workspaces(workspaces)
+    expected = RootResidentMcpError if failure == "owner_scope" else RuntimeError
+    with pytest.raises(expected, match="workspace_scope_stale|workspace_mount_failed"):
+        acquire()
+    agent_runtime.verify_root_agent_runtime_scope.assert_called_once_with(
+        root_kind=root_kind, run_ref=scope["run_ref"], attempt_ref=scope["attempt_ref"],
+        root_session_ref=scope["root_session_ref"], fence_ref=scope["fence_ref"],
+        runtime_binding_hash=scope["runtime_binding_hash"],
+    )
+    assert len(issued) == 1
+    assert authority.revoke_resident_mcp_channel.call_count == int(immediate)
+    channels.release(first_key)
+    authority.revoke_resident_mcp_channel.assert_called_once_with(issued[0])
+    # Recovery can issue a fresh grant; delayed cleanup of the failed generation
+    # must not revoke it, regardless of the caller's release policy.
+    monkeypatch.setattr(workspaces, "bind_runtime", lambda _context: None)
+    new_key, new_access = acquire()
+    assert new_key != first_key and new_access.token != first_access.token
+    channels.release(first_key)
+    channels.revoke(first_key)
+    assert authority.revoke_resident_mcp_channel.call_count == 1
+    channels.release(new_key)
+    assert authority.revoke_resident_mcp_channel.call_count == 2

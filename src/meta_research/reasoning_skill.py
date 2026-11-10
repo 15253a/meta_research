@@ -996,6 +996,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
                 capability_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
                 phase=operation_name, job_ref=request.job_ref, guidance_binding=guidance_binding,
+                revoke_on_failure=True,
             )
         except RootResidentMcpError as error:
             raise ReasoningSkillUnavailable(error.code) from error

@@ -217,6 +217,7 @@ class RootResidentMcpChannels:
         phase: str,
         job_ref: str | None,
         guidance_binding: FrozenGuidanceBinding | None = None,
+        revoke_on_failure: bool = False,
     ) -> tuple[RootResidentMcpChannelKey, RootResidentMcpAccess]:
         authority = self._authority
         base_url = self._base_url
@@ -311,10 +312,10 @@ class RootResidentMcpChannels:
                             capability_binding_hash, self._root_kind, phase, "", guidance_binding))),
                 )
             except SemanticMcpError as error:
-                self.revoke((*key, channel.connection.grant_ref))
+                self._release((*key, channel.connection.grant_ref), immediate=revoke_on_failure)
                 raise RootResidentMcpError(error.code) from error
             except Exception:
-                self.revoke((*key, channel.connection.grant_ref))
+                self._release((*key, channel.connection.grant_ref), immediate=revoke_on_failure)
                 raise
 
     def release(self, key: RootResidentMcpChannelKey) -> None:

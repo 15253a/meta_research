@@ -1065,6 +1065,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 run_ref=run_ref, attempt_ref=attempt_ref, root_session_ref=root_session_ref,
                 fence_ref=fence_ref, capability_binding_hash=canonical_hash(runtime_binding.as_dict()),
                 phase=operation_name, job_ref=job_ref, guidance_binding=guidance_binding,
+                revoke_on_failure=True,
             )
         except RootResidentMcpError as error:
             raise BundleSkillUnavailable(error.code) from error
