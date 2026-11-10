@@ -2,6 +2,7 @@
 import json
 import threading
 import time
+import tomllib
 
 import pytest
 
@@ -10,6 +11,7 @@ from meta_research.bundle_skill import CodexBundleSkillAdapter
 from meta_research.idea_skill import _compile_codex_output_schema
 from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
+from meta_research.runtime_conditions import read_runtime_conditions, save_runtime_conditions
 from test_public_bundle_stage import (
     _bundle_runtime, _prepare_bundle_request, _DeterministicBundleSkill,
 )
@@ -45,7 +47,7 @@ def _runtime(root, executable):
 
 
 @pytest.mark.parametrize("tamper", [False, True], ids=["same-native-new-call", "reject-tampered-stop"])
-def test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history(tmp_path, monkeypatch, tamper):
+def test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history(tmp_path, tamper):
     root = tmp_path / "data"
     root.mkdir()
     executable = _provider(tmp_path / "codex", root, (NATIVE,), stopped_zero=True)
@@ -66,20 +68,31 @@ def test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history(tm
     while not calls.exists():
         assert time.monotonic() < deadline, (failures, runtime.bundle_stage.observation.code)
         time.sleep(.01)
+    spool = next((root / "bundle-skill-provider").glob("provider-operations/*/primary"))
+    # Wait for the actual native identity to reach the durable supervisor stream,
+    # not merely for the fixture subprocess to have opened its call log.
+    stdout = spool / "stdout.jsonl"
+    while not stdout.exists() or NATIVE not in stdout.read_text():
+        assert time.monotonic() < deadline, (failures, runtime.bundle_stage.observation.code)
+        time.sleep(.01)
     _control(runtime, before, "pause")
     worker.join(15)
     assert not worker.is_alive() and not failures
-    spool = next((root / "bundle-skill-provider").glob("provider-operations/*/primary"))
     assert json.loads((spool / "supervisor-exit.json").read_text())["payload"]["termination_reason"] == "stopped"
     original = {p.name: p.read_bytes() for p in spool.iterdir() if p.is_file()}
+    quest_ref = runtime.owners.agent_runtime.query_managed_run(before.run_ref)["quest_ref"]
     runtime.close()
     if tamper:
         receipt = json.loads((spool / "supervisor-exit.json").read_text())
         receipt["seal"] = "0" * 64
         (spool / "supervisor-exit.json").write_text(json.dumps(receipt))
-    resources = bundle_skill._bundle_skill_resources()
-    resources["SKILL.md"] += "\nFresh pagination guidance for this resumed call.\n"
-    monkeypatch.setattr(bundle_skill, "_bundle_skill_resources", lambda: dict(resources))
+    # Editable research instructions refresh for the new physical call. Changing
+    # installed role methods would instead change the capability binding itself.
+    fresh_guidance = "Fresh pagination guidance for this resumed call."
+    conditions = read_runtime_conditions(root, quest_ref)
+    save_runtime_conditions(root, quest_ref,
+        text=conditions["text"] + "\n" + fresh_guidance,
+        expected_revision=conditions["revision"])
     restarted, adapter = _runtime(root, executable)
     try:
         assert not restarted.bundle_stage.process_once()
@@ -114,7 +127,13 @@ def test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history(tm
         assert len(calls.read_text().splitlines()) == 2
         newer = [p for p in (root / "bundle-skill-provider").glob("provider-operations/*/primary") if p != spool]
         assert len(newer) == 1
-        assert "Fresh pagination guidance" in (newer[0] / "prompt.txt").read_text()
+        config_values = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--config"]
+        developer = tomllib.loads(next(value for value in config_values
+            if value.startswith("developer_instructions=")))["developer_instructions"]
+        assert "Role skill source:" in developer
+        assert "bundle_stage/SKILL.md" in developer
+        assert fresh_guidance in (newer[0] / "prompt.txt").read_text()
+        assert fresh_guidance.encode() not in original["prompt.txt"]
         assert original == {p.name: p.read_bytes() for p in spool.iterdir() if p.is_file()}
     finally:
         restarted.close()
