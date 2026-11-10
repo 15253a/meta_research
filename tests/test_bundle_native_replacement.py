@@ -147,7 +147,7 @@ def test_first_replacement_rolling_failure_continues_the_authenticated_native(tm
         else:
             graph, target, old, _, _ = _ready_launch(runtime)
         ar = runtime.owners.agent_runtime
-        ar.begin_provider_unit(unit_ref="initial-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
+        ar.begin_provider_unit(unit_ref="initial-unavailable-unit", operation_ref=old.primary_invocation.operation_ref,
             run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
         ar.record_stage_provider_hard_ceiling(unit_ref="initial-unavailable-unit", run_ref=old.run_ref,
             attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
@@ -169,7 +169,7 @@ def test_first_replacement_rolling_failure_continues_the_authenticated_native(tm
         for hop in range(correction_hops - 1):
             retired_attempts.append(corrected)
             unit_ref = "another-authenticated-correction:" + str(hop)
-            ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=corrected.review_invocation.operation_ref,
+            ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=corrected.primary_invocation.operation_ref,
                 run_ref=corrected.run_ref, attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref,
                 unit_kind="bundle_review")
             ar.record_stage_provider_hard_ceiling(unit_ref=unit_ref, run_ref=corrected.run_ref,
@@ -208,7 +208,7 @@ def test_first_replacement_rolling_failure_continues_the_authenticated_native(tm
                 {"ref": target.target_ref}).scalar_one() <= 1
         if correction_hops > 1:
             ar.begin_provider_unit(unit_ref="new-native-unavailable-unit",
-                operation_ref=corrected.review_invocation.operation_ref, run_ref=corrected.run_ref,
+                operation_ref=corrected.primary_invocation.operation_ref, run_ref=corrected.run_ref,
                 attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref, unit_kind="bundle_review")
             ar.record_stage_provider_hard_ceiling(unit_ref="new-native-unavailable-unit", run_ref=corrected.run_ref,
                 attempt_ref=corrected.attempt_ref, fence_ref=corrected.fence_ref,
@@ -252,7 +252,7 @@ def test_unbound_replacement_without_authenticated_native_keeps_the_original_ope
     try:
         graph, _target, old, _, _ = _ready_launch(runtime)
         ar = runtime.owners.agent_runtime
-        ar.begin_provider_unit(unit_ref="initial-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
+        ar.begin_provider_unit(unit_ref="initial-unavailable-unit", operation_ref=old.primary_invocation.operation_ref,
             run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
         ar.record_stage_provider_hard_ceiling(unit_ref="initial-unavailable-unit", run_ref=old.run_ref,
             attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
@@ -295,7 +295,7 @@ def _owner_closure_replacement(runtime):
             break
     assert graph.strategy_complete and graph.graph_ref == graph_ref
     old = ar.query_bundle_stage_run(request_ref)
-    ar.begin_provider_unit(unit_ref="owner-closure-unavailable-unit", operation_ref=old.review_invocation.operation_ref,
+    ar.begin_provider_unit(unit_ref="owner-closure-unavailable-unit", operation_ref=old.primary_invocation.operation_ref,
         run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
     ar.record_stage_provider_hard_ceiling(unit_ref="owner-closure-unavailable-unit", run_ref=old.run_ref,
         attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
@@ -371,7 +371,7 @@ def test_real_target_terminal_published_after_bundle_isolation_closes_without_ne
         def publish_after_real_bundle_isolation(**values):
             request_ref = runtime.bundle_stage.query_current()["stage_run_request"]["request_ref"]
             old = ar.query_bundle_stage_run(request_ref)
-            ar.begin_provider_unit(unit_ref="late-target-bundle-unavailable", operation_ref=old.review_invocation.operation_ref,
+            ar.begin_provider_unit(unit_ref="late-target-bundle-unavailable", operation_ref=old.primary_invocation.operation_ref,
                 run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
             ar.record_stage_provider_hard_ceiling(unit_ref="late-target-bundle-unavailable", run_ref=old.run_ref,
                 attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, failure_code="codex_native_session_unavailable",
@@ -419,7 +419,7 @@ def _change_owner_report_qualification(runtime, old, current, damage):
     ar = runtime.owners.agent_runtime
     if damage == "active-unit":
         ar.begin_provider_unit(unit_ref="owner-closure-new-active-unit",
-            operation_ref=current.review_invocation.operation_ref, run_ref=current.run_ref,
+            operation_ref=current.primary_invocation.operation_ref, run_ref=current.run_ref,
             attempt_ref=current.attempt_ref, fence_ref=current.fence_ref, unit_kind="bundle_review")
     elif damage == "pending-human-request":
         from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
@@ -527,7 +527,7 @@ def test_accepted_graph_continues_same_native_after_public_provider_correction(t
     try:
         graph, target, old, _decision, _launch = _ready_launch(runtime)
         ar, rg = runtime.owners.agent_runtime, runtime.owners.research_graph
-        invocation = old.review_invocation
+        invocation = old.primary_invocation
         unit_ref = "bundle-terminal-turn-unit"
         ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=invocation.operation_ref,
             run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
@@ -596,7 +596,7 @@ def test_historical_execution_uses_only_the_same_root_native_replacement_proof(t
     try:
         graph, _target, old, _decision, _launch = _ready_launch(runtime)
         ar = runtime.owners.agent_runtime
-        invocation = old.review_invocation
+        invocation = old.primary_invocation
         unit_ref = "bundle-historical-native-missing-unit"
         ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=invocation.operation_ref,
             run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")
@@ -649,7 +649,7 @@ def test_coordinator_replaces_unavailable_rolling_session_without_readmitting_gr
     try:
         graph, target, old, _decision, _launch = _ready_launch(runtime)
         ar, rg, database = runtime.owners.agent_runtime, runtime.owners.research_graph, runtime._database
-        invocation = old.review_invocation
+        invocation = old.primary_invocation
         unit_ref = "bundle-native-missing-unit"
         ar.begin_provider_unit(unit_ref=unit_ref, operation_ref=invocation.operation_ref,
             run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref, unit_kind="bundle_review")

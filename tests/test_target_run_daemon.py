@@ -105,7 +105,7 @@ def test_admitted_target_frontier_survives_bundle_provider_correction(
         unit_ref = "bundle-review-after-launch-correction"
         owner.begin_provider_unit(
             unit_ref=unit_ref,
-            operation_ref=original.review_invocation.operation_ref,
+            operation_ref=original.primary_invocation.operation_ref,
             run_ref=original.run_ref,
             attempt_ref=original.attempt_ref,
             fence_ref=original.fence_ref,
@@ -196,7 +196,7 @@ def test_admitted_target_frontier_survives_bundle_daemon_recovery(
         assert original is not None
         owner.begin_provider_unit(
             unit_ref="bundle-review-inflight-before-restart",
-            operation_ref=original.review_invocation.operation_ref,
+            operation_ref=original.primary_invocation.operation_ref,
             run_ref=original.run_ref,
             attempt_ref=original.attempt_ref,
             fence_ref=original.fence_ref,

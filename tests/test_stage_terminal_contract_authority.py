@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -92,9 +93,16 @@ def _active_stage_unit(tmp_path: Path, *, stage: str, phase: str):
                 ),
                 {"stage": stage, "run_ref": run.run_ref},
             )
-    invocation = (
-        run.primary_invocation if phase == "primary" else run.review_invocation
-    )
+    invocation = run.primary_invocation
+    if phase == "review":
+        # These units represent actual later Bundle/Reasoning provider work,
+        # with distinct physical identities and no placeholder invocation row.
+        assert stage in {"bundle", "reasoning"}
+        job_ref = invocation.operation_ref + ":continuation"
+        invocation = SimpleNamespace(
+            invocation_ref="provider_unit_" + canonical_hash({"run": run.run_ref, "job": job_ref})[:64],
+            operation_ref=job_ref,
+        )
     runtime.owners.agent_runtime.begin_provider_unit(
         unit_ref=invocation.invocation_ref,
         operation_ref=invocation.operation_ref,
@@ -106,8 +114,10 @@ def _active_stage_unit(tmp_path: Path, *, stage: str, phase: str):
     return runtime, run, invocation.invocation_ref
 
 
-@pytest.mark.parametrize("stage", ("idea", "plan", "bundle", "reasoning"))
-@pytest.mark.parametrize("phase", ("primary", "review"))
+@pytest.mark.parametrize("stage,phase", (
+    ("idea", "primary"), ("plan", "primary"), ("bundle", "primary"),
+    ("reasoning", "primary"), ("bundle", "review"), ("reasoning", "review"),
+))
 def test_owner_accepts_only_the_stage_phase_result_contract_code(
     tmp_path: Path,
     stage: str,
@@ -133,47 +143,49 @@ def test_owner_accepts_only_the_stage_phase_result_contract_code(
 
         managed = runtime.owners.agent_runtime.query_managed_run(run.run_ref)
         assert managed is not None
-        assert managed["status"] == "suspended_fenced"
-        assert managed["terminal_reason"] == failure_code
-        assert managed["safe_point"]["checkpoint"]["provider_exit"] == (
-            _provider_evidence(
-                failure_code=failure_code,
-                detail_code=detail_code,
-            )
-        )
+        # Completed contract failures enter the existing correction path;
+        # physical ceilings alone suspend. Verify the retained original proof
+        # and fresh fence instead of expecting the retired suspension shape.
+        assert managed["status"] == "running"
+        assert managed["attempt_ref"] != run.attempt_ref
+        assert managed["fence_ref"] != run.fence_ref
+        feedback = runtime.owners.agent_runtime.query_stage_provider_correction_feedback(
+            run_ref=run.run_ref, attempt_ref=managed["attempt_ref"], fence_ref=managed["fence_ref"])
+        assert feedback["failure_code"] == failure_code
+        assert feedback["detail_code"] == detail_code
+        assert feedback["provider_unit_ref"] == unit_ref
+        with runtime._database.read() as connection:
+            import json
+            checkpoint = json.loads(connection.execute(text(
+                "SELECT checkpoint_json FROM ar_safe_points WHERE safe_point_ref=:ref"
+            ), {"ref": feedback["safe_point_ref"]}).scalar_one())
+        assert checkpoint["provider_exit"] == _provider_evidence(
+            failure_code=failure_code, detail_code=detail_code)
+        with pytest.raises(OwnerConflict):
+            runtime.owners.agent_runtime.record_stage_provider_hard_ceiling(
+                unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref, failure_code=failure_code,
+                provider_exit=_provider_evidence(failure_code=failure_code, detail_code=detail_code))
     finally:
         runtime.close()
 
 
-def test_owner_accepts_primary_phase_and_review_child_trace_contract_codes(
-    tmp_path: Path,
-) -> None:
-    accepted = (
-        ("idea", "primary", "codex_primary_review_phase_invalid"),
-        *(
-            ("idea", "review", code)
-            for code in _SHARED_CHILD_TRACE_FAILURES
-        ),
-        ("bundle", "review", "codex_child_review_trace_invalid"),
-    )
-    for index, (stage, phase, failure_code) in enumerate(accepted):
-        runtime, run, unit_ref = _active_stage_unit(
-            tmp_path / str(index), stage=stage, phase=phase
-        )
-        try:
-            runtime.owners.agent_runtime.record_stage_provider_hard_ceiling(
-                unit_ref=unit_ref,
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
+@pytest.mark.parametrize("failure_code", _SHARED_CHILD_TRACE_FAILURES)
+def test_retired_local_review_codes_cannot_authorize_provider_failure(tmp_path, failure_code):
+    runtime, run, unit_ref = _active_stage_unit(tmp_path, stage="idea", phase="primary")
+    try:
+        owner = runtime.owners.agent_runtime
+        before = owner.query_managed_run(run.run_ref)
+        with pytest.raises(OwnerConflict, match="stage_provider_hard_ceiling_invalid"):
+            owner.record_stage_provider_hard_ceiling(
+                unit_ref=unit_ref, run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
                 failure_code=failure_code,
                 provider_exit=_provider_evidence(failure_code=failure_code),
             )
-            managed = runtime.owners.agent_runtime.query_managed_run(run.run_ref)
-            assert managed is not None
-            assert managed["terminal_reason"] == failure_code
-        finally:
-            runtime.close()
+        assert owner.query_managed_run(run.run_ref) == before
+    finally:
+        runtime.close()
 
 
 @pytest.mark.parametrize(
@@ -310,10 +322,10 @@ def test_terminal_contract_rejects_invalid_detail_without_mutation(
     invalid_detail_code: str | None,
 ) -> None:
     runtime, run, unit_ref = _active_stage_unit(
-        tmp_path, stage="plan", phase="review"
+        tmp_path, stage="plan", phase="primary"
     )
     owner = runtime.owners.agent_runtime
-    failure_code = "plan_review_result_contract_invalid"
+    failure_code = "plan_primary_result_contract_invalid"
     before = owner.query_managed_run(run.run_ref)
     assert before is not None
     evidence = _provider_evidence(failure_code=failure_code)

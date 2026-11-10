@@ -362,9 +362,9 @@ def test_inactive_question_guidance_waits_for_its_work_and_history_scope_survive
             return replace(super().generate_draft(request),
                 primary_session_ref="scoped-native-" + request.run_ref)
 
-        def review_draft(self, request, draft):
+        def finalize_draft(self, request, draft):
             consume(self.runtime.owners.human_collaboration, self.operation(request, "review"))
-            return super().review_draft(request, draft)
+            return super().finalize_draft(request, draft)
 
     provider = Idea()
     plan = Plan(no_gap=False)

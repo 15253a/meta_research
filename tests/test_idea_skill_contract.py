@@ -1310,6 +1310,25 @@ class _MultipleNativeSessionRunner(_SequenceRunner):
         )
 
 
+@pytest.fixture(autouse=True)
+def _controlled_provider_entry(tmp_path, monkeypatch):
+    """Resolve a real, hashable entry point without requiring a host CLI install.
+
+    The existing runners control model output; manifest/transport validation
+    still executes against this actual executable file.
+    """
+    entry_dir = tmp_path / "provider-entry"
+    entry_dir.mkdir()
+    entry = entry_dir / "codex"
+    entry.write_text(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex 0.156.1'; "
+        "elif [ \"$1\" = \"features\" ]; then echo 'multi_agent stable true'; "
+        "else exit 91; fi\n", encoding="utf-8",
+    )
+    entry.chmod(0o700)
+    monkeypatch.setenv("PATH", str(entry_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+
 def _fake_codex_executable(
     path: Path,
     *,
@@ -1676,7 +1695,7 @@ def test_codex_0147_lossy_stdout_does_not_gate_public_review_result(
         adapter_kind="codex_cli",
     )
 
-    result = adapter.review_draft(request, draft)
+    result = adapter.finalize_draft(request, draft)
 
     assert result.reviewer_agent_ref is None
     assert result.primary_session_ref == runner.root_session_ref
@@ -1719,11 +1738,11 @@ def test_durable_review_recovery_does_not_require_child_trace(
         native_session_ref=draft.primary_session_ref,
     )
 
-    first_result = first.review_draft(review_request, draft)
+    first_result = first.finalize_draft(review_request, draft)
 
     no_replay = _SequenceRunner([])
     restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
-    recovered = restarted.review_draft(review_request, draft)
+    recovered = restarted.finalize_draft(review_request, draft)
 
     assert recovered.final_outcome == first_result.final_outcome
     assert no_replay.calls == []
@@ -1802,11 +1821,11 @@ def test_durable_review_without_spawn_trace_replays_public_result(
         native_session_ref=draft.primary_session_ref,
     )
 
-    first_result = first.review_draft(review_request, draft)
+    first_result = first.finalize_draft(review_request, draft)
 
     no_replay = _SequenceRunner([])
     restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
-    recovered = restarted.review_draft(review_request, draft)
+    recovered = restarted.finalize_draft(review_request, draft)
 
     assert recovered.final_outcome == first_result.final_outcome
     assert no_replay.calls == []
@@ -1920,11 +1939,11 @@ def test_production_adapter_reconciles_each_durable_provider_phase(
         native_session_ref=draft.primary_session_ref,
         job_ref="idea-review-operation:stable",
     )
-    result = first.review_draft(review_request, draft)
+    result = first.finalize_draft(review_request, draft)
     assert result.final_outcome == draft.draft
     assert len(first_runner.calls) == 1
 
-    recovered_result = restarted.review_draft(review_request, recovered_draft)
+    recovered_result = restarted.finalize_draft(review_request, recovered_draft)
     assert recovered_result == result
     assert response_lost_runner.calls == []
 

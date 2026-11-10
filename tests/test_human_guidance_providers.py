@@ -118,9 +118,9 @@ class _IdeaTransport(CodexIdeaSkillAdapter):
         _shared_call(self, request, "primary")
         return _DeterministicIdeaSkill().generate_draft(request)
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         _shared_call(self, request, "review")
-        return _DeterministicIdeaSkill().review_draft(request, draft)
+        return _DeterministicIdeaSkill().finalize_draft(request, draft)
 
 
 class _PlanTransport(CodexPlanSkillAdapter):
@@ -128,9 +128,9 @@ class _PlanTransport(CodexPlanSkillAdapter):
         _shared_call(self, request, "primary")
         return _DeterministicPlanSkill(no_gap=False).generate_draft(request)
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         _shared_call(self, request, "review")
-        return _DeterministicPlanSkill(no_gap=False).review_draft(request, draft)
+        return _DeterministicPlanSkill(no_gap=False).finalize_draft(request, draft)
 
 
 class _BundleTransport(CodexBundleSkillAdapter):
@@ -146,8 +146,8 @@ class _BundleTransport(CodexBundleSkillAdapter):
         self.call(request, "primary")
         return _DeterministicBundleSkill().generate_draft(request)
 
-    def review_draft(self, request, draft):
-        return _DeterministicBundleSkill().review_draft(request, draft)
+    def finalize_draft(self, request, draft):
+        return _DeterministicBundleSkill().finalize_draft(request, draft)
 
     def schedule_target(self, request):
         self.call(request, f"dispatch-{request.generation}")
@@ -169,9 +169,9 @@ class _ReasoningTransport(CodexReasoningSkillAdapter):
         self.call(request, "primary")
         return _DeterministicReasoningSkill().generate_draft(request)
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.call(request, "review")
-        return _DeterministicReasoningSkill().review_draft(request, draft)
+        return _DeterministicReasoningSkill().finalize_draft(request, draft)
 
 
 def _adapter(adapter_type, tmp_path):

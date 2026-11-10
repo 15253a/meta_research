@@ -463,12 +463,8 @@ class ReasoningStageWorker:
             self._transient_error = "reasoning_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
 
-        invocation = (
-            run.primary_invocation
-            if run.primary_draft is None
-            else run.review_invocation
-        )
-        phase = "primary" if run.primary_draft is None else "review"
+        invocation = run.primary_invocation
+        phase = "primary"
         base_job_ref = invocation.operation_ref
         job_ref = self._agent_runtime.root_provider_continuation_job_ref(
             root_kind="reasoning",
@@ -639,223 +635,127 @@ class ReasoningStageWorker:
             primary_session_ref=checkpoint.native_session_ref,
             adapter_kind=checkpoint.adapter_kind,
         )
-        try:
-            self._agent_runtime.begin_provider_unit(
-                unit_ref=unit_ref,
-                operation_ref=job_ref,
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                unit_kind="reasoning_review",
-            )
-        except OwnerConflict as error:
-            self._transient_error = error.code
-            return _CycleStep(False, provider_boundary_attempted=True)
-        provider_safe = True
         result = None
         try:
-            try:
-                operation = self._freeze_completion_operation(
-                    run, job_ref, "review", unit_ref
+            operation = (None if self._human_guidance is None else StageGuidanceOperation(
+                GuidanceRuntimeScope("reasoning", run.run_ref, run.attempt_ref,
+                    run.root_session_ref, run.fence_ref, run.runtime_binding_hash),
+                job_ref, "primary", run.primary_invocation.invocation_ref,
+            ))
+            result = provider.finalize_draft(skill_request, draft)
+            result = _assemble_provider_result(skill_request, result)
+            if isinstance(result, ReasoningAutonomousCheckpointResult):
+                (
+                    checkpoint_hash,
+                    _scientific_outcome_hash,
+                    _autonomous_scope_hash,
+                    review_hash,
+                ) = validate_reasoning_autonomous_checkpoint_result(
+                    skill_request, draft, result
                 )
-                result = provider.review_draft(skill_request, draft)
-                result = _assemble_provider_result(skill_request, result)
-                if isinstance(result, ReasoningAutonomousCheckpointResult):
-                    (
-                        checkpoint_hash,
-                        _scientific_outcome_hash,
-                        _autonomous_scope_hash,
-                        review_hash,
-                    ) = validate_reasoning_autonomous_checkpoint_result(
-                        skill_request, draft, result
-                    )
-                    if self._agent_runtime.park_root_provider_session_for_human_request(
-                        root_kind="reasoning",
-                        phase="review",
+                recorded = (
+                    self._agent_runtime.record_reasoning_autonomous_checkpoint(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
                         fence_ref=run.fence_ref,
                         native_session_ref=result.primary_session_ref,
-                        runtime_binding_hash=run.runtime_binding_hash,
-                    ):
-                        self._finish_provider_job(job_ref)
-                        self._transient_error = None
-                        return _CycleStep(
-                            True, provider_boundary_attempted=True
-                        )
-                    recorded = (
-                        self._agent_runtime.record_reasoning_autonomous_checkpoint(
-                            run_ref=run.run_ref,
-                            attempt_ref=run.attempt_ref,
-                            fence_ref=run.fence_ref,
-                            native_session_ref=result.primary_session_ref,
-                            runtime_binding=run.runtime_binding,
-                            checkpoint=result.reviewed_checkpoint,
-                            review=result.review_document(),
-                            idempotency_key=_operation_key(
-                                "reasoning-autonomous-checkpoint",
-                                run.run_ref,
-                                run.attempt_ref,
-                            ),
-                        )
+                        runtime_binding=run.runtime_binding,
+                        checkpoint=result.reviewed_checkpoint,
+                        review=result.review_document(),
+                        idempotency_key=_operation_key(
+                            "reasoning-autonomous-checkpoint",
+                            run.run_ref,
+                            run.attempt_ref,
+                        ),
                     )
-                    if (
-                        recorded.checkpoint_hash != checkpoint_hash
-                        or recorded.review_hash != review_hash
-                    ):
-                        raise OwnerConflict(
-                            "reasoning_autonomous_checkpoint_material_mismatch"
-                        )
-                    self._transient_error = None
-                    return _CycleStep(True, provider_boundary_attempted=True)
-                (
-                    draft_hash,
-                    final_output_hash,
-                    _scientific_outcome_hash,
-                    _transition_hash,
-                    review_hash,
-                ) = validate_reasoning_skill_result(skill_request, result)
-            except ReasoningSkillUnavailable as error:
-                review_session_ref = (
-                    error.native_session_ref or run.native_session_ref
                 )
                 if (
-                    review_session_ref is not None
-                    and self._agent_runtime.park_root_provider_session_for_human_request(
-                        root_kind="reasoning",
-                        phase="review",
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        native_session_ref=review_session_ref,
-                        runtime_binding_hash=run.runtime_binding_hash,
-                    )
+                    recorded.checkpoint_hash != checkpoint_hash
+                    or recorded.review_hash != review_hash
                 ):
-                    self._finish_provider_job(job_ref)
-                    self._transient_error = None
-                    return _CycleStep(True, provider_boundary_attempted=True)
-                if error.rejected_candidate is not None:
-                    if (
-                        error.rejected_native_session_ref is None
-                        or error.rejected_detail_code is None
-                    ):
-                        raise OwnerConflict("stage_completion_rejection_invalid")
-                    self._reject_completion_candidate(
-                        unit_ref=unit_ref,
-                        run=run,
-                        operation_name="review",
-                        native_session_ref=error.rejected_native_session_ref,
-                        candidate=error.rejected_candidate,
-                        failure_code=error.code,
-                        detail_code=error.rejected_detail_code,
-                        feedback=error.rejected_feedback,
+                    raise OwnerConflict(
+                        "reasoning_autonomous_checkpoint_material_mismatch"
                     )
-                    provider_safe = False
-                    self._transient_error = error.code
-                    return _CycleStep(True, provider_boundary_attempted=True)
-                if error.code == "codex_operation_reconciliation_pending":
-                    provider_safe = False
-                elif error.recovery_checkpoint is not None:
-                    provider_safe = False
-                    self._agent_runtime.record_stage_provider_hard_ceiling(
-                        unit_ref=unit_ref,
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        failure_code=error.code,
-                        provider_exit=error.recovery_checkpoint,
-                    )
-                self._transient_error = error.code
-                return _CycleStep(False, provider_boundary_attempted=True)
-            except RecoverableReasoningSkillCandidateError as error:
-                if result is None:
-                    self._transient_error = str(error)
-                    return _CycleStep(False, provider_boundary_attempted=True)
-                if self._agent_runtime.park_root_provider_session_for_human_request(
-                    root_kind="reasoning",
-                    phase="review",
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    native_session_ref=result.primary_session_ref,
-                    runtime_binding_hash=run.runtime_binding_hash,
-                ):
-                    self._finish_provider_job(job_ref)
-                    self._transient_error = None
-                    return _CycleStep(True, provider_boundary_attempted=True)
-                failure_code = "reasoning_review_result_contract_invalid"
-                self._reject_completion_candidate(
-                    unit_ref=unit_ref,
-                    run=run,
-                    operation_name="review",
-                    native_session_ref=result.primary_session_ref,
-                    candidate=asdict(result),
-                    failure_code=failure_code,
-                    detail_code=error.diagnostic,
-                )
-                provider_safe = False
-                self._transient_error = failure_code
-                return _CycleStep(True, provider_boundary_attempted=True)
-            except ReasoningSkillContractError as error:
-                self._transient_error = str(error)
-                return _CycleStep(False, provider_boundary_attempted=True)
-            if self._agent_runtime.park_root_provider_session_for_human_request(
-                root_kind="reasoning",
-                phase="review",
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                native_session_ref=result.primary_session_ref,
-                runtime_binding_hash=run.runtime_binding_hash,
-            ):
-                self._finish_provider_job(job_ref)
                 self._transient_error = None
-                return _CycleStep(True, provider_boundary_attempted=True)
-            review = result.review_document()
-            submission_ref = "reasoning_submission_" + canonical_hash(
-                {
-                    "request_ref": request.request_ref,
-                    "attempt_ref": run.attempt_ref,
-                    "fence_ref": run.fence_ref,
-                    "final_output_hash": final_output_hash,
-                    "review_hash": review_hash,
-                }
-            )[:32]
-            self._bind_completion_conditions(
-                operation, submission_ref, result.outcome_document(),
-                result.reviewed_draft, review,
-            )
-            execution = self._agent_runtime.record_reasoning_attempt_execution(
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                submission_ref=submission_ref,
-                native_session_ref=result.primary_session_ref,
-                runtime_binding=run.runtime_binding,
-                outcome=result.outcome_document(),
-                reviewed_draft=result.reviewed_draft,
-                review=review,
-                idempotency_key=_operation_key(
-                    "reasoning-execute", run.run_ref, run.attempt_ref
-                ),
-            )
-            if canonical_hash(execution.outcome) != final_output_hash or (
-                canonical_hash(execution.reviewed_draft) != draft_hash
-            ):
-                raise OwnerConflict("reasoning_execution_material_mismatch")
-            self._transient_error = None
-            finish_job = getattr(self._provider, "finish_job", None)
-            if callable(finish_job):
-                finish_job(job_ref)
-            return _CycleStep(True, provider_boundary_attempted=True)
-        finally:
-            if provider_safe:
-                self._agent_runtime.acknowledge_provider_safe_point(
-                    unit_ref=unit_ref,
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
+                return _CycleStep(True, provider_boundary_attempted=False)
+            (
+                draft_hash,
+                final_output_hash,
+                _scientific_outcome_hash,
+                _transition_hash,
+                review_hash,
+            ) = validate_reasoning_skill_result(skill_request, result)
+        except ReasoningSkillUnavailable as error:
+            if error.rejected_candidate is not None:
+                if error.rejected_native_session_ref is None or error.rejected_detail_code is None:
+                    raise OwnerConflict("stage_completion_rejection_invalid")
+                self._reject_completion_candidate(
+                    unit_ref=run.primary_invocation.invocation_ref, run=run,
+                    operation_name="local", native_session_ref=error.rejected_native_session_ref,
+                    candidate=error.rejected_candidate,
+                    failure_code="reasoning_local_result_contract_invalid",
+                    detail_code=error.rejected_detail_code,
                 )
+                self._transient_error = "reasoning_local_result_contract_invalid"
+                return _CycleStep(True)
+            self._transient_error = error.code
+            return _CycleStep(False)
+        except RecoverableReasoningSkillCandidateError as error:
+            if result is None:
+                self._transient_error = str(error)
+                return _CycleStep(False, provider_boundary_attempted=False)
+            failure_code = "reasoning_local_result_contract_invalid"
+            self._reject_completion_candidate(
+                unit_ref=unit_ref,
+                run=run,
+                operation_name="local",
+                native_session_ref=result.primary_session_ref,
+                candidate=asdict(result),
+                failure_code=failure_code,
+                detail_code=error.diagnostic,
+            )
+            self._transient_error = failure_code
+            return _CycleStep(True, provider_boundary_attempted=False)
+        except ReasoningSkillContractError as error:
+            self._transient_error = str(error)
+            return _CycleStep(False, provider_boundary_attempted=False)
+        review = result.review_document()
+        submission_ref = "reasoning_submission_" + canonical_hash(
+            {
+                "request_ref": request.request_ref,
+                "attempt_ref": run.attempt_ref,
+                "fence_ref": run.fence_ref,
+                "final_output_hash": final_output_hash,
+                "review_hash": review_hash,
+            }
+        )[:32]
+        self._bind_completion_conditions(
+            operation, submission_ref, result.outcome_document(),
+            result.reviewed_draft, review,
+        )
+        execution = self._agent_runtime.record_reasoning_attempt_execution(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            submission_ref=submission_ref,
+            native_session_ref=result.primary_session_ref,
+            runtime_binding=run.runtime_binding,
+            outcome=result.outcome_document(),
+            reviewed_draft=result.reviewed_draft,
+            review=review,
+            idempotency_key=_operation_key(
+                "reasoning-execute", run.run_ref, run.attempt_ref
+            ),
+        )
+        if canonical_hash(execution.outcome) != final_output_hash or (
+            canonical_hash(execution.reviewed_draft) != draft_hash
+        ):
+            raise OwnerConflict("reasoning_execution_material_mismatch")
+        self._transient_error = None
+        finish_job = getattr(self._provider, "finish_job", None)
+        if callable(finish_job):
+            finish_job(job_ref)
+        return _CycleStep(True, provider_boundary_attempted=False)
 
     def _skill_request(
         self,
@@ -1037,7 +937,7 @@ class ReasoningStageWorker:
         if not reasoning_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "reasoning_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
-        invocation = run.review_invocation
+        invocation = run.primary_invocation
         base_job_ref = invocation.operation_ref + ":creation-final"
         skill_request = self._continuation_skill_request(request, run, phase="creation-final", base_job_ref=base_job_ref)
         job_ref = skill_request.job_ref
@@ -1286,8 +1186,13 @@ class ReasoningStageWorker:
                 "The complete diagnostic is retained in this candidate and "
                 "will be delivered with the correction request.",
             )
-        self._agent_runtime.reject_stage_completion_candidate(
-            unit_ref=unit_ref,
+        reject = (self._agent_runtime.reject_stage_local_candidate
+                  if operation_name == "local" else self._agent_runtime.reject_stage_completion_candidate)
+        source = ({"primary_draft_hash": run.primary_draft.draft_hash}
+                  if operation_name == "local" else {})
+        reject(
+            **source,
+            unit_ref=run.primary_invocation.invocation_ref if operation_name == "local" else unit_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,

@@ -380,7 +380,7 @@ class _DeterministicBundleSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: BundleSkillRequest, draft: BundleSkillDraft
     ) -> BundleSkillResult:
         return BundleSkillResult(
@@ -396,7 +396,7 @@ class _DeterministicBundleSkill:
 
     def execute(self, request: BundleSkillRequest) -> BundleSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(request, draft)
+        return self.finalize_draft(request, draft)
 
     def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         selected = (
@@ -1042,7 +1042,7 @@ def _assert_public_bundle_execution(current: dict[str, object]) -> dict[str, obj
     assert run["status"] == "awaiting_acceptance"
     assert run["primary_draft_checkpoint"]["status"] == "recorded"
     assert run["provider_operations"]["primary"]["status"] == "completed"
-    assert run["provider_operations"]["review"]["status"] == "prepared"
+    assert set(run["provider_operations"]) == {"primary"}
     assert run["attempt_execution_receipt"]["status"] == "accepted"
     assert current["target_graph"]["status"] == "not_attempted"
     assert current["stage_commit"] is None
@@ -1586,10 +1586,12 @@ def test_formal_target_graph_fails_closed_without_owner_proof_verifier(
         _finish_idea_stage(runtime)
         _finish_plan_stage(runtime)
         for _step in range(8):
-            try:
-                runtime.bundle_stage.process_once()
-            except OwnerConflict as error:
-                assert error.code == "target_candidate_owner_proof_unverified"
+            runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            rejection = current["target_graph"].get("rejection")
+            if rejection is not None:
+                assert rejection["code"] == "target_candidate_owner_proof_unverified"
+                assert rejection["receipt"]["issuer"] == "research_graph"
                 break
         else:
             raise AssertionError("Formal candidate was not rejected fail-closed")
@@ -2077,7 +2079,7 @@ def test_bundle_dispatch_is_fail_closed_until_runtime_protection_is_confirmed(
         assert waiting == [
             {
                 "responsibility_ref": waiting[0]["responsibility_ref"],
-                "operation_ref": run.review_invocation.operation_ref,
+                "operation_ref": run.primary_invocation.operation_ref,
                 "effect_kind": "provider_unit",
                 "reason": {"code": "power_inhibitor_acquisition_failed"},
             }
@@ -2088,7 +2090,7 @@ def test_bundle_dispatch_is_fail_closed_until_runtime_protection_is_confirmed(
         assert len(provider.schedule_requests) == 1
         assert (
             provider.schedule_requests[0].job_ref
-            == run.review_invocation.operation_ref
+            == run.primary_invocation.operation_ref
         )
         assert len(
             runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
@@ -2206,7 +2208,7 @@ def test_bundle_dispatch_restart_reuses_job_and_reconciles_committed_boundary(
             raise AssertionError("Bundle dispatch did not reach the finish boundary")
 
         assert len(provider.schedule_requests) == 1
-        stable_job_ref = run.review_invocation.operation_ref
+        stable_job_ref = run.primary_invocation.operation_ref
         assert provider.schedule_requests[0].job_ref == stable_job_ref
         assert len(runtime.query_runtime_observability()["responsibilities"]) == 1
     finally:
@@ -2222,7 +2224,7 @@ def test_bundle_dispatch_restart_reuses_job_and_reconciles_committed_boundary(
             request_ref
         )
         assert recovered_run is not None
-        assert recovered_run.review_invocation.operation_ref == stable_job_ref
+        assert recovered_run.primary_invocation.operation_ref == stable_job_ref
         for _step in range(6):
             changed = restarted.bundle_stage.process_once()
             if (
@@ -2280,7 +2282,7 @@ def test_bundle_dispatch_restart_does_not_ack_unknown_turn_as_completed_review(
             raise AssertionError("Bundle dispatch did not enter unknown outcome")
 
         assert len(provider.schedule_requests) == 1
-        stable_job_ref = run.review_invocation.operation_ref
+        stable_job_ref = run.primary_invocation.operation_ref
         assert provider.schedule_requests[0].job_ref == stable_job_ref
         with runtime._database.read() as connection:
             old_unit = connection.execute(
@@ -2292,9 +2294,9 @@ def test_bundle_dispatch_restart_does_not_ack_unknown_turn_as_completed_review(
                 {"run_ref": run.run_ref},
             ).one()
         assert old_unit.operation_ref == stable_job_ref
-        assert old_unit.unit_ref != run.review_invocation.invocation_ref
+        assert old_unit.unit_ref != run.primary_invocation.invocation_ref
         old_attempt_ref = run.attempt_ref
-        old_invocation_ref = run.review_invocation.invocation_ref
+        old_invocation_ref = run.primary_invocation.invocation_ref
     finally:
         runtime.close()
 
@@ -2307,8 +2309,8 @@ def test_bundle_dispatch_restart_does_not_ack_unknown_turn_as_completed_review(
         recovered = restarted.owners.agent_runtime.query_bundle_stage_run(request_ref)
         assert recovered is not None
         assert recovered.attempt_ref != old_attempt_ref
-        assert recovered.review_invocation.invocation_ref != old_invocation_ref
-        assert recovered.review_invocation.operation_ref == stable_job_ref
+        assert recovered.primary_invocation.invocation_ref != old_invocation_ref
+        assert recovered.primary_invocation.operation_ref == stable_job_ref
         with restarted._database.read() as connection:
             persisted_old_unit = connection.execute(
                 text(
@@ -2372,7 +2374,7 @@ def test_bundle_target_batch_is_fail_closed_until_runtime_protection_is_confirme
         assert waiting == [
             {
                 "responsibility_ref": waiting[0]["responsibility_ref"],
-                "operation_ref": run.review_invocation.operation_ref,
+                "operation_ref": run.primary_invocation.operation_ref,
                 "effect_kind": "provider_unit",
                 "reason": {"code": "power_inhibitor_acquisition_failed"},
             }
@@ -2382,7 +2384,7 @@ def test_bundle_target_batch_is_fail_closed_until_runtime_protection_is_confirme
         assert runtime.bundle_stage.process_once()
         assert len(provider.batch_requests) == 1
         assert provider.batch_requests[0].job_ref == (
-            run.review_invocation.operation_ref
+            run.primary_invocation.operation_ref
         )
         assert len(
             runtime.owners.agent_runtime.query_bundle_target_proposals(run.run_ref)
@@ -2432,7 +2434,7 @@ def test_bundle_target_batch_restart_reconciles_committed_owner_proposal(
             )
 
         assert len(provider.batch_requests) == 1
-        stable_job_ref = run.review_invocation.operation_ref
+        stable_job_ref = run.primary_invocation.operation_ref
         assert provider.batch_requests[0].job_ref == stable_job_ref
         assert len(
             runtime.owners.agent_runtime.query_bundle_target_proposals(run.run_ref)
@@ -2451,7 +2453,7 @@ def test_bundle_target_batch_restart_reconciles_committed_owner_proposal(
             request_ref
         )
         assert recovered_run is not None
-        assert recovered_run.review_invocation.operation_ref == stable_job_ref
+        assert recovered_run.primary_invocation.operation_ref == stable_job_ref
         for _step in range(4):
             changed = restarted.bundle_stage.process_once()
             recovered_graph = restarted.owners.research_graph.query_target_graph(

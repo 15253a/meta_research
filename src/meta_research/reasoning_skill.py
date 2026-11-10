@@ -285,7 +285,7 @@ class ReasoningSkillProvider(Protocol):
         self, request: ReasoningSkillRequest
     ) -> ReasoningSkillDraft: ...
 
-    def review_draft(
+    def finalize_draft(
         self, request: ReasoningSkillRequest, draft: ReasoningSkillDraft
     ) -> ReasoningSkillResult | ReasoningAutonomousCheckpointResult: ...
 
@@ -890,7 +890,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
     def _transport_contract_failure_code(self, operation_name: str) -> str:
         if operation_name == "primary":
             return "reasoning_primary_result_contract_invalid"
-        if operation_name in {"review", "autonomous-resume"}:
+        if operation_name == "autonomous-resume":
             return "reasoning_review_result_contract_invalid"
         raise ReasoningSkillUnavailable("codex_operation_spool_invalid")
 
@@ -1148,11 +1148,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         template = _schema_template_request()
         schemas = {
             "reasoning-primary-output": _reasoning_primary_output_schema(template),
-            "reasoning-review": _reasoning_review_response_schema(
+            "reasoning-autonomous-resume": _reasoning_review_response_schema(
                 template, _reasoning_stage_output_schema(template)
-            ),
-            "reasoning-autonomous-review": _reasoning_review_response_schema(
-                template, _reasoning_autonomous_checkpoint_schema(template)
             ),
         }
         schemas = {
@@ -1340,7 +1337,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         return draft
 
     @resource_preparation
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
@@ -1382,14 +1379,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or completion is not None
             and not isinstance(completion, dict)
         ):
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code="reasoning_review_result_contract_invalid",
-                detail_code="codex_reasoning_review_invalid",
-                rejected_candidate=reviewed,
-            )
+            # This is local validation of the persisted primary candidate.
+            # No review transport exists to reconcile or seal.
+            raise ReasoningContractError("reasoning_review_result_contract_invalid")
         result = ReasoningSkillResult(
             reviewed_draft=draft.draft,
             scientific_outcome=scientific_outcome,
@@ -1525,7 +1517,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
 
     def execute(self, request: ReasoningSkillRequest) -> ReasoningSkillResult:
         draft = self.generate_draft(request)
-        result = self.review_draft(
+        result = self.finalize_draft(
             replace(request, native_session_ref=draft.primary_session_ref),
             draft,
         )

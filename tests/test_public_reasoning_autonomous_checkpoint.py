@@ -321,7 +321,7 @@ def test_reasoning_autonomous_checkpoint_is_current_durable_and_non_terminal(
         assert current.fence_ref == run.fence_ref
         assert current.execution is None
         assert current.completion is None
-        assert current.review_invocation.status == "prepared"
+        assert current.primary_invocation.status == "completed"
 
         after = runtime.owners.agent_runtime.query_snapshot()
         for fact in ("stage_run_count", "attempt_count", "session_count"):
@@ -383,46 +383,32 @@ def test_reasoning_autonomous_checkpoint_is_current_durable_and_non_terminal(
                 receipt=replace(checkpoint.receipt, payload_hash="1" * 64),
             )
 
-        runtime.owners.agent_runtime.begin_provider_unit(
-            unit_ref=current.review_invocation.invocation_ref,
-            operation_ref=current.review_invocation.operation_ref,
-            run_ref=current.run_ref,
-            attempt_ref=current.attempt_ref,
-            fence_ref=current.fence_ref,
-            unit_kind="reasoning_review",
+        job_ref = current.primary_invocation.operation_ref + ":creation-final"
+        unit_ref = "provider_unit_" + canonical_hash({"run_ref": current.run_ref, "job_ref": job_ref})[:64]
+        owner = runtime.owners.agent_runtime
+        owner.begin_provider_unit(
+            unit_ref=unit_ref, operation_ref=job_ref,
+            run_ref=current.run_ref, attempt_ref=current.attempt_ref,
+            fence_ref=current.fence_ref, unit_kind="reasoning_review",
         )
-        rejection = (
-            runtime.owners.agent_runtime.reject_stage_completion_candidate(
-                unit_ref=current.review_invocation.invocation_ref,
-                run_ref=current.run_ref,
-                attempt_ref=current.attempt_ref,
-                fence_ref=current.fence_ref,
-                native_session_ref=primary.native_session_ref,
-                candidate={
-                    "phase": "autonomous-resume",
-                    "result": {"invalid_transition": True},
-                },
-                reason_code="reasoning_review_result_contract_invalid",
-                detail_code="reasoning_transition_invalid",
-                feedback=("Return a valid transition expression.",),
-            )
+        rejected_job = owner.record_reasoning_continuation_rejection(
+            checkpoint_ref=checkpoint.checkpoint_ref, phase="creation-final",
+            unit_ref=unit_ref, run_ref=current.run_ref, attempt_ref=current.attempt_ref,
+            fence_ref=current.fence_ref, native_session_ref=primary.native_session_ref,
+            candidate={"phase": "autonomous-resume", "result": {"invalid_transition": True}},
+            failure_code="reasoning_review_result_contract_invalid",
+            detail_code="reasoning_transition_invalid",
+            feedback=("Return a valid transition expression.",),
         )
-        successor = runtime.owners.agent_runtime.query_reasoning_stage_run(
-            request.request_ref
-        )
-        assert successor is not None
-        assert successor.attempt_generation == 2
-        assert successor.attempt_ref == rejection.successor_attempt_ref
-        assert successor.native_session_ref == current.native_session_ref
-        assert successor.autonomous_checkpoint == checkpoint
-        assert successor.execution is None
-        assert successor.review_invocation.status == "prepared"
-        assert (
-            runtime.owners.agent_runtime.query_reasoning_autonomous_checkpoint(
-                checkpoint.checkpoint_ref
-            )
-            == checkpoint
-        )
+        assert rejected_job == job_ref
+        current_after = owner.query_reasoning_stage_run(request.request_ref)
+        assert current_after.attempt_ref == current.attempt_ref
+        assert current_after.primary_invocation == current.primary_invocation
+        assert current_after.autonomous_checkpoint == checkpoint
+        assert current_after.execution is None
+        rejected = owner.query_reasoning_continuation_rejections(checkpoint.checkpoint_ref, "creation-final")
+        assert len(rejected) == 1 and rejected[0]["job_ref"] == job_ref
+        assert owner.query_reasoning_autonomous_checkpoint(checkpoint.checkpoint_ref) == checkpoint
     finally:
         runtime.close()
 
@@ -484,7 +470,9 @@ def test_reasoning_autonomous_resume_parks_the_exact_human_request_session(
         )
         current = owner.query_reasoning_stage_run(request.request_ref)
         assert current is not None
-        invocation = current.review_invocation
+        from types import SimpleNamespace
+        job_ref = current.primary_invocation.operation_ref + ":creation-final"
+        invocation = SimpleNamespace(operation_ref=job_ref, invocation_ref="provider_unit_" + canonical_hash({"run_ref": current.run_ref, "job_ref": job_ref})[:64])
         owner.begin_provider_unit(
             unit_ref=invocation.invocation_ref,
             operation_ref=invocation.operation_ref,

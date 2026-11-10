@@ -35,7 +35,7 @@ def _pending_final(runtime):
     candidate = runtime.owners.research_memory.query_reasoning_scientific_candidate_by_checkpoint_ref(checkpoint.checkpoint_ref)
     scientific_decision = runtime.owners.research_graph.query_reasoning_scientific_decision_by_outcome_ref(candidate.scientific_outcome_ref)
     assert scientific_decision.decision == 'accepted'
-    job_ref = previous.review_invocation.operation_ref + ":creation-final"
+    job_ref = previous.primary_invocation.operation_ref + ":creation-final"
     unit_ref = "provider_unit_" + canonical_hash({"run_ref": previous.run_ref, "job_ref": job_ref})[:64]
     ar.begin_provider_unit(
         unit_ref=unit_ref, operation_ref=job_ref, run_ref=previous.run_ref,

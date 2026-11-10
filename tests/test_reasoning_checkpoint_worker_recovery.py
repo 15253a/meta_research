@@ -36,7 +36,7 @@ class _RevisingCheckpointProvider:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.calls.append(("review", request))
         # Correct agent behavior: a passed check produces no finding.
         return ReasoningAutonomousCheckpointResult(
@@ -144,9 +144,9 @@ def test_worker_revises_candidate_then_reads_summary_and_accepts_science(setup, 
         assert delivered.predecessor_candidate_ref == expected_predecessor
         assert delivered.job_ref not in {
             initial_run.primary_invocation.operation_ref,
-            initial_run.review_invocation.operation_ref,
+            initial_run.primary_invocation.operation_ref,
         }
-    assert provider.calls[0][1].job_ref != provider.calls[1][1].job_ref
+    assert provider.calls[0][1].job_ref == provider.calls[1][1].job_ref
     assert worker.transient_error is None
     # At the next boundary it waits for autonomous creation, without repeating
     # the prior rejection or starting a third Provider operation.

@@ -144,7 +144,7 @@ class IdeaStageWorker:
 
         if self._agent_runtime.reconcile_pending_provider_cleanup(
             self._provider,
-            unit_kinds=("idea_primary", "idea_review"),
+            unit_kinds=("idea_primary",),
         ):
             return True
         transient_error: str | None = None
@@ -464,12 +464,8 @@ class IdeaStageWorker:
         if runtime_binding != run.runtime_binding:
             self._transient_error = "idea_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
-        invocation = (
-            run.primary_invocation
-            if run.primary_draft is None
-            else run.review_invocation
-        )
-        phase = "primary" if run.primary_draft is None else "review"
+        invocation = run.primary_invocation
+        phase = "primary"
         base_job_ref = invocation.operation_ref
         job_ref = self._agent_runtime.root_provider_continuation_job_ref(
             root_kind="idea",
@@ -672,164 +668,81 @@ class IdeaStageWorker:
             primary_session_ref=checkpoint.native_session_ref,
             adapter_kind=checkpoint.adapter_kind,
         )
-        try:
-            self._agent_runtime.begin_provider_unit(
-                unit_ref=unit_ref,
-                operation_ref=job_ref,
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                unit_kind="idea_review",
-            )
-        except OwnerConflict as error:
-            self._transient_error = error.code
-            return _CycleStep(False, provider_boundary_attempted=True)
-        provider_safe = True
         result = None
         try:
-            try:
-                result = provider.review_draft(skill_request, draft)
-                draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
-                    skill_request,
-                    result,
-                    predecessor_material_outcome_hash=predecessor_hash,
-                )
-            except IdeaSkillUnavailable as error:
-                review_session_ref = (
-                    error.native_session_ref or run.native_session_ref
-                )
-                if (
-                    review_session_ref is not None
-                    and self._agent_runtime.park_root_provider_session_for_human_request(
-                        root_kind="idea",
-                        phase="review",
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        native_session_ref=review_session_ref,
-                        runtime_binding_hash=run.runtime_binding_hash,
-                    )
-                ):
-                    self._finish_provider_job(job_ref)
-                    self._transient_error = None
-                    return _CycleStep(True, provider_boundary_attempted=True)
-                if error.rejected_candidate is not None:
-                    if (
-                        error.rejected_native_session_ref is None
-                        or error.rejected_detail_code is None
-                    ):
-                        raise OwnerConflict("stage_completion_rejection_invalid")
-                    self._reject_completion_candidate(
-                        unit_ref=unit_ref,
-                        run=run,
-                        operation_name="review",
-                        native_session_ref=error.rejected_native_session_ref,
-                        candidate=error.rejected_candidate,
-                        failure_code=error.code,
-                        detail_code=error.rejected_detail_code,
-                    )
-                    provider_safe = False
-                    self._transient_error = error.code
-                    return _CycleStep(True, provider_boundary_attempted=True)
-                if error.code == "codex_operation_reconciliation_pending":
-                    provider_safe = False
-                elif error.recovery_checkpoint is not None:
-                    provider_safe = False
-                    self._agent_runtime.record_stage_provider_hard_ceiling(
-                        unit_ref=unit_ref,
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        failure_code=error.code,
-                        provider_exit=error.recovery_checkpoint,
-                    )
-                self._transient_error = error.code
-                return _CycleStep(False, provider_boundary_attempted=True)
-            except RecoverableIdeaSkillCandidateError as error:
-                if result is None:
-                    self._transient_error = str(error)
-                    return _CycleStep(False, provider_boundary_attempted=True)
-                if self._agent_runtime.park_root_provider_session_for_human_request(
-                    root_kind="idea",
-                    phase="review",
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    native_session_ref=result.primary_session_ref,
-                    runtime_binding_hash=run.runtime_binding_hash,
-                ):
-                    self._finish_provider_job(job_ref)
-                    self._transient_error = None
-                    return _CycleStep(True, provider_boundary_attempted=True)
-                failure_code = "idea_review_result_contract_invalid"
-                self._reject_completion_candidate(
-                    unit_ref=unit_ref,
-                    run=run,
-                    operation_name="review",
-                    native_session_ref=result.primary_session_ref,
-                    candidate=asdict(result),
-                    failure_code=failure_code,
-                    detail_code=str(error),
-                )
-                provider_safe = False
-                self._transient_error = failure_code
-                return _CycleStep(True, provider_boundary_attempted=True)
-            except IdeaSkillContractError as error:
-                self._transient_error = str(error)
-                return _CycleStep(False, provider_boundary_attempted=True)
-            if self._agent_runtime.park_root_provider_session_for_human_request(
-                root_kind="idea",
-                phase="review",
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                native_session_ref=result.primary_session_ref,
-                runtime_binding_hash=run.runtime_binding_hash,
-            ):
-                self._finish_provider_job(job_ref)
-                self._transient_error = None
-                return _CycleStep(True, provider_boundary_attempted=True)
-            review = review_record(
+            result = provider.finalize_draft(skill_request, draft)
+            draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
+                skill_request,
                 result,
-                draft_hash=draft_hash,
-                outcome_hash=outcome_hash,
+                predecessor_material_outcome_hash=predecessor_hash,
             )
-            submission_ref = "idea_submission_" + canonical_hash(
-                {
-                    "request_ref": request.request_ref,
-                    "attempt_ref": run.attempt_ref,
-                    "fence_ref": run.fence_ref,
-                    "outcome_hash": outcome_hash,
-                    "review_hash": canonical_hash(review),
-                }
-            )[:32]
-            self._agent_runtime.record_idea_attempt_execution(
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                submission_ref=submission_ref,
-                native_session_ref=result.primary_session_ref,
-                runtime_binding=run.runtime_binding,
-                outcome=result.final_outcome,
-                reviewed_draft=result.reviewed_draft,
-                review=review,
-                idempotency_key=_operation_key(
-                    "idea-execute", run.run_ref, run.attempt_ref
-                ),
-            )
-            self._transient_error = None
-            finish_job = getattr(self._provider, "finish_job", None)
-            if callable(finish_job):
-                finish_job(job_ref)
-            return _CycleStep(True, provider_boundary_attempted=True)
-        finally:
-            if provider_safe:
-                self._agent_runtime.acknowledge_provider_safe_point(
-                    unit_ref=unit_ref,
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
+        except IdeaSkillUnavailable as error:
+            if error.rejected_candidate is not None:
+                if error.rejected_native_session_ref is None or error.rejected_detail_code is None:
+                    raise OwnerConflict("stage_completion_rejection_invalid")
+                self._reject_completion_candidate(
+                    unit_ref=run.primary_invocation.invocation_ref, run=run,
+                    operation_name="local", native_session_ref=error.rejected_native_session_ref,
+                    candidate=error.rejected_candidate,
+                    failure_code="idea_local_result_contract_invalid",
+                    detail_code=error.rejected_detail_code,
                 )
+                self._transient_error = "idea_local_result_contract_invalid"
+                return _CycleStep(True)
+            self._transient_error = error.code
+            return _CycleStep(False)
+        except RecoverableIdeaSkillCandidateError as error:
+            if result is None:
+                self._transient_error = str(error)
+                return _CycleStep(False, provider_boundary_attempted=False)
+            failure_code = "idea_local_result_contract_invalid"
+            self._reject_completion_candidate(
+                unit_ref=unit_ref,
+                run=run,
+                operation_name="local",
+                native_session_ref=result.primary_session_ref,
+                candidate=asdict(result),
+                failure_code=failure_code,
+                detail_code=str(error),
+            )
+            self._transient_error = failure_code
+            return _CycleStep(True, provider_boundary_attempted=False)
+        except IdeaSkillContractError as error:
+            self._transient_error = str(error)
+            return _CycleStep(False, provider_boundary_attempted=False)
+        review = review_record(
+            result,
+            draft_hash=draft_hash,
+            outcome_hash=outcome_hash,
+        )
+        submission_ref = "idea_submission_" + canonical_hash(
+            {
+                "request_ref": request.request_ref,
+                "attempt_ref": run.attempt_ref,
+                "fence_ref": run.fence_ref,
+                "outcome_hash": outcome_hash,
+                "review_hash": canonical_hash(review),
+            }
+        )[:32]
+        self._agent_runtime.record_idea_attempt_execution(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            submission_ref=submission_ref,
+            native_session_ref=result.primary_session_ref,
+            runtime_binding=run.runtime_binding,
+            outcome=result.final_outcome,
+            reviewed_draft=result.reviewed_draft,
+            review=review,
+            idempotency_key=_operation_key(
+                "idea-execute", run.run_ref, run.attempt_ref
+            ),
+        )
+        self._transient_error = None
+        finish_job = getattr(self._provider, "finish_job", None)
+        if callable(finish_job):
+            finish_job(job_ref)
+        return _CycleStep(True, provider_boundary_attempted=False)
 
     def _finish_provider_job(self, job_ref: str) -> None:
         finish_job = getattr(self._provider, "finish_job", None)
@@ -847,8 +760,13 @@ class IdeaStageWorker:
         failure_code: str,
         detail_code: str,
     ) -> None:
-        self._agent_runtime.reject_stage_completion_candidate(
-            unit_ref=unit_ref,
+        reject = (self._agent_runtime.reject_stage_local_candidate
+                  if operation_name == "local" else self._agent_runtime.reject_stage_completion_candidate)
+        source = ({"primary_draft_hash": run.primary_draft.draft_hash}
+                  if operation_name == "local" else {})
+        reject(
+            **source,
+            unit_ref=run.primary_invocation.invocation_ref if operation_name == "local" else unit_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
@@ -1016,12 +934,6 @@ def _public_run(run: IdeaStageRun) -> dict[str, object]:
                 "status": run.primary_invocation.status,
                 "request_hash": run.primary_invocation.request_hash,
                 "response_hash": run.primary_invocation.response_hash,
-            },
-            "review": {
-                "invocation_ref": run.review_invocation.invocation_ref,
-                "status": run.review_invocation.status,
-                "request_hash": run.review_invocation.request_hash,
-                "response_hash": run.review_invocation.response_hash,
             },
         },
         "primary_draft_checkpoint": (

@@ -136,7 +136,7 @@ class _NoViableIdeaSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         return IdeaSkillResult(
@@ -151,7 +151,7 @@ class _NoViableIdeaSkill:
         )
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
-        return self.review_draft(request, self.generate_draft(request))
+        return self.finalize_draft(request, self.generate_draft(request))
 
 
 class _CandidateCompletionReasoningSkill:
@@ -269,7 +269,7 @@ class _CandidateCompletionReasoningSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
@@ -292,7 +292,7 @@ class _CandidateCompletionReasoningSkill:
         )
 
     def execute(self, request: ReasoningSkillRequest) -> ReasoningSkillResult:
-        return self.review_draft(request, self.generate_draft(request))
+        return self.finalize_draft(request, self.generate_draft(request))
 
 
 def _base_runtime(path: Path):

@@ -182,7 +182,7 @@ class _ExhaustionBundleSkill(_DeterministicBundleSkill):
             }
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: BundleSkillRequest, draft: BundleSkillDraft
     ) -> BundleExhaustionSkillResult:
         assessment_hash = canonical_hash(draft.draft)
@@ -253,12 +253,12 @@ class _RejectedThenExhaustionBundleSkill(_ExhaustionBundleSkill):
             return super().generate_draft(request)
         return _DeterministicBundleSkill.generate_draft(self, request)
 
-    def review_draft(
+    def finalize_draft(
         self, request: BundleSkillRequest, draft: BundleSkillDraft
     ) -> BundleSkillResult | BundleExhaustionSkillResult:
         if draft.output_kind == "target_plan":
-            return _DeterministicBundleSkill.review_draft(self, request, draft)
-        return super().review_draft(request, draft)
+            return _DeterministicBundleSkill.finalize_draft(self, request, draft)
+        return super().finalize_draft(request, draft)
 
 
 class _RejectingTargetCandidateProofVerifier:

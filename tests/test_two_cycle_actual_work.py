@@ -74,8 +74,8 @@ class _Plan(_MultiRunPlanSkill):
 
 
 class _Reasoning(_MultiRunReasoningSkill):
-    def review_draft(self,request,draft):
-        return replace(super().review_draft(request,draft),review_mode='advisory_unobserved',reviewer_agent_ref=None)
+    def finalize_draft(self,request,draft):
+        return replace(super().finalize_draft(request,draft),review_mode='advisory_unobserved',reviewer_agent_ref=None)
 
     def _result_parts(self,request):
         outcome,next_cycle=super()._result_parts(request)

@@ -29,18 +29,26 @@ class HumanGuidanceMixin:
     ) -> None:
         if operation.scope.root_kind != "reasoning" or not submission_ref:
             raise OwnerConflict("reasoning_completion_conditions_invalid")
-        cut = self.freeze_operation_guidance(operation)
-        if cut.direction_cut is None:
-            raise OwnerConflict("goal_direction_cut_missing")
-        binding = {
-            "scope": operation.scope.as_dict(),
-            "guidance_binding": cut.binding.as_dict(),
-            "output_hash": canonical_hash(output),
-            "payload_hash": payload_hash,
-            "conditions": cut.direction_cut["conditions"],
-        }
+        # Local acceptance consumes the original primary cut. Only actual
+        # provider turns may freeze a new cut or require an active unit.
+        local_primary = operation.operation_name == "primary"
+        verifier = (self._agent_runtime.verify_reasoning_primary_completion_operation
+                    if local_primary else self._agent_runtime.verify_stage_guidance_operation)
         with self._database.fenced_write() as connection:
-            self._agent_runtime.verify_stage_guidance_operation(operation)
+            work = verifier(operation)
+            cut = (self.recover_operation_guidance(operation.identity) if local_primary
+                   else self.freeze_operation_guidance(operation))
+            if cut.binding.quest_ref != work.quest_ref or cut.provenance_ref != work.provenance_ref:
+                raise OwnerConflict("guidance_snapshot_unbound")
+            if cut.direction_cut is None:
+                raise OwnerConflict("goal_direction_cut_missing")
+            binding = {
+                "scope": operation.scope.as_dict(),
+                "guidance_binding": cut.binding.as_dict(),
+                "output_hash": canonical_hash(output),
+                "payload_hash": payload_hash,
+                "conditions": cut.direction_cut["conditions"],
+            }
             row = connection.execute(text(
                 "SELECT * FROM hc_reasoning_completion_conditions "
                 "WHERE submission_ref=:submission_ref"

@@ -241,6 +241,12 @@ def _provider_terminal_rows(runtime, operation_ref: str) -> dict[str, object]:
     }
 
 
+def _managed_checkpoint(runtime, run_ref):
+    managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
+    assert managed is not None
+    return managed["safe_point"]["checkpoint"]
+
+
 def _transport_contract_codex(
     executable: Path,
     call_counter: Path,
@@ -515,7 +521,7 @@ class _SealedReviewTraceFailureIdeaProvider(_IdeaProvider):
         super().__init__()
         self.review_calls = 0
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         del request, draft
         self.review_calls += 1
         raise IdeaSkillUnavailable(
@@ -532,9 +538,9 @@ class _SealedMaterialContractFailureIdeaProvider(_IdeaProvider):
         self.review_calls = 0
         self.checkpoint_calls = 0
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.review_calls += 1
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         return replace(result, final_outcome={})
 
     def terminal_contract_failure_checkpoint(
@@ -549,7 +555,7 @@ class _SealedMaterialContractFailureIdeaProvider(_IdeaProvider):
         assert job_ref
         assert operation_name == "review"
         assert native_session_ref
-        assert failure_code == "idea_review_result_contract_invalid"
+        assert failure_code == "idea_local_result_contract_invalid"
         assert detail_code == "idea_outcome_question_mismatch"
         self.checkpoint_calls += 1
         return _signed_contract_failure_evidence(failure_code, detail_code)
@@ -560,14 +566,14 @@ class _SealedMaterialContractFailurePlanProvider(_DeterministicPlanSkill):
         super().__init__(no_gap=False)
         self.review_calls = 0
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.review_calls += 1
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         return replace(result, final_plan={})
 
     def terminal_contract_failure_checkpoint(self, **values):
         assert values["operation_name"] == "review"
-        assert values["failure_code"] == "plan_review_result_contract_invalid"
+        assert values["failure_code"] == "plan_local_result_contract_invalid"
         assert values["detail_code"] == "plan_document_invalid"
         return _signed_contract_failure_evidence(
             values["failure_code"], values["detail_code"]
@@ -581,9 +587,9 @@ class _InvalidLocalTargetPlanReviewProvider(_DeterministicBundleSkill):
     def runtime_binding(self) -> BundleRuntimeBinding:
         return _operation_bound_bundle_runtime_binding()
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.review_calls += 1
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         return replace(
             result,
             review_mode="advisory_unobserved",
@@ -607,9 +613,9 @@ class _AdvisoryExhaustionBundleProvider(_ExhaustionBundleSkill):
     def runtime_binding(self) -> BundleRuntimeBinding:
         return _operation_bound_bundle_runtime_binding()
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.review_calls += 1
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         return replace(
             result,
             review_mode="advisory_unobserved",
@@ -626,7 +632,7 @@ class _CeilingExhaustionBundleProvider(_ExhaustionBundleSkill):
     def runtime_binding(self) -> BundleRuntimeBinding:
         return _operation_bound_bundle_runtime_binding()
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         del request, draft
         self.review_calls += 1
         raise IdeaSkillUnavailable(
@@ -636,8 +642,8 @@ class _CeilingExhaustionBundleProvider(_ExhaustionBundleSkill):
 
 
 class _InvalidExhaustionBundleProvider(_AdvisoryExhaustionBundleProvider):
-    def review_draft(self, request, draft):
-        result = super().review_draft(request, draft)
+    def finalize_draft(self, request, draft):
+        result = super().finalize_draft(request, draft)
         return replace(result, reviewed_assessment_hash="0" * 64)
 
 
@@ -648,15 +654,15 @@ class _SealedMaterialContractFailureReasoningProvider(
         super().__init__()
         self.review_calls = 0
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.review_calls += 1
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         return replace(result, scientific_outcome={})
 
     def terminal_contract_failure_checkpoint(self, **values):
         assert values["operation_name"] == "review"
         assert values["failure_code"] == (
-            "reasoning_review_result_contract_invalid"
+            "reasoning_local_result_contract_invalid"
         )
         assert values["detail_code"] == "reasoning_skill_output_binding_mismatch"
         return _signed_contract_failure_evidence(
@@ -805,30 +811,35 @@ def test_idea_signed_hard_ceiling_durably_fences_attempt_without_terminal_run(
         runtime.close()
 
 
-def test_idea_signed_terminal_failure_is_fenced_without_replay(
+@pytest.mark.parametrize("termination_reason", ["completed", "launch_failed"])
+def test_idea_known_terminal_failure_preserves_evidence_and_creates_successor(
     tmp_path: Path,
+    termination_reason: str,
 ) -> None:
-    provider = _TerminalFailureIdeaProvider()
+    provider = _TerminalFailureIdeaProvider(termination_reason)
     runtime = _runtime(
         prepare_data_root(tmp_path / "idea-terminal-failure"), provider
     )
     try:
         _confirm_question(runtime)
         runtime.idea_stage.start("idea-terminal-failure-start")
-
+        before = runtime.idea_stage.query_current()["run"]
         assert not runtime.idea_stage.process_once()
         run = runtime.idea_stage.query_current()["run"]
-        assert run["status"] == "suspended_fenced"
-        assert run["fence_status"] == "revoked"
-        assert run["blocker"] == {
-            "status": "durable",
-            "reason": {"code": "codex_operation_failed"},
-        }
-        assert run["recovery_checkpoint"]["checkpoint"]["provider_exit"] == (
-            _signed_ceiling_evidence("completed")
-        )
-
-        assert not runtime.idea_stage.process_once()
+        assert run["status"] == "admitted"
+        assert run["attempt_generation"] == 2
+        assert run["attempt_ref"] != before["attempt_ref"]
+        assert run["root_session_ref"] == before["root_session_ref"]
+        assert run["blocker"] is None
+        checkpoint = _managed_checkpoint(runtime, run["run_ref"])
+        assert checkpoint["action"] == "provider_result_correction"
+        assert checkpoint["attempt_ref"] == before["attempt_ref"]
+        assert checkpoint["provider_exit"] == _signed_ceiling_evidence(termination_reason)
+        original = before["provider_operations"]["primary"]
+        assert run["provider_operations"]["primary"]["operation_ref"] != original["operation_ref"]
+        rows = _provider_terminal_rows(runtime, original["operation_ref"])
+        assert any(row[1] == "completed" for row in rows["units"])
+        assert any(row[1:3] == ("finished", "terminal") for row in rows["responsibilities"])
         assert provider.generate_calls == 1
     finally:
         runtime.close()
@@ -846,19 +857,16 @@ def test_idea_sealed_review_trace_failure_stays_local_to_the_attempt(
         runtime.idea_stage.start("idea-review-trace-failure-start")
 
         assert runtime.idea_stage.process_once()
-        primary_complete = runtime.idea_stage.query_current()["run"]
-        assert primary_complete["primary_draft_checkpoint"]["status"] == "recorded"
-
+        before = runtime.idea_stage.query_current()["run"]
         assert not runtime.idea_stage.process_once()
         run = runtime.idea_stage.query_current()["run"]
         assert run["status"] == "admitted"
-        assert run["attempt_generation"] == 2
-        assert run["attempt_ref"] != primary_complete["attempt_ref"]
-        assert run["root_session_ref"] == primary_complete["root_session_ref"]
-        assert run["native_session_ref"] == primary_complete["native_session_ref"]
-        assert run["blocker"] is None
-        assert run["recovery_checkpoint"] is None
+        assert run["attempt_ref"] == before["attempt_ref"]
+        assert run["provider_operations"] == before["provider_operations"]
+        assert set(run["provider_operations"]) == {"primary"}
         assert run["completion_rejection"] is None
+        assert run["recovery_checkpoint"] is None
+        assert runtime.idea_stage.transient_error == "codex_child_review_spawn_invalid"
         assert provider.review_calls == 1
     finally:
         runtime.close()
@@ -886,7 +894,7 @@ def test_idea_invalid_final_content_creates_same_session_successor(
         assert run["native_session_ref"] == original["native_session_ref"]
         assert run["blocker"] is None
         assert run["completion_rejection"]["reason"] == {
-            "code": "idea_review_result_contract_invalid",
+            "code": "idea_local_result_contract_invalid",
             "detail": "idea_outcome_question_mismatch",
         }
         assert run["completion_rejection"]["attempt_ref"] == original[
@@ -924,7 +932,7 @@ def test_plan_post_result_contract_failure_creates_successor(
         assert successor["attempt_generation"] == 2
         assert successor["blocker"] is None
         assert successor["completion_rejection"]["reason"] == {
-            "code": "plan_review_result_contract_invalid",
+            "code": "plan_local_result_contract_invalid",
             "detail": "plan_document_invalid",
         }
         assert provider.review_calls == 1
@@ -946,102 +954,75 @@ def test_bundle_local_target_plan_review_failure_does_not_invent_provider_phase(
         assert runtime.bundle_stage.process_once()  # Run admission.
         assert runtime.bundle_stage.process_once()  # Real primary provider turn.
         before = runtime.bundle_stage.query_current()["run"]
-        review_invocation_ref = before["provider_operations"]["review"][
-            "invocation_ref"
-        ]
+        assert set(before["provider_operations"]) == {"primary"}
+        primary_invocation_ref = before["provider_operations"]["primary"]["invocation_ref"]
 
-        assert not runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.process_once()
         assert provider.review_calls == 1
         current = runtime.bundle_stage.query_current()["run"]
         assert current["status"] == "admitted"
-        assert current["attempt_ref"] == before["attempt_ref"]
-        assert current["completion_rejection"] is None
-        assert runtime.bundle_stage.observation.code == (
-            "bundle_review_result_contract_invalid"
-        )
+        assert current["attempt_ref"] != before["attempt_ref"]
+        assert current["root_session_ref"] == before["root_session_ref"]
+        rejection = current["completion_rejection"]
+        assert rejection["reason"]["code"] == "bundle_local_result_contract_invalid"
+        assert rejection["attempt_ref"] == before["attempt_ref"]
+        assert rejection["provider_completion"]["response_hash"] == before["provider_operations"]["primary"]["response_hash"]
         with runtime._database.read() as connection:
             assert connection.execute(
                 text(
-                    "SELECT COUNT(*) FROM ar_provider_units WHERE unit_ref = "
-                    ":unit_ref"
+                    "SELECT COUNT(*) FROM ar_provider_units WHERE run_ref = "
+                    ":run_ref AND unit_kind = 'bundle_review'"
                 ),
-                {"unit_ref": review_invocation_ref},
+                {"run_ref": before["run_ref"]},
             ).scalar_one() == 0
             assert connection.execute(
                 text(
                     "SELECT COUNT(*) FROM ar_stage_completion_rejections WHERE "
                     "provider_invocation_ref = :invocation_ref"
                 ),
-                {"invocation_ref": review_invocation_ref},
-            ).scalar_one() == 0
+                {"invocation_ref": primary_invocation_ref},
+            ).scalar_one() == 1
     finally:
         runtime.close()
 
 
-def test_bundle_exhaustion_review_unit_wraps_effect_and_acknowledges_safe_point(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_bundle_exhaustion_local_finalization_has_no_provider_unit_or_safe_point(tmp_path, monkeypatch):
     provider = _AdvisoryExhaustionBundleProvider()
-    runtime = _bundle_runtime(
-        tmp_path / "bundle-exhaustion-review-provider-unit",
-        bundle_skill_provider=provider,
-        harness_ready=False,
-    )
+    runtime = _bundle_runtime(tmp_path / "bundle-exhaustion-local", bundle_skill_provider=provider, harness_ready=False)
     try:
         _prepare_bundle_request(runtime)
-        assert runtime.bundle_stage.process_once()  # Run admission.
-        assert runtime.bundle_stage.process_once()  # Primary assessment.
-        current = runtime.bundle_stage.query_current()
-        request_ref = current["stage_run_request"]["request_ref"]
-        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.process_once()
+        view = runtime.bundle_stage.query_current()
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(view["stage_run_request"]["request_ref"])
         assert run is not None
-
-        review_draft = provider.review_draft
-
-        def review_after_begin(request, draft):
+        def provider_state():
             with runtime._database.read() as connection:
-                unit = connection.execute(
-                    text(
-                        "SELECT unit_kind, status FROM ar_provider_units WHERE "
-                        "unit_ref = :unit_ref"
-                    ),
-                    {"unit_ref": run.review_invocation.invocation_ref},
-                ).one()
-            assert tuple(unit) == ("bundle_review", "active")
-            return review_draft(request, draft)
-
-        acknowledged: list[str] = []
-        acknowledge = runtime.owners.agent_runtime.acknowledge_provider_safe_point
-
-        def record_acknowledgement(**values):
-            acknowledged.append(values["unit_ref"])
-            return acknowledge(**values)
-
-        monkeypatch.setattr(provider, "review_draft", review_after_begin)
-        monkeypatch.setattr(
-            runtime.owners.agent_runtime,
-            "acknowledge_provider_safe_point",
-            record_acknowledgement,
-        )
-
+                invocations = [tuple(row) for row in connection.execute(text(
+                    "SELECT invocation_ref,phase,status,response_hash FROM ar_stage_provider_invocations WHERE run_ref=:run ORDER BY invocation_ref"
+                ), {"run": run.run_ref})]
+                units = [tuple(row) for row in connection.execute(text(
+                    "SELECT unit_ref,unit_kind,status FROM ar_provider_units WHERE run_ref=:run ORDER BY unit_ref"
+                ), {"run": run.run_ref})]
+            return invocations, units
+        before = provider_state()
+        assert [row[1] for row in before[0]] == ["primary"]
+        finalize = provider.finalize_draft
+        def local(request, draft):
+            assert provider_state() == before
+            return finalize(request, draft)
+        monkeypatch.setattr(provider, "finalize_draft", local)
+        def no_fake_ack(**_values):
+            raise AssertionError("local finalization must not acknowledge a provider safe point")
+        monkeypatch.setattr(runtime.owners.agent_runtime, "acknowledge_provider_safe_point", no_fake_ack)
         assert runtime.bundle_stage.process_once()
         assert provider.review_calls == 1
-        assert acknowledged == [run.review_invocation.invocation_ref]
-        with runtime._database.read() as connection:
-            unit = connection.execute(
-                text(
-                    "SELECT unit_kind, status FROM ar_provider_units WHERE "
-                    "unit_ref = :unit_ref"
-                ),
-                {"unit_ref": run.review_invocation.invocation_ref},
-            ).one()
-        assert tuple(unit) == ("bundle_review", "completed")
+        assert provider_state() == before
     finally:
         runtime.close()
 
 
-def test_bundle_exhaustion_invalid_candidate_uses_active_review_seam(
+def test_bundle_exhaustion_invalid_candidate_keeps_completed_primary_evidence(
     tmp_path: Path,
 ) -> None:
     provider = _InvalidExhaustionBundleProvider()
@@ -1062,7 +1043,7 @@ def test_bundle_exhaustion_invalid_candidate_uses_active_review_seam(
         assert current["root_session_ref"] == before["root_session_ref"]
         assert current["native_session_ref"] == before["native_session_ref"]
         assert current["completion_rejection"]["reason"] == {
-            "code": "bundle_review_result_contract_invalid",
+            "code": "bundle_local_result_contract_invalid",
             "detail": "bundle_exhaustion_review_binding_invalid",
         }
         with runtime._database.read() as connection:
@@ -1072,7 +1053,7 @@ def test_bundle_exhaustion_invalid_candidate_uses_active_review_seam(
                     ":unit_ref"
                 ),
                 {
-                    "unit_ref": before["provider_operations"]["review"][
+                    "unit_ref": before["provider_operations"]["primary"][
                         "invocation_ref"
                     ]
                 },
@@ -1082,57 +1063,24 @@ def test_bundle_exhaustion_invalid_candidate_uses_active_review_seam(
         runtime.close()
 
 
-def test_bundle_exhaustion_review_signed_ceiling_fences_without_replay(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_bundle_local_exhaustion_exception_cannot_forge_provider_ceiling(tmp_path, monkeypatch):
     provider = _CeilingExhaustionBundleProvider()
-    runtime = _bundle_runtime(
-        tmp_path / "bundle-exhaustion-review-ceiling",
-        bundle_skill_provider=provider,
-        harness_ready=False,
-    )
+    runtime = _bundle_runtime(tmp_path / "bundle-exhaustion-local-error", bundle_skill_provider=provider, harness_ready=False)
     try:
         _prepare_bundle_request(runtime)
-        assert runtime.bundle_stage.process_once()  # Run admission.
-        assert runtime.bundle_stage.process_once()  # Primary assessment.
-
-        acknowledged: list[str] = []
-        acknowledge = runtime.owners.agent_runtime.acknowledge_provider_safe_point
-
-        def record_acknowledgement(**values):
-            acknowledged.append(values["unit_ref"])
-            return acknowledge(**values)
-
-        monkeypatch.setattr(
-            runtime.owners.agent_runtime,
-            "acknowledge_provider_safe_point",
-            record_acknowledgement,
-        )
+        assert runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.process_once()
+        before = runtime.bundle_stage.query_current()["run"]
         assert not runtime.bundle_stage.process_once()
-
-        current = runtime.bundle_stage.query_current()
-        run = current["run"]
-        assert run["status"] == "suspended_fenced"
-        assert run["blocker"]["reason"] == {"code": "codex_operation_timeout"}
-        assert run["recovery_checkpoint"]["checkpoint"]["provider_exit"] == (
-            _signed_ceiling_evidence("timeout")
-        )
-        with runtime._database.read() as connection:
-            unit = connection.execute(
-                text(
-                    "SELECT unit_kind, status FROM ar_provider_units WHERE "
-                    "unit_ref = :unit_ref"
-                ),
-                {
-                    "unit_ref": run["provider_operations"]["review"][
-                        "invocation_ref"
-                    ]
-                },
-            ).one()
-        assert tuple(unit) == ("bundle_review", "revoked")
-        assert acknowledged == []
-        assert not runtime.bundle_stage.process_once()
+        after = runtime.bundle_stage.query_current()["run"]
+        assert after["attempt_ref"] == before["attempt_ref"]
+        assert after["status"] == before["status"]
+        assert after["blocker"] is None
+        assert after["recovery_checkpoint"] is None
+        assert runtime.bundle_stage.observation.kind == "failure"
+        assert runtime.bundle_stage.observation.code == "codex_operation_timeout"
+        assert set(after["provider_operations"]) == {"primary"}
+        assert after["provider_operations"] == before["provider_operations"]
         assert provider.review_calls == 1
     finally:
         runtime.close()
@@ -1169,7 +1117,7 @@ def test_reasoning_post_result_contract_failure_creates_successor(
         assert successor["native_session_ref"] == original["native_session_ref"]
         assert successor["blocker"] is None
         assert successor["completion_rejection"]["reason"] == {
-            "code": "reasoning_review_result_contract_invalid",
+            "code": "reasoning_local_result_contract_invalid",
             "detail": "scientific_outcome_authoritative_metadata_conflict",
         }
         assert "scientific_outcome.cycle_ref:supplied=None:expected=" in " ".join(
@@ -1229,7 +1177,7 @@ def test_direct_provider_contract_error_remains_transient(
         else:
             raise AssertionError(f"{stage} provider boundary was not reached")
 
-        assert worker.transient_error == f"{stage}_provider_contract_error"
+        assert (worker.observation.code if stage == "bundle" else worker.transient_error) == f"{stage}_provider_contract_error"
         current = worker.query_current()
         assert current["run"]["status"] == "admitted"
         assert current["run"]["recovery_checkpoint"] is None
@@ -1245,12 +1193,6 @@ def test_direct_provider_contract_error_remains_transient(
             "idea_primary_result_contract_invalid",
             "codex_outcome_invalid",
             1,
-        ),
-        (
-            "review",
-            "idea_review_result_contract_invalid",
-            "codex_review_invalid",
-            2,
         ),
     ],
 )
@@ -1274,16 +1216,7 @@ def test_production_adapter_invalid_shape_creates_same_session_successor(
             completed["cycle_ref"]
         )
         assert request is not None
-        if phase == "primary":
-            outputs.append({})
-        else:
-            outputs.extend(
-                [
-                    {"outcome": _runtime_idea_outcome(request)},
-                    {"reviewer_agent_ref": "codex-reviewer:shape-invalid"},
-                ]
-            )
-            assert runtime.idea_stage.process_once()
+        outputs.append({})
 
         before = runtime.idea_stage.query_current()["run"]
         assert runtime.idea_stage.process_once()
@@ -1505,6 +1438,14 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
             runtime,
             str(quest["cycle_ref"]),
         )
+        runtime.owners.agent_runtime.begin_provider_unit(
+            unit_ref=run.primary_invocation.invocation_ref,
+            operation_ref=run.primary_invocation.operation_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            unit_kind="plan_primary",
+        )
         with pytest.raises(
             IdeaSkillUnavailable,
             match="plan_primary_result_contract_invalid",
@@ -1519,11 +1460,9 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
         )
         assert not (operation / "completed.json").exists()
         operation_ref = run.primary_invocation.operation_ref
-        assert _provider_terminal_rows(runtime, operation_ref) == {
-            "units": (),
-            "responsibilities": (),
-            "receipts": (),
-        }
+        interrupted = _provider_terminal_rows(runtime, operation_ref)
+        assert any(row[1] == "active" for row in interrupted["units"])
+        assert not interrupted["receipts"]
     finally:
         runtime.close()
 
@@ -1536,10 +1475,13 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
     try:
         assert not restarted.plan_stage.process_once()
         blocked = restarted.plan_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        provider_exit = blocked["recovery_checkpoint"]["checkpoint"][
-            "provider_exit"
-        ]
+        assert blocked["status"] == "admitted"
+        assert blocked["attempt_ref"] != run.attempt_ref
+        assert blocked["root_session_ref"] == run.root_session_ref
+        checkpoint = _managed_checkpoint(restarted, run.run_ref)
+        assert checkpoint["action"] == "provider_result_correction"
+        assert checkpoint["attempt_ref"] == run.attempt_ref
+        provider_exit = checkpoint["provider_exit"]
         assert provider_exit == first_checkpoint
         for field in (
             "invocation_hash",
@@ -1551,10 +1493,10 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
         ):
             assert provider_exit[field] == exit_marker[field]
         terminal_rows = _provider_terminal_rows(restarted, operation_ref)
-        assert any(row[1] == "revoked" for row in terminal_rows["units"])
+        assert any(row[1] == "completed" for row in terminal_rows["units"])
         calls_after_restart_fence = call_counter.read_text(encoding="utf-8")
 
-        assert not restarted.plan_stage.process_once()
+        assert _managed_checkpoint(restarted, run.run_ref) == checkpoint
         assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
         assert call_counter.read_text(encoding="utf-8") == (
             calls_after_restart_fence
@@ -1756,13 +1698,13 @@ def test_bundle_production_adapter_persists_primary_without_second_review_turn(
         ("dispatch", "codex_bundle_dispatch_invalid", 2),
         (
             "dispatch-contract",
-            "bundle_dispatch_requires_authoritative_blocker",
+            "bundle_dispatch_target_not_in_frontier",
             2,
         ),
         ("target-batch", "codex_bundle_target_batch_invalid", 3),
     ],
 )
-def test_bundle_rolling_invalid_result_is_terminal_without_replay(
+def test_bundle_rolling_invalid_result_retains_terminal_proof_for_correction(
     tmp_path: Path,
     rolling_operation: str,
     detail_code: str,
@@ -1807,9 +1749,9 @@ def test_bundle_rolling_invalid_result_is_terminal_without_replay(
         if rolling_operation.startswith("dispatch"):
             if rolling_operation == "dispatch-contract":
                 yield {
-                    "action": "wait",
-                    "selected_target_ref": None,
-                    "rationale": "Wait despite an executable accepted frontier.",
+                    "action": "dispatch",
+                    "selected_target_ref": "target-outside-current-frontier",
+                    "rationale": "An unauthorized target must be rejected.",
                 }
             else:
                 yield {"action": "dispatch"}
@@ -1845,20 +1787,17 @@ def test_bundle_rolling_invalid_result_is_terminal_without_replay(
             changed = runtime.bundle_stage.process_once()
             current = runtime.bundle_stage.query_current()
             run_view = current.get("run")
-            if run_view is not None and run_view["status"] == "suspended_fenced":
+            if run_view is not None and run_view["attempt_generation"] == 2:
                 assert not changed
                 break
         else:
             raise AssertionError(
-                f"Bundle {rolling_operation} did not reach the terminal fence"
+                f"Bundle {rolling_operation} did not install a correction Attempt: {runtime.bundle_stage.observation}"
             )
 
-        assert current["run"]["blocker"]["reason"] == {
-            "code": "bundle_review_result_contract_invalid"
-        }
-        provider_exit = current["run"]["recovery_checkpoint"]["checkpoint"][
-            "provider_exit"
-        ]
+        assert current["run"]["blocker"] is None
+        checkpoint = _managed_checkpoint(runtime, current["run"]["run_ref"])
+        provider_exit = checkpoint["provider_exit"]
         assert provider_exit["contract_failure_code"] == (
             "bundle_review_result_contract_invalid"
         )
@@ -1866,16 +1805,20 @@ def test_bundle_rolling_invalid_result_is_terminal_without_replay(
         request_ref = current["stage_run_request"]["request_ref"]
         run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
         assert run is not None
-        operation_ref = run.review_invocation.operation_ref
+        assert checkpoint["action"] == "provider_result_correction"
+        operation_ref = checkpoint["provider_operation_ref"]
+        assert run.primary_invocation.operation_ref != operation_ref
         terminal_rows = _provider_terminal_rows(runtime, operation_ref)
-        assert any(row[1] == "revoked" for row in terminal_rows["units"])
+        assert any(row[1] == "completed" for row in terminal_rows["units"])
         assert any(
-            row[1:3] == ("finished", "permanent_fence")
+            row[1:3] == ("finished", "terminal")
             for row in terminal_rows["responsibilities"]
         )
         assert len(runner.calls) == expected_calls
 
-        assert not runtime.bundle_stage.process_once()
+        # The old physical turn is terminal. Any next dispatch belongs to the
+        # new Attempt, so observing recovery must not invoke that old turn.
+        assert _managed_checkpoint(runtime, run.run_ref) == checkpoint
         assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
         assert len(runner.calls) == expected_calls
     finally:
@@ -1893,7 +1836,9 @@ def test_bundle_rolling_invalid_result_is_terminal_without_replay(
         "http://127.0.0.1:8765"
     )
     try:
-        assert not restarted.bundle_stage.process_once()
+        recovered = restarted.bundle_stage.query_current()["run"]
+        assert recovered["attempt_ref"] == current["run"]["attempt_ref"]
+        assert _managed_checkpoint(restarted, run.run_ref) == checkpoint
         assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
         assert no_replay.calls == []
     finally:
@@ -2027,7 +1972,7 @@ def test_reasoning_production_adapter_missing_review_trace_accepts_result(
     ("phase", "failure_code", "missing_semantic_call", "expected_calls"),
     [
         ("primary", "reasoning_primary_result_contract_invalid", 0, 1),
-        ("review", "reasoning_review_result_contract_invalid", 0, 1),
+        ("review", "reasoning_local_result_contract_invalid", 0, 1),
     ],
 )
 def test_reasoning_missing_semantic_trace_is_diagnostic(
@@ -2093,7 +2038,7 @@ def test_reasoning_missing_semantic_trace_is_diagnostic(
 
 @pytest.mark.parametrize(
     "termination_reason",
-    ["descendant_process", "launch_failed"],
+    ["descendant_process"],
 )
 def test_idea_other_signed_terminal_exits_are_fenced_without_replay(
     tmp_path: Path,
@@ -2264,6 +2209,7 @@ def test_resume_after_production_ceiling_uses_a_new_physical_operation(
         tmp_path / "idea-provider",
         executable=str(executable),
         timeout_seconds=0.2,
+        process_runner=_ExecWireContractRunner(),
     )
     drafting = _DraftingProvider()
     runtime = build_production_runtime(

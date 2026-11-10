@@ -846,7 +846,7 @@ class IdeaSkillProvider(Protocol):
 
     def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft: ...
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult: ...
 
@@ -1034,7 +1034,7 @@ class CodexIdeaSkillAdapter:
     _root_agent_kind: RootAgentKind = "idea"
     _shell_environment_inherit: str | None = None
     _web_search_mode = "live"
-    _reconciliation_operation_names = ("primary", "review")
+    _reconciliation_operation_names = ("primary",)
     _provider_transport_limits = DEFAULT_PROVIDER_TRANSPORT_LIMITS
 
     def _sandbox_arguments(
@@ -1050,8 +1050,6 @@ class CodexIdeaSkillAdapter:
     def _transport_contract_failure_code(self, operation_name: str) -> str:
         if operation_name == "primary":
             return "idea_primary_result_contract_invalid"
-        if operation_name == "review":
-            return "idea_review_result_contract_invalid"
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
 
     def __init__(
@@ -1483,10 +1481,6 @@ class CodexIdeaSkillAdapter:
             "outcome-envelope-template": _outcome_envelope_schema(
                 "__question_ref__", "__context_pack_ref__"
             ),
-            "advisory-finalization-template": _review_finalization_schema(
-                "__question_ref__",
-                "__context_pack_ref__",
-            ),
         }
         output_contracts = {
             name: _compile_codex_output_schema(schema)
@@ -1891,7 +1885,7 @@ class CodexIdeaSkillAdapter:
         )
 
     @resource_preparation
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         # Root policy organizes advisory review before returning a candidate.
@@ -1918,7 +1912,7 @@ class CodexIdeaSkillAdapter:
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(
+        return self.finalize_draft(
             replace(request, native_session_ref=draft.primary_session_ref),
             draft,
         )
@@ -3443,131 +3437,8 @@ def _with_failed_native_session(
     )
 
 
-def _verify_child_review_trace(
-    stdout: str,
-    *,
-    root_session_ref: str,
-    reviewer_agent_ref: str,
-    expected_spawn_prompt: str | None = None,
-) -> str | None:
-    successful_calls: dict[str, list[dict[str, object]]] = {
-        "spawn_agent": [],
-        "wait": [],
-    }
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if (
-            not isinstance(item, dict)
-            or item.get("type") != "collab_tool_call"
-            or item.get("status") != "completed"
-        ):
-            continue
-        tool = item.get("tool")
-        if tool in successful_calls:
-            successful_calls[cast(str, tool)].append(
-                cast(dict[str, object], item)
-            )
-
-    spawn_calls = successful_calls["spawn_agent"]
-    if len(spawn_calls) != 1:
-        raise IdeaSkillUnavailable("codex_child_review_spawn_invalid")
-    spawn = spawn_calls[0]
-    spawn_receivers = spawn.get("receiver_thread_ids")
-    spawn_states = spawn.get("agents_states")
-    if (
-        spawn.get("sender_thread_id") != root_session_ref
-        or not isinstance(spawn_receivers, list)
-        or len(spawn_receivers) != 1
-        or not isinstance(spawn_receivers[0], str)
-        or not spawn_receivers[0]
-        or not isinstance(spawn_states, dict)
-    ):
-        raise IdeaSkillUnavailable("codex_child_review_spawn_invalid")
-    spawned_child_ref = spawn_receivers[0]
-    spawned_state = spawn_states.get(spawned_child_ref)
-    if (
-        not isinstance(spawned_state, dict)
-        or not isinstance(spawned_state.get("status"), str)
-        or not spawned_state["status"]
-    ):
-        raise IdeaSkillUnavailable("codex_child_review_spawn_invalid")
-    if reviewer_agent_ref != spawned_child_ref:
-        raise IdeaSkillUnavailable("codex_child_review_ref_mismatch")
-    if (
-        expected_spawn_prompt is not None
-        and spawn.get("prompt") != expected_spawn_prompt
-    ):
-        raise IdeaSkillUnavailable("codex_child_review_task_mismatch")
-
-    wait_calls = successful_calls["wait"]
-    if not wait_calls:
-        raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
-    terminal_wait_seen = False
-    terminal_message: str | None = None
-    for wait in wait_calls:
-        wait_receivers = wait.get("receiver_thread_ids")
-        wait_states = wait.get("agents_states")
-        if (
-            wait.get("sender_thread_id") != root_session_ref
-            or not isinstance(wait_receivers, list)
-            or not isinstance(wait_states, dict)
-        ):
-            raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
-        # Codex can emit a completed, empty wait event when the bounded wait
-        # times out, then wait again for the same child. It is not a second
-        # reviewer and must not strand an otherwise valid durable result.
-        if wait_receivers == [] and wait_states == {}:
-            continue
-        if wait_receivers != [spawned_child_ref]:
-            raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
-        completed_state = wait_states.get(spawned_child_ref)
-        if not isinstance(completed_state, dict):
-            raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
-        if completed_state.get("status") == "completed":
-            terminal_wait_seen = True
-            message = completed_state.get("message")
-            if message is not None:
-                if not isinstance(message, str) or not message.strip():
-                    raise IdeaSkillUnavailable(
-                        "codex_child_review_wait_invalid"
-                    )
-                if terminal_message is not None and terminal_message != message:
-                    raise IdeaSkillUnavailable(
-                        "codex_child_review_wait_invalid"
-                    )
-                terminal_message = message
-    if not terminal_wait_seen:
-        raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
-    if expected_spawn_prompt is not None and terminal_message is None:
-        raise IdeaSkillUnavailable("codex_child_review_result_missing")
-    return terminal_message
 
 
-def _stdout_child_review_spawn_prompt_visible(stdout: str) -> bool:
-    """Whether the compatibility projection exposes a spawn prompt at all."""
-
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "collab_tool_call"
-            and item.get("tool") == "spawn_agent"
-            and "prompt" in item
-        ):
-            return True
-    return False
 
 
 def _write_completed_operation(
@@ -4077,7 +3948,3 @@ def _outcome_envelope_schema(
         },
         "required": ["outcome"],
     }
-
-
-def _review_finalization_schema(question_ref: str, context_pack_ref: str) -> dict[str, object]:
-    return {"type": "object", "additionalProperties": False, "properties": {"final_outcome": _outcome_schema(question_ref, context_pack_ref)}, "required": ["final_outcome"]}

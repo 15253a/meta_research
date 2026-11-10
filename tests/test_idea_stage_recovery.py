@@ -141,7 +141,7 @@ class _IdeaProvider:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         return IdeaSkillResult(
@@ -157,7 +157,7 @@ class _IdeaProvider:
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(request, draft)
+        return self.finalize_draft(request, draft)
 
 
 class _RecoveringIdeaProvider(_IdeaProvider):
@@ -176,13 +176,13 @@ class _ReviewRecoveringIdeaProvider(_IdeaProvider):
         super().__init__()
         self.review_calls = 0
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         self.review_calls += 1
         if self.review_calls == 1:
             raise IdeaSkillUnavailable("codex_review_timeout")
-        return super().review_draft(request, draft)
+        return super().finalize_draft(request, draft)
 
 
 class _HumanRequestIdeaProvider(_IdeaProvider):
@@ -213,11 +213,11 @@ class _HumanRequestIdeaProvider(_IdeaProvider):
             )
         return draft
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         self.review_requests.append(request)
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         if self.phase == "review" and self.human_request is None:
             self._open_human_request(request, phase="review")
         return result

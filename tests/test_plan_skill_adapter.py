@@ -22,7 +22,6 @@ from meta_research.plan_skill import (
     PlanSkillResult,
     PlanSkillUnavailable,
     _plan_envelope_schema,
-    _review_finalization_schema,
     _validate_request,
     validate_plan_skill_result,
     _with_derived_answer_contract_hash,
@@ -387,7 +386,6 @@ def test_large_legal_idea_set_keeps_actual_provider_schemas_within_budget() -> N
 
     _validate_request(request)
     _compile_codex_output_schema(_plan_envelope_schema(request))
-    _compile_codex_output_schema(_review_finalization_schema(request))
 
 
 class _SequenceRunner:

@@ -751,7 +751,7 @@ def test_current_reasoning_provider_authors_judgments_without_copying_metadata(
     adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
     request = replace(request, runtime_binding=adapter.runtime_binding())
     draft = adapter.generate_draft(request)
-    result = adapter.review_draft(replace(request, native_session_ref=draft.primary_session_ref), draft)
+    result = adapter.finalize_draft(replace(request, native_session_ref=draft.primary_session_ref), draft)
     validate_reasoning_skill_result(request, result)
     final = result.outcome_document()["scientific_outcome"]
     assert final["causal_interpretation"]["target_commit_refs"] == ["target-commit:one", "target-commit:two"]
@@ -838,7 +838,7 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     request = replace(_request(), runtime_binding=binding)
 
     draft = adapter.generate_draft(request)
-    result = adapter.review_draft(
+    result = adapter.finalize_draft(
         replace(request, native_session_ref=draft.primary_session_ref),
         draft,
     )
@@ -973,7 +973,7 @@ def test_completion_rejection_feedback_reaches_reasoning_primary_and_review(
     )
 
     draft = adapter.generate_draft(request)
-    adapter.review_draft(request, draft)
+    adapter.finalize_draft(request, draft)
 
     assert len(runner.calls) == 1
     for _argv, prompt, _schema in runner.calls:
@@ -1024,7 +1024,7 @@ def test_reasoning_result_does_not_require_internal_review_trace(
     )
 
     draft = adapter.generate_draft(request)
-    result = adapter.review_draft(
+    result = adapter.finalize_draft(
         replace(request, native_session_ref=draft.primary_session_ref),
         draft,
     )

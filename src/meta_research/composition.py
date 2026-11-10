@@ -736,11 +736,11 @@ def build_production_runtime(
             diagnostic_bound_providers.append(provider)
     agent_runtime.bind_provider_quiescence_driver(
         idea_skill_provider,
-        unit_kinds=("idea_primary", "idea_review"),
+        unit_kinds=("idea_primary",),
     )
     agent_runtime.bind_provider_quiescence_driver(
         plan_skill_provider,
-        unit_kinds=("plan_primary", "plan_review"),
+        unit_kinds=("plan_primary",),
     )
     agent_runtime.bind_provider_quiescence_driver(
         bundle_skill_provider,

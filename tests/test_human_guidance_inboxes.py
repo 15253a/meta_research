@@ -80,9 +80,9 @@ class _InboxIdea(_DeterministicIdeaSkill):
         self.on_primary(self.runtime.owners.human_collaboration, self.operation(request, "primary"))
         return super().generate_draft(request)
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.on_review(self.runtime.owners.human_collaboration, self.operation(request, "review"))
-        return super().review_draft(request, draft)
+        return super().finalize_draft(request, draft)
 
 
 def _run_idea(tmp_path, provider):

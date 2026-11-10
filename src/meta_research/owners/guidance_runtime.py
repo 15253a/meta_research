@@ -19,7 +19,7 @@ class GuidanceRuntimeMixin:
         if (scope.root_kind not in {"idea", "plan", "bundle", "reasoning"}
                 or not isinstance(operation.job_ref, str) or not operation.job_ref
                 or not isinstance(name, str)
-                or not (name in {"primary", "review"}
+                or not (name == "primary"
                     or scope.root_kind == "bundle" and re.fullmatch(r"(?:dispatch|target-batch)-[1-9][0-9]*", name)
                     or scope.root_kind == "reasoning" and name == "autonomous-resume")):
             raise OwnerConflict("guidance_operation_invalid")
@@ -37,7 +37,7 @@ class GuidanceRuntimeMixin:
         unit_kind = scope.root_kind + ("_primary" if name == "primary" else "_review")
         if len(units) != 1 or units[0].unit_kind != unit_kind or run is None:
             raise OwnerConflict("guidance_provider_unit_unbound")
-        if scope.root_kind == "bundle" and name not in {"primary", "review"}:
+        if scope.root_kind == "bundle" and name != "primary":
             from meta_research.owners.common import canonical_hash
             expected = "provider_unit_" + canonical_hash({
                 "operation_ref": operation.job_ref, "operation_name": name,
@@ -53,6 +53,32 @@ class GuidanceRuntimeMixin:
             if checkpoint is None:
                 raise OwnerConflict("guidance_provider_unit_unbound")
         return VerifiedGuidanceWork(scope.root_kind, scope.run_ref,
+            verified["quest_ref"], run.request_ref)
+
+    def verify_reasoning_primary_completion_operation(
+        self, operation: StageGuidanceOperation,
+    ) -> VerifiedGuidanceWork:
+        """Read a persisted primary for local acceptance, never authorize a turn."""
+        scope = operation.scope
+        if scope.root_kind != "reasoning" or operation.operation_name != "primary":
+            raise OwnerConflict("guidance_operation_invalid")
+        verified = self.verify_root_agent_runtime_scope(**scope.as_dict())
+        with self._database.read() as connection:
+            request_ref = connection.execute(text(
+                "SELECT request_ref FROM ar_stage_runs WHERE run_ref=:run_ref "
+                "AND stage='reasoning'"
+            ), {"run_ref": scope.run_ref}).scalar_one_or_none()
+        run = self.query_reasoning_stage_run(request_ref) if request_ref else None
+        if (run is None or run.primary_draft is None
+                or run.attempt_ref != scope.attempt_ref
+                or run.fence_ref != scope.fence_ref
+                or run.root_session_ref != scope.root_session_ref
+                or run.runtime_binding_hash != scope.runtime_binding_hash
+                or run.primary_invocation.status != "completed"
+                or run.primary_invocation.operation_ref != operation.job_ref
+                or run.primary_invocation.invocation_ref != operation.unit_ref):
+            raise OwnerConflict("guidance_provider_unit_unbound")
+        return VerifiedGuidanceWork("reasoning", scope.run_ref,
             verified["quest_ref"], run.request_ref)
 
     def verify_target_guidance_preparation(self, operation: TargetGuidanceOperation) -> VerifiedGuidanceWork:

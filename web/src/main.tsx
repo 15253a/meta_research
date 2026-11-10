@@ -1215,7 +1215,7 @@ function collectOutputPages(chunks: OutputChunk[], next: {offset: number; text: 
 }
 
 function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
-  const [selectedPhase, setSelectedPhase] = useState<"current" | "primary" | "review">("current");
+  const [selectedPhase, setSelectedPhase] = useState<"current" | "primary">("current");
   const [followLive, setFollowLive] = useState(true);
   const expanded = true;
   const [chunks, setChunks] = useState<OutputChunk[]>([]);
@@ -1390,12 +1390,12 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
   }, [documentVisible, error, expanded, followLive, load, loading, terminal]);
 
   const atHead = Boolean(terminal?.source_caught_up && !terminal.has_more);
-  const phaseLabel = terminal?.phase === "review" ? "审查"
+  const phaseLabel = terminal?.phase === "review" ? "历史审查"
     : terminal?.phase === "primary" ? "主任务"
-      : terminal?.phase === "autonomous-resume" ? "审查后续处理"
+      : terminal?.phase === "autonomous-resume" ? "继续研究"
         : terminal?.phase?.startsWith("target-batch-") ? `第 ${terminal.phase.slice(13)} 批实验调度`
           : terminal?.phase?.startsWith("dispatch-") ? `第 ${terminal.phase.slice(9)} 次调度`
-            : terminal?.phase ?? (selectedPhase === "review" ? "审查与后续" : selectedPhase === "primary" ? "主任务" : "当前任务");
+            : terminal?.phase ?? (selectedPhase === "primary" ? "主任务" : "当前任务");
   useEffect(() => {
     if (followLive && atHead && logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -1406,9 +1406,9 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
     <section className="research-conversation" data-testid={`stage-root-observations-${item.ref}`}>
       <header className="research-output-toolbar">
         <div role="group" aria-label="选择输出">
-          {([['current', '当前输出'], ['primary', '主任务输出'], ['review', '审查输出']] as const).map(([phase, label]) => (
+          {([['current', '当前输出'], ['primary', '主任务输出']] as const).map(([phase, label]) => (
             <button key={phase} type="button" aria-pressed={selectedPhase === phase}
-              onClick={() => setSelectedPhase(phase)}>{phase === "review" && item.source === "bundle_stage" ? "审查与调度" : label}</button>
+              onClick={() => setSelectedPhase(phase)}>{label}</button>
           ))}
         </div>
         <span>{activityStatusCopy(item.status)}</span>

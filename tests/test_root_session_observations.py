@@ -41,8 +41,6 @@ def root_reader(tmp_path, monkeypatch):
 def _add_stage_call(runtime, run, phase, *, status="completed", sequence=1):
     if phase == "primary":
         invocation = run.primary_invocation
-    elif phase == "review":
-        invocation = run.review_invocation
     else:
         invocation = SimpleNamespace(
             operation_ref=run.primary_invocation.operation_ref,
@@ -80,17 +78,17 @@ def _add_stage_call(runtime, run, phase, *, status="completed", sequence=1):
     return invocation.invocation_ref, directory
 
 
-def test_stage_root_merges_primary_review_and_dispatch_without_losing_messages(root_reader):
+def test_stage_root_merges_primary_batch_and_dispatch_without_losing_messages(root_reader):
     reader, runtime, request, run = root_reader
     calls = [_add_stage_call(runtime, run, phase, sequence=index + 1)[0]
-             for index, phase in enumerate(("primary", "review", "dispatch-2"))]
+             for index, phase in enumerate(("primary", "target-batch-1", "dispatch-2"))]
     listing = reader.query(request.accepted_question.quest_ref)
     assert listing["limited"] is False
     session = next(s for s in listing["sessions"] if s["session_ref"] == run.root_session_ref)
     assert [o["operation_ref"] for o in session["operations"]] == calls
     assert session["is_executing"] is False
     assert run.root_session_ref not in listing["active_session_refs"]
-    for operation_ref, phase in zip(calls, ("primary", "review", "dispatch-2")):
+    for operation_ref, phase in zip(calls, ("primary", "target-batch-1", "dispatch-2")):
         page = reader.query_output(request.accepted_question.quest_ref, run.root_session_ref,
                                    operation_ref=operation_ref)
         assert f"{phase} public message" in page["text"]

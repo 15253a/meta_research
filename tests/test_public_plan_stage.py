@@ -145,7 +145,7 @@ class _DeterministicIdeaSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         return IdeaSkillResult(
@@ -160,7 +160,7 @@ class _DeterministicIdeaSkill:
         )
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
-        return self.review_draft(request, self.generate_draft(request))
+        return self.finalize_draft(request, self.generate_draft(request))
 
 
 class _DeterministicPlanSkill:
@@ -292,7 +292,7 @@ class _DeterministicPlanSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult:
         return PlanSkillResult(
@@ -307,7 +307,7 @@ class _DeterministicPlanSkill:
         )
 
     def execute(self, request: PlanSkillRequest) -> PlanSkillResult:
-        return self.review_draft(request, self.generate_draft(request))
+        return self.finalize_draft(request, self.generate_draft(request))
 
 
 class _OperationBoundPlanSkill(_DeterministicPlanSkill):
@@ -658,17 +658,17 @@ class _DomainThenCompletionRejectedPlanSkill(_DeterministicPlanSkill):
         self.review_requests: list[PlanSkillRequest] = []
         self.completion_rejected = False
 
-    def review_draft(
+    def finalize_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult:
         self.review_requests.append(request)
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         if request.owner_rejection_kind == "domain" and not (
             self.completion_rejected
         ):
             self.completion_rejected = True
             raise PlanSkillUnavailable(
-                "plan_review_result_contract_invalid",
+                "plan_local_result_contract_invalid",
                 rejected_candidate={"final_plan": result.final_plan},
                 rejected_native_session_ref=result.primary_session_ref,
                 rejected_detail_code="codex_output_invalid",
@@ -729,12 +729,13 @@ def test_domain_and_completion_rejections_compose_in_the_same_native_session(
         ]
         completion_rejection = combined["run"]["completion_rejection"]
         assert completion_rejection["reason"] == {
-            "code": "plan_review_result_contract_invalid",
+            "code": "plan_local_result_contract_invalid",
             "detail": "codex_output_invalid",
         }
         assert combined["plan_acceptance"]["status"] == "rejected"
 
-        assert runtime.plan_stage.process_once()
+        assert runtime.plan_stage.process_once()  # Corrective real primary.
+        assert runtime.plan_stage.process_once()  # Local finalization.
         combined_request = plan_skill.review_requests[-1]
         assert combined_request.owner_rejection_kind == "domain"
         assert combined_request.predecessor_submission_ref == (
@@ -764,7 +765,7 @@ def test_domain_and_completion_rejections_compose_in_the_same_native_session(
             "attempt_ref"
         ]
         assert accepted_execution.predecessor_rejection_receipt is not None
-        assert len(plan_skill.requests) == 2
+        assert len(plan_skill.requests) == 3
         correction = plan_skill.requests[1]
         assert correction.native_session_ref == original_run["native_session_ref"]
         assert correction.predecessor_submission_ref == original_run[

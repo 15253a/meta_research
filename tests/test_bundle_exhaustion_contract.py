@@ -341,7 +341,6 @@ def _evidence(*, attempted: bool = False) -> BundleExhaustionEvidence:
         primary_invocation_ref=primary_invocation_ref,
         primary_response_hash=_hash("primary-response"),
         primary_assessment_hash=assessment_hash,
-        review_invocation_ref="bundle-review-invocation:1",
         reviewer_agent_ref=reviewer,
         review_findings=(),
         review_trace=review_trace,
@@ -507,3 +506,25 @@ def test_assessment_root_item_budget_fails_closed() -> None:
         validate_bundle_exhaustion_assessment(
             oversized, plan_document=_plan_document()
         )
+
+
+def test_historical_exhaustion_keeps_original_schema_and_invocation_binding() -> None:
+    historical = replace(
+        _evidence(attempted=True),
+        schema_ref="meta-research/bundle-exhaustion-evidence/v1",
+        review_invocation_ref="review-invocation:historical",
+    )
+    original = historical.as_dict()
+    restored = bundle_exhaustion_evidence_from_dict(
+        original, plan_document=_plan_document()
+    )
+    assert restored.as_dict() == original
+    assert restored.evidence_hash == canonical_hash(original)
+    assert restored.review_invocation_ref == "review-invocation:historical"
+
+    current = _evidence().as_dict()
+    assert current["schema_ref"] == "meta-research/bundle-exhaustion-evidence/v2"
+    assert "review_invocation_ref" not in current
+    current["review_invocation_ref"] = "review-invocation:forged"
+    with pytest.raises(OwnerConflict, match="bundle_exhaustion_evidence_invalid"):
+        bundle_exhaustion_evidence_from_dict(current, plan_document=_plan_document())

@@ -60,9 +60,9 @@ class _AutonomousTransport(_ReasoningTransport):
         self.call(request, "primary")
         return self.delegate.generate_draft(request)
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.call(request, "review")
-        return self.delegate.review_draft(request, draft)
+        return self.delegate.finalize_draft(request, draft)
 
     def decide_after_deepfetch(self, request, checkpoint, facts, summary):
         self.call(request, "autonomous-resume")

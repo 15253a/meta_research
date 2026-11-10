@@ -281,7 +281,7 @@ class _MetricReuseReasoningSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
@@ -305,7 +305,7 @@ class _MetricReuseReasoningSkill:
         )
 
     def execute(self, request: ReasoningSkillRequest) -> ReasoningSkillResult:
-        return self.review_draft(request, self.generate_draft(request))
+        return self.finalize_draft(request, self.generate_draft(request))
 
 
 def _runtime(path: Path, authority, provider):

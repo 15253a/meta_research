@@ -105,7 +105,7 @@ class PlanSkillProvider(Protocol):
 
     def generate_draft(self, request: PlanSkillRequest) -> PlanSkillDraft: ...
 
-    def review_draft(
+    def finalize_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult: ...
 
@@ -332,8 +332,6 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
     def _transport_contract_failure_code(self, operation_name: str) -> str:
         if operation_name == "primary":
             return "plan_primary_result_contract_invalid"
-        if operation_name == "review":
-            return "plan_review_result_contract_invalid"
         raise PlanSkillUnavailable("codex_operation_spool_invalid")
 
     def __init__(
@@ -376,9 +374,6 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         _key_path, transport_key = self._transport_key()
         output_contracts = {
             "plan-envelope-template": _plan_envelope_schema(
-                _schema_template_request()
-            ),
-            "advisory-finalization-template": _review_finalization_schema(
                 _schema_template_request()
             ),
         }
@@ -549,7 +544,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         )
 
     @resource_preparation
-    def review_draft(
+    def finalize_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult:
         # Root policy organizes advisory review before returning a candidate.
@@ -575,7 +570,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
 
     def execute(self, request: PlanSkillRequest) -> PlanSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(
+        return self.finalize_draft(
             replace(request, native_session_ref=draft.primary_session_ref),
             draft,
         )
@@ -689,8 +684,6 @@ def _plan_envelope_schema(request: PlanSkillRequest) -> dict[str, object]:
     }
 
 
-def _review_finalization_schema(request: PlanSkillRequest) -> dict[str, object]:
-    return {"type": "object", "additionalProperties": False, "properties": {"final_plan": _plan_document_schema(request)}, "required": ["final_plan"]}
 
 
 def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:

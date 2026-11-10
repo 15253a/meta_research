@@ -75,7 +75,7 @@ class _CorrectingParentSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         self.calls.append(("review", request))
         output = deepcopy(draft.draft)
         if self.malformed_phase == "review" and self.malformed is None:

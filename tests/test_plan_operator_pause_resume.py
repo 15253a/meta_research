@@ -1,8 +1,4 @@
-"""A paused Plan continues its primary or its optional post-draft work.
-
-The fixture explicitly schedules post-draft work. The production Plan adapter
-still checkpoints its final candidate locally without a second review call.
-"""
+"""Pause/restart real Plan primary; finalize a saved candidate locally."""
 import json
 from pathlib import Path
 import threading
@@ -12,7 +8,7 @@ import pytest
 
 from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
-from meta_research.plan_skill import CodexPlanSkillAdapter, _review_finalization_schema
+from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.idea_skill import stage_operation_input
 from test_public_plan_stage import (
     _runtime, _confirm_direct_quest, _finish_idea_stage,
@@ -23,12 +19,7 @@ from test_reasoning_operator_pause_resume import _control, _ExecWireContractRunn
 NATIVE = 'operator-paused-native-plan'
 
 
-class _SupervisedPlanWithOptionalContinuation(CodexPlanSkillAdapter):
-    """Explicit fixture workload to exercise an already saved Plan's pause.
-
-    This is an Owner continuation contract, not production forced-review
-    choreography or evidence of selected app-server review capabilities.
-    """
+class _SupervisedPlan(CodexPlanSkillAdapter):
     def __init__(self, root, executable):
         self.root = root
         self.primary_calls = 0
@@ -42,23 +33,6 @@ class _SupervisedPlanWithOptionalContinuation(CodexPlanSkillAdapter):
         (self.root / 'next-output.json').write_text(json.dumps({'plan':draft.draft}))
         return super().generate_draft(request)
 
-    def review_draft(self, request, draft):
-        (self.root / 'next-output.json').write_text(json.dumps({'final_plan':draft.draft}))
-        output, native, _ = self._invoke_root_operation(
-            operation_name='review',
-            prompt='Test-only optional post-draft work. Preserve the exact saved Plan and return final_plan.',
-            schema=_review_finalization_schema(request),
-            native_session_ref=draft.primary_session_ref,
-            job_ref=request.job_ref, run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding.as_dict(),
-            operation_input={'request': stage_operation_input(request, 'plan'),
-                             'saved_primary_draft': draft.draft},
-        )
-        assert native == draft.primary_session_ref
-        assert output['final_plan'] == draft.draft
-        return super().review_draft(request, draft)
 
 
 def _provider(path, root, *, stop_on_call=2):
@@ -85,7 +59,7 @@ def _provider(path, root, *, stop_on_call=2):
 
 
 def _make_runtime(root, executable):
-    adapter = _SupervisedPlanWithOptionalContinuation(root, executable)
+    adapter = _SupervisedPlan(root, executable)
     runtime = _runtime(root, idea_skill=_DeterministicIdeaSkill(), plan_skill=adapter)
     runtime.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
     adapter.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
@@ -171,7 +145,7 @@ def test_pause_before_any_plan_call_keeps_the_prepared_primary(tmp_path):
         runtime.close()
 
 
-def test_saved_plan_draft_needs_no_primary_spool_to_resume_before_review(tmp_path):
+def test_saved_plan_draft_needs_no_primary_spool_to_resume_local_finalization(tmp_path):
     runtime = _runtime(tmp_path / 'data', idea_skill=_DeterministicIdeaSkill(),
                        plan_skill=_DeterministicPlanSkill(no_gap=False))
     try:
@@ -195,68 +169,33 @@ def test_saved_plan_draft_needs_no_primary_spool_to_resume_before_review(tmp_pat
         runtime.close()
 
 
-@pytest.mark.parametrize('tamper', [False, True], ids=['resume-review-only', 'reject-tampered-stop'])
-def test_paused_plan_review_preserves_primary_and_replaces_stopped_operation(tmp_path, tamper):
-    """Pause the fixture's optional work; never repeat its accepted primary."""
-    root = tmp_path / 'data'
+
+def test_saved_primary_restarts_into_local_finalization_without_provider(tmp_path):
+    root = tmp_path / "data"
     root.mkdir()
-    executable = _provider(tmp_path / 'codex', root)
+    executable = _provider(tmp_path / "codex", root, stop_on_call=99)
     runtime, _ = _make_runtime(root, executable)
     _confirm_direct_quest(runtime)
     _finish_idea_stage(runtime)
     for _ in range(3):
         assert runtime.plan_stage.process_once()
-    request_ref = runtime.plan_stage.query_current()['stage_run_request']['request_ref']
+    request_ref = runtime.plan_stage.query_current()["stage_run_request"]["request_ref"]
     before = runtime.owners.agent_runtime.query_plan_stage_run(request_ref)
     assert before.primary_draft is not None
-    failures = []
-    def run_review():
-        try:
-            runtime.plan_stage.process_once()
-        except BaseException as error:
-            failures.append(error)
-    worker = threading.Thread(target=run_review)
-    worker.start()
-    deadline = time.monotonic() + 15
-    calls = root / 'provider-calls.jsonl'
-    while len(calls.read_text().splitlines()) < 2:
-        assert time.monotonic() < deadline, failures
-        time.sleep(.01)
-    _control(runtime, before, 'pause')
-    worker.join(15)
-    assert not worker.is_alive() and not failures
-    spool = next((root / 'plan-skill-provider').glob('provider-operations/*/review'))
-    assert json.loads((spool / 'supervisor-exit.json').read_text())['payload']['termination_reason'] == 'stopped'
-    original_spool = {p.name:p.read_bytes() for p in spool.iterdir() if p.is_file()}
+    assert len((root / "provider-calls.jsonl").read_text().splitlines()) == 1
     runtime.close()
-    if tamper:
-        with (spool / 'stdout.jsonl').open('a') as stream:
-            stream.write('{"type":"thread.started","thread_id":"forged"}\n')
     restarted, adapter = _make_runtime(root, executable)
     try:
-        assert not restarted.plan_stage.process_once()
-        if tamper:
-            with pytest.raises(OwnerConflict, match='operator_stop_checkpoint_invalid'):
-                _control(restarted, before, 'resume')
-            assert restarted.owners.agent_runtime.query_managed_run(before.run_ref)['status'] == 'suspended'
-            assert len(calls.read_text().splitlines()) == 2
-            return
-        assert _control(restarted, before, 'resume')['executed'] is True
-        resumed = restarted.owners.agent_runtime.query_plan_stage_run(request_ref)
-        assert resumed.attempt_ref != before.attempt_ref
-        assert resumed.fence_ref != before.fence_ref
-        assert resumed.run_ref == before.run_ref
-        assert resumed.root_session_ref == before.root_session_ref
-        assert resumed.native_session_ref == before.native_session_ref == NATIVE
-        assert resumed.runtime_binding_hash == before.runtime_binding_hash
-        assert resumed.primary_draft.draft == before.primary_draft.draft
-        assert resumed.review_invocation.operation_ref != before.review_invocation.operation_ref
         assert restarted.plan_stage.process_once()
         after = restarted.owners.agent_runtime.query_plan_stage_run(request_ref)
+        assert after.primary_draft == before.primary_draft
         assert after.execution is not None
         assert adapter.primary_calls == 0
-        assert len(calls.read_text().splitlines()) == 3
-        assert original_spool == {p.name:p.read_bytes() for p in spool.iterdir() if p.is_file()}
+        assert len((root / "provider-calls.jsonl").read_text().splitlines()) == 1
+        from sqlalchemy import text
+        with restarted.owners.agent_runtime._database.read() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_stage_provider_invocations WHERE attempt_ref=:ref"), {"ref": after.attempt_ref}).scalar_one() == 1
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_provider_units WHERE attempt_ref=:ref AND unit_kind='plan_review'"), {"ref": after.attempt_ref}).scalar_one() == 0
         for _ in range(5):
             restarted.plan_stage.process_once()
         assert restarted.owners.advancement_engine.query_plan_stage_commit(request_ref) is not None

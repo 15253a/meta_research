@@ -117,7 +117,7 @@ class _DeterministicIdeaSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         self.review_requests.append(request)
@@ -134,7 +134,7 @@ class _DeterministicIdeaSkill:
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(request, draft)
+        return self.finalize_draft(request, draft)
 
 
 def _runtime(path: Path, idea_skill: _DeterministicIdeaSkill):
@@ -271,9 +271,7 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         assert requested["run"]["provider_operations"]["primary"]["status"] == (
             "prepared"
         )
-        assert requested["run"]["provider_operations"]["review"]["status"] == (
-            "prepared"
-        )
+        assert set(requested["run"]["provider_operations"]) == {"primary"}
         assert requested["run"]["primary_draft_checkpoint"] is None
         assert requested["run"]["attempt_execution_receipt"] is None
         assert requested["run"]["completion_receipt"] is None
@@ -316,9 +314,7 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         assert primary_bound["run"]["provider_operations"]["primary"][
             "status"
         ] == "completed"
-        assert primary_bound["run"]["provider_operations"]["review"][
-            "status"
-        ] == "prepared"
+        assert set(primary_bound["run"]["provider_operations"]) == {"primary"}
         primary_checkpoint = primary_bound["run"]["primary_draft_checkpoint"]
         assert primary_checkpoint["status"] == "recorded"
         assert primary_checkpoint["adapter_kind"] == "test_deterministic"
@@ -328,9 +324,7 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         assert runtime.idea_stage.process_once()
         executed = runtime.idea_stage.query_current()
         assert executed["run"]["status"] == "awaiting_acceptance"
-        assert executed["run"]["provider_operations"]["review"]["status"] == (
-            "completed"
-        )
+        assert set(executed["run"]["provider_operations"]) == {"primary"}
         assert executed["run"]["attempt_execution_receipt"]["status"] == "accepted"
         assert executed["run"]["completion_receipt"] is None
         assert executed["outcome_acceptance"]["status"] == "awaiting_content"
@@ -401,13 +395,13 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
 class _CorrectedIdeaSkill(_DeterministicIdeaSkill):
     """Return one completed but invalid candidate, then honor Owner feedback."""
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
-        result = super().review_draft(request, draft)
+        result = super().finalize_draft(request, draft)
         if len(self.review_requests) == 1:
             raise IdeaSkillUnavailable(
-                "idea_review_result_contract_invalid",
+                "idea_local_result_contract_invalid",
                 rejected_candidate={
 
                     "final_outcome": result.final_outcome,
@@ -445,10 +439,10 @@ def test_idea_completion_rejection_keeps_history_and_resumes_same_session(
         assert rejection["attempt_ref"] == original["attempt_ref"]
         assert rejection["successor_attempt_ref"] == rejected["attempt_ref"]
         assert rejection["reason"]["code"] == (
-            "idea_review_result_contract_invalid"
+            "idea_local_result_contract_invalid"
         )
         assert rejection["reason"]["detail"] == "codex_output_invalid"
-        assert rejection["candidate"]["phase"] == "review"
+        assert rejection["candidate"]["phase"] == "local"
         assert set(rejection["candidate"]["result"]) == {"final_outcome"}
         assert rejection["candidate"]["result"]["final_outcome"]["kind"] == "IdeaSet"
         assert rejection["feedback"]
@@ -463,7 +457,8 @@ def test_idea_completion_rejection_keeps_history_and_resumes_same_session(
         assert original_fact is not None
         assert original_fact.as_public_dict() == rejection
 
-        assert runtime.idea_stage.process_once()
+        assert runtime.idea_stage.process_once()  # Corrective real primary.
+        assert runtime.idea_stage.process_once()  # Local finalization.
         revised_request = provider.review_requests[-1]
         assert revised_request.owner_rejection_kind == "completion"
         assert revised_request.predecessor_submission_ref == rejection[

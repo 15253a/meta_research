@@ -336,8 +336,8 @@ def test_successor_cycle_keeps_elapsed_time_and_budget_revision(tmp_path, monkey
     )
 
     class AdvisoryReasoningSkill(_DeterministicReasoningSkill):
-        def review_draft(self, request, draft):
-            return replace(super().review_draft(request, draft),
+        def finalize_draft(self, request, draft):
+            return replace(super().finalize_draft(request, draft),
                            review_mode="advisory_unobserved", reviewer_agent_ref=None)
 
     now = [1000.0]
@@ -397,12 +397,12 @@ def test_authoritative_quest_ending_stops_time(tmp_path, monkeypatch):
     )
 
     class Idea(_NoViableIdeaSkill):
-        def review_draft(self, request, draft):
-            return replace(super().review_draft(request, draft), review_mode="advisory_unobserved", reviewer_agent_ref=None)
+        def finalize_draft(self, request, draft):
+            return replace(super().finalize_draft(request, draft), review_mode="advisory_unobserved", reviewer_agent_ref=None)
 
     class Reasoning(_CandidateCompletionReasoningSkill):
-        def review_draft(self, request, draft):
-            return replace(super().review_draft(request, draft), review_mode="advisory_unobserved", reviewer_agent_ref=None)
+        def finalize_draft(self, request, draft):
+            return replace(super().finalize_draft(request, draft), review_mode="advisory_unobserved", reviewer_agent_ref=None)
 
     now = [1000.0]
     monkeypatch.setattr("time.time", lambda: now[0])

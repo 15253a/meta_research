@@ -359,7 +359,7 @@ class BundleSkillProvider(Protocol):
 
     def generate_draft(self, request: BundleSkillRequest) -> BundleSkillDraft: ...
 
-    def review_draft(
+    def finalize_draft(
         self, request: BundleSkillRequest, draft: BundleSkillDraft
     ) -> BundleSkillResult | BundleExhaustionSkillResult: ...
 
@@ -1444,7 +1444,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
 
     @resource_preparation
-    def review_draft(
+    def finalize_draft(
         self, request: BundleSkillRequest, draft: BundleSkillDraft
     ) -> BundleSkillResult | BundleExhaustionSkillResult:
         _validate_request(request)
@@ -1540,7 +1540,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         self, request: BundleSkillRequest
     ) -> BundleSkillResult | BundleExhaustionSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(
+        return self.finalize_draft(
             replace(request, native_session_ref=draft.primary_session_ref), draft
         )
 
@@ -2022,111 +2022,10 @@ def _target_plan_envelope_schema(
     }
 
 
-def _review_schema(
-    request: BundleSkillRequest,
-    *,
-    draft: BundleSkillDraft | None = None,
-) -> dict[str, object]:
-    if draft is not None and draft.output_kind == "exhaustion_assessment":
-        return _exhaustion_review_schema(
-            reviewed_assessment_hash=canonical_hash(draft.draft)
-        )
-    target_review = _target_plan_review_schema(request)
-    if draft is not None:
-        if draft.output_kind != "target_plan":
-            raise BundleSkillUnavailable("bundle_skill_output_kind_invalid")
-        return target_review
-    return target_review
 
 
-def _target_plan_review_schema(
-    request: BundleSkillRequest,
-) -> dict[str, object]:
-    text = {"type": "string", "minLength": 1}
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "reviewer_agent_ref": text,
-            "findings": {
-                "type": "array",
-                "maxItems": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "finding_id": text,
-                        "category": {
-                            "type": "string",
-                            "enum": [
-                                "lineage",
-                                "dag",
-                                "dedup",
-                                "feasibility",
-                                "owner_boundary",
-                            ],
-                        },
-                        "message": text,
-                    },
-                    "required": ["finding_id", "category", "message"],
-                },
-            },
-            "final_target_plan": _target_plan_schema(request),
-            "dispositions": {
-                "type": "array",
-                "maxItems": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "finding_id": text,
-                        "action": {
-                            "type": "string",
-                            "enum": ["revised", "not_adopted"],
-                        },
-                        "rationale": text,
-                    },
-                    "required": ["finding_id", "action", "rationale"],
-                },
-            },
-        },
-        "required": [
-            "reviewer_agent_ref",
-            "findings",
-            "final_target_plan",
-            "dispositions",
-        ],
-    }
 
 
-def _exhaustion_review_schema(
-    *, reviewed_assessment_hash: str | None
-) -> dict[str, object]:
-    reviewed_hash_schema: dict[str, object] = _sha256_schema()
-    if reviewed_assessment_hash is not None:
-        reviewed_hash_schema = {"const": reviewed_assessment_hash}
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "schema_ref": {"const": BUNDLE_EXHAUSTION_REVIEW_RESPONSE_SCHEMA},
-            "reviewer_agent_ref": _ref_schema(),
-            "reviewed_assessment_hash": reviewed_hash_schema,
-            "accepted": {"const": True},
-            "findings": {
-                "type": "array",
-                "maxItems": 0,
-                "items": {"type": "string"},
-            },
-        },
-        "required": [
-            "schema_ref",
-            "reviewer_agent_ref",
-            "reviewed_assessment_hash",
-            "accepted",
-            "findings",
-        ],
-    }
 
 
 def _exhaustion_assessment_envelope_schema(

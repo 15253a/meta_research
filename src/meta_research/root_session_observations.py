@@ -196,9 +196,13 @@ class RootSessionObservations:
 
     def _stage_scope(self, row, unit):
         phase = unit["invocation_phase"]
+        # Current continuation units represent a real autonomous-resume turn;
+        # they do not share a fictitious local-review invocation. Historical
+        # units can still bind their original sealed review evidence below.
         if (row["stage"] == "reasoning" and unit["unit_kind"] == "reasoning_review"
-                and unit["reasoning_checkpoint_ref"] and unit["reasoning_checkpoint_recorded_at"]
-                and unit["started_at"] >= unit["reasoning_checkpoint_recorded_at"]):
+                and (phase is None or (unit["reasoning_checkpoint_ref"]
+                     and unit["reasoning_checkpoint_recorded_at"]
+                     and unit["started_at"] >= unit["reasoning_checkpoint_recorded_at"]))):
             phase = "autonomous-resume"
         elif phase is None and not (row["stage"] == "bundle" and unit["unit_kind"] == "bundle_review"):
             phase = unit["unit_kind"].rsplit("_", 1)[-1]
@@ -214,7 +218,8 @@ class RootSessionObservations:
     def _stage_reader(self, row, unit, *, historical_review=False):
         scope = self._stage_scope(row, unit)
         if historical_review:
-            if scope["operation_name"] != "autonomous-resume":
+            if (unit["invocation_phase"] != "review"
+                    or scope["operation_name"] != "autonomous-resume"):
                 raise ValueError("root_session_operation_not_found")
             # The accepted checkpoint separates two physical turns that reuse
             # the same Owner unit. Its earlier signed review remains history.
@@ -250,7 +255,8 @@ class RootSessionObservations:
             units = self._stage_units(connection, row)
             session["limited"] = len(units) > _MAX_OPERATIONS
             for unit in reversed(units[:_MAX_OPERATIONS]):
-                if self._stage_scope(row, unit)["operation_name"] == "autonomous-resume":
+                if (unit["invocation_phase"] == "review"
+                        and self._stage_scope(row, unit)["operation_name"] == "autonomous-resume"):
                     historical_reader, historical_scope = self._stage_reader(row, unit, historical_review=True)
                     try:
                         if historical_reader._resolve_operation(historical_scope) is not None:

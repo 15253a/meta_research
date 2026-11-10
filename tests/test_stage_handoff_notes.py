@@ -134,7 +134,7 @@ def _reasoning_prompt(tmp_path, notes):
     context["upstream_stage_closure"][-1]["closure"] = notes
     request = replace(request, runtime_binding=adapter.runtime_binding(), context_pack=context, context_pack_hash=canonical_hash(context))
     draft = adapter.generate_draft(request)
-    result = adapter.review_draft(replace(request, native_session_ref=draft.primary_session_ref), draft)
+    result = adapter.finalize_draft(replace(request, native_session_ref=draft.primary_session_ref), draft)
     assert result.scientific_outcome["notes"] == NOTE
     sections = _context_sections(runner.calls[0][1], request.context_pack_hash,
         complete_sections=("upstream_stage_closure",))

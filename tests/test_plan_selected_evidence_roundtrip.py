@@ -109,9 +109,9 @@ class _LaterPagePlanSkill(_DeterministicPlanSkill):
 
 
 class _LaterPageReasoningSkill(_MetricReuseReasoningSkill):
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         return replace(
-            super().review_draft(request, draft),
+            super().finalize_draft(request, draft),
             review_mode='advisory_unobserved', reviewer_agent_ref=None,
         )
 

@@ -34,9 +34,8 @@ from meta_research.owners.common import (
     OwnerConflict,
     canonical_hash,
 )
-BUNDLE_EXHAUSTION_EVIDENCE_SCHEMA = (
-    "meta-research/bundle-exhaustion-evidence/v1"
-)
+BUNDLE_EXHAUSTION_EVIDENCE_SCHEMA = "meta-research/bundle-exhaustion-evidence/v2"
+_HISTORICAL_EXHAUSTION_EVIDENCE_SCHEMA = "meta-research/bundle-exhaustion-evidence/v1"
 BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA = (
     "meta-research/bundle-exhaustion-assessment/v1"
 )
@@ -863,17 +862,21 @@ class BundleExhaustionEvidence:
     primary_invocation_ref: str
     primary_response_hash: str
     primary_assessment_hash: str
-    review_invocation_ref: str
     reviewer_agent_ref: str | None
     review_findings: tuple[str, ...]
     review_trace: BundleExhaustionReviewTrace | None
     completion_contract: NormalizedCompletionContract
     exploration_records: tuple[BundleExhaustionExplorationRecord, ...]
     rejected_submissions: tuple[BundleExhaustionRejectedSubmission, ...]
+    review_invocation_ref: str | None = None
     schema_ref: str = BUNDLE_EXHAUSTION_EVIDENCE_SCHEMA
 
     def __post_init__(self) -> None:
-        if self.schema_ref != BUNDLE_EXHAUSTION_EVIDENCE_SCHEMA:
+        if self.schema_ref not in {BUNDLE_EXHAUSTION_EVIDENCE_SCHEMA, _HISTORICAL_EXHAUSTION_EVIDENCE_SCHEMA}:
+            raise OwnerConflict("bundle_exhaustion_evidence_schema_invalid")
+        if self.schema_ref == _HISTORICAL_EXHAUSTION_EVIDENCE_SCHEMA:
+            _text(self.review_invocation_ref, "bundle_exhaustion_review_invocation_ref_invalid")
+        elif self.review_invocation_ref is not None:
             raise OwnerConflict("bundle_exhaustion_evidence_schema_invalid")
         _text(
             self.evidence_identity,
@@ -897,10 +900,6 @@ class BundleExhaustionEvidence:
             (
                 self.primary_invocation_ref,
                 "bundle_exhaustion_primary_invocation_ref_invalid",
-            ),
-            (
-                self.review_invocation_ref,
-                "bundle_exhaustion_review_invocation_ref_invalid",
             ),
         ):
             _text(value, code, maximum=256)
@@ -1119,7 +1118,8 @@ class BundleExhaustionEvidence:
             "primary_invocation_ref": self.primary_invocation_ref,
             "primary_response_hash": self.primary_response_hash,
             "primary_assessment_hash": self.primary_assessment_hash,
-            "review_invocation_ref": self.review_invocation_ref,
+            **({"review_invocation_ref": self.review_invocation_ref}
+               if self.schema_ref == _HISTORICAL_EXHAUSTION_EVIDENCE_SCHEMA else {}),
             "reviewer_agent_ref": self.reviewer_agent_ref,
             "review_findings": list(self.review_findings),
             "review_trace": (
@@ -1990,7 +1990,7 @@ def bundle_exhaustion_evidence_from_dict(
         "primary_invocation_ref",
         "primary_response_hash",
         "primary_assessment_hash",
-        "review_invocation_ref",
+        *({"review_invocation_ref"} if value.get("schema_ref") == _HISTORICAL_EXHAUSTION_EVIDENCE_SCHEMA else set()),
         "reviewer_agent_ref",
         "review_findings",
         "review_trace",
@@ -2124,7 +2124,7 @@ def bundle_exhaustion_evidence_from_dict(
         primary_invocation_ref=value["primary_invocation_ref"],
         primary_response_hash=value["primary_response_hash"],
         primary_assessment_hash=value["primary_assessment_hash"],
-        review_invocation_ref=value["review_invocation_ref"],
+        review_invocation_ref=value.get("review_invocation_ref"),
         reviewer_agent_ref=value["reviewer_agent_ref"],
         review_findings=tuple(value["review_findings"]),
         review_trace=review_trace,

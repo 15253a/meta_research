@@ -101,28 +101,21 @@ def _authenticated_client(runtime: object) -> TestClient:
         create_app(runtime, base_url=base_url, control_key="control-secret"),
         base_url=base_url,
     )
-    client.cookies.set("meta_research_session", "test-session")
+    response = client.post("/auth/bootstrap", headers={"Origin": base_url},
+                           json={"token": runtime.authentication.issue_bootstrap_token()})
+    assert response.status_code == 200
+    client._test_runtime = runtime
     return client
 
 
 def _runtime(reader: StageRootObservationReader) -> object:
-    configurable = SimpleNamespace(
-        configure_resident_mcp_endpoint=lambda _base_url: None
-    )
-    return SimpleNamespace(
-        configure_resident_mcp_endpoint=lambda _base_url: None,
-        bundle_stage=configurable,
-        reasoning_stage=configurable,
-        target_run_runtime=configurable,
-        query_stage_root_observations=reader.query,
-        query_stage_raw_output=lambda run_ref, **values: reader.query_raw(
-            run_ref, **values
-        ),
-        authentication=SimpleNamespace(
-            session_is_valid=lambda token: token == "test-session",
-            control_key_matches=lambda supplied, expected: supplied == expected,
-        ),
-    )
+    from test_public_plan_stage import _runtime as production_runtime
+    from test_public_plan_stage import _DeterministicIdeaSkill, _DeterministicPlanSkill
+    runtime = production_runtime(reader._data_root / "route-product",
+        idea_skill=_DeterministicIdeaSkill(), plan_skill=_DeterministicPlanSkill(no_gap=False))
+    runtime.query_stage_root_observations = reader.query
+    runtime.query_stage_raw_output = lambda run_ref, **values: reader.query_raw(run_ref, **values)
+    return runtime
 
 
 def test_stage_root_reader_pages_only_redacted_root_command_output(
@@ -581,6 +574,7 @@ def test_stage_root_observation_route_is_authenticated_bounded_and_redacted(
         ).status_code == 401
     finally:
         client.close()
+        client._test_runtime.close()
 
 
 def test_stage_raw_output_route_pages_exact_private_provider_stdout(
@@ -656,3 +650,4 @@ def test_stage_raw_output_route_pages_exact_private_provider_stdout(
         ).status_code == 401
     finally:
         client.close()
+        client._test_runtime.close()

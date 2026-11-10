@@ -32,18 +32,18 @@ from test_public_quest_completion import (
 
 
 class _AdvisoryIdeaSkill(_NoViableIdeaSkill):
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         return replace(
-            super().review_draft(request, draft),
+            super().finalize_draft(request, draft),
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
         )
 
 
 class _AdvisoryCompletionReasoningSkill(_CandidateCompletionReasoningSkill):
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         return replace(
-            super().review_draft(request, draft),
+            super().finalize_draft(request, draft),
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
         )

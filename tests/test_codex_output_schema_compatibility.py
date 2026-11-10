@@ -6,12 +6,9 @@ import pytest
 
 from meta_research.bundle_skill import (
     _dispatch_schema,
-    _exhaustion_review_schema,
-    _review_schema as _bundle_review_schema,
     _schema_template_request as _bundle_template_request,
     _target_batch_schema,
     _target_plan_envelope_schema,
-    _target_plan_review_schema,
 )
 from meta_research.deepfetch import (
     _deepfetch_output_schema,
@@ -23,17 +20,14 @@ from meta_research.idea_skill import (
     _compile_codex_output_schema,
     _decode_codex_provider_output,
     _outcome_envelope_schema,
-    _review_finalization_schema as _idea_review_schema,
     _unwrap_codex_root_output,
     _validate_codex_output_schema_dialect,
 )
 from meta_research.plan_skill import (
     _plan_envelope_schema,
-    _review_finalization_schema as _plan_review_schema,
     _schema_template_request as _plan_template_request,
 )
 from meta_research.reasoning_skill import (
-    _reasoning_autonomous_checkpoint_schema,
     _reasoning_primary_output_schema,
     _reasoning_review_response_schema,
     _reasoning_stage_output_schema,
@@ -77,37 +71,18 @@ def _actual_operation_schemas() -> Iterator[tuple[str, dict[str, object]]]:
         "idea-primary",
         _outcome_envelope_schema("question:template", "context:template"),
     )
-    yield (
-        "idea-review",
-        _idea_review_schema("question:template", "context:template"),
-    )
 
     plan = _plan_template_request()
     yield "plan-primary", _plan_envelope_schema(plan)
-    yield "plan-review", _plan_review_schema(plan)
 
     bundle = _bundle_template_request()
     yield "bundle-primary", _target_plan_envelope_schema(bundle)
-    yield "bundle-target-review", _target_plan_review_schema(bundle)
-    yield "bundle-exhaustion-review", _exhaustion_review_schema(
-        reviewed_assessment_hash="a" * 64
-    )
     yield "bundle-dispatch", _dispatch_schema(("target:template",))
     yield "bundle-rolling-batch", _target_batch_schema(bundle)
-    # This union is frozen into RuntimeBinding even though actual review turns
-    # select one of the two concrete schemas above.
-    yield "bundle-review-binding", _bundle_review_schema(bundle)
 
     reasoning = _reasoning_template_request()
     closed = _reasoning_stage_output_schema(reasoning)
-    autonomous = _reasoning_autonomous_checkpoint_schema(reasoning)
     yield "reasoning-primary", _reasoning_primary_output_schema(reasoning)
-    yield "reasoning-review", _reasoning_review_response_schema(
-        reasoning, closed
-    )
-    yield "reasoning-autonomous-review", _reasoning_review_response_schema(
-        reasoning, autonomous
-    )
     yield "reasoning-autonomous-resume", _reasoning_review_response_schema(
         reasoning, closed
     )

@@ -2837,7 +2837,7 @@ export async function fetchStageRawOutput(
     after?: number;
     limit?: number;
     signal?: AbortSignal;
-    phase?: "primary" | "review";
+    phase?: "primary" | "review" | "autonomous-resume" | `target-batch-${number}` | `dispatch-${number}`;
   } = {},
 ): Promise<StageRawOutputPage> {
   const after = options.after ?? 0;

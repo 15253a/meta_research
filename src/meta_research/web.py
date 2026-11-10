@@ -3311,7 +3311,7 @@ def create_app(
         run_ref: str,
         after: int = Query(default=0, ge=0),
         limit: int = Query(default=64 * 1024, ge=4, le=256 * 1024),
-        phase: Literal["primary", "review"] | None = None,
+        phase: str | None = Query(default=None, min_length=1, max_length=96),
     ) -> dict[str, object]:
         try:
             page = runtime.query_stage_raw_output(

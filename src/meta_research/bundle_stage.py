@@ -526,7 +526,7 @@ class BundleStageWorker:
             batch_target_commits = tuple(
                 self._target_commit_projection(commit) for commit in commits
             )
-            batch_operation_ref = run.review_invocation.operation_ref
+            batch_operation_ref = run.primary_invocation.operation_ref
             batch_unit_ref = _rolling_provider_unit_ref(
                 operation_ref=batch_operation_ref,
                 operation_name=f"target-batch-{graph.head_generation + 1}",
@@ -793,7 +793,7 @@ class BundleStageWorker:
             if pending_dispatch is not None
             else len(decisions) + 1
         )
-        dispatch_operation_ref = run.review_invocation.operation_ref
+        dispatch_operation_ref = run.primary_invocation.operation_ref
         dispatch_unit_ref = _rolling_provider_unit_ref(
             operation_ref=dispatch_operation_ref,
             operation_name=f"dispatch-{dispatch_generation}",
@@ -2741,12 +2741,8 @@ class BundleStageWorker:
         if not bundle_bindings_compatible(runtime_binding, run.runtime_binding):
             self._observation = BundleObservation("failure", "bundle_runtime_binding_drift")
             return False
-        invocation = (
-            run.primary_invocation
-            if run.primary_draft is None
-            else run.review_invocation
-        )
-        phase = "primary" if run.primary_draft is None else "review"
+        invocation = run.primary_invocation
+        phase = "primary"
         base_job_ref = invocation.operation_ref
         job_ref = self._agent_runtime.root_provider_continuation_job_ref(
             root_kind="bundle",
@@ -2949,154 +2945,43 @@ class BundleStageWorker:
             adapter_kind=run.primary_draft.adapter_kind,
             output_kind=cast(str, _bundle_primary_output_kind(run)),
         )
-        # Exhaustion review is the only review-phase provider effect. TargetPlan
-        # review is an adapter-local projection of the validated primary draft.
+        # Both exhaustion and TargetPlan wrapping validate the persisted primary
+        # locally. Neither owns another provider operation, unit, or safe point.
         if draft.output_kind == "exhaustion_assessment":
-            try:
-                self._agent_runtime.begin_provider_unit(
-                    unit_ref=unit_ref,
-                    operation_ref=job_ref,
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    unit_kind="bundle_review",
-                )
-            except OwnerConflict as error:
-                self._observation = BundleObservation("failure", error.code)
-                return False
-            provider_safe = True
             result = None
             try:
-                try:
-                    result = provider.review_draft(skill_request, draft)
-                    if not isinstance(result, BundleExhaustionSkillResult):
-                        raise BundleSkillContractError(
-                            "bundle_skill_result_invalid"
-                        )
-                    validate_bundle_exhaustion_skill_result(
-                        skill_request,
-                        result,
-                    )
-                except BundleSkillUnavailable as error:
-                    error = self._recover_stopped_error(error, run.run_ref)
-                    review_session_ref = (
-                        error.native_session_ref or run.native_session_ref
-                    )
-                    if (
-                        review_session_ref is not None
-                        and self._agent_runtime.park_root_provider_session_for_human_request(
-                            root_kind="bundle",
-                            phase="review",
-                            run_ref=run.run_ref,
-                            attempt_ref=run.attempt_ref,
-                            fence_ref=run.fence_ref,
-                            native_session_ref=review_session_ref,
-                            runtime_binding_hash=run.runtime_binding_hash,
-                        )
-                    ):
-                        self._finish_provider_job(job_ref)
-                        self._observation = BundleObservation("ready")
-                        return True
-                    if error.rejected_candidate is not None:
-                        if (
-                            error.rejected_native_session_ref is None
-                            or error.rejected_detail_code is None
-                        ):
-                            raise OwnerConflict(
-                                "stage_completion_rejection_invalid"
-                            )
-                        self._reject_completion_candidate(
-                            unit_ref=unit_ref,
-                            run=run,
-                            operation_name="review",
-                            native_session_ref=error.rejected_native_session_ref,
-                            candidate=error.rejected_candidate,
-                            failure_code=error.code,
-                            detail_code=error.rejected_detail_code,
-                        )
-                        provider_safe = False
-                        self._observation = BundleObservation("failure", error.code)
-                        return True
-                    if error.code == "codex_operation_reconciliation_pending":
-                        provider_safe = False
-                    elif error.recovery_checkpoint is not None:
-                        provider_safe = False
-                        self._agent_runtime.record_stage_provider_hard_ceiling(
-                            unit_ref=unit_ref,
-                            run_ref=run.run_ref,
-                            attempt_ref=run.attempt_ref,
-                            fence_ref=run.fence_ref,
-                            failure_code=error.code,
-                            provider_exit=error.recovery_checkpoint,
-                        )
-                    self._observation = BundleObservation("failure", error.code)
-                    return False
-                except RecoverableBundleSkillCandidateError as error:
-                    if result is None:
-                        self._observation = BundleObservation("failure", str(error))
-                        return False
-                    if self._agent_runtime.park_root_provider_session_for_human_request(
-                        root_kind="bundle",
-                        phase="review",
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        native_session_ref=result.primary_session_ref,
-                        runtime_binding_hash=run.runtime_binding_hash,
-                    ):
-                        self._finish_provider_job(job_ref)
-                        self._observation = BundleObservation("ready")
-                        return True
-                    failure_code = "bundle_review_result_contract_invalid"
+                result = provider.finalize_draft(skill_request, draft)
+                if not isinstance(result, BundleExhaustionSkillResult):
+                    raise BundleSkillContractError("bundle_skill_result_invalid")
+                validate_bundle_exhaustion_skill_result(skill_request, result)
+            except BundleSkillUnavailable as error:
+                self._observation = BundleObservation("failure", error.code)
+                return False
+            except RecoverableBundleSkillCandidateError as error:
+                if result is not None:
                     self._reject_completion_candidate(
-                        unit_ref=unit_ref,
-                        run=run,
-                        operation_name="review",
+                        unit_ref=run.primary_invocation.invocation_ref,
+                        run=run, operation_name="local",
                         native_session_ref=result.primary_session_ref,
                         candidate=asdict(result),
-                        failure_code=failure_code,
+                        failure_code="bundle_local_result_contract_invalid",
                         detail_code=str(error),
                     )
-                    provider_safe = False
-                    self._observation = BundleObservation("failure", failure_code)
-                    return True
-                except BundleSkillContractError as error:
-                    self._observation = BundleObservation("failure", str(error))
-                    return False
-                if self._agent_runtime.park_root_provider_session_for_human_request(
-                    root_kind="bundle",
-                    phase="review",
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    native_session_ref=result.primary_session_ref,
-                    runtime_binding_hash=run.runtime_binding_hash,
-                ):
-                    self._finish_provider_job(job_ref)
-                    self._observation = BundleObservation("ready")
-                    return True
-                self._accept_exhaustion_review(
-                    request=request,
-                    run=run,
-                    result=result,
-                )
-                self._observation = BundleObservation("ready")
-                return True
-            finally:
-                if provider_safe:
-                    self._agent_runtime.acknowledge_provider_safe_point(
-                        unit_ref=unit_ref,
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                    )
+                self._observation = BundleObservation("failure", str(error))
+                return result is not None
+            except BundleSkillContractError as error:
+                self._observation = BundleObservation("failure", str(error))
+                return False
+            self._accept_exhaustion_assessment(request=request, run=run, result=result)
+            self._observation = BundleObservation("ready")
+            return True
 
         if draft.output_kind != "target_plan":
             self._observation = BundleObservation("failure", "bundle_skill_output_kind_invalid")
             return False
         result = None
         try:
-            result = provider.review_draft(skill_request, draft)
+            result = provider.finalize_draft(skill_request, draft)
             if not isinstance(result, BundleSkillResult):
                 raise BundleSkillContractError(
                     "bundle_skill_result_invalid"
@@ -3108,10 +2993,15 @@ class BundleStageWorker:
             self._observation = BundleObservation("failure", error.code)
             return False
         except RecoverableBundleSkillCandidateError as error:
-            self._observation = BundleObservation("failure", str(error)
-                if result is None
-                else "bundle_review_result_contract_invalid")
-            return False
+            if result is not None:
+                self._reject_completion_candidate(
+                    unit_ref=run.primary_invocation.invocation_ref, run=run,
+                    operation_name="local", native_session_ref=result.primary_session_ref,
+                    candidate=asdict(result), failure_code="bundle_local_result_contract_invalid",
+                    detail_code=str(error),
+                )
+            self._observation = BundleObservation("failure", str(error))
+            return result is not None
         except BundleSkillContractError as error:
             self._observation = BundleObservation("failure", str(error))
             return False
@@ -3234,7 +3124,12 @@ class BundleStageWorker:
         failure_code: str,
         detail_code: str,
     ) -> None:
-        self._agent_runtime.reject_stage_completion_candidate(
+        reject = (self._agent_runtime.reject_stage_local_candidate
+                  if operation_name == "local" else self._agent_runtime.reject_stage_completion_candidate)
+        source = ({"primary_draft_hash": run.primary_draft.draft_hash}
+                  if operation_name == "local" else {})
+        reject(
+            **source,
             unit_ref=unit_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
@@ -3329,7 +3224,7 @@ class BundleStageWorker:
                     and failure_code == "codex_operation_failed"
                     and checkpoint.get("termination_reason") in {"completed", "launch_failed"})))
 
-    def _accept_exhaustion_review(
+    def _accept_exhaustion_assessment(
         self,
         *,
         request: StageRunRequest,
@@ -3419,7 +3314,6 @@ class BundleStageWorker:
             primary_invocation_ref=run.primary_invocation.invocation_ref,
             primary_response_hash=primary_response_hash,
             primary_assessment_hash=result.reviewed_assessment_hash,
-            review_invocation_ref=run.review_invocation.invocation_ref,
             reviewer_agent_ref=result.reviewer_agent_ref,
             review_findings=result.findings,
             # New evidence never promotes optional collaboration provenance to
@@ -3541,7 +3435,6 @@ class BundleStageWorker:
     def _finish_bundle_jobs(self, run: BundleStageRun) -> None:
         for job_ref in {
             run.primary_invocation.operation_ref,
-            run.review_invocation.operation_ref,
         }:
             self._finish_provider_job(job_ref)
 

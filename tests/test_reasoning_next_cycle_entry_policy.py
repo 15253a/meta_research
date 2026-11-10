@@ -95,8 +95,8 @@ def test_same_question_reasoning_entry_creates_a_runnable_request(tmp_path):
     )
 
     class AdvisoryReasoningSkill(_DeterministicReasoningSkill):
-        def review_draft(self, request, draft):
-            return replace(super().review_draft(request, draft),
+        def finalize_draft(self, request, draft):
+            return replace(super().finalize_draft(request, draft),
                            review_mode="advisory_unobserved", reviewer_agent_ref=None)
 
     runtime = _reasoning_runtime(

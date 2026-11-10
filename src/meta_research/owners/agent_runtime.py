@@ -5,6 +5,7 @@ from meta_research.owners.guidance_runtime import GuidanceRuntimeMixin
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -746,7 +747,7 @@ class RootCompletionRejection:
                 "invocation_ref": self.provider_invocation_ref,
                 "operation_ref": self.provider_operation_ref,
                 "status": "completed",
-                "response_hash": self.candidate_hash,
+                "response_hash": self.known_facts.get("source_primary_response_hash", self.candidate_hash),
             },
             "candidate": self.candidate,
             "candidate_hash": self.candidate_hash,
@@ -778,7 +779,6 @@ class IdeaStageRun:
     runtime_binding_hash: str
     fence_ref: str
     primary_invocation: IdeaProviderInvocation
-    review_invocation: IdeaProviderInvocation
     primary_draft: IdeaPrimaryDraft | None
     execution: AttemptExecution | None
     predecessor_execution: AttemptExecution | None
@@ -1072,6 +1072,21 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     def reject_stage_completion_candidate(
         self,
         *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        candidate: dict[str, object],
+        reason_code: str,
+        detail_code: str,
+        feedback: tuple[str, ...],
+    ) -> RootCompletionRejection: ...
+
+    def reject_stage_local_candidate(
+        self,
+        *,
+        primary_draft_hash: str,
         unit_ref: str,
         run_ref: str,
         attempt_ref: str,
@@ -1900,9 +1915,7 @@ _CONTROL_QUIESCENCE_REDISPATCH_SECONDS = 0.25
 _PROVIDER_UNIT_KINDS = frozenset(
     {
         "idea_primary",
-        "idea_review",
         "plan_primary",
-        "plan_review",
         "bundle_primary",
         "bundle_review",
         "reasoning_primary",
@@ -1921,29 +1934,6 @@ _PROVIDER_UNIT_RUN_KINDS = {
     "reasoning_review": "reasoning_stage",
     "deepfetch": "deepfetch",
 }
-_STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES = frozenset(
-    {
-        "codex_child_review_causal_order_invalid",
-        "codex_child_review_child_ledger_invalid",
-        "codex_child_review_child_runtime_invalid",
-        "codex_child_review_delivery_invalid",
-        "codex_child_review_hash_mismatch",
-        "codex_child_review_lineage_invalid",
-        "codex_child_review_operation_invalid",
-        "codex_child_review_request_invalid",
-        "codex_child_review_root_ledger_invalid",
-        "codex_child_review_root_runtime_invalid",
-        "codex_child_review_spawn_invalid",
-        "codex_child_review_ref_mismatch",
-        "codex_child_review_stdout_identity_mismatch",
-        "codex_child_review_stdout_invalid",
-        "codex_child_review_task_mismatch",
-        "codex_child_review_terminal_invalid",
-        "codex_child_review_turn_invalid",
-        "codex_child_review_wait_invalid",
-        "codex_child_review_result_missing",
-    }
-)
 _STAGE_PROVIDER_TERMINAL_CONTRACT_FAILURES = {
     "idea_primary": frozenset(
         {
@@ -1951,35 +1941,26 @@ _STAGE_PROVIDER_TERMINAL_CONTRACT_FAILURES = {
             "idea_primary_result_contract_invalid",
         }
     ),
-    "idea_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
-    | {"idea_review_result_contract_invalid"},
     "plan_primary": frozenset(
         {
             "codex_primary_review_phase_invalid",
             "plan_primary_result_contract_invalid",
         }
     ),
-    "plan_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
-    | {"plan_review_result_contract_invalid"},
     "bundle_primary": frozenset(
         {
             "codex_primary_review_phase_invalid",
             "bundle_primary_result_contract_invalid",
         }
     ),
-    "bundle_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
-    | {
-        "bundle_review_result_contract_invalid",
-        "codex_child_review_trace_invalid",
-    },
+    "bundle_review": frozenset({"bundle_review_result_contract_invalid"}),
     "reasoning_primary": frozenset(
         {
             "codex_primary_review_phase_invalid",
             "reasoning_primary_result_contract_invalid",
         }
     ),
-    "reasoning_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
-    | {"reasoning_review_result_contract_invalid"},
+    "reasoning_review": frozenset({"reasoning_review_result_contract_invalid"}),
 }
 
 
@@ -6408,9 +6389,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                    else self.query_reasoning_stage_run(request_ref))
             if run is None:
                 raise OwnerConflict("operator_stop_checkpoint_invalid")
-            if (run.primary_draft is not None and not is_plan) or run.execution is not None:
+            if run.primary_draft is not None or run.execution is not None:
                 continue
-            phase = "primary" if run.primary_draft is None else "review"
+            phase = "primary"
             checkpoint = self._operator_stop_reader(row["run_ref"], phase)
             if checkpoint is not None:
                 checkpoints[row["run_ref"]] = checkpoint
@@ -6929,7 +6910,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
 
         if not isinstance(run_ref, str) or not run_ref or len(run_ref) > 256:
             raise OwnerConflict("stage_root_observation_run_invalid")
-        if phase not in {None, "primary", "review"}:
+        if phase not in {None, "primary", "review", "autonomous-resume"} and not (
+            isinstance(phase, str) and re.fullmatch(r"(?:dispatch|target-batch)-[1-9][0-9]*", phase)
+        ):
             raise OwnerConflict("stage_root_observation_phase_invalid")
         with self._database.read() as connection:
             control = connection.execute(
@@ -7062,11 +7045,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
         ):
             raise OwnerConflict("stage_root_observation_scope_invalid")
-        # Phase selection stays inside the same current attempt and fence.
-        # Completed primary output remains readable while its review runs.
-        candidates = units if phase is None else [
-            unit for unit in units if str(unit.unit_kind).endswith("_" + phase)
-        ]
+        # Explicit physical phases select only units proven by their operation identity.
+        candidates = units
+        if phase in {"primary", "review"}:
+            candidates = [unit for unit in units if str(unit.unit_kind).endswith("_" + phase)]
+        elif phase == "autonomous-resume":
+            candidates = [unit for unit in units if unit.unit_kind == "reasoning_review"]
+        elif phase is not None:
+            candidates = [unit for unit in units if unit.unit_kind == "bundle_review"
+                and unit.unit_ref == "provider_unit_" + canonical_hash({
+                    "operation_ref": unit.operation_ref, "operation_name": phase,
+                    "attempt_ref": attempt_ref})[:64]]
         selected = candidates[0] if candidates else None
         if selected is not None and (
             not isinstance(selected.unit_ref, str)
@@ -7100,31 +7089,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 ):
                     raise OwnerConflict("stage_root_observation_scope_invalid")
                 operation_name = str(invocation.phase)
-            if (
-                control.run_kind == "reasoning_stage"
-                and selected.unit_kind == "reasoning_review"
-                and reasoning_checkpoint_ref is not None
-                and reasoning_checkpoint_recorded_at is not None
-                and float(selected.started_at)
-                >= float(reasoning_checkpoint_recorded_at)
-            ):
-                # Reasoning deliberately reuses its review invocation/unit for
-                # the later autonomous-resume turn. The checkpoint is the
-                # Owner fact that distinguishes that exact durable phase.
+            if control.run_kind == "reasoning_stage" and selected.unit_kind == "reasoning_review" and not matching_invocations:
                 operation_name = "autonomous-resume"
+            elif control.run_kind == "bundle_stage" and selected.unit_kind == "bundle_review" and not matching_invocations:
+                # With no explicit phase, the signed spool reader resolves the
+                # unique physical operation against the deterministic unit ref.
+                operation_name = phase if phase not in {None, "review"} else None
             elif operation_name is None:
-                if (
-                    control.run_kind == "bundle_stage"
-                    and selected.unit_kind == "bundle_review"
-                    and submission_ref is not None
-                ):
-                    # Bundle's rolling dispatch/target-batch unit encodes its
-                    # physical operation name in unit_ref. Leave the hint
-                    # absent so the observer can prove it against each signed
-                    # candidate rather than guess by directory order.
-                    operation_name = None
-                else:
-                    operation_name = str(selected.unit_kind).rsplit("_", 1)[1]
+                operation_name = str(selected.unit_kind).rsplit("_", 1)[1]
         return {
             "run_ref": str(control.run_ref),
             "run_kind": str(control.run_kind),
@@ -7946,6 +7918,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         fence_ref: str | None,
         unit_kind: str,
     ) -> None:
+        if unit_kind in {"idea_review", "plan_review"}:
+            raise OwnerConflict("provider_unit_kind_invalid")
         if unit_kind not in _PROVIDER_UNIT_KINDS:
             raise OwnerConflict("runtime_provider_unit_invalid")
         if not unit_ref or len(unit_ref) > 96:
@@ -8327,7 +8301,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         except RuntimeProtectionUnavailable as error:
             raise OwnerConflict(error.code) from error
 
-    def reject_stage_completion_candidate(
+    def reject_stage_completion_candidate(self, **kwargs) -> RootCompletionRejection:
+        """Reject an actual, active provider completion before primary sealing."""
+        return self._reject_stage_completion_candidate(**kwargs)
+
+    def reject_stage_local_candidate(self, *, primary_draft_hash: str, **kwargs) -> RootCompletionRejection:
+        """Reject local validation of an exact persisted primary without changing it."""
+        return self._reject_stage_completion_candidate(
+            primary_draft_hash=primary_draft_hash, **kwargs
+        )
+
+    def _reject_stage_completion_candidate(
         self,
         *,
         unit_ref: str,
@@ -8339,9 +8323,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         reason_code: str,
         detail_code: str,
         feedback: tuple[str, ...],
+        primary_draft_hash: str | None = None,
     ) -> RootCompletionRejection:
         """Append one semantic rejection and install its same-Session successor."""
 
+        local = primary_draft_hash is not None
         if (
             not unit_ref
             or len(unit_ref) > 96
@@ -8415,7 +8401,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or run is None
                 or attempt is None
                 or fence is None
-                or unit is None
+                or (not local and unit is None)
                 or session is None
                 or run.stage not in FORMAL_STAGES
                 or control.run_kind != f"{run.stage}_stage"
@@ -8429,16 +8415,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or attempt.fence_ref != fence_ref
                 or attempt.root_session_ref != session.session_ref
                 or fence.status != "current"
-                or unit.run_ref != run_ref
+                or (not local and (
+                    unit.run_ref != run_ref
                 or unit.attempt_ref != attempt_ref
                 or unit.fence_ref != fence_ref
                 or unit.status != "active"
                 or _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind)
                 != control.run_kind
+                ))
             ):
                 raise OwnerConflict("stage_completion_rejection_stale")
-            phase = str(unit.unit_kind).removeprefix(f"{run.stage}_")
-            if phase not in {"primary", "review"}:
+            phase = "local" if local else str(unit.unit_kind).removeprefix(f"{run.stage}_")
+            if phase not in {"primary", "local"}:
                 raise OwnerConflict("stage_completion_rejection_invalid")
             if reason_code != f"{run.stage}_{phase}_result_contract_invalid":
                 raise OwnerConflict("stage_completion_rejection_reason_invalid")
@@ -8459,13 +8447,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "fence_ref": fence_ref,
                 },
             ).first()
-            if (
-                invocation is None
-                or invocation.phase != phase
-                or invocation.operation_ref != unit.operation_ref
-                or invocation.status != "prepared"
-                or invocation.response_hash is not None
-            ):
+            if local:
+                verified_primary, _ = _provider_invocations(connection, run, attempt, fence)
+                if (verified_primary.invocation_ref != unit_ref or connection.execute(text(
+                    "SELECT 1 FROM ar_provider_units WHERE run_ref=:run_ref AND "
+                    "status IN ('active','revocation_pending') LIMIT 1"
+                ), {"run_ref": run_ref}).first() is not None):
+                    raise OwnerConflict("stage_completion_rejection_stale")
+                persisted = _primary_draft(run, attempt, session)
+                if (invocation is None or invocation.phase != "primary"
+                        or invocation.status != "completed" or persisted is None
+                        or persisted.draft_hash != primary_draft_hash
+                        or persisted.native_session_ref != native_session_ref
+                        or invocation.response_hash != _primary_provider_response_hash(
+                            native_session_ref=persisted.native_session_ref,
+                            draft=persisted.draft, adapter_kind=persisted.adapter_kind,
+                            stage=run.stage)):
+                    raise OwnerConflict("stage_completion_rejection_stale")
+            elif (invocation is None or invocation.phase != phase
+                    or invocation.operation_ref != unit.operation_ref
+                    or invocation.status != "prepared" or invocation.response_hash is not None):
                 raise OwnerConflict("stage_completion_rejection_stale")
 
             preserved_native_session_ref = session.native_session_ref
@@ -8525,6 +8526,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "primary_draft_hash": attempt.primary_draft_hash,
                 "candidate_native_session_ref": native_session_ref,
             }
+            if local:
+                known_facts["source_primary_response_hash"] = invocation.response_hash
             known_facts_json = canonical_json(known_facts)
             known_facts_hash = canonical_hash(known_facts)
             payload = {
@@ -8568,22 +8571,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 candidate_ref,
                 receipt_bindings,
             )
-            effect = _provider_runtime_effect(
-                unit_ref=str(unit.unit_ref),
-                operation_ref=str(unit.operation_ref),
-                run_ref=run_ref,
-                attempt_ref=attempt_ref,
-                fence_ref=fence_ref,
-                claim_started_at=float(unit.started_at),
-            )
-            _complete_provider_invocation(
-                connection,
-                run,
-                attempt,
-                fence,
-                phase=phase,
-                response_hash=candidate_hash,
-            )
+            if not local:
+                effect = _provider_runtime_effect(
+                    unit_ref=str(unit.unit_ref),
+                    operation_ref=str(unit.operation_ref),
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                    claim_started_at=float(unit.started_at),
+                )
+                _complete_provider_invocation(
+                    connection,
+                    run,
+                    attempt,
+                    fence,
+                    phase=phase,
+                    response_hash=candidate_hash,
+                )
             connection.execute(
                 text(
                     "UPDATE ar_execution_fences SET status = 'rejected', "
@@ -8592,29 +8596,30 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 ),
                 {"now": now, "fence_ref": fence_ref},
             )
-            connection.execute(
-                text(
-                    "UPDATE ar_provider_units SET status = 'completed', "
-                    "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
-                    "'active'"
-                ),
-                {"now": now, "unit_ref": unit_ref},
-            )
-            try:
-                record_runtime_boundary(
-                    connection,
-                    identity=effect,
-                    boundary="terminal",
-                    checkpoint_ref=None,
-                    owner_evidence_ref=rejection_ref,
+            if not local:
+                connection.execute(
+                    text(
+                        "UPDATE ar_provider_units SET status = 'completed', "
+                        "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
+                        "'active'"
+                    ),
+                    {"now": now, "unit_ref": unit_ref},
                 )
-            except RuntimeProtectionUnavailable as error:
-                raise OwnerConflict(error.code) from error
+                try:
+                    record_runtime_boundary(
+                        connection,
+                        identity=effect,
+                        boundary="terminal",
+                        checkpoint_ref=None,
+                        owner_evidence_ref=rejection_ref,
+                    )
+                except RuntimeProtectionUnavailable as error:
+                    raise OwnerConflict(error.code) from error
             replacement = self._replace_fenced_managed_attempt(
                 connection,
                 control,
                 now,
-                reuse_checkpoint=phase == "review",
+                reuse_checkpoint=False,
                 reuse_operation_refs=False,
                 preserve_native_session=True,
                 replacement_reason_code="root_completion_rejected",
@@ -8698,16 +8703,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 },
             )
             rejected_attempt_ref = attempt_ref
-        assert effect is not None and rejected_attempt_ref is not None
-        if self._runtime_protection is None:
-            raise OwnerConflict("runtime_protection_unavailable")
-        try:
-            self._runtime_protection.finish(
-                effect.responsibility_ref,
-                boundary="terminal",
-            )
-        except RuntimeProtectionUnavailable as error:
-            raise OwnerConflict(error.code) from error
+        assert rejected_attempt_ref is not None
+        if effect is not None:
+            if self._runtime_protection is None:
+                raise OwnerConflict("runtime_protection_unavailable")
+            try:
+                self._runtime_protection.finish(
+                    effect.responsibility_ref,
+                    boundary="terminal",
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
         rejected = self.query_stage_completion_rejection(rejected_attempt_ref)
         if rejected is None:
             raise OwnerConflict("stage_completion_rejection_missing_after_commit")
@@ -8817,7 +8823,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or invocation.fence_ref != row.fence_ref
             or invocation.operation_ref != row.provider_operation_ref
             or invocation.status != "completed"
-            or invocation.response_hash != row.candidate_hash
+            or invocation.response_hash != known_facts.get("source_primary_response_hash", row.candidate_hash)
+            or (known_facts.get("phase") == "local" and (
+                invocation.phase != "primary"
+                or rejected_attempt.primary_draft_hash != known_facts.get("primary_draft_hash")
+                or invocation.response_hash != _primary_provider_response_hash(
+                    native_session_ref=known_facts.get("candidate_native_session_ref"),
+                    draft=decoded_object(rejected_attempt.primary_draft_json),
+                    adapter_kind=rejected_attempt.primary_adapter_kind, stage=row.stage)
+            ))
             or not isinstance(feedback_value, list)
             or not feedback_value
             or any(not isinstance(item, str) or not item for item in feedback_value)
@@ -9132,8 +9146,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         and primary.status == "prepared" and bound_attempt.primary_draft_json is None
                         and bound_attempt.payload_json is None)
                     bind_rolling = (stage_run.stage == "bundle" and rolling_basis is not None
-                        and unit.unit_kind == "bundle_review" and review.operation_ref == unit.operation_ref
-                        and review.status == "prepared" and bound_attempt.primary_draft_json is None
+                        and unit.unit_kind == "bundle_review" and primary.operation_ref == unit.operation_ref
+                        and primary.status == "prepared" and bound_attempt.primary_draft_json is None
                         and bound_attempt.payload_json is None
                         and provider_exit["native_session_ref"] != decoded_object(
                             rolling_basis.checkpoint_json)["provider_exit"]["native_session_ref"])
@@ -10664,8 +10678,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         saved = _query_managed_safe_point(connection, row)
         scope = checkpoint.get("scope", {})
         native = checkpoint.get("native_session_ref")
-        is_review = row.run_kind == "plan_stage" and scope.get("unit_kind") == "plan_review"
-        phase = "review" if is_review else "primary"
+        phase = "primary"
         unit_kind = f"{row.run_kind.removesuffix('_stage')}_{phase}"
         reason_code = f"operator_stopped_{phase}_resumed"
         if (saved is None or saved["checkpoint"].get("action") != "pause"
@@ -10696,7 +10709,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         ), {"run_ref": row.run_ref, "attempt_ref": row.attempt_ref,
             "fence_ref": row.fence_ref}).first()
         if (run.current_attempt_ref != row.attempt_ref or run.current_fence_ref != row.fence_ref
-                or (attempt.primary_draft_json is not None) != is_review or attempt.submission_ref is not None
+                or attempt.primary_draft_json is not None or attempt.submission_ref is not None
                 or attempt.status != "running" or fence.status != "current"
                 or session.status != "active" or session.native_session_ref not in {None, native}
                 or unit is None or unit.unit_ref != scope.get("unit_ref")
@@ -10905,7 +10918,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 row.phase: row.operation_ref for row in old_invocations
             }
             if (
-                set(operation_refs) != {"primary", "review"}
+                "primary" not in operation_refs
                 or any(
                     not isinstance(value, str) or not value
                     for value in operation_refs.values()
@@ -15677,7 +15690,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             autonomous_resume = (
                 root_kind == "reasoning" and phase == "autonomous-resume"
             )
-            if phase not in {"primary", "review"} and not autonomous_resume:
+            if phase != "primary" and not autonomous_resume:
                 return False
             provider_phase = "review" if autonomous_resume else phase
             run, attempt, session, fence = _load_stage_fence(
@@ -15688,7 +15701,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "SELECT * FROM ar_stage_provider_invocations WHERE "
                     "attempt_ref = :attempt_ref AND phase = :phase"
                 ),
-                {"attempt_ref": attempt_ref, "phase": provider_phase},
+                {"attempt_ref": attempt_ref, "phase": "primary"},
             ).first()
             unit = connection.execute(
                 text(
@@ -15706,11 +15719,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             primary_pending = (
                 phase == "primary" and attempt.primary_draft_json is None
             )
-            review_pending = (
-                phase == "review"
-                and attempt.primary_draft_json is not None
-                and attempt.submission_ref is None
-            )
             autonomous_resume_pending = (
                 autonomous_resume
                 and attempt.submission_ref is None
@@ -15727,22 +15735,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or attempt.status != "running"
                 or not (
                     primary_pending
-                    or review_pending
                     or autonomous_resume_pending
                 )
                 or fence.status != "current"
                 or session.status != "active"
                 or session.native_session_ref not in {None, native_session_ref}
                 or invocation is None
-                or invocation.status != "prepared"
-                or invocation.response_hash is not None
+                or (not autonomous_resume and (invocation.status != "prepared" or invocation.response_hash is not None))
+                or (autonomous_resume and invocation.status != "completed")
                 or unit is None
-                or (
+                or (not autonomous_resume and (
                     unit.operation_ref != invocation.operation_ref
                     and not _is_root_human_request_continuation_ref(
                         unit.operation_ref
                     )
-                )
+                ))
+                or (autonomous_resume and unit.unit_ref != "provider_unit_" + canonical_hash({
+                    "run_ref": run_ref, "job_ref": unit.operation_ref})[:64])
                 or unit.unit_kind != f"{root_kind}_{provider_phase}"
                 or unit.status != "active"
             ):
@@ -17807,7 +17816,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or draft is None
             or primary.status != "completed"
             or primary.response_hash is None
-            or review.status != "prepared"
             or attempt.submission_ref is not None
             or attempt.execution_receipt_ref is not None
         ):
@@ -17866,6 +17874,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or evidence.review_findings != ()
         ):
             raise OwnerConflict("bundle_exhaustion_advisory_review_invalid")
+        if evidence.schema_ref != "meta-research/bundle-exhaustion-evidence/v2":
+            raise OwnerConflict("bundle_exhaustion_evidence_schema_invalid")
         verified_request = self._verified_bundle_exhaustion_request(evidence)
         accepted_plan = verified_request.accepted_formal_plan
         if accepted_plan is None:
@@ -17953,15 +17963,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     or primary_draft is None
                     or primary_draft.draft_hash
                     != evidence.primary_assessment_hash
-                    or review.invocation_ref != evidence.review_invocation_ref
-                    or review.run_ref != evidence.run_ref
-                    or review.attempt_ref != evidence.attempt_ref
-                    or review.fence_ref != evidence.execution_fence_ref
-                    or review.phase != "review"
-                    or (
-                        review.status != "prepared"
-                        or review.response_hash is not None
-                    )
                     or run.runtime_binding_hash
                     != current_run.runtime_binding_hash
                 ):
@@ -18224,7 +18225,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 != evidence.primary_assessment_hash
                 or primary.invocation_ref != evidence.primary_invocation_ref
                 or primary.response_hash != evidence.primary_response_hash
-                or review.invocation_ref != evidence.review_invocation_ref
+                or (evidence.review_invocation_ref is not None and (
+                    review is None or review.invocation_ref != evidence.review_invocation_ref
                 or (
                     evidence.review_trace is None
                     and (
@@ -18240,6 +18242,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         != bundle_exhaustion_review_response_hash(evidence)
                     )
                 )
+                ))
             ):
                 raise OwnerConflict("bundle_exhaustion_evidence_stale")
             assessment_receipt = _bundle_exhaustion_assessment_receipt(
@@ -19361,7 +19364,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         ):
             raise OwnerConflict("stage_run_integrity_invalid")
         with self._database.read() as connection:
-            primary_invocation, review_invocation = _provider_invocations(
+            primary_invocation, _ = _provider_invocations(
                 connection, run, attempt, fence
             )
             autonomous_checkpoint = (
@@ -19373,23 +19376,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 )
                 if expected_stage == "reasoning"
                 else _reasoning_autonomous_checkpoint(run, attempt, session)
-            )
-            exhaustion_review = (
-                connection.execute(
-                    text(
-                        "SELECT review_invocation_ref, review_response_hash, "
-                        "primary_assessment_hash FROM "
-                        "ar_bundle_exhaustion_evidence WHERE run_ref = :run_ref "
-                        "AND attempt_ref = :attempt_ref AND fence_ref = :fence_ref"
-                    ),
-                    {
-                        "run_ref": run.run_ref,
-                        "attempt_ref": attempt.attempt_ref,
-                        "fence_ref": fence.fence_ref,
-                    },
-                ).first()
-                if expected_stage == "bundle"
-                else None
             )
         if self._stage_request_verifier is not None:
             self._stage_request_verifier.verify_stage_run_request(
@@ -19439,44 +19425,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             raise OwnerConflict("idea_provider_invocation_invalid")
         if expected_stage != "reasoning" and autonomous_checkpoint is not None:
             raise OwnerConflict("stage_run_integrity_invalid")
-        if execution is None:
-            review_is_accepted_exhaustion = (
-                exhaustion_review is not None
-                and review_invocation.status == "completed"
-                and exhaustion_review.review_invocation_ref
-                == review_invocation.invocation_ref
-                and exhaustion_review.review_response_hash
-                == review_invocation.response_hash
-                and primary_draft is not None
-                and exhaustion_review.primary_assessment_hash
-                == primary_draft.draft_hash
-            )
-            if review_invocation.status != "prepared" and not review_is_accepted_exhaustion:
-                raise OwnerConflict("idea_provider_invocation_invalid")
-        elif primary_draft is None:
-            raise OwnerConflict("idea_provider_invocation_invalid")
-        elif (
-            run.stage == "bundle"
-            and execution.review.get("review_mode")
-            == "advisory_unobserved"
-        ):
-            if (
-                review_invocation.status != "prepared"
-                or review_invocation.response_hash is not None
-            ):
-                raise OwnerConflict("idea_provider_invocation_invalid")
-        elif (
-            review_invocation.status != "completed"
-            or review_invocation.response_hash
-            != _review_provider_response_hash(
-                native_session_ref=execution.native_session_ref,
-                reviewed_draft=execution.reviewed_draft,
-                outcome=execution.outcome,
-                review=execution.review,
-                stage=run.stage,
-            )
-        ):
-            raise OwnerConflict("idea_provider_invocation_invalid")
+        if execution is not None and primary_draft is None:
+            raise OwnerConflict("idea_primary_draft_required")
         predecessor_execution = None
         rejection_receipt = None
         if predecessor is not None:
@@ -19558,7 +19508,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             runtime_binding_hash=run.runtime_binding_hash,
             fence_ref=fence.fence_ref,
             primary_invocation=primary_invocation,
-            review_invocation=review_invocation,
             primary_draft=primary_draft,
             execution=execution,
             predecessor_execution=predecessor_execution,
@@ -20430,22 +20379,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         }
         payload_json = canonical_json(payload)
         payload_hash = canonical_hash(payload)
-        advisory_bundle_review = (
-            expected_stage == "bundle"
-            and review.get("review_mode")
-            == "advisory_unobserved"
-        )
-        provider_response_hash = (
-            None
-            if advisory_bundle_review
-            else _review_provider_response_hash(
-                native_session_ref=native_session_ref,
-                reviewed_draft=reviewed_draft,
-                outcome=outcome,
-                review=review,
-                stage=expected_stage,
-            )
-        )
         command_kind = f"record_{expected_stage}_attempt_execution"
         command_hash = canonical_hash(
             {
@@ -20458,7 +20391,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "runtime_binding_hash": runtime_binding_hash,
                 "payload_hash": payload_hash,
                 "material_outcome_hash": outcome_material_hash,
-                "provider_response_hash": provider_response_hash,
+                "local_result_hash": payload_hash,
             }
         )
         _query_stage_command(
@@ -20499,7 +20432,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 )
             ):
                 raise OwnerConflict("idea_primary_draft_conflict")
-            primary_invocation, review_invocation = _provider_invocations(
+            primary_invocation, _ = _provider_invocations(
                 connection, preview_run, preview_attempt, preview_fence
             )
             if (
@@ -20510,19 +20443,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     draft=primary_draft.draft,
                     adapter_kind=primary_draft.adapter_kind,
                     stage=preview_run.stage,
-                )
-                or (
-                    advisory_bundle_review
-                    and (
-                        review_invocation.status != "prepared"
-                        or review_invocation.response_hash is not None
-                    )
-                )
-                or (
-                    not advisory_bundle_review
-                    and review_invocation.status == "completed"
-                    and review_invocation.response_hash
-                    != provider_response_hash
                 )
             ):
                 raise OwnerConflict("idea_provider_invocation_invalid")
@@ -20587,26 +20507,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 )
             ):
                 raise OwnerConflict("idea_primary_draft_conflict")
-            if advisory_bundle_review:
-                _primary_invocation, current_review_invocation = (
-                    _provider_invocations(connection, run, attempt, fence)
-                )
-                if (
-                    current_review_invocation.status != "prepared"
-                    or current_review_invocation.response_hash is not None
-                ):
-                    raise OwnerConflict("idea_provider_invocation_invalid")
-            else:
-                if provider_response_hash is None:
-                    raise OwnerConflict("idea_provider_invocation_invalid")
-                _complete_provider_invocation(
-                    connection,
-                    run,
-                    attempt,
-                    fence,
-                    phase="review",
-                    response_hash=provider_response_hash,
-                )
             lineage, current_predecessor_receipt, current_predecessor_submission = (
                 _successor_execution_lineage(
                     connection,
@@ -20759,7 +20659,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "payload_hash": payload_hash,
                         "material_outcome_hash": outcome_material_hash,
                         "runtime_binding_hash": runtime_binding_hash,
-                        "provider_response_hash": provider_response_hash,
+                        "local_result_hash": payload_hash,
                         "receipt_ref": receipt_ref,
                     },
                 )
@@ -24511,7 +24411,7 @@ def _insert_provider_invocations(
     stage: str = "idea",
     operation_refs: dict[str, str] | None = None,
 ) -> None:
-    for phase in ("primary", "review"):
+    for phase in ("primary",):
         invocation_ref = new_ref(f"{stage}_{phase}_invocation")
         operation_ref = (
             new_ref(f"{stage}_{phase}_operation")
@@ -24556,7 +24456,7 @@ def _insert_provider_invocations(
 
 def _provider_invocations(
     connection, run, attempt, fence
-) -> tuple[IdeaProviderInvocation, IdeaProviderInvocation]:
+) -> tuple[IdeaProviderInvocation, IdeaProviderInvocation | None]:
     rows = connection.execute(
         text(
             "SELECT * FROM ar_stage_provider_invocations WHERE "
@@ -24565,11 +24465,12 @@ def _provider_invocations(
         {"attempt_ref": attempt.attempt_ref},
     ).all()
     by_phase = {row.phase: row for row in rows}
-    if len(rows) != 2 or set(by_phase) != {"primary", "review"}:
+    # Retain exact historical review rows for read validation only. New attempts
+    # allocate primary, and local validation never produces a provider record.
+    if "primary" not in by_phase or len(rows) != len(by_phase) or set(by_phase) - {"primary", "review"}:
         raise OwnerConflict("idea_provider_invocation_invalid")
-    values: list[IdeaProviderInvocation] = []
-    for phase in ("primary", "review"):
-        row = by_phase[phase]
+    values: dict[str, IdeaProviderInvocation] = {}
+    for phase, row in by_phase.items():
         operation_ref = row.operation_ref
         expected_hash = _provider_invocation_request_hash(
             invocation_ref=row.invocation_ref,
@@ -24600,8 +24501,7 @@ def _provider_invocations(
             and (not _is_sha256(row.response_hash) or row.completed_at is None)
         ):
             raise OwnerConflict("idea_provider_invocation_invalid")
-        values.append(
-            IdeaProviderInvocation(
+        values[phase] = IdeaProviderInvocation(
                 invocation_ref=row.invocation_ref,
                 operation_ref=operation_ref,
                 request_ref=run.request_ref,
@@ -24614,8 +24514,7 @@ def _provider_invocations(
                 status=row.status,
                 response_hash=row.response_hash,
             )
-        )
-    return values[0], values[1]
+    return values["primary"], values.get("review")
 
 
 def _complete_provider_invocation(
@@ -24629,6 +24528,8 @@ def _complete_provider_invocation(
 ) -> IdeaProviderInvocation:
     primary, review = _provider_invocations(connection, run, attempt, fence)
     invocation = primary if phase == "primary" else review
+    if invocation is None:
+        raise OwnerConflict("idea_provider_invocation_invalid")
     if invocation.status == "completed":
         if invocation.response_hash != response_hash:
             raise OwnerConflict("idea_provider_response_conflict")
@@ -24675,11 +24576,11 @@ def _verify_provider_execution_chain(
             stage=row.stage,
         )
         or (
-            advisory_bundle_review
+            review is not None and advisory_bundle_review
             and (review.status != "prepared" or review.response_hash is not None)
         )
         or (
-            not advisory_bundle_review
+            review is not None and not advisory_bundle_review
             and (
                 review.status != "completed"
                 or review.response_hash

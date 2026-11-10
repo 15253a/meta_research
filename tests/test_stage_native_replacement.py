@@ -16,7 +16,7 @@ class ReplacementAwareIdea(_DeterministicIdeaSkill):
         return replace(draft, primary_session_ref="native-root-" + str(len(self.requests)))
 
 
-def _active_review(tmp_path):
+def _active_revision(tmp_path):
     provider = ReplacementAwareIdea()
     runtime = _runtime(tmp_path, idea_skill=provider, plan_skill=_DeterministicPlanSkill(no_gap=False))
     created = _confirm_direct_quest(runtime)
@@ -28,10 +28,22 @@ def _active_review(tmp_path):
     owner = runtime.owners.agent_runtime
     run = owner.query_idea_stage_run(request.request_ref)
     assert run.primary_draft is not None and run.native_session_ref == "native-root-1"
-    invocation = run.review_invocation
+    runtime._test_saved_primary = run.primary_draft.draft
+    owner.reject_stage_local_candidate(
+        unit_ref=run.primary_invocation.invocation_ref, run_ref=run.run_ref,
+        attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+        native_session_ref=run.native_session_ref,
+        primary_draft_hash=run.primary_draft.draft_hash,
+        candidate=run.primary_draft.draft,
+        reason_code="idea_local_result_contract_invalid",
+        detail_code="idea_candidate_revision_required",
+        feedback=("Correct the candidate before its formal acceptance.",),
+    )
+    run = owner.query_idea_stage_run(request.request_ref)
+    invocation = run.primary_invocation
     owner.begin_provider_unit(unit_ref=invocation.invocation_ref,
         operation_ref=invocation.operation_ref, run_ref=run.run_ref,
-        attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, unit_kind="idea_review")
+        attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, unit_kind="idea_primary")
     evidence = {
         "schema_ref": "meta-research/provider-native-session-unavailable/v1",
         "termination_reason": "completed", "result_file_hash": None,
@@ -53,7 +65,7 @@ def _record(owner, run, invocation, evidence):
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "d" * 64],
     ids=["absent", "sealed-empty", "sealed-partial"])
 def test_proven_missing_native_session_fences_old_attempt_and_keeps_exact_work(tmp_path, result_hash):
-    runtime, provider, request, old, invocation, evidence = _active_review(tmp_path)
+    runtime, provider, request, old, invocation, evidence = _active_revision(tmp_path)
     try:
         owner = runtime.owners.agent_runtime
         evidence["result_file_hash"] = result_hash
@@ -70,7 +82,7 @@ def test_proven_missing_native_session_fences_old_attempt_and_keeps_exact_work(t
             attempt_ref=current.attempt_ref, fence_ref=current.fence_ref)
         assert basis["context_pack_ref"] == request.context_pack_ref
         assert basis["context_pack_hash"] == request.context_pack_hash
-        assert basis["saved_work"][0]["primary_draft"] == old.primary_draft.draft
+        assert any(item["primary_draft"] == runtime._test_saved_primary for item in basis["saved_work"])
         assert basis["retired_native_session_ref"] == old.native_session_ref
         assert "transcript" not in basis
         assert runtime.idea_stage.process_once()
@@ -84,7 +96,7 @@ def test_proven_missing_native_session_fences_old_attempt_and_keeps_exact_work(t
 
 @pytest.mark.parametrize("damage", ["foreign-native", "unknown-response", "unsealed-response"])
 def test_uncertain_or_foreign_native_failure_cannot_replace_the_session(tmp_path, damage):
-    runtime, _, request, old, invocation, evidence = _active_review(tmp_path)
+    runtime, _, request, old, invocation, evidence = _active_revision(tmp_path)
     try:
         bad = deepcopy(evidence)
         if damage == "foreign-native":
@@ -104,7 +116,7 @@ def test_uncertain_or_foreign_native_failure_cannot_replace_the_session(tmp_path
 def test_later_unrelated_safe_point_cannot_hide_the_replacement_basis(tmp_path):
     from sqlalchemy import text
     from meta_research.owners.common import canonical_json
-    runtime, _, request, old, invocation, evidence = _active_review(tmp_path)
+    runtime, _, request, old, invocation, evidence = _active_revision(tmp_path)
     try:
         owner = runtime.owners.agent_runtime
         _record(owner, old, invocation, evidence)
@@ -138,7 +150,7 @@ def test_later_unrelated_safe_point_cannot_hide_the_replacement_basis(tmp_path):
 @pytest.mark.parametrize("status", ["failed", "interrupted"])
 @pytest.mark.parametrize("result_hash", [None, "c" * 64], ids=["no-result", "partial-result"])
 def test_reconciled_terminal_native_turn_corrects_in_the_same_native_root(tmp_path, status, result_hash):
-    runtime, _, request, old, invocation, proof = _active_review(tmp_path)
+    runtime, _, request, old, invocation, proof = _active_revision(tmp_path)
     try:
         owner = runtime.owners.agent_runtime
         proof = {key: value for key, value in proof.items()

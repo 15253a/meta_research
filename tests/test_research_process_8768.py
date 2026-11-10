@@ -123,8 +123,8 @@ def test_related_questions_and_answered_human_help_use_real_owners(tmp_path):
             outcome["notes"] = f"总体问题未解决；保留失败观察，先检验局部机制；遵循 {self.human_response_ref}。"
             return outcome, transition
 
-        def review_draft(self, request, draft):
-            return replace(super().review_draft(request, draft),
+        def finalize_draft(self, request, draft):
+            return replace(super().finalize_draft(request, draft),
                            review_mode="advisory_unobserved", reviewer_agent_ref=None)
 
     skill = NotesReasoning()

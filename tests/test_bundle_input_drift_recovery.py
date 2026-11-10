@@ -239,7 +239,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         owner = runtime.owners.agent_runtime
         if fresh_replacement:
             from test_bundle_native_replacement import _unavailable_proof
-            owner.begin_provider_unit(unit_ref="input-drift-unavailable", operation_ref=original.review_invocation.operation_ref,
+            owner.begin_provider_unit(unit_ref="input-drift-unavailable", operation_ref=original.primary_invocation.operation_ref,
                 run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref, unit_kind="bundle_review")
             owner.record_stage_provider_hard_ceiling(unit_ref="input-drift-unavailable", run_ref=original.run_ref,
                 attempt_ref=original.attempt_ref, fence_ref=original.fence_ref, failure_code="codex_native_session_unavailable",
@@ -268,7 +268,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
             run_ref=original.run_ref, attempt_ref=original.attempt_ref,
             fence_ref=original.fence_ref, root_session_ref=original.root_session_ref,
             graph_ref=graph.graph_ref,
-            native_session_ref=original.native_session_ref, job_ref=original.review_invocation.operation_ref,
+            native_session_ref=original.native_session_ref, job_ref=original.primary_invocation.operation_ref,
             inbox_checkpoint=_inbox_checkpoint(run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref),
         )
         if fresh_replacement:
@@ -276,7 +276,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
             context = runtime.bundle_stage._rolling_replacement_context(stage_request, original, graph, ())
             request = replace(request, native_replacement_context=context)
         unit_ref = "bundle-input-cut-recovery"
-        owner.begin_provider_unit(unit_ref=unit_ref, operation_ref=original.review_invocation.operation_ref,
+        owner.begin_provider_unit(unit_ref=unit_ref, operation_ref=original.primary_invocation.operation_ref,
             run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref, unit_kind="bundle_review")
         completed = adapter.schedule_target(request)
         assert completed.native_session_ref == observed_native
@@ -299,7 +299,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         successor = owner.query_bundle_stage_run(original.request_ref)
         assert successor.attempt_ref != original.attempt_ref
         assert successor.fence_ref != original.fence_ref
-        assert successor.review_invocation.operation_ref != original.review_invocation.operation_ref
+        assert successor.primary_invocation.operation_ref != original.primary_invocation.operation_ref
         assert successor.root_session_ref == original.root_session_ref
         assert successor.native_session_ref == observed_native
         if fresh_replacement:
@@ -314,7 +314,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         next_request = replace(_changed(request, "dispatch"),
             native_session_ref=successor.native_session_ref, native_replacement_context=None,
             attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref,
-            job_ref=successor.review_invocation.operation_ref,
+            job_ref=successor.primary_invocation.operation_ref,
             inbox_checkpoint=_inbox_checkpoint(run_ref=successor.run_ref,
                 attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref))
         assert adapter.schedule_target(next_request).action == "wait"

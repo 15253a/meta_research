@@ -34,13 +34,13 @@ class _CountingReasoningSkill(_DeterministicReasoningSkill):
         self.generate_calls += 1
         return super().generate_draft(request)
 
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
     ):
         self.review_calls += 1
-        return super().review_draft(request, draft)
+        return super().finalize_draft(request, draft)
 
 
 class _CountingAutonomousReasoningSkill(_AutonomousReasoningSkill):
@@ -86,7 +86,7 @@ class _CeilingReasoningSkill(_CountingReasoningSkill):
 
 
 class _ReviewCeilingReasoningSkill(_CountingReasoningSkill):
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
@@ -156,7 +156,7 @@ def test_reasoning_primary_waits_on_typed_provider_protection_before_call(
         runtime.close()
 
 
-def test_reasoning_review_waits_on_typed_provider_protection_before_call(
+def test_reasoning_local_finalization_does_not_acquire_provider_protection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -181,12 +181,14 @@ def test_reasoning_review_waits_on_typed_provider_protection_before_call(
             blocked_provider_unit,
         )
 
-        assert not runtime.reasoning_stage.process_once()
-        assert runtime.reasoning_stage.transient_error == (
-            "power_inhibitor_acquisition_failed"
-        )
+        assert runtime.reasoning_stage.process_once()
+        assert runtime.reasoning_stage.transient_error is None
         assert provider.generate_calls == 1
-        assert provider.review_calls == 0
+        assert provider.review_calls == 1
+        run = runtime.owners.agent_runtime.query_reasoning_stage_run(
+            str(primary["stage_run_request"]["request_ref"]))
+        assert run.execution is not None
+        assert run.primary_invocation.status == "completed"
     finally:
         runtime.close()
 
@@ -270,7 +272,7 @@ def test_reasoning_primary_records_signed_hard_ceiling_without_safe_ack(
         runtime.close()
 
 
-def test_reasoning_review_records_signed_hard_ceiling_without_safe_ack(
+def test_reasoning_local_finalization_cannot_invent_provider_ceiling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -305,16 +307,13 @@ def test_reasoning_review_records_signed_hard_ceiling_without_safe_ack(
         assert provider.generate_calls == 1
         assert provider.review_calls == 1
         assert safe_acks == []
-        assert recorded == [
-            {
-                "unit_ref": run.review_invocation.invocation_ref,
-                "run_ref": run.run_ref,
-                "attempt_ref": run.attempt_ref,
-                "fence_ref": run.fence_ref,
-                "failure_code": "codex_operation_output_limit",
-                "provider_exit": _signed_ceiling_evidence("output_limit"),
-            }
-        ]
+        assert recorded == []
+        # A local validator cannot manufacture a provider boundary or overwrite
+        # the already completed primary, even if a custom implementation raises
+        # a transport-shaped exception.
+        current = runtime.owners.agent_runtime.query_reasoning_stage_run(request_ref)
+        assert current.primary_invocation == run.primary_invocation
+        assert current.primary_draft == run.primary_draft
     finally:
         runtime.close()
 

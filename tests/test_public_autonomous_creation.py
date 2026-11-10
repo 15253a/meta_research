@@ -284,7 +284,7 @@ class _AutonomousReasoningSkill:
             adapter_kind="test_deterministic",
         )
 
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,

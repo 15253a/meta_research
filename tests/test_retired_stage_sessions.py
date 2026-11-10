@@ -31,9 +31,21 @@ def test_cleanup_recovers_replaced_stage_thread_only_from_verified_owner_binding
         owner = runtime.owners.agent_runtime
         run = owner.query_idea_stage_run(request.request_ref)
         assert run.native_session_ref == previous
-        unit = run.review_invocation
+        runtime._test_saved_primary = run.primary_draft.draft
+        owner.reject_stage_local_candidate(
+            unit_ref=run.primary_invocation.invocation_ref, run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+            native_session_ref=run.native_session_ref,
+            primary_draft_hash=run.primary_draft.draft_hash,
+            candidate=run.primary_draft.draft,
+            reason_code="idea_local_result_contract_invalid",
+            detail_code="idea_candidate_revision_required",
+            feedback=("Correct the candidate before its formal acceptance.",),
+        )
+        run = owner.query_idea_stage_run(request.request_ref)
+        unit = run.primary_invocation
         owner.begin_provider_unit(unit_ref=unit.invocation_ref, operation_ref=unit.operation_ref,
-            run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, unit_kind="idea_review")
+            run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, unit_kind="idea_primary")
         owner.record_stage_provider_hard_ceiling(unit_ref=unit.invocation_ref, run_ref=run.run_ref,
             attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, failure_code="codex_native_session_unavailable",
             provider_exit=_unavailable_proof(previous))
