@@ -17094,7 +17094,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             }
         )
         evidence_json = canonical_json(evidence.as_dict())
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = connection.execute(
                 text(
                     "SELECT * FROM ar_bundle_exhaustion_evidence WHERE "
@@ -19650,7 +19650,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 outcome_ref=None,
                 receipt=predecessor_receipt,
             )
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay_ref = _stage_command_replay(
                 connection,
                 idempotency_key,

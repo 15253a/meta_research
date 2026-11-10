@@ -185,3 +185,85 @@ def test_each_local_stage_restarts_without_provider_and_obeys_current_control(tm
         assert _real_provider_state(runtime, run.run_ref) == before
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("role", ["idea", "plan", "bundle", "exhaustion", "reasoning"])
+def test_concurrent_local_acceptance_replays_one_exact_execution(tmp_path, role):
+    import threading
+    path = tmp_path / "concurrent-acceptance"
+    runtime, provider = _local_stage_runtime(path, role)
+    second = None
+    kind = "bundle" if role == "exhaustion" else role
+    stage = getattr(runtime, kind + "_stage")
+    try:
+        for _ in range(8):
+            view = stage.query_current()
+            run = (None if view["stage_run_request"] is None else
+                   getattr(runtime.owners.agent_runtime, "query_" + kind + "_stage_run")(view["stage_run_request"]["request_ref"]))
+            if run is not None and run.primary_draft is not None:
+                break
+            assert stage.process_once()
+        assert run is not None and run.primary_draft is not None
+        before = _real_provider_state(runtime, run.run_ref)
+        second, second_provider = _local_stage_runtime(path, role, initialize=False)
+        barrier = threading.Barrier(2)
+        for active in (provider, second_provider):
+            finalize = active.finalize_draft
+            def synchronized(request, draft, original=finalize):
+                result = original(request, draft)
+                barrier.wait(timeout=10)
+                return result
+            active.finalize_draft = synchronized
+            def no_provider(*_args, **_kwargs):
+                raise AssertionError("concurrent local resume must not generate primary")
+            active.generate_draft = no_provider
+        other_stage = getattr(second, kind + "_stage")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(lambda worker: worker.process_once(), (stage, other_stage)))
+        assert results == (True, True)
+        owner = runtime.owners.agent_runtime
+        first = getattr(owner, "query_" + kind + "_stage_run")(run.request_ref)
+        other = getattr(second.owners.agent_runtime, "query_" + kind + "_stage_run")(run.request_ref)
+        assert first.attempt_ref == other.attempt_ref == run.attempt_ref
+        assert _real_provider_state(runtime, run.run_ref) == before
+        if role == "exhaustion":
+            evidence = owner.query_bundle_exhaustion_evidence_for_run(run_ref=run.run_ref, attempt_ref=run.attempt_ref)
+            replay = second.owners.agent_runtime.query_bundle_exhaustion_evidence(evidence.evidence_ref)
+            assert evidence == replay
+            with runtime._database.read() as connection:
+                assert connection.execute(text(
+                    "SELECT COUNT(*) FROM ar_bundle_exhaustion_evidence WHERE run_ref=:run"
+                ), {"run": run.run_ref}).scalar_one() == 1
+            with pytest.raises(OwnerConflict, match="bundle_exhaustion_evidence_conflict"):
+                owner.reconcile_bundle_exhaustion_evidence(
+                    evidence_identity=evidence.evidence.evidence_identity, expected_evidence_hash="0" * 64,
+                )
+        else:
+            assert first.execution == other.execution
+            assert first.execution is not None
+            with runtime._database.read() as connection:
+                assert connection.execute(text(
+                    "SELECT COUNT(*) FROM ar_stage_attempts WHERE run_ref=:run AND execution_receipt_ref IS NOT NULL"
+                ), {"run": run.run_ref}).scalar_one() == 1
+                assert connection.execute(text(
+                    "SELECT COUNT(*) FROM ar_stage_commands WHERE command_kind=:kind AND result_ref=:submission"
+                ), {"kind": "record_"+kind+"_attempt_execution", "submission": first.execution.submission_ref}).scalar_one() == 1
+                key = connection.execute(text(
+                    "SELECT idempotency_key FROM ar_stage_commands WHERE command_kind=:kind AND result_ref=:submission"
+                ), {"kind": "record_"+kind+"_attempt_execution", "submission": first.execution.submission_ref}).scalar_one()
+            from dataclasses import replace
+            with pytest.raises(OwnerConflict, match="idempotency_conflict"):
+                getattr(owner, "record_" + kind + "_attempt_execution")(
+                    run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+                    submission_ref=first.execution.submission_ref,
+                    native_session_ref=first.execution.native_session_ref,
+                    runtime_binding=replace(first.execution.runtime_binding, model_ref="foreign-model-v1"),
+                    **{{"plan": "plan", "bundle": "target_plan"}.get(kind, "outcome"): first.execution.outcome},
+                    reviewed_draft=first.execution.reviewed_draft,
+                    review=first.execution.review, idempotency_key=key,
+                )
+            assert getattr(owner, "query_" + kind + "_stage_run")(run.request_ref).execution == first.execution
+    finally:
+        if second is not None:
+            second.close()
+        runtime.close()
