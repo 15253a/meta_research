@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.root_resident_mcp import RootResidentMcpError
+
 from meta_research.resource_preparation import resource_preparation, prepared_resource
 from meta_research.native_guidance import native_guidance_operation
 
@@ -11,7 +13,6 @@ from importlib.resources import files
 from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, cast
-from urllib.parse import urlsplit
 
 from meta_research.codex_ledger import CodexSessionLedgerReader
 from meta_research.codex_runtime import (
@@ -920,10 +921,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         self._full_conformance_authority: (
             ReasoningFullConformanceAuthority | None
         ) = None
-        self._resident_mcp_base_url: str | None = None
-        self._resident_mcp_channels: dict[
-            tuple[str, str], ResidentMcpChannel
-        ] = {}
 
     def bind_full_conformance_authority(
         self, authority: ReasoningFullConformanceAuthority
@@ -935,35 +932,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable(
                 "reasoning_harness_conformance_authority_conflict"
             )
+        self.bind_resident_mcp_authority(authority)
         self._full_conformance_authority = authority
 
-    def configure_resident_mcp_endpoint(self, base_url: str) -> None:
-        if not isinstance(base_url, str):
-            raise ReasoningSkillUnavailable(
-                "reasoning_semantic_mcp_endpoint_invalid"
-            )
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in {"", "/"}
-        ):
-            raise ReasoningSkillUnavailable(
-                "reasoning_semantic_mcp_endpoint_invalid"
-            )
-        normalized = base_url.rstrip("/")
-        if (
-            self._resident_mcp_base_url is not None
-            and self._resident_mcp_base_url != normalized
-        ):
-            raise ReasoningSkillUnavailable(
-                "reasoning_semantic_mcp_endpoint_conflict"
-            )
-        self._resident_mcp_base_url = normalized
 
     def _reasoning_semantic_operation_ids(self) -> tuple[str, ...]:
         try:
@@ -981,15 +952,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             )
         return operation_ids
 
-    def _release_resident_channel(self, key: tuple[str, str]) -> None:
-        channel = self._resident_mcp_channels.pop(key, None)
-        authority = self._full_conformance_authority
-        if channel is None or authority is None:
-            return
-        try:
-            authority.revoke_resident_mcp_channel(channel)
-        except HarnessAdmissionError as error:
-            raise ReasoningSkillUnavailable(error.code) from error
 
     @native_guidance_operation
     def _invoke_with_resident_mcp(
@@ -1010,11 +972,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             include_direction=native_session_ref is None,
         )
         authority = self._full_conformance_authority
-        base_url = self._resident_mcp_base_url
-        if authority is None or base_url is None:
+        if authority is None or self._root_resident_mcp.endpoint_url is None:
             raise ReasoningSkillUnavailable("reasoning_semantic_mcp_unavailable")
         operation_ids = self._reasoning_semantic_operation_ids()
-        subject_policy = "operation_tree"
         human_request_enabled = bool(
             set(operation_ids) & set(ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS)
         )
@@ -1030,110 +990,48 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable(
                 "reasoning_semantic_mcp_operation_binding_incomplete"
             )
-        channel_key = (request.job_ref or request.run_ref, operation_name)
-        channel = self._resident_mcp_channels.get(channel_key)
-        if channel is None:
-            try:
-                channel = authority.issue_resident_mcp_channel(
-                    root_kind="reasoning",
-                    phase=operation_name,
-                    subject_policy=subject_policy,
-                    run_ref=request.run_ref,
-                    attempt_ref=request.attempt_ref,
-                    root_session_ref=request.root_session_ref,
-                    fence_ref=request.fence_ref,
-                    capability_binding_hash=canonical_hash(
-                        request.runtime_binding.as_dict()
-                    ),
-                    operation_ids=operation_ids,
-                    **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
-                )
-            except HarnessAdmissionError as error:
-                raise ReasoningSkillUnavailable(error.code) from error
-            self._resident_mcp_channels[channel_key] = channel
-
         try:
-            _validate_reasoning_resident_channel(channel, operation_ids)
-            if getattr(channel.binding, "guidance_binding", None) != guidance_binding:
-                raise ReasoningSkillUnavailable("guidance_snapshot_unbound")
-            endpoint = urlsplit(channel.binding.endpoint_ref)
-            if (
-                endpoint.scheme
-                or endpoint.netloc
-                or endpoint.query
-                or endpoint.fragment
-                or not endpoint.path.startswith("/")
-                or endpoint.path.startswith("//")
-            ):
-                raise ReasoningSkillUnavailable(
-                    "reasoning_semantic_mcp_endpoint_invalid"
-                )
-            scope_binding_hash = canonical_hash(
-                {
-                    **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
-                    "catalog_hash": channel.binding.catalog_hash,
-                    "operation_bindings": list(
-                        channel.binding.operation_bindings
-                    ),
-                    "root_kind": "reasoning",
-                    "phase": operation_name,
-                    "subject_policy": subject_policy,
-                    "semantic_mcp_shared_with_children": True,
-                }
+            channel_key, access = self._root_resident_mcp.acquire(
+                run_ref=request.run_ref, attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
+                capability_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
+                phase=operation_name, job_ref=request.job_ref, guidance_binding=guidance_binding,
             )
+        except RootResidentMcpError as error:
+            raise ReasoningSkillUnavailable(error.code) from error
+        pending = False
+        try:
+            _validate_reasoning_operation_bindings(access.operation_bindings, operation_ids)
             result = self._invoke(
                 operation_name=operation_name,
                 prompt=prompt,
                 schema=schema,
                 native_session_ref=native_session_ref,
                 job_ref=request.job_ref,
-                mcp_url=base_url + endpoint.path,
-                mcp_token=channel.connection.token,
-                mcp_scope_binding_hash=scope_binding_hash,
+                mcp_url=access.url,
+                mcp_token=access.token,
+                mcp_scope_binding_hash=access.scope_binding_hash,
                 semantic_mcp_protected_environment=human_request_enabled,
                 authorized_operation_ids=operation_ids,
                 run_ref=request.run_ref,
                 **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
                 operation_input=stage_operation_input(request, "reasoning") if operation_input is None else operation_input,
-                workspace_binding=self._workspace_binding(run_ref=request.run_ref,
-                    attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
-                    fence_ref=request.fence_ref, runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict())),
+                workspace_binding=access.workspace_binding,
             )
             # The sealed stream remains diagnostic evidence.  The scoped
             # channel already owns authorization, so a Root may use only the
             # operations needed by this turn without a call-order ritual.
         except ReasoningSkillUnavailable as error:
-            if error.code != "codex_operation_reconciliation_pending":
-                self._release_resident_channel(channel_key)
+            pending = error.code == "codex_operation_reconciliation_pending"
             raise
-        except Exception:
-            self._release_resident_channel(channel_key)
-            raise
-        self._release_resident_channel(channel_key)
+        finally:
+            if not pending:
+                try:
+                    self._root_resident_mcp.revoke(channel_key)
+                except RootResidentMcpError as error:
+                    raise ReasoningSkillUnavailable(error.code) from error
         return result
 
-    def request_stop(self) -> None:
-        try:
-            super().request_stop()
-        finally:
-            for key in tuple(self._resident_mcp_channels):
-                self._release_resident_channel(key)
-
-    def finish_job(self, job_ref: str) -> None:
-        try:
-            super().finish_job(job_ref)
-        finally:
-            for key in tuple(self._resident_mcp_channels):
-                if key[0] == job_ref:
-                    self._release_resident_channel(key)
-
-    def reconcile_cancelled_job(self, job_ref: str) -> bool:
-        reconciled = super().reconcile_cancelled_job(job_ref)
-        if reconciled:
-            for key in tuple(self._resident_mcp_channels):
-                if key[0] == job_ref:
-                    self._release_resident_channel(key)
-        return reconciled
 
     @resource_preparation
     def runtime_binding(self) -> ReasoningRuntimeBinding:
@@ -1526,13 +1424,10 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         return result
 
 
-def _validate_reasoning_resident_channel(
-    channel: ResidentMcpChannel,
+def _validate_reasoning_operation_bindings(
+    bindings: tuple[dict[str, object], ...],
     operation_ids: tuple[str, ...],
 ) -> None:
-    if channel.binding.connection_grant_ref != channel.connection.grant_ref:
-        raise ReasoningSkillUnavailable("reasoning_semantic_mcp_scope_invalid")
-    bindings = channel.binding.operation_bindings
     by_id: dict[str, dict[str, object]] = {}
     expected_fields = {
         "semantic_operation_id",

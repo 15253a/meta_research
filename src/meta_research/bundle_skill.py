@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.root_resident_mcp import RootResidentMcpError
+
 from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 
 from meta_research.context_presentation import (
@@ -18,7 +20,6 @@ from importlib.resources import files
 from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, cast
-from urllib.parse import urlsplit
 
 from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
@@ -957,10 +958,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         self._full_conformance_authority: (
             BundleFullConformanceAuthority | None
         ) = None
-        self._resident_mcp_base_url: str | None = None
-        self._resident_mcp_channels: dict[
-            tuple[str, str], ResidentMcpChannel
-        ] = {}
         self._batch_plan_reader = None
         self._batch_source_readers = None
 
@@ -972,14 +969,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
 
     def _operation_output_schema(self, schema, job_ref, operation_name):
         from meta_research.bundle_output_assembly import full_prose_output_schema
-        from meta_research.idea_skill import _read_sealed_operation_invocation
+        from meta_research.sealed_provider_operations import read_sealed_invocation
         full = full_prose_output_schema(schema)
         if job_ref is not None:
             path = (self._workspace / "provider-operations" / canonical_hash({"job_ref": job_ref})
                     / operation_name / "invocation.json")
             if path.exists():
                 _, key = self._transport_key()
-                sealed = _read_sealed_operation_invocation(path, key=key)
+                sealed = read_sealed_invocation(path, key=key)
                 for candidate in (schema, full):
                     if sealed.get("output_schema_hash") == canonical_hash(_compile_codex_output_schema(candidate)):
                         return candidate
@@ -996,35 +993,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             raise BundleSkillUnavailable(
                 "bundle_harness_conformance_authority_conflict"
             )
+        self.bind_resident_mcp_authority(authority)
         self._full_conformance_authority = authority
 
-    def configure_resident_mcp_endpoint(self, base_url: str) -> None:
-        """Bind the daemon-local Semantic MCP endpoint without persisting it.
-
-        The deployment address is not research state and the bearer credential
-        is never part of a RuntimeBinding, prompt, argv, or durable spool.
-        """
-
-        if not isinstance(base_url, str):
-            raise BundleSkillUnavailable("bundle_semantic_mcp_endpoint_invalid")
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in {"", "/"}
-        ):
-            raise BundleSkillUnavailable("bundle_semantic_mcp_endpoint_invalid")
-        normalized = base_url.rstrip("/")
-        if (
-            self._resident_mcp_base_url is not None
-            and self._resident_mcp_base_url != normalized
-        ):
-            raise BundleSkillUnavailable("bundle_semantic_mcp_endpoint_conflict")
-        self._resident_mcp_base_url = normalized
 
     def _bundle_semantic_operation_ids(self) -> tuple[str, ...]:
         try:
@@ -1040,15 +1011,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             raise BundleSkillUnavailable("bundle_semantic_mcp_catalog_unavailable")
         return operation_ids
 
-    def _release_resident_channel(self, key: tuple[str, str]) -> None:
-        channel = self._resident_mcp_channels.pop(key, None)
-        authority = self._full_conformance_authority
-        if channel is None or authority is None:
-            return
-        try:
-            authority.revoke_resident_mcp_channel(channel)
-        except HarnessAdmissionError as error:
-            raise BundleSkillUnavailable(error.code) from error
 
     @resource_preparation
     @native_guidance_operation
@@ -1077,14 +1039,12 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             include_direction=native_session_ref is None,
         )
         authority = self._full_conformance_authority
-        base_url = self._resident_mcp_base_url
-        if authority is None or base_url is None:
+        if authority is None or self._root_resident_mcp.endpoint_url is None:
             raise BundleSkillUnavailable("bundle_semantic_mcp_unavailable")
         operation_ids = self._bundle_semantic_operation_ids()
         # The bearer belongs to this exact operation tree. Root reconnects and
         # native children may use its catalog; Owner/currentness checks remain
         # bound to the admitted Bundle scope.
-        subject_policy = "operation_tree"
         try:
             conformance = authority.require_operation_binding(
                 harness_family="codex",
@@ -1100,49 +1060,15 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if not bundle_bindings_compatible(rebound, runtime_binding):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
-        channel_key = (job_ref or run_ref, operation_name)
-        channel = self._resident_mcp_channels.get(channel_key)
-        if channel is None:
-            try:
-                channel = authority.issue_resident_mcp_channel(
-                    root_kind="bundle",
-                    phase=operation_name,
-                    subject_policy=subject_policy,
-                    run_ref=run_ref,
-                    attempt_ref=attempt_ref,
-                    root_session_ref=root_session_ref,
-                    fence_ref=fence_ref,
-                    capability_binding_hash=canonical_hash(
-                        runtime_binding.as_dict()
-                    ),
-                    operation_ids=operation_ids,
-                    **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
-                )
-            except HarnessAdmissionError as error:
-                raise BundleSkillUnavailable(error.code) from error
-            self._resident_mcp_channels[channel_key] = channel
-        if (
-            getattr(channel.binding, "guidance_binding", None) != guidance_binding
-            or channel.connection.grant_ref
-            != channel.binding.connection_grant_ref
-            or channel.binding.catalog_hash
-            != conformance.semantic_mcp_catalog_hash
-            or canonical_hash(list(channel.binding.operation_bindings))
-            != conformance.semantic_mcp_operation_bindings_hash
-        ):
-            self._release_resident_channel(channel_key)
-            raise BundleSkillUnavailable("bundle_runtime_binding_drift")
-        endpoint_ref = channel.binding.endpoint_ref
-        if not endpoint_ref.startswith("/") or "?" in endpoint_ref or "#" in endpoint_ref:
-            self._release_resident_channel(channel_key)
-            raise BundleSkillUnavailable("bundle_semantic_mcp_endpoint_invalid")
-        scope_binding_hash = canonical_hash(
-            {
-                **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
-                "catalog_hash": channel.binding.catalog_hash,
-                "operation_bindings": list(channel.binding.operation_bindings),
-            }
-        )
+        try:
+            channel_key, access = self._root_resident_mcp.acquire(
+                run_ref=run_ref, attempt_ref=attempt_ref, root_session_ref=root_session_ref,
+                fence_ref=fence_ref, capability_binding_hash=canonical_hash(runtime_binding.as_dict()),
+                phase=operation_name, job_ref=job_ref, guidance_binding=guidance_binding,
+            )
+        except RootResidentMcpError as error:
+            raise BundleSkillUnavailable(error.code) from error
+        pending = False
         try:
             result = self._invoke(
                 operation_name=operation_name,
@@ -1150,50 +1076,27 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 schema=schema,
                 native_session_ref=native_session_ref,
                 job_ref=job_ref,
-                mcp_url=base_url + endpoint_ref,
-                mcp_token=channel.connection.token,
-                mcp_scope_binding_hash=scope_binding_hash,
+                mcp_url=access.url,
+                mcp_token=access.token,
+                mcp_scope_binding_hash=access.scope_binding_hash,
                 semantic_mcp_protected_environment=True,
                 authorized_operation_ids=operation_ids,
                 run_ref=run_ref,
                 **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
-                workspace_binding=self._workspace_binding(run_ref=run_ref, attempt_ref=attempt_ref,
-                    root_session_ref=root_session_ref, fence_ref=fence_ref,
-                    runtime_binding_hash=canonical_hash(runtime_binding.as_dict())),
+                workspace_binding=access.workspace_binding,
                 operation_input=operation_input,
             )
         except BundleSkillUnavailable as error:
-            if error.code != "codex_operation_reconciliation_pending":
-                self._release_resident_channel(channel_key)
+            pending = error.code == "codex_operation_reconciliation_pending"
             raise
-        except Exception:
-            self._release_resident_channel(channel_key)
-            raise
-        self._release_resident_channel(channel_key)
+        finally:
+            if not pending:
+                try:
+                    self._root_resident_mcp.revoke(channel_key)
+                except RootResidentMcpError as error:
+                    raise BundleSkillUnavailable(error.code) from error
         return result
 
-    def request_stop(self) -> None:
-        try:
-            super().request_stop()
-        finally:
-            for key in tuple(self._resident_mcp_channels):
-                self._release_resident_channel(key)
-
-    def finish_job(self, job_ref: str) -> None:
-        try:
-            super().finish_job(job_ref)
-        finally:
-            for key in tuple(self._resident_mcp_channels):
-                if key[0] == job_ref:
-                    self._release_resident_channel(key)
-
-    def reconcile_cancelled_job(self, job_ref: str) -> bool:
-        reconciled = super().reconcile_cancelled_job(job_ref)
-        if reconciled:
-            for key in tuple(self._resident_mcp_channels):
-                if key[0] == job_ref:
-                    self._release_resident_channel(key)
-        return reconciled
 
     def _is_reconciliation_operation_name(self, operation_name: str) -> bool:
         dynamic_generation = next(
@@ -2020,12 +1923,6 @@ def _target_plan_envelope_schema(
             _exhaustion_assessment_envelope_schema(request),
         ]
     }
-
-
-
-
-
-
 
 
 def _exhaustion_assessment_envelope_schema(

@@ -424,8 +424,10 @@ class ProviderRootObservations:
 
     def _acquisition_replacement_checkpoint(self,directory,key,job,native):
         """Read the same exact no-rollout proof as the adapter, without writing."""
-        from meta_research.idea_skill import (
-            _provider_native_session_unavailable, _verified_operation_inputs, IdeaSkillUnavailable,
+        from meta_research.sealed_provider_operations import (
+            native_session_unavailable as _provider_native_session_unavailable,
+            verify_operation_inputs as _verified_operation_inputs,
+            ProviderOperationUnavailable,
         )
         if native is None or not (directory / "native-resume-rejected.json").exists():
             return None
@@ -444,7 +446,7 @@ class ProviderRootObservations:
         digest = canonical_hash(invocation)
         try:
             prompt_hash, schema_hash, _ = _verified_operation_inputs(directory,invocation_hash=digest)
-        except IdeaSkillUnavailable as error:
+        except ProviderOperationUnavailable as error:
             raise ValueError("acquisition_replacement_invalid") from error
         receipt,envelope = read_verified_exit_receipt(directory / "supervisor-exit.json",key=key,
             invocation_hash=digest,prompt_path=directory / "prompt.txt",schema_path=directory / "output-schema.json",
@@ -455,7 +457,7 @@ class ProviderRootObservations:
             "result_file_hash":receipt["result_file_hash"],"supervisor_receipt_hash":canonical_hash(envelope)}
         try:
             unavailable = _provider_native_session_unavailable(directory,marker,native)
-        except IdeaSkillUnavailable as error:
+        except ProviderOperationUnavailable as error:
             raise ValueError("acquisition_replacement_invalid") from error
         if unavailable is None:
             raise ValueError("acquisition_replacement_invalid")

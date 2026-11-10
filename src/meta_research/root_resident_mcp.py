@@ -108,9 +108,11 @@ class RootResidentMcpAccess:
     scope_binding_hash: str
     operation_ids: tuple[str, ...]
     workspace_binding: WorkspaceBinding | None = None
+    operation_bindings: tuple[dict[str, object], ...] = ()
 
 
-RootResidentMcpChannelKey = tuple[str, str, str]
+RootResidentMcpChannelKey = tuple[str, str, str, str]
+_ChannelScope = tuple[str, str, str]
 
 
 class RootResidentMcpChannels:
@@ -125,8 +127,8 @@ class RootResidentMcpChannels:
         self._workspaces: RootWorkspaces | None = None
         self._authority: RootResidentMcpAuthority | None = None
         self._base_url: str | None = None
-        self._channels: dict[RootResidentMcpChannelKey, _ResidentMcpChannel] = {}
-        self._channel_users: dict[RootResidentMcpChannelKey, int] = {}
+        self._channels: dict[_ChannelScope, _ResidentMcpChannel] = {}
+        self._channel_users: dict[_ChannelScope, int] = {}
         self._lock = threading.RLock()
 
     @property
@@ -136,6 +138,10 @@ class RootResidentMcpChannels:
     @property
     def enabled(self) -> bool:
         return self._authority is not None or self._base_url is not None
+
+    @property
+    def endpoint_url(self) -> str | None:
+        return None if self._base_url is None else self._base_url + "/mcp"
 
     def bind_workspaces(self, workspaces: RootWorkspaces) -> None:
         if self._workspaces is not None and self._workspaces is not workspaces:
@@ -294,31 +300,48 @@ class RootResidentMcpChannels:
                         **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
                     }
                 )
-                return key, RootResidentMcpAccess(
+                return (*key, channel.connection.grant_ref), RootResidentMcpAccess(
                     url=base_url + endpoint.path,
                     token=channel.connection.token,
                     scope_binding_hash=scope_binding_hash,
                     operation_ids=self._operation_ids,
+                    operation_bindings=channel.binding.operation_bindings,
                     workspace_binding=(None if self._workspaces is None else self._workspaces.bind_runtime(
                         SemanticCallContext(run_ref, attempt_ref, root_session_ref, fence_ref,
                             capability_binding_hash, self._root_kind, phase, "", guidance_binding))),
                 )
             except SemanticMcpError as error:
-                self.release(key)
+                self.revoke((*key, channel.connection.grant_ref))
                 raise RootResidentMcpError(error.code) from error
             except Exception:
-                self.release(key)
+                self.revoke((*key, channel.connection.grant_ref))
                 raise
 
     def release(self, key: RootResidentMcpChannelKey) -> None:
+        """Release one user of this exact grant generation."""
+        self._release(key, immediate=False)
+
+    def revoke(self, key: RootResidentMcpChannelKey) -> None:
+        """End this physical call's grant now, including concurrent users.
+
+        Bundle and Reasoning have always revoked at the first terminal call
+        boundary. A late release from another user cannot revoke a newer grant
+        issued for the same scope while that old user was finishing.
+        """
+        self._release(key, immediate=True)
+
+    def _release(self, key: RootResidentMcpChannelKey, *, immediate: bool) -> None:
+        scope = key[:3]
         with self._lock:
-            channel = self._channels.get(key)
-            users = self._channel_users.get(key, 0)
-            if channel is not None and users > 1:
-                self._channel_users[key] = users - 1
+            channel = self._channels.get(scope)
+            if channel is None or channel.connection.grant_ref != key[3]:
                 return
-            self._channel_users.pop(key, None)
-            channel = self._channels.pop(key, None)
+            users = self._channel_users.get(scope, 0)
+            if not immediate and users > 1:
+                self._channel_users[scope] = users - 1
+                return
+            self._channel_users.pop(scope, None)
+            channel = self._channels.pop(scope, None)
             authority = self._authority
         if channel is None or authority is None:
             return

@@ -6,11 +6,13 @@ from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.provider_supervisor import (
     ProviderSupervisorError, read_transport_key_for_operation, read_verified_exit_receipt,
 )
-from meta_research.idea_skill import (
-    IdeaSkillUnavailable,
-    _provider_hard_ceiling_checkpoint,
-    _write_exit_marker,
-    _verified_operation_inputs, _read_spool_text, _verified_native_session,
+from meta_research.sealed_provider_operations import (
+    ProviderOperationUnavailable,
+    hard_ceiling_checkpoint as _provider_hard_ceiling_checkpoint,
+    write_exit_marker as _write_exit_marker,
+    verify_operation_inputs as _verified_operation_inputs,
+    read_spool_text as _read_spool_text,
+    verify_native_session as _verified_native_session,
 )
 from meta_research.stage_root_observations import (
     StageRootObservationError,
@@ -41,7 +43,7 @@ class StoppedStageProviderRecovery:
             if marker.get("termination_reason") != "stopped":
                 return None
             return _provider_hard_ceiling_checkpoint(marker)
-        except (StageRootObservationError, IdeaSkillUnavailable):
+        except (StageRootObservationError, ProviderOperationUnavailable):
             # Missing, stale, or unverified evidence cannot authorize a fence.
             return None
 
@@ -90,6 +92,6 @@ class StoppedStageProviderRecovery:
                 "supervisor_receipt_hash": canonical_hash(envelope),
                 "provider_exit": receipt,
             }
-        except (StageRootObservationError, IdeaSkillUnavailable, ProviderSupervisorError,
+        except (StageRootObservationError, ProviderOperationUnavailable, ProviderSupervisorError,
                 OSError, UnicodeError, ValueError) as error:
             raise OwnerConflict("operator_stop_checkpoint_invalid") from error

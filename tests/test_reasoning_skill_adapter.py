@@ -473,7 +473,10 @@ class _FullConformanceAuthority:
             contract_hash="1" * 64,
             conformance_ref="hfc:reasoning:1",
             semantic_mcp_catalog_hash="2" * 64,
-            semantic_mcp_operation_bindings_hash="3" * 64,
+            semantic_mcp_operation_bindings_hash=canonical_hash([
+                _operation_binding(operation_id)
+                for operation_id in REASONING_ROOT_SEMANTIC_OPERATION_IDS
+            ]),
             required_families=("codex", "claude"),
             required_capabilities=("semantic_mcp", "subagent"),
             required_operation_ids=REASONING_ROOT_SEMANTIC_OPERATION_IDS,

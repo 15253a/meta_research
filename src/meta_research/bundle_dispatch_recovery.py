@@ -9,10 +9,18 @@ if TYPE_CHECKING:
     )
 
 from meta_research.idea_skill import (
-    IdeaSkillUnavailable, _compile_codex_output_schema,
-    _decode_codex_provider_output, _operation_transport_limits,
-    _read_completed_operation, _read_operation_invocation, _read_sealed_operation_invocation, _read_spool_text,
-    _unwrap_codex_root_output, _verified_operation_inputs,
+    _compile_codex_output_schema,
+    _decode_codex_provider_output,
+    _unwrap_codex_root_output,
+)
+from meta_research.sealed_provider_operations import (
+    ProviderOperationUnavailable,
+    operation_transport_limits as _operation_transport_limits,
+    read_completed_operation as _read_completed_operation,
+    read_invocation as _read_operation_invocation,
+    read_sealed_invocation as _read_sealed_operation_invocation,
+    read_spool_text as _read_spool_text,
+    verify_operation_inputs as _verified_operation_inputs,
 )
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.root_capabilities import root_capability_profile
@@ -36,7 +44,7 @@ def _completed_operation(adapter, request, operation_name, raw_schema):
         root_capability_profile=profile.as_dict(),
         root_capability_profile_hash=profile.digest,
         output_schema_hash=canonical_hash(_compile_codex_output_schema(raw_schema)),
-        mcp_url=adapter._resident_mcp_base_url + "/mcp",
+        mcp_url=adapter._root_resident_mcp.endpoint_url,
     )
     invocation = _read_operation_invocation(
         directory / "invocation.json", key=key, expected_base=expected,
@@ -49,7 +57,7 @@ def _completed_operation(adapter, request, operation_name, raw_schema):
     if (not isinstance(operation_input, dict)
             or canonical_json(operation_input) != encoded_input
             or canonical_hash(operation_input) != invocation.get("operation_input_hash")):
-        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+        raise ProviderOperationUnavailable("codex_operation_spool_invalid")
     output, session, _stdout = _read_completed_operation(
         directory, invocation_hash=invocation_hash,
         native_session_ref=request.native_session_ref, transport_limits=limits,
@@ -84,22 +92,22 @@ def recover_rejected_dispatch(
         )
         if (operation_input.get("kind") != "bundle_dispatch"
                 or operation_input.get("identity") != _rolling_operation_identity(request)):
-            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+            raise ProviderOperationUnavailable("codex_operation_identity_conflict")
         fields = operation_input["request"]
         if not isinstance(fields, dict):
             raise ValueError("invalid dispatch input")
         if fields.get("generation") != request.generation:
-            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+            raise ProviderOperationUnavailable("codex_operation_identity_conflict")
         if not isinstance(fields["frontier"], list) or not isinstance(fields["state"], dict):
             raise ValueError("invalid dispatch input")
         original = replace(
             request, frontier=tuple(fields["frontier"]), state=fields["state"],
             inbox_checkpoint=fields["inbox_checkpoint"],
         )
-    except IdeaSkillUnavailable:
+    except ProviderOperationUnavailable:
         raise
     except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as error:
-        raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+        raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error
     result = BundleDispatchResult(
         action=output.get("action"), selected_target_ref=output.get("selected_target_ref"),
         rationale=output.get("rationale"), native_session_ref=session, adapter_kind="codex_cli",
@@ -129,7 +137,7 @@ def recover_rejected_target_batch(
         )
         if (operation_input.get("kind") != "bundle_target_batch"
                 or operation_input.get("identity") != _rolling_operation_identity(request)):
-            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+            raise ProviderOperationUnavailable("codex_operation_identity_conflict")
         context = operation_input["request"]
         identity_names = (
             "stage_request_ref", "run_ref", "attempt_ref", "fence_ref", "root_session_ref",
@@ -141,7 +149,7 @@ def recover_rejected_target_batch(
                 or context.get("runtime_binding_hash") != canonical_hash(request.runtime_binding.as_dict())
                 or context.get("initial_target_plan_hash") != canonical_hash(request.initial_target_plan)
                 or context.get("formal_plan") != request.plan_document):
-            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+            raise ProviderOperationUnavailable("codex_operation_identity_conflict")
         if not isinstance(context.get("current_targets"), list) or not isinstance(context.get("target_commits"), list):
             raise ValueError("invalid batch closure")
         original = replace(
@@ -149,10 +157,10 @@ def recover_rejected_target_batch(
             target_commits=tuple(context["target_commits"]),
             inbox_checkpoint=context["inbox_checkpoint"],
         )
-    except IdeaSkillUnavailable:
+    except ProviderOperationUnavailable:
         raise
     except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as error:
-        raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+        raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error
     result = BundleTargetBatchResult(
         strategy_update=output.get("strategy_update"), rationale=output.get("rationale"),
         native_session_ref=session, adapter_kind="codex_cli",

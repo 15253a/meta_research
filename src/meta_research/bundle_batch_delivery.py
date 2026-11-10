@@ -5,10 +5,16 @@ import json
 from dataclasses import replace
 
 from meta_research.idea_skill import (
-    IdeaSkillUnavailable, _read_completed_operation, _read_sealed_operation_invocation,
-    _read_spool_text, _read_operation_business_input, _operation_transport_limits,
     _decode_codex_provider_output,
     _unwrap_codex_root_output,
+)
+from meta_research.sealed_provider_operations import (
+    ProviderOperationUnavailable,
+    read_completed_operation as _read_completed_operation,
+    read_sealed_invocation as _read_sealed_operation_invocation,
+    read_spool_text as _read_spool_text,
+    read_business_input as _read_operation_business_input,
+    operation_transport_limits as _operation_transport_limits,
 )
 from meta_research.owners.common import canonical_hash
 
@@ -54,7 +60,7 @@ def verified_batch_delivery_baseline(adapter, request, *, verified_proposals=(),
                 or fields.get("context_pack_hash") != request.context_pack_hash
                 or fields.get("formal_plan") != request.plan_document
                 or fields.get("initial_target_plan_hash") != initial_plan_hash):
-            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+            raise ProviderOperationUnavailable("codex_operation_identity_conflict")
         output, _, _ = _read_completed_operation(operation, invocation_hash=digest,
                                                 native_session_ref=request.native_session_ref,
                                                 transport_limits=limits)
@@ -92,7 +98,7 @@ def verified_batch_delivery_baseline(adapter, request, *, verified_proposals=(),
                         raise ValueError("view does not match frozen records")
                     delivered[name].add(record_hash)
         except (ValueError, KeyError, TypeError) as error:
-            raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+            raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error
         latest = fields
         operations.append({"operation_name": operation.name, "invocation_hash": digest,
                            "prompt_hash": invocation["prompt_hash"],
