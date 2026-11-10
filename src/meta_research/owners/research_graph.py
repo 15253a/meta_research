@@ -4735,6 +4735,22 @@ class SQLiteResearchGraphReceiptVerifier:
         formal_plan_ref: str | None,
         receipt: AcceptanceReceipt,
     ) -> None:
+        with self._database.read_snapshot():
+            self._verify_formal_plan_decision(
+                request_ref=request_ref, submission_ref=submission_ref, decision=decision,
+                formal_plan_ref=formal_plan_ref, receipt=receipt,
+            )
+
+    def _verify_formal_plan_decision(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str | None,
+        decision: str,
+        formal_plan_ref: str | None,
+        receipt: AcceptanceReceipt,
+        verified_plan_document: dict[str, object] | None = None,
+    ) -> None:
         expected_kind = (
             FORMAL_PLAN_ACCEPTED_RECEIPT_KIND
             if decision == "accepted"
@@ -4838,16 +4854,19 @@ class SQLiteResearchGraphReceiptVerifier:
             subject_ref=row.plan_content_ref,
             payload_hash=row.plan_content_receipt_hash,
         )
-        self._plan_content_verifier.verify_plan_content_receipt(
-            request_ref=row.request_ref,
-            submission_ref=row.submission_ref,
-            content_ref=row.plan_content_ref,
-            payload_hash=row.payload_hash,
-            plan_hash=row.plan_document_hash,
-            reviewed_draft_hash=row.reviewed_draft_hash,
-            review_hash=row.review_hash,
-            receipt=plan_content_receipt,
-        )
+        if verified_plan_document is None:
+            self._plan_content_verifier.verify_plan_content_receipt(
+                request_ref=row.request_ref,
+                submission_ref=row.submission_ref,
+                content_ref=row.plan_content_ref,
+                payload_hash=row.payload_hash,
+                plan_hash=row.plan_document_hash,
+                reviewed_draft_hash=row.reviewed_draft_hash,
+                review_hash=row.review_hash,
+                receipt=plan_content_receipt,
+            )
+        elif canonical_hash(verified_plan_document) != row.plan_document_hash:
+            raise OwnerConflict("formal_plan_content_receipt_invalid")
         # Exact signed RM content and RG decision receipts bind the adopted
         # sources already admitted at Plan acceptance. Reading an accepted fact
         # does not reopen domain admission or traverse its source graph. Current
@@ -4898,105 +4917,107 @@ class SQLiteResearchGraphReceiptVerifier:
         plan_document_hash: str,
         receipt: AcceptanceReceipt,
     ) -> None:
-        if (
-            receipt.issuer != RG_OWNER
-            or receipt.kind != FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND
-            or receipt.subject_ref != plan_document_hash
-        ):
-            raise OwnerConflict("formal_plan_content_receipt_issuer_invalid")
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM rg_formal_plan_content_acceptances WHERE "
-                    "receipt_ref = :receipt_ref"
-                ),
-                {"receipt_ref": receipt.receipt_ref},
-            ).first()
-            decision = (
-                None
-                if row is None
-                else connection.execute(
+        with self._database.read_snapshot():
+            if (
+                receipt.issuer != RG_OWNER
+                or receipt.kind != FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND
+                or receipt.subject_ref != plan_document_hash
+            ):
+                raise OwnerConflict("formal_plan_content_receipt_issuer_invalid")
+            with self._database.read() as connection:
+                row = connection.execute(
                     text(
-                        "SELECT * FROM rg_formal_plan_decisions WHERE "
-                        "decision_ref = :decision_ref"
+                        "SELECT * FROM rg_formal_plan_content_acceptances WHERE "
+                        "receipt_ref = :receipt_ref"
                     ),
-                    {"decision_ref": row.decision_ref},
+                    {"receipt_ref": receipt.receipt_ref},
                 ).first()
+                decision = (
+                    None
+                    if row is None
+                    else connection.execute(
+                        text(
+                            "SELECT * FROM rg_formal_plan_decisions WHERE "
+                            "decision_ref = :decision_ref"
+                        ),
+                        {"decision_ref": row.decision_ref},
+                    ).first()
+                )
+                content = (
+                    None
+                    if row is None
+                    else connection.execute(
+                        text(
+                            "SELECT * FROM rm_plan_documents WHERE content_ref = "
+                            ":content_ref"
+                        ),
+                        {"content_ref": row.plan_content_ref},
+                    ).first()
+                )
+            if row is None or decision is None or content is None:
+                raise OwnerConflict("formal_plan_content_receipt_invalid")
+            try:
+                plan_document = decoded_object(content.plan_document_json)
+            except (TypeError, ValueError) as error:
+                raise OwnerConflict("formal_plan_content_receipt_invalid") from error
+            plan_content_receipt = AcceptanceReceipt(
+                issuer="research_memory",
+                kind="plan_document_content_acceptance",
+                receipt_ref=row.plan_content_receipt_ref,
+                subject_ref=row.plan_content_ref,
+                payload_hash=row.plan_content_receipt_hash,
             )
-            content = (
-                None
-                if row is None
-                else connection.execute(
-                    text(
-                        "SELECT * FROM rm_plan_documents WHERE content_ref = "
-                        ":content_ref"
-                    ),
-                    {"content_ref": row.plan_content_ref},
-                ).first()
+            formal_plan_receipt = AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=FORMAL_PLAN_ACCEPTED_RECEIPT_KIND,
+                receipt_ref=row.formal_plan_receipt_ref,
+                subject_ref=row.formal_plan_ref,
+                payload_hash=row.formal_plan_receipt_hash,
             )
-        if row is None or decision is None or content is None:
-            raise OwnerConflict("formal_plan_content_receipt_invalid")
-        try:
-            plan_document = decoded_object(content.plan_document_json)
-        except (TypeError, ValueError) as error:
-            raise OwnerConflict("formal_plan_content_receipt_invalid") from error
-        plan_content_receipt = AcceptanceReceipt(
-            issuer="research_memory",
-            kind="plan_document_content_acceptance",
-            receipt_ref=row.plan_content_receipt_ref,
-            subject_ref=row.plan_content_ref,
-            payload_hash=row.plan_content_receipt_hash,
-        )
-        formal_plan_receipt = AcceptanceReceipt(
-            issuer=RG_OWNER,
-            kind=FORMAL_PLAN_ACCEPTED_RECEIPT_KIND,
-            receipt_ref=row.formal_plan_receipt_ref,
-            subject_ref=row.formal_plan_ref,
-            payload_hash=row.formal_plan_receipt_hash,
-        )
-        if (
-            row.formal_plan_ref != formal_plan_ref
-            or row.plan_document_hash != plan_document_hash
-            or row.receipt_hash != receipt.payload_hash
-            or row.receipt_hash != _formal_plan_content_acceptance_receipt_hash(row)
-            or decision.decision_ref != row.decision_ref
-            or decision.decision != "accepted"
-            or decision.formal_plan_ref != row.formal_plan_ref
-            or decision.request_ref != row.request_ref
-            or decision.submission_ref != row.submission_ref
-            or decision.plan_content_ref != row.plan_content_ref
-            or decision.plan_document_hash != row.plan_document_hash
-            or decision.plan_content_receipt_ref != row.plan_content_receipt_ref
-            or decision.plan_content_receipt_hash != row.plan_content_receipt_hash
-            or decision.receipt_ref != row.formal_plan_receipt_ref
-            or decision.receipt_hash != row.formal_plan_receipt_hash
-            or content.content_ref != row.plan_content_ref
-            or content.submission_ref != row.submission_ref
-            or content.request_ref != row.request_ref
-            or content.plan_document_hash != row.plan_document_hash
-            or canonical_json(plan_document) != content.plan_document_json
-            or canonical_hash(plan_document) != row.plan_document_hash
-        ):
-            raise OwnerConflict("formal_plan_content_receipt_invalid")
-        if self._plan_content_verifier is None:
-            raise OwnerConflict("plan_content_verifier_unavailable")
-        self._plan_content_verifier.verify_plan_content_receipt(
-            request_ref=content.request_ref,
-            submission_ref=content.submission_ref,
-            content_ref=content.content_ref,
-            payload_hash=content.payload_hash,
-            plan_hash=content.plan_document_hash,
-            reviewed_draft_hash=content.reviewed_draft_hash,
-            review_hash=content.review_hash,
-            receipt=plan_content_receipt,
-        )
-        self.verify_formal_plan_decision(
-            request_ref=decision.request_ref,
-            submission_ref=decision.submission_ref,
-            decision="accepted",
-            formal_plan_ref=decision.formal_plan_ref,
-            receipt=formal_plan_receipt,
-        )
+            if (
+                row.formal_plan_ref != formal_plan_ref
+                or row.plan_document_hash != plan_document_hash
+                or row.receipt_hash != receipt.payload_hash
+                or row.receipt_hash != _formal_plan_content_acceptance_receipt_hash(row)
+                or decision.decision_ref != row.decision_ref
+                or decision.decision != "accepted"
+                or decision.formal_plan_ref != row.formal_plan_ref
+                or decision.request_ref != row.request_ref
+                or decision.submission_ref != row.submission_ref
+                or decision.plan_content_ref != row.plan_content_ref
+                or decision.plan_document_hash != row.plan_document_hash
+                or decision.plan_content_receipt_ref != row.plan_content_receipt_ref
+                or decision.plan_content_receipt_hash != row.plan_content_receipt_hash
+                or decision.receipt_ref != row.formal_plan_receipt_ref
+                or decision.receipt_hash != row.formal_plan_receipt_hash
+                or content.content_ref != row.plan_content_ref
+                or content.submission_ref != row.submission_ref
+                or content.request_ref != row.request_ref
+                or content.plan_document_hash != row.plan_document_hash
+                or canonical_json(plan_document) != content.plan_document_json
+                or canonical_hash(plan_document) != row.plan_document_hash
+            ):
+                raise OwnerConflict("formal_plan_content_receipt_invalid")
+            if self._plan_content_verifier is None:
+                raise OwnerConflict("plan_content_verifier_unavailable")
+            verified_plan_document = self._plan_content_verifier.verify_plan_content_receipt(
+                request_ref=content.request_ref,
+                submission_ref=content.submission_ref,
+                content_ref=content.content_ref,
+                payload_hash=content.payload_hash,
+                plan_hash=content.plan_document_hash,
+                reviewed_draft_hash=content.reviewed_draft_hash,
+                review_hash=content.review_hash,
+                receipt=plan_content_receipt,
+            )
+            self._verify_formal_plan_decision(
+                request_ref=decision.request_ref,
+                submission_ref=decision.submission_ref,
+                decision="accepted",
+                formal_plan_ref=decision.formal_plan_ref,
+                receipt=formal_plan_receipt,
+                verified_plan_document=verified_plan_document,
+            )
 
     def _query_bundle_report_contract_source(
         self,
@@ -5007,119 +5028,86 @@ class SQLiteResearchGraphReceiptVerifier:
         head_receipt: AcceptanceReceipt,
         formal_plan_content_receipt: AcceptanceReceipt,
     ) -> tuple[AcceptedTargetGraph, dict[str, object]]:
-        self.verify_target_graph_receipt(
-            request_ref=request_ref,
-            run_ref=run_ref,
-            graph_ref=graph_ref,
-            receipt=head_receipt,
-            require_current=True,
-            require_complete=False,
-        )
-        with self._database.read() as connection:
-            graph_row = connection.execute(
-                text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
-                {"graph_ref": graph_ref},
-            ).first()
-            target_rows = connection.execute(
-                text(
-                    "SELECT * FROM rg_targets WHERE graph_ref = :graph_ref "
-                    "ORDER BY ordinal"
-                ),
-                {"graph_ref": graph_ref},
-            ).all()
-            append_rows = connection.execute(
-                text(
-                    "SELECT a.*, p.proposal_json AS proposal_json FROM "
-                    "rg_target_graph_appends a JOIN ar_bundle_target_proposals p "
-                    "ON p.proposal_ref = a.proposal_ref WHERE a.graph_ref = "
-                    ":graph_ref ORDER BY a.generation"
-                ),
-                {"graph_ref": graph_ref},
-            ).all()
-            plan_row = (
-                None
-                if graph_row is None
-                else connection.execute(
-                    text(
-                        "SELECT plan_document_json, plan_document_hash FROM "
-                        "rm_plan_documents WHERE content_ref = :content_ref"
-                    ),
-                    {"content_ref": graph_row.plan_content_ref},
-                ).first()
+        with self._database.read_snapshot():
+            self.verify_target_graph_receipt(
+                request_ref=request_ref,
+                run_ref=run_ref,
+                graph_ref=graph_ref,
+                receipt=head_receipt,
+                require_current=True,
+                require_complete=False,
             )
-        if graph_row is None or plan_row is None:
-            raise OwnerConflict("bundle_report_contract_invalid")
-        try:
-            plan_document = decoded_object(plan_row.plan_document_json)
-            graph = _accepted_target_graph(
-                graph_row, target_rows, append_rows, plan_document
-            )
-            completion_value = graph.target_plan.get("completion_contract")
-            if not isinstance(completion_value, dict):
-                raise TypeError("completion contract")
-            completion = normalized_completion_contract_from_dict(
-                completion_value,
-                plan_document=plan_document,
-            )
-            formal_candidates = tuple(
-                formal_target_candidate_from_dict(
-                    target.spec,
-                    completion_contract=completion,
+            facts = self._query_target_graph_read_facts(request_ref)
+            if facts is None:
+                raise OwnerConflict("bundle_report_contract_invalid")
+            graph, append_rows, plan_document = facts
+            try:
+                completion_value = graph.target_plan.get("completion_contract")
+                if not isinstance(completion_value, dict):
+                    raise TypeError("completion contract")
+                completion = normalized_completion_contract_from_dict(
+                    completion_value,
+                    plan_document=plan_document,
                 )
-                for target in graph.targets
+                formal_candidates = tuple(
+                    formal_target_candidate_from_dict(
+                        target.spec,
+                        completion_contract=completion,
+                    )
+                    for target in graph.targets
+                )
+            except (
+                BundleTargetContractError,
+                OwnerConflict,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise OwnerConflict("bundle_report_contract_invalid") from error
+            self.verify_formal_plan_content_acceptance(
+                formal_plan_ref=graph.formal_plan_ref,
+                plan_document_hash=graph.plan_document_hash,
+                receipt=formal_plan_content_receipt,
             )
-        except (
-            BundleTargetContractError,
-            OwnerConflict,
-            TypeError,
-            ValueError,
-        ) as error:
-            raise OwnerConflict("bundle_report_contract_invalid") from error
-        self.verify_formal_plan_content_acceptance(
-            formal_plan_ref=graph.formal_plan_ref,
-            plan_document_hash=graph.plan_document_hash,
-            receipt=formal_plan_content_receipt,
-        )
-        briefs = tuple(item.brief for item in completion.experiments)
-        candidates = {
-            item.candidate.local_label: item.candidate for item in formal_candidates
-        }
-        target_by_label = {
-            target.target_key: target.target_ref for target in graph.targets
-        }
-        if set(candidates) != set(target_by_label):
-            raise OwnerConflict("bundle_report_contract_invalid")
-        result: dict[str, object] = {
-            "formal_plan_ref": graph.formal_plan_ref,
-            "briefs": briefs,
-            "completion_contract": completion,
-            "candidates": candidates,
-            "target_by_label": target_by_label,
-            "target_refs": tuple(target.target_ref for target in graph.targets),
-            "strategy_complete": graph.strategy_complete,
-            "generation": graph.head_generation,
-            "target_set_hash": graph.target_set_hash,
-            "coverage_hash": graph.coverage_hash,
-        }
-        # The graph replay above authenticates every append and its raw proposal.
-        notes = graph.target_plan.get("notes")
-        source_ref = graph.submission_ref
-        source_hash = graph.target_plan_hash
-        initial_update = graph.target_plan.get("initial_strategy_update", {})
-        if isinstance(initial_update, dict) and isinstance(initial_update.get("notes"), str) and initial_update["notes"].strip():
-            notes = initial_update["notes"]
-        for appended in append_rows:
-            proposal = decoded_object(appended.proposal_json)
-            update = proposal.get("strategy_update", {})
-            latest = update.get("notes") if isinstance(update, dict) else None
-            if isinstance(latest, str) and latest.strip():
-                notes = latest
-                source_ref = appended.proposal_ref
-                source_hash = canonical_hash(proposal)
-        if notes is not None:
-            result.update(notes=notes, notes_source_ref=source_ref, notes_source_hash=source_hash,
-                          notes_text_hash=hashlib.sha256(notes.encode("utf-8")).hexdigest())
-        return graph, result
+            briefs = tuple(item.brief for item in completion.experiments)
+            candidates = {
+                item.candidate.local_label: item.candidate for item in formal_candidates
+            }
+            target_by_label = {
+                target.target_key: target.target_ref for target in graph.targets
+            }
+            if set(candidates) != set(target_by_label):
+                raise OwnerConflict("bundle_report_contract_invalid")
+            result: dict[str, object] = {
+                "formal_plan_ref": graph.formal_plan_ref,
+                "briefs": briefs,
+                "completion_contract": completion,
+                "candidates": candidates,
+                "target_by_label": target_by_label,
+                "target_refs": tuple(target.target_ref for target in graph.targets),
+                "strategy_complete": graph.strategy_complete,
+                "generation": graph.head_generation,
+                "target_set_hash": graph.target_set_hash,
+                "coverage_hash": graph.coverage_hash,
+            }
+            # The graph replay above authenticates every append and its raw proposal.
+            notes = graph.target_plan.get("notes")
+            source_ref = graph.submission_ref
+            source_hash = graph.target_plan_hash
+            initial_update = graph.target_plan.get("initial_strategy_update", {})
+            if isinstance(initial_update, dict) and isinstance(initial_update.get("notes"), str) and initial_update["notes"].strip():
+                notes = initial_update["notes"]
+            for appended in append_rows:
+                proposal = decoded_object(appended.proposal_json)
+                update = proposal.get("strategy_update", {})
+                latest = update.get("notes") if isinstance(update, dict) else None
+                if isinstance(latest, str) and latest.strip():
+                    notes = latest
+                    source_ref = appended.proposal_ref
+                    source_hash = canonical_hash(proposal)
+            if notes is not None:
+                result.update(notes=notes, notes_source_ref=source_ref, notes_source_hash=source_hash,
+                              notes_text_hash=hashlib.sha256(notes.encode("utf-8")).hexdigest())
+            return graph, result
 
     def query_target_formal_plan_projection_source(
         self,
@@ -5465,7 +5453,7 @@ class SQLiteResearchGraphReceiptVerifier:
     @snapshot_cached
     def _query_target_graph_read_facts(
         self, request_ref: str
-    ) -> tuple[AcceptedTargetGraph, tuple[SimpleNamespace, ...]] | None:
+    ) -> tuple[AcceptedTargetGraph, tuple[SimpleNamespace, ...], dict[str, object]] | None:
         """Pure DB reconstruction shared by graph reads and receipt checks.
 
         Issuer verification stays in the caller and runs on every access.
@@ -5515,7 +5503,7 @@ class SQLiteResearchGraphReceiptVerifier:
         accepted = _accepted_target_graph(row, target_rows, append_rows, plan_document)
         return accepted, tuple(
             SimpleNamespace(**dict(item._mapping)) for item in append_rows
-        )
+        ), plan_document
 
     def verify_target_graph_receipt(
         self,
@@ -5546,7 +5534,7 @@ class SQLiteResearchGraphReceiptVerifier:
         facts = self._query_target_graph_read_facts(request_ref)
         if facts is None:
             raise OwnerConflict("target_graph_receipt_invalid")
-        accepted, append_rows = facts
+        accepted, append_rows, _plan_document = facts
         if accepted.graph_ref != graph_ref or accepted.run_ref != run_ref:
             raise OwnerConflict("target_graph_receipt_invalid")
         with self._database.read() as connection:
@@ -12378,7 +12366,8 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         self._receipt_verifier.verify_formal_plan_content_acceptance(**values)
 
     def query_bundle_report_contract(self, **values) -> dict[str, object]:
-        return self._receipt_verifier.query_bundle_report_contract(**values)
+        with self._database.read_snapshot():
+            return self._receipt_verifier.query_bundle_report_contract(**values)
 
     def query_target_formal_plan_projection_source(
         self, **values: object

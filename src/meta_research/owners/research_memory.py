@@ -1227,7 +1227,7 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
         self, submission_ref: str
     ) -> AcceptedPlanDocument | None: ...
 
-    def verify_plan_content_receipt(self, **values) -> None: ...
+    def verify_plan_content_receipt(self, **values) -> dict[str, object]: ...
 
     def accept_reasoning_content(
         self,
@@ -1877,7 +1877,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         reviewed_draft_hash: str,
         review_hash: str,
         receipt: AcceptanceReceipt,
-    ) -> None:
+    ) -> dict[str, object]:
         if (
             receipt.issuer != RM_OWNER
             or receipt.kind != PLAN_CONTENT_RECEIPT_KIND
@@ -1902,7 +1902,7 @@ class SQLiteResearchMemoryReceiptVerifier:
             or row.receipt_hash != receipt.payload_hash
         ):
             raise OwnerConflict("plan_content_receipt_invalid")
-        self._verified_plan_document(row)
+        return self._verified_plan_document(row).plan_document
 
     def _verified_plan_document(self, row) -> AcceptedPlanDocument:
         if row.receipt_hash != _plan_content_receipt_hash(row):
@@ -7309,8 +7309,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             return None
         return self._receipt_verifier._verified_plan_document(row)
 
-    def verify_plan_content_receipt(self, **values) -> None:
-        self._receipt_verifier.verify_plan_content_receipt(**values)
+    def verify_plan_content_receipt(self, **values) -> dict[str, object]:
+        return self._receipt_verifier.verify_plan_content_receipt(**values)
 
     def accept_reasoning_scientific_candidate(
         self,

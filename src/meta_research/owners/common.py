@@ -668,7 +668,7 @@ class PlanContentReceiptVerifier(Protocol):
         reviewed_draft_hash: str,
         review_hash: str,
         receipt: AcceptanceReceipt,
-    ) -> None: ...
+    ) -> dict[str, object]: ...
 
 
 
