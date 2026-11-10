@@ -26,7 +26,7 @@ function runningProduct(): DeterministicProduct {
 }
 
 async function openCreation(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "创建 Quest" }).click();
+  await page.getByRole("button", { name: "创建研究任务" }).click();
   const dialog = page.getByRole("dialog", {
     name: "创建 Quest，并决定第一个研究问题",
   });
@@ -59,7 +59,7 @@ async function createAcceptedQuestThroughWeb(page: Page): Promise<void> {
   await expect(device).toBeVisible();
   await device.click();
   await expect(
-    dialog.getByText("已绑定 1 张实际检测设备。", { exact: false }),
+    computeCard.getByText("已绑定 1 张实际检测设备。", { exact: false }),
   ).toBeVisible();
 
   await dialog.getByRole("button", { name: "生成第一个问题" }).click();
@@ -68,7 +68,7 @@ async function createAcceptedQuestThroughWeb(page: Page): Promise<void> {
     { timeout: 15_000 },
   );
   await expect(
-    dialog.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
+    dialog.getByText("研究目标和第一问已就绪，请核对后确认创建", { exact: true }),
   ).toBeVisible();
 
   const confirmation = dialog.getByRole("button", {
@@ -88,10 +88,9 @@ async function createAcceptedQuestThroughWeb(page: Page): Promise<void> {
       return "snapshot_unavailable";
     }
   }, { timeout: 30_000 }).toBe("completed");
-  if (await dialog.isVisible()) {
-    await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
-  }
-  await page.getByRole("button", { name: "Quest 总览", exact: true }).click();
+  // Successful confirmation closes this dialog after the accepted snapshot.
+  await expect(dialog).toBeHidden({ timeout: 30_000 });
+  await page.getByRole("button", { name: "研究总览", exact: true }).click();
   await expect(page.getByTestId("current-cycle-overview")).toBeVisible();
 }
 
@@ -146,7 +145,7 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
   // The marker comes from inside generate_draft. Nothing in this test calls a
   // Stage worker or Owner method, so the production lifespan daemon must have
   // admitted the Run and invoked the configured external Provider.
-  await runningProduct().waitForPlanProviderPhase("plan-primary", 30_000);
+  await runningProduct().waitForPlanStageBoundary("plan-primary", 30_000);
   await expect.poll(async () => (
     await publicPlanStage(page)
   ).run?.status).toBe("admitted");
@@ -179,6 +178,7 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
     )?.status,
   ).toBe("ready");
 
+  await page.locator(".research-existing-details > summary").click();
   const card = page.getByTestId("plan-stage-card");
   await expect(card).toBeVisible();
   await expect(card).toHaveAttribute("data-plan-stage-state", "run");
@@ -186,17 +186,16 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
     "实际 Plan Skill 尚未形成 Attempt 执行证据",
   );
 
-  runningProduct().releasePlanProviderPhase("plan-primary");
-  await runningProduct().waitForPlanProviderPhase("plan-review");
+  runningProduct().releasePlanStageBoundary("plan-primary");
+  await runningProduct().waitForPlanStageBoundary("plan-local-finalization");
   await expect.poll(async () => (
     await publicPlanStage(page)
   ).run?.primary_draft_checkpoint?.status).toBe("recorded");
-  const awaitingReview = await publicPlanStage(page);
-  expect(awaitingReview.run).toMatchObject({
+  const awaitingFinalization = await publicPlanStage(page);
+  expect(awaitingFinalization.run).toMatchObject({
     status: "admitted",
     provider_operations: {
       primary: { status: "completed" },
-      review: { status: "prepared" },
     },
     primary_draft_checkpoint: {
       status: "recorded",
@@ -204,9 +203,10 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
     },
     attempt_execution_receipt: null,
   });
+  expect(Object.keys(awaitingFinalization.run?.provider_operations ?? {})).toEqual(["primary"]);
   await expect(card).toHaveAttribute("data-plan-stage-state", "run");
 
-  runningProduct().releasePlanProviderPhase("plan-review");
+  runningProduct().releasePlanStageBoundary("plan-local-finalization");
   await expect.poll(async () => (
     await publicPlanStage(page)
   ).stage_commit?.status, { timeout: 30_000 }).toBe("Completed");
@@ -302,13 +302,11 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
   await expect(page.getByTestId("current-question-card")).toContainText(
     transitionedForeground.question_ref,
   );
-  const stageStrip = page.getByRole("list", {
-    name: "本轮研究可开展的四类工作",
-  });
-  await expect(stageStrip.locator('[data-stage-position="plan"]'))
-    .toHaveAttribute("data-stage-state", "result");
-  await expect(stageStrip.locator('[data-stage-position="bundle"]'))
-    .toHaveAttribute("data-stage-state", "current");
+  const stageStrip = page.getByRole("region", { name: "研究光谱" });
+  await expect(stageStrip.locator('[data-stage="plan"]'))
+    .toContainText("结果已接纳");
+  await expect(stageStrip.locator('[data-stage="bundle"]'))
+    .toHaveAttribute("aria-current", "step");
 
   const dynamicFacts = [
     committed.stage_run_request?.request_ref,

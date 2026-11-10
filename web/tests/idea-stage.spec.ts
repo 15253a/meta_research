@@ -109,12 +109,6 @@ const RUN = {
       request_hash: "6".repeat(64),
       response_hash: null,
     },
-    review: {
-      invocation_ref: "idea-review-invocation-001",
-      status: "prepared",
-      request_hash: "7".repeat(64),
-      response_hash: null,
-    },
   },
   primary_draft_checkpoint: null,
   review: null,
@@ -137,12 +131,6 @@ const AWAITING: IdeaStageFixture = {
         status: "completed",
         request_hash: "6".repeat(64),
         response_hash: "8".repeat(64),
-      },
-      review: {
-        invocation_ref: "idea-review-invocation-001",
-        status: "completed",
-        request_hash: "7".repeat(64),
-        response_hash: "9".repeat(64),
       },
     },
     primary_draft_checkpoint: {
@@ -381,7 +369,7 @@ test("readiness failure keeps durable Idea facts visible and names the worker bl
 
   await expect(page.getByRole("banner")).toBeVisible();
   await expect(page.getByRole("navigation", { name: "主导航" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "创建 Quest" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "创建研究任务" })).toBeEnabled();
   await expect(page.getByRole("complementary", { name: "Quest Companion" })).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });

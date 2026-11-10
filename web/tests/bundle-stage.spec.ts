@@ -265,10 +265,10 @@ test("a real BundleExhaustion exposes its public basis and remains a Cycle resul
 
   await page.setViewportSize({ width: 1440, height: 1000 });
   await openAuthenticatedProduct(page, runningProduct());
-  await runningProduct().waitForPlanProviderPhase("plan-primary", 30_000);
-  runningProduct().releasePlanProviderPhase("plan-primary");
-  await runningProduct().waitForPlanProviderPhase("plan-review", 30_000);
-  runningProduct().releasePlanProviderPhase("plan-review");
+  await runningProduct().waitForPlanStageBoundary("plan-primary", 30_000);
+  runningProduct().releasePlanStageBoundary("plan-primary");
+  await runningProduct().waitForPlanStageBoundary("plan-local-finalization", 30_000);
+  runningProduct().releasePlanStageBoundary("plan-local-finalization");
 
   await expect.poll(async () => (
     await publicBundleStage(page)
@@ -292,7 +292,11 @@ test("a real BundleExhaustion exposes its public basis and remains a Cycle resul
   });
   expect(bundleStage.target_graph.targets).toEqual([]);
   expect(bundleStage.target_commits).toEqual([]);
-  expect(bundleStage.run).toMatchObject({ status: "completed" });
+  expect(bundleStage.run).toMatchObject({
+    status: "completed",
+    provider_operations: { primary: { status: "completed" } },
+  });
+  expect(Object.keys(bundleStage.run?.provider_operations ?? {})).toEqual(["primary"]);
 
   const snapshot = await publicSnapshot(page);
   expect(snapshot.bundle_stage).toEqual(bundleStage);
@@ -309,10 +313,11 @@ test("a real BundleExhaustion exposes its public basis and remains a Cycle resul
   );
   expect(decisionReceiptRef).toBeTruthy();
 
-  const bundlePosition = page.getByRole("list", {
-    name: "本轮研究可开展的四类工作",
-  }).locator('[data-stage-position="bundle"]');
-  await expect(bundlePosition).toHaveAttribute("data-stage-state", "result");
+  const spectrum = page.getByRole("region", { name: "研究光谱" });
+  await expect(spectrum.locator('[data-stage="bundle"]'))
+    .toContainText("未形成可用方案");
+  await expect(spectrum.locator('[data-stage="reasoning"]'))
+    .toHaveAttribute("aria-current", "step");
 });
 
 test("Bundle keeps partial TargetCommit truth and blockers visible", async ({

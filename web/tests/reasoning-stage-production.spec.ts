@@ -28,7 +28,7 @@ function runningProduct(): DeterministicProduct {
 }
 
 async function openCreation(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "创建 Quest" }).click();
+  await page.getByRole("button", { name: "创建研究任务" }).click();
   const dialog = page.getByRole("dialog", {
     name: "创建 Quest，并决定第一个研究问题",
   });
@@ -64,7 +64,7 @@ async function createAcceptedQuestThroughWeb(page: Page): Promise<void> {
     { timeout: 15_000 },
   );
   await expect(
-    dialog.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
+    dialog.getByText("研究目标和第一问已就绪，请核对后确认创建", { exact: true }),
   ).toBeVisible();
   await dialog.getByRole("button", {
     name: "确认创建 Quest 与第一个问题",
@@ -81,10 +81,9 @@ async function createAcceptedQuestThroughWeb(page: Page): Promise<void> {
       return "snapshot_unavailable";
     }
   }, { timeout: 30_000 }).toBe("completed");
-  if (await dialog.isVisible()) {
-    await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
-  }
-  await page.getByRole("button", { name: "Quest 总览", exact: true }).click();
+  // Successful confirmation closes this dialog after the accepted snapshot.
+  await expect(dialog).toBeHidden({ timeout: 30_000 });
+  await page.getByRole("button", { name: "研究总览", exact: true }).click();
   await expect(page.getByTestId("current-cycle-overview")).toBeVisible();
 }
 
@@ -135,7 +134,7 @@ test("Chrome observes the real Reasoning chain and keeps every Owner boundary se
   await openAuthenticatedProduct(page, runningProduct());
   await createAcceptedQuestThroughWeb(page);
 
-  await runningProduct().waitForReasoningProviderPhase(
+  await runningProduct().waitForReasoningStageBoundary(
     "reasoning-primary",
     30_000,
   );
@@ -222,7 +221,7 @@ test("Chrome observes the real Reasoning chain and keeps every Owner boundary se
   });
   expect((await publicSnapshot(page)).reasoning_stage).toEqual(admitted);
 
-  await page.getByRole("button", { name: "问题树", exact: true }).click();
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "问题树", exact: true }).click();
   const tree = page.getByTestId("question-tree");
   const currentTreeItem = tree.locator(
     `[data-question-ref="${foreground.question_ref}"]`,
@@ -313,21 +312,22 @@ test("Chrome observes the real Reasoning chain and keeps every Owner boundary se
     "data-question-ref",
     foreground.question_ref,
   );
-  const stages = page.getByRole("list", {
-    name: "本轮研究可开展的四类工作",
-  });
-  await expect(stages.getByRole("listitem")).toHaveCount(4);
+  const stages = page.getByRole("region", { name: "研究光谱" });
+  await expect(stages.locator(".spectrum-stage")).toHaveCount(4);
   for (const [position, state] of Object.entries({
-    idea: "result",
-    plan: "skipped",
-    bundle: "skipped",
-    reasoning: "current",
+    idea: "结果已接纳",
+    plan: "本轮已跳过",
+    bundle: "本轮已跳过",
+    reasoning: "当前阶段",
   })) {
-    await expect(stages.locator(`[data-stage-position="${position}"]`))
-      .toHaveAttribute("data-stage-state", state);
+    await expect(stages.locator(`[data-stage="${position}"]`))
+      .toContainText(state);
   }
+  await expect(stages.locator('[data-stage="reasoning"]'))
+    .toHaveAttribute("aria-current", "step");
   await expect(stages).not.toContainText(/Writing.*Stage|Companion.*Stage/);
 
+  await page.locator(".research-existing-details > summary").click();
   const card = page.getByTestId("reasoning-stage-card");
   await expect(card).toBeVisible();
   await expect(card).toHaveAttribute("data-reasoning-stage-state", "run");
@@ -356,13 +356,19 @@ test("Chrome observes the real Reasoning chain and keeps every Owner boundary se
     }))).toEqual({ pageWidth: viewport.width, viewportWidth: viewport.width });
   }
 
-  runningProduct().releaseReasoningProviderPhase("reasoning-primary");
-  await runningProduct().waitForReasoningProviderPhase("reasoning-review");
+  runningProduct().releaseReasoningStageBoundary("reasoning-primary");
+  await runningProduct().waitForReasoningStageBoundary("reasoning-local-finalization");
   await expect.poll(async () => (
     await publicReasoningStage(page)
   ).run?.primary_draft_checkpoint?.status).toBe("recorded");
+  const localBoundary = await publicReasoningStage(page);
+  expect(localBoundary.run).toMatchObject({
+    provider_operations: { primary: { status: "completed" } },
+    attempt_execution_receipt: null,
+  });
+  expect(Object.keys(localBoundary.run?.provider_operations ?? {})).toEqual(["primary"]);
 
-  runningProduct().releaseReasoningProviderPhase("reasoning-review");
+  runningProduct().releaseReasoningStageBoundary("reasoning-local-finalization");
   await expect.poll(async () => (
     await publicReasoningStage(page)
   ).stage_commit?.status, { timeout: 30_000 }).toBe("Completed");

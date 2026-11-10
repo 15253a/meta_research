@@ -15,7 +15,7 @@ import {
 test.describe.configure({ timeout: 150_000 });
 
 async function openCreation(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "创建 Quest" }).click();
+  await page.getByRole("button", { name: "创建研究任务" }).click();
   const dialog = page.getByRole("dialog", {
     name: "创建 Quest，并决定第一个研究问题",
   });
@@ -67,7 +67,7 @@ async function createAcceptedQuestThroughWeb(
     { timeout: 15_000 },
   );
   await expect(
-    dialog.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
+    dialog.getByText("研究目标和第一问已就绪，请核对后确认创建", { exact: true }),
   ).toBeVisible();
   await dialog.getByRole("button", {
     name: "确认创建 Quest 与第一个问题",
@@ -187,10 +187,10 @@ test("Chrome observes mandatory AutonomousCreation without a browser-authored ef
     await openAuthenticatedProduct(page, product);
     await createAcceptedQuestThroughWeb(page, { deepfetch: true });
 
-    await product.waitForReasoningProviderPhase("reasoning-primary", 30_000);
-    product.releaseReasoningProviderPhase("reasoning-primary");
-    await product.waitForReasoningProviderPhase("reasoning-review", 30_000);
-    product.releaseReasoningProviderPhase("reasoning-review");
+    await product.waitForReasoningStageBoundary("reasoning-primary", 30_000);
+    product.releaseReasoningStageBoundary("reasoning-primary");
+    await product.waitForReasoningStageBoundary("reasoning-local-finalization", 30_000);
+    product.releaseReasoningStageBoundary("reasoning-local-finalization");
 
     await expect.poll(async () => (await publicAutonomous(page))?.status, {
       timeout: 60_000,
@@ -284,10 +284,10 @@ test("Chrome requires the exact HC preview before RG acceptance and AE ending", 
     await openAuthenticatedProduct(page, product);
     await createAcceptedQuestThroughWeb(page);
 
-    await product.waitForReasoningProviderPhase("reasoning-primary", 30_000);
-    product.releaseReasoningProviderPhase("reasoning-primary");
-    await product.waitForReasoningProviderPhase("reasoning-review", 30_000);
-    product.releaseReasoningProviderPhase("reasoning-review");
+    await product.waitForReasoningStageBoundary("reasoning-primary", 30_000);
+    product.releaseReasoningStageBoundary("reasoning-primary");
+    await product.waitForReasoningStageBoundary("reasoning-local-finalization", 30_000);
+    product.releaseReasoningStageBoundary("reasoning-local-finalization");
     await expect.poll(async () => (
       await publicReasoning(page)
     ).stage_commit?.transition_kind, { timeout: 30_000 }).toBe(

@@ -34,6 +34,8 @@ from meta_research.bundle_target_contract import (
     build_normalized_completion_contract,
     normalized_completion_contract_to_dict,
 )
+from meta_research.codex_runtime import CODEX_MODEL_REF
+from meta_research.human_guidance import GuidanceRuntimeScope, StageGuidanceOperation
 from meta_research.composition import build_production_runtime
 from meta_research.deepfetch import (
     DeepFetchProviderRequest,
@@ -573,7 +575,7 @@ class DeterministicIdeaSkill:
             adapter_kind="chrome_deterministic_idea",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
         return IdeaSkillResult(
@@ -586,13 +588,30 @@ class DeterministicIdeaSkill:
         )
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
-        return self.review_draft(request, self.generate_draft(request))
+        return self.finalize_draft(request, self.generate_draft(request))
 
 
-class ControlledDeterministicReasoningSkill:
+class ReasoningGuidanceProvider:
+    """Freeze the real HC cut at the same active-provider seam as Codex."""
+
+    def bind_human_guidance_authority(self, authority) -> None:
+        self._human_guidance = authority
+
+    def freeze_guidance(self, request: ReasoningSkillRequest, phase: str) -> None:
+        self._human_guidance.freeze_operation_guidance(StageGuidanceOperation(
+            GuidanceRuntimeScope(
+                "reasoning", request.run_ref, request.attempt_ref,
+                request.root_session_ref, request.fence_ref,
+                canonical_hash(request.runtime_binding.as_dict()),
+            ),
+            request.job_ref, phase,
+        ))
+
+
+class ControlledDeterministicReasoningSkill(ReasoningGuidanceProvider):
     """A controlled provider used through the production Reasoning worker."""
 
-    def __init__(self, control: ProviderPhaseControl) -> None:
+    def __init__(self, control: StageBoundaryControl) -> None:
         self._control = control
 
     def request_stop(self) -> None:
@@ -671,6 +690,7 @@ class ControlledDeterministicReasoningSkill:
     def generate_draft(
         self, request: ReasoningSkillRequest
     ) -> ReasoningSkillDraft:
+        self.freeze_guidance(request, "primary")
         self._control.wait_for_release("reasoning-primary")
         return ReasoningSkillDraft(
             draft=self._output(request),
@@ -679,20 +699,18 @@ class ControlledDeterministicReasoningSkill:
             adapter_kind="chrome_deterministic_reasoning",
         )
 
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
     ) -> ReasoningSkillResult:
-        self._control.wait_for_release("reasoning-review")
+        self._control.wait_for_release("reasoning-local-finalization")
         output = self._output(request)
         return ReasoningSkillResult(
             reviewed_draft=draft.draft,
             scientific_outcome=output["scientific_outcome"],
             next_cycle_proposal=None,
             candidate_completion=output["candidate_completion"],
-            findings=(),
-            dispositions=(),
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -701,13 +719,13 @@ class ControlledDeterministicReasoningSkill:
 
     def execute(self, request: ReasoningSkillRequest) -> ReasoningSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(request, draft)
+        return self.finalize_draft(request, draft)
 
 
-class ControlledAutonomousReasoningSkill:
+class ControlledAutonomousReasoningSkill(ReasoningGuidanceProvider):
     """A real resumable Reasoning provider with an autonomous checkpoint."""
 
-    def __init__(self, control: ProviderPhaseControl) -> None:
+    def __init__(self, control: StageBoundaryControl) -> None:
         self._control = control
 
     def request_stop(self) -> None:
@@ -783,6 +801,7 @@ class ControlledAutonomousReasoningSkill:
     def generate_draft(
         self, request: ReasoningSkillRequest
     ) -> ReasoningSkillDraft:
+        self.freeze_guidance(request, "primary")
         self._control.wait_for_release("reasoning-primary")
         return ReasoningSkillDraft(
             draft=self._checkpoint(request),
@@ -791,17 +810,15 @@ class ControlledAutonomousReasoningSkill:
             adapter_kind="chrome_deterministic_reasoning",
         )
 
-    def review_draft(
+    def finalize_draft(
         self,
         request: ReasoningSkillRequest,
         draft: ReasoningSkillDraft,
     ) -> ReasoningAutonomousCheckpointResult:
-        self._control.wait_for_release("reasoning-review")
+        self._control.wait_for_release("reasoning-local-finalization")
         return ReasoningAutonomousCheckpointResult(
             primary_draft=draft.draft,
             reviewed_checkpoint=draft.draft,
-            findings=(),
-            dispositions=(),
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -814,6 +831,7 @@ class ControlledAutonomousReasoningSkill:
         checkpoint: dict[str, object],
         creation_result: dict[str, object],
     ) -> ReasoningSkillResult:
+        self.freeze_guidance(request, "autonomous-resume")
         outcome = checkpoint["scientific_outcome"]
         anchor = creation_result["question_anchor"]
         transition = {
@@ -838,25 +856,6 @@ class ControlledAutonomousReasoningSkill:
             scientific_outcome=outcome,
             next_cycle_proposal=transition,
             candidate_completion=None,
-            findings=(
-                {
-                    "finding_id": "autonomous-target-owner-facts",
-                    "category": "transition_boundary",
-                    "message": (
-                        "Bind the final transition to the accepted target."
-                    ),
-                },
-            ),
-            dispositions=(
-                {
-                    "finding_id": "autonomous-target-owner-facts",
-                    "action": "revised",
-                    "rationale": (
-                        "The accepted Anchor and current graph facts are now "
-                        "available."
-                    ),
-                },
-            ),
             primary_session_ref=request.native_session_ref
             or "chrome-reasoning-autonomous-primary-session",
             review_mode="advisory_unobserved",
@@ -868,8 +867,8 @@ class ControlledAutonomousReasoningSkill:
         raise AssertionError("autonomous Reasoning must preserve its checkpoint")
 
 
-class ProviderPhaseControl:
-    """Private adapter handshake; it never changes Owner or Projection state."""
+class StageBoundaryControl:
+    """Test gate for provider and local boundaries; no Owner or Projection writes."""
 
     def __init__(self, root: Path) -> None:
         self._root = root
@@ -892,7 +891,7 @@ class ProviderPhaseControl:
 class ControlledDeterministicPlanSkill:
     """A deterministic external provider exercised by the production Plan worker."""
 
-    def __init__(self, control: ProviderPhaseControl) -> None:
+    def __init__(self, control: StageBoundaryControl) -> None:
         self._control = control
 
     def request_stop(self) -> None:
@@ -985,6 +984,7 @@ class ControlledDeterministicPlanSkill:
                 "evidence_reference_revision": request.context_pack[
                     "evidence_reference_revision"
                 ],
+                "selected_evidence_bindings": [],
             },
         }
 
@@ -997,10 +997,10 @@ class ControlledDeterministicPlanSkill:
             adapter_kind="chrome_deterministic_plan",
         )
 
-    def review_draft(
+    def finalize_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult:
-        self._control.wait_for_release("plan-review")
+        self._control.wait_for_release("plan-local-finalization")
         return PlanSkillResult(
             reviewed_draft=draft.draft,
             final_plan=draft.draft,
@@ -1012,7 +1012,7 @@ class ControlledDeterministicPlanSkill:
 
     def execute(self, request: PlanSkillRequest) -> PlanSkillResult:
         draft = self.generate_draft(request)
-        return self.review_draft(request, draft)
+        return self.finalize_draft(request, draft)
 
 
 class DeterministicExhaustionBundleSkill:
@@ -1129,7 +1129,7 @@ class DeterministicExhaustionBundleSkill:
             output_kind="exhaustion_assessment",
         )
 
-    def review_draft(
+    def finalize_draft(
         self,
         request: BundleSkillRequest,
         draft: BundleSkillDraft,
@@ -1149,7 +1149,7 @@ class DeterministicExhaustionBundleSkill:
     def execute(
         self, request: BundleSkillRequest
     ) -> BundleExhaustionSkillResult:
-        return self.review_draft(request, self.generate_draft(request))
+        return self.finalize_draft(request, self.generate_draft(request))
 
 
 class TransientResearchGraph:
@@ -1357,7 +1357,7 @@ async def serve(
     if stage_pipeline in {"plan-gap", "bundle-exhaustion"}:
         idea_skill = DeterministicIdeaSkill()
         plan_skill = ControlledDeterministicPlanSkill(
-            ProviderPhaseControl(
+            StageBoundaryControl(
                 prepared_data_root.run / "chrome-provider-control"
             )
         )
@@ -1366,14 +1366,14 @@ async def serve(
     elif stage_pipeline in {"reasoning-no-evidence", "quest-completion"}:
         idea_skill = DeterministicIdeaSkill(no_viable=True)
         reasoning_skill = ControlledDeterministicReasoningSkill(
-            ProviderPhaseControl(
+            StageBoundaryControl(
                 prepared_data_root.run / "chrome-provider-control"
             )
         )
     elif stage_pipeline == "reasoning-autonomous":
         idea_skill = DeterministicIdeaSkill(no_viable=True)
         reasoning_skill = ControlledAutonomousReasoningSkill(
-            ProviderPhaseControl(
+            StageBoundaryControl(
                 prepared_data_root.run / "chrome-provider-control"
             )
         )
@@ -1410,7 +1410,7 @@ async def serve(
     if stage_pipeline == "bundle-exhaustion":
         runtime.harnesses.start_full_conformance(
             FullConformanceRequest(
-                codex_model_ref="gpt-5.6-sol",
+                codex_model_ref=CODEX_MODEL_REF,
                 codex_auth_profile_ref="harness-profile:codex-default",
                 claude_model_ref="claude-conformance",
                 claude_auth_profile_ref="harness-profile:claude-default",
@@ -1481,13 +1481,16 @@ async def serve(
             idempotency_key="browser-human-request-handoff",
             quest_ref=completed_root["quest_ref"],
         )
-    human_collaboration._research_graph = TransientResearchGraph(  # noqa: SLF001
-        runtime.owners.research_graph,
-        failure_limit=1_000 if legacy_state == "recovering" else 3,
-    )
-    human_collaboration._research_memory = TransientResearchMemory(  # noqa: SLF001
-        runtime.owners.research_memory
-    )
+    # Stage browser scenarios exercise the real Owners directly. Deliberate
+    # initialization I/O failures belong to the recovery scenarios below.
+    if stage_pipeline is None:
+        human_collaboration._research_graph = TransientResearchGraph(  # noqa: SLF001
+            runtime.owners.research_graph,
+            failure_limit=1_000 if legacy_state == "recovering" else 3,
+        )
+        human_collaboration._research_memory = TransientResearchMemory(  # noqa: SLF001
+            runtime.owners.research_memory
+        )
     if legacy_state is not None:
         seed_legacy_current(human_collaboration, legacy_state)
 

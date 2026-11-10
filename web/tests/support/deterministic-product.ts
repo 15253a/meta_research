@@ -32,8 +32,8 @@ type DeterministicProductOptions = {
     | "quest-completion";
 };
 
-export type PlanProviderPhase = "plan-primary" | "plan-review";
-export type ReasoningProviderPhase = "reasoning-primary" | "reasoning-review";
+export type PlanStageBoundary = "plan-primary" | "plan-local-finalization";
+export type ReasoningStageBoundary = "reasoning-primary" | "reasoning-local-finalization";
 
 const supportDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(supportDirectory, "../../..");
@@ -109,6 +109,7 @@ export class DeterministicProduct {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
+      process.stderr.write(chunk);
     });
 
     try {
@@ -202,8 +203,8 @@ export class DeterministicProduct {
     rmSync(custodyRoot, { recursive: true });
   }
 
-  async waitForPlanProviderPhase(
-    phase: PlanProviderPhase,
+  async waitForPlanStageBoundary(
+    phase: PlanStageBoundary,
     timeoutMs = 20_000,
   ): Promise<void> {
     const marker = this.providerMarker(phase, "started");
@@ -221,14 +222,14 @@ export class DeterministicProduct {
     }
   }
 
-  releasePlanProviderPhase(phase: PlanProviderPhase): void {
+  releasePlanStageBoundary(phase: PlanStageBoundary): void {
     writeFileSync(this.providerMarker(phase, "release"), "release\n", {
       encoding: "utf8",
     });
   }
 
-  async waitForReasoningProviderPhase(
-    phase: ReasoningProviderPhase,
+  async waitForReasoningStageBoundary(
+    phase: ReasoningStageBoundary,
     timeoutMs = 20_000,
   ): Promise<void> {
     const marker = this.providerMarker(phase, "started");
@@ -246,14 +247,14 @@ export class DeterministicProduct {
     }
   }
 
-  releaseReasoningProviderPhase(phase: ReasoningProviderPhase): void {
+  releaseReasoningStageBoundary(phase: ReasoningStageBoundary): void {
     writeFileSync(this.providerMarker(phase, "release"), "release\n", {
       encoding: "utf8",
     });
   }
 
   private providerMarker(
-    phase: PlanProviderPhase | ReasoningProviderPhase,
+    phase: PlanStageBoundary | ReasoningStageBoundary,
     state: "started" | "release",
   ): string {
     return join(

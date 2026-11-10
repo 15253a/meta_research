@@ -26,7 +26,7 @@ test.beforeAll(async ({ browser }, testInfo) => {
     await product.authenticate(page);
     storageState = await context.storageState();
     try {
-      await product.waitForPlanProviderPhase("plan-primary", 30_000);
+      await product.waitForPlanStageBoundary("plan-primary", 30_000);
     } catch (error) {
       for (const path of ["/api/v1/status", "/api/v1/snapshot", "/internal/readiness"]) {
         const name = `setup-${path.split("/").pop()}`;
