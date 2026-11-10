@@ -175,6 +175,12 @@ def test_checkpoint_retry_does_not_swallow_integrity_errors(monkeypatch, code):
 @pytest.mark.parametrize("error", [OwnerConflict("unclassified_reason"), RuntimeError("unexpected failure")])
 def test_unknown_exception_is_a_failure_and_next_public_call_recovers(monkeypatch, error):
     worker = _worker_at_inbox_boundary(monkeypatch, lambda _run: None, lambda: True)
+    monkeypatch.setattr(worker._agent_runtime, "query_managed_run",
+                        lambda _run: {"status": "suspended", "terminal_reason": "human_request_wait"})
+    assert worker.process_once() is False
+    assert worker.observation.kind == "waiting"
+    assert worker.observation.code == "human_request_wait"
+    monkeypatch.setattr(worker._agent_runtime, "query_managed_run", lambda _run: None)
     def fail(_run):
         raise error
     monkeypatch.setattr(worker, "_drain_bundle_inbox", fail)
