@@ -26,7 +26,7 @@ def _scenario(tmp_path, mutate=lambda doc: None, *, runtime=None, ready=None):
         artifact = workspace / f'outputs/data/run{index+1}.txt'
         artifact.parent.mkdir(exist_ok=True)
         artifact.write_bytes(output)
-    metrics = json.loads((workspace / 'outputs/metrics.json').read_text())
+    metrics = json.loads((workspace / 'outputs/result.json').read_text())
     evaluator=workspace/'implementation/v2/evaluate.py'
     evaluator.write_text('from pathlib import Path\nimport json\na=int(Path("outputs/data/run1.txt").read_text())\nb=int(Path("outputs/data/run2.txt").read_text())\nprint(json.dumps({"metric:effect":b-a}))\n')
     metrics['metrics']=json.loads(subprocess.check_output([sys.executable,str(evaluator)],cwd=workspace))
@@ -45,7 +45,7 @@ def _scenario(tmp_path, mutate=lambda doc: None, *, runtime=None, ready=None):
         root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
         fence_ref=handle.execution_fence_ref)
     final_text = 'Squared 6 and 13 with two retained method snapshots.'
-    evidence = replace(old, handoff=None, workspace_ref=workspace_ref, final_text=final_text,
+    evidence = replace(old, workspace_ref=workspace_ref, final_text=final_text,
         final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest())
     finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
         workspace_resolver=runtime.target_run_authorities.agent_runtime,

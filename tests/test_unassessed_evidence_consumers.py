@@ -20,7 +20,7 @@ from test_target_root_finalizer import _root_finalizer_fixture
 def test_owner_work_publication_and_reasoning_only_cite_real_metrics(tmp_path, assessment):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         metrics = document["metrics"]
         evaluations = [] if assessment is None else [{

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -170,28 +171,53 @@ class _EvidenceReader:
     def __init__(self, evidence: TargetRootCompletionEvidence) -> None:
         self.evidence = evidence
 
-    def verify_target_root_completion_evidence(
-        self, *, handle, evidence, handoff
-    ) -> str:
-        if (
-            evidence != self.evidence
-            or evidence.target_ref != handle.target_ref
-            or handoff != evidence.handoff
-        ):
+    def verify_target_root_completion_evidence(self, *, handle, evidence) -> str:
+        if evidence != self.evidence or evidence.target_ref != handle.target_ref:
             raise OwnerConflict("target_root_completion_evidence_invalid")
-        return canonical_hash(
-            {
-                "handle": handle.target_ref,
-                "evidence_ref": evidence.evidence_ref,
-                "operation_ref": evidence.operation_ref,
-                "handoff": canonical_json(
-                    {
-                        "target_ref": handoff.target_ref,
-                        "target_run_ref": handoff.target_run_ref,
-                    }
-                ),
-            }
-        )
+        return canonical_hash({
+            "handle": handle.target_ref, "evidence_ref": evidence.evidence_ref,
+            "operation_ref": evidence.operation_ref, "workspace_ref": evidence.workspace_ref,
+            "final_text_sha256": evidence.final_text_sha256,
+        })
+
+
+def _completion_handoff(workspace, evidence):
+    """Inspect the system-derived internal contract, never agent evidence."""
+    pinned = target_run_finalizer_module._pin_workspace_root(evidence.workspace_ref, workspace)
+    try:
+        handoff = target_run_finalizer_module._system_target_completion_handoff(
+            handle=evidence, evidence=evidence, root_descriptor=pinned.descriptor)
+        document = json.loads((workspace / "outputs/result.json").read_text(encoding="utf-8"))
+        declared = {item["relative_path"] for item in document.get("retained_artifacts", [])}
+        # Tests alter explicit declarations. Newly discovered conventional files
+        # remain for the real finalizer to discover, rather than being declared
+        # a second time when a test appends its intended selection.
+        return replace(handoff, artifacts=tuple(item for item in handoff.artifacts
+            if item.role in {"implementation", "result"} or item.relative_path in declared))
+    finally:
+        os.close(pinned.descriptor)
+
+
+def _replace_completion_evidence(workspace, evidence, *, handoff=None, **changes):
+    """Put test research declarations on the current system-owned input path."""
+    if handoff is not None:
+        document_path = workspace / "outputs/result.json"
+        document = json.loads(document_path.read_text(encoding="utf-8"))
+        document["retained_artifacts"] = [
+            {"role": artifact.role, "relative_path": artifact.relative_path}
+            for artifact in handoff.artifacts if artifact.role not in {"implementation", "result"}
+        ]
+        implementation = [artifact.relative_path for artifact in handoff.artifacts
+                          if artifact.role == "implementation"]
+        if implementation != ["implementation"]:
+            for run in document.get("formal_runs", []):
+                if not run.get("variant_run_ref"):
+                    run["implementation_paths"] = implementation
+        document_path.write_text(canonical_json(document), encoding="utf-8")
+        if not handoff.summary.startswith("System-bound Target root completion;"):
+            changes["final_text"] = handoff.summary
+            changes["final_text_sha256"] = hashlib.sha256(handoff.summary.encode()).hexdigest()
+    return replace(evidence, **changes)
 
 
 def _root_finalizer_fixture(tmp_path: Path, *, runtime=None, ready=None):
@@ -260,7 +286,7 @@ def _root_finalizer_fixture(tmp_path: Path, *, runtime=None, ready=None):
     )
     artifacts: list[dict[str, str]] = [
         {"role": "implementation", "relative_path": "implementation"},
-        {"role": "result", "relative_path": "outputs/metrics.json"},
+        {"role": "result", "relative_path": "outputs/result.json"},
         {"role": "log", "relative_path": "logs/train.log"},
     ]
     if authority.measurement_contract.checkpoint_policy == "required":
@@ -276,20 +302,11 @@ def _root_finalizer_fixture(tmp_path: Path, *, runtime=None, ready=None):
                              if artifact["role"] == "checkpoint"],
         "evaluations": [{"attempt_key": "primary", "metrics": metrics, "artifact_paths": []}],
     }]
-    (workspace / "outputs" / "metrics.json").write_text(
-        canonical_json(result_document), encoding="utf-8"
-    )
-    handoff = canonical_json(
-        {
-            "artifacts": artifacts,
-            "result_document_path": "outputs/metrics.json",
-            "schema_ref": "meta-research/target-completion-handoff/v1",
-            "status": "completed",
-            "summary": "Root finished implementation and training.",
-            "target_ref": handle.target_ref,
-            "target_run_ref": handle.target_run_ref,
-        }
-    )
+    result_document["retained_artifacts"] = [
+        artifact for artifact in artifacts if artifact["role"] not in {"implementation", "result"}
+    ]
+    (workspace / "outputs/result.json").write_text(canonical_json(result_document), encoding="utf-8")
+    final_text = "Root finished implementation and training."
     evidence = TargetRootCompletionEvidence(
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
@@ -302,7 +319,9 @@ def _root_finalizer_fixture(tmp_path: Path, *, runtime=None, ready=None):
         operation_generation=1,
         evidence_ref="harness_evidence_target_root_final_turn",
         evidence_sequence=10,
-        handoff=decode_target_completion_handoff(handoff),
+        workspace_ref=_workspace_ref,
+        final_text=final_text,
+        final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest(),
         observed_at=1.0,
     )
     return runtime, lifecycle, memory, authority, handle, workspace, evidence
@@ -334,9 +353,9 @@ class _CurrentBindingBundleSkill(bundle_fixtures._DeterministicBundleSkill):
             required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
         )
 
-    def review_draft(self, request, draft):
+    def finalize_draft(self, request, draft):
         return replace(
-            super().review_draft(request, draft),
+            super().finalize_draft(request, draft),
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
         )
@@ -408,7 +427,7 @@ def test_finalizer_freezes_once_and_replays_without_reopening_live_workspace(
         (workspace / "implementation" / "train.py").write_text(
             "print('mutated later')\n", encoding="utf-8"
         )
-        (workspace / "outputs" / "metrics.json").write_text(
+        (workspace / "outputs" / "result.json").write_text(
             canonical_json(
                 {
                     "metrics": {"forged": 999.0},
@@ -450,7 +469,7 @@ def test_complete_result_without_total_classification_reaches_target_commit(
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path)
     )
-    result_path = workspace / "outputs" / "metrics.json"
+    result_path = workspace / "outputs" / "result.json"
     document = json.loads(result_path.read_text(encoding="utf-8"))
     document.pop("result_disposition")
     document["observations"] = {"measured_effect": "The recorded metrics are the observations."}
@@ -493,7 +512,7 @@ def test_result_uses_owner_schema_without_recopying_it_into_source(
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path)
     )
-    result_path = workspace / "outputs" / "metrics.json"
+    result_path = workspace / "outputs" / "result.json"
     document = json.loads(result_path.read_text(encoding="utf-8"))
     document.pop("schema_ref")
     document.pop("result_disposition")
@@ -540,7 +559,7 @@ def test_unclassified_result_remains_readable_as_evidence_for_reasoning(
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path)
     )
-    result_path = workspace / "outputs" / "metrics.json"
+    result_path = workspace / "outputs" / "result.json"
     document = json.loads(result_path.read_text(encoding="utf-8"))
     document.pop("schema_ref")
     document.pop("result_disposition")
@@ -695,11 +714,11 @@ def test_recoverable_rg_rejection_is_append_only_and_replays_as_revision_require
             "print('train revision 2')\n", encoding="utf-8"
         )
         successor_handoff = replace(
-            evidence.handoff,
+            _completion_handoff(workspace, evidence),
             summary="Root revised the result after exact RG feedback.",
         )
-        successor_evidence = replace(
-            evidence,
+        successor_evidence = _replace_completion_evidence(
+            workspace, evidence,
             operation_ref="harness_target_root_successor_turn",
             operation_generation=evidence.operation_generation + 1,
             evidence_ref="harness_evidence_target_root_successor_turn",
@@ -769,7 +788,7 @@ def test_real_rg_semantic_rejection_returns_revision_required_after_rm_freeze(
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         canonical_json(invalid_result), encoding="utf-8"
     )
     finalizer = TargetRunFinalizer(
@@ -807,7 +826,7 @@ def test_invalid_result_candidate_is_rejected_before_rm_and_can_be_revised(
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path)
     )
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         "{not-json}", encoding="utf-8"
     )
     finalizer = TargetRunFinalizer(
@@ -827,7 +846,7 @@ def test_invalid_result_candidate_is_rejected_before_rm_and_can_be_revised(
         assert rejected.pending_code == "target_root_result_document_invalid"
         assert rejected.rejection_feedback == (
             "The declared result document is not valid unambiguous UTF-8 JSON for the "
-            "Target result schema. Rewrite outputs/metrics.json and complete another "
+            "Target result schema. Rewrite outputs/result.json and complete another "
             "root turn."
         )
         first_completion = lifecycle.query_completion(handle.target_ref)
@@ -853,17 +872,17 @@ def test_invalid_result_candidate_is_rejected_before_rm_and_can_be_revised(
             "result_disposition": "positive",
             "schema_ref": authority.measurement_contract.result_schema_ref,
         }
-        (workspace / "outputs" / "metrics.json").write_text(
+        (workspace / "outputs" / "result.json").write_text(
             canonical_json(valid_result), encoding="utf-8"
         )
-        successor_evidence = replace(
-            evidence,
+        successor_evidence = _replace_completion_evidence(
+            workspace, evidence,
             operation_ref="harness_target_root_revised_final_turn",
             operation_generation=evidence.operation_generation + 1,
             evidence_ref="harness_evidence_target_root_revised_final_turn",
             evidence_sequence=evidence.evidence_sequence + 1,
             handoff=replace(
-                evidence.handoff,
+                _completion_handoff(workspace, evidence),
                 summary="Root corrected the rejected result document.",
             ),
             observed_at=evidence.observed_at + 1.0,
@@ -934,7 +953,7 @@ def test_result_document_rejects_more_metrics_than_the_formal_protocol_can_name(
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         canonical_json(result_document), encoding="utf-8"
     )
     finalizer = TargetRunFinalizer(
@@ -967,7 +986,7 @@ def test_result_document_maps_unbounded_integer_to_typed_metric_rejection(
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         canonical_json(result_document), encoding="utf-8"
     )
     finalizer = TargetRunFinalizer(
@@ -1000,7 +1019,7 @@ def test_result_document_rejects_finite_integer_beyond_bundle_canonical_range(
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         canonical_json(result_document), encoding="utf-8"
     )
     finalizer = TargetRunFinalizer(
@@ -1033,7 +1052,7 @@ def test_result_document_accepts_bundle_canonical_integer_boundary(
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         canonical_json(result_document), encoding="utf-8"
     )
     finalizer = TargetRunFinalizer(
@@ -1062,7 +1081,7 @@ def test_result_document_maps_deep_json_to_recoverable_typed_rejection(
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path)
     )
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         "[" * 10_000 + "0" + "]" * 10_000,
         encoding="utf-8",
     )
@@ -1096,7 +1115,7 @@ def test_result_document_maps_surrogate_schema_to_recoverable_invalid_document(
         "result_disposition": "positive",
         "schema_ref": "\ud800",
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         json.dumps(
             result_document,
             ensure_ascii=True,
@@ -1135,7 +1154,7 @@ def test_result_document_maps_surrogate_metric_key_to_recoverable_invalid_metric
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         json.dumps(
             result_document,
             ensure_ascii=True,
@@ -1356,7 +1375,7 @@ def test_prefreeze_rejection_store_unavailability_replays_exact_feedback(
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path)
     )
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         "{not-json}", encoding="utf-8"
     )
     original_reject = lifecycle.reject_completion
@@ -1397,7 +1416,7 @@ def test_prefreeze_rejection_store_unavailability_replays_exact_feedback(
 
         # Even if live bytes drift before retry, replay uses the exact failure
         # already frozen into the immutable candidate generation.
-        (workspace / "outputs" / "metrics.json").write_text(
+        (workspace / "outputs" / "result.json").write_text(
             canonical_json(
                 {
                     "metrics": {"later": 1.0},
@@ -1431,7 +1450,7 @@ def test_finalizer_maps_symlinked_artifact_to_recoverable_rejection_before_rm(
     )
     (workspace / "logs" / "train.log").unlink()
     (workspace / "logs" / "train.log").symlink_to(
-        workspace / "outputs" / "metrics.json"
+        workspace / "outputs" / "result.json"
     )
     finalizer = TargetRunFinalizer(
         lifecycle=lifecycle,

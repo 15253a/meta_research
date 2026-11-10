@@ -1,4 +1,5 @@
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff
 
 import json
 import pytest
@@ -54,11 +55,11 @@ def _accept(runtime, lifecycle, memory, handle, evidence):
 def test_multiple_actual_runs_and_assessments_are_not_collapsed(tmp_path):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / 'outputs/metrics.json'
+        path = workspace / 'outputs/result.json'
         document = json.loads(path.read_text())
         first = document['metrics']
         second = {key: 7.0 for key in first}
-        checkpoints = [artifact.relative_path for artifact in evidence.handoff.artifacts
+        checkpoints = [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                        if artifact.role == 'checkpoint']
         document['formal_runs'] = [
             {'run_key': 'audit-a', 'checkpoint_paths': checkpoints, 'evaluations': [
@@ -88,7 +89,7 @@ def test_multiple_actual_runs_and_assessments_are_not_collapsed(tmp_path):
 def test_invalid_extra_evaluation_rolls_back_entire_acceptance(tmp_path):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / 'outputs/metrics.json'
+        path = workspace / 'outputs/result.json'
         document = json.loads(path.read_text())
         document['formal_runs'] = [{'run_key': 'actual', 'evaluations': [
             {'attempt_key': 'valid', 'metrics': document['metrics']},
@@ -119,7 +120,7 @@ def test_explicit_unexecuted_completion_preserves_assets_without_fabricating_res
     from meta_research.target_run_finalizer import TargetRootOwnerRejection
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / 'outputs/metrics.json'
+        path = workspace / 'outputs/result.json'
         document = json.loads(path.read_text())
         document['execution_hierarchy'] = {
             'variant_run': {'status': 'not_instantiated'},

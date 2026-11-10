@@ -20,7 +20,7 @@ def test_primary_may_explicitly_select_an_existing_cross_baseline_variant(tmp_pa
             baseline,variant = _register_method(connection,
                 {'method_key':'alternative','method_version':'1','method_contract':{'purpose':'different actual method'}},
                 {'method':'count'})
-        path=workspace/'outputs/metrics.json'; doc=json.loads(path.read_text())
+        path=workspace/'outputs/result.json'; doc=json.loads(path.read_text())
         doc['formal_runs']=[{'run_key':'selected','variant_ref':variant,
             'evaluations':[{'attempt_key':'actual','metrics':doc['metrics']}] if evaluated else []}]
         path.write_text(canonical_json(doc))
@@ -86,7 +86,7 @@ def test_explicit_variant_from_another_quest_is_rejected(tmp_path):
         graph=runtime.owners.research_graph
         assert graph.query_baseline(baseline,quest_ref=current) is None
         assert baseline not in {item['baseline_ref'] for item in graph.query_baselines(quest_ref=current)['items']}
-        path=workspace/'outputs/metrics.json';doc=json.loads(path.read_text())
+        path=workspace/'outputs/result.json';doc=json.loads(path.read_text())
         doc['formal_runs']=[{'run_key':'foreign','variant_ref':variant,'evaluations':[]}]
         path.write_text(canonical_json(doc))
         with pytest.raises(OwnerConflict,match='variant_scope_invalid'):

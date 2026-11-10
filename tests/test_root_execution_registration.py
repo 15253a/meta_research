@@ -43,7 +43,7 @@ def test_non_execution_requires_all_frozen_declarations_not_a_metric_label():
 def test_legacy_unexecuted_handoff_keeps_original_anchors_without_formal_results(tmp_path, monkeypatch):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / 'outputs/metrics.json'
+        path = workspace / 'outputs/result.json'
         document = json.loads(path.read_text())
         document.update({key: value for key, value in _unexecuted().items() if key != 'metrics'})
         path.write_text(canonical_json(document))

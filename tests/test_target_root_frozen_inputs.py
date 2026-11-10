@@ -20,7 +20,6 @@ from meta_research.owners.target_run_runtime import (
 )
 from meta_research.owners.agent_runtime_harness import TargetRootCompletionEvidence
 from meta_research.target_run_finalizer import TargetRunFinalizer
-from meta_research.target_run_runtime_contract import decode_target_completion_handoff
 from test_target_run_owner import _records
 
 
@@ -255,25 +254,6 @@ def test_tampered_frozen_input_blocks_all_completion_rm_and_rg_writes(
     projected = Path(artifact_path)
     projected.chmod(0o600)
     projected.write_bytes(b"same-OS-root-agent-tamper\n")
-    handoff = decode_target_completion_handoff(
-        canonical_json(
-            {
-                "artifacts": [
-                    {
-                        "role": "implementation",
-                        "relative_path": "implementation",
-                    },
-                    {"role": "result", "relative_path": "outputs/metrics.json"}
-                ],
-                "result_document_path": "outputs/metrics.json",
-                "schema_ref": "meta-research/target-completion-handoff/v1",
-                "status": "completed",
-                "summary": "provider drained after completing the target",
-                "target_ref": handle.target_ref,
-                "target_run_ref": handle.target_run_ref,
-            }
-        )
-    )
     evidence = TargetRootCompletionEvidence(
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
@@ -286,7 +266,8 @@ def test_tampered_frozen_input_blocks_all_completion_rm_and_rg_writes(
         operation_generation=1,
         evidence_ref="root-final-evidence",
         evidence_sequence=1,
-        handoff=handoff,
+        workspace_ref=workspace._workspace.workspace_ref, final_text="provider drained after completing the target",
+        final_text_sha256=hashlib.sha256("provider drained after completing the target".encode()).hexdigest(),
         observed_at=1.0,
     )
 

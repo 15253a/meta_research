@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Target results retain research facts without a mandatory overall verdict."""
 
 import json
@@ -16,7 +17,7 @@ def test_unclassified_result_is_accepted_persisted_and_replayable(tmp_path):
         _root_finalizer_fixture(tmp_path)
     )
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_bytes())
         document.pop("result_disposition")
         document["target_spec_binding"] = projection_plain_value(
@@ -76,7 +77,7 @@ def test_conflicting_result_identity_can_be_corrected_on_the_same_work(tmp_path,
         _root_finalizer_fixture(tmp_path)
     )
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_bytes())
         document.pop("result_disposition")
         document[field] = "another-identity"
@@ -106,13 +107,13 @@ def test_conflicting_result_identity_can_be_corrected_on_the_same_work(tmp_path,
         document.pop(field)
         corrected_bytes = json.dumps(document).encode()
         result_path.write_bytes(corrected_bytes)
-        revised_evidence = replace(
-            evidence,
+        revised_evidence = _replace_completion_evidence(
+            workspace, evidence,
             operation_ref="harness_target_identity_corrected_final_turn",
             operation_generation=evidence.operation_generation + 1,
             evidence_ref="harness_evidence_target_identity_corrected_final_turn",
             evidence_sequence=evidence.evidence_sequence + 1,
-            handoff=replace(evidence.handoff, summary="Corrected the source identity."),
+            handoff=replace(_completion_handoff(workspace, evidence), summary="Corrected the source identity."),
             observed_at=evidence.observed_at + 1,
         )
         revised = TargetRunFinalizer(
@@ -192,7 +193,7 @@ def test_missing_metric_feedback_identifies_the_affected_actual_evaluation(tmp_p
         _root_finalizer_fixture(tmp_path)
     )
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_bytes())
         document.pop("result_disposition")
         document["metrics"] = {"metric:unregistered": 999.0}
@@ -222,7 +223,7 @@ def test_secondary_metric_conflict_can_be_revised_without_repeating_valid_work(t
         _root_finalizer_fixture(tmp_path)
     )
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_bytes())
         document.pop("result_disposition")
         document["formal_runs"][0]["evaluations"].append({
@@ -253,13 +254,13 @@ def test_secondary_metric_conflict_can_be_revised_without_repeating_valid_work(t
 
         document["formal_runs"][0]["evaluations"][1]["metrics"] = {"metric:effect": 2.0}
         result_path.write_text(json.dumps(document), encoding="utf-8")
-        revised_evidence = replace(
-            evidence,
+        revised_evidence = _replace_completion_evidence(
+            workspace, evidence,
             operation_ref="harness_secondary_metric_corrected_final_turn",
             operation_generation=evidence.operation_generation + 1,
             evidence_ref="harness_evidence_secondary_metric_corrected_final_turn",
             evidence_sequence=evidence.evidence_sequence + 1,
-            handoff=replace(evidence.handoff, summary="Corrected only the secondary metrics."),
+            handoff=replace(_completion_handoff(workspace, evidence), summary="Corrected only the secondary metrics."),
             observed_at=evidence.observed_at + 1,
         )
         revised_finalizer = TargetRunFinalizer(

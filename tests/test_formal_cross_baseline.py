@@ -57,7 +57,7 @@ def test_non_primary_run_can_use_a_variant_of_another_baseline(tmp_path):
                 {"method_key": "comparison_partner_method", "method_version": "1",
                  "method_contract": {"meaning": "partner method for comparison"}},
                 {"seed": 7})
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         metrics = document["metrics"]
         document["formal_runs"] = [
@@ -83,7 +83,7 @@ def test_non_primary_run_can_use_a_variant_of_another_baseline(tmp_path):
 def test_run_can_declare_a_new_method_at_completion(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         metrics = document["metrics"]
         document["formal_runs"] = [
@@ -124,7 +124,7 @@ def test_run_can_declare_a_new_method_at_completion(tmp_path):
 def test_primary_run_may_declare_its_actual_variant_and_get_paired_evaluation(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         metrics = document["metrics"]
         document["formal_runs"] = [

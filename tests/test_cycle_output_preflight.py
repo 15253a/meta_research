@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _replace_completion_evidence
 import hashlib
 import json
 from dataclasses import replace
@@ -18,7 +19,7 @@ def test_implementation_file_declaration_rejects_before_copy_with_exact_field(tm
     import meta_research.target_run_finalizer as module
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        document = json.loads((workspace / "outputs/metrics.json").read_bytes())
+        document = json.loads((workspace / "outputs/result.json").read_bytes())
         document["formal_runs"][0]["implementation_paths"] = ["implementation/train.py"]
         (workspace / "outputs/result.json").write_text(canonical_json(document))
         workspace_ref, _ = runtime.target_run_authorities.agent_runtime.resolve_target_workspace(
@@ -26,7 +27,7 @@ def test_implementation_file_declaration_rejects_before_copy_with_exact_field(tm
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
         final = "Completed scientific work remains retained."
-        evidence = replace(evidence, handoff=None, workspace_ref=workspace_ref, final_text=final,
+        evidence = _replace_completion_evidence(workspace, evidence, workspace_ref=workspace_ref, final_text=final,
             final_text_sha256=hashlib.sha256(final.encode()).hexdigest())
         freeze = Mock(wraps=module._freeze_artifact)
         monkeypatch.setattr(module, "_freeze_artifact", freeze)
@@ -66,7 +67,7 @@ def test_implementation_preflight_does_not_recheck_live_workspace_during_frozen_
         (selected / "payload.bin").write_bytes(b"".join(
             hashlib.sha256(str(index).encode()).digest() for index in range(128)
         ))
-        document = json.loads((workspace / "outputs/metrics.json").read_bytes())
+        document = json.loads((workspace / "outputs/result.json").read_bytes())
         document["formal_runs"][0]["implementation_paths"] = ["implementation/selected"]
         (workspace / "outputs/result.json").write_text(canonical_json(document))
         # Exercise the existing large-artifact custody path with small fixtures.
@@ -76,7 +77,7 @@ def test_implementation_preflight_does_not_recheck_live_workspace_during_frozen_
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
         final = "Original completed research."
-        evidence = replace(evidence, handoff=None, workspace_ref=workspace_ref, final_text=final,
+        evidence = _replace_completion_evidence(workspace, evidence, workspace_ref=workspace_ref, final_text=final,
             final_text_sha256=hashlib.sha256(final.encode()).hexdigest())
         with pytest.raises(OwnerConflict, match="target_root_artifact_intake_unavailable"):
             TargetRunFinalizer(lifecycle=lifecycle, memory=UnavailableMemory(),

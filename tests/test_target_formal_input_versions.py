@@ -88,8 +88,7 @@ def _admitted_input_root(tmp_path):
             attempt_generation=1, root_session_ref=handle.root_session_ref,
             native_session_ref="native-formal-version", fence_ref=handle.execution_fence_ref,
             operation_ref="formal-version-final", operation_generation=1,
-            evidence_ref="formal-version-evidence", evidence_sequence=1, handoff=None,
-            workspace_ref=workspace_ref, final_text=summary,
+            evidence_ref="formal-version-evidence", evidence_sequence=1,             workspace_ref=workspace_ref, final_text=summary,
             final_text_sha256=hashlib.sha256(summary.encode()).hexdigest(), observed_at=1.0)
         return runtime, lifecycle, memory, handle, workspace, evidence, selected, newer
     except BaseException:

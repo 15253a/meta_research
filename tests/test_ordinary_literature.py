@@ -134,7 +134,7 @@ def test_accepted_target_reading_is_indexed_by_bundle_with_original_provenance(t
     from test_stage_resource_handoff import _bundle_channel, _call, _accepted
     runtime, lifecycle, memory, authority, handle, workspace, old = _root_finalizer_fixture(tmp_path)
     try:
-        (workspace / "outputs/result.json").write_bytes((workspace / "outputs/metrics.json").read_bytes())
+        (workspace / "outputs/result.json").write_bytes((workspace / "outputs/result.json").read_bytes())
         analysis=workspace/"outputs/analysis";analysis.mkdir()
         body="Our Target reading of doi:10.1000/external: independent evidence still missing.\n"
         (analysis/"research-note.md").write_text(body)
@@ -142,7 +142,7 @@ def test_accepted_target_reading_is_indexed_by_bundle_with_original_provenance(t
             target_ref=handle.target_ref,target_run_ref=handle.target_run_ref,root_session_ref=handle.root_session_ref,
             attempt_ref=handle.execution_attempt_ref,fence_ref=handle.execution_fence_ref)
         message="Reading preserved with limitations."
-        evidence=replace(old,handoff=None,workspace_ref=workspace_ref,final_text=message,
+        evidence=replace(old,workspace_ref=workspace_ref,final_text=message,
             final_text_sha256=hashlib.sha256(message.encode()).hexdigest())
         finalizer=TargetRunFinalizer(lifecycle=lifecycle,memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,evidence_reader=_SystemEvidenceReader(),

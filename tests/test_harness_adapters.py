@@ -4328,7 +4328,7 @@ def test_root_stdout_is_not_promoted_into_formal_harness_evidence(
     )
 
     evidence = CodexHarnessAdapter(tmp_path, runner=runner).invoke(
-        _invocation("codex")
+        replace(_invocation("codex"), target_workspace_ref="workspace-formal-boundary", working_directory=str(tmp_path))
     )
 
     encoded = json.dumps(evidence.evidence_events)
@@ -4337,10 +4337,11 @@ def test_root_stdout_is_not_promoted_into_formal_harness_evidence(
     completion_events = [
         event
         for event in evidence.evidence_events
-        if "target_root_completion_candidate" in event
+        if "target_root_completion_binding" in event
     ]
     assert len(completion_events) == 1
-    assert completion_events[0]["target_root_completion_candidate"] == handoff
+    assert completion_events[0]["target_root_completion_binding"]["final_text"] == json.dumps(handoff, sort_keys=True, separators=(",", ":"))
+    assert "target_root_completion_candidate" not in completion_events[0]
     assert completion_events[0]["target_root_agent_message"] is True
     assert evidence.evidence_events[-1]["target_root_terminal"] is True
 

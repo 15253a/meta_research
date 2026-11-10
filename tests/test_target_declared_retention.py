@@ -27,7 +27,7 @@ def test_agent_retains_file_directory_and_collection_with_declared_purposes(tmp_
             path = workspace / relative_path
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-        document = json.loads((workspace / "outputs/metrics.json").read_text())
+        document = json.loads((workspace / "outputs/result.json").read_text())
         document["retained_artifacts"] = [
             {"relative_path": "materials/cohort", "role": "data"},
             {"relative_path": "fieldnotes/observation.md", "role": "analysis"},
@@ -45,7 +45,7 @@ def test_agent_retains_file_directory_and_collection_with_declared_purposes(tmp_
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
         final_text = "Retained the cohort, observations and exact state from the actual work."
-        evidence = replace(old, handoff=None, workspace_ref=workspace_ref,
+        evidence = replace(old, workspace_ref=workspace_ref,
             final_text=final_text, final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest())
         finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,

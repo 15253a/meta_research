@@ -105,8 +105,7 @@ def _start_root(runtime, ready, prior, assets=()):
     (workspace / "outputs").mkdir()
     evidence = replace(prior, target_ref=key, target_run_ref=handle.target_run_ref,
         attempt_ref=handle.execution_attempt_ref, root_session_ref=handle.root_session_ref,
-        fence_ref=handle.execution_fence_ref, workspace_ref=workspace_ref, handoff=None,
-        native_session_ref="native:" + key, operation_ref="operation:" + key, evidence_ref="evidence:" + key)
+        fence_ref=handle.execution_fence_ref, workspace_ref=workspace_ref,         native_session_ref="native:" + key, operation_ref="operation:" + key, evidence_ref="evidence:" + key)
     return lifecycle, memory, handle, workspace, evidence
 
 
@@ -146,7 +145,7 @@ def _admitted_evidence_input(tmp_path, assessed):
             root_session_ref=source_handle.root_session_ref, attempt_ref=source_handle.execution_attempt_ref,
             fence_ref=source_handle.execution_fence_ref)
         summary = "Retained historical input material for a later comparison."
-        evidence = replace(prior, handoff=None, workspace_ref=workspace_ref, final_text=summary,
+        evidence = replace(prior, workspace_ref=workspace_ref, final_text=summary,
             final_text_sha256=hashlib.sha256(summary.encode()).hexdigest())
         completed = _finalizer(runtime, lifecycle, memory).finalize(handle=source_handle, evidence=evidence)
         assert completed.status == "completed"

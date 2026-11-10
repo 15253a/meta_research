@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Whole research artifacts cross the real AR completion / RM boundary."""
 from dataclasses import replace
 import hashlib
@@ -20,8 +21,8 @@ def test_large_dataset_and_checkpoint_are_preserved_and_replay_without_live_file
             with path.open('wb') as stream:
                 stream.write(b'real retained research artifact\n')
                 stream.truncate(size)
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role='data', relative_path='outputs/data/acquired'),
             TargetCompletionArtifact(role='checkpoint', relative_path='outputs/large-checkpoint.bin'),
         )))

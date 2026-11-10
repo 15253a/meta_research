@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -21,9 +22,9 @@ def _finalizer(runtime, lifecycle, memory, evidence):
 
 
 def _declare(workspace, evidence):
-    path = workspace / "outputs/metrics.json"
+    path = workspace / "outputs/result.json"
     document = json.loads(path.read_text())
-    paths = [artifact.relative_path for artifact in evidence.handoff.artifacts if artifact.role == "checkpoint"]
+    paths = [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts if artifact.role == "checkpoint"]
     document["formal_runs"] = [
         {"run_key": "actual-a", "status": "executed", "checkpoint_paths": paths,
          "evaluations": [{"attempt_key": "missing-prerequisite", "status": "blocked"}]},

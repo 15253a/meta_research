@@ -25,10 +25,6 @@ from meta_research.runtime_protection import (
 from meta_research.target_raw_output import TargetRawOutputUnavailable
 from meta_research.target_run_runtime_contract import (
     TARGET_COMPLETION_BINDING_SCHEMA,
-    TargetCompletionHandoff,
-    TargetCompletionHandoffError,
-    decode_target_completion_handoff,
-    validate_target_completion_handoff,
 )
 
 
@@ -293,11 +289,10 @@ class TargetRootCompletionEvidence:
     operation_generation: int
     evidence_ref: str
     evidence_sequence: int
-    handoff: TargetCompletionHandoff | None
     observed_at: float
-    workspace_ref: str | None = None
-    final_text: str | None = None
-    final_text_sha256: str | None = None
+    workspace_ref: str
+    final_text: str
+    final_text_sha256: str
 
 
 class AgentRuntimeHarnessInterface(Protocol):
@@ -474,7 +469,6 @@ class AgentRuntimeHarnessInterface(Protocol):
         self,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff | None,
     ) -> str: ...
 
     def complete_operation(
@@ -3662,10 +3656,6 @@ class SQLiteAgentRuntimeHarness:
                 "target_root_completion_evidence_invalid"
             )
         binding = candidate_event.get("target_root_completion_binding")
-        handoff: TargetCompletionHandoff | None = None
-        workspace_ref: str | None = None
-        final_text: str | None = None
-        final_text_sha256: str | None = None
         if isinstance(binding, dict):
             scope = candidate_event.get("target_run_scope")
             final_text = binding.get("final_text")
@@ -3718,55 +3708,9 @@ class SQLiteAgentRuntimeHarness:
                     "target_root_completion_evidence_invalid"
                 )
         else:
-            if "target_root_completion_binding" in candidate_event:
-                raise AgentRuntimeHarnessError(
-                    "target_root_completion_evidence_invalid"
-                )
-            # Historical/restart compatibility only.  New provider turns emit
-            # a system-owned text binding and never require an agent envelope.
-            candidate = candidate_event.get(
-                "target_root_completion_candidate"
+            raise AgentRuntimeHarnessError(
+                "target_root_completion_evidence_invalid"
             )
-            result_candidate = candidate_event.get(
-                "target_root_completion_result_candidate"
-            )
-            if not isinstance(candidate, dict) and isinstance(
-                result_candidate, dict
-            ):
-                candidate = {
-                    "schema_ref": "meta-research/target-completion-handoff/v1",
-                    "target_ref": target_ref,
-                    "target_run_ref": str(run.run_ref),
-                    "status": "completed",
-                    **result_candidate,
-                }
-            if not isinstance(candidate, dict):
-                if candidate_event.get(
-                    "target_root_completion_binding_error"
-                ) is not None:
-                    raise AgentRuntimeHarnessError(
-                        "target_root_completion_evidence_invalid"
-                    )
-                if candidate_event.get(
-                    "target_root_completion_candidate_error"
-                ) == "target_completion_handoff_invalid":
-                    raise AgentRuntimeHarnessError(
-                        "target_root_completion_handoff_invalid"
-                    )
-                return None
-            try:
-                handoff = decode_target_completion_handoff(
-                    canonical_json(candidate)
-                )
-                validate_target_completion_handoff(
-                    handoff,
-                    expected_target_ref=target_ref,
-                    expected_target_run_ref=str(run.run_ref),
-                )
-            except TargetCompletionHandoffError as error:
-                raise AgentRuntimeHarnessError(
-                    "target_root_completion_evidence_invalid"
-                ) from error
         return TargetRootCompletionEvidence(
             target_ref=target_ref,
             target_run_ref=str(run.run_ref),
@@ -3779,7 +3723,6 @@ class SQLiteAgentRuntimeHarness:
             operation_generation=int(operation.generation),
             evidence_ref=str(candidate_row.event_ref),
             evidence_sequence=int(candidate_row.sequence),
-            handoff=handoff,
             observed_at=float(candidate_row.recorded_at),
             workspace_ref=workspace_ref,
             final_text=final_text,
@@ -3790,17 +3733,12 @@ class SQLiteAgentRuntimeHarness:
         self,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff | None,
     ) -> str:
         """Re-open the issuer ledger and bind finalization to exact evidence."""
 
         if (
             type(handle) is not TargetWorkHandle
             or type(evidence) is not TargetRootCompletionEvidence
-            or (
-                handoff is not None
-                and type(handoff) is not TargetCompletionHandoff
-            )
         ):
             raise AgentRuntimeHarnessError(
                 "target_root_completion_evidence_invalid"
@@ -3809,27 +3747,11 @@ class SQLiteAgentRuntimeHarness:
         if (
             current is None
             or current != evidence
-            or current.handoff != handoff
             or current.target_ref != handle.target_ref
             or current.target_run_ref != handle.target_run_ref
             or current.root_session_ref != handle.root_session_ref
             or current.attempt_ref != handle.execution_attempt_ref
             or current.fence_ref != handle.execution_fence_ref
-            or (
-                handoff is not None
-                and (
-                    handoff.target_ref != handle.target_ref
-                    or handoff.target_run_ref != handle.target_run_ref
-                )
-            )
-            or (
-                handoff is None
-                and (
-                    current.workspace_ref is None
-                    or current.final_text is None
-                    or current.final_text_sha256 is None
-                )
-            )
         ):
             raise AgentRuntimeHarnessError(
                 "target_root_completion_evidence_invalid"

@@ -55,7 +55,7 @@ def _structured_fixture(tmp_path, monkeypatch):
 def test_structured_measurements_survive_owner_commit_bundle_and_evidence_reuse(tmp_path, monkeypatch):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _structured_fixture(tmp_path, monkeypatch)
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_bytes())
         document["metrics"] = deepcopy(METRICS)
         document["formal_runs"][0]["evaluations"][0]["metrics"] = document["metrics"]
@@ -156,7 +156,7 @@ def test_structured_metrics_retain_the_overall_result_document_budget():
 def test_initial_schema_allows_well_formed_evolved_structured_measurements(tmp_path, monkeypatch):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _structured_fixture(tmp_path, monkeypatch)
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_bytes())
         document["metrics"] = deepcopy(METRICS)
         document["formal_runs"][0]["evaluations"][0]["metrics"] = document["metrics"]

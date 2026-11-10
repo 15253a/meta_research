@@ -64,7 +64,7 @@ def test_successor_idea_accepts_committed_target_asset_without_evidence_role(tmp
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
         summary = 'Retained an observation; no evaluation or comparative claim.'
-        evidence = replace(prior, handoff=None, workspace_ref=workspace_ref, final_text=summary,
+        evidence = replace(prior, workspace_ref=workspace_ref, final_text=summary,
             final_text_sha256=hashlib.sha256(summary.encode()).hexdigest())
         finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,

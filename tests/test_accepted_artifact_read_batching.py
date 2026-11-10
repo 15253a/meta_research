@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Large accepted outputs do not generate a database read per artifact."""
 import json
 import time
@@ -17,7 +18,7 @@ def many_artifact_root(tmp_path):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         paths = []
-        artifacts = [item for item in evidence.handoff.artifacts if item.role != 'checkpoint']
+        artifacts = [item for item in _completion_handoff(workspace, evidence).artifacts if item.role != 'checkpoint']
         for index in range(32):
             path = f'outputs/checkpoints/state-{index}.bin'
             (workspace / path).parent.mkdir(exist_ok=True)
@@ -28,8 +29,8 @@ def many_artifact_root(tmp_path):
             (workspace / path).parent.mkdir(parents=True, exist_ok=True)
             (workspace / path).write_text(json.dumps({'index': index}))
             artifacts.append(TargetCompletionArtifact(role='analysis', relative_path=path))
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=tuple(artifacts)))
-        result = workspace / 'outputs/metrics.json'
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=tuple(artifacts)))
+        result = workspace / 'outputs/result.json'
         document = json.loads(result.read_text())
         document['formal_runs'] = [{'run_key': 'all-retained-states', 'checkpoint_paths': paths,
             'evaluations': [{'attempt_key': 'assessment', 'metrics': document['metrics'],

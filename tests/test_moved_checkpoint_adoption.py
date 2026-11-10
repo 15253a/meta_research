@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Stable checkpoint identity survives duplicate ordinals and later adoption."""
 from dataclasses import replace
 import json
@@ -57,9 +58,9 @@ def test_moved_state_old_evaluation_replays_but_new_evaluation_uses_current_owne
     try:
         evidence = _with_checkpoint(workspace,evidence)
         (workspace/'outputs/b.ckpt').write_bytes(b'B-state')
-        evidence = replace(evidence,handoff=replace(evidence.handoff,artifacts=(*evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence,handoff=replace(_completion_handoff(workspace, evidence),artifacts=(*_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role='checkpoint',relative_path='outputs/b.ckpt'))))
-        path=workspace/'outputs/metrics.json'; doc=json.loads(path.read_text())
+        path=workspace/'outputs/result.json'; doc=json.loads(path.read_text())
         doc['formal_runs']=[
             {'run_key':'A','checkpoint_paths':['outputs/final.ckpt'],
              'evaluations':[{'attempt_key':'original','metrics':doc['metrics']}]},
@@ -91,9 +92,9 @@ def test_moved_state_old_evaluation_replays_but_new_evaluation_uses_current_owne
             assert connection.exec_driver_sql('PRAGMA integrity_check').scalar_one()=='ok'
             assert connection.exec_driver_sql('PRAGMA foreign_key_check').all()==[]
         _,life2,mem2,_,handle2,space2,evidence2=_next_target(runtime,authority,handle,tmp_path,monkeypatch)
-        evidence2=replace(evidence2,operation_ref='second-terminal',evidence_ref='second-evidence',
-            handoff=replace(evidence2.handoff,artifacts=tuple(a for a in evidence2.handoff.artifacts if a.role!='checkpoint')))
-        path2=space2/'outputs/metrics.json'; doc2=json.loads(path2.read_text()); old=original['A']; selected=original[new_owner]
+        evidence2=_replace_completion_evidence(workspace, evidence2,operation_ref='second-terminal',evidence_ref='second-evidence',
+            handoff=replace(_completion_handoff(workspace, evidence2),artifacts=tuple(a for a in _completion_handoff(workspace, evidence2).artifacts if a.role!='checkpoint')))
+        path2=space2/'outputs/result.json'; doc2=json.loads(path2.read_text()); old=original['A']; selected=original[new_owner]
         doc2['formal_runs']=[
             {'run_key':'old-A-assessment','variant_ref':old['variant_run']['variant_ref'],'variant_run_ref':a,
              'checkpoint_paths':['outputs/final.ckpt'], 'evaluations':[{'attempt_key':'old',

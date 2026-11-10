@@ -16,7 +16,7 @@ from meta_research.provider_call_observations import (
 from meta_research.provider_supervisor import (
     read_transport_envelope, read_verified_exit_receipt, write_exit_receipt,
 )
-from meta_research.research_notes import manifest_research_notes, materialize_note_body, read_note_body
+from meta_research.research_notes import FINAL_STATEMENT_PATH, manifest_research_notes, materialize_note_body, read_note_body
 from meta_research.target_run_finalizer import TargetRunFinalizer
 from test_target_root_finalizer import _root_finalizer_fixture
 
@@ -198,8 +198,8 @@ def test_required_current_contract_and_selected_inputs_survive_context_budget(ca
 
 
 class _SystemEvidenceReader:
-    def verify_target_root_completion_evidence(self, *, handle, evidence, handoff):
-        assert handoff is None and evidence.target_ref == handle.target_ref
+    def verify_target_root_completion_evidence(self, *, handle, evidence):
+        assert evidence.target_ref == handle.target_ref
         return canonical_hash({"evidence_ref": evidence.evidence_ref,
                                "final_text_sha256": evidence.final_text_sha256})
 
@@ -207,7 +207,6 @@ class _SystemEvidenceReader:
 def test_research_note_and_final_statement_are_immutable_assets_with_replay(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, old = _root_finalizer_fixture(tmp_path)
     try:
-        (workspace / "outputs/result.json").write_bytes((workspace / "outputs/metrics.json").read_bytes())
         analysis = workspace / "outputs/analysis"
         analysis.mkdir()
         body = "Current understanding: uncertain. Missing independent cohort.\n" * 100
@@ -217,7 +216,7 @@ def test_research_note_and_final_statement_are_immutable_assets_with_replay(tmp_
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
         final_text = "八项审计完成；uncertain，外部泛化证据仍缺。"
-        evidence = replace(old, handoff=None, workspace_ref=workspace_ref,
+        evidence = replace(old, workspace_ref=workspace_ref,
                            final_text=final_text,
                            final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest())
         finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
@@ -274,13 +273,12 @@ def test_research_note_and_final_statement_are_immutable_assets_with_replay(tmp_
 def test_historical_statement_backfill_preserves_legacy_manifest_and_scoped_body(tmp_path, monkeypatch):
     runtime, lifecycle, memory, authority, handle, workspace, old = _root_finalizer_fixture(tmp_path)
     try:
-        (workspace / "outputs/result.json").write_bytes((workspace / "outputs/metrics.json").read_bytes())
         workspace_ref, _ = runtime.target_run_authorities.agent_runtime.resolve_target_workspace(
             target_ref=handle.target_ref, target_run_ref=handle.target_run_ref,
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
         body = "uncertain: eight audit criteria assessed; independent generalization evidence is missing."
-        evidence = replace(old, handoff=None, workspace_ref=workspace_ref,
+        evidence = replace(old, workspace_ref=workspace_ref,
             final_text=body, final_text_sha256=hashlib.sha256(body.encode()).hexdigest())
         reader = _SystemEvidenceReader()
         finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
@@ -288,8 +286,16 @@ def test_historical_statement_backfill_preserves_legacy_manifest_and_scoped_body
             evidence_reader=reader, measurement_authority=runtime.owners.research_graph)
         original_freeze = finalizer._freeze
         def legacy_freeze(**arguments):
-            arguments["final_text"] = None
-            return original_freeze(**arguments)
+            frozen = original_freeze(**arguments)
+            artifacts = frozen.artifacts[:-1]
+            assert frozen.artifacts[-1].declared_relative_path == FINAL_STATEMENT_PATH
+            snapshot_hash = canonical_hash({
+                "schema_ref": "meta-research/target-root-artifact-snapshot/v1",
+                "target_ref": handle.target_ref, "target_run_ref": handle.target_run_ref,
+                "workspace_ref": frozen.workspace_ref,
+                "artifacts": [item.snapshot_value() for item in artifacts],
+            })
+            return replace(frozen, artifacts=artifacts, artifact_snapshot_hash=snapshot_hash)
         monkeypatch.setattr(finalizer, "_freeze", legacy_freeze)
         accepted = finalizer.finalize(handle=handle, evidence=evidence)
         manifest = memory.query(accepted.manifest_ref)

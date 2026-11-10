@@ -1,4 +1,5 @@
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff
 
 import io
 import json
@@ -219,7 +220,7 @@ def test_two_actual_productions_keep_retirement_blocked_after_role_correction(tm
         evidence,
     ) = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         document["formal_runs"] = [
             {
@@ -227,7 +228,7 @@ def test_two_actual_productions_keep_retirement_blocked_after_role_correction(tm
                 "artifact_paths": ["logs/train.log"],
                 "checkpoint_paths": [
                     artifact.relative_path
-                    for artifact in evidence.handoff.artifacts
+                    for artifact in _completion_handoff(workspace, evidence).artifacts
                     if artifact.role == "checkpoint"
                 ],
                 "evaluations": [

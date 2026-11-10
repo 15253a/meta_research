@@ -341,7 +341,6 @@ class TargetRootCompletionEvidenceReader(Protocol):
         *,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff | None,
     ) -> str: ...
 
 
@@ -535,7 +534,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             raise OwnerConflict("target_root_completion_evidence_invalid")
         _validate_evidence(evidence, handle=completion.handle)
         source_hash = evidence_reader.verify_target_root_completion_evidence(
-            handle=completion.handle, evidence=evidence, handoff=evidence.handoff)
+            handle=completion.handle, evidence=evidence)
         if (evidence.final_text is None or source_hash != completion.evidence_content_hash
             or evidence.evidence_ref != completion.evidence_ref
             or evidence.operation_ref != completion.harness_operation_ref):
@@ -1298,7 +1297,6 @@ class TargetRunFinalizer:
                 self._evidence_reader.verify_target_root_completion_evidence(
                     handle=handle,
                     evidence=evidence,
-                    handoff=evidence.handoff,
                 )
             )
         except OwnerConflict:
@@ -1325,14 +1323,7 @@ class TargetRunFinalizer:
                 and latest.harness_operation_ref == evidence.operation_ref
                 and latest.evidence_ref == evidence.evidence_ref
                 and latest.evidence_content_hash == evidence_content_hash
-                and (
-                    evidence.handoff is None
-                    or latest.handoff == evidence.handoff
-                )
-                and (
-                    evidence.workspace_ref is None
-                    or latest.workspace_ref == evidence.workspace_ref
-                )
+                and latest.workspace_ref == evidence.workspace_ref
             )
             if matches_latest:
                 completion = latest
@@ -1372,19 +1363,16 @@ class TargetRunFinalizer:
 
         if handoff is None:
             try:
-                if evidence.handoff is not None:
-                    handoff = evidence.handoff
-                else:
-                    pinned_workspace = self._resolve_workspace(handle)
-                    if evidence.workspace_ref != pinned_workspace.workspace_ref:
-                        raise OwnerConflict(
-                            "target_root_completion_evidence_invalid"
-                        )
-                    handoff = _system_target_completion_handoff(
-                        handle=handle,
-                        evidence=evidence,
-                        root_descriptor=pinned_workspace.descriptor,
+                pinned_workspace = self._resolve_workspace(handle)
+                if evidence.workspace_ref != pinned_workspace.workspace_ref:
+                    raise OwnerConflict(
+                        "target_root_completion_evidence_invalid"
                     )
+                handoff = _system_target_completion_handoff(
+                    handle=handle,
+                    evidence=evidence,
+                    root_descriptor=pinned_workspace.descriptor,
+                )
                 validate_target_completion_handoff(
                     handoff,
                     expected_target_ref=handle.target_ref,
@@ -1406,8 +1394,7 @@ class TargetRunFinalizer:
             if pinned_workspace is None:
                 pinned_workspace = self._resolve_workspace(handle)
                 if (
-                    evidence.workspace_ref is not None
-                    and evidence.workspace_ref != pinned_workspace.workspace_ref
+                    evidence.workspace_ref != pinned_workspace.workspace_ref
                 ):
                     os.close(pinned_workspace.descriptor)
                     raise OwnerConflict(
@@ -1420,7 +1407,6 @@ class TargetRunFinalizer:
                         handle=handle,
                         handoff=handoff,
                         resolved_workspace=pinned_workspace,
-                        system_owned=evidence.handoff is None,
                         final_text=evidence.final_text,
                         staging_directory=Path(staging_directory),
                         retained_completion=completion,
@@ -1748,27 +1734,25 @@ class TargetRunFinalizer:
         handle: TargetWorkHandle,
         handoff: TargetCompletionHandoff,
         resolved_workspace: _PinnedWorkspaceRoot,
-        system_owned: bool,
-        final_text: str | None = None,
+        final_text: str,
         staging_directory: Path | None = None,
         retained_completion: AcceptedTargetRootCompletion | None = None,
     ) -> _FrozenWorkspace:
         workspace_ref = resolved_workspace.workspace_ref
         root_descriptor = resolved_workspace.descriptor
-        if system_owned:
-            declared_implementation = tuple(
-                artifact
-                for artifact in handoff.artifacts
-                if artifact.role == "implementation"
-            )
-            if not declared_implementation or any(
-                artifact.relative_path != "implementation"
-                and not artifact.relative_path.startswith("implementation/")
-                for artifact in declared_implementation
-            ):
-                raise OwnerConflict("target_implementation_workspace_invalid")
-            if retained_completion is None:
-                _preflight_implementation_directories(root_descriptor, handoff.artifacts)
+        declared_implementation = tuple(
+            artifact
+            for artifact in handoff.artifacts
+            if artifact.role == "implementation"
+        )
+        if not declared_implementation or any(
+            artifact.relative_path != "implementation"
+            and not artifact.relative_path.startswith("implementation/")
+            for artifact in declared_implementation
+        ):
+            raise OwnerConflict("target_implementation_workspace_invalid")
+        if retained_completion is None:
+            _preflight_implementation_directories(root_descriptor, handoff.artifacts)
         frozen_artifacts: list[_FrozenArtifact] = []
         for ordinal, artifact in enumerate(handoff.artifacts):
             frozen_artifact = None
@@ -1786,17 +1770,16 @@ class TargetRunFinalizer:
                     staging_directory=staging_directory,
                 )
             frozen_artifacts.append(frozen_artifact)
-        if system_owned and final_text is not None:
-            # These are verified Harness bytes, not a filesystem claim. Keep
-            # the original final statement as an RM asset even when the root
-            # left no research-note.md or the native session later compacts.
-            content = final_text.encode("utf-8")
-            digest = hashlib.sha256(content).hexdigest()
-            frozen_artifacts.append(_FrozenArtifact(
-                ordinal=len(frozen_artifacts), role="analysis",
-                declared_relative_path=FINAL_STATEMENT_PATH, artifact_kind="file",
-                media_type="text/markdown; charset=utf-8", content=content,
-                content_hash=digest, tree_hash=digest))
+        # These are verified Harness bytes, not a filesystem claim. Keep
+        # the original final statement as an RM asset even when the root
+        # left no research-note.md or the native session later compacts.
+        content = final_text.encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()
+        frozen_artifacts.append(_FrozenArtifact(
+            ordinal=len(frozen_artifacts), role="analysis",
+            declared_relative_path=FINAL_STATEMENT_PATH, artifact_kind="file",
+            media_type="text/markdown; charset=utf-8", content=content,
+            content_hash=digest, tree_hash=digest))
         artifacts = tuple(frozen_artifacts)
         snapshot_hash = canonical_hash(
             {
@@ -1810,7 +1793,7 @@ class TargetRunFinalizer:
         implementation = tuple(
             item for item in artifacts if item.role == "implementation"
         )
-        if system_owned and any(item.artifact_kind != "directory" for item in implementation):
+        if any(item.artifact_kind != "directory" for item in implementation):
             raise OwnerConflict("target_implementation_workspace_invalid")
         if not implementation:
             raise OwnerConflict("target_root_implementation_missing")
@@ -1890,20 +1873,27 @@ def _system_target_completion_handoff(
         TargetCompletionArtifact(role=role, relative_path=relative_path)
         for role, relative_path in _SYSTEM_TARGET_COMPLETION_REQUIRED_ARTIFACTS
     ]
-    descriptor, info = _open_workspace_artifact(root_descriptor, "outputs/result.json")
+    document = {}
     try:
+        descriptor, info = _open_workspace_artifact(root_descriptor, "outputs/result.json")
         try:
             document = json.loads(_read_stable_regular_file(descriptor, info))
-        except (ValueError, UnicodeDecodeError) as error:
-            raise OwnerConflict('target_root_result_document_invalid') from error
-        if not isinstance(document, dict) or not isinstance(document.get('formal_runs', []), list):
-            raise OwnerConflict('target_root_result_document_invalid')
-    finally:
-        os.close(descriptor)
+        finally:
+            os.close(descriptor)
+        if not isinstance(document, dict):
+            document = {}
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        # Discovery only selects paths. The freeze boundary validates their
+        # bytes and durably records a correctable candidate rejection.
+        document = {}
+    except OwnerConflict as error:
+        if error.code not in _RM_RECOVERABLE_CANDIDATE_FEEDBACK:
+            raise
     retained = _retained_artifact_declarations(document, strict=False)
     selected_paths = []
-    for run in document.get('formal_runs', []):
-        if not isinstance(run, dict) or run.get('variant_run_ref') or run.get('status', 'executed') not in {'executed', 'failed'}:
+    runs = document.get('formal_runs', [])
+    for run in runs if isinstance(runs, list) else ():
+        if not isinstance(run, dict) or run.get('variant_run_ref') or run.get('status', 'executed') not in ('executed', 'failed'):
             continue
         paths = run.get('implementation_paths')
         if paths is None:
@@ -1963,14 +1953,15 @@ def _declared_artifact_boundaries(document, relative_path, role):
     selected = []
     selected.extend(item.relative_path
                     for item in _retained_artifact_declarations(document, strict=False))
-    for run in document.get('formal_runs', []):
-        if not isinstance(run, dict) or run.get('status', 'executed') not in {'executed', 'failed'}:
+    runs = document.get('formal_runs', [])
+    for run in runs if isinstance(runs, list) else ():
+        if not isinstance(run, dict) or run.get('status', 'executed') not in ('executed', 'failed'):
             continue
         producers = [] if run.get('variant_run_ref') else [run]
         evaluations = run.get('evaluations', [])
         if isinstance(evaluations, list):
             producers.extend(attempt for attempt in evaluations if isinstance(attempt, dict)
-                and attempt.get('status', 'executed') in {'executed', 'failed'}
+                and attempt.get('status', 'executed') in ('executed', 'failed')
                 and not attempt.get('evaluation_attempt_ref'))
         for producer in producers:
             declared = producer.get('checkpoint_paths' if role == 'checkpoint' else 'artifact_paths')
@@ -2121,16 +2112,9 @@ def _workspace_artifact_exists(
     return True
 
 
-def _completion_evidence_mode_is_valid(
+def _completion_text_binding_is_valid(
     evidence: TargetRootCompletionEvidence,
 ) -> bool:
-    if evidence.handoff is not None:
-        return (
-            type(evidence.handoff) is TargetCompletionHandoff
-            and evidence.workspace_ref is None
-            and evidence.final_text is None
-            and evidence.final_text_sha256 is None
-        )
     if (
         type(evidence.workspace_ref) is not str
         or not evidence.workspace_ref
@@ -2176,7 +2160,7 @@ def _validate_evidence(
         or evidence.evidence_sequence < 0
         or type(evidence.observed_at) is not float
         or not math.isfinite(evidence.observed_at)
-        or not _completion_evidence_mode_is_valid(evidence)
+        or not _completion_text_binding_is_valid(evidence)
     ):
         raise OwnerConflict("target_root_completion_evidence_invalid")
 

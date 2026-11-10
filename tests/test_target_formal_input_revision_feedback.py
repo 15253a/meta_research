@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Invalid formal input references produce exact Owner feedback for the same Root."""
 from dataclasses import replace
 import json
@@ -15,7 +16,7 @@ from test_target_root_finalizer import _EvidenceReader, _root_finalizer_fixture
 def test_invalid_formal_input_is_rejected_and_revised_in_same_root(tmp_path, assessed, bad_run_ordinal):
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         metrics = document["metrics"]
         runs = [{"run_key": "actual-run-" + str(index), "input_refs": [],
@@ -58,10 +59,10 @@ def test_invalid_formal_input_is_rejected_and_revised_in_same_root(tmp_path, ass
         # the frozen rejected artifacts. Only a new completion generation is made.
         document["formal_runs"][bad_run_ordinal]["input_refs"] = []
         path.write_text(canonical_json(document), encoding="utf-8")
-        successor = replace(evidence,
+        successor = _replace_completion_evidence(workspace, evidence,
             operation_ref="actual-root-input-correction", operation_generation=evidence.operation_generation + 1,
             evidence_ref="actual-root-input-correction-evidence", evidence_sequence=evidence.evidence_sequence + 10,
-            handoff=replace(evidence.handoff, summary="Corrected the unadmitted input reference after RG feedback."),
+            handoff=replace(_completion_handoff(workspace, evidence), summary="Corrected the unadmitted input reference after RG feedback."),
             observed_at=evidence.observed_at + 1)
         revising = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,
@@ -86,7 +87,7 @@ def test_invalid_formal_input_is_rejected_and_revised_in_same_root(tmp_path, ass
 def test_unrelated_formal_domain_error_still_rolls_back_entire_acceptance(tmp_path):
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document["formal_runs"] = [{"run_key": "actual", "input_refs": [], "evaluations": [
             {"attempt_key": "valid", "metrics": document["metrics"]},

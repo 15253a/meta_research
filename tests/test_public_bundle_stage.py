@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -54,9 +55,6 @@ from meta_research.target_run_finalizer import (
     TargetRunFinalizer,
 )
 from meta_research.target_commit_evidence import target_adoption_binding
-from meta_research.target_run_runtime_contract import (
-    decode_target_completion_handoff,
-)
 from test_public_plan_stage import (
     _DeterministicDraftingAdapter,
     _DeterministicIdeaSkill,
@@ -886,7 +884,7 @@ def _accept_real_target_root_commit(runtime):
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
+    (workspace / "outputs" / "result.json").write_text(
         canonical_json(result_document), encoding="utf-8"
     )
     (workspace / "logs" / "train.log").write_text(
@@ -894,7 +892,7 @@ def _accept_real_target_root_commit(runtime):
     )
     artifacts: list[dict[str, str]] = [
         {"role": "implementation", "relative_path": "implementation"},
-        {"role": "result", "relative_path": "outputs/metrics.json"},
+        {"role": "result", "relative_path": "outputs/result.json"},
         {"role": "log", "relative_path": "logs/train.log"},
     ]
     if authority.measurement_contract.checkpoint_policy == "required":
@@ -903,17 +901,9 @@ def _accept_real_target_root_commit(runtime):
             1,
             {"role": "checkpoint", "relative_path": "outputs/final.ckpt"},
         )
-    handoff = canonical_json(
-        {
-            "artifacts": artifacts,
-            "result_document_path": "outputs/metrics.json",
-            "schema_ref": "meta-research/target-completion-handoff/v1",
-            "status": "completed",
-            "summary": "Root finished implementation and training.",
-            "target_ref": handle.target_ref,
-            "target_run_ref": handle.target_run_ref,
-        }
-    )
+    result_document["retained_artifacts"] = [a for a in artifacts if a["role"] not in {"result", "implementation"}]
+    (workspace / "outputs/result.json").write_text(canonical_json(result_document), encoding="utf-8")
+    final_text = "Root finished implementation and training."
     evidence = TargetRootCompletionEvidence(
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
@@ -926,7 +916,8 @@ def _accept_real_target_root_commit(runtime):
         operation_generation=1,
         evidence_ref="harness_evidence_protected_bundle_root_final_turn",
         evidence_sequence=10,
-        handoff=decode_target_completion_handoff(handoff),
+        workspace_ref=_workspace_ref, final_text=final_text,
+        final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest(),
         observed_at=1.0,
     )
     result = TargetRunFinalizer(

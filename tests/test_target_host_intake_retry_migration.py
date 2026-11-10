@@ -39,7 +39,7 @@ def test_host_intake_retry_migration_preserves_populated_owner_records(
         )
         runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text(encoding="utf-8"))
         document["formal_runs"][0]["input_refs"] = ["not-an-admitted-input"]
         result_path.write_text(canonical_json(document), encoding="utf-8")
@@ -103,7 +103,7 @@ def test_host_intake_retry_migration_preserves_populated_owner_records(
     upgrade_database(database)
     after = snapshot()
 
-    assert after["revision"] == "0081_quest_research_time"
+    assert after["revision"] == "0082_stage_local_acceptance"
     assert after["rows"] == before["rows"]
     assert after["foreign_key_errors"] == []
     clock_tables = {

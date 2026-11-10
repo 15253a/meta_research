@@ -1,4 +1,5 @@
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 
 import hashlib
 from dataclasses import replace
@@ -181,8 +182,8 @@ def test_finalizer_keeps_long_note_identity_across_query_and_replay(tmp_path: Pa
         if directory:
             (analysis / "raw-data.bin").write_bytes(b"\xff\x00")
         declared = "outputs/analysis" if directory else "outputs/analysis/research-note.md"
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="analysis", relative_path=declared),
         )))
         finalizer = TargetRunFinalizer(

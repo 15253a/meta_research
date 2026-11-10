@@ -61,7 +61,7 @@ def test_unassessed_cross_target_reuse_is_queryable_without_duplicating_executio
             _, second_lifecycle, second_memory, _, second_handle, second_workspace, second_evidence = root_fixtures._root_finalizer_fixture(tmp_path / 'second')
         second_evidence = replace(second_evidence, operation_ref='second-target-final-turn',
                                   evidence_ref='second-target-final-evidence')
-        result_path = second_workspace / 'outputs/metrics.json'
+        result_path = second_workspace / 'outputs/result.json'
         document = json.loads(result_path.read_text())
         old = original[0]
         document['formal_runs'] = [{

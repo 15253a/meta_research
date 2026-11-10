@@ -1,4 +1,5 @@
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 
 from copy import deepcopy
 from pathlib import Path
@@ -162,10 +163,10 @@ def test_native_target_owner_accepts_and_replays_qualitative_evidence(tmp_path: 
             "result_disposition": "uncertain",
             "observations": ["The two archives record incompatible dates for the same event."],
         }
-        (workspace / "outputs" / "metrics.json").write_text(canonical_json(document), encoding="utf-8")
-        evidence = replace(evidence, handoff=replace(
-            evidence.handoff,
-            artifacts=tuple(artifact for artifact in evidence.handoff.artifacts if artifact.role != "log"),
+        (workspace / "outputs" / "result.json").write_text(canonical_json(document), encoding="utf-8")
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(
+            _completion_handoff(workspace, evidence),
+            artifacts=tuple(artifact for artifact in _completion_handoff(workspace, evidence).artifacts if artifact.role != "log"),
         ))
         finalizer = TargetRunFinalizer(
             lifecycle=lifecycle,

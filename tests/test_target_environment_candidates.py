@@ -169,7 +169,7 @@ def test_environment_candidate_survives_real_target_acceptance_with_original_imp
 
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         document["environment_candidates"] = [_candidate("implementation")]
         path.write_text(canonical_json(document))

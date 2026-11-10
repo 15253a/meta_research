@@ -1,5 +1,6 @@
 """Dataset declarations keep their precise content boundary through completion."""
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 
 from collections import Counter
 from copy import deepcopy
@@ -93,20 +94,20 @@ def test_automatic_discovery_preserves_nested_dataset_boundary_and_all_other_byt
 
 
 def test_frozen_parent_dataset_mismatch_returns_feedback_and_can_be_corrected_in_same_run(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         _data(workspace)
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text())
         document["formal_runs"][0]["artifact_paths"].extend([
             DATASET_PATH, OTHER_PATH, PARENT_PATH + "/download-notes.txt",
         ])
         document["dataset_candidates"] = [_candidate()]
         result_path.write_text(canonical_json(document), encoding="utf-8")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="data", relative_path=PARENT_PATH),
         )))
         kwargs = dict(
@@ -115,9 +116,13 @@ def test_frozen_parent_dataset_mismatch_returns_feedback_and_can_be_corrected_in
             measurement_authority=runtime.owners.research_graph,
         )
         # Model the deployed state: RM has already frozen the parent collection.
-        seeded = TargetRunFinalizer(
-            **kwargs, evidence_reader=_EvidenceReader(evidence),
-        ).finalize(handle=handle, evidence=evidence)
+        historical_handoff = _completion_handoff(workspace, evidence)
+        with monkeypatch.context() as historical_snapshot:
+            historical_snapshot.setattr("meta_research.target_run_finalizer._system_target_completion_handoff",
+                lambda **_arguments: historical_handoff)
+            seeded = TargetRunFinalizer(
+                **kwargs, evidence_reader=_EvidenceReader(evidence),
+            ).finalize(handle=handle, evidence=evidence)
         assert seeded.status == "rm_accepted"
         frozen = memory.query(seeded.manifest_ref)
         original_completion = lifecycle.query_completion(handle.target_ref)
@@ -141,14 +146,14 @@ def test_frozen_parent_dataset_mismatch_returns_feedback_and_can_be_corrected_in
             assert connection.execute(text("SELECT count(*) FROM rg_target_commits")).scalar_one() == 0
             assert connection.execute(text("SELECT count(*) FROM rg_target_root_measurements")).scalar_one() == 0
 
-        precise_handoff = replace(evidence.handoff, artifacts=(
-            *(entry for entry in evidence.handoff.artifacts if entry.relative_path != PARENT_PATH),
+        precise_handoff = replace(_completion_handoff(workspace, evidence), artifacts=(
+            *(entry for entry in _completion_handoff(workspace, evidence).artifacts if entry.relative_path != PARENT_PATH),
             TargetCompletionArtifact(role="data", relative_path=DATASET_PATH),
             TargetCompletionArtifact(role="data", relative_path=OTHER_PATH),
             TargetCompletionArtifact(role="data", relative_path=PARENT_PATH + "/download-notes.txt"),
         ))
-        successor = replace(
-            evidence, handoff=precise_handoff,
+        successor = _replace_completion_evidence(
+            workspace, evidence, handoff=precise_handoff,
             operation_ref="dataset-boundary-correction-turn",
             operation_generation=evidence.operation_generation + 1,
             evidence_ref="dataset-boundary-correction-evidence",

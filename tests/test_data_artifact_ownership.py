@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Retained data follows its actual producer without forcing Dataset registration."""
 import json
 import sqlite3
@@ -22,11 +23,11 @@ def test_data_products_require_an_explicit_actual_producer(tmp_path, multiple, e
         path.parent.mkdir(parents=True)
         path.write_text('Original collected observation', encoding='utf-8')
         relative = 'outputs/data/observations.txt'
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts, TargetCompletionArtifact(role='data', relative_path=relative))))
-        document_path = workspace / 'outputs/metrics.json'
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts, TargetCompletionArtifact(role='data', relative_path=relative))))
+        document_path = workspace / 'outputs/result.json'
         document = json.loads(document_path.read_text())
-        checkpoints = [item.relative_path for item in evidence.handoff.artifacts if item.role == 'checkpoint']
+        checkpoints = [item.relative_path for item in _completion_handoff(workspace, evidence).artifacts if item.role == 'checkpoint']
         document['formal_runs'] = [{'run_key': 'collection', 'checkpoint_paths': checkpoints,
                                    'evaluations': [{'attempt_key': 'assessment', 'metrics': document['metrics']}]}]
         if multiple:

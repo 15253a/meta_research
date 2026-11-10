@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Execution output and assessment output keep distinct exact RM provenance."""
 import json
 import os
@@ -18,13 +19,13 @@ def _prepare(workspace, evidence):
              ('analysis', 'outputs/evaluation-report.md')]
     for role, path in paths:
         (workspace / path).write_text('Actual ' + path, encoding='utf-8')
-    evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-        *evidence.handoff.artifacts,
+    evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+        *_completion_handoff(workspace, evidence).artifacts,
         *(TargetCompletionArtifact(role=role, relative_path=path) for role, path in paths))))
-    result = workspace / 'outputs/metrics.json'
+    result = workspace / 'outputs/result.json'
     document = json.loads(result.read_text())
     document['formal_runs'] = [{'run_key': 'observed',
-        'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+        'checkpoint_paths': [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                              if artifact.role == 'checkpoint'],
         'artifact_paths': ['logs/train.log', 'outputs/observations.json'],
         'evaluations': [{'attempt_key': 'assessed', 'metrics': document['metrics'],
@@ -47,7 +48,7 @@ def test_exact_execution_and_assessment_artifacts_survive_acceptance_and_replay(
         evaluation_versions = {item['version_ref'] for item in facts[0]['evaluation_artifacts']}
         assert {by_path['logs/train.log'], by_path['outputs/observations.json']} <= run_versions
         assert {by_path['logs/evaluate.log'], by_path['outputs/evaluation-report.md'],
-                by_path['outputs/metrics.json']} == evaluation_versions
+                by_path['outputs/result.json']} == evaluation_versions
         assert not run_versions & evaluation_versions
         assert _accept(runtime, lifecycle, memory, handle, evidence)[0] == accepted
         assert graph.query_target_formal_results(handle.target_ref) == facts
@@ -64,7 +65,7 @@ def test_unbound_subject_artifact_rolls_back_graph_facts(tmp_path):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         evidence = _prepare(workspace, evidence)
-        result = workspace / 'outputs/metrics.json'
+        result = workspace / 'outputs/result.json'
         document = json.loads(result.read_text())
         document['formal_runs'][0]['artifact_paths'].append('not-published.log')
         result.write_text(canonical_json(document))
@@ -92,8 +93,8 @@ def test_explicit_assessment_collections_keep_target_notes_separate(tmp_path, gr
                 (workspace / directory).mkdir()
                 for index in range(40):
                     (workspace / directory / f'step-{index}.log').write_text(str(index))
-            evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=tuple(
-                artifact for artifact in evidence.handoff.artifacts if artifact.role != 'log')))
+            evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=tuple(
+                artifact for artifact in _completion_handoff(workspace, evidence).artifacts if artifact.role != 'log')))
         else:
             (workspace / evaluation_log).write_text('Actual assessment log')
         for path in ('outputs/analysis/raw/observations.json',
@@ -106,13 +107,13 @@ def test_explicit_assessment_collections_keep_target_notes_separate(tmp_path, gr
                  ('analysis', 'outputs/analysis/research-note.md'), ('log', 'logs/target.log')]
         if grouped_logs:
             paths.append(('log', run_log))
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             *(TargetCompletionArtifact(role=role, relative_path=path) for role, path in paths))))
-        result_path = workspace / 'outputs/metrics.json'
+        result_path = workspace / 'outputs/result.json'
         document = json.loads(result_path.read_text())
         document['formal_runs'] = [{'run_key': 'primary',
-            'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+            'checkpoint_paths': [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                                  if artifact.role == 'checkpoint'],
             'artifact_paths': [run_log, 'outputs/analysis/raw'],
             'evaluations': [{'attempt_key': 'primary', 'metrics': document['metrics'],
@@ -125,7 +126,7 @@ def test_explicit_assessment_collections_keep_target_notes_separate(tmp_path, gr
         assert {asset['version_ref'] for asset in facts[0]['run_artifacts']} == {
             by_path[run_log], by_path['outputs/analysis/raw']}
         assert {asset['version_ref'] for asset in facts[0]['evaluation_artifacts']} == {
-            by_path[evaluation_log], by_path['outputs/analysis/evaluation'], by_path['outputs/metrics.json']}
+            by_path[evaluation_log], by_path['outputs/analysis/evaluation'], by_path['outputs/result.json']}
         assert by_path['outputs/analysis/research-note.md'] and by_path['logs/target.log']
         assert _accept(runtime, lifecycle, memory, handle, evidence)[0] == accepted
         assert graph.query_target_formal_results(handle.target_ref) == facts
@@ -137,9 +138,9 @@ def test_explicit_assessment_collections_keep_target_notes_separate(tmp_path, gr
 def test_multiple_producers_keep_unassigned_logs_in_manifest_until_explicitly_assigned(tmp_path, explicit_paths):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        document_path = workspace / 'outputs/metrics.json'
+        document_path = workspace / 'outputs/result.json'
         document = json.loads(document_path.read_text())
-        checkpoints = [artifact.relative_path for artifact in evidence.handoff.artifacts
+        checkpoints = [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                        if artifact.role == 'checkpoint']
         runs, paths = [], []
         for key in ('a', 'b'):
@@ -155,8 +156,8 @@ def test_multiple_producers_keep_unassigned_logs_in_manifest_until_explicitly_as
             runs.append(run)
         document['formal_runs'] = runs
         document_path.write_text(canonical_json(document))
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             *(TargetCompletionArtifact(role='log', relative_path=path) for path in paths))))
         _, manifest = _accept(runtime, lifecycle, memory, handle, evidence)
         facts = runtime.owners.research_graph.query_target_formal_results(handle.target_ref)
@@ -165,7 +166,7 @@ def test_multiple_producers_keep_unassigned_logs_in_manifest_until_explicitly_as
         for index, key in enumerate(('a', 'b')):
             assert {asset['version_ref'] for asset in facts[index]['run_artifacts']} == (
                 {by_path[f'logs/train-{key}.log']} if explicit_paths else set())
-            expected = {by_path['outputs/metrics.json']}
+            expected = {by_path['outputs/result.json']}
             if explicit_paths:
                 expected.add(by_path[f'logs/eval-{key}.log'])
             assert {asset['version_ref'] for asset in facts[index]['evaluation_artifacts']} == expected
@@ -178,7 +179,7 @@ def test_actual_failures_keep_run_attempt_and_artifacts_without_metrics(tmp_path
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         evidence = _prepare(workspace, evidence)
-        result = workspace / 'outputs/metrics.json'
+        result = workspace / 'outputs/result.json'
         document = json.loads(result.read_text())
         document['metrics'] = {}
         document['result_disposition'] = 'uncertain'

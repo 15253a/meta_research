@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Current formal-work declarations return to the same Root for correction."""
 from dataclasses import replace
 import json
@@ -29,14 +30,15 @@ from test_target_root_finalizer import _EvidenceReader, _root_finalizer_fixture
 def test_invalid_work_inventory_is_revised_without_repeating_work(tmp_path, field_path, invalid, expected_field, empty_summary):
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         checkpoint = workspace / "outputs/final.ckpt"
         if not checkpoint.exists():
             checkpoint.write_bytes(b"synthetic-retained-trained-state")
-            evidence = replace(evidence, handoff=replace(evidence.handoff,
-                artifacts=evidence.handoff.artifacts + (
+            evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence),
+                artifacts=_completion_handoff(workspace, evidence).artifacts + (
                     TargetCompletionArtifact(role="checkpoint", relative_path="outputs/final.ckpt"),)))
+            document = json.loads(path.read_text(encoding="utf-8"))
         document["formal_runs"][0]["checkpoint_paths"] = ["outputs/final.ckpt"]
         if empty_summary:
             document["metrics"] = {}
@@ -72,10 +74,10 @@ def test_invalid_work_inventory_is_revised_without_repeating_work(tmp_path, fiel
 
         document = original_document
         path.write_text(canonical_json(document), encoding="utf-8")
-        successor = replace(evidence, operation_ref="inventory-correction",
+        successor = _replace_completion_evidence(workspace, evidence, operation_ref="inventory-correction",
             operation_generation=evidence.operation_generation + 1,
             evidence_ref="inventory-correction-evidence", evidence_sequence=evidence.evidence_sequence + 10,
-            handoff=replace(evidence.handoff, summary="Corrected the evaluation list; reused existing research."),
+            handoff=replace(_completion_handoff(workspace, evidence), summary="Corrected the evaluation list; reused existing research."),
             observed_at=evidence.observed_at + 1)
         revising = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,

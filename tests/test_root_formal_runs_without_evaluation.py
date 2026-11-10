@@ -1,5 +1,6 @@
 """Actual runs survive an unfinished evaluation without manufactured results."""
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff
 
 import json
 
@@ -51,7 +52,7 @@ def test_inventory_without_any_actual_execution_cannot_claim_execution():
 
 
 def _with_unassessed_runs(workspace):
-    path = workspace / 'outputs/metrics.json'
+    path = workspace / 'outputs/result.json'
     document = json.loads(path.read_text())
     document['formal_runs'] = [
         {'run_key': 'analysis-executed', 'checkpoint_paths': [], 'evaluations': [{'attempt_key': 'blocked', 'status': 'blocked'}]},
@@ -101,7 +102,7 @@ def test_unassessed_run_still_requires_a_real_variant_and_rolls_back_all_entitie
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         _with_unassessed_runs(workspace)
-        path = workspace / 'outputs/metrics.json'
+        path = workspace / 'outputs/result.json'
         document = json.loads(path.read_text())
         document['formal_runs'][0]['variant_ref'] = 'variant-does-not-exist'
         path.write_text(canonical_json(document))
@@ -117,10 +118,10 @@ def test_unassessed_run_still_requires_a_real_variant_and_rolls_back_all_entitie
 def test_target_with_only_blocked_evaluation_commits_work_without_formal_result(tmp_path):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / 'outputs/metrics.json'
+        path = workspace / 'outputs/result.json'
         document = json.loads(path.read_text())
         document['formal_runs'] = [{'run_key': 'executed',
-            'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+            'checkpoint_paths': [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                                  if artifact.role == 'checkpoint'],
             'artifact_paths': ['logs/train.log'], 'evaluations': [{'status': 'blocked'}]}]
         document['metrics'] = {}

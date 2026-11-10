@@ -1,5 +1,6 @@
 """Declared work owns retained products by its selections, not directory names."""
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 
 import json
 from dataclasses import replace
@@ -22,13 +23,13 @@ def test_declared_work_cannot_claim_unassigned_data_from_its_directory(tmp_path)
         source = workspace / relative
         source.parent.mkdir(parents=True)
         source.write_text("cohort,value\nexternal,8\n", encoding="utf-8")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="data", relative_path=relative),
         )))
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text())
-        checkpoints = [artifact.relative_path for artifact in evidence.handoff.artifacts
+        checkpoints = [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                        if artifact.role == "checkpoint"]
         document["formal_runs"] = [{
             "run_key": "declared-work",
@@ -61,13 +62,13 @@ def test_failed_independent_work_keeps_separate_same_byte_productions(tmp_path):
             source = workspace / relative
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_bytes(b"observed\nnegative\n")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             *(TargetCompletionArtifact(role="data", relative_path=relative) for relative in paths),
         )))
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text())
-        checkpoints = [artifact.relative_path for artifact in evidence.handoff.artifacts
+        checkpoints = [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                        if artifact.role == "checkpoint"]
         document["metrics"] = {}
         document["result_disposition"] = "uncertain"
@@ -111,11 +112,11 @@ def test_metric_summary_cannot_claim_retained_products_from_their_directories(tm
         path = workspace / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"observed\nexternal\n")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="data", relative_path=relative),
         )))
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text())
         document.pop("formal_runs", None)
         result_path.write_text(canonical_json(document))
@@ -142,8 +143,8 @@ def test_target_note_in_mixed_directory_does_not_hide_unassigned_report(tmp_path
         source.mkdir(parents=True)
         (source / "research-note.md").write_text("Current Target understanding.\n", encoding="utf-8")
         (source / "assessment-report.md").write_text("Independent assessment found no effect.\n", encoding="utf-8")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="analysis", relative_path=relative),
         )))
 
@@ -175,11 +176,11 @@ def test_explicit_mixed_report_container_remains_exact_assessment_content(tmp_pa
         source.mkdir(parents=True)
         (source / "research-note.md").write_text("Current Target understanding.\n", encoding="utf-8")
         (source / "assessment-report.md").write_text("Independent assessment found no effect.\n", encoding="utf-8")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="analysis", relative_path=relative),
         )))
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text())
         document["formal_runs"][0]["evaluations"][0]["artifact_paths"] = [relative]
         result_path.write_text(canonical_json(document))
@@ -216,8 +217,8 @@ def test_standalone_target_note_remains_manifest_content_without_a_producer(tmp_
         source = workspace / relative
         source.parent.mkdir(parents=True)
         source.write_text("Current Target understanding.\n", encoding="utf-8")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="analysis", relative_path=relative),
         )))
 
@@ -253,11 +254,11 @@ def test_target_note_only_directory_cannot_be_an_assessment_report(tmp_path, mon
         (source / "research-note.md").write_text("Current Target understanding.\n", encoding="utf-8")
         if empty_report:
             (source / "assessment-report.md").write_bytes(b"")
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="analysis", relative_path=relative),
         )))
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text())
         document["formal_runs"][0]["evaluations"][0]["artifact_paths"] = [relative]
         result_path.write_text(canonical_json(document))
@@ -300,8 +301,8 @@ def test_proven_note_only_directory_remains_target_content_without_a_producer(tm
         source.mkdir(parents=True)
         (source / "empty-context").mkdir()
         (source / "research-note.md").write_bytes(body)
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="analysis", relative_path=relative),
         )))
 

@@ -5,6 +5,7 @@ and every historical reference resolvable; acceptance replays tolerate the
 adjusted current attribution.
 """
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff
 
 import json
 
@@ -18,12 +19,12 @@ from test_target_root_finalizer import _root_finalizer_fixture
 
 def _accepted_run_with_two_work_items(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
-    path = workspace / "outputs/metrics.json"
+    path = workspace / "outputs/result.json"
     document = json.loads(path.read_text())
     metrics = document["metrics"]
     document["formal_runs"] = [
         {"run_key": "measured-work", "checkpoint_paths": [artifact.relative_path
-            for artifact in evidence.handoff.artifacts if artifact.role == "checkpoint"],
+            for artifact in _completion_handoff(workspace, evidence).artifacts if artifact.role == "checkpoint"],
          "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
         {"run_key": "audit-work", "artifact_paths": ["logs/train.log"], "evaluations": []},
     ]
@@ -135,12 +136,12 @@ def test_adjustment_rejects_missing_subject_and_noop(tmp_path):
 def test_historical_acceptance_replay_tolerates_adjusted_attribution(tmp_path):
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         metrics = document["metrics"]
         document["formal_runs"] = [
             {"run_key": "measured-work", "checkpoint_paths": [artifact.relative_path
-                for artifact in evidence.handoff.artifacts if artifact.role == "checkpoint"],
+                for artifact in _completion_handoff(workspace, evidence).artifacts if artifact.role == "checkpoint"],
              "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
             {"run_key": "audit-work", "artifact_paths": ["logs/train.log"], "evaluations": []},
         ]
@@ -396,12 +397,12 @@ def test_reuse_reconciles_after_artifact_moved_away(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path))
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         metrics = document["metrics"]
         document["formal_runs"] = [
             {"run_key": "measured-work",
-             "checkpoint_paths": [artifact.relative_path for artifact in evidence.handoff.artifacts
+             "checkpoint_paths": [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                                   if artifact.role == "checkpoint"],
              "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
             {"run_key": "audit-work", "evaluations": [],

@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Actual report-based assessments keep formal provenance without invented scores."""
 import json
 from dataclasses import replace
@@ -34,16 +35,16 @@ def _report_work(workspace, evidence, *, report=True, status='executed', artifac
         path.write_text('# Material inspection\n\nThe supplied source contains the recorded observations. '
                         'Its collection period supports this question; missing interview context limits interpretation.\n',
                         encoding='utf-8')
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts, TargetCompletionArtifact(role='analysis', relative_path=report_path))))
-    document_path = workspace / 'outputs/metrics.json'
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts, TargetCompletionArtifact(role='analysis', relative_path=report_path))))
+    document_path = workspace / 'outputs/result.json'
     document = json.loads(document_path.read_text())
     document['metrics'] = {}
     attempt = {'attempt_key': 'material-inspection', 'status': status, 'metrics': {}}
     if artifact_paths is not None:
         attempt['artifact_paths'] = artifact_paths
     document['formal_runs'] = [{'run_key': 'material-collection',
-        'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+        'checkpoint_paths': [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                              if artifact.role == 'checkpoint'],
         'artifact_paths': ['logs/train.log'], 'evaluations': [attempt]}]
     document_path.write_text(canonical_json(document))
@@ -146,7 +147,7 @@ def test_report_file_does_not_turn_unperformed_or_failed_assessment_into_result(
         if status == 'blocked':
             # The retained report belongs to the work that actually happened;
             # an unperformed Evaluation cannot own a report artifact.
-            result_path = workspace / 'outputs/metrics.json'
+            result_path = workspace / 'outputs/result.json'
             document = json.loads(result_path.read_text())
             document['formal_runs'][0]['artifact_paths'] = [report_path]
             result_path.write_text(canonical_json(document))

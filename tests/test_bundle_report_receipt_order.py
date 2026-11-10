@@ -1,3 +1,4 @@
+import hashlib
 """Bundle reports preserve receipt identity across differently ordered Targets."""
 from dataclasses import replace
 
@@ -8,7 +9,6 @@ from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canoni
 from meta_research.owners.agent_runtime_harness import TargetRootCompletionEvidence
 from meta_research.owners.target_run_runtime import canonical_target_scope_binding
 from meta_research.target_run_finalizer import SQLiteTargetRootCompletionMemoryAuthority, TargetRunFinalizer
-from meta_research.target_run_runtime_contract import decode_target_completion_handoff
 from test_public_bundle_stage import _bundle_runtime, _TwoTargetBundleSkill, _TogglePowerInhibitor
 from test_target_launch_admission import _ready_launch
 from test_target_root_finalizer import _CurrentBindingBundleSkill, _EvidenceReader
@@ -62,7 +62,7 @@ def _finish_native_target(runtime, graph, target, dispatch):
         owner.research_memory, lifecycle)
     authority = owner.research_graph.query_target_measurement_domain_authority(key)
     assert authority is not None
-    _, workspace = runtime.target_run_authorities.agent_runtime.resolve_target_workspace(
+    workspace_ref, workspace = runtime.target_run_authorities.agent_runtime.resolve_target_workspace(
         target_ref=key, target_run_ref=handle.target_run_ref, root_session_ref=handle.root_session_ref,
         attempt_ref=handle.execution_attempt_ref, fence_ref=handle.execution_fence_ref)
     (workspace / 'implementation/train.py').write_text("print('fixture')\n")
@@ -71,23 +71,23 @@ def _finish_native_target(runtime, graph, target, dispatch):
     result = {'metrics': {metric: float(i + 1) for i, metric in enumerate(
         authority.measurement_contract.protocol_version.required_metric_keys)},
         'result_disposition': 'positive', 'schema_ref': authority.measurement_contract.result_schema_ref}
-    (workspace / 'outputs/metrics.json').write_text(canonical_json(result))
+    (workspace / 'outputs/result.json').write_text(canonical_json(result))
     (workspace / 'logs/train.log').write_text('fixture execution complete\n')
     artifacts = [{'role': 'implementation', 'relative_path': 'implementation'},
-        {'role': 'result', 'relative_path': 'outputs/metrics.json'},
+        {'role': 'result', 'relative_path': 'outputs/result.json'},
         {'role': 'log', 'relative_path': 'logs/train.log'}]
     if authority.measurement_contract.checkpoint_policy == 'required':
         (workspace / 'outputs/final.ckpt').write_bytes(b'fixture-checkpoint')
         artifacts.append({'role': 'checkpoint', 'relative_path': 'outputs/final.ckpt'})
-    handoff = decode_target_completion_handoff(canonical_json({'artifacts': artifacts,
-        'result_document_path': 'outputs/metrics.json', 'schema_ref': 'meta-research/target-completion-handoff/v1',
-        'status': 'completed', 'summary': 'Fixture native root completed.',
-        'target_ref': key, 'target_run_ref': handle.target_run_ref}))
+    final_text = "Fixture native root completed."
+    result["retained_artifacts"] = [a for a in artifacts if a["role"] not in {"result", "implementation"}]
+    (workspace / "outputs/result.json").write_text(canonical_json(result))
     evidence = TargetRootCompletionEvidence(target_ref=key, target_run_ref=handle.target_run_ref,
         attempt_ref=handle.execution_attempt_ref, attempt_generation=admission.run.attempt_generation,
         root_session_ref=handle.root_session_ref, native_session_ref=f'native:{key}',
         fence_ref=handle.execution_fence_ref, operation_ref=f'operation:{key}', operation_generation=1,
-        evidence_ref=f'evidence:{key}', evidence_sequence=10, handoff=handoff, observed_at=1.0)
+        evidence_ref=f'evidence:{key}', evidence_sequence=10, observed_at=1.0, workspace_ref=workspace_ref,
+        final_text=final_text, final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest())
     completed = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
         workspace_resolver=runtime.target_run_authorities.agent_runtime, evidence_reader=_EvidenceReader(evidence),
         measurement_authority=owner.research_graph, graph_authority=owner.research_graph).finalize(

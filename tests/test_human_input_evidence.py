@@ -260,7 +260,7 @@ def _accept_root_commit(tmp_path, *, unmeasured):
         _root_finalizer_fixture(tmp_path)
     )
     if unmeasured:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         document["formal_runs"] = [
             {"run_key": "analysis-work", "evaluations": []}

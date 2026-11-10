@@ -43,7 +43,7 @@ def test_same_root_note_revision_reaches_target_commit_and_bundle_exact_reader(
         # The production composition binds actual AR/RG/control recovery readers.
         memory = runtime.target_run_finalizer._memory
         result_path = workspace / "outputs/result.json"
-        document = json.loads((workspace / "outputs/metrics.json").read_text(encoding="utf-8"))
+        document = json.loads((workspace / "outputs/result.json").read_text(encoding="utf-8"))
         document["formal_runs"] = [{
             "run_key": "existing-work", "input_refs": ["not-an-admitted-input"],
             "artifact_paths": ["logs"], "checkpoint_paths": [],
@@ -60,7 +60,7 @@ def test_same_root_note_revision_reaches_target_commit_and_bundle_exact_reader(
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref,
         )
-        evidence = replace(old, handoff=None, workspace_ref=workspace_ref,
+        evidence = replace(old, workspace_ref=workspace_ref,
             final_text=first_statement,
             final_text_sha256=hashlib.sha256(first_statement.encode()).hexdigest())
         finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,

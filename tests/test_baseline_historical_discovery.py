@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff
 """Historical Baseline navigation uses accepted work and exact content readers."""
 import json
 
@@ -12,9 +13,9 @@ from test_target_root_finalizer import _root_finalizer_fixture
 @pytest.fixture
 def completed_work(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
-    path = workspace / "outputs/metrics.json"
+    path = workspace / "outputs/result.json"
     document = json.loads(path.read_text())
-    checkpoints = [item.relative_path for item in evidence.handoff.artifacts if item.role == "checkpoint"]
+    checkpoints = [item.relative_path for item in _completion_handoff(workspace, evidence).artifacts if item.role == "checkpoint"]
     document["formal_runs"] = [
         {"run_key": "spectral-diagnostic-run", "checkpoint_paths": checkpoints, "evaluations": [
             {"attempt_key": "calibration-assessment", "metrics": document["metrics"]},
@@ -127,7 +128,7 @@ def test_continuation_detects_insert_delete_and_scope_change_but_not_other_owner
 def test_description_search_keeps_actual_run_attribution_within_multi_method_target(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         document["formal_runs"] = [
             {"run_key": "primary-method-work", "evaluations": [{"attempt_key": "main", "metrics": document["metrics"]}]},

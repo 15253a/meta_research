@@ -161,7 +161,7 @@ def test_signed_stop_resumes_same_native_and_owner_accepts_completion(harness_ca
     assert evidence is not None
     assert evidence.operation_ref == operation.operation_ref
     assert evidence.native_session_ref == NATIVE and evidence.final_text == FINAL_TEXT
-    assert owner.verify_target_root_completion_evidence(handle, evidence, evidence.handoff)
+    assert owner.verify_target_root_completion_evidence(handle, evidence)
 
 
 def test_complete_profiles_still_merge_two_successful_native_turns(harness_case):
@@ -266,7 +266,7 @@ def test_untrusted_failed_history_rejects_then_reconciles_same_successful_spool(
     assert {name: successful_spool.with_name(name).read_bytes() for name in success_bytes} == success_bytes
     evidence = owner.query_target_root_completion_evidence(handle.target_ref)
     assert evidence is not None and evidence.operation_ref == operation.operation_ref
-    assert owner.verify_target_root_completion_evidence(handle, evidence, evidence.handoff)
+    assert owner.verify_target_root_completion_evidence(handle, evidence)
 
 
 def test_native_resume_with_no_previous_profile_remains_unavailable(harness_case):

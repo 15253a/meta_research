@@ -1,5 +1,6 @@
 """Large research data crosses real Bundle, Target, RM and RG Owner seams."""
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 
 import hashlib
 import json
@@ -50,16 +51,16 @@ def test_bundle_completed_large_dataset_and_report_feed_dependent_target(tmp_pat
         (workspace / data_path / "empty").mkdir()
         evidence, report_path = _report_work(workspace, evidence,
             artifact_paths=["outputs/analysis/evaluation/report.md"])
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
-            *evidence.handoff.artifacts,
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=(
+            *_completion_handoff(workspace, evidence).artifacts,
             TargetCompletionArtifact(role="data", relative_path=data_path),
             TargetCompletionArtifact(role="checkpoint", relative_path=checkpoint_path),
         )))
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         document = json.loads(result_path.read_text())
         run = document["formal_runs"][0]
         run["artifact_paths"] = [data_path]
-        run["checkpoint_paths"] = [artifact.relative_path for artifact in evidence.handoff.artifacts
+        run["checkpoint_paths"] = [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                                    if artifact.role == "checkpoint"]
         run["evaluations"][0]["checkpoint_paths"] = [checkpoint_path]
         result_path.write_text(canonical_json(document), encoding="utf-8")

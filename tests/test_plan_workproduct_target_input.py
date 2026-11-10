@@ -72,8 +72,8 @@ class _Bundle(_CurrentBindingBundleSkill):
 
 
 class _Reasoning(_MultiRunReasoningSkill):
-    def review_draft(self, request, draft):
-        return replace(super().review_draft(request, draft),
+    def finalize_draft(self, request, draft):
+        return replace(super().finalize_draft(request, draft),
             review_mode="advisory_unobserved", reviewer_agent_ref=None)
 
 
@@ -112,7 +112,7 @@ def test_protected_workproduct_and_scientific_outcome_feed_the_next_plan(tmp_pat
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
         summary = "Executed one material-producing script; no evaluation was performed."
-        evidence = replace(prior, handoff=None, workspace_ref=workspace_ref, final_text=summary,
+        evidence = replace(prior, workspace_ref=workspace_ref, final_text=summary,
             final_text_sha256=hashlib.sha256(summary.encode()).hexdigest())
         finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,

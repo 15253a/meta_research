@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Retention is a research choice; exact selected states stay verifiable."""
 import json
 import os
@@ -28,7 +29,7 @@ def _retention_fixture(tmp_path, monkeypatch, policy, count):
     monkeypatch.setattr(fixtures, '_formal_candidate', candidate)
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     assert authority.measurement_contract.checkpoint_policy == policy
-    artifacts = [item for item in evidence.handoff.artifacts if item.role != 'checkpoint']
+    artifacts = [item for item in _completion_handoff(workspace, evidence).artifacts if item.role != 'checkpoint']
     paths = []
     for index in range(count):
         path = f'outputs/checkpoints/step-{index}.state'
@@ -36,8 +37,8 @@ def _retention_fixture(tmp_path, monkeypatch, policy, count):
         (workspace / path).write_bytes(f'actual selected state {index}'.encode())
         paths.append(path)
         artifacts.append(TargetCompletionArtifact(role='checkpoint', relative_path=path))
-    evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=tuple(artifacts)))
-    result = workspace / 'outputs/metrics.json'
+    evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=tuple(artifacts)))
+    result = workspace / 'outputs/result.json'
     document = json.loads(result.read_text())
     document['formal_runs'] = [{'run_key': 'selected-state-run', 'checkpoint_paths': paths,
         'evaluations': [{'attempt_key': 'selected-state-assessment', 'metrics': document['metrics'],
@@ -76,7 +77,7 @@ def test_owner_accepts_agent_selected_checkpoint_coverage_and_exact_assessment_s
 def test_evaluation_cannot_claim_a_published_state_excluded_from_its_run(tmp_path, monkeypatch):
     runtime, lifecycle, memory, handle, workspace, evidence, paths = _retention_fixture(tmp_path, monkeypatch, 'forbidden', 2)
     try:
-        result = workspace / 'outputs/metrics.json'
+        result = workspace / 'outputs/result.json'
         document = json.loads(result.read_text())
         document['formal_runs'][0]['checkpoint_paths'] = paths[:1]
         result.write_text(canonical_json(document))

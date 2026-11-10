@@ -119,7 +119,7 @@ def test_formatted_result_retains_original_asset_and_verifies_semantic_hash(tmp_
     from meta_research.target_run_finalizer import TargetRunFinalizer
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         value = json.loads(result_path.read_text())
         original = (json.dumps(value, indent=2, ensure_ascii=True) + "\n").encode()
         result_path.write_bytes(original)
@@ -159,7 +159,7 @@ def test_unmeasured_result_survives_owner_commit_and_bundle_projection(tmp_path,
     monkeypatch.setattr(fixture_module, "_formal_candidate", nullable_candidate)
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        result_path = workspace / "outputs/metrics.json"
+        result_path = workspace / "outputs/result.json"
         value = json.loads(result_path.read_text())
         value["metrics"]["metric:effect"] = None
         value["formal_runs"][0]["evaluations"][0]["metrics"] = value["metrics"]

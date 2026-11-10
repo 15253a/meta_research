@@ -1,5 +1,6 @@
 """The host preserves the exact artifact boundaries chosen by real producers."""
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 
 from dataclasses import replace
 import hashlib
@@ -67,20 +68,27 @@ def test_explicit_parent_and_child_are_both_exact_assets_without_new_semantic_re
     assert {a.relative_path for a in handoff.artifacts if a.role == 'log'} == {'logs', 'logs/train.log'}
 
 
-def test_frozen_split_logs_reject_recoverably_and_same_run_accepts_exact_parent(tmp_path):
+def test_frozen_split_logs_reject_recoverably_and_same_run_accepts_exact_parent(tmp_path, monkeypatch):
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / 'outputs/metrics.json'
+        path = workspace / 'outputs/result.json'
         document = json.loads(path.read_text())
         document['formal_runs'] = [{'run_key': 'audit', 'artifact_paths': ['logs'],
-            'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+            'checkpoint_paths': [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                                  if artifact.role == 'checkpoint'],
             'evaluations': [{'attempt_key': 'check', 'metrics': document['metrics']}]}]
         path.write_text(canonical_json(document))
         kwargs = dict(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,
             measurement_authority=runtime.owners.research_graph)
-        frozen_result = TargetRunFinalizer(**kwargs, evidence_reader=_EvidenceReader(evidence)).finalize(handle=handle, evidence=evidence)
+        historical_handoff = _completion_handoff(workspace, evidence)
+        # Seed the historical split selection through real AR/RM custody. New
+        # discovery already preserves the declared parent, so it cannot create
+        # this formerly accepted snapshot shape on its own.
+        with monkeypatch.context() as historical_snapshot:
+            historical_snapshot.setattr("meta_research.target_run_finalizer._system_target_completion_handoff",
+                lambda **_arguments: historical_handoff)
+            frozen_result = TargetRunFinalizer(**kwargs, evidence_reader=_EvidenceReader(evidence)).finalize(handle=handle, evidence=evidence)
         assert frozen_result.status == 'rm_accepted'
         frozen = memory.query(frozen_result.manifest_ref)
         finalizer = TargetRunFinalizer(**kwargs, evidence_reader=_EvidenceReader(evidence), graph_authority=runtime.owners.research_graph)
@@ -94,10 +102,10 @@ def test_frozen_split_logs_reject_recoverably_and_same_run_accepts_exact_parent(
         with runtime._database.read() as db:
             assert db.execute(text('SELECT COUNT(*) FROM rg_target_commits')).scalar_one() == 0
             assert db.execute(text('SELECT COUNT(*) FROM rg_variant_runs')).scalar_one() == 0
-        successor = replace(evidence,
-            handoff=replace(evidence.handoff, artifacts=tuple(
+        successor = _replace_completion_evidence(workspace, evidence,
+            handoff=replace(_completion_handoff(workspace, evidence), artifacts=tuple(
                 TargetCompletionArtifact(role='log', relative_path='logs') if a.role == 'log' else a
-                for a in evidence.handoff.artifacts)),
+                for a in _completion_handoff(workspace, evidence).artifacts)),
             operation_ref='corrected-boundary-turn', operation_generation=evidence.operation_generation + 1,
             evidence_ref='corrected-boundary-evidence', evidence_sequence=evidence.evidence_sequence + 10,
             observed_at=evidence.observed_at + 1)
@@ -129,7 +137,7 @@ def test_unbound_unsafe_or_wrong_role_is_rejected_with_actionable_feedback(path)
 def test_file_as_intermediate_directory_gets_signed_revision_feedback(tmp_path):
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        document = json.loads((workspace / 'outputs/metrics.json').read_text())
+        document = json.loads((workspace / 'outputs/result.json').read_text())
         invalid_path = 'logs/train.log/not-a-directory'
         document['formal_runs'] = [{'run_key': 'audit', 'artifact_paths': [invalid_path],
             'evaluations': [{'attempt_key': 'check', 'metrics': document['metrics']}]}]
@@ -143,7 +151,7 @@ def test_file_as_intermediate_directory_gets_signed_revision_feedback(tmp_path):
             target_ref=handle.target_ref, target_run_ref=handle.target_run_ref,
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
-        evidence = replace(evidence, handoff=None, workspace_ref=workspace_ref, final_text=final,
+        evidence = _replace_completion_evidence(workspace, evidence, workspace_ref=workspace_ref, final_text=final,
             final_text_sha256=hashlib.sha256(final.encode()).hexdigest())
         result = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,

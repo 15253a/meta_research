@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 
 from dataclasses import replace
 from pathlib import Path
@@ -55,10 +56,6 @@ from meta_research.semantic_owner_gateway import (
     REASONING_ROOT_SEMANTIC_OPERATION_IDS,
     ROOT_AGENT_SEMANTIC_OPERATION_IDS,
     TARGET_ROOT_SEMANTIC_OPERATION_IDS,
-)
-from meta_research.target_run_runtime_contract import (
-    TargetCompletionArtifact,
-    TargetCompletionHandoff,
 )
 
 
@@ -1961,19 +1958,6 @@ def test_harness_exposes_typed_owner_completion_without_profile_parsing(
     tmp_path: Path,
 ) -> None:
     runtime, owner, _adapter = _runtime(tmp_path)
-    handoff = TargetCompletionHandoff(
-        schema_ref="meta-research/target-completion-handoff/v1",
-        target_ref="target:test",
-        target_run_ref="target-run:test",
-        status="completed",
-        artifacts=(
-            TargetCompletionArtifact(
-                role="result", relative_path="outputs/result.json"
-            ),
-        ),
-        result_document_path="outputs/result.json",
-        summary="Final training completed.",
-    )
     evidence = TargetRootCompletionEvidence(
         target_ref="target:test",
         target_run_ref="target-run:test",
@@ -1986,7 +1970,8 @@ def test_harness_exposes_typed_owner_completion_without_profile_parsing(
         operation_generation=3,
         evidence_ref="harness-evidence:test",
         evidence_sequence=7,
-        handoff=handoff,
+        workspace_ref="workspace:test", final_text="Final training completed.",
+        final_text_sha256=hashlib.sha256("Final training completed.".encode()).hexdigest(),
         observed_at=2.0,
     )
     owner.completion_evidence = evidence

@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _replace_completion_evidence
 """Checkpoint declaration mistakes return through the actual Owner revision seam."""
 from dataclasses import replace
 import hashlib
@@ -22,7 +23,7 @@ TABLES = ('rg_variant_runs', 'rg_evaluation_attempts', 'rg_metric_results',
 
 def _setup(tmp_path):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
-    document = json.loads((workspace / 'outputs/metrics.json').read_text())
+    document = json.loads((workspace / 'outputs/result.json').read_text())
     document['formal_runs'] = [{'run_key': 'main_neural_fold_0_seed_20260929',
         'artifact_paths': [DATA, 'logs/train.log'], 'checkpoint_paths': [DATA],
         'evaluations': [{'attempt_key': 'held-out-assessment', 'metrics': document['metrics']}]}]
@@ -34,7 +35,7 @@ def _setup(tmp_path):
         root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
         fence_ref=handle.execution_fence_ref)
     final = 'Training and assessment completed; retain the actual outputs.'
-    evidence = replace(evidence, handoff=None, workspace_ref=workspace_ref, final_text=final,
+    evidence = _replace_completion_evidence(workspace, evidence, workspace_ref=workspace_ref, final_text=final,
         final_text_sha256=hashlib.sha256(final.encode()).hexdigest())
     kwargs = dict(lifecycle=lifecycle, memory=memory,
         workspace_resolver=runtime.target_run_authorities.agent_runtime,

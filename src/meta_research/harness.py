@@ -81,7 +81,6 @@ from meta_research.target_raw_output import (
     TargetRawOutputStore,
     TargetRawOutputUnavailable,
 )
-from meta_research.target_run_runtime_contract import TargetCompletionHandoff
 from meta_research.runtime_conditions import compose_runtime_prompt, render_runtime_conditions, selected_stage_model
 
 
@@ -1727,7 +1726,6 @@ class HarnessRuntime:
         *,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff | None,
     ) -> str:
         """Issuer-reverify one final binding against the durable event ledger."""
 
@@ -1735,7 +1733,6 @@ class HarnessRuntime:
             return self._owner.verify_target_root_completion_evidence(
                 handle=handle,
                 evidence=evidence,
-                handoff=handoff,
             )
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error

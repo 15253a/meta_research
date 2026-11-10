@@ -1,4 +1,5 @@
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 
 import hashlib
 import json
@@ -36,8 +37,8 @@ def test_large_completed_artifact_reaches_next_target_as_read_only_files(
         output.seek(65 * 1024 * 1024 - 1)
         output.write(b"x")
     expected_hash = _hash(payload)
-    evidence = replace(evidence, handoff=replace(evidence.handoff,
-        artifacts=evidence.handoff.artifacts + (TargetCompletionArtifact(
+    evidence = _replace_completion_evidence(root, evidence, handoff=replace(_completion_handoff(root, evidence),
+        artifacts=_completion_handoff(root, evidence).artifacts + (TargetCompletionArtifact(
             role="analysis", relative_path=source.relative_to(root).as_posix()),)))
     finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
         workspace_resolver=runtime.target_run_authorities.agent_runtime,
@@ -123,8 +124,8 @@ def test_large_artifact_intake_retry_survives_completion_snapshot_recreation(
     with source.open("wb") as output:
         output.seek(65 * 1024 * 1024 - 1)
         output.write(b"x")
-    evidence = replace(evidence, handoff=replace(evidence.handoff,
-        artifacts=evidence.handoff.artifacts + (TargetCompletionArtifact(
+    evidence = _replace_completion_evidence(root, evidence, handoff=replace(_completion_handoff(root, evidence),
+        artifacts=_completion_handoff(root, evidence).artifacts + (TargetCompletionArtifact(
             role="analysis", relative_path="outputs/data.bin"),)))
     finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
         workspace_resolver=runtime.target_run_authorities.agent_runtime,
@@ -141,11 +142,28 @@ def test_large_artifact_intake_retry_survives_completion_snapshot_recreation(
         with pytest.raises(OwnerConflict, match="injected_transient"):
             finalizer.finalize(handle=handle, evidence=evidence)
         assert memory.query_for_completion(lifecycle.query_completion(handle.target_ref).completion_ref) is None
-        before = len(owner.query_asset_inventory())
+        def accepted_versions():
+            # Inventory verification observations can advance on every read;
+            # accepted bytes, identity and receipts must remain immutable.
+            return {item.version_ref: (item.asset_ref, item.memory_ref,
+                item.version_number, item.content_hash, item.manifest_hash,
+                item.byte_count, item.accepted_at, item.receipt)
+                for item in owner.query_asset_inventory()}
+        before = accepted_versions()
         monkeypatch.setattr(owner, "submit_asset_intake", original)
         accepted = finalizer.finalize(handle=handle, evidence=evidence)
         assert accepted.status == "rm_accepted"
-        assert len(owner.query_asset_inventory()) == before
+        after = accepted_versions()
+        assert {ref: after[ref] for ref in before} == before
+        # The large asset was accepted before the interruption. Current text
+        # binding additionally freezes its final statement after that asset.
+        manifest = memory.query(accepted.manifest_ref)
+        final_statement = next(entry for entry in manifest.entries
+            if entry.declared_relative_path == "handoff/final-message.md")
+        assert set(after) - set(before) == {final_statement.binding.version_ref}
+        assert owner.materialize_asset(final_statement.binding.version_ref).content == evidence.final_text.encode()
+        assert finalizer.finalize(handle=handle, evidence=evidence) == accepted
+        assert accepted_versions() == after
     finally:
         runtime.close()
 
@@ -160,8 +178,8 @@ def test_queued_large_intake_keeps_stable_source_until_owner_retry(
     with source.open("wb") as output:
         output.seek(65 * 1024 * 1024 - 1)
         output.write(b"x")
-    evidence = replace(evidence, handoff=replace(evidence.handoff,
-        artifacts=evidence.handoff.artifacts + (TargetCompletionArtifact(
+    evidence = _replace_completion_evidence(root, evidence, handoff=replace(_completion_handoff(root, evidence),
+        artifacts=_completion_handoff(root, evidence).artifacts + (TargetCompletionArtifact(
             role="analysis", relative_path="outputs/data.bin"),)))
     finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
         workspace_resolver=runtime.target_run_authorities.agent_runtime,

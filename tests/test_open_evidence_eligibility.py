@@ -27,7 +27,7 @@ from test_target_root_finalizer import _root_finalizer_fixture
 
 def _accept_unmeasured(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
-    path = workspace / "outputs/metrics.json"
+    path = workspace / "outputs/result.json"
     document = json.loads(path.read_text())
     document["formal_runs"] = [{"run_key": "analysis-work", "evaluations": []}]
     document["metrics"] = {}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import sys
 from dataclasses import replace
@@ -29,7 +30,6 @@ from meta_research.owners.agent_runtime_harness import (
 )
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.target_raw_output import TargetRawOutputStore
-from meta_research.target_run_runtime_contract import TargetCompletionHandoff
 from meta_research.web import create_app
 
 
@@ -410,31 +410,23 @@ def test_target_root_completion_evidence_is_the_last_root_message_of_an_executed
     database = Database(path)
     owner = SQLiteAgentRuntimeHarness(database, DurableFeed(database))
     _seed_running_target_harness(path)
-    handoff = {
-        "schema_ref": "meta-research/target-completion-handoff/v1",
-        "target_ref": "target-observed",
-        "target_run_ref": "target-run-observed",
-        "status": "completed",
-        "artifacts": [
-            {"role": "implementation", "relative_path": "implementation"},
-            {"role": "result", "relative_path": "outputs/result.json"},
-        ],
-        "result_document_path": "outputs/result.json",
-        "summary": "Target root completed its iterative work.",
-    }
+    final_text = "Target root completed its iterative work."
+    binding = {"schema_ref": "meta-research/target-completion-binding/v1",
+        "final_text": final_text, "final_text_sha256": hashlib.sha256(final_text.encode()).hexdigest(),
+        "final_text_bytes": len(final_text.encode()), "workspace_ref": "workspace-observed"}
     messages = (
         _event(1),
         {
             "event_ref": "harness_evidence:"
-            + canonical_hash({"completion": handoff}),
+            + canonical_hash({"completion": binding}),
             "sequence": 2,
             "kind": "item.completed",
             "item_kind": "agent_message",
             "actor_session_ref": "native-target-root",
             "native_session_ref": "native-target-root",
-            "target_run_scope": _target_scope(),
+            "target_run_scope": {**_target_scope(), "schema_ref": "meta-research/target-root-observation-scope/v2", "native_session_ref": "native-target-root", "target_workspace_ref": "workspace-observed"},
             "target_root_agent_message": True,
-            "target_root_completion_candidate": handoff,
+            "target_root_completion_binding": binding,
         },
         {
             "event_ref": "harness_evidence:"
@@ -442,7 +434,7 @@ def test_target_root_completion_evidence_is_the_last_root_message_of_an_executed
             "sequence": 3,
             "kind": "turn.completed",
             "native_session_ref": "native-target-root",
-            "target_run_scope": _target_scope(),
+            "target_run_scope": {**_target_scope(), "schema_ref": "meta-research/target-root-observation-scope/v2", "native_session_ref": "native-target-root", "target_workspace_ref": "workspace-observed"},
             "target_root_terminal": True,
         },
     )
@@ -465,15 +457,9 @@ def test_target_root_completion_evidence_is_the_last_root_message_of_an_executed
         assert evidence.operation_generation == 4
         assert evidence.evidence_ref == messages[1]["event_ref"]
         assert evidence.native_session_ref == "native-target-root"
-        assert evidence.handoff == TargetCompletionHandoff(
-            schema_ref="meta-research/target-completion-handoff/v1",
-            target_ref="target-observed",
-            target_run_ref="target-run-observed",
-            status="completed",
-            artifacts=evidence.handoff.artifacts,
-            result_document_path="outputs/result.json",
-            summary="Target root completed its iterative work.",
-        )
+        assert evidence.final_text == final_text
+        assert evidence.final_text_sha256 == binding["final_text_sha256"]
+        assert evidence.workspace_ref == "workspace-observed"
         assert owner.query_target_root_completion_evidence(
             "target-observed"
         ) == evidence
@@ -496,7 +482,7 @@ def test_target_root_completion_evidence_is_the_last_root_message_of_an_executed
             recoverable=True,
         )
         assert owner.verify_target_root_completion_evidence(
-            handle, evidence, evidence.handoff
+            handle, evidence
         ) == canonical_hash(projection_plain_value(evidence))
         with pytest.raises(
             AgentRuntimeHarnessError,
@@ -505,7 +491,6 @@ def test_target_root_completion_evidence_is_the_last_root_message_of_an_executed
             owner.verify_target_root_completion_evidence(
                 replace(handle, execution_fence_ref="forged-fence"),
                 evidence,
-                evidence.handoff,
             )
         with pytest.raises(
             AgentRuntimeHarnessError,
@@ -514,7 +499,6 @@ def test_target_root_completion_evidence_is_the_last_root_message_of_an_executed
             owner.verify_target_root_completion_evidence(
                 handle,
                 replace(evidence, evidence_ref="forged-evidence"),
-                evidence.handoff,
             )
     finally:
         database.close()

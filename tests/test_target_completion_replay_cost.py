@@ -1,4 +1,5 @@
 """Accepted completion replay must use its immutable RM snapshot."""
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +30,8 @@ def _replay_fixture(tmp_path, monkeypatch):
         root_session_ref=handle.root_session_ref, native_session_ref="native-replay",
         fence_ref=handle.execution_fence_ref, operation_ref="operation-replay",
         operation_generation=1, evidence_ref="evidence-replay", evidence_sequence=1,
-        handoff=handoff, observed_at=1.0,
+        workspace_ref=workspace._workspace.workspace_ref, final_text="Finished research.",
+        final_text_sha256=hashlib.sha256("Finished research.".encode()).hexdigest(), observed_at=1.0,
     )
     completion = SimpleNamespace(
         handle=handle, completion_ref="accepted-completion", generation=1,

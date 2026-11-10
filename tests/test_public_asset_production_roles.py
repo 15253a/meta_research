@@ -1,5 +1,6 @@
 """Retained production and purpose relations protect their exact content."""
 from __future__ import annotations
+from test_target_root_finalizer import _completion_handoff
 
 import json
 from pathlib import Path
@@ -12,11 +13,11 @@ from test_target_root_finalizer import _root_finalizer_fixture
 def test_independent_production_references_survive_one_role_correction(tmp_path: Path):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        path = workspace / "outputs/metrics.json"
+        path = workspace / "outputs/result.json"
         document = json.loads(path.read_text())
         document["formal_runs"] = [
             {"run_key": "first", "artifact_paths": ["logs/train.log"],
-             "checkpoint_paths": [artifact.relative_path for artifact in evidence.handoff.artifacts
+             "checkpoint_paths": [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                                   if artifact.role == "checkpoint"],
              "evaluations": [{"attempt_key": "assessment", "metrics": document["metrics"]}]},
             {"run_key": "second", "artifact_paths": ["logs/train.log"],

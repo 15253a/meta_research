@@ -1,3 +1,4 @@
+from test_target_root_finalizer import _completion_handoff, _replace_completion_evidence
 """Formal outputs belong to their declared run and evaluation."""
 from dataclasses import replace
 import json
@@ -14,15 +15,15 @@ from test_target_root_finalizer import _EvidenceReader, _root_finalizer_fixture
 
 
 def _with_checkpoint(workspace, evidence):
-    if not any(artifact.relative_path == 'outputs/final.ckpt' for artifact in evidence.handoff.artifacts):
+    if not any(artifact.relative_path == 'outputs/final.ckpt' for artifact in _completion_handoff(workspace, evidence).artifacts):
         (workspace / 'outputs/final.ckpt').write_bytes(b'actual-first-state')
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=evidence.handoff.artifacts + (
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=_completion_handoff(workspace, evidence).artifacts + (
             TargetCompletionArtifact(role='checkpoint', relative_path='outputs/final.ckpt'),)))
     return evidence
 
 
 def _document(workspace, runs):
-    path = workspace / 'outputs/metrics.json'
+    path = workspace / 'outputs/result.json'
     document = json.loads(path.read_text())
     document['formal_runs'] = [dict(run, evaluations=[dict(evaluation, metrics=document['metrics'])
         for evaluation in run['evaluations']]) for run in runs]
@@ -34,7 +35,7 @@ def test_two_actual_runs_have_distinct_checkpoint_roles_and_evaluation_subsets(t
     try:
         evidence = _with_checkpoint(workspace, evidence)
         (workspace / 'outputs/other.ckpt').write_bytes(b'actual-second-state')
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=evidence.handoff.artifacts + (
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=_completion_handoff(workspace, evidence).artifacts + (
             TargetCompletionArtifact(role='checkpoint', relative_path='outputs/other.ckpt'),)))
         _document(workspace, [
             {'run_key': 'first', 'checkpoint_paths': ['outputs/final.ckpt'], 'evaluations': [
@@ -72,7 +73,7 @@ def test_ambiguous_or_cross_run_checkpoint_claim_rolls_back(tmp_path, runs, unas
         evidence = _with_checkpoint(workspace, evidence)
         if unassigned_checkpoint:
             (workspace / unassigned_checkpoint).write_bytes(b'unassigned-state')
-            evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=evidence.handoff.artifacts + (
+            evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=_completion_handoff(workspace, evidence).artifacts + (
                 TargetCompletionArtifact(role='checkpoint', relative_path=unassigned_checkpoint),)))
         _document(workspace, runs)
         from meta_research.target_run_finalizer import TargetRootOwnerRejection
@@ -93,7 +94,7 @@ def test_complete_checkpoint_ownership_accepts_omitted_empty_declarations(tmp_pa
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         evidence = _with_checkpoint(workspace, evidence)
-        checkpoints = [artifact.relative_path for artifact in evidence.handoff.artifacts
+        checkpoints = [artifact.relative_path for artifact in _completion_handoff(workspace, evidence).artifacts
                        if artifact.role == 'checkpoint']
         original_bytes = {path: (workspace / path).read_bytes() for path in checkpoints}
         runs = [
@@ -106,7 +107,7 @@ def test_complete_checkpoint_ownership_accepts_omitted_empty_declarations(tmp_pa
         ]
         _document(workspace, runs)
         if assessed_runs == 'none':
-            path = workspace / 'outputs/metrics.json'
+            path = workspace / 'outputs/result.json'
             document = json.loads(path.read_text())
             document['metrics'] = {}
             path.write_text(canonical_json(document))
@@ -192,7 +193,7 @@ def test_same_reused_run_under_two_work_keys_selects_each_declared_checkpoint_su
     try:
         evidence = _with_checkpoint(workspace, evidence)
         (workspace / 'outputs/other.ckpt').write_bytes(b'actual-second-state')
-        evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=evidence.handoff.artifacts + (
+        evidence = _replace_completion_evidence(workspace, evidence, handoff=replace(_completion_handoff(workspace, evidence), artifacts=_completion_handoff(workspace, evidence).artifacts + (
             TargetCompletionArtifact(role='checkpoint', relative_path='outputs/other.ckpt'),)))
         _accept(runtime, lifecycle, memory, handle, evidence)
         # Exercise the transaction writer with two new assessments of the same

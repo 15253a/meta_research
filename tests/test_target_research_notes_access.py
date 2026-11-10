@@ -20,7 +20,7 @@ from test_target_root_finalizer import _root_finalizer_fixture
 def test_current_target_reads_own_saved_note_through_real_mcp_without_stage_context(tmp_path):
     runtime, lifecycle, memory, authority, handle, workspace, old = _root_finalizer_fixture(tmp_path)
     try:
-        (workspace / "outputs/result.json").write_bytes((workspace / "outputs/metrics.json").read_bytes())
+        (workspace / "outputs/result.json").write_bytes((workspace / "outputs/result.json").read_bytes())
         analysis = workspace / "outputs/analysis"
         analysis.mkdir()
         body = "uncertain: the independent source is still missing."
@@ -29,7 +29,7 @@ def test_current_target_reads_own_saved_note_through_real_mcp_without_stage_cont
             target_ref=handle.target_ref, target_run_ref=handle.target_run_ref,
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref)
-        evidence = replace(old, handoff=None, workspace_ref=workspace_ref,
+        evidence = replace(old, workspace_ref=workspace_ref,
             final_text=body, final_text_sha256=hashlib.sha256(body.encode()).hexdigest())
         finalizer = TargetRunFinalizer(lifecycle=lifecycle, memory=memory,
             workspace_resolver=runtime.target_run_authorities.agent_runtime,
