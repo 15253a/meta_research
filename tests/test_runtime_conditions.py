@@ -312,3 +312,16 @@ def test_prompt_framing_round_trip_and_invalid_length():
     assert split_runtime_prompt(prompt) == ("", prompt)
     with pytest.raises(ValueError, match="runtime_conditions_prompt_invalid"):
         split_runtime_prompt("[meta-research runtime conditions v1; characters=900]\n短文本")
+
+
+def test_all_stage_model_choices_survive_a_new_python_process(root):
+    import subprocess
+    import sys
+    original = read_runtime_conditions(root, 'quest-one')
+    selected = {stage: 'gpt-5.6-sol' for stage in original['stage_models']}
+    saved = save_runtime_conditions(root, 'quest-one', text=original['text'],
+        expected_revision=original['revision'], stage_models=selected)
+    assert read_runtime_conditions(root, 'quest-one') == saved
+    program = "from pathlib import Path; import json,sys; from meta_research.runtime_conditions import read_runtime_conditions,selected_stage_model; root=Path(sys.argv[1]); value=read_runtime_conditions(root,'quest-one'); print(json.dumps({stage:selected_stage_model(root,stage,run_ref='run-one',default='unused') for stage in value['stage_models']}))"
+    readback = subprocess.check_output([sys.executable, '-c', program, str(root)], text=True)
+    assert json.loads(readback) == selected

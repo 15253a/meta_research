@@ -72,12 +72,29 @@ def test_projection_condition_reads_have_no_extra_database_or_writes(tmp_path, m
         monkeypatch.setattr(Database, '__init__', initialize)
         monkeypatch.setattr(sqlite3, 'connect', connect)
         event.listen(runtime._database._engine, 'before_cursor_execute', sql)
+        observations = []
         for observation in ('first', 'stable'):
             constructions.clear(); sqlite_connects.clear(); statements.clear()
             runtime.projection.query_snapshot(include_stages=False)
             writes = [statement for statement in statements if statement.lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'BEGIN IMMEDIATE'))]
             print({'observation': observation, 'database_constructions': len(constructions),
                    'raw_sqlite_connects': len(sqlite_connects), 'write_statements': len(writes)})
-            assert not constructions and not sqlite_connects and not writes
+            observations.append((len(constructions), len(sqlite_connects), len(writes)))
+        import asyncio
+        from meta_research.snapshot_queries import SnapshotQueryCoordinator
+        coordinator = SnapshotQueryCoordinator(
+            lambda **options: runtime.projection.query_snapshot(include_stages=False, **options),
+            feed_revision=lambda: runtime.feed.query_readiness().current_revision)
+        async def retained():
+            first = await coordinator.query(include_assets=True, include_history=True)
+            constructions.clear(); sqlite_connects.clear(); statements.clear()
+            second = await coordinator.query(include_assets=True, include_history=True)
+            assert first == second
+            writes = [statement for statement in statements if statement.lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'BEGIN IMMEDIATE'))]
+            print({'observation': 'retained', 'database_constructions': len(constructions),
+                   'raw_sqlite_connects': len(sqlite_connects), 'write_statements': len(writes)})
+            observations.append((len(constructions), len(sqlite_connects), len(writes)))
+        asyncio.run(retained())
+        assert all(counts == (0, 0, 0) for counts in observations)
     finally:
         runtime.close()
