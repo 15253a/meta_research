@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 from sqlalchemy import text
@@ -57,11 +58,10 @@ class _AutonomousTransport(_ReasoningTransport):
         self.delegate = _AutonomousReasoningSkill()
 
     def generate_draft(self, request):
-        self.call(request, "primary")
-        return self.delegate.generate_draft(request)
+        native = self.call(request, "primary")
+        return replace(self.delegate.generate_draft(request), primary_session_ref=native)
 
     def finalize_draft(self, request, draft):
-        self.call(request, "review")
         return self.delegate.finalize_draft(request, draft)
 
     def decide_after_deepfetch(self, request, checkpoint, facts, summary):
@@ -100,6 +100,7 @@ def test_two_active_target_roots_treat_independently_and_cannot_read_each_others
         pass
 
     runtime = _current_bundle_runtime(tmp_path / "runtime", bundle_skill=ParallelBundle())
+    _configure(runtime)
     try:
         first_target, _, _, first, _ = _admit_independent_target_root(runtime)
         launch = runtime.owners.agent_runtime.query_admitted_target_launch(first_target.target_ref)

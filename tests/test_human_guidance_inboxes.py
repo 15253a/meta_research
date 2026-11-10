@@ -66,10 +66,10 @@ def test_http_rejects_malformed_strengths(tmp_path, strength):
 
 
 class _InboxIdea(_DeterministicIdeaSkill):
-    def __init__(self, on_primary, on_review):
+    def __init__(self, on_primary, on_local):
         super().__init__()
         self.on_primary = on_primary
-        self.on_review = on_review
+        self.on_local = on_local
 
     def operation(self, request, name):
         scope = GuidanceRuntimeScope("idea", request.run_ref, request.attempt_ref,
@@ -81,8 +81,37 @@ class _InboxIdea(_DeterministicIdeaSkill):
         return super().generate_draft(request)
 
     def finalize_draft(self, request, draft):
-        self.on_review(self.runtime.owners.human_collaboration, self.operation(request, "review"))
+        self.on_local(self.runtime.owners.human_collaboration, self.operation(request, "primary"))
         return super().finalize_draft(request, draft)
+
+
+class _RevisingInboxIdea(_InboxIdea):
+    """A rejected local candidate causes a real new primary in the same Root."""
+
+    def __init__(self, on_primary, on_revision):
+        super().__init__(on_primary, lambda *_: None)
+        self.on_revision = on_revision
+        self.first_request = None
+        self.rejected = False
+
+    def generate_draft(self, request):
+        if self.first_request is None:
+            self.first_request = request
+            callback = self.on_primary
+        else:
+            assert request.owner_feedback
+            assert request.root_session_ref == self.first_request.root_session_ref
+            assert request.attempt_ref != self.first_request.attempt_ref
+            callback = self.on_revision
+        callback(self.runtime.owners.human_collaboration, self.operation(request, "primary"))
+        return _DeterministicIdeaSkill.generate_draft(self, request)
+
+    def finalize_draft(self, request, draft):
+        result = super().finalize_draft(request, draft)
+        if not self.rejected:
+            self.rejected = True
+            return replace(result, final_outcome={**result.final_outcome, "question_ref": "wrong-question"})
+        return result
 
 
 def _run_idea(tmp_path, provider):
@@ -93,8 +122,11 @@ def _run_idea(tmp_path, provider):
 
 
 def _finish(runtime):
-    for _ in range(6):
-        runtime.idea_stage.process_once()
+    for _ in range(12):
+        if runtime.idea_stage.query_current()["stage_commit"] is not None:
+            return
+        assert runtime.idea_stage.process_once(), runtime.idea_stage.transient_error
+    raise AssertionError("Idea Stage did not reach its accepted StageCommit")
 
 
 def test_empty_first_cut_survives_late_submit_and_new_operation_receives_it(tmp_path):
@@ -109,7 +141,7 @@ def test_empty_first_cut_survives_late_submit_and_new_operation_receives_it(tmp_
         assert recovered.deliveries == ()
         with pytest.raises(OwnerConflict, match="guidance_provider_unit_unbound"):
             hc.freeze_operation_guidance(replace(operation, job_ref="foreign-job"))
-    def review(hc, operation):
+    def revision(hc, operation):
         cut = hc.freeze_operation_guidance(operation)
         delivery, = cut.deliveries
         assert delivery.needs_treatment is True
@@ -117,12 +149,12 @@ def test_empty_first_cut_survives_late_submit_and_new_operation_receives_it(tmp_
             delivery_ref=delivery.delivery_ref, effect_id="read")
         assert read["original_text"] == "Inspect device drift."
         assert read["strength"] == 3
-        observed["review"] = cut.binding.snapshot_ref
-    provider = _InboxIdea(primary, review)
+        observed["revision"] = cut.binding.snapshot_ref
+    provider = _RevisingInboxIdea(primary, revision)
     runtime, _ = _run_idea(tmp_path, provider)
     try:
         _finish(runtime)
-        assert observed["review"] != observed["empty"]
+        assert observed["revision"] != observed["empty"]
     finally:
         runtime.close()
 
@@ -161,7 +193,7 @@ def test_feedback_without_mechanical_read_preserves_replay_and_continuing_constr
         with pytest.raises(OwnerConflict, match="guidance_already_treated"):
             hc.feedback_operation_guidance(**{**command, "effect_id": "another"})
         observed["receipt"] = receipt
-    def review(hc, operation):
+    def revision(hc, operation):
         cut = hc.freeze_operation_guidance(operation)
         delivery, = cut.deliveries
         assert delivery.needs_treatment is False
@@ -169,7 +201,7 @@ def test_feedback_without_mechanical_read_preserves_replay_and_continuing_constr
         assert page["deliveries"][0]["prior_treatment"] == observed["receipt"]
         assert page["deliveries"][0]["strength"] == 4
         observed["continuing"] = page
-    provider = _InboxIdea(primary, review)
+    provider = _RevisingInboxIdea(primary, revision)
     runtime, quest = _run_idea(tmp_path, provider)
     try:
         guide = runtime.owners.human_collaboration.submit_human_guidance(

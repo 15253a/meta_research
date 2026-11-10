@@ -76,9 +76,9 @@ class _CorrectingParentSkill:
         )
 
     def finalize_draft(self, request, draft):
-        self.calls.append(("review", request))
+        self.calls.append(("local", request))
         output = deepcopy(draft.draft)
-        if self.malformed_phase == "review" and self.malformed is None:
+        if self.malformed_phase == "local" and self.malformed is None:
             output["scientific_outcome"]["research_synthesis"]["parent_questions"] = []
             self.malformed = deepcopy(output)
         return ReasoningSkillResult(
@@ -89,7 +89,7 @@ class _CorrectingParentSkill:
         )
 
 
-@pytest.mark.parametrize(("phase", "parent_count"), [("primary", 1), ("review", 3)])
+@pytest.mark.parametrize(("phase", "parent_count"), [("primary", 1), ("local", 3)])
 def test_missing_parent_feedback_survives_real_rejection_restart_and_delivery(tmp_path, phase, parent_count):
     path = tmp_path / phase
     provider = _CorrectingParentSkill(phase)
@@ -131,7 +131,7 @@ def test_missing_parent_feedback_survives_real_rejection_restart_and_delivery(tm
         assert current.native_session_ref == "native:diagnostic"
         assert current.attempt_generation == generation
         corrected = [call for call in provider.calls if call[1].owner_feedback]
-        assert [name for name, _ in corrected] == (["primary", "review"] if phase == "primary" else ["review"])
+        assert [name for name, _ in corrected] == ["primary", "local"]
         for _, delivered in corrected:
             assert delivered.native_session_ref == "native:diagnostic"
             assert delivered.owner_feedback == rejection.feedback

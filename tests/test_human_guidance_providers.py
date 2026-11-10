@@ -3,6 +3,7 @@ from __future__ import annotations
 from tool_catalog_helpers import catalog_operations
 
 import hashlib
+from dataclasses import replace
 import json
 import subprocess
 from pathlib import Path
@@ -63,9 +64,11 @@ class _GuidanceRunner(_SignedRunner):
     def __init__(self):
         super().__init__()
         self.inboxes = []
+        self.after_treatment = []
         self.receipts = []
         self.runtime = None
         self.after_first = None
+        self.native_session_ref = "guidance-native"
 
     def run_command(self, argv, timeout):
         return subprocess.CompletedProcess(argv, 0,
@@ -98,53 +101,61 @@ class _GuidanceRunner(_SignedRunner):
                     reasons="Device drift can obscure morphology.",
                     disposition="goal_alignment_pending" if exact["strength"] == 5 else "applied")
                 self.receipts.append(receipt)
+        self.after_treatment.append(_tool(self.runtime, token, "human_guidance.read"))
         if len(self.inboxes) == 1 and self.after_first is not None:
             self.after_first(inbox)
-        return super().__call__(argv, prompt, timeout, environment)
+        result = super().__call__(argv, prompt, timeout, environment)
+        return subprocess.CompletedProcess(
+            result.args, result.returncode,
+            result.stdout.replace('"runtime-native"', json.dumps(self.native_session_ref)),
+            result.stderr,
+        )
 
 
 def _shared_call(adapter, request, name):
-    value, _, _ = adapter._invoke_root_operation(operation_name=name,
+    value, native, _ = adapter._invoke_root_operation(operation_name=name,
         prompt="Read and handle this operation's formal guidance.", schema=_SCHEMA,
-        native_session_ref=None if name == "primary" else "runtime-native",
+        native_session_ref=request.native_session_ref,
         job_ref=request.job_ref, run_ref=request.run_ref, attempt_ref=request.attempt_ref,
         root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
         runtime_binding=request.runtime_binding.as_dict())
     assert value == {"ok": True}
+    assert native
+    return native
 
 
 class _IdeaTransport(CodexIdeaSkillAdapter):
     def generate_draft(self, request):
-        _shared_call(self, request, "primary")
-        return _DeterministicIdeaSkill().generate_draft(request)
+        native = _shared_call(self, request, "primary")
+        return replace(_DeterministicIdeaSkill().generate_draft(request), primary_session_ref=native)
 
     def finalize_draft(self, request, draft):
-        _shared_call(self, request, "review")
         return _DeterministicIdeaSkill().finalize_draft(request, draft)
 
 
 class _PlanTransport(CodexPlanSkillAdapter):
     def generate_draft(self, request):
-        _shared_call(self, request, "primary")
-        return _DeterministicPlanSkill(no_gap=False).generate_draft(request)
+        native = _shared_call(self, request, "primary")
+        return replace(_DeterministicPlanSkill(no_gap=False).generate_draft(request), primary_session_ref=native)
 
     def finalize_draft(self, request, draft):
-        _shared_call(self, request, "review")
         return _DeterministicPlanSkill(no_gap=False).finalize_draft(request, draft)
 
 
 class _BundleTransport(CodexBundleSkillAdapter):
     def call(self, request, name):
-        value, _, _ = self._invoke_with_resident_mcp(run_ref=request.run_ref,
+        value, native, _ = self._invoke_with_resident_mcp(run_ref=request.run_ref,
             attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
             fence_ref=request.fence_ref, runtime_binding=request.runtime_binding,
             operation_name=name, prompt="Read and handle formal guidance.", schema=_SCHEMA,
-            native_session_ref=None if name == "primary" else "runtime-native", job_ref=request.job_ref)
+            native_session_ref=request.native_session_ref, job_ref=request.job_ref)
         assert value == {"ok": True}
+        assert native
+        return native
 
     def generate_draft(self, request):
-        self.call(request, "primary")
-        return _DeterministicBundleSkill().generate_draft(request)
+        native = self.call(request, "primary")
+        return replace(_DeterministicBundleSkill().generate_draft(request), primary_session_ref=native)
 
     def finalize_draft(self, request, draft):
         return _DeterministicBundleSkill().finalize_draft(request, draft)
@@ -160,22 +171,24 @@ class _BundleTransport(CodexBundleSkillAdapter):
 
 class _ReasoningTransport(CodexReasoningSkillAdapter):
     def call(self, request, name):
-        value, _, _ = self._invoke_with_resident_mcp(request=request,
+        value, native, _ = self._invoke_with_resident_mcp(request=request,
             operation_name=name, prompt="Read and handle formal guidance.", schema=_SCHEMA,
-            native_session_ref=None if name == "primary" else "runtime-native")
+            native_session_ref=request.native_session_ref)
         assert value == {"ok": True}
+        assert native
+        return native
 
     def generate_draft(self, request):
-        self.call(request, "primary")
-        return _DeterministicReasoningSkill().generate_draft(request)
+        native = self.call(request, "primary")
+        return replace(_DeterministicReasoningSkill().generate_draft(request), primary_session_ref=native)
 
     def finalize_draft(self, request, draft):
-        self.call(request, "review")
         return _DeterministicReasoningSkill().finalize_draft(request, draft)
 
 
 def _adapter(adapter_type, tmp_path):
     runner = _GuidanceRunner()
+    runner.native_session_ref = "guidance-native:" + adapter_type.__name__
     adapter = adapter_type(tmp_path / adapter_type.__name__,
         executable=str(_fake_codex(tmp_path / (adapter_type.__name__ + "-codex"))), process_runner=runner)
     return adapter, runner
@@ -211,8 +224,14 @@ def test_actual_idea_and_plan_transport_freeze_independent_stage_responsibility(
             if current["stage_commit"] is not None:
                 break
             runtime.plan_stage.process_once()
-        assert [inbox["deliveries"][0]["needs_treatment"] for inbox in idea_runner.inboxes] == [True, False]
-        assert [inbox["deliveries"][0]["needs_treatment"] for inbox in plan_runner.inboxes] == [True, False]
+        assert runtime.plan_stage.query_current()["stage_commit"] is not None
+        assert [inbox["deliveries"][0]["needs_treatment"] for inbox in idea_runner.inboxes] == [True]
+        assert [inbox["deliveries"][0]["needs_treatment"] for inbox in plan_runner.inboxes] == [True]
+        for runner in (idea_runner, plan_runner):
+            assert runner.after_treatment[0]["binding"] == runner.inboxes[0]["binding"]
+            assert runner.after_treatment[0]["deliveries"] == runner.inboxes[0]["deliveries"]
+        assert [seal["operation_name"] for seal in _seals(idea)] == ["primary"]
+        assert [seal["operation_name"] for seal in _seals(plan)] == ["primary"]
         assert len(idea_runner.receipts) == len(plan_runner.receipts) == 1
         assert idea_runner.receipts[0]["goal_update_pending"] is True
         assert plan_runner.receipts[0]["goal_update_pending"] is True
@@ -266,9 +285,13 @@ def test_actual_reasoning_transport_gets_guidance_before_provider_seal(tmp_path)
         _finish_idea_stage(runtime)
         for _ in range(16):
             runtime.reasoning_stage.process_once()
-            if len(runner.inboxes) >= 2:
+            if runtime.reasoning_stage.query_current()["stage_commit"] is not None:
                 break
-        assert [item["deliveries"][0]["needs_treatment"] for item in runner.inboxes[:2]] == [True, False], (runtime.reasoning_stage.transient_error, runtime.reasoning_stage.query_current())
+        assert runtime.reasoning_stage.query_current()["stage_commit"] is not None
+        assert [item["deliveries"][0]["needs_treatment"] for item in runner.inboxes] == [True]
+        assert runner.after_treatment[0]["binding"] == runner.inboxes[0]["binding"]
+        assert runner.after_treatment[0]["deliveries"] == runner.inboxes[0]["deliveries"]
+        assert [seal["operation_name"] for seal in _seals(provider)] == ["primary"]
         assert len(runner.receipts) == 1
         assert {seal["guidance_binding"]["identity"]["root_kind"] for seal in _seals(provider)} == {"reasoning"}
     finally:
@@ -321,9 +344,12 @@ def test_guidance_catalog_is_available_only_to_the_five_working_roles(tmp_path):
 def test_actual_empty_operation_retry_keeps_original_cut_after_late_submission(tmp_path):
     class RetryingIdea(_IdeaTransport):
         def generate_draft(self, request):
-            _shared_call(self, request, "primary")
-            _shared_call(self, request, "primary")
-            return _DeterministicIdeaSkill().generate_draft(request)
+            native = _shared_call(self, request, "primary")
+            assert _shared_call(self, request, "primary") == native
+            draft = replace(_DeterministicIdeaSkill().generate_draft(request), primary_session_ref=native)
+            if not request.owner_feedback:
+                return replace(draft, draft={**draft.draft, "question_ref": "wrong-question"})
+            return draft
 
     provider, runner = _adapter(RetryingIdea, tmp_path)
     runtime = _plan_runtime(tmp_path / "runtime", idea_skill=provider,
@@ -338,7 +364,11 @@ def test_actual_empty_operation_retry_keeps_original_cut_after_late_submission(t
         assert runner.inboxes[0]["deliveries"] == []
         assert len(runner.inboxes) == 2
         assert runner.inboxes[1]["deliveries"][0]["needs_treatment"] is True
-        primary = next(item for item in _seals(provider) if item["operation_name"] == "primary")
+        seals = _seals(provider)
+        assert len(seals) == 2
+        assert all(item["operation_name"] == "primary" for item in seals)
+        assert len({item["guidance_binding"]["identity"]["run_ref"] for item in seals}) == 1
+        primary = next(item for item in seals if item["guidance_binding"]["snapshot_ref"] == runner.inboxes[0]["binding"]["snapshot_ref"])
         rows = runtime.owners.human_collaboration.query_guidance_deliveries(late["constraint_ref"])
         assert len(rows) == 1
         assert rows[0]["operation_ref"] != primary["guidance_binding"]["identity"]["operation_ref"]
