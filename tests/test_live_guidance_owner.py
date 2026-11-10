@@ -94,7 +94,10 @@ def test_live_guidance_rechecks_current_fence_and_rejects_a_finished_root(tmp_pa
     runtime, _ = _run_idea(tmp_path, provider)
     try:
         _finish(runtime)
-        with pytest.raises(OwnerConflict, match="idea_runtime_scope_stale"):
+        assert runtime.idea_stage.query_current()["stage_commit"] is not None
+        # Local finalization completes the root from its saved primary. The current
+        # root/fence guard rejects this retired operation before the Stage guard.
+        with pytest.raises(OwnerConflict, match="^root_agent_human_request_scope_stale$"):
             runtime.owners.human_collaboration.prepare_live_guidance(**observed)
     finally:
         runtime.close()
