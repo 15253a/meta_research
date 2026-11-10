@@ -1411,9 +1411,7 @@ test("a non-asset HumanRequestResponse reloads the same sealed body and key when
   await dialog.getByRole("button", { name: "我已重连" }).click();
   await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(1);
-  const pending = await page.evaluate(() => JSON.parse(sessionStorage.getItem(
-    "meta_research_pending_human_request_response",
-  )!) as JsonRecord);
+  const pending = JSON.parse((await humanRequestRecoveryDatabaseState(page)).manifests[0]) as JsonRecord;
   expect(pending).toMatchObject({
     schema: "meta-research/human-request-response/v1",
     request_ref: "agent_runtime:HR-27:r1",
@@ -2285,7 +2283,7 @@ test("sealed server reference survives lost ACK and reload with controls locked"
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
   await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(1);
-  const pending = await page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"));
+  const pending = (await humanRequestRecoveryDatabaseState(page)).manifests[0];
   expect(pending).toContain("AES-GCM");
   expect(pending).not.toContain("Exact original bytes.");
   await page.reload({ waitUntil: "domcontentloaded" });

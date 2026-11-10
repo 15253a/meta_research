@@ -2990,7 +2990,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
       if (delivery?.status === "recorded") {
         setRecorded(true);
         setSealedResponse(null);
-        setError(null);
+        setError(delivery.error ?? null);
         setRecoveryReady(true);
         onChanged();
         return;
@@ -3124,6 +3124,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         <p>本请求的回执与后继状态保留在此。提交不表示原根已恢复，也不表示科学问题已解决。</p>
         <p>原根核验：{evaluationDecision ?? "尚无确认"}；后续处理：{String(request.disposition?.decision ?? "尚无确认")}。</p>
         <code>{String(humanResponseDeliveryState(request.request_ref)?.result?.response_ref ?? "")}</code>
+        {error ? <p role="alert">本地恢复记录暂未清理，系统会继续核对。<code>{error}</code></p> : null}
         <HumanRequestMaterialReferences responses={request.responses ?? []} />
       </div>
     );
@@ -3151,6 +3152,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         <div>
           <h3>回应已提交</h3>
           <code>{String(humanResponseDeliveryState(request.request_ref)?.result?.response_ref ?? "")}</code>
+          {error ? <p role="alert">本地恢复记录暂未清理，系统会继续核对。<code>{error}</code></p> : null}
           <HumanRequestMaterialReferences responses={request.responses ?? []} />
           <p>回应及原始来源引用已提交到请求原根。材料保留在原服务器路径，原根可按需读取；提交本身不自动入库。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
         </div>

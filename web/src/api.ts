@@ -3334,8 +3334,11 @@ async function deliverPendingHumanRequestResponseOnce(
         || isPermanentHumanResponseRejection(error)) {
       await discardPendingHumanRequestResponse(delivery);
       observeHumanResponseDelivery(requestRef, { status: "rejected", error: error instanceof Error ? error.message : "request_failed" });
-    } else if (humanResponseDeliveryState(requestRef)?.status !== "recorded") {
-      observeHumanResponseDelivery(requestRef, { status: "pending" });
+    } else {
+      const deliveryState = humanResponseDeliveryState(requestRef);
+      observeHumanResponseDelivery(requestRef, deliveryState?.status === "recorded"
+        ? { ...deliveryState, error: error instanceof Error ? error.message : "request_failed" }
+        : { status: "pending" });
     }
     throw error;
   }
@@ -4988,20 +4991,28 @@ export function hydratePendingHumanRequestRecovery(): Promise<void> {
 async function hydratePendingHumanRequestRecoveryOnce(): Promise<void> {
   const legacyManifests = await readHumanRequestRecoveryManifests();
   for (const { legacySlot } of humanRequestRecoveryManifestKinds) {
-    const serialized = legacyManifests.get(legacySlot) ?? readSessionValue(legacySlot);
-    if (!serialized) continue;
-    let descriptor: HumanRequestRecoveryManifestDescriptor;
-    try {
-      descriptor = describeHumanRequestRecoveryManifest(serialized);
-    } catch {
-      continue;
+    for (const location of ["idb", "session"] as const) {
+      const serialized = location === "idb"
+        ? legacyManifests.get(legacySlot) : readSessionValue(legacySlot);
+      if (!serialized) continue;
+      const descriptor = describeHumanRequestRecoveryManifest(serialized);
+      // A broken original remains available for diagnosis/recovery. In
+      // particular, importing a descriptor without its key is not success.
+      if (descriptor.kind === "response") {
+        const response = parsePendingHumanRequestResponse(serialized)!;
+        await unsealHumanRequestResponseBody(
+          response.sealed_response, humanRequestResponseDeliveryBindingJson(response),
+        );
+      }
+      await migrateLegacyHumanRequestRecoveryManifest(
+        legacySlot,
+        humanRequestRecoveryManifestKey(descriptor.kind, descriptor.requestRef),
+        serialized,
+        location === "idb",
+        descriptor.sealed,
+      );
+      if (readSessionValue(legacySlot) === serialized) removeSessionValue(legacySlot);
     }
-    await migrateLegacyHumanRequestRecoveryManifest(
-      legacySlot,
-      humanRequestRecoveryManifestKey(descriptor.kind, descriptor.requestRef),
-      serialized,
-      legacyManifests.has(legacySlot),
-    );
   }
 
   const manifests = await reconcileHumanRequestRecoveryDatabase();
@@ -5012,9 +5023,6 @@ async function hydratePendingHumanRequestRecoveryOnce(): Promise<void> {
     if (descriptor.pendingWrite) {
       seedPendingWrite(descriptor.pendingWrite.slot, descriptor.pendingWrite.key);
     }
-  });
-  humanRequestRecoveryManifestKinds.forEach(({ kind }) => {
-    syncHumanRequestRecoverySessionCache(kind);
   });
 }
 
@@ -5095,19 +5103,6 @@ function describeHumanRequestRecoveryManifest(
   throw new ProductError("human_request_recovery_manifest_invalid");
 }
 
-function syncHumanRequestRecoverySessionCache(
-  kind: HumanRequestRecoveryManifestKind,
-): void {
-  const legacy = humanRequestRecoveryManifestKinds.find(
-    (entry) => entry.kind === kind,
-  );
-  if (!legacy) return;
-  const legacySlot = legacy.legacySlot;
-  const serialized = recoveryManifestValues(kind)[0];
-  if (serialized) writeSessionValue(legacySlot, serialized);
-  else removeSessionValue(legacySlot);
-}
-
 async function storeHumanRequestRecoveryRecord(
   kind: HumanRequestRecoveryManifestKind,
   requestRef: string,
@@ -5157,7 +5152,6 @@ async function storeHumanRequestRecoveryRecord(
     database.close();
   }
   humanRequestRecoveryManifestCache.set(manifestKey, serialized);
-  syncHumanRequestRecoverySessionCache(kind);
 }
 
 async function replaceHumanRequestRecoveryRecord(
@@ -5211,7 +5205,6 @@ async function replaceHumanRequestRecoveryRecord(
     database.close();
   }
   humanRequestRecoveryManifestCache.set(manifestKey, replacementSerialized);
-  syncHumanRequestRecoverySessionCache(kind);
 }
 
 async function deleteHumanRequestRecoveryRecord(
@@ -5265,7 +5258,6 @@ async function deleteHumanRequestRecoveryRecord(
   }
   if (deleted || humanRequestRecoveryManifestCache.get(manifestKey) === expectedSerialized) {
     humanRequestRecoveryManifestCache.delete(manifestKey);
-    syncHumanRequestRecoverySessionCache(kind);
   }
 }
 
@@ -5307,32 +5299,59 @@ async function migrateLegacyHumanRequestRecoveryManifest(
   manifestKey: string,
   serialized: string,
   deleteLegacy: boolean,
+  sealed?: SealedRecoveryPayload,
 ): Promise<void> {
   const database = await openHumanRequestRecoveryDatabase();
   let conflict = false;
+  let missingPayload = false;
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = database.transaction(
-        humanRequestRecoveryManifestStore,
+        [humanRequestRecoveryManifestStore, humanRequestRecoveryKeyStore,
+          humanRequestRecoveryCiphertextStore],
         "readwrite",
       );
       const store = transaction.objectStore(humanRequestRecoveryManifestStore);
       const currentRequest = store.get(manifestKey);
-      currentRequest.onsuccess = () => {
+      const legacyRequest = store.get(legacyKey);
+      const keyRequest = sealed
+        ? transaction.objectStore(humanRequestRecoveryKeyStore).get(sealed.key_ref) : null;
+      const ciphertextRequest = sealed
+        ? transaction.objectStore(humanRequestRecoveryCiphertextStore).get(sealed.ciphertext_ref) : null;
+      let reads = 0;
+      const inspect = () => {
+        if (++reads !== (sealed ? 4 : 2)) return;
+        // Another tab may already have imported and delivered this original.
+        if (deleteLegacy && legacyRequest.result === undefined) return;
+        if (deleteLegacy && legacyRequest.result !== serialized) {
+          conflict = true;
+          transaction.abort();
+          return;
+        }
         if (currentRequest.result !== undefined && currentRequest.result !== serialized) {
           conflict = true;
+          transaction.abort();
+          return;
+        }
+        if (sealed && (!keyRequest!.result || !ciphertextRequest!.result)) {
+          missingPayload = true;
           transaction.abort();
           return;
         }
         if (currentRequest.result === undefined) store.put(serialized, manifestKey);
         if (deleteLegacy) store.delete(legacyKey);
       };
+      currentRequest.onsuccess = inspect;
+      legacyRequest.onsuccess = inspect;
+      if (keyRequest) keyRequest.onsuccess = inspect;
+      if (ciphertextRequest) ciphertextRequest.onsuccess = inspect;
       transaction.oncomplete = () => resolve();
       transaction.onerror = () => reject(new ProductError(
         "human_request_recovery_manifest_store_unavailable",
       ));
       transaction.onabort = () => reject(new ProductError(conflict
         ? "human_request_recovery_manifest_conflict"
+        : missingPayload ? "human_request_recovery_sealing_key_missing"
         : "human_request_recovery_manifest_store_unavailable"));
     });
   } finally {
@@ -5343,6 +5362,7 @@ async function migrateLegacyHumanRequestRecoveryManifest(
 async function reconcileHumanRequestRecoveryDatabase(): Promise<Map<string, string>> {
   const database = await openHumanRequestRecoveryDatabase();
   let validManifests = new Map<string, string>();
+  let invalid: unknown;
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = database.transaction(
@@ -5378,7 +5398,7 @@ async function reconcileHumanRequestRecoveryDatabase(): Promise<Map<string, stri
         manifestKeysRequest.result.forEach((key, index) => {
           const serialized = manifestValuesRequest.result[index];
           if (typeof key !== "string" || typeof serialized !== "string") {
-            manifestStore.delete(key);
+            invalid = new ProductError("human_request_recovery_manifest_invalid");
             return;
           }
           try {
@@ -5391,7 +5411,9 @@ async function reconcileHumanRequestRecoveryDatabase(): Promise<Map<string, stri
               || (existingKeyRefs.has(descriptor.sealed.key_ref)
                 && existingCiphertextRefs.has(descriptor.sealed.ciphertext_ref));
             if (key !== exactKey || !payloadPresent) {
-              manifestStore.delete(key);
+              invalid = new ProductError(payloadPresent
+                ? "human_request_recovery_manifest_invalid"
+                : "human_request_recovery_sealing_key_missing");
               return;
             }
             next.set(key, serialized);
@@ -5399,10 +5421,14 @@ async function reconcileHumanRequestRecoveryDatabase(): Promise<Map<string, stri
               referencedKeyRefs.add(descriptor.sealed.key_ref);
               referencedCiphertextRefs.add(descriptor.sealed.ciphertext_ref);
             }
-          } catch {
-            manifestStore.delete(key);
+          } catch (error) {
+            invalid = error;
           }
         });
+        if (invalid) {
+          transaction.abort();
+          return;
+        }
         existingKeyRefs.forEach((key) => {
           if (!referencedKeyRefs.has(key)) keyStore.delete(key);
         });
@@ -5419,7 +5445,7 @@ async function reconcileHumanRequestRecoveryDatabase(): Promise<Map<string, stri
       transaction.onerror = () => reject(new ProductError(
         "human_request_recovery_manifest_store_unavailable",
       ));
-      transaction.onabort = () => reject(new ProductError(
+      transaction.onabort = () => reject(invalid ?? new ProductError(
         "human_request_recovery_manifest_store_unavailable",
       ));
     });
