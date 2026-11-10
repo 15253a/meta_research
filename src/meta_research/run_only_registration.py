@@ -1,8 +1,4 @@
-"""Preserve verified executions whose assessment has not produced a result yet.
-
-These are native runs with immutable input bindings, not a TargetCommit or an
-EvaluationAttempt. The ordinary completion correction path remains in charge.
-"""
+"""Read and verify historical unassessed executions."""
 from __future__ import annotations
 
 import json
@@ -12,11 +8,11 @@ from sqlalchemy import text
 
 from meta_research.bundle_protocol import projection_plain_value
 from meta_research.formal_entities import (
-    _checkpoint_paths, _default_checkpoint_paths, _ensure_input, _insert, _ref, _register_run_checkpoints,
-    _variant_declaration, explicit_unexecuted_root_evidence, insert_variant_run,
+    _checkpoint_paths, _default_checkpoint_paths, _ensure_input, _ref, _register_run_checkpoints,
+    _variant_declaration, explicit_unexecuted_root_evidence,
     verified_target_input_asset_refs,
 )
-from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash, canonical_json
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 
 SCHEMA = "meta-research/unassessed-execution-inputs/v1"
 
@@ -157,17 +153,10 @@ def _verify_original_binding_source(owner, proof, run_ref):
             raise OwnerConflict("target_unassessed_execution_integrity_invalid")
 
 
-def _resolve_run_variant_declarations(connection, *, runs, target, accepted_at, verify_only):
-    """Give run-only executions the method identity their work actually used.
-
-    Same seam as the measured completion path: a declared contract resolves
-    or registers the Baseline and gets-or-creates the Variant by recipe hash.
-    """
+def _resolve_run_variant_declarations(connection, *, runs, target):
     declared = {run["run_key"]: run for run in runs if _variant_declaration(run) is not None}
     if not declared:
         return
-    from meta_research.baseline_identity import resolve_baseline_method_identity
-    from meta_research.owners.research_graph import _get_or_create_target_measurement_identity
     quest_ref = connection.execute(text(
         "SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g ON g.graph_ref=t.graph_ref "
         "WHERE t.target_ref=:ref"), {"ref": target.target_ref}).scalar_one_or_none()
@@ -179,36 +168,23 @@ def _resolve_run_variant_declarations(connection, *, runs, target, accepted_at, 
             continue
         if run.get("variant_ref") or run.get("variant_run_ref"):
             raise OwnerConflict("target_formal_variant_declaration_invalid")
-        if verify_only:
-            # Verification only resolves what live acceptance registered.
-            from meta_research.formal_entities import _lookup_declared_baseline
-            baseline_ref = _lookup_declared_baseline(connection, declaration["forward"])
-            natural = {"baseline_ref": baseline_ref,
-                       "recipe_hash": canonical_hash(declaration["recipe"])}
-            row = connection.execute(text(
-                "SELECT variant_ref FROM rg_experiment_variants WHERE baseline_ref=:baseline_ref "
-                "AND recipe_hash=:recipe_hash"), natural).first()
-            if row is None:
-                raise OwnerConflict("target_unassessed_execution_missing")
-            run["variant_ref"] = str(row[0])
-            continue
-        baseline_ref, _created = resolve_baseline_method_identity(
-            connection, forward=declaration["forward"], quest_ref=quest_ref,
-            accepted_at=accepted_at)
+        # Verification only resolves what live acceptance registered.
+        from meta_research.formal_entities import _lookup_declared_baseline
+        baseline_ref = _lookup_declared_baseline(connection, declaration["forward"])
         natural = {"baseline_ref": baseline_ref,
                    "recipe_hash": canonical_hash(declaration["recipe"])}
-        run["variant_ref"], _variant_created = _get_or_create_target_measurement_identity(
-            connection, table="rg_experiment_variants", ref_column="variant_ref",
-            ref_prefix="variant", natural=natural,
-            immutable={"recipe_json": canonical_json(declaration["recipe"])},
-            insert_only={"accepted_at": accepted_at})
+        row = connection.execute(text(
+            "SELECT variant_ref FROM rg_experiment_variants WHERE baseline_ref=:baseline_ref "
+            "AND recipe_hash=:recipe_hash"), natural).first()
+        if row is None:
+            raise OwnerConflict("target_unassessed_execution_missing")
+        run["variant_ref"] = str(row[0])
 
 
-def _persist_runs(connection, *, completion, manifest, target, authority, runs, source_owner, verify_only=False):
+def _persist_runs(connection, *, completion, manifest, target, authority, runs, source_owner):
     from meta_research.owners.research_graph import _accepted_experiment_input_binding
 
-    inserted = {}
-    def ensure(table, key, values, writer=None):
+    def ensure(table, key, values):
         row = connection.execute(text(f"SELECT * FROM {table} WHERE {key}=:ref"),
                                  {"ref": values[key]}).mappings().first()
         if row is not None:
@@ -224,20 +200,15 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
                     raise OwnerConflict("target_unassessed_execution_integrity_invalid")
             elif differing:
                 raise OwnerConflict("target_unassessed_execution_integrity_invalid")
-        elif verify_only:
-            raise OwnerConflict("target_unassessed_execution_missing")
         else:
-            (writer or (lambda conn, vals: _insert(conn, table, vals)))(connection, values)
-            inserted[table] = inserted.get(table, 0) + 1
+            raise OwnerConflict("target_unassessed_execution_missing")
 
     _check_source_rows(connection, completion, manifest, target, authority)
     entries = [entry.as_dict() for entry in manifest.entries if entry.role == "checkpoint"]
     checkpoint_defaults = _default_checkpoint_paths(
         {run['run_key']: run.get('checkpoint_paths') for run in runs
-         if not run.get('variant_run_ref')}, entries, require_explicit=not verify_only)
-    _resolve_run_variant_declarations(connection, runs=runs, target=target,
-                                      accepted_at=completion.accepted_at,
-                                      verify_only=verify_only)
+         if not run.get('variant_run_ref')}, entries, require_explicit=False)
+    _resolve_run_variant_declarations(connection, runs=runs, target=target)
     from meta_research.formal_entities import verify_formal_variant_scope
     verify_formal_variant_scope(connection, target_ref=target.target_ref,
         variant_refs=[run.get('variant_ref', authority.identities.variant_ref) for run in runs])
@@ -275,7 +246,7 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
             binding_ref = _ref("variant_input", run_ref)
             recorded = connection.execute(text(
                 "SELECT inputs_json FROM rg_experiment_input_bindings WHERE binding_ref=:ref"),
-                {"ref": binding_ref}).scalar_one_or_none() if verify_only else None
+                {"ref": binding_ref}).scalar_one_or_none()
             # Reading historical executions must reproduce their exact input
             # receipt, including the original selection semantics.
             legacy_input_selection = (recorded is not None
@@ -287,14 +258,14 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
                 "variant_run_ref": run_ref, "variant_ref": variant_ref, "input_binding_ref": binding_ref,
                 "implementation_revision_ref": inputs["implementation_revision_ref"],
                 "status": "executed", "created_at": at, "updated_at": at,
-            }, insert_variant_run)
+            })
             bound_inputs = inputs
         association_ref = _ref("root_unassessed_run", completion.completion_ref, run["run_key"])
         prior = connection.execute(text('SELECT checkpoint_roles_json FROM rg_target_root_unassessed_runs '
             'WHERE association_ref=:ref'), {'ref': association_ref}).first()
         frozen_refs = [row['role_ref'] for row in json.loads(prior.checkpoint_roles_json)] if prior else None
         checkpoint_paths = run.get("checkpoint_paths")
-        if verify_only and checkpoint_paths is None and prior is not None and not reused:
+        if checkpoint_paths is None and prior is not None and not reused:
             checkpoint_paths = [record["declared_relative_path"]
                                 for record in json.loads(prior.checkpoint_roles_json)]
         checkpoints = _register_run_checkpoints(connection, ensure=ensure,
@@ -334,60 +305,7 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
             "completion_ref": completion.completion_ref, "manifest_ref": manifest.manifest_ref,
             "association_ref": association_ref,
             "checkpoint_roles": checkpoints})
-    for table, counter in (("rg_variant_runs", "variant_run_count"),
-                           ("rg_experiment_input_bindings", "experiment_input_binding_count"),
-                           ("rg_experiment_asset_roles", "experiment_asset_role_count")):
-        if inserted.get(table):
-            connection.execute(text(f"UPDATE research_graph_state SET {counter}={counter}+:count "
-                                    "WHERE singleton='owner'"), {"count": inserted[table]})
-    if inserted:
-        connection.execute(text("UPDATE research_graph_state SET revision=revision+1 WHERE singleton='owner'"))
     return records
-
-
-def preserve_unassessed_runs(owner, *, completion, manifest, result_document, domain_context):
-    """Called only after the ordinary completion issuer/domain checks succeeded."""
-    from meta_research.target_run_finalizer import TargetRootOwnerRejection
-
-    runs = _unassessed_inventory(result_document.as_dict())
-    if runs is None:
-        return None
-    from meta_research.owners.research_graph import _accepted_experiment_input_binding
-    for run in runs:
-        if not run.get("variant_run_ref"):
-            continue
-        with owner._database.read() as connection:
-            binding = connection.execute(text("SELECT b.* FROM rg_variant_runs r JOIN rg_experiment_input_bindings b "
-                "ON b.binding_ref=r.input_binding_ref WHERE r.variant_run_ref=:ref"),
-                {"ref": run["variant_run_ref"]}).mappings().first()
-        if binding is None:
-            raise OwnerConflict("target_formal_reused_run_invalid")
-        _verify_original_binding_source(owner, _accepted_experiment_input_binding(SimpleNamespace(**binding)),
-                                        run["variant_run_ref"])
-    current = owner._verify_target_root_issuers(completion=completion, manifest=manifest,
-                                               result_document=result_document)
-    context = owner._target_root_domain_context(completion=completion, manifest=manifest,
-                                                result_document=result_document)
-    if current != (completion, manifest) or context != domain_context:
-        raise OwnerConflict("target_root_commit_issuer_stale")
-    target, authority, _, _ = context
-    with owner._database.fenced_write() as connection:
-        records = _persist_runs(connection, completion=completion, manifest=manifest,
-                                target=target, authority=authority, runs=runs, source_owner=owner)
-    material = {"completion_ref": completion.completion_ref, "manifest_ref": manifest.manifest_ref,
-                "manifest_payload_hash": manifest.payload_hash,
-                "runs": [{"run_key": row["run_key"], "variant_run_ref": row["variant_run_ref"]} for row in records]}
-    digest = canonical_hash(material)
-    feedback = ("The actual executions are registered: " + canonical_json(material["runs"]) +
-        ". No evaluation result, metric or TargetCommit was created because all assessments are unexecuted. "
-        "Continue the research or wait for the missing prerequisite. When an assessment becomes possible, "
-        "reuse these exact variant_run_ref values for the same executions and report its actual metrics.")
-    rejection_ref = "rg_unassessed_execution_" + digest[:32]
-    return TargetRootOwnerRejection(issuer="research_graph", rejection_ref=rejection_ref,
-        code="target_formal_assessment_pending", feedback=feedback,
-        receipt=AcceptanceReceipt(issuer="research_graph", kind="target_root_completion_rejected",
-            receipt_ref="rg_unassessed_receipt_" + digest[:32], subject_ref=completion.completion_ref,
-            payload_hash=canonical_hash({**material, "rejection_ref": rejection_ref, "feedback": feedback})))
 
 
 def query_unassessed_runs(owner, target_ref):
@@ -422,7 +340,7 @@ def query_unassessed_runs(owner, target_ref):
             raise OwnerConflict("target_unassessed_execution_integrity_invalid")
         with owner._database.read() as connection:
             records.extend(_persist_runs(connection, completion=completion, manifest=manifest,
-                target=target, authority=authority, runs=runs, source_owner=owner, verify_only=True))
+                target=target, authority=authority, runs=runs, source_owner=owner))
     if {record["association_ref"] for record in records} != {row["association_ref"] for row in rows}:
         raise OwnerConflict("target_unassessed_execution_integrity_invalid")
     return tuple({record["variant_run_ref"]: record for record in records}.values())

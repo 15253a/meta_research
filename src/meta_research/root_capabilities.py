@@ -525,66 +525,6 @@ def codex_feature_diagnostics(
     )
 
 
-def codex_feature_diagnostics_match(
-    value: object,
-    *,
-    profile: RootCapabilityProfile,
-    entry_path: RootCapabilityEntryPath,
-    provider_version: str,
-    authorized_operation_ids: tuple[str, ...] = (),
-    semantic_mcp_available: bool = False,
-) -> bool:
-    """Revalidate sealed diagnostics without rerunning the provider probe."""
-
-    if not isinstance(value, dict):
-        return False
-    inventory = value.get("provider_feature_inventory")
-    if not isinstance(inventory, dict):
-        return False
-    status = inventory.get("status")
-    if status == "not_reported":
-        expected = codex_feature_diagnostics(
-            profile=profile,
-            entry_path=entry_path,
-            provider_version=provider_version,
-            feature_output=None,
-            authorized_operation_ids=authorized_operation_ids,
-            semantic_mcp_available=semantic_mcp_available,
-        )
-        return value == expected
-    features = inventory.get("features")
-    if status != "observed" or not isinstance(features, dict):
-        return False
-    try:
-        available, unavailable = capabilities_from_codex_feature_inventory(
-            features
-        )
-        if semantic_mcp_available:
-            available.add("semantic_mcp")
-        evidence_ref = codex_feature_inventory_evidence_ref(
-            profile=profile,
-            entry_path=entry_path,
-            provider_version=provider_version,
-            features=features,
-        )
-        expected = profile.public_diagnostics(
-            entry_path=entry_path,
-            available_capabilities=tuple(
-                capability
-                for capability in profile.capabilities
-                if capability in available
-            ),
-            authorized_operation_ids=authorized_operation_ids,
-            usage_observed=False,
-            unavailable_capabilities=unavailable,
-            provider_feature_inventory=features,
-            provider_feature_inventory_evidence_refs=(evidence_ref,),
-        )
-    except ValueError:
-        return False
-    return value == expected
-
-
 def validate_root_capability_diagnostics(
     value: object,
     *,

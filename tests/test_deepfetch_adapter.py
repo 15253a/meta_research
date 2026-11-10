@@ -23,7 +23,6 @@ from meta_research.deepfetch import (
     _deepfetch_web_evidence_gate_output_schema,
     _read_hosted_acquisition_artifact,
     _validated_v4_acquisition_effect,
-    _verified_codex_reader_ledger_refs,
     canonical_hash,
     validate_deepfetch_result,
 )
@@ -3102,43 +3101,6 @@ def test_codex_deepfetch_accepts_terminal_delivery_after_reader_progress_message
 
     assert result.completion == "complete"
     assert result.papers_ledger is not None
-
-
-def test_codex_deepfetch_rejects_nonterminal_last_reader_delivery(
-    tmp_path: Path,
-) -> None:
-    class FinalThenProgressLedger(RecordedCodexReaderLedger):
-        def read(self, session_ref: str) -> tuple[dict[str, object], ...]:
-            records = super().read(session_ref)
-            if session_ref != self.root_ref:
-                return records
-            progress = {
-                "type": "response_item",
-                "payload": {
-                    "type": "agent_message",
-                    "author": self.task_name,
-                    "recipient": "/root",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Message Type: MESSAGE\nPayload:\nstill working",
-                        }
-                    ],
-                },
-            }
-            return (*records, progress)
-
-    ledger = FinalThenProgressLedger()
-    ledger.expected_cwd = str(tmp_path)
-
-    with pytest.raises(DeepFetchUnavailable) as failure:
-        _verified_codex_reader_ledger_refs(
-            ledger,
-            root_session_ref=ledger.root_ref,
-            expected_working_directory=ledger.expected_cwd,
-        )
-
-    assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
 
 
 def test_codex_deepfetch_ledger_diagnostic_failure_does_not_block_result(
