@@ -18,7 +18,7 @@ from test_bundle_skill_adapter import (
 )
 from test_target_root_finalizer import _current_bundle_runtime
 from test_target_launch_admission import _ready_launch
-from test_bundle_runtime_conditions_compatibility import _SignedDispatchRunner
+from bundle_signed_runner import _SignedDispatchRunner
 
 
 class _SignedDriftRunner(_SignedDispatchRunner):

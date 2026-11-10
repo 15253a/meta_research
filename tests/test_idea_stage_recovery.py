@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import json
 import subprocess
 import time
@@ -24,8 +27,6 @@ from meta_research.quest_drafting import (
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 from meta_research.web import create_app
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
@@ -47,8 +48,8 @@ _QUESTION = {
 
 
 class _DraftingProvider:
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
-        return ProposalDraftResult(_QUESTION, "test_deterministic")
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
+        return synthesis_result(request, _QUESTION, "test_deterministic")
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
         return IntentTurnResult(
@@ -830,7 +831,6 @@ def test_real_idea_nonzero_after_human_request_resumes_same_session(
         idea_skill_provider=_IdeaProvider(),
         harness_adapters=(
             _FullConformanceAdapter("codex"),
-            _FullConformanceAdapter("claude"),
         ),
         startup_power_probe=False,
         startup_harness_diagnostics=False,
@@ -860,7 +860,6 @@ def test_real_idea_nonzero_after_human_request_resumes_same_session(
         idea_skill_provider=adapter,
         harness_adapters=(
             _FullConformanceAdapter("codex"),
-            _FullConformanceAdapter("claude"),
         ),
         startup_power_probe=False,
         startup_harness_diagnostics=False,

@@ -124,7 +124,7 @@ def _runtime(path: Path, authority, plan, reasoning):
         idea_skill_provider=_DeterministicIdeaSkill(), plan_skill_provider=plan,
         bundle_skill_provider=_DeterministicBundleSkill(),
         reasoning_skill_provider=reasoning, target_commit_evidence_authority=authority,
-        harness_adapters=(_FullConformanceAdapter('codex'), _FullConformanceAdapter('claude')),
+        harness_adapters=(_FullConformanceAdapter('codex'),),
     )
     plan.page_reader = runtime.owners.research_graph.query_plan_evidence_page
     if runtime.harnesses.query_status()['status'] != 'ready':

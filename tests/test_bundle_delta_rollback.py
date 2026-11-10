@@ -11,7 +11,7 @@ from test_bundle_input_drift_recovery import _adapter, _output
 @pytest.mark.parametrize("start,end", [("delta-v2", "full"), ("full", "delta-v2"),
                                       ("plan-reference-v1", "delta-v2"), ("delta-v2", "plan-reference-v1")])
 @pytest.mark.parametrize("unknown", [False, True])
-def test_mode_switch_preserves_sealed_operation_and_affects_only_future(tmp_path, monkeypatch, start, end, unknown):
+def test_retired_rollout_values_cannot_change_delta_or_sealed_operation(tmp_path, monkeypatch, start, end, unknown):
     adapter, runner = _adapter(tmp_path, _output("batch"), durable=True)
     request, reader, *_ = _bind(adapter)
     monkeypatch.setenv("META_RESEARCH_BUNDLE_BATCH_VIEW", start)
@@ -41,7 +41,7 @@ def test_mode_switch_preserves_sealed_operation_and_affects_only_future(tmp_path
     adapter.propose_target_batch(replace(request, base_generation=1))
     view = json.loads(next(line.partition("=")[2] for line in runner.calls[-1][1].splitlines()
                            if line.startswith("batch_context=")))
-    assert ("formal_plan" in view) == (end == "full")
-    assert ("responsibility_index" in view) == (end == "delta-v2")
+    assert "formal_plan" not in view
+    assert "responsibility_index" in view
     assert len(runner.calls) == 2
     assert {name: (operation / name).read_bytes() for name in frozen} == frozen

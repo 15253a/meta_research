@@ -222,7 +222,6 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
         plan_skill_provider=_DeterministicPlanSkill(no_gap=False),
         harness_adapters=(
             _FullConformanceAdapter("codex"),
-            _FullConformanceAdapter("claude"),
         ),
     )
     try:

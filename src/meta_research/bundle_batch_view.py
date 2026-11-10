@@ -10,12 +10,6 @@ _EXCLUDED_RUNTIME_KEYS = frozenset({
     "run_ref", "attempt_ref", "fence_ref", "root_session_ref",
     "runtime_binding_hash", "provider_feedback",
 })
-_REFERENCED_PLAN_FIELDS = frozenset({
-    "schema_ref", "kind", "question_ref", "idea_set_ref", "context_pack_ref",
-    "source_bindings", "idea_trace", "experiment_briefs",
-})
-
-
 _SEMANTIC_FIELDS = frozenset({
     "experiment_key", "goal", "characteristics", "boundary_constraints", "semantic_delta",
 })
@@ -55,66 +49,12 @@ def _brief_plan_bindings(plan, completion):
     return bindings if seen == set(semantics) else None
 
 
-def render_batch_reading_context(request, prompt_context, *, verified_plan_reader=None):
-    """Project the host-verified source without changing the sealed business input.
-
-    The reader metadata is not an authorization grant. The host must resolve the
-    source through the current authenticated reader before calling this helper.
-    """
-    legacy = {name: value for name, value in prompt_context.items()
-              if name not in _EXCLUDED_RUNTIME_KEYS}
-    if (not request.native_session_ref or request.native_replacement_context is not None
-            or request.provider_feedback is not None
-            or not isinstance(verified_plan_reader, dict)):
-        return legacy
-    reader = verified_plan_reader
-    expected_arguments = {
-        "context_pack_ref": request.context_pack_ref,
-        "source": "context_pack",
-        "path": ["accepted_formal_plan_binding", "plan_document"],
-        "offset": 0,
-        "limit": 16384,
-    }
-    expected_identity = {
-        "operation": "research_memory.stage_context.read",
-        "context_pack_ref": request.context_pack_ref,
-        "context_pack_hash": request.context_pack_hash,
-        "formal_plan_ref": request.formal_plan_ref,
-        "plan_hash": canonical_hash(request.plan_document),
-        "native_session_ref": request.native_session_ref,
-    }
-    if (reader.get("arguments") != expected_arguments
-            or any(reader.get(key) != value for key, value in expected_identity.items())
-            or prompt_context.get("formal_plan") != request.plan_document):
-        return legacy
-    completion = request.initial_target_plan.get("completion_contract")
-    if not isinstance(completion, dict):
-        return legacy
-    brief_bindings = _brief_plan_bindings(request.plan_document, completion)
-    if brief_bindings is None:
-        return legacy
-    view = deepcopy({name: value for name, value in legacy.items() if name != "formal_plan"})
-    view["formal_plan_reader"] = {
-        "semantic_operation_id": reader["operation"],
-        "arguments": deepcopy(reader["arguments"]),
-        "formal_plan_ref": request.formal_plan_ref,
-        "content_hash": reader["plan_hash"],
-        "context_pack_hash": request.context_pack_hash,
-    }
-    view["plan_responsibilities"] = {
-        key: deepcopy(value) for key, value in request.plan_document.items()
-        if key not in _REFERENCED_PLAN_FIELDS
-    }
-    view["plan_responsibilities"]["brief_plan_bindings"] = deepcopy(brief_bindings)
-    view["completion_contract"] = deepcopy(completion)
-    view["cycle_position"] = deepcopy(request.cycle_position)
-    return view
 
 
 _READ_OP = "research_memory.stage_context.read"
 _LIMIT = 16384
 
-def _legacy_view(prompt_context):
+def _full_reading_view(prompt_context):
     return {name: value for name, value in prompt_context.items()
             if name not in _EXCLUDED_RUNTIME_KEYS}
 
@@ -190,19 +130,19 @@ def partition_batch_records(records, baseline_records, readers, *, key):
 
 def render_delta_batch_reading_context(request, prompt_context, *, verified_plan_reader=None,
                                        verified_source_readers=None, verified_delivery_baseline=None):
-    legacy = _legacy_view(prompt_context)
+    full = _full_reading_view(prompt_context)
     plan_verified = _plan_verified(request, prompt_context, verified_plan_reader)
     if (not request.native_session_ref or request.native_replacement_context is not None
             or request.provider_feedback is not None
             or (not plan_verified and not verified_source_readers)):
-        return deepcopy(legacy)
+        return deepcopy(full)
     completion = request.initial_target_plan.get("completion_contract")
     if not isinstance(completion, dict) or _brief_plan_bindings(request.plan_document, completion) is None:
-        return deepcopy(legacy)
+        return deepcopy(full)
     omitted = {"cycle_position", "current_targets", "target_commits"}
     if plan_verified:
         omitted.add("formal_plan")
-    view = deepcopy({name: value for name, value in legacy.items() if name not in omitted})
+    view = deepcopy({name: value for name, value in full.items() if name not in omitted})
     readers = verified_source_readers or {}
     completion_reader = readers.get("completion_contract")
     retained = []
@@ -233,7 +173,7 @@ def render_delta_batch_reading_context(request, prompt_context, *, verified_plan
     for field, key, source in (("current_targets", "target_ref", "bundle_target"),
                                 ("target_commits", "commit_ref", "bundle_target_commit")):
         previous = None if baseline is None else baseline[field]
-        current = legacy[field]
+        current = full[field]
         exact_readers = {item[key]: readers.get(field, {}).get(item[key]) for item in current
             if _exact_source(readers.get(field, {}).get(item[key]), request, source, item[key], item)}
         shown, index, exceptions = partition_batch_records(current, previous, exact_readers, key=key)

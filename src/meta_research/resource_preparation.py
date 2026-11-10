@@ -3,6 +3,9 @@
 Each public preparation starts fresh. This never caches a runtime binding or
 infers content identity from filesystem metadata.
 """
+import hashlib
+from pathlib import Path
+
 from contextvars import ContextVar
 from functools import wraps
 from typing import Callable, ParamSpec, TypeVar
@@ -37,3 +40,30 @@ def prepared_resource(function: Callable[_P, _T]) -> Callable[_P, _T]:
             prepared[key] = function(*args, **kwargs)
         return prepared[key]
     return read
+
+
+def resource_bytes(path: Path) -> bytes:
+    """Read exact file bytes shared by digest and dependency discovery."""
+    return _resource_bytes(path.resolve())
+
+
+@prepared_resource
+def _resource_bytes(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+def resource_sha256(path: Path) -> str:
+    return _resource_sha256(path.resolve())
+
+
+@prepared_resource
+def _resource_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    if path.stat().st_size <= 2_000_000:
+        digest.update(resource_bytes(path))
+    else:
+        # Discovery never reads large binaries; keep their digest streaming.
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()

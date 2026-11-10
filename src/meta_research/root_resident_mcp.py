@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import hashlib
 from pathlib import Path
+from meta_research.resource_preparation import resource_sha256
 import threading
 from dataclasses import dataclass
 from typing import Protocol
@@ -190,8 +191,8 @@ class RootResidentMcpChannels:
                 "semantic-mcp-resident",
             ),
             resource_bindings=(
-                "adapter-source:meta_research.root_workspace@sha256:" + hashlib.sha256(
-                    Path(__file__).with_name("root_workspace.py").read_bytes()).hexdigest(),
+                "adapter-source:meta_research.root_workspace@sha256:" + resource_sha256(
+                    Path(__file__).with_name("root_workspace.py")),
                 _OPERATION_BINDING_RESOURCE_PREFIX
                 + "contract:"
                 + binding.contract_ref

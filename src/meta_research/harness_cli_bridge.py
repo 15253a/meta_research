@@ -14,7 +14,7 @@ _STDERR_LIMIT = 1024 * 1024
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--family", choices=("codex", "claude"), required=True)
+    parser.add_argument("--family", choices=("codex",), required=True)
     parser.add_argument("--provider-argv", type=Path, required=True)
     parser.add_argument("--output-schema", type=Path, required=True)
     parser.add_argument("--output-last-message", type=Path, required=True)

@@ -128,7 +128,7 @@ def test_bundle_quota_wait_stops_retries_and_explicit_resume_keeps_native(tmp_pa
         prefix="adapter-source:meta_research.idea_skill@sha256:"
         frozen=replace(binding,instruction_set_hash="a"*64,resource_bindings=tuple(
             prefix+"653e4374f2440a6b93ad40b520db472dd9c8b5b6dde80a707a59c380ff3e0a25" if entry.startswith(prefix) else entry for entry in binding.resource_bindings))
-        assert bundle_bindings_compatible(frozen,binding)
+        assert not bundle_bindings_compatible(frozen,binding)
         assert not bundle_bindings_compatible(replace(frozen,model_ref="other"),binding)
         unknown=replace(frozen,resource_bindings=tuple(prefix+"f"*64 if entry.startswith(prefix) else entry for entry in frozen.resource_bindings))
         assert not bundle_bindings_compatible(unknown,binding)

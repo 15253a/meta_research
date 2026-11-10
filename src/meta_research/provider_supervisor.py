@@ -452,40 +452,6 @@ def supervisor_spawn_options() -> dict[str, object]:
     return ProviderProcessPlatform().supervisor_spawn_options()
 
 
-def minimal_subprocess_environment(
-    *,
-    platform_name: str | None = None,
-    source_environment: Mapping[str, str] | None = None,
-    extra: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """Keep only host bootstrap variables required by an isolated subprocess."""
-
-    selected_platform = platform_name or os.name
-    source = os.environ if source_environment is None else source_environment
-    allowed = {"PATH"}
-    if selected_platform == "nt":
-        allowed.update(
-            {
-                "COMSPEC",
-                "PATHEXT",
-                "SYSTEMROOT",
-                "TEMP",
-                "TMP",
-                "WINDIR",
-            }
-        )
-    elif selected_platform != "posix":
-        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
-    environment = {
-        name: value
-        for name, value in source.items()
-        if name.upper() in allowed
-    }
-    if not any(name.upper() == "PATH" for name in environment):
-        environment["PATH"] = ""
-    if extra is not None:
-        environment.update(extra)
-    return environment
 
 
 def protected_subprocess_environment(

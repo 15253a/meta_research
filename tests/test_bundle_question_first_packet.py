@@ -97,7 +97,7 @@ def test_bundle_rejects_question_body_outside_frozen_hash_before_provider_call(t
 
 
 def test_bundle_replay_keeps_original_operation_and_question_bytes(tmp_path):
-    from test_bundle_runtime_conditions_compatibility import _SignedDispatchRunner
+    from bundle_signed_runner import _SignedDispatchRunner
     adapter, runner, request = _setup(tmp_path, _question(), _SignedDispatchRunner)
     request = replace(request, job_ref="bundle:first-packet")
     first = adapter.generate_draft(request)
@@ -113,7 +113,7 @@ def test_bundle_stage_resolves_frozen_question_before_real_adapter_delivery(tmp_
     from test_human_guidance_providers import _tool
     from test_public_bundle_stage import _bundle_runtime, _prepare_bundle_request
     from test_public_plan_stage import _QUESTION
-    from test_bundle_runtime_conditions_compatibility import _SignedDispatchRunner
+    from bundle_signed_runner import _SignedDispatchRunner
 
     class Delivered(BaseException):
         pass

@@ -4,7 +4,7 @@ import pytest
 
 from meta_research.external_mcp import ExternalMcpRuntime, parse_services
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
-from meta_research.harness_adapters import CodexHarnessAdapter, ClaudeHarnessAdapter, HarnessAdapterUnavailable, HarnessSupervisorTransport
+from meta_research.harness_adapters import CodexHarnessAdapter, HarnessAdapterUnavailable, HarnessSupervisorTransport
 from meta_research.target_raw_output import TargetRawOutputStore
 from test_external_mcp import service
 from test_harness_frozen_terminal_recovery import _StoppedWithLostReply
@@ -51,10 +51,6 @@ def test_target_snapshot_precedes_owner_intent_and_survives_crash_before_spool(t
         assert first_invocation.external_mcp_access.binding()["snapshot_hash"]
         codex_argv = CodexHarnessAdapter(tmp_path / "codex")._argv(first_invocation)
         assert any(value.startswith("mcp_servers.meta_research_external.url=") for value in codex_argv)
-        claude = ClaudeHarnessAdapter(tmp_path / "claude")
-        claude_argv = claude._argv(first_invocation)
-        config = json.loads(open(claude_argv[claude_argv.index("--mcp-config") + 1]).read())
-        assert config["mcpServers"]["meta_research_external"]["headers"] == {"Authorization": "Bearer ${META_RESEARCH_EXTERNAL_MCP_TOKEN}"}
         external.save_config(services=parse_services([service(tmp_path, allowed_root_kinds=[], research_instructions="Edited instruction")]), expected_revision=current.revision)
         monkeypatch.setattr(CodexHarnessAdapter, "invoke", invoke)
         with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):

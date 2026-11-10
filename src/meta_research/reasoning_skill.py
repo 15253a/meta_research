@@ -14,7 +14,6 @@ from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, cast
 
-from meta_research.codex_ledger import CodexSessionLedgerReader
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -906,8 +905,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
-        codex_ledger_reader: CodexSessionLedgerReader | None = None,
-        codex_home: Path | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -915,8 +912,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             model_ref=model_ref,
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
-            codex_ledger_reader=codex_ledger_reader,
-            codex_home=codex_home,
         )
         self._full_conformance_authority: (
             ReasoningFullConformanceAuthority | None

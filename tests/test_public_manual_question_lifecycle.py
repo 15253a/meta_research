@@ -25,6 +25,9 @@ RG identity/parent/binding acceptance.
 
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -53,8 +56,6 @@ from meta_research.quest_drafting import (
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 from meta_research.runtime_protection import (
     InhibitorLease,
@@ -78,8 +79,8 @@ class DeterministicDraftingAdapter:
     def __init__(self) -> None:
         self.intent_requests: list[IntentTurnRequest] = []
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
-        return ProposalDraftResult(dict(QUESTION), "test_deterministic")
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
+        return synthesis_result(request, dict(QUESTION), "test_deterministic")
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
         self.intent_requests.append(request)

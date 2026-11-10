@@ -575,7 +575,6 @@ def test_target_provider_return_checkpoints_session_then_resumes_once(
         bundle_skill_provider=bundle_provider,
         harness_adapters=(
             bundle_fixtures._FullConformanceAdapter("codex"),
-            bundle_fixtures._FullConformanceAdapter("claude"),
         ),
         power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),
         startup_power_probe=False,
@@ -610,7 +609,6 @@ def test_target_provider_return_checkpoints_session_then_resumes_once(
                 runner=runner,
                 target_root_timeout_seconds=30 * 24 * 60 * 60,
             ),
-            bundle_fixtures._FullConformanceAdapter("claude"),
         ),
         power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),
         startup_power_probe=False,
@@ -693,7 +691,6 @@ def test_target_provider_return_checkpoints_session_then_resumes_once(
                     runner=runner,
                     target_root_timeout_seconds=30 * 24 * 60 * 60,
                 ),
-                bundle_fixtures._FullConformanceAdapter("claude"),
             ),
             power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),
             startup_power_probe=False,
@@ -1217,7 +1214,7 @@ def test_harness_runtime_rate_limits_channel_attempts_across_restart(
     runtime = HarnessRuntime(
         owner,
         gateway,
-        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        (_TargetRootAdapter("codex"),),
     )
 
     with pytest.raises(HarnessAdmissionError) as initial_wait:
@@ -1251,7 +1248,7 @@ def test_harness_runtime_rate_limits_channel_attempts_across_restart(
     restarted = HarnessRuntime(
         restarted_owner,
         restarted_gateway,
-        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        (_TargetRootAdapter("codex"),),
     )
     try:
         with pytest.raises(HarnessAdmissionError) as restarted_wait:

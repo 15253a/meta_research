@@ -22040,7 +22040,6 @@ class SQLiteAgentRuntimeReceiptVerifier:
         # DeepFetch payload on every public snapshot/readiness projection.
         runtime_binding = _deepfetch_runtime_binding(
             row.runtime_binding_json,
-            allow_historical_root_profile=row.status == "executed",
         )
         if (
             canonical_json(runtime_binding.as_dict()) != row.runtime_binding_json
@@ -22472,7 +22471,7 @@ def _reconciliation_acquisition_item(paper_id: str) -> AcquisitionItemResult:
 
 
 def _deepfetch_runtime_binding(
-    value: str, *, allow_historical_root_profile: bool = False
+    value: str
 ) -> DeepFetchRuntimeBinding:
     try:
         decoded = decoded_object(value)
@@ -22501,31 +22500,7 @@ def _deepfetch_runtime_binding(
             harness_ref=str(decoded["harness_ref"]),
             capability_bindings=tuple(capabilities),
         )
-        validation_binding = binding
-        if allow_historical_root_profile:
-            from meta_research.runtime_binding_compatibility import (
-                reviewed_historical_root_profile_hashes,
-            )
-
-            profile = root_capability_profile("deepfetch")
-            historical = {
-                "root-capability-profile:sha256:" + digest
-                for digest in reviewed_historical_root_profile_hashes(profile.digest)
-            }
-            # Only project the reviewed prose identity for validation. Return
-            # the original binding so stored hashes and receipts stay exact.
-            # Only executed historical rows opt in. Admission, execution and
-            # recovery of unfinished work still use the current profile.
-            validation_binding = replace(
-                binding,
-                capability_bindings=tuple(
-                    "root-capability-profile:sha256:" + profile.digest
-                    if item in historical
-                    else item
-                    for item in binding.capability_bindings
-                ),
-            )
-        validate_runtime_binding(validation_binding)
+        validate_runtime_binding(binding)
         return binding
     except (
         KeyError,
@@ -22540,7 +22515,6 @@ def _deepfetch_runtime_binding(
 def _deepfetch_run_from_row(row) -> DeepFetchRun:
     runtime_binding = _deepfetch_runtime_binding(
         row.runtime_binding_json,
-        allow_historical_root_profile=row.status == "executed",
     )
     provider_operation_generation = int(row.provider_operation_generation)
     provider_operation_ref = str(row.provider_operation_ref)
@@ -24219,7 +24193,6 @@ def _validated_runtime_binding(
     *,
     stage: str | None = None,
     allow_legacy_full_conformance: bool = False,
-    allow_historical_root_profile: bool = False,
 ) -> tuple[
     IdeaRuntimeBinding
     | PlanRuntimeBinding
@@ -24410,13 +24383,6 @@ def _validated_runtime_binding(
     profile = root_capability_profile(cast(RootAgentKind, stage),
         binding.model_ref if binding.model_ref in SUPPORTED_CODEX_MODEL_REFS else CODEX_MODEL_REF)
     allowed_root_bindings = set(profile.runtime_bindings())
-    if allow_historical_root_profile:
-        from meta_research.runtime_binding_compatibility import reviewed_historical_root_profile_hashes
-
-        allowed_root_bindings.update(
-            "root-capability-profile:sha256:" + digest
-            for digest in reviewed_historical_root_profile_hashes(profile.digest)
-        )
     if (
         (stage == "bundle" and not bundle_binding_valid)
         or (stage == "reasoning" and not reasoning_binding_valid)
@@ -24593,7 +24559,6 @@ def _runtime_binding_from_row(
             binding,
             stage=row.stage,
             allow_legacy_full_conformance=True,
-            allow_historical_root_profile=True,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise OwnerConflict("idea_runtime_binding_invalid") from error

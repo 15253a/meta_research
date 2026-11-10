@@ -66,7 +66,7 @@ from meta_research.target_raw_output import (
 LOGGER = logging.getLogger(__name__)
 
 
-HarnessFamily = Literal["codex", "claude"]
+HarnessFamily = Literal["codex"]
 HarnessProcessRunner = Callable[
     [list[str], str, float | None, dict[str, str]],
     subprocess.CompletedProcess[str],
@@ -91,7 +91,6 @@ class CodexChildLedgerReader(Protocol):
 
         ...
 
-CLAUDE_LOCKED_VERSION = "2.1.220"
 _MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
 _HARNESS_FAMILY_ENV = "META_RESEARCH_HARNESS_FAMILY"
 _HARNESS_WORKSPACE_ENV = "META_RESEARCH_HARNESS_WORKSPACE"
@@ -1094,75 +1093,6 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
         return argv
 
 
-class ClaudeHarnessAdapter(_NativeCliHarnessAdapter):
-    family = "claude"
-    executable = "claude"
-    locked_version = CLAUDE_LOCKED_VERSION
-
-    def _argv(self, invocation: HarnessInvocation) -> list[str]:
-        config = {
-            "mcpServers": {
-                "meta_research": {
-                    "type": "http",
-                    "url": invocation.mcp_url,
-                    "headers": {
-                        "Authorization": f"Bearer ${{{_MCP_TOKEN_ENV}}}",
-                    },
-                }
-            }
-        }
-        if invocation.external_mcp_access is not None:
-            config["mcpServers"]["meta_research_external"] = {
-                "type": "http", "url": invocation.external_mcp_access.url,
-                "headers": {"Authorization": "Bearer ${META_RESEARCH_EXTERNAL_MCP_TOKEN}"},
-            }
-        config_directory = self._workspace / "mcp-configs"
-        config_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        config_path = config_directory / (
-            canonical_hash(
-                {
-                    "run_ref": invocation.run_ref,
-                    "attempt_ref": invocation.attempt_ref,
-                    "fence_ref": invocation.fence_ref,
-                    "mcp_url": invocation.mcp_url,
-                    **({} if invocation.external_mcp_access is None else {"operation_ref": invocation.provider_operation_ref,
-                        "external_mcp": invocation.external_mcp_access.binding(), "external_mcp_url": invocation.external_mcp_access.url}),
-                }
-            )
-            + ".json"
-        )
-        encoded = json.dumps(config, sort_keys=True, separators=(",", ":"))
-        if config_path.exists():
-            if config_path.read_text(encoding="utf-8") != encoded:
-                raise HarnessAdapterUnavailable("mcp_config_identity_conflict")
-        else:
-            _write_private(config_path, encoded)
-        argv = [
-            self.executable,
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-hook-events",
-            "--include-partial-messages",
-            "--forward-subagent-text",
-            "--model",
-            invocation.model_ref,
-            "--mcp-config",
-            str(config_path),
-            "--strict-mcp-config",
-            "--permission-mode",
-            "dontAsk",
-            "--allowedTools",
-            (
-                "Bash,Read,Write,Edit,Agent,WebSearch,WebFetch,Skill,"
-                "mcp__meta_research__*"
-                + (",mcp__meta_research_external__*" if invocation.external_mcp_access is not None else "")
-            ),
-        ]
-        if invocation.native_session_ref is not None:
-            argv.extend(["--resume", invocation.native_session_ref])
-        return argv
 
 class _HarnessStdoutEventTail:
     """Replay the private JSONL spool from byte zero while it is growing."""
@@ -1308,7 +1238,7 @@ class HarnessSupervisorTransport:
         ):
             return self._process_runner(argv, prompt, timeout, environment)
         family = environment.get(_HARNESS_FAMILY_ENV)
-        if family not in {"codex", "claude"}:
+        if family not in {"codex"}:
             raise OSError("harness family unavailable")
         operation_ref = environment.get(_PROVIDER_OPERATION_ENV)
         if not operation_ref or len(operation_ref) > 128:
@@ -1566,7 +1496,7 @@ class HarnessSupervisorTransport:
     ) -> str | None:
         family = environment.get(_HARNESS_FAMILY_ENV)
         operation_ref = environment.get(_PROVIDER_OPERATION_ENV)
-        if family not in {"codex", "claude"} or not operation_ref or len(operation_ref) > 128:
+        if family not in {"codex"} or not operation_ref or len(operation_ref) > 128:
             raise OSError("provider operation identity unavailable")
         matches: list[str] = []
         operation_root = self._workspace / "provider-operations"
@@ -1805,12 +1735,6 @@ def _verified_failed_native_session_ref(
         native_ref = None
         if family == "codex" and event.get("type") == "thread.started":
             native_ref = event.get("thread_id")
-        elif (
-            family == "claude"
-            and event.get("type") == "system"
-            and event.get("subtype") == "init"
-        ):
-            native_ref = event.get("session_id")
         if (
             isinstance(native_ref, str)
             and native_ref
@@ -1828,35 +1752,8 @@ def _verified_failed_native_session_ref(
     return native_session_ref
 
 
-def _is_non_symlink_codex_home_descendant(path: Path, codex_home: Path) -> bool:
-    """Reject a package routed through a symlink even when it resolves in home."""
-
-    try:
-        relative = path.relative_to(codex_home)
-    except ValueError:
-        return False
-    current = codex_home
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            return False
-    try:
-        path.resolve(strict=True).relative_to(codex_home)
-    except (OSError, ValueError):
-        return False
-    return True
 
 
-def _ledger_session_id(records: tuple[dict[str, object], ...]) -> str | None:
-    metadata = [
-        record.get("payload")
-        for record in records
-        if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict)
-    ]
-    if len(metadata) != 1:
-        return None
-    value = metadata[0].get("id")
-    return value if isinstance(value, str) else None
 
 
 _ANSI_ESCAPE = re.compile(
@@ -2230,20 +2127,11 @@ class _TargetRootEventProjector:
         self._root_native_session_ref = (
             native_ref if isinstance(native_ref, str) else None
         )
-        self._claude_tools: dict[str, str] = {}
         self._codex_command_output_projector = (
             CodexRootCommandOutputProjector(
                 known_root_native_session_ref=self._root_native_session_ref
             )
-            if family == "codex"
-            else None
         )
-        self._output_bytes = 0
-        self._gap_bytes = 0
-        self._gap_events = 0
-        self._gap_tail = ""
-        self._gap_redacted = False
-        self._gap_emissions = 0
 
     def summarize(
         self, event: dict[str, object]
@@ -2285,64 +2173,18 @@ class _TargetRootEventProjector:
             if terminal:
                 summary["target_root_terminal"] = True
         observation: dict[str, object] | None = None
-        if self._family == "codex":
-            projector = self._codex_command_output_projector
-            assert projector is not None
-            projected = projector.project(
-                event,
-                expected_root_native_session_ref=self._root_native_session_ref,
-            )
+        projector = self._codex_command_output_projector
+        assert projector is not None
+        projected = projector.project(
+            event,
+            expected_root_native_session_ref=self._root_native_session_ref,
+        )
+        if projected is not None:
+            observation = self._command_projection_observation(projected)
+        if terminal and observation is None:
+            projected = projector.finish()
             if projected is not None:
                 observation = self._command_projection_observation(projected)
-            if terminal and observation is None:
-                projected = projector.finish()
-                if projected is not None:
-                    observation = self._command_projection_observation(projected)
-        else:
-            output = self._root_output(event)
-            if output is not None:
-                output_text, _command_ref = output
-                ephemeral = _TargetRootCommandOutputState()
-                text, redacted, overflow_bytes = (
-                    _consume_target_root_output_delta(
-                        ephemeral,
-                        output_text,
-                        final=True,
-                    )
-                )
-                if overflow_bytes:
-                    self._remember_redacted_output_gap(overflow_bytes)
-                remaining = max(
-                    0, _TARGET_ROOT_OUTPUT_TOTAL_LIMIT - self._output_bytes
-                )
-                if remaining > 0 and text:
-                    visible, chunk_truncated = _truncate_utf8(
-                        text,
-                        min(remaining, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT),
-                    )
-                    self._output_bytes += len(_target_root_output_bytes(visible))
-                    observation = {
-                        "schema_ref": "meta-research/target-root-observation/v1",
-                        "scope": self._scope,
-                        "root_native_session_ref": self._root_native_session_ref,
-                        "kind": "command_output",
-                        "stream": "stdout",
-                        "text": visible,
-                        "redacted": redacted,
-                        "truncated": chunk_truncated,
-                    }
-                    if chunk_truncated:
-                        self._remember_output_gap(
-                            text[len(visible) :], redacted=redacted
-                        )
-                elif text:
-                    self._remember_output_gap(text, redacted=redacted)
-                    if self._output_gap_is_due():
-                        observation = self._take_output_gap()
-                elif overflow_bytes and self._output_gap_is_due():
-                    observation = self._take_output_gap()
-            if terminal and observation is None and self._gap_events:
-                observation = self._take_output_gap()
         return summary, capabilities, native_ref, terminal, observation
 
     def _command_projection_observation(
@@ -2363,103 +2205,41 @@ class _TargetRootEventProjector:
             value["dropped_events"] = projection.dropped_events
         return value
 
-    def _remember_output_gap(self, text: str, *, redacted: bool) -> None:
-        if not text:
-            return
-        self._gap_bytes += len(_target_root_output_bytes(text))
-        self._gap_events += 1
-        self._gap_tail = _utf8_tail(text, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT)
-        self._gap_redacted = self._gap_redacted or redacted
 
-    def _remember_redacted_output_gap(self, dropped_bytes: int) -> None:
-        if dropped_bytes <= 0:
-            return
-        marker = "[REDACTED]"
-        self._gap_bytes += dropped_bytes + len(
-            _target_root_output_bytes(marker)
-        )
-        self._gap_events += 1
-        self._gap_tail = marker
-        self._gap_redacted = True
 
-    def _output_gap_is_due(self) -> bool:
-        return (
-            self._gap_emissions == 0
-            or self._gap_bytes >= _TARGET_ROOT_OUTPUT_SAMPLE_BYTES
-            or self._gap_events >= _TARGET_ROOT_OUTPUT_SAMPLE_EVENTS
-        )
 
-    def _take_output_gap(self) -> dict[str, object]:
-        tail_bytes = len(_target_root_output_bytes(self._gap_tail))
-        observation = {
-            "schema_ref": "meta-research/target-root-observation/v1",
-            "scope": self._scope,
-            "root_native_session_ref": self._root_native_session_ref,
-            "kind": "output_gap",
-            "stream": "stdout",
-            # This is an exact redacted tail sample. Gap metadata is carried in
-            # its own fields so no synthetic marker is mixed into stdout.
-            "text": self._gap_tail,
-            "redacted": self._gap_redacted,
-            "truncated": True,
-            "dropped_bytes": max(0, self._gap_bytes - tail_bytes),
-            "dropped_events": self._gap_events,
-        }
-        self._gap_bytes = 0
-        self._gap_events = 0
-        self._gap_tail = ""
-        self._gap_redacted = False
-        self._gap_emissions += 1
-        return observation
 
     def _root_agent_message(self, event: dict[str, object]) -> str | None:
         if self._root_native_session_ref is None:
             return None
-        if self._family == "codex":
-            item = event.get("item")
-            actor_ref = (
-                _codex_item_actor(event, item)
-                if isinstance(item, dict)
-                else None
-            )
-            if (
-                event.get("type") != "item.completed"
-                or not isinstance(item, dict)
-                or item.get("type") != "agent_message"
-                # Native Codex root item envelopes do not always repeat the
-                # thread id learned from ``thread.started``.  An explicit
-                # actor must still match, so child-ledger items fail closed.
-                or actor_ref is _CODEX_ITEM_ACTOR_CONFLICT
-                or (
-                    actor_ref is not None
-                    and actor_ref != self._root_native_session_ref
-                )
-            ):
-                return None
-            value = item.get("text") or item.get("content")
-            return value if isinstance(value, str) else None
+        item = event.get("item")
+        actor_ref = (
+            _codex_item_actor(event, item)
+            if isinstance(item, dict)
+            else None
+        )
         if (
-            event.get("type") != "assistant"
-            or event.get("session_id") != self._root_native_session_ref
-            or event.get("parent_tool_use_id") not in (None, "")
+            event.get("type") != "item.completed"
+            or not isinstance(item, dict)
+            or item.get("type") != "agent_message"
+            # Native Codex root item envelopes do not always repeat the
+            # thread id learned from ``thread.started``.  An explicit
+            # actor must still match, so child-ledger items fail closed.
+            or actor_ref is _CODEX_ITEM_ACTOR_CONFLICT
+            or (
+                actor_ref is not None
+                and actor_ref != self._root_native_session_ref
+            )
         ):
             return None
-        text_blocks = [
-            block["text"]
-            for block in _claude_content_blocks(event)
-            if block.get("type") == "text" and isinstance(block.get("text"), str)
-        ]
-        return str(text_blocks[0]) if len(text_blocks) == 1 else None
+        value = item.get("text") or item.get("content")
+        return value if isinstance(value, str) else None
 
     def _observe_root_identity(
         self, event: dict[str, object], native_ref: str | None
     ) -> None:
         is_root_start = (
             self._family == "codex" and event.get("type") == "thread.started"
-        ) or (
-            self._family == "claude"
-            and event.get("type") == "system"
-            and event.get("subtype") == "init"
         )
         if not is_root_start or native_ref is None:
             return
@@ -2468,87 +2248,8 @@ class _TargetRootEventProjector:
         elif self._root_native_session_ref != native_ref:
             raise HarnessAdapterUnavailable("native_session_identity_changed")
 
-    def _root_output(
-        self, event: dict[str, object]
-    ) -> tuple[str, str | None] | None:
-        if self._root_native_session_ref is None:
-            return None
-        if self._family == "codex":
-            item = event.get("item")
-            actor_ref = (
-                _codex_item_actor(event, item)
-                if isinstance(item, dict)
-                else None
-            )
-            if (
-                event.get("type") not in {"item.updated", "item.completed"}
-                or not isinstance(item, dict)
-                or item.get("type") != "command_execution"
-                or actor_ref is _CODEX_ITEM_ACTOR_CONFLICT
-                or (
-                    actor_ref is not None
-                    and actor_ref != self._root_native_session_ref
-                )
-            ):
-                return None
-            output = next(
-                (
-                    item.get(name)
-                    for name in ("aggregated_output", "output", "stdout")
-                    if isinstance(item.get(name), str)
-                ),
-                None,
-            )
-            if not isinstance(output, str):
-                return None
-            command_ref = item.get("id")
-            return output, command_ref if isinstance(command_ref, str) else None
-
-        event_native_ref = event.get("session_id")
-        root_event = (
-            event_native_ref == self._root_native_session_ref
-            and event.get("parent_tool_use_id") in (None, "")
-        )
-        if not root_event:
-            return None
-        output: list[str] = []
-        for block in _claude_content_blocks(event):
-            block_type = block.get("type")
-            if block_type == "tool_use":
-                tool_use_id = block.get("id")
-                name = block.get("name")
-                if isinstance(tool_use_id, str) and isinstance(name, str):
-                    self._claude_tools[tool_use_id] = name
-                continue
-            if block_type != "tool_result":
-                continue
-            tool_use_id = block.get("tool_use_id")
-            name = (
-                self._claude_tools.get(tool_use_id)
-                if isinstance(tool_use_id, str)
-                else None
-            )
-            if name is None or name.casefold() not in {"bash", "shell"}:
-                continue
-            value = _claude_tool_result_text(block.get("content"))
-            if value:
-                output.append(value)
-        return ("\n".join(output), None) if output else None
 
 
-def _claude_tool_result_text(value: object) -> str | None:
-    if isinstance(value, str):
-        return value
-    if not isinstance(value, list):
-        return None
-    parts = [
-        str(item["text"])
-        for item in value
-        if isinstance(item, dict)
-        and item.get("type") == "text"
-        and isinstance(item.get("text"), str)
-    ]
-    return "\n".join(parts) if parts else None
 
 
 def _consume_target_root_ansi_delta(
@@ -3030,7 +2731,6 @@ def _evidence_from_events(
     root_native_refs: set[str] = set()
     summaries: list[dict[str, object]] = []
     terminal = False
-    claude_pending_tools: dict[str, tuple[str, str]] = {}
     projector = _TargetRootEventProjector(
         family=family,
         observation_scope=observation_scope,
@@ -3057,38 +2757,11 @@ def _evidence_from_events(
         )
         for capability in capabilities:
             observed[capability].append(event_ref)
-        if family == "claude":
-            for block in _claude_content_blocks(event):
-                block_type = block.get("type")
-                if block_type == "tool_use":
-                    tool_use_id = block.get("id")
-                    name = block.get("name")
-                    if isinstance(tool_use_id, str) and isinstance(name, str):
-                        claude_pending_tools[tool_use_id] = (name, event_ref)
-                elif block_type == "tool_result":
-                    tool_use_id = block.get("tool_use_id")
-                    pending = (
-                        claude_pending_tools.pop(tool_use_id, None)
-                        if isinstance(tool_use_id, str)
-                        else None
-                    )
-                    if pending is None or block.get("is_error") is True:
-                        continue
-                    name, request_event_ref = pending
-                    for capability in _capabilities_for_tool(name, name):
-                        observed[capability].extend(
-                            [request_event_ref, event_ref]
-                        )
         if native_ref is not None:
             native_refs.add(native_ref)
             observed["native_session"].append(event_ref)
             if (
                 (family == "codex" and event.get("type") == "thread.started")
-                or (
-                    family == "claude"
-                    and event.get("type") == "system"
-                    and event.get("subtype") == "init"
-                )
             ):
                 root_native_refs.add(native_ref)
         terminal = terminal or is_terminal
@@ -3141,9 +2814,7 @@ def _evidence_from_events(
     profile: dict[str, object] = {
         "schema_ref": "meta-research/harness-capability-profile/v1",
         "harness_family": family,
-        "locked_version": (
-            CODEX_LOCKED_VERSION if family == "codex" else CLAUDE_LOCKED_VERSION
-        ),
+        "locked_version": CODEX_LOCKED_VERSION,
         "provider_version": provider_version,
         "native_session_ref": native_session_ref,
         "capabilities": capabilities,
@@ -3163,9 +2834,7 @@ def _evidence_from_events(
 def _summarize_event(
     family: HarnessFamily, event: dict[str, object]
 ) -> tuple[dict[str, object] | None, set[str], str | None, bool]:
-    if family == "codex":
-        return _summarize_codex_event(event)
-    return _summarize_claude_event(event)
+    return _summarize_codex_event(event)
 
 
 def _summarize_codex_event(
@@ -3253,113 +2922,8 @@ def _summarize_codex_event(
     return summary, capabilities, native_ref, event_type == "turn.completed"
 
 
-def _summarize_claude_event(
-    event: dict[str, object]
-) -> tuple[dict[str, object] | None, set[str], str | None, bool]:
-    event_type = event.get("type")
-    if not isinstance(event_type, str):
-        return None, set(), None, False
-    subtype = event.get("subtype")
-    native_ref = event.get("session_id")
-    if not isinstance(native_ref, str):
-        native_ref = None
-    capabilities: set[str] = set()
-    inventory_names: list[str] = []
-    invoked_tool_names: list[str] = []
-    skill_invocations: list[dict[str, str]] = []
-    if event_type == "system" and subtype == "init":
-        tools = event.get("tools")
-        if isinstance(tools, list):
-            capabilities.add("tool_inventory")
-            inventory_names.extend(item for item in tools if isinstance(item, str))
-    message = event.get("message")
-    content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                name = block.get("name")
-                if isinstance(name, str):
-                    invoked_tool_names.append(name)
-                    tool_use_id = block.get("id")
-                    skill_input = block.get("input")
-                    if (
-                        name.lower() == "skill"
-                        and isinstance(tool_use_id, str)
-                        and isinstance(skill_input, dict)
-                        and set(skill_input) == {"skill"}
-                        and isinstance(skill_input.get("skill"), str)
-                    ):
-                        skill_invocations.append(
-                            {
-                                "tool_use_id": tool_use_id,
-                                "skill_name": skill_input["skill"],
-                            }
-                        )
-    lifecycle = {
-        "fork": "fork",
-        "steer": "steer",
-        "interrupt": "interrupt",
-        "resume": "resume",
-    }
-    if isinstance(subtype, str) and subtype in lifecycle:
-        capabilities.add(lifecycle[subtype])
-    if (
-        event_type == "system"
-        and subtype
-        in {"hook_response", "hook_completed", "hook_execution_complete"}
-        and event.get("is_error") is not True
-        and event.get("status") not in {"error", "failed", "cancelled"}
-    ):
-        capabilities.add("hook")
-    summary: dict[str, object] = {"kind": event_type}
-    usage = reported_usage(event)
-    if usage is not None:
-        summary["reported_token_usage"] = usage
-    compaction = compaction_observation(event)
-    if compaction is not None:
-        summary["context_compaction"] = compaction
-    if isinstance(subtype, str):
-        summary["subtype"] = subtype
-    if inventory_names:
-        summary["inventory_kinds"] = sorted(set(inventory_names))
-    if invoked_tool_names:
-        summary["tool_kinds"] = sorted(set(invoked_tool_names))
-    if skill_invocations:
-        summary["skill_invocations"] = skill_invocations
-    result_ids = [
-        block["tool_use_id"]
-        for block in _claude_content_blocks(event)
-        if block.get("type") == "tool_result"
-        and isinstance(block.get("tool_use_id"), str)
-    ]
-    if result_ids:
-        summary["tool_result_ids"] = sorted(set(result_ids))
-    successful_result_ids = [
-        block["tool_use_id"]
-        for block in _claude_content_blocks(event)
-        if block.get("type") == "tool_result"
-        and isinstance(block.get("tool_use_id"), str)
-        and block.get("is_error") is not True
-        and block.get("status") not in {"error", "failed", "cancelled"}
-    ]
-    if successful_result_ids:
-        summary["successful_tool_result_ids"] = sorted(
-            set(successful_result_ids)
-        )
-    if native_ref is not None:
-        summary["native_session_ref"] = native_ref
-    is_terminal = event_type == "result" and event.get("is_error") is False
-    return summary, capabilities, native_ref, is_terminal
 
 
-def _claude_content_blocks(
-    event: dict[str, object]
-) -> list[dict[str, object]]:
-    message = event.get("message")
-    content = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(content, list):
-        return []
-    return [block for block in content if isinstance(block, dict)]
 
 
 def _verified_subagent_evidence(
@@ -3371,18 +2935,12 @@ def _verified_subagent_evidence(
     codex_child_ledger_reader: CodexChildLedgerReader | None = None,
     expected_working_directory: str | None = None,
 ) -> dict[str, object] | None:
-    if family == "codex":
-        return _verified_codex_subagent_evidence(
-            events,
-            evidence_refs_by_sequence=evidence_refs_by_sequence,
-            root_session_ref=root_session_ref,
-            codex_child_ledger_reader=codex_child_ledger_reader,
-            expected_working_directory=expected_working_directory,
-        )
-    return _verified_claude_subagent_evidence(
+    return _verified_codex_subagent_evidence(
         events,
         evidence_refs_by_sequence=evidence_refs_by_sequence,
         root_session_ref=root_session_ref,
+        codex_child_ledger_reader=codex_child_ledger_reader,
+        expected_working_directory=expected_working_directory,
     )
 
 
@@ -4215,72 +3773,6 @@ def _verified_child_terminal_output(
     return outputs[0] if len(outputs) == 1 else None
 
 
-def _verified_claude_subagent_evidence(
-    events: tuple[dict[str, object], ...],
-    *,
-    evidence_refs_by_sequence: dict[int, str],
-    root_session_ref: str,
-) -> dict[str, object] | None:
-    requests: list[tuple[int, str]] = []
-    results: list[tuple[int, dict[str, object], str | None]] = []
-    for sequence, event in enumerate(events, start=1):
-        for block in _claude_content_blocks(event):
-            if block.get("type") == "tool_use":
-                tool_name = str(block.get("name", "")).lower()
-                tool_use_id = block.get("id")
-                if tool_name in {"agent", "task", "subagent"}:
-                    if (
-                        event.get("session_id") != root_session_ref
-                        or not isinstance(tool_use_id, str)
-                        or not tool_use_id
-                    ):
-                        return None
-                    requests.append((sequence, tool_use_id))
-            elif block.get("type") == "tool_result":
-                session_ref = event.get("session_id")
-                results.append(
-                    (
-                        sequence,
-                        block,
-                        session_ref if isinstance(session_ref, str) else None,
-                    )
-                )
-    if len(requests) != 1:
-        return None
-    request_sequence, tool_use_id = requests[0]
-    matching = [
-        (sequence, block)
-        for sequence, block, _session_ref in results
-        if block.get("tool_use_id") == tool_use_id
-    ]
-    if len(matching) != 1:
-        return None
-    result_sequence, result = matching[0]
-    child_ref = result.get("agent_id") or result.get("child_agent_ref")
-    if (
-        result_sequence <= request_sequence
-        or result.get("is_error") is True
-        or result.get("status") != "completed"
-        or result.get("parent_session_id") != root_session_ref
-        or not isinstance(child_ref, str)
-        or not child_ref
-        or child_ref == root_session_ref
-    ):
-        return None
-    spawn_ref = evidence_refs_by_sequence.get(request_sequence)
-    completion_ref = evidence_refs_by_sequence.get(result_sequence)
-    if spawn_ref is None or completion_ref is None:
-        return None
-    payload = _target_review_payload(result)
-    evidence: dict[str, object] = {
-        "parent_session_ref": root_session_ref,
-        "child_session_ref": child_ref,
-        "spawn_evidence_ref": spawn_ref,
-        "completion_evidence_ref": completion_ref,
-        "payload": payload,
-        "payload_hash": None if payload is None else canonical_hash(payload),
-    }
-    return evidence
 
 
 def _target_review_payload(value: object) -> dict[str, object] | None:

@@ -294,7 +294,7 @@ async function waitForReadyProposal(dialog: Locator) {
   await expect(dialog.getByLabel("首问题要解决的未知")).toHaveValue(QUESTION.unknown);
   await expect(dialog.getByLabel("首问题的答案形态")).toHaveValue(QUESTION.answer);
   await expect(
-    dialog.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
+    dialog.getByRole("region", { name: "确认影响摘要" }).getByText("创建前请核对以下影响", { exact: true }),
   ).toBeVisible();
 }
 
@@ -324,6 +324,8 @@ test("a completed Quest lands once on its accepted first Question", async ({
   page,
 }) => {
   test.setTimeout(45_000);
+  await product?.stop();
+  product = await DeterministicProduct.start({ initializationFaults: false });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.setViewportSize({ width: 390, height: 844 });
   await openAuthenticatedProduct(page, runningProduct());
@@ -344,10 +346,15 @@ test("a completed Quest lands once on its accepted first Question", async ({
 
   const pending = await publicCurrent(page);
   expect(pending).not.toBeNull();
+  expect(pending!.confirmation_preview?.status).toBe("current");
+  expect(pending!.proposal?.status).toBe("current");
+  expect(pending!.resource_envelope?.status).toBe("current");
   const firstQuestionTitle = await dialog.getByLabel("首问题标题").inputValue();
-  await dialog.getByRole("button", {
+  const confirm = dialog.getByRole("button", {
     name: "确认创建 Quest 与第一个问题",
-  }).click();
+  });
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
 
   await expect(dialog).toBeHidden({ timeout: 15_000 });
   const completed = await waitForPublicStatus(

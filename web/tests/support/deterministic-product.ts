@@ -20,6 +20,7 @@ type ProductStart = {
 };
 
 type DeterministicProductOptions = {
+  initializationFaults?: boolean;
   legacyState?: "draft" | "recovering";
   manualRoot?: boolean;
   humanRequestHandoff?: boolean;
@@ -75,6 +76,9 @@ export class DeterministicProduct {
     }
     if (options.manualRoot) {
       argv.push("--manual-root");
+    }
+    if (options.initializationFaults === false) {
+      argv.push("--without-initialization-faults");
     }
     if (options.humanRequestHandoff) {
       argv.push("--human-request-handoff");

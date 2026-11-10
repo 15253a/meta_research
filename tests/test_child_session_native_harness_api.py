@@ -1,16 +1,16 @@
-"""Native child metadata through the signed Claude Harness and public HTTP seam.
+"""Historical signed Claude rows remain readable through authenticated HTTP.
 
-The provider subprocess is deterministic. Its small literals reflect actual
-Claude task envelopes; larger captured real Opus samples use the same fixture
-from the local ticket acceptance probe.
+The fixture seeds persisted Owner records and signed spool bytes. It never
+admits or executes a new Claude Harness operation in the current runtime.
 """
 import json
-import sys
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from meta_research.harness_adapters import HarnessSupervisorTransport
+from meta_research.provider_supervisor import (
+    SUPERVISOR_EXIT_SCHEMA_V2, ensure_transport_key, write_exit_receipt,
+)
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.owners.target_run_runtime import canonical_target_scope_binding
 from meta_research.web import create_app
@@ -18,7 +18,7 @@ from test_public_bundle_stage import _bundle_runtime
 from test_target_launch_admission import _ready_launch
 
 
-def admit_claude_root(runtime):
+def seed_historical_claude_root(runtime):
     graph, target, _bundle_run, dispatch, _request = _ready_launch(runtime)
     rg = runtime.owners.research_graph
     rg.accept_formal_plan_content(formal_plan_ref=graph.formal_plan_ref,
@@ -36,51 +36,59 @@ def admit_claude_root(runtime):
     scope = canonical_target_scope_binding(target_ref=target.target_ref, target_run_ref=run_ref,
         target_spec_hash=launch.target_spec_binding.content_hash_ref, candidate=candidate.candidate,
         formal_plan=formal.formal_plan, accepted_input_refs=())
-    admission = runtime.harnesses.admit_target_run(target_ref=target.target_ref,
-        target_run_ref=run_ref, harness_family="claude", model_ref="claude-opus-5-5",
-        auth_profile_ref="harness-profile:claude-default", target_scope_binding=scope)
-    return target, admission.run, graph.quest_ref
+    # Seed the storage contract directly. The public current Harness rejects
+    # Claude admission; historical read support must not reopen that route.
+    binding = {"contract_ref": "historical/claude-operation-binding/v1"}
+    request = {"request_ref": "historical-claude:" + run_ref,
+        "target_ref": target.target_ref, "target_run_ref": run_ref,
+        "harness_family": "claude", "model_ref": "claude-opus-5-5",
+        "auth_profile_ref": "historical-claude-profile",
+        "full_conformance_binding": binding,
+        "full_conformance_binding_hash": canonical_hash(binding),
+        "target_scope_binding_hash": canonical_hash(scope)}
+    owner = runtime.owners.agent_runtime.harness_runs
+    run = owner.reserve_admission(request=request, idempotency_key=request["request_ref"],
+        request_hash=canonical_hash(request), capability_binding_hash="a" * 64,
+        authoritative_run_ref=run_ref)
+    with runtime._database.write() as connection:
+        connection.execute(text("UPDATE ar_harness_runs SET status='admitted' WHERE run_ref=:ref"),
+                           {"ref": run.run_ref})
+    return target, owner.query_run(run.request_ref), graph.quest_ref
 
 
-def replay_native_stream(runtime, run, source_bytes, native_root):
-    """Actual subprocess -> existing transport signature -> Owner evidence ledger."""
+def seed_signed_native_stream(runtime, run, source_bytes, native_root):
+    """Materialize a prior operation's exact signed storage contract."""
     owner = runtime.owners.agent_runtime.harness_runs
     operation = run.run_ref + ":harness_turn:1"
     store = runtime.harnesses._target_raw_output_store
-    workspace = store._workspace
-    provider = runtime.data_root.root / "replay-native-provider.py"
-    source = runtime.data_root.root / "captured-native.jsonl"
+    invocation_hash = canonical_hash({"historical_operation": operation,
+                                      "source_hash": canonical_hash(source_bytes.hex())})
+    directory = store._source_path(invocation_hash).parent
+    directory.mkdir(parents=True)
+    source = directory / "stdout.jsonl"
     source.write_bytes(source_bytes)
-    provider.write_text("import pathlib,sys\nsys.stdin.read()\n"
-                        "sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n",
-                        encoding="utf-8")
-    scope = {"schema_ref": "meta-research/target-root-observation-scope/v1",
-        "target_run_ref": run.run_ref, "attempt_ref": run.attempt_ref,
-        "attempt_generation": run.attempt_generation, "root_session_ref": run.root_session_ref,
-        "fence_ref": run.fence_ref, "native_session_ref": None}
-    environment = {"META_RESEARCH_HARNESS_FAMILY": "claude",
-        "META_RESEARCH_HARNESS_WORKSPACE": str(workspace),
-        "META_RESEARCH_PROVIDER_OPERATION_REF": operation,
-        "META_RESEARCH_HARNESS_EVIDENCE_SCOPE_REF": canonical_hash(scope),
-        "META_RESEARCH_HARNESS_OBSERVATION_SCOPE": canonical_json(scope)}
-    argv = [sys.executable, str(provider), str(source)]
-    prompt, timeout = "Replay isolated native lifecycle bytes", 15.0
-    invocation_hash = canonical_hash({"schema_ref": "meta-research/harness-provider-operation/v1",
-        "family": "claude", "provider_operation_ref": operation, "argv": argv,
-        "prompt_hash": canonical_hash(prompt), "timeout_seconds": timeout,
-        "environment_names": sorted(environment)})
+    prompt = directory / "prompt.txt"
+    schema = directory / "output-schema.json"
+    prompt.write_text("Historical native lifecycle fixture", encoding="utf-8")
+    schema.write_text('{"type":"object"}', encoding="utf-8")
+    _, key = ensure_transport_key(store._workspace)
+    write_exit_receipt(directory / "supervisor-exit.json", key=key,
+        invocation_hash=invocation_hash, prompt_path=prompt, schema_path=schema,
+        stdout_path=source, result_path=directory / "last-message.json", returncode=0,
+        input_bytes=prompt.stat().st_size, schema_ref=SUPERVISOR_EXIT_SCHEMA_V2)
+    envelope = json.loads((directory / "supervisor-exit.json").read_text())
+    receipt = {"provider_operation_ref": operation,
+        "schema_ref": "meta-research/harness-provider-transport-receipt/v1",
+        "spool_ref": "provider-spool:" + invocation_hash,
+        "transport_invocation_hash": invocation_hash,
+        "supervisor_receipt_hash": canonical_hash(envelope),
+        "termination_reason": "completed", "provider_returncode": 0}
     owner.start_operation(run_ref=run.run_ref, operation_ref=operation, generation=1,
                           invocation_hash=invocation_hash, resume=False)
-    transport = HarnessSupervisorTransport(workspace,
-        event_sink=owner.append_target_root_events, raw_output_store=store)
-    completed = transport(argv, prompt, timeout, environment)
-    assert completed.returncode == 0
-    assert completed.stdout.encode("utf-8") == source_bytes
-    receipt = {"provider_operation_ref": operation, **completed.meta_research_transport_receipt}
     owner.complete_operation(operation_ref=operation, run_ref=run.run_ref,
         native_session_ref=native_root, profile={"provider_transport_receipts": [receipt]},
         evidence_events=())
-    return operation, store._source_path(invocation_hash)
+    return operation, source
 
 
 def authenticated_client(runtime):
@@ -103,7 +111,7 @@ def test_signed_claude_native_child_is_public_under_its_target_and_survives_rest
     runtime = _bundle_runtime(data)
     client = None
     try:
-        target, run, quest = admit_claude_root(runtime)
+        target, run, quest = seed_historical_claude_root(runtime)
         events = [
             {"type": "system", "subtype": "init", "session_id": "native-claude-root"},
             {"type": "assistant", "session_id": "native-claude-root", "parent_tool_use_id": None,
@@ -120,7 +128,7 @@ def test_signed_claude_native_child_is_public_under_its_target_and_survives_rest
             {"type": "result", "session_id": "native-claude-root", "is_error": False},
         ]
         source = "".join(json.dumps(e) + "\n" for e in events).encode()
-        operation, path = replay_native_stream(runtime, run, source, "native-claude-root")
+        operation, path = seed_signed_native_stream(runtime, run, source, "native-claude-root")
         client = authenticated_client(runtime)
         before = target_root(client, quest, run.root_session_ref)
         assert [(c["native_session_ref"], c["status"]) for c in before["children"]] == [
@@ -141,6 +149,10 @@ def test_signed_claude_native_child_is_public_under_its_target_and_survives_rest
         output = client.get(f"/api/v1/quests/{quest}/root-sessions/{run.root_session_ref}/output",
                             params={"operation_ref": operation})
         assert output.status_code == 503
+        # Restart uses the durable signed artifacts, never a cached child list.
+        path.write_bytes(source + b"\n")
+        damaged = target_root(client, quest, run.root_session_ref)
+        assert damaged["children"] == [] and damaged["limited"] is True
     finally:
         if client is not None:
             client.close()

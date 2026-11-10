@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import time
 from types import SimpleNamespace
 
@@ -14,7 +17,6 @@ from meta_research.owners import human_requests as human_requests_module
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
     IntentTurnResult,
-    ProposalDraftResult,
 )
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.owners.research_memory import AssetIntakeRequest
@@ -22,8 +24,8 @@ from meta_research.web import create_app
 
 
 class _DeterministicDraftingProvider:
-    def draft(self, _request) -> ProposalDraftResult:
-        return ProposalDraftResult(
+    def synthesize_first_question(self, _request) -> FirstQuestionSynthesisResult:
+        return synthesis_result(_request,
             content={
                 "title": "A bounded question",
                 "unknown_statement": "What remains unknown?",

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -12,15 +15,14 @@ from meta_research.quest_drafting import (
     HostComputeDevice,
     HostComputeSnapshot,
     IntentTurnResult,
-    ProposalDraftResult,
 )
 from meta_research.web import create_app
 from guidance_confirmation_helpers import guidance_proposal_value
 
 
 class _DeterministicDraftingProvider:
-    def draft(self, _request) -> ProposalDraftResult:
-        return ProposalDraftResult(
+    def synthesize_first_question(self, _request) -> FirstQuestionSynthesisResult:
+        return synthesis_result(_request,
             content={
                 "title": "A bounded question",
                 "unknown_statement": "What remains unknown?",

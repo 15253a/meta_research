@@ -34,10 +34,6 @@ from meta_research.codex_runtime import (
     CODEX_REASONING_EFFORT_BINDING,
     CODEX_ROOT_REASONING_PRESET_CONFIG,
 )
-from meta_research.codex_ledger import (
-    CodexHomeLedgerReader,
-    CodexSessionLedgerReader,
-)
 
 from meta_research.provider_supervisor import (
     SUPERVISOR_REQUEST_SCHEMA,
@@ -692,8 +688,6 @@ class CodexDeepFetchAdapter:
             ]
             | None
         ) = None,
-        codex_ledger_reader: CodexSessionLedgerReader | None = None,
-        codex_home: Path | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -706,9 +700,6 @@ class CodexDeepFetchAdapter:
         )
         self._skill_root = _deepfetch_skill_root()
         self._skill_bundle_hash = _deepfetch_skill_bundle_hash(self._skill_root)
-        self._codex_ledger_reader = codex_ledger_reader
-        if self._codex_ledger_reader is None and codex_home is not None:
-            self._codex_ledger_reader = CodexHomeLedgerReader(codex_home)
         self._root_operation_diagnostic_recorder: (
             RootOperationDiagnosticRecorder | None
         ) = None
@@ -1406,7 +1397,6 @@ class CodexDeepFetchAdapter:
                     "quest-acquisition-semantic-effect",
                     "native-child-readers",
                     "papers-v4-finalize",
-                    "codex-reader-ledger:v1",
                     "provider-output-limits:"
                     f"stream={DEEPFETCH_PROVIDER_STREAM_MAX_BYTES};"
                     f"result={PROVIDER_RESULT_MAX_BYTES}",

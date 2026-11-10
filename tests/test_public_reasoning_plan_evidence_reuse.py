@@ -325,7 +325,6 @@ def _runtime(path: Path, authority, provider):
         target_commit_evidence_authority=authority,
         harness_adapters=(
             _FullConformanceAdapter("codex"),
-            _FullConformanceAdapter("claude"),
         ),
     )
     if runtime.harnesses.query_status()["status"] != "ready":

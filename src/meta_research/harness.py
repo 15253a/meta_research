@@ -392,9 +392,6 @@ class _ResidentMcpScope:
 class FullConformanceRequest:
     codex_model_ref: str
     codex_auth_profile_ref: str
-    # Deprecated compatibility inputs are decoded but never selected.
-    claude_model_ref: str | None = None
-    claude_auth_profile_ref: str | None = None
 
     def provider_configuration(
         self, family: HarnessFamily
@@ -493,7 +490,7 @@ class HarnessRuntime:
         adapter_families = set(self._adapters)
         if (
             "codex" not in adapter_families
-            or not adapter_families <= {"codex", "claude"}
+            or not adapter_families <= {"codex"}
         ):
             raise HarnessAdmissionError("harness_adapter_catalog_invalid")
         try:
@@ -3121,9 +3118,7 @@ class HarnessRuntime:
             or row.idempotency_key != row.request_ref
         ):
             return None
-        family: HarnessFamily = (
-            "codex" if family_value == "codex" else "claude"
-        )
+        family: HarnessFamily = "codex"
         request = self._request_from_value(
             row.request, row.idempotency_key, row
         )
@@ -3454,8 +3449,6 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("harness_probe_request_invalid")
         if isinstance(request, TargetHarnessRequest):
-            from meta_research.runtime_binding_compatibility import target_request_catalog_compatible
-
             if (
                 not request.target_ref
                 or len(request.target_ref) > 96
@@ -3465,10 +3458,7 @@ class HarnessRuntime:
                 != request.full_conformance_binding_hash
                 or len(request.full_conformance_binding_hash) != 64
                 or len(request.target_scope_binding_hash) != 64
-                or not target_request_catalog_compatible(
-                    request.required_operation_ids, request.full_conformance_binding,
-                    TARGET_ROOT_SEMANTIC_OPERATION_IDS,
-                )
+                or request.required_operation_ids != TARGET_ROOT_SEMANTIC_OPERATION_IDS
                 or request.required_capabilities
                 not in {
                     _target_root_lifecycle_capabilities(resume=False),

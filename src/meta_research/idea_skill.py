@@ -31,7 +31,7 @@ from meta_research.sealed_provider_operations import (
     _COMPLETION_ENVELOPE_MAX_BYTES,
 )
 
-from meta_research.resource_preparation import resource_preparation, prepared_resource
+from meta_research.resource_preparation import resource_preparation, prepared_resource, resource_bytes, resource_sha256
 from meta_research.native_guidance import native_guidance_operation, bind_live_guidance, live_native_argv
 
 from contextlib import ExitStack
@@ -65,10 +65,6 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Callable, Protocol, cast
 
-from meta_research.codex_ledger import (
-    CodexHomeLedgerReader,
-    CodexSessionLedgerReader,
-)
 from meta_research.system_prompt import read_output_language
 from meta_research.runtime_conditions import (
     compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt, selected_stage_model,
@@ -1029,8 +1025,6 @@ class CodexIdeaSkillAdapter:
             [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
-        codex_ledger_reader: CodexSessionLedgerReader | None = None,
-        codex_home: Path | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -1043,9 +1037,6 @@ class CodexIdeaSkillAdapter:
         self._model_ref = model_ref
         self._timeout_seconds = timeout_seconds
         self._runner = process_runner or _CancellableProcessRunner()
-        self._codex_ledger_reader = codex_ledger_reader
-        if self._codex_ledger_reader is None and codex_home is not None:
-            self._codex_ledger_reader = CodexHomeLedgerReader(codex_home)
         self._root_operation_diagnostic_recorder: (
             RootOperationDiagnosticRecorder | None
         ) = None
@@ -2956,7 +2947,7 @@ def _discover_harness_artifacts(entry: Path) -> set[Path]:
             continue
         artifacts.add(path)
         try:
-            raw = path.read_bytes() if path.stat().st_size <= 2_000_000 else b""
+            raw = resource_bytes(path) if path.stat().st_size <= 2_000_000 else b""
         except OSError as error:
             raise IdeaSkillUnavailable("codex_cli_identity_unavailable") from error
         if not raw or b"\0" in raw:
@@ -3031,16 +3022,11 @@ def _codex_native_binary(entrypoint: Path) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-@prepared_resource
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
     try:
-        with path.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                digest.update(chunk)
+        return resource_sha256(path)
     except OSError as error:
         raise IdeaSkillUnavailable("codex_cli_identity_unavailable") from error
-    return digest.hexdigest()
 
 
 def _shared_codex_adapter_source_hash() -> str:
@@ -3101,34 +3087,11 @@ def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, objec
             "candidate_key": {"type": "string", "minLength": 1},
             "direction": {"type": "string", "minLength": 1},
             "rationale": {"type": "string", "minLength": 1},
-            "assumptions": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-            "risks": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
             "evidence_boundary": evidence,
-            "falsification_hint": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {"test": {"type": "string", "minLength": 1}, "would_refute": {"type": "string", "minLength": 1}},
-                "required": ["test", "would_refute"],
-            },
-            "material_difference": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "from_history": {"type": "string", "minLength": 1},
-                    "from_peers": {"type": "string", "minLength": 1},
-                    "plan_commitment_change": {"type": "string", "minLength": 1},
-                },
-                "required": ["from_history", "from_peers", "plan_commitment_change"],
-            },
+            "notes": {"type": "string"},
         },
-        "required": ["candidate_key", "direction", "rationale", "assumptions", "risks", "evidence_boundary", "falsification_hint", "material_difference"],
+        "required": ["candidate_key", "direction", "rationale", "evidence_boundary", "notes"],
     }
-    # Research detail lives in free notes; legacy detailed candidates remain readable.
-    for field in ("assumptions", "risks", "falsification_hint", "material_difference"):
-        candidate["properties"].pop(field)
-        candidate["required"].remove(field)
-    candidate["properties"]["notes"] = {"type": "string"}
-    candidate["required"].append("notes")
     base = {
         "question_ref": {"type": "string", "const": question_ref},
         "context_pack_ref": {"type": "string", "const": context_pack_ref},

@@ -802,7 +802,6 @@ def _bundle_runtime(
         target_commit_evidence_authority=target_commit_evidence_authority,
         harness_adapters=(
             _FullConformanceAdapter("codex"),
-            _FullConformanceAdapter("claude"),
         ),
         power_inhibitor=power_inhibitor,
     )

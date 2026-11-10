@@ -607,7 +607,6 @@ def build_production_runtime(
             data_root.root / "companion-provider",
             executable=codex_executable,
             process_runner=codex_provider_runner,
-            codex_home=data_root.codex_home.absolute(),
         )
         if proposal_drafter is None or intent_drafting_provider is None
         else None
@@ -621,19 +620,16 @@ def build_production_runtime(
         data_root.root / "idea-skill-provider",
         executable=codex_executable,
         process_runner=codex_provider_runner,
-        codex_home=data_root.codex_home.absolute(),
     )
     plan_skill_provider = plan_skill_provider or CodexPlanSkillAdapter(
         data_root.root / "plan-skill-provider",
         executable=codex_executable,
         process_runner=codex_provider_runner,
-        codex_home=data_root.codex_home.absolute(),
     )
     bundle_skill_provider = bundle_skill_provider or CodexBundleSkillAdapter(
         data_root.root / "bundle-skill-provider",
         executable=codex_executable,
         process_runner=codex_provider_runner,
-        codex_home=data_root.codex_home.absolute(),
     )
     reasoning_skill_provider = (
         reasoning_skill_provider
@@ -641,7 +637,6 @@ def build_production_runtime(
             data_root.root / "reasoning-skill-provider",
             executable=codex_executable,
             process_runner=codex_provider_runner,
-            codex_home=data_root.codex_home.absolute(),
         )
     )
     acquisition_provider = acquisition_provider or CodexAcquisitionRootAdapter(
@@ -649,7 +644,6 @@ def build_production_runtime(
         NatureDownloaderAdapter(),
         executable=codex_executable,
         process_runner=codex_provider_runner,
-        codex_home=data_root.codex_home.absolute(),
     )
 
     host_compute_reader = create_host_compute_observation_reader(database)
@@ -713,7 +707,6 @@ def build_production_runtime(
         data_root.root / "deepfetch-provider",
         executable=codex_executable,
         process_runner=codex_provider_runner,
-        codex_home=data_root.codex_home.absolute(),
     )
     diagnostic_bound_providers: list[object] = []
     for provider in (

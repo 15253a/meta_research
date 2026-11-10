@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import json
 import subprocess
 import time
@@ -20,13 +23,11 @@ from meta_research.owners.human_collaboration_ladder import (
     SQLiteHumanCollaborationLadder,
 )
 from meta_research.quest_drafting import (
-    CodexDraftingAdapter,
     DraftingUnavailable,
     HostComputeDevice,
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftResult,
 )
 from meta_research.runtime_protection import (
     InhibitorLease,
@@ -53,8 +54,8 @@ class _DeterministicDraftingProvider:
         self.intent_requests: list[IntentTurnRequest] = []
         self.agent_proposal = agent_proposal
 
-    def draft(self, _request) -> ProposalDraftResult:
-        return ProposalDraftResult(
+    def synthesize_first_question(self, _request) -> FirstQuestionSynthesisResult:
+        return synthesis_result(_request,
             content=_QUESTION,
             adapter_kind="deterministic_test_adapter",
         )
@@ -1748,7 +1749,7 @@ def test_companion_ack_loss_recovers_without_a_second_provider_job_or_thread(
     data_path = tmp_path / "companion-ack-loss-data"
     provider_workspace = tmp_path / "companion-provider-spool"
     external_calls: list[tuple[str, str]] = []
-    first_provider = CodexDraftingAdapter(
+    first_provider = CodexCompanionAdapter(
         provider_workspace,
         process_runner=_RecordingCompanionJobRunner(external_calls),
     )
@@ -1781,7 +1782,7 @@ def test_companion_ack_loss_recovers_without_a_second_provider_job_or_thread(
     finally:
         runtime.close()
 
-    restarted_provider = CodexDraftingAdapter(
+    restarted_provider = CodexCompanionAdapter(
         provider_workspace,
         process_runner=_RecordingCompanionJobRunner(external_calls),
     )
@@ -1832,7 +1833,7 @@ def test_companion_unknown_outcome_keeps_hold_and_spool_without_blind_replay(
     external_calls: list[str] = []
     runtime = _runtime(
         data_path,
-        CodexDraftingAdapter(
+        CodexCompanionAdapter(
             provider_workspace,
             process_runner=_UnknownOutcomeCompanionJobRunner(external_calls),
         ),  # type: ignore[arg-type]
@@ -1865,7 +1866,7 @@ def test_companion_unknown_outcome_keeps_hold_and_spool_without_blind_replay(
 
     restarted = _runtime(
         data_path,
-        CodexDraftingAdapter(
+        CodexCompanionAdapter(
             provider_workspace,
             process_runner=_UnknownOutcomeCompanionJobRunner(external_calls),
         ),  # type: ignore[arg-type]
@@ -1897,7 +1898,7 @@ def test_companion_rejects_tampered_sealed_provider_result(
     external_calls: list[tuple[str, str]] = []
     runtime = _runtime(
         data_path,
-        CodexDraftingAdapter(
+        CodexCompanionAdapter(
             provider_workspace,
             process_runner=_RecordingCompanionJobRunner(external_calls),
         ),  # type: ignore[arg-type]
@@ -1932,7 +1933,7 @@ def test_companion_rejects_tampered_sealed_provider_result(
 
     restarted = _runtime(
         data_path,
-        CodexDraftingAdapter(
+        CodexCompanionAdapter(
             provider_workspace,
             process_runner=_RecordingCompanionJobRunner(external_calls),
         ),  # type: ignore[arg-type]

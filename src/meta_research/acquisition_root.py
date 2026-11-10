@@ -55,7 +55,6 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
-        codex_home: Path | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -66,7 +65,6 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             model_ref=model_ref,
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
-            codex_home=codex_home,
         )
         _key_path, self._transport_key = ensure_transport_key(self._workspace)
 

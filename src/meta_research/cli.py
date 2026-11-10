@@ -95,14 +95,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="harness-profile:codex-default",
     )
     conformance_start_parser.add_argument(
-        "--claude-model",
-        help=argparse.SUPPRESS,
-    )
-    conformance_start_parser.add_argument(
-        "--claude-auth-profile",
-        help=argparse.SUPPRESS,
-    )
-    conformance_start_parser.add_argument(
         "--json", action="store_true", dest="as_json"
     )
 

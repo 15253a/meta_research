@@ -428,119 +428,6 @@ class WebEvidenceGateRunner(RecordingRunner):
         )
 
 
-class RecordedCodexReaderLedger:
-    def __init__(self) -> None:
-        self.expected_cwd = ""
-        self.root_ref = "native-web-research-1"
-        self.child_ref = "native-reader-child-1"
-        self.task_name = "/root/reader_agent_1"
-        self.terminal = '{"status":"complete"}'
-
-    def read(self, session_ref: str) -> tuple[dict[str, object], ...]:
-        context = {
-            "type": "turn_context",
-            "payload": {
-                "cwd": self.expected_cwd,
-                "sandbox_policy": {"type": "danger-full-access"},
-            },
-        }
-        if session_ref == self.root_ref:
-            call_id = "call-reader-1"
-            return (
-                {
-                    "type": "session_meta",
-                    "payload": {
-                        "id": self.root_ref,
-                        "session_id": self.root_ref,
-                        "cwd": self.expected_cwd,
-                        "thread_source": "user",
-                        "originator": "codex_exec",
-                        "source": "exec",
-                    },
-                },
-                context,
-                {
-                    "type": "response_item",
-                    "payload": {
-                        "type": "function_call",
-                        "name": "spawn_agent",
-                        "call_id": call_id,
-                        "arguments": json.dumps(
-                            {
-                                "task_name": "reader_agent_1",
-                                "message": "read the hosted artifact",
-                                "fork_turns": "all",
-                            }
-                        ),
-                    },
-                },
-                {
-                    "type": "response_item",
-                    "payload": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": json.dumps({"task_name": self.task_name}),
-                    },
-                },
-                {
-                    "type": "event_msg",
-                    "payload": {
-                        "type": "sub_agent_activity",
-                        "kind": "started",
-                        "event_id": call_id,
-                        "agent_path": self.task_name,
-                        "agent_thread_id": self.child_ref,
-                    },
-                },
-                {
-                    "type": "response_item",
-                    "payload": {
-                        "type": "agent_message",
-                        "author": self.task_name,
-                        "recipient": "/root",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": "Payload:\n" + self.terminal,
-                            }
-                        ],
-                    },
-                },
-            )
-        if session_ref == self.child_ref:
-            return (
-                {
-                    "type": "session_meta",
-                    "payload": {
-                        "id": self.child_ref,
-                        "session_id": self.root_ref,
-                        "parent_thread_id": self.root_ref,
-                        "cwd": self.expected_cwd,
-                        "thread_source": "subagent",
-                        "originator": "codex_exec",
-                        "source": {
-                            "subagent": {
-                                "thread_spawn": {
-                                    "parent_thread_id": self.root_ref,
-                                    "depth": 1,
-                                    "agent_path": self.task_name,
-                                }
-                            }
-                        },
-                    },
-                },
-                context,
-                {
-                    "type": "event_msg",
-                    "payload": {
-                        "type": "task_complete",
-                        "last_agent_message": self.terminal,
-                    },
-                },
-            )
-        raise OSError("ledger missing")
-
-
 def test_codex_home_ledger_reader_rejects_malformed_terminal_jsonl(
     tmp_path: Path,
 ) -> None:
@@ -1388,7 +1275,6 @@ def _request() -> DeepFetchProviderRequest:
             model_ref="gpt-test",
             harness_ref="codex-cli",
             capability_bindings=(
-                "codex-reader-ledger:v1",
                 "web-evidence-gate:v1",
                 "web-search-live",
                 "web-fetch-live",
@@ -1489,9 +1375,9 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
     ]["score"] == 4
     binding = adapter.runtime_binding()
     assert binding.provider_version == PROTOTYPE_COMMIT
+    assert "codex-reader-ledger:v1" not in binding.capability_bindings
     assert {
         "agent-workspace-policy:provider-operation-scoped-v2",
-        "codex-reader-ledger:v1",
         "deepfetch-v4-main-agent",
         "filesystem-danger-full-access",
         "quest-acquisition-semantic-effect",
@@ -3011,7 +2897,45 @@ def test_codex_deepfetch_accepts_public_result_without_internal_reader_trace(
     assert result.completion == "complete"
 
 
-def test_codex_deepfetch_accepts_reader_output_from_verified_codex_ledgers(
+@pytest.mark.parametrize("child_count", [0, 2])
+def test_codex_deepfetch_public_result_and_diagnostics_follow_stdout_children(
+    tmp_path: Path, child_count: int,
+) -> None:
+    class ChildrenRunner(SequencedPrototypeRunner):
+        def __call__(self, argv, prompt, timeout):
+            completed = super().__call__(argv, prompt, timeout)
+            events = []
+            if "web_evidence_gate=v1" not in prompt:
+                for index in range(child_count):
+                    child = f"native-observed-reader-{index}"
+                    events.extend([_reader_event("spawn_agent", "native-web-research-1", child, "pending_init"),
+                                   _reader_event("wait", "native-web-research-1", child, "completed")])
+            events.append({"type": "turn.completed"})
+            return subprocess.CompletedProcess(argv, completed.returncode,
+                stdout=completed.stdout + "\n" + "\n".join(json.dumps(event) for event in events),
+                stderr=completed.stderr)
+
+    runner = ChildrenRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
+    runner.emit_reader_evidence = False
+    adapter = _bind_acquisition(CodexDeepFetchAdapter(tmp_path / "provider", process_runner=runner),
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"))
+    store = RootOperationDiagnosticStore(tmp_path / "diagnostics")
+    adapter.bind_root_operation_diagnostics_recorder(store)
+    result = _execute(adapter)
+    assert result.completion == "complete" and result.papers_ledger is not None
+    usage = [item["diagnostics"]["usage"]["subagent"]
+             for item in store.query_page(root_kind="deepfetch")["items"]]
+    assert usage
+    if child_count:
+        assert any(item["status"] == "used" and item["evidence_refs"] for item in usage)
+    else:
+        assert all(item == {"status": "not_used", "evidence_refs": []} for item in usage)
+    calls = len(runner.calls)
+    assert _execute(adapter) == result
+    assert len(runner.calls) == calls
+
+
+def test_codex_deepfetch_accepts_public_reader_assignment_without_private_ledger(
     tmp_path: Path,
 ) -> None:
     final = copy.deepcopy(PROTOTYPE_FINAL)
@@ -3022,108 +2946,19 @@ def test_codex_deepfetch_accepts_reader_output_from_verified_codex_ledgers(
     assignments[0]["reader_agent_ref"] = "/root/reader_agent_1"
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, final])
     runner.emit_reader_evidence = False
-    ledger = RecordedCodexReaderLedger()
     adapter = _bind_acquisition(
         CodexDeepFetchAdapter(
             tmp_path / "provider",
             process_runner=runner,
-            codex_ledger_reader=ledger,
         ),
         RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
     request = replace(_request(), runtime_binding=adapter.runtime_binding())
-    ledger.expected_cwd = str(
-        adapter._agent_workspace_path(
-            f"{request.run_ref}:direct",
-            canonical_hash(request.runtime_binding.as_dict()),
-        )
-    )
 
     result = adapter.execute(request)
 
     assert result.completion == "complete"
     assert result.papers_ledger is not None
-
-
-def test_codex_deepfetch_accepts_terminal_delivery_after_reader_progress_message(
-    tmp_path: Path,
-) -> None:
-    class ProgressThenFinalLedger(RecordedCodexReaderLedger):
-        def read(self, session_ref: str) -> tuple[dict[str, object], ...]:
-            records = super().read(session_ref)
-            if session_ref != self.root_ref:
-                return records
-            progress = {
-                "type": "response_item",
-                "payload": {
-                    "type": "agent_message",
-                    "author": self.task_name,
-                    "recipient": "/root",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "Message Type: MESSAGE\n"
-                                f"Task name: {self.task_name}\n"
-                                f"Sender: {self.task_name}\n"
-                                "Payload:\n"
-                            ),
-                        }
-                    ],
-                },
-            }
-            return (*records[:-1], progress, records[-1])
-
-    final = copy.deepcopy(PROTOTYPE_FINAL)
-    workflow = final["workflow"]
-    assert isinstance(workflow, dict)
-    assignments = workflow["reader_assignments"]
-    assert isinstance(assignments, list)
-    assignments[0]["reader_agent_ref"] = "/root/reader_agent_1"
-    ledger = ProgressThenFinalLedger()
-    adapter = _bind_acquisition(
-        CodexDeepFetchAdapter(
-            tmp_path / "provider",
-            process_runner=SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, final]),
-            codex_ledger_reader=ledger,
-        ),
-        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
-    )
-    request = replace(_request(), runtime_binding=adapter.runtime_binding())
-    ledger.expected_cwd = str(
-        adapter._agent_workspace_path(
-            f"{request.run_ref}:direct",
-            canonical_hash(request.runtime_binding.as_dict()),
-        )
-    )
-
-    result = adapter.execute(request)
-
-    assert result.completion == "complete"
-    assert result.papers_ledger is not None
-
-
-def test_codex_deepfetch_ledger_diagnostic_failure_does_not_block_result(
-    tmp_path: Path,
-) -> None:
-    class MissingLedger(RecordedCodexReaderLedger):
-        def read(self, session_ref: str) -> tuple[dict[str, object], ...]:
-            raise OSError(f"missing {session_ref}")
-
-    adapter = _bind_acquisition(
-        CodexDeepFetchAdapter(
-            tmp_path / "provider",
-            process_runner=SequencedPrototypeRunner(
-                [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL]
-            ),
-            codex_ledger_reader=MissingLedger(),
-        ),
-        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
-    )
-
-    result = _execute(adapter)
-
-    assert result.completion == "complete"
 
 
 def test_codex_deepfetch_does_not_bind_result_to_internal_child_identity(
@@ -3167,22 +3002,14 @@ def test_codex_deepfetch_does_not_bind_result_to_internal_child_identity(
     assignments = workflow["reader_assignments"]
     assert isinstance(assignments, list)
     assignments[0]["reader_agent_ref"] = "/root/reader_agent_1"
-    ledger = RecordedCodexReaderLedger()
     adapter = _bind_acquisition(
         CodexDeepFetchAdapter(
             tmp_path / "provider",
             process_runner=DifferentChildRunner([PROTOTYPE_ACQUIRE, final]),
-            codex_ledger_reader=ledger,
         ),
         RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
     request = replace(_request(), runtime_binding=adapter.runtime_binding())
-    ledger.expected_cwd = str(
-        adapter._agent_workspace_path(
-            f"{request.run_ref}:direct",
-            canonical_hash(request.runtime_binding.as_dict()),
-        )
-    )
 
     result = adapter.execute(request)
 

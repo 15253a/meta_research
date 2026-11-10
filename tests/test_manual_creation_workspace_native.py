@@ -30,9 +30,6 @@ class RecordingCompanion(CodexCompanionAdapter):
         self.requests.append(request)
         return super().reply(request)
 
-    def draft(self, request):
-        self.proposal_requests.append(request)
-        return super().draft(request)
 
     def synthesize_first_question(self, request):
         self.synthesis_requests.append(request)
@@ -77,7 +74,7 @@ def test_real_manual_creation_dispatch_preserves_its_actual_work_across_restart(
             files=(("human.txt", b"Manual context pending observation: settle for 23 minutes."),))
         assert runtime.root_workspaces.deliver(destination, delivery_ref="manual-original-answer",
             files=(("human.txt", b"Manual context pending observation: settle for 23 minutes."),)) == delivered
-        assert not (original.location.directory / "inbox").exists()
+        assert not list((original.location.directory / "inbox").rglob("human.txt"))
         human.send_manual_drafting_message(context_ref,
             expected_basis_hash=seeded["seed"]["hash"], message="Read the material in the original inbox.",
             idempotency_key="native-manual-second")

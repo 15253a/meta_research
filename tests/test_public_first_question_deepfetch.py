@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import copy
 import json
 import subprocess
@@ -33,8 +36,6 @@ from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
     HostComputeDevice,
     HostComputeSnapshot,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 from meta_research.runtime_protection import (
     InhibitorLease,
@@ -806,10 +807,10 @@ class PendingDurableRunner:
 
 class SnapshotAwareProposalDrafter:
     def __init__(self, expected_completion: str = "limited") -> None:
-        self.requests: list[ProposalDraftRequest] = []
+        self.requests: list[FirstQuestionSynthesisRequest] = []
         self.expected_completion = expected_completion
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         self.requests.append(request)
         assert request.literature_snapshot is not None
         assert request.literature_snapshot["schema_ref"] == (
@@ -823,14 +824,14 @@ class SnapshotAwareProposalDrafter:
         content = dict(QUESTION)
         if len(self.requests) > 1:
             content["background_context"] += f"（第 {len(self.requests)} 次生成）"
-        return ProposalDraftResult(content=content, adapter_kind="test_drafter")
+        return synthesis_result(request, content=content, adapter_kind="test_drafter")
 
 
 class BindingOnlyProposalDrafter:
     def __init__(self) -> None:
-        self.requests: list[ProposalDraftRequest] = []
+        self.requests: list[FirstQuestionSynthesisRequest] = []
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         self.requests.append(request)
         evidence = request.literature_snapshot
         assert evidence is not None
@@ -838,7 +839,7 @@ class BindingOnlyProposalDrafter:
             "binding_only_due_to_size"
         )
         assert evidence["summary"].startswith("完整 DeepFetch 证据已由")
-        return ProposalDraftResult(content=QUESTION, adapter_kind="test_drafter")
+        return synthesis_result(request, content=QUESTION, adapter_kind="test_drafter")
 
 
 def _authenticate(runtime) -> tuple[TestClient, dict[str, str]]:

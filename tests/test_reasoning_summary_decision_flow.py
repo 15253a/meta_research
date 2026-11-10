@@ -57,7 +57,7 @@ def runtime_at(path, skill, deepfetch_provider=None):
     runtime = build_production_runtime(prepare_data_root(path), proposal_drafter=drafting, intent_drafting_provider=drafting,
         host_compute_probe=_DeterministicProbe(), idea_skill_provider=_DeterministicIdeaSkill(no_viable=True), plan_skill_provider=_DeterministicPlanSkill(no_gap=False),
         reasoning_skill_provider=skill, deepfetch_provider=deepfetch_provider or DeterministicDeepFetchProvider(), acquisition_provider=_ReadyAcquisitionProvider(),
-        harness_adapters=(_FullConformanceAdapter("codex"), _FullConformanceAdapter("claude")))
+        harness_adapters=(_FullConformanceAdapter("codex"),))
     if runtime.harnesses.query_status()["status"] != "ready":
         runtime.harnesses.start_full_conformance(replace(_full_request(), codex_model_ref=CODEX_MODEL_REF))
         for _ in range(4): runtime.harnesses.advance_full_conformance(mcp_base_url="http://127.0.0.1:8765")

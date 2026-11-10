@@ -8,7 +8,7 @@ import pytest
 from meta_research.companion import CodexCompanionAdapter
 from meta_research.composition import build_production_runtime
 from meta_research.codex_runtime import CODEX_LOCKED_VERSION
-from meta_research.harness_adapters import ClaudeHarnessAdapter, HarnessAdapterUnavailable, HarnessSupervisorTransport
+from meta_research.harness_adapters import CodexHarnessAdapter, HarnessAdapterUnavailable, HarnessSupervisorTransport
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
 from meta_research.paths import prepare_data_root
 from meta_research.provider_supervisor import read_supervisor_request
@@ -29,7 +29,7 @@ def _native_executable(path):
         "import json, os, sys\n"
         "from pathlib import Path\n"
         "if '--version' in sys.argv:\n"
-        f"    print('2.1.220' if 'claude' in Path(sys.argv[0]).name else 'codex-cli {CODEX_LOCKED_VERSION}')\n"
+        f"    print('codex-cli {CODEX_LOCKED_VERSION}')\n"
         "    raise SystemExit(0)\n"
         "if sys.argv[-2:] == ['features', 'list']:\n"
         "    print('hooks stable true\\nmulti_agent stable true\\nplugins stable true\\nremote_plugin stable true\\nshell_tool stable true\\nskill_search stable true\\nunified_exec stable true')\n"
@@ -48,9 +48,12 @@ def _native_executable(path):
         "            if 'phase=preflight' in prompt:\n"
         "                Path('preflight-nonce.txt').write_text('Acquisition preflight pending nonce')\n"
         "                value = dict(status='ready', browser_context_ref=None, reason_code=None, evidence={'configuration_health':'not_required','browser_control':'not_required','authorized_resource':'oa_only'})\n"
-        "            else:\n"
+        "            elif 'phase=batch' in prompt:\n"
         "                Path('native-observed-preflight.txt').write_text(Path('preflight-nonce.txt').read_text())\n"
         "                value = {'results': [{'paper_id':'paper:1','status':'missing','path':None,'format':None,'failure':{'code':'oa_not_found','detail':'No OA body.'}}]}\n"
+        "            else:\n"
+        "                value = {'cwd': os.getcwd(), 'previous': bool(previous), 'human': [], 'reply': 'Checked pending observations.'}\n"
+        "                schema = params.get('outputSchema', {}); value = {key: value[key] for key in schema.get('properties', value) if key in value}\n"
         "            print(json.dumps({'method':'item/completed','params':{'threadId':'local-native-root','turnId':'local-turn','item':{'type':'agentMessage','id':'final','text':json.dumps(value)}}}), flush=True)\n"
         "            print(json.dumps({'method':'turn/completed','params':{'threadId':'local-native-root','turn':{'id':'local-turn','status':'completed'}}}), flush=True)\n"
         "    raise SystemExit(0)\n"
@@ -80,8 +83,8 @@ def _native_executable(path):
         "    Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(json.dumps(value))\n"
         "    print(json.dumps({'type': 'thread.started', 'thread_id': 'local-native-root'}))\n"
         "else:\n"
-        "    print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'local-claude-root'}))\n"
-        "    print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'local-claude-root', 'is_error': False, 'result': json.dumps(value)}))\n",
+        "    print(json.dumps({'type': 'thread.started', 'thread_id': 'local-native-root'}))\n"
+        "    print(json.dumps({'type': 'turn.completed'}))\n",
         encoding="utf-8")
     path.chmod(0o700)
     return path
@@ -215,34 +218,34 @@ def test_shared_companion_adapter_interleaves_roots_and_resumes_distinct_jobs(tm
 
 
 @pytest.mark.parametrize("durable", [False, True])
-def test_actual_claude_child_cwd_initial_resume_and_signed_replay(tmp_path, durable):
+def test_actual_codex_child_cwd_initial_resume_and_signed_replay(tmp_path, durable):
     from test_target_root_finalizer import _root_finalizer_fixture
     runtime, _lifecycle, _memory, _authority, handle, workspace, _evidence = _root_finalizer_fixture(tmp_path)
-    transport = HarnessSupervisorTransport(tmp_path / "claude-supervisor") if durable else _CancellableProcessRunner()
-    adapter = ClaudeHarnessAdapter(tmp_path / "claude-adapter", runner=transport)
-    adapter.executable = str(_native_executable(tmp_path / "local-claude"))
+    transport = HarnessSupervisorTransport(tmp_path / "codex-supervisor") if durable else _CancellableProcessRunner()
+    adapter = CodexHarnessAdapter(tmp_path / "codex-adapter", runner=transport)
+    adapter.executable = str(_native_executable(tmp_path / "local-codex"))
     try:
         lease = runtime.target_run_authorities.agent_runtime.query_target_workspace(handle.target_run_ref)
-        invocation = replace(_invocation("claude"), run_ref=handle.target_run_ref,
+        invocation = replace(_invocation("codex"), owner_invocation_hash="1" * 64, run_ref=handle.target_run_ref,
             root_session_ref=handle.root_session_ref, attempt_ref=handle.execution_attempt_ref,
             fence_ref=handle.execution_fence_ref, target_workspace_ref=lease.workspace_ref,
             working_directory=str(workspace))
         first = adapter.invoke(invocation)
-        second_invocation = replace(invocation, provider_operation_ref="provider-operation:claude-resume",
+        second_invocation = replace(invocation, owner_invocation_hash="2" * 64, provider_operation_ref="provider-operation:codex-resume",
             native_session_ref=first.native_session_ref)
         second = adapter.invoke(second_invocation)
-        assert first.native_session_ref == second.native_session_ref == "local-claude-root"
+        assert first.native_session_ref == second.native_session_ref == "local-native-root"
         assert (workspace / "native-marker.txt").read_text().splitlines() == [str(workspace)] * 2
         if durable:
             replay = adapter.invoke(second_invocation)
-            assert replay.native_session_ref == "local-claude-root"
+            assert replay.native_session_ref == "local-native-root"
             assert (workspace / "native-marker.txt").read_text().splitlines() == [str(workspace)] * 2
             other = tmp_path / "foreign-directory"
             other.mkdir()
             with pytest.raises(HarnessAdapterUnavailable):
                 adapter.invoke(replace(second_invocation, working_directory=str(other)))
             assert not (other / "native-marker.txt").exists()
-            requests = list((tmp_path / "claude-supervisor").glob("provider-operations/*/*/supervisor-request.json"))
+            requests = list((tmp_path / "codex-supervisor").glob("provider-operations/*/*/supervisor-request.json"))
             assert len(requests) == 2
             for request in requests:
                 assert read_supervisor_request(request, transport._transport_key)["working_directory"] == str(workspace)
@@ -269,7 +272,7 @@ def test_actual_claude_child_cwd_initial_resume_and_signed_replay(tmp_path, dura
         runtime.owners.human_collaboration.respond_to_human_request(opened["request_ref"],
             decision="provided", facts={"material_delivered": True}, note="Material ready.",
             idempotency_key="target-human-answer")
-        third = adapter.invoke(replace(invocation, provider_operation_ref="provider-operation:claude-human-resume",
+        third = adapter.invoke(replace(invocation, owner_invocation_hash="3" * 64, provider_operation_ref="provider-operation:codex-human-resume",
             native_session_ref=first.native_session_ref))
         assert third.native_session_ref == first.native_session_ref
         assert (workspace / "native-observed-human.txt").read_text() == "original Target pending observation"
@@ -330,6 +333,7 @@ def test_real_hc_initialization_dispatch_preserves_directory_across_turns(tmp_pa
     runtime = build_production_runtime(prepare_data_root(tmp_path / "runtime"),
         proposal_drafter=_DeterministicDraftingAdapter(), intent_drafting_provider=adapter,
         host_compute_probe=_DeterministicProbe())
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     try:
         human = runtime.owners.human_collaboration
         creation = human.create_quest({}, "native-intent-open")
@@ -344,10 +348,76 @@ def test_real_hc_initialization_dispatch_preserves_directory_across_turns(tmp_pa
                 expected_draft_hash=current["quest_draft"]["hash"],
                 message="Review the pending observations.", idempotency_key=f"native-intent-{index}")
             assert human.process_drafting_once()
+            turn = human.query_quest_creation(creation["initialization_id"])["intent_session"]["turns"][-1]
+            assert turn["assistant_status"] == "completed", turn
         assert (destination.location.directory / "native-marker.txt").read_text().splitlines() == [
             str(destination.location.directory)] * 2
         assert (destination.location.quest_ref, destination.location.cycle_ref) == (None, None)
         assert not (adapter.research_workspace_root / "native-marker.txt").exists()
+    finally:
+        runtime.close()
+
+
+def test_native_creation_understands_synthesizes_and_commits_through_owners(tmp_path):
+    from native_creation_provider import ObservedCompanion, native_creation_executable, QUESTION
+    from test_public_quest_initialization import _draft_from, _confirmation_payload
+    from sqlalchemy import text
+    executable = native_creation_executable(tmp_path / "native-creation")
+    adapter = ObservedCompanion(tmp_path / "companion", executable=str(executable))
+    runtime = build_production_runtime(prepare_data_root(tmp_path / "runtime"),
+        proposal_drafter=adapter, intent_drafting_provider=adapter,
+        host_compute_probe=_DeterministicProbe())
+    runtime.configure_resident_mcp_endpoint("http://testserver")
+    runtime.root_workspaces.configure_creation_runtime(executable=executable, credentials_home=tmp_path / "credentials")
+    try:
+        human = runtime.owners.human_collaboration
+        from fastapi.testclient import TestClient
+        from meta_research.web import create_app
+        from test_creation_material_consumption import _open
+        source = tmp_path / "original-notes.txt"
+        source.write_text("Unreviewed calibration observations remain available for research.")
+        client = TestClient(create_app(runtime, base_url="http://testserver", control_key="control"))
+        anchor, _, _ = _open(client, runtime, source, "native-creation-open")
+        initialization = anchor.ref
+        probed = human.observe_host_compute(initialization, ["GPU-plan-test"], "native-creation-compute")
+        draft = _draft_from(probed)
+        draft["route"] = "direct"
+        saved = human.revise_quest_draft(initialization, draft, probed["quest_draft"]["hash"],
+            "native-creation-draft", expected_draft_revision=probed["quest_draft"]["revision"])
+        human.generate_question_proposal(initialization, saved["quest_draft"]["hash"],
+            "native-creation-generate", expected_draft_revision=saved["quest_draft"]["revision"])
+        assert human.process_drafting_once()
+        ready = human.query_quest_creation(initialization)
+        assert ready["proposal"] is not None, str(ready)
+        assert ready["proposal"]["content"] == QUESTION
+        assert [kind for kind, _ in adapter.native_calls] == ["initialization-understanding", "first-question-synthesis"]
+        works = [work for _, work in adapter.native_calls]
+        assert works[0].runtime.work_directory == works[1].runtime.work_directory
+        assert len(adapter.native_markers) == 2
+        assert all(marker["cwd"] == "/workspace" for marker in adapter.native_markers)
+        with runtime._database.read() as connection:
+            assert connection.execute(text("SELECT count(*) FROM rg_questions")).scalar_one() == 0
+        prepared = ready["creation_basis"]
+        assert prepared is not None
+        preview = human.preview_confirmation(initialization,
+            quest_draft_revision=ready["quest_draft"]["revision"], quest_draft_hash=ready["quest_draft"]["hash"],
+            proposal_ref=ready["proposal"]["ref"], proposal_hash=ready["proposal"]["hash"],
+            idempotency_key="native-creation-preview")
+        confirmed = human.confirm_quest(initialization, **_confirmation_payload(preview), idempotency_key="native-creation-confirm")
+        assert confirmed["status"] == "dispatching"
+        for _ in range(16):
+            current = human.query_quest_creation(initialization)
+            if current["status"] == "completed":
+                break
+            assert human.reconcile_once()
+        completed = human.query_quest_creation(initialization)
+        assert completed["status"] == "completed", completed.get("recovery")
+        exact = runtime.owners.research_memory.creation_bases.for_question(
+            completed["question_ref"], completed["quest_ref"])
+        assert exact["basis_hash"] == prepared["basis_hash"]
+        assert human.confirm_quest(initialization, **_confirmation_payload(preview), idempotency_key="native-creation-confirm") == completed
+        assert len(adapter.native_calls) == 2
+        client.close()
     finally:
         runtime.close()
 

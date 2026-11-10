@@ -97,14 +97,14 @@ def test_authorized_missing_reader_keeps_body_and_wrong_native_is_rejected(tmp_p
         reader(request)
 
 
-def test_rollback_keeps_full_new_input_without_unused_reader_probe(tmp_path, monkeypatch):
+def test_retired_rollout_value_cannot_bypass_current_reader(tmp_path, monkeypatch):
     adapter, runner = _adapter(tmp_path, _output("batch"))
     request, _, _, _, calls, _ = _bind(adapter)
     monkeypatch.setenv("META_RESEARCH_BUNDLE_BATCH_VIEW", "full")
     adapter.propose_target_batch(request)
     view = json.loads(next(line.removeprefix("batch_context=") for line in runner.calls[0][1].splitlines() if line.startswith("batch_context=")))
-    assert view["formal_plan"] == request.plan_document
-    assert not calls
+    assert "formal_plan" not in view
+    assert calls
 
 
 def test_plan_probe_is_bounded_and_real_read_rejects_revocation_between_pages(tmp_path, monkeypatch):

@@ -18,7 +18,6 @@ from meta_research.composition import build_production_runtime
 from meta_research.harness import HarnessAdmissionError, HarnessProbeRequest
 from meta_research.harness_adapters import (
     CODEX_LOCKED_VERSION,
-    ClaudeHarnessAdapter,
     CodexHarnessAdapter,
     HARNESS_PROVIDER_STREAM_MAX_BYTES,
     HarnessAdapterUnavailable,
@@ -98,10 +97,6 @@ def test_harness_probe_accepts_prompt_above_legacy_256k_limit(
         data_root,
         harness_adapters=(
             CodexHarnessAdapter(data_root.run / "harness", runner=runner),
-            ClaudeHarnessAdapter(
-                data_root.run / "harness",
-                runner=_RecordedRunner("claude", ()),
-            ),
         ),
     )
     try:
@@ -845,14 +840,10 @@ def test_startup_provider_diagnostic_acquire_failure_never_spawns_provider(
 ) -> None:
     data_root = prepare_data_root(tmp_path / "startup-probe-acquire-failure")
     codex_runner = _RecordedRunner("codex", ())
-    claude_runner = _RecordedRunner("claude", ())
     runtime = build_production_runtime(
         data_root,
         harness_adapters=(
             CodexHarnessAdapter(data_root.run / "harness", runner=codex_runner),
-            ClaudeHarnessAdapter(
-                data_root.run / "harness", runner=claude_runner
-            ),
         ),
         power_inhibitor=_FailingPowerInhibitor(),
         startup_power_probe=False,
@@ -861,13 +852,12 @@ def test_startup_provider_diagnostic_acquire_failure_never_spawns_provider(
         first = runtime.harnesses.query_status()
         second = runtime.harnesses.query_status()
 
-        assert codex_runner.calls == claude_runner.calls == []
+        assert codex_runner.calls == []
         assert first == second
         assert {
             item["harness_family"]: item["missing_reason"] for item in first["adapters"]
         } == {
             "codex": {"code": "power_inhibitor_acquisition_failed"},
-            "claude": {"code": "power_inhibitor_acquisition_failed"},
         }
         observability = runtime.query_runtime_observability()
         assert observability["responsibilities"] == []
@@ -881,7 +871,7 @@ def test_startup_provider_diagnostic_acquire_failure_never_spawns_provider(
                     "'harness_probe' ORDER BY responsibility_ref"
                 )
             ).all()
-        assert responsibilities == [("finished", "checkpoint")] * 2
+        assert responsibilities == [("finished", "checkpoint")]
     finally:
         runtime.close()
 
@@ -894,17 +884,12 @@ def test_startup_provider_diagnostic_is_fresh_and_binary_identity_bound(
     executable.chmod(0o700)
     data_root = prepare_data_root(tmp_path / "startup-provider-diagnostic")
     codex_runner = _RecordedRunner("codex", ())
-    claude_runner = _RecordedRunner("claude", ())
     codex = CodexHarnessAdapter(data_root.run / "harness", runner=codex_runner)
-    claude = ClaudeHarnessAdapter(
-        data_root.run / "harness", runner=claude_runner
-    )
     codex.executable = str(executable)
-    claude.executable = str(executable)
 
     runtime = build_production_runtime(
         data_root,
-        harness_adapters=(codex, claude),
+        harness_adapters=(codex,),
         power_inhibitor=_ConfirmedPowerInhibitor(),
         startup_power_probe=False,
     )
@@ -913,13 +898,9 @@ def test_startup_provider_diagnostic_is_fresh_and_binary_identity_bound(
         second = runtime.harnesses.query_status()
         assert [item["installation_status"] for item in first["adapters"]] == [
             "ready",
-            "ready",
         ]
         assert first == second
         assert [call[0] for call in codex_runner.calls] == [
-            [str(executable), "--version"]
-        ]
-        assert [call[0] for call in claude_runner.calls] == [
             [str(executable), "--version"]
         ]
 
@@ -927,13 +908,12 @@ def test_startup_provider_diagnostic_is_fresh_and_binary_identity_bound(
         missing = runtime.harnesses.query_status()
         assert [item["installation_status"] for item in missing["adapters"]] == [
             "capability_unavailable",
-            "capability_unavailable",
         ]
         assert all(
             item["missing_reason"] == {"code": "provider_executable_changed"}
             for item in missing["adapters"]
         )
-        assert len(codex_runner.calls) == len(claude_runner.calls) == 1
+        assert len(codex_runner.calls) == 1
 
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         executable.chmod(0o700)
@@ -945,7 +925,7 @@ def test_startup_provider_diagnostic_is_fresh_and_binary_identity_bound(
             }
             for item in replaced["adapters"]
         )
-        assert len(codex_runner.calls) == len(claude_runner.calls) == 1
+        assert len(codex_runner.calls) == 1
     finally:
         runtime.close()
 
@@ -1001,96 +981,6 @@ def test_target_root_uses_frozen_operation_timeout_not_adapter_restart_config(
     assert runner.turn_timeouts == [0.4]
 
 
-def test_claude_adapter_derives_capabilities_without_model_self_report(
-    tmp_path: Path,
-) -> None:
-    runner = _RecordedRunner(
-        "claude",
-        (
-            {
-                "type": "system",
-                "subtype": "init",
-                "session_id": "claude-session-1",
-                "tools": ["Bash", "Read", "mcp__meta_research__snapshot", "Agent", "WebSearch", "WebFetch"],
-                "skills": ["probe"],
-                "plugins": ["probe"],
-                "hooks": ["pre_tool"],
-            },
-            {"type": "assistant", "session_id": "claude-session-1", "message": {"content": [
-                {"type": "tool_use", "id": "tool-1", "name": "Bash"},
-                {"type": "tool_use", "id": "tool-2", "name": "Read"},
-                {"type": "tool_use", "id": "tool-3", "name": "mcp__meta_research__snapshot"},
-                {"type": "tool_use", "id": "tool-4", "name": "Agent"},
-                {"type": "tool_use", "id": "tool-5", "name": "WebSearch"},
-                {"type": "tool_use", "id": "tool-6", "name": "WebFetch"},
-                {"type": "tool_use", "id": "tool-7", "name": "Skill"},
-                {"type": "tool_use", "id": "tool-8", "name": "plugin__probe__run"},
-            ]}},
-            {
-                "type": "user",
-                "session_id": "claude-session-1",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": f"tool-{index}",
-                            "is_error": False,
-                            **(
-                                {
-                                    "agent_id": "claude-child-1",
-                                    "parent_session_id": "claude-session-1",
-                                    "status": "completed",
-                                }
-                                if index == 4
-                                else {}
-                            ),
-                        }
-                        for index in range(1, 9)
-                    ]
-                },
-            },
-            {"type": "system", "subtype": "hook_completed", "session_id": "claude-session-1", "status": "completed"},
-            {"type": "system", "subtype": "fork", "session_id": "claude-session-1"},
-            {"type": "system", "subtype": "steer", "session_id": "claude-session-1"},
-            {"type": "system", "subtype": "interrupt", "session_id": "claude-session-1"},
-            {"type": "system", "subtype": "resume", "session_id": "claude-session-1"},
-            {"type": "result", "session_id": "claude-session-1", "is_error": False},
-        ),
-    )
-    result = ClaudeHarnessAdapter(tmp_path, runner=runner).invoke(
-        _invocation("claude")
-    )
-
-    assert result.native_session_ref == "claude-session-1"
-    assert result.profile["provider_version"] == "2.1.220"
-    _assert_profile_is_event_derived(
-        result.profile,
-        expected_available={
-            "tool_inventory",
-            "shell",
-            "file_access",
-            "semantic_mcp",
-            "skill",
-            "plugin",
-            "hook",
-            "subagent",
-            "stream",
-            "native_session",
-            "fork",
-            "steer",
-            "interrupt",
-            "resume",
-            "web_search",
-            "web_fetch",
-        },
-    )
-    argv, _prompt, environment = runner.calls[-1]
-    assert argv[:2] == ["claude", "-p"]
-    assert "opaque-channel-token" not in " ".join(argv)
-    assert environment["META_RESEARCH_MCP_TOKEN"] == "opaque-channel-token"
-    config_path = Path(argv[argv.index("--mcp-config") + 1])
-    assert runner.calls[-1][1]
-    assert "opaque-channel-token" not in config_path.read_text(encoding="utf-8")
 
 
 def test_missing_web_events_are_not_observed_or_inferred_from_text(
@@ -1122,69 +1012,6 @@ def test_missing_web_events_are_not_observed_or_inferred_from_text(
     assert capabilities["web_fetch"]["status"] == "not_observed"
 
 
-def test_claude_tool_request_without_successful_result_is_not_capability_proof(
-    tmp_path: Path,
-) -> None:
-    runner = _RecordedRunner(
-        "claude",
-        (
-            {
-                "type": "system",
-                "subtype": "init",
-                "session_id": "claude-incomplete-tool",
-                "tools": ["Bash", "WebSearch"],
-                "skills": ["discovered-only"],
-                "plugins": ["discovered-only"],
-                "hooks": ["discovered-only"],
-            },
-            {
-                "type": "assistant",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "tool-not-finished",
-                            "name": "Bash",
-                        },
-                        {
-                            "type": "tool_use",
-                            "id": "tool-failed",
-                            "name": "WebSearch",
-                        },
-                    ]
-                },
-            },
-            {
-                "type": "user",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "tool-failed",
-                            "is_error": True,
-                        }
-                    ]
-                },
-            },
-            {
-                "type": "result",
-                "session_id": "claude-incomplete-tool",
-                "is_error": False,
-            },
-        ),
-    )
-
-    result = ClaudeHarnessAdapter(tmp_path, runner=runner).invoke(
-        _invocation("claude")
-    )
-
-    capabilities = result.profile["capabilities"]
-    assert capabilities["tool_inventory"]["status"] == "available"
-    assert capabilities["shell"]["status"] == "not_observed"
-    assert capabilities["web_search"]["status"] == "not_observed"
-    assert capabilities["skill"]["status"] == "not_observed"
-    assert capabilities["plugin"]["status"] == "not_observed"
-    assert capabilities["hook"]["status"] == "not_observed"
 
 
 def test_subagent_requires_one_root_spawn_and_terminal_child_provenance(
@@ -2497,94 +2324,6 @@ def test_target_codex_reports_one_disabled_provider_feature_locally(
     ]
 
 
-def test_claude_parent_stream_cannot_prove_child_code_review_skill(
-    tmp_path: Path,
-) -> None:
-    root_ref = "claude-code-review-root"
-    child_ref = "claude-code-review-child"
-    result = ClaudeHarnessAdapter(
-        tmp_path,
-        runner=_RecordedRunner(
-            "claude",
-            (
-                {
-                    "type": "system",
-                    "subtype": "init",
-                    "session_id": root_ref,
-                    "tools": ["Skill", "Agent"],
-                },
-                {
-                    "type": "assistant",
-                    "session_id": root_ref,
-                    "message": {
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": "skill-use-1",
-                                "name": "Skill",
-                                "input": {"skill": "code-review"},
-                            }
-                        ]
-                    },
-                },
-                {
-                    "type": "user",
-                    "session_id": root_ref,
-                    "message": {
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "skill-use-1",
-                                "is_error": False,
-                            }
-                        ]
-                    },
-                },
-                {
-                    "type": "assistant",
-                    "session_id": root_ref,
-                    "message": {
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": "agent-use-1",
-                                "name": "Agent",
-                            }
-                        ]
-                    },
-                },
-                {
-                    "type": "user",
-                    "session_id": root_ref,
-                    "message": {
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "agent-use-1",
-                                "is_error": False,
-                                "status": "completed",
-                                "agent_id": child_ref,
-                                "parent_session_id": root_ref,
-                                "result": {
-                                    "schema_ref": (
-                                        "meta-research/target-review-evidence/v1"
-                                    ),
-                                    "review_kind": "code",
-                                    "review": {"review_ref": "review:1"},
-                                    "scope": {"target_ref": "target:1"},
-                                },
-                            }
-                        ]
-                    },
-                },
-                {"type": "result", "session_id": root_ref, "is_error": False},
-            ),
-        ),
-    ).invoke(_invocation("claude"))
-
-    evidence = result.profile["subagent_evidence"]
-    assert isinstance(evidence, list) and len(evidence) == 1
-    assert "skill_name" not in evidence[0]
 
 
 @pytest.mark.parametrize(
@@ -2690,58 +2429,6 @@ def test_subagent_rejects_noncausal_but_ignores_failed_other_spawn(
     assert result.profile["capabilities"]["subagent"]["status"] == expected_status
 
 
-def test_claude_subagent_result_must_follow_its_root_request(
-    tmp_path: Path,
-) -> None:
-    root_ref = "claude-root-invalid-provenance"
-    result = ClaudeHarnessAdapter(
-        tmp_path,
-        runner=_RecordedRunner(
-            "claude",
-            (
-                {
-                    "type": "system",
-                    "subtype": "init",
-                    "session_id": root_ref,
-                    "tools": ["Agent"],
-                },
-                {
-                    "type": "user",
-                    "session_id": root_ref,
-                    "message": {
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "agent-tool-1",
-                                "is_error": False,
-                                "agent_id": "claude-child-invalid",
-                                "parent_session_id": root_ref,
-                                "status": "completed",
-                            }
-                        ]
-                    },
-                },
-                {
-                    "type": "assistant",
-                    "session_id": root_ref,
-                    "message": {
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": "agent-tool-1",
-                                "name": "Agent",
-                            }
-                        ]
-                    },
-                },
-                {"type": "result", "session_id": root_ref, "is_error": False},
-            ),
-        ),
-    ).invoke(_invocation("claude"))
-
-    assert result.profile["capabilities"]["subagent"]["status"] == (
-        "not_observed"
-    )
 
 
 def test_adapter_fails_closed_on_locked_version_drift(tmp_path: Path) -> None:
@@ -2757,59 +2444,13 @@ def test_adapter_fails_closed_on_locked_version_drift(tmp_path: Path) -> None:
         )
 
 
-def test_claude_structured_401_is_distinct_from_provider_unavailable(
-    tmp_path: Path,
-) -> None:
-    class RevokedRunner(_RecordedRunner):
-        def __call__(self, argv, prompt, timeout, environment):
-            if "--version" in argv:
-                return subprocess.CompletedProcess(argv, 0, "2.1.220\n", "")
-            return subprocess.CompletedProcess(
-                argv,
-                1,
-                "\n".join(
-                    (
-                        json.dumps(
-                            {
-                                "type": "system",
-                                "subtype": "init",
-                                "session_id": "claude-revoked",
-                                "tools": [],
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "system",
-                                "subtype": "api_retry",
-                                "error_status": 401,
-                                "error": "authentication_failed",
-                                "session_id": "claude-revoked",
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "result",
-                                "is_error": True,
-                                "api_error_status": 401,
-                                "session_id": "claude-revoked",
-                            }
-                        ),
-                    )
-                ),
-                "",
-            )
-
-    with pytest.raises(HarnessAdapterUnavailable, match="provider_auth_revoked"):
-        ClaudeHarnessAdapter(tmp_path, runner=RevokedRunner("claude", ())).invoke(
-            _invocation("claude")
-        )
 
 
 def test_doctor_exposes_the_latest_typed_provider_failure(tmp_path: Path) -> None:
     class RevokedRunner(_RecordedRunner):
         def __call__(self, argv, prompt, timeout, environment):
             if "--version" in argv:
-                return subprocess.CompletedProcess(argv, 0, "2.1.220\n", "")
+                return subprocess.CompletedProcess(argv, 0, f"codex-cli {CODEX_LOCKED_VERSION}\n", "")
             return subprocess.CompletedProcess(
                 argv,
                 1,
@@ -2818,7 +2459,7 @@ def test_doctor_exposes_the_latest_typed_provider_failure(tmp_path: Path) -> Non
                         "type": "result",
                         "is_error": True,
                         "api_error_status": 401,
-                        "session_id": "claude-revoked-doctor",
+                        "session_id": "codex-revoked-doctor",
                     }
                 ),
                 "",
@@ -2830,25 +2471,21 @@ def test_doctor_exposes_the_latest_typed_provider_failure(tmp_path: Path) -> Non
         harness_adapters=(
             CodexHarnessAdapter(
                 data_root.run / "harness",
-                runner=_RecordedRunner("codex", ()),
-            ),
-            ClaudeHarnessAdapter(
-                data_root.run / "harness",
-                runner=RevokedRunner("claude", ()),
+                runner=RevokedRunner("codex", ()),
             ),
         ),
     )
     try:
         admission = runtime.harnesses.admit_probe(
             HarnessProbeRequest(
-                request_ref="doctor-claude-revoked",
-                harness_family="claude",
+                request_ref="doctor-codex-revoked",
+                harness_family="codex",
                 model_ref="sonnet",
-                auth_profile_ref="harness-profile:claude-default",
+                auth_profile_ref="harness-profile:codex-default",
                 required_operation_ids=("research_graph.snapshot.read",),
                 required_capabilities=("native_session",),
             ),
-            idempotency_key="doctor-claude-revoked",
+            idempotency_key="doctor-codex-revoked",
         )
         with pytest.raises(HarnessAdmissionError, match="provider_auth_revoked"):
             runtime.harnesses.execute_probe(
@@ -2857,9 +2494,9 @@ def test_doctor_exposes_the_latest_typed_provider_failure(tmp_path: Path) -> Non
                 mcp_base_url="http://127.0.0.1:8765",
             )
 
-        claude = runtime.harnesses.query_status()["adapters"][1]
-        assert claude["capability_profile"] is None
-        assert claude["missing_reason"] == {"code": "provider_auth_revoked"}
+        codex = runtime.harnesses.query_status()["adapters"][0]
+        assert codex["capability_profile"] is None
+        assert codex["missing_reason"] == {"code": "provider_auth_revoked"}
     finally:
         runtime.close()
 
@@ -2903,10 +2540,6 @@ def test_doctor_does_not_reuse_a_ready_profile_after_resume_auth_revocation(
         data_root,
         harness_adapters=(
             CodexHarnessAdapter(data_root.run / "harness", runner=runner),
-            ClaudeHarnessAdapter(
-                data_root.run / "harness",
-                runner=_RecordedRunner("claude", ()),
-            ),
         ),
     )
     try:
@@ -2942,7 +2575,7 @@ def test_doctor_does_not_reuse_a_ready_profile_after_resume_auth_revocation(
         runtime.close()
 
 
-def test_codex_and_claude_share_the_sealed_durable_provider_supervisor(
+def test_codex_uses_sealed_durable_provider_supervisor(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "shared-supervisor"
@@ -4374,10 +4007,6 @@ def test_unknown_provider_outcome_reconciles_receipt_before_any_replay(
     def adapters():
         return (
             DurableCodexAdapter(workspace / "codex", runner=supervisor),
-            ClaudeHarnessAdapter(
-                workspace / "claude",
-                runner=_RecordedRunner("claude", ()),
-            ),
         )
 
     data_root = prepare_data_root(tmp_path / "provider-reconciliation-data")
@@ -4462,16 +4091,12 @@ def test_signed_supervisor_ceiling_fences_attempt_until_explicit_recovery(
         def _argv(self, invocation: HarnessInvocation) -> list[str]:
             return [sys.executable, str(provider)]
 
-    def adapters() -> tuple[CodexHarnessAdapter, ClaudeHarnessAdapter]:
+    def adapters() -> tuple[CodexHarnessAdapter, ...]:
         return (
             CeilingCodexAdapter(
                 workspace / "codex",
                 runner=HarnessSupervisorTransport(workspace / "supervisor"),
                 timeout_seconds=0.1,
-            ),
-            ClaudeHarnessAdapter(
-                workspace / "claude",
-                runner=_RecordedRunner("claude", ()),
             ),
         )
 
@@ -4552,7 +4177,7 @@ def test_signed_supervisor_ceiling_fences_attempt_until_explicit_recovery(
         restored.close()
 
 
-def test_codex_and_claude_complete_short_runs_through_one_typed_admission(
+def test_codex_completes_short_runs_through_typed_admission(
     tmp_path: Path,
 ) -> None:
     codex_runner = _RecordedRunner(
@@ -4562,22 +4187,14 @@ def test_codex_and_claude_complete_short_runs_through_one_typed_admission(
             {"type": "turn.completed"},
         ),
     )
-    claude_runner = _RecordedRunner(
-        "claude",
-        (
-            {"type": "system", "subtype": "init", "session_id": "claude-native-runtime", "tools": []},
-            {"type": "result", "session_id": "claude-native-runtime", "is_error": False},
-        ),
-    )
     data_root = prepare_data_root(tmp_path / "typed-runs")
     adapters = (
         CodexHarnessAdapter(data_root.run / "harness", runner=codex_runner),
-        ClaudeHarnessAdapter(data_root.run / "harness", runner=claude_runner),
     )
     runtime = build_production_runtime(data_root, harness_adapters=adapters)
     try:
         runs = []
-        for family in ("codex", "claude"):
+        for family in ("codex",):
             admission = runtime.harnesses.admit_probe(
                 HarnessProbeRequest(
                     request_ref=f"typed-probe-{family}",
@@ -4602,7 +4219,6 @@ def test_codex_and_claude_complete_short_runs_through_one_typed_admission(
             runs.append(completed)
 
         assert runs[0].native_session_ref == "codex-native-runtime"
-        assert runs[1].native_session_ref == "claude-native-runtime"
         resumed = runtime.harnesses.resume_probe_turn(
             "typed-probe-codex",
             prompt="Resume the bounded conformance probe.",
@@ -4622,7 +4238,6 @@ def test_codex_and_claude_complete_short_runs_through_one_typed_admission(
         profiles = runtime.harnesses.query_capability_profiles()
         assert [profile["harness_family"] for profile in profiles] == [
             "codex",
-            "claude",
         ]
         assert profiles[0]["capabilities"]["resume"]["status"] == "available"
         assert len(profiles[0]["provider_operation_refs"]) == 3
@@ -4634,7 +4249,7 @@ def test_codex_and_claude_complete_short_runs_through_one_typed_admission(
         assert [
             item["locked_version"]
             for item in snapshot["harnesses"]["adapters"]
-        ] == [CODEX_LOCKED_VERSION, "2.1.220"]
+        ] == [CODEX_LOCKED_VERSION]
         assert snapshot["harnesses"]["status"] == "capability_unavailable"
         assert all(
             item["capability_profile"] is None
@@ -4647,6 +4262,6 @@ def test_codex_and_claude_complete_short_runs_through_one_typed_admission(
 
     restored = build_production_runtime(data_root, harness_adapters=adapters)
     try:
-        assert len(restored.harnesses.query_capability_profiles()) == 2
+        assert len(restored.harnesses.query_capability_profiles()) == 1
     finally:
         restored.close()

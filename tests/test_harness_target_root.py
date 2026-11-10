@@ -1243,7 +1243,7 @@ def test_failed_target_admission_recovery_refreshes_both_runtime_caches_once(
     runtime = HarnessRuntime(
         owner,
         gateway,
-        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        (_TargetRootAdapter("codex"),),
     )
     runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
 
@@ -1286,7 +1286,7 @@ def test_failed_resume_turn_recovers_after_restart_in_same_native_session(
     failing = HarnessRuntime(
         owner,
         _Gateway(),
-        (failing_adapter, _TargetRootAdapter("claude")),
+        (failing_adapter,),
     )
     failing.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
 
@@ -1303,7 +1303,7 @@ def test_failed_resume_turn_recovers_after_restart_in_same_native_session(
     restarted = HarnessRuntime(
         owner,
         _Gateway(),
-        (continuation_adapter, _TargetRootAdapter("claude")),
+        (continuation_adapter,),
     )
     restarted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
     recovered = restarted.recover_failed_target_root(owner.run.request_ref)
@@ -1367,7 +1367,7 @@ def test_recovery_replays_temporary_channel_failure_without_stale_cache(
     runtime = HarnessRuntime(
         owner,
         gateway,
-        (adapter, _TargetRootAdapter("claude")),
+        (adapter,),
     )
     runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
     prompt = "Own implementation through final training completion."
@@ -1515,7 +1515,7 @@ def test_target_root_lifecycle_resumes_native_session_after_runtime_restart(
     restarted = HarnessRuntime(
         owner,
         _Gateway(),
-        (continuation_adapter, _TargetRootAdapter("claude")),
+        (continuation_adapter,),
     )
     restarted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
 
@@ -1555,7 +1555,7 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     interrupted = HarnessRuntime(
         owner,
         _Gateway(),
-        (interrupted_adapter, _TargetRootAdapter("claude")),
+        (interrupted_adapter,),
         runtime_protection=protection,
         runtime_boundary_recorder=boundary_recorder,
     )
@@ -1577,7 +1577,7 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     recovered = HarnessRuntime(
         owner,
         _Gateway(),
-        (recovery_adapter, _TargetRootAdapter("claude")),
+        (recovery_adapter,),
         runtime_protection=protection,
         runtime_boundary_recorder=boundary_recorder,
     )
@@ -1612,7 +1612,7 @@ def test_target_root_reconciliation_keeps_the_admitted_operation_timeout(
     interrupted = HarnessRuntime(
         owner,
         _Gateway(),
-        (interrupted_adapter, _TargetRootAdapter("claude")),
+        (interrupted_adapter,),
     )
     interrupted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
     prompt = "Own implementation through final training completion."
@@ -1633,7 +1633,7 @@ def test_target_root_reconciliation_keeps_the_admitted_operation_timeout(
     restarted = HarnessRuntime(
         owner,
         _Gateway(),
-        (restarted_adapter, _TargetRootAdapter("claude")),
+        (restarted_adapter,),
     )
     restarted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
     completed = restarted.run_or_resume_target_root(
@@ -1665,7 +1665,7 @@ def test_target_root_reconciliation_keeps_the_admitted_operation_timeout(
     changed_runtime = HarnessRuntime(
         changed_owner,
         _Gateway(),
-        (changed_adapter, _TargetRootAdapter("claude")),
+        (changed_adapter,),
     )
     changed_runtime.bind_target_workspace_resolver(
         _WorkspaceResolver(tmp_path)
@@ -1695,7 +1695,7 @@ def test_legacy_target_request_without_frozen_timeout_fails_closed(
     runtime = HarnessRuntime(
         owner,
         _Gateway(),
-        (restarted_adapter, _TargetRootAdapter("claude")),
+        (restarted_adapter,),
     )
     runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
 
@@ -1745,7 +1745,7 @@ def test_target_root_repeated_unknown_reconciliation_keeps_one_operation_and_hol
         runtime = HarnessRuntime(
             owner,
             _Gateway(),
-            (adapter, _TargetRootAdapter("claude")),
+            (adapter,),
             runtime_protection=protection,
             runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
         )
@@ -1815,7 +1815,7 @@ def test_target_root_restart_replays_owner_commit_before_runtime_finish(
     interrupted = HarnessRuntime(
         owner,
         _Gateway(),
-        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        (_TargetRootAdapter("codex"),),
         runtime_protection=protection,
         runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
     )
@@ -1840,7 +1840,7 @@ def test_target_root_restart_replays_owner_commit_before_runtime_finish(
     HarnessRuntime(
         owner,
         _Gateway(),
-        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        (_TargetRootAdapter("codex"),),
         runtime_protection=restarted_protection,
         runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
     )
@@ -1872,7 +1872,7 @@ def test_target_root_power_wait_never_calls_provider_and_can_reconcile(
     runtime = HarnessRuntime(
         owner,
         _Gateway(),
-        (adapter, _TargetRootAdapter("claude")),
+        (adapter,),
         runtime_protection=protection,
         runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
     )
@@ -1923,7 +1923,7 @@ def test_target_root_cancel_delegates_exact_current_durable_operation() -> None:
     runtime = HarnessRuntime(
         owner,
         _Gateway(),
-        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        (_TargetRootAdapter("codex"),),
         operation_canceller=canceller,
     )
     original_identity = (

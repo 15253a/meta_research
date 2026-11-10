@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from meta_research.harness_adapters import _codex_item_actor, _claude_content_blocks
+from meta_research.harness_adapters import _codex_item_actor
 from meta_research.owners.common import canonical_hash
 from meta_research.provider_supervisor import (
     SUPERVISOR_EXIT_SCHEMA, SUPERVISOR_EXIT_SCHEMA_V2,
@@ -192,3 +192,14 @@ def append_child_sessions(session, children):
     for child in children:
         existing[child["session_ref"]] = child
     session["children"] = list(existing.values())
+
+
+# Historical provider spools remain readable after new Claude execution retires.
+def _claude_content_blocks(
+    event: dict[str, object]
+) -> list[dict[str, object]]:
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]

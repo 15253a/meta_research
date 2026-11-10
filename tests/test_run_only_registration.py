@@ -179,9 +179,15 @@ def test_exact_asset_version_can_be_selected_from_accepted_receipt():
         result_document=SimpleNamespace(as_dict=lambda: {'formal_runs': [{'run_key': 'actual'}]}))
     target = SimpleNamespace(target_ref="target", spec_hash="spec-hash")
     authority = SimpleNamespace(authority_ref="authority", authority_hash="authority-hash")
+    source_owner = SimpleNamespace(
+        query_target_input_asset_projection=lambda **kwargs: SimpleNamespace(
+            target_ref="target", as_bundle_proof=lambda: proof,
+            asset=SimpleNamespace(asset_ref="asset", version_ref="asset-version-7")),
+        query_target_commit_input_asset_bindings=lambda **kwargs: {},
+    )
     selected = _source_inputs(completion, manifest, target, authority,
-        {"run_key": "actual", "input_refs": ["asset-version-7", "upstream"]})
+        {"run_key": "actual", "input_refs": ["asset-version-7", "upstream"]}, source_owner=source_owner)
     assert selected["input_refs"] == ["asset-version-7", "upstream"]
     with pytest.raises(OwnerConflict, match="input_reference_invalid"):
         _source_inputs(completion, manifest, target, authority,
-            {"run_key": "actual", "input_refs": ["unadmitted-version"]})
+            {"run_key": "actual", "input_refs": ["unadmitted-version"]}, source_owner=source_owner)

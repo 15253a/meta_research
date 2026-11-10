@@ -58,7 +58,6 @@ from meta_research.bundle_protocol import (
     BUNDLE_ROOT_MAX_SERIALIZED_BYTES,
     TERMINAL_EXTERNAL_OUTCOMES,
 )
-from meta_research.codex_ledger import CodexSessionLedgerReader
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -943,8 +942,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
-        codex_ledger_reader: CodexSessionLedgerReader | None = None,
-        codex_home: Path | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -952,8 +949,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             model_ref=model_ref,
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
-            codex_ledger_reader=codex_ledger_reader,
-            codex_home=codex_home,
         )
         self._full_conformance_authority: (
             BundleFullConformanceAuthority | None
@@ -1604,7 +1599,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "kind": "bundle_target_batch", "identity": _rolling_operation_identity(request),
             "request": prompt_context,
         }
-        from meta_research.bundle_batch_view import render_batch_reading_context, render_delta_batch_reading_context
+        from meta_research.bundle_batch_view import render_delta_batch_reading_context
         from meta_research.semantic_mcp import SemanticMcpError
 
         operation_name = f"target-batch-{request.base_generation + 1}"
@@ -1614,14 +1609,12 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         reader = None
         sources = None
         baseline = None
-        mode = os.environ.get("META_RESEARCH_BUNDLE_BATCH_VIEW", "delta-v2")
         if (not sealed and request.native_session_ref and request.target_commits
                 and request.native_replacement_context is None and not request.provider_feedback
-                and mode in {"delta-v2", "plan-reference-v1"}
                 and self._batch_plan_reader is not None):
             try:
                 reader = self._batch_plan_reader(request)
-                if mode == "delta-v2" and self._batch_source_readers is not None:
+                if self._batch_source_readers is not None:
                     sources = self._batch_source_readers(request)
                     from meta_research.bundle_batch_delivery import verified_batch_delivery_baseline
                     baseline = verified_batch_delivery_baseline(self, request,
@@ -1629,13 +1622,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                         verified_proposal_checkpoints=sources.get("proposal_checkpoints", {}))
             except SemanticMcpError as error:
                 raise BundleSkillUnavailable(str(error)) from error
-        if mode == "delta-v2":
-            reading_context = render_delta_batch_reading_context(request, prompt_context,
-                verified_plan_reader=reader, verified_source_readers=sources,
-                verified_delivery_baseline=baseline)
-        else:
-            reading_context = render_batch_reading_context(request, prompt_context,
-                verified_plan_reader=reader if mode == "plan-reference-v1" else None)
+        reading_context = render_delta_batch_reading_context(request, prompt_context,
+            verified_plan_reader=reader, verified_source_readers=sources,
+            verified_delivery_baseline=baseline)
         prompt = (
             _rolling_position_prompt(request) +
             stage_replacement_prompt(request) +

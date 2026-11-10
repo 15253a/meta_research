@@ -178,32 +178,6 @@ def test_companion_preview_checks_job_and_signature(tmp_path):
     assert adapter.observe_reply(job) == ""
 
 
-def test_drafting_preview_checks_job_and_excludes_proposals(tmp_path):
-    from meta_research.quest_drafting import CodexDraftingAdapter, DRAFTING_JOB_SCHEMA_V1
-    adapter = CodexDraftingAdapter(tmp_path)
-    directory = adapter._durable_job_directory("current-job")
-    directory.mkdir(parents=True)
-    invocation = {
-        "schema_ref": DRAFTING_JOB_SCHEMA_V1,
-        "job_ref": "current-job",
-        "prompt_hash": "a" * 64,
-        "schema_hash": "b" * 64,
-        "native_session_ref": None,
-        "ephemeral": False,
-        "transport_mode": "durable_supervisor",
-    }
-    path = directory / "invocation.json"
-    path.write_text(json.dumps(invocation))
-    (directory / "stdout.jsonl").write_bytes(_event('{"reply":"Current answer"}'))
-    assert adapter.observe_reply("current-job") == "Current answer"
-    assert adapter.observe_reply("other-job") == ""
-    invocation["ephemeral"] = True
-    path.write_text(json.dumps(invocation))
-    assert adapter.observe_reply("current-job") == ""
-    invocation["ephemeral"] = False
-    invocation["job_ref"] = "other-job"
-    path.write_text(json.dumps(invocation))
-    assert adapter.observe_reply("current-job") == ""
 
 
 def test_reply_providers_request_public_paragraph_progress(tmp_path, monkeypatch):
@@ -221,13 +195,7 @@ def test_reply_providers_request_public_paragraph_progress(tmp_path, monkeypatch
         return {"reply": "Complete answer"}, "session", ""
     monkeypatch.setattr(companion, "_invoke_optional_root_task_operation", companion_invoke)
     assert companion.reply(request).reply == "Complete answer"
-    drafting = CodexDraftingAdapter(tmp_path / "drafting")
-    def drafting_invoke(prompt, schema, **kwargs):
-        prompts.append(prompt)
-        return {"reply": "Complete answer"}, "session"
-    monkeypatch.setattr(drafting, "_invoke", drafting_invoke)
-    assert drafting.reply(request).reply == "Complete answer"
-    assert len(prompts) == 2
+    assert len(prompts) == 1
     assert all(CHAT_REPLY_PROGRESS_INSTRUCTION in prompt for prompt in prompts)
 
 
@@ -275,42 +243,6 @@ def test_large_tool_gap_does_not_drop_previously_streamed_paragraphs(tmp_path):
     assert preview == "First paragraph\n\nSecond paragraph"
 
 
-def test_drafting_recovers_existing_job_with_original_prompt(tmp_path, monkeypatch):
-    from dataclasses import replace
-    from meta_research.chat_progress import CHAT_REPLY_PROGRESS_INSTRUCTION
-    from meta_research.quest_drafting import (
-        CODEX_DRAFTING_LOCKED_VERSION, CodexDraftingAdapter, IntentTurnRequest,
-        _reply_schema, _seal_durable_job, _write_durable_json,
-    )
-    calls = []
-    def runner(*args):
-        calls.append(args)
-        raise AssertionError("completed job must not launch a provider again")
-    adapter = CodexDraftingAdapter(tmp_path, process_runner=runner)
-    request = IntentTurnRequest("init", 1, "a" * 64, {}, "Question", "session")
-    actual_invoke = adapter._invoke
-    captured = []
-    def capture(prompt, *args, **kwargs):
-        captured.append(prompt)
-        return {"reply": "Saved answer"}, "session"
-    monkeypatch.setattr(adapter, "_invoke", capture)
-    adapter.reply(request)
-    legacy_prompt = captured[0].replace(CHAT_REPLY_PROGRESS_INSTRUCTION, "", 1)
-    job = "old-drafting-job"
-    directory = adapter._durable_job_directory(job)
-    directory.mkdir(parents=True)
-    invocation = adapter._drafting_invocation(
-        legacy_prompt, _reply_schema(), native_session_ref="session",
-        ephemeral=False, job_ref=job, directory=directory,
-        provider_version=CODEX_DRAFTING_LOCKED_VERSION,
-    )
-    _write_durable_json(directory / "invocation.json", invocation)
-    _seal_durable_job(directory, invocation, ({"reply": "Saved answer"}, "session"))
-    before = (directory / "invocation.json").read_bytes()
-    monkeypatch.setattr(adapter, "_invoke", actual_invoke)
-    assert adapter.reply(replace(request, job_ref=job)).reply == "Saved answer"
-    assert (directory / "invocation.json").read_bytes() == before
-    assert calls == []
 
 
 def test_companion_keeps_original_prompt_for_signed_existing_job(tmp_path, monkeypatch):

@@ -198,7 +198,10 @@ def test_actual_adapter_methods_share_current_protected_gateway_and_readers(tmp_
             assert synthesis.input_identity.consumed == ()
             assert synthesis.work.runtime.jail_root == result.work.runtime.jail_root
             assert {Path(path).name for path in adapter.calls[1][0]["invocation_runner"].read_only_inputs} >= {"sources.json", "basis.json"}
-            assert len(adapter.calls[1][0]["authorized_operation_ids"]) == 6
+            from meta_research.semantic_mcp import TOOL_DISCOVERY_OPERATION_IDS
+            assert adapter.calls[1][0]["authorized_operation_ids"] == (
+                *TOOL_DISCOVERY_OPERATION_IDS, *CREATION_MATERIAL_OPERATION_IDS,
+                "research_memory.creation_basis.read", "research_memory.content.read")
             assert not adapter._creation_calls
             assert adapter.cancel_job("adapter-synthesis") is True
             assert (source / "large.bin").stat().st_blocks == 0

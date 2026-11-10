@@ -560,12 +560,9 @@ def validate_root_capability_diagnostics(
     ):
         raise ValueError("root_capability_diagnostic_invalid")
     profile = root_capability_profile(observed_kind)
-    from meta_research.runtime_binding_compatibility import reviewed_historical_root_profile_hashes
 
     observed_profile_hash = value.get("capability_profile_hash")
-    allowed_profile_hashes = {
-        profile.digest, *reviewed_historical_root_profile_hashes(profile.digest)
-    }
+    allowed_profile_hashes = {profile.digest}
     if observed_kind in RESEARCH_STAGES and observed_profile_hash not in allowed_profile_hashes:
         allowed_profile_hashes.update(root_capability_profile(observed_kind, model).digest
                                       for model in SUPPORTED_CODEX_MODEL_REFS if model != profile.model_ref)

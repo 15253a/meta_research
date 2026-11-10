@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import text
 
 from meta_research.context_presentation import CONTEXT_VIEW_MAX_BYTES, stage_context_view
-from meta_research.harness_adapters import _summarize_codex_event, _summarize_claude_event
+from meta_research.harness_adapters import _summarize_codex_event
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash, canonical_json
 from meta_research.provider_call_observations import (
     observe_provider_files, prompt_observation, reported_usage,
@@ -43,9 +43,9 @@ def test_reported_usage_keeps_turn_and_last_call_scopes_distinct():
     assert single["scope"] == "provider_last_call_reported"
     assert single["cached_input_tokens"] is None
     assert reported_usage({"usage": {"input_tokens": True, "output_tokens": -1}}) is None
-    claude = _summarize_claude_event({"type": "assistant", "message": {
-        "usage": {"input_tokens": 300, "cache_read_input_tokens": 8000, "output_tokens": 20}}})[0]
-    assert claude["reported_token_usage"]["raw_reported"]["cache_read_input_tokens"] == 8000
+    claude = reported_usage({"type": "assistant", "message": {
+        "usage": {"input_tokens": 300, "cache_read_input_tokens": 8000, "output_tokens": 20}}})
+    assert claude["raw_reported"]["cache_read_input_tokens"] == 8000
 
 
 def test_signed_call_observation_keeps_existing_receipt_and_exact_compaction_locator(tmp_path):

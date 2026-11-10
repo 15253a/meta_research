@@ -1682,7 +1682,6 @@ def test_codex_0147_lossy_stdout_does_not_gate_public_review_result(
     adapter = CodexIdeaSkillAdapter(
         tmp_path / "idea-provider",
         process_runner=runner,
-        codex_home=codex_home,
     )
     request = _request(
         runtime_binding=adapter.runtime_binding(),

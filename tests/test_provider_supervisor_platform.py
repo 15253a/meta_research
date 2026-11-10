@@ -19,7 +19,6 @@ from meta_research.provider_supervisor import (
     SupervisorFileLock,
     WindowsProviderJob,
     ensure_transport_key,
-    minimal_subprocess_environment,
     provider_result_argv,
     read_verified_exit_receipt,
     request_supervisor_stop,
@@ -339,28 +338,6 @@ def test_windows_stop_uses_the_sealed_operation_control_without_proc(
     assert stop_seen.is_set()
 
 
-def test_windows_minimal_environment_keeps_bootstrap_values_without_secrets() -> None:
-    environment = minimal_subprocess_environment(
-        platform_name="nt",
-        source_environment={
-            "PATH": r"C:\Windows\System32",
-            "SystemRoot": r"C:\Windows",
-            "COMSPEC": r"C:\Windows\System32\cmd.exe",
-            "PATHEXT": ".COM;.EXE",
-            "TEMP": r"C:\Temp",
-            "SECRET_TOKEN": "must-not-cross",
-        },
-        extra={"META_RESEARCH_PROVIDER_OPERATION": r"C:\run\request.json"},
-    )
-
-    assert environment == {
-        "PATH": r"C:\Windows\System32",
-        "SystemRoot": r"C:\Windows",
-        "COMSPEC": r"C:\Windows\System32\cmd.exe",
-        "PATHEXT": ".COM;.EXE",
-        "TEMP": r"C:\Temp",
-        "META_RESEARCH_PROVIDER_OPERATION": r"C:\run\request.json",
-    }
 
 
 def test_windows_provider_result_target_is_a_private_file_not_proc(

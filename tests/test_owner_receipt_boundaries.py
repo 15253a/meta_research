@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -19,8 +22,6 @@ from meta_research.quest_drafting import (
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 
 
@@ -35,8 +36,8 @@ _QUESTION = {
 
 
 class _DeterministicDraftingAdapter:
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
-        return ProposalDraftResult(_QUESTION, "test_deterministic")
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
+        return synthesis_result(request, _QUESTION, "test_deterministic")
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
         return IntentTurnResult("测试回复", "test-session", "test_deterministic")

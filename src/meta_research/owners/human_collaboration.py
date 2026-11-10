@@ -85,7 +85,6 @@ from meta_research.quest_drafting import (
     IntentDraftingProvider,
     IntentTurnRequest,
     ProposalDrafter,
-    ProposalDraftRequest,
     QUESTION_FIELD_MAX_LENGTHS,
 )
 from meta_research.reasoning_contract import (
@@ -7077,37 +7076,25 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 expected_native_generation=int(job.native_session_generation))
             with self._database.read() as connection:
                 companion_native_session_ref = connection.execute(text("SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": job.initialization_id}).scalar_one_or_none()
-            request = ProposalDraftRequest(
-                    initialization_id=job.initialization_id,
-                    draft_revision=int(job.basis_revision),
-                    draft_hash=job.basis_hash,
-                    draft=frozen_draft,
-                    job_ref=provider_job_ref,
-                    literature_snapshot=literature_snapshot,
-                    companion_native_session_ref=companion_native_session_ref,
-                    root_session_ref=self.query_quest_creation(job.initialization_id)["intent_session"]["ref"],
-                )
+            root_session_ref = self.query_quest_creation(job.initialization_id)["intent_session"]["ref"]
             synthesize = getattr(self._proposal_drafter, "synthesize_first_question", None)
-            if callable(synthesize):
-                from meta_research.creation_basis import FirstQuestionSynthesisRequest
-                workspace = self._creation_workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
-                context = self._research_memory.creation_bases.project(basis, literature_snapshot, workspace)
-                result = synthesize(FirstQuestionSynthesisRequest(request.initialization_id, request.draft_revision,
-                    request.draft_hash, frozen_draft, provider_job_ref, request.root_session_ref,
-                    companion_native_session_ref, basis, context, literature_snapshot))
-                if literature_snapshot is not None:
-                    if result.revision is None:
-                        raise OwnerConflict("creation_literature_revision_required")
-                    basis = self._research_memory.creation_bases.accept_revision(basis,
-                        literature_snapshot["source_snapshot"], result.revision, result)
-                elif result.revision is not None:
-                    raise OwnerConflict("creation_direct_revision_invalid")
-                else:
-                    basis = self._research_memory.creation_bases.accept_consumed(basis, result)
+            if not callable(synthesize):
+                raise OwnerConflict("creation_synthesis_provider_unavailable")
+            from meta_research.creation_basis import FirstQuestionSynthesisRequest
+            workspace = self._creation_workspaces.bind_initialization(job.initialization_id, root_session_ref)
+            context = self._research_memory.creation_bases.project(basis, literature_snapshot, workspace)
+            result = synthesize(FirstQuestionSynthesisRequest(job.initialization_id, int(job.basis_revision),
+                job.basis_hash, frozen_draft, provider_job_ref, root_session_ref,
+                companion_native_session_ref, basis, context, literature_snapshot))
+            if literature_snapshot is not None:
+                if result.revision is None:
+                    raise OwnerConflict("creation_literature_revision_required")
+                basis = self._research_memory.creation_bases.accept_revision(basis,
+                    literature_snapshot["source_snapshot"], result.revision, result)
+            elif result.revision is not None:
+                raise OwnerConflict("creation_direct_revision_invalid")
             else:
-                if frozen_draft.get("material_manifest", {}).get("entries") or basis.get("input_identity") is not None:
-                    raise OwnerConflict("creation_synthesis_provider_unavailable")
-                result = self._proposal_drafter.draft(request)
+                basis = self._research_memory.creation_bases.accept_consumed(basis, result)
             content = _validate_question_content(result.content)
             self._research_memory.creation_bases.require_current(basis)
             if result.adapter_kind == "codex_companion_fork" and (

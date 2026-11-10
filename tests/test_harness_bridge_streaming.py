@@ -96,3 +96,21 @@ def test_nonzero_provider_large_stdout_reaches_signed_exit_without_losing_tail(t
     assert completed.stdout.encode() == payload + b'\n{"type":"meta_research.provider_error","family":"codex","error_kind":"provider_failed"}\n'
     assert completed.meta_research_transport_receipt['termination_reason'] == 'completed'
     assert completed.meta_research_transport_receipt['provider_returncode'] == 101
+
+
+def test_retired_claude_bridge_rejects_before_provider_spawn(tmp_path):
+    marker = tmp_path / "unexpected-provider"
+    argv_path = tmp_path / "argv.json"
+    argv_path.write_text(json.dumps([sys.executable, "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).touch()"]))
+    schema = tmp_path / "schema.json"
+    schema.write_text("{}")
+    result = tmp_path / "result.json"
+    completed = subprocess.run([sys.executable, "-m", "meta_research.harness_cli_bridge",
+        "--family", "claude", "--provider-argv", str(argv_path),
+        "--output-schema", str(schema), "--output-last-message", str(result), "-"],
+        input=b"bounded prompt", capture_output=True,
+        env={**os.environ, "META_RESEARCH_HARNESS_WORKSPACE": str(tmp_path)}, timeout=10)
+    assert completed.returncode == 64
+    assert b"invalid choice" in completed.stderr and b"claude" in completed.stderr
+    assert not marker.exists() and not result.exists()

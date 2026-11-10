@@ -63,10 +63,10 @@ def test_probe_still_checks_whole_content_after_same_first_byte(committed_target
             research_memory=owner.research_memory)
 
 
-def test_full_mode_does_not_probe_unused_readers(tmp_path, monkeypatch):
+def test_full_correction_packet_does_not_probe_unused_readers(tmp_path, monkeypatch):
     adapter, runner = _adapter(tmp_path, _output("batch"), durable=True)
     request, *_ = _bind(adapter)
-    monkeypatch.setenv("META_RESEARCH_BUNDLE_BATCH_VIEW", "full")
+    request = replace(request, provider_feedback={"reason": "owner rejection"})
     adapter.bind_batch_plan_reader(lambda _: pytest.fail("full mode used Plan reader"))
     adapter.bind_batch_source_readers(lambda _: pytest.fail("full mode used source readers"))
     adapter.propose_target_batch(request)

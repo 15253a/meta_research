@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 from typing import cast
+from copy import deepcopy
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
 
 import uvicorn
 
@@ -49,7 +51,6 @@ from meta_research.idea_skill import (
 )
 from meta_research.harness import FullConformanceRequest
 from meta_research.harness_adapters import (
-    CLAUDE_LOCKED_VERSION,
     CODEX_LOCKED_VERSION,
     HARNESS_CAPABILITIES,
     HarnessInvocation,
@@ -91,8 +92,6 @@ from meta_research.quest_drafting import (
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 from meta_research.runtime_protection import InhibitorLease
 from meta_research.semantic_owner_gateway import (
@@ -238,11 +237,7 @@ class DeterministicFullConformanceAdapter:
 
     def __init__(self, family: str) -> None:
         self.family = family
-        self.locked_version = (
-            CODEX_LOCKED_VERSION
-            if family == "codex"
-            else CLAUDE_LOCKED_VERSION
-        )
+        self.locked_version = CODEX_LOCKED_VERSION
 
     def installation_profile(self) -> dict[str, object]:
         return {
@@ -301,7 +296,7 @@ class DeterministicDraftingAdapter:
         self._lock = threading.Lock()
         self._intent_started = intent_started
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         assert request.draft["goal"]
         assert request.draft["completion_criteria"]
         with self._lock:
@@ -323,9 +318,17 @@ class DeterministicDraftingAdapter:
             content["background_context"] = (
                 "DeepFetch 已核查两篇论文；一篇没有可合法获取的开放全文。"
             )
-        return ProposalDraftResult(
+        revision = None
+        if request.literature_snapshot is not None:
+            revision = {"understanding": deepcopy(request.basis["understanding"]),
+                        "corrections": [],
+                        "search_assessment": "The supplied literature retains this fixture's prepared understanding."}
+        return FirstQuestionSynthesisResult(
             content=content,
             adapter_kind="chrome_deterministic",
+            companion_native_session_ref=request.companion_native_session_ref,
+            proposal_fork_native_session_ref=None,
+            revision=revision,
         )
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
@@ -1346,6 +1349,7 @@ async def serve(
     stage_pipeline: str | None,
     human_request_handoff: bool,
     human_request_handoff_kind: str,
+    initialization_faults: bool,
 ) -> None:
     intent_started = threading.Event()
     adapter = DeterministicDraftingAdapter(intent_started)
@@ -1381,7 +1385,6 @@ async def serve(
     harness_adapters = (
         (
             DeterministicFullConformanceAdapter("codex"),
-            DeterministicFullConformanceAdapter("claude"),
         )
         if stage_pipeline == "bundle-exhaustion"
         else None
@@ -1412,8 +1415,6 @@ async def serve(
             FullConformanceRequest(
                 codex_model_ref=CODEX_MODEL_REF,
                 codex_auth_profile_ref="harness-profile:codex-default",
-                claude_model_ref="claude-conformance",
-                claude_auth_profile_ref="harness-profile:claude-default",
             )
         )
         for _turn in range(4):
@@ -1483,7 +1484,7 @@ async def serve(
         )
     # Stage browser scenarios exercise the real Owners directly. Deliberate
     # initialization I/O failures belong to the recovery scenarios below.
-    if stage_pipeline is None:
+    if stage_pipeline is None and initialization_faults:
         human_collaboration._research_graph = TransientResearchGraph(  # noqa: SLF001
             runtime.owners.research_graph,
             failure_limit=1_000 if legacy_state == "recovering" else 3,
@@ -1546,6 +1547,7 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--legacy-state", choices=("draft", "recovering"))
     parser.add_argument("--manual-root", action="store_true")
+    parser.add_argument("--without-initialization-faults", action="store_false", dest="initialization_faults")
     parser.add_argument("--human-request-handoff", action="store_true")
     parser.add_argument("--human-request-handoff-kind", choices=("offline_action", "library_reconnect", "system_operation_help"), default="offline_action")
     parser.add_argument(
@@ -1569,6 +1571,7 @@ def main() -> None:
             args.stage_pipeline,
             args.human_request_handoff,
             args.human_request_handoff_kind,
+            args.initialization_faults,
         )
     )
 

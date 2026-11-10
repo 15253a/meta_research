@@ -218,7 +218,7 @@ def test_two_unknown_reconciliations_finish_then_owner_admits_next_turn(tmp_path
     monkeypatch.setattr(adapter, '_provider_feature_inventory', lambda *a, **kw: {})
     from meta_research.feed import DurableFeed
     protection = RuntimeProtection(database=database, feed=DurableFeed(database), inhibitor=_TestPowerInhibitor(), event_logger=RuntimeEventLogger(tmp_path / 'runtime.jsonl'))
-    runtime = HarnessRuntime(owner, _Gateway(), (adapter, _TargetRootAdapter('claude')), runtime_protection=protection, runtime_boundary_recorder=RuntimeBoundaryRecorder(database))
+    runtime = HarnessRuntime(owner, _Gateway(), (adapter,), runtime_protection=protection, runtime_boundary_recorder=RuntimeBoundaryRecorder(database))
     try:
         run = owner.query_run(request.request_ref)
         operation_ref = f'{run.run_ref}:harness_turn:1'

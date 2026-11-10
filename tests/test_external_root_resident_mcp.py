@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -26,7 +29,6 @@ from meta_research.quest_drafting import (
     HostComputeDevice,
     HostComputeSnapshot,
     IntentTurnResult,
-    ProposalDraftResult,
 )
 from meta_research.root_resident_mcp import RootResidentMcpChannels
 from meta_research.semantic_owner_gateway import (
@@ -143,9 +145,9 @@ class _WaitingAcquisitionDelegate(_AcquisitionDelegate):
 
 
 class _QuestDrafter:
-    def draft(self, request: object) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: object) -> FirstQuestionSynthesisResult:
         del request
-        return ProposalDraftResult(
+        return synthesis_result(request,
             content={
                 "title": "Resident MCP acquisition",
                 "unknown_statement": "Which source remains unavailable?",

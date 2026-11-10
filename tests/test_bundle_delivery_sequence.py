@@ -22,7 +22,6 @@ def _sequence(tmp_path, monkeypatch):
         for name in ("current_targets", "target_commits"):
             value[name] = deepcopy(shown.get(name, list(getattr(current, name))))
         return value
-    monkeypatch.setattr("meta_research.bundle_batch_view.render_batch_reading_context", render)
     monkeypatch.setattr("meta_research.bundle_batch_view.render_delta_batch_reading_context", render)
     return adapter, runner, request, shown
 

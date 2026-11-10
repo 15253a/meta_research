@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import json
 import subprocess
 import time
@@ -11,11 +14,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from meta_research.companion import CodexCompanionAdapter
 from meta_research.composition import build_production_runtime
 from meta_research.owners.common import OwnerConflict, canonical_json
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
-    CodexDraftingAdapter,
     DraftingUnavailable,
     HostComputeDevice,
     HostComputeSnapshot,
@@ -23,8 +26,6 @@ from meta_research.quest_drafting import (
     INTENT_REPLY_MAX_LENGTH,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 from meta_research.web import create_app
 
@@ -44,9 +45,9 @@ class DeterministicDraftingAdapter:
         self.intent_requests: list[IntentTurnRequest] = []
         self.draft_calls = 0
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         self.draft_calls += 1
-        return ProposalDraftResult(content=QUESTION, adapter_kind="test_deterministic")
+        return synthesis_result(request, content=QUESTION, adapter_kind="test_deterministic")
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
         self.intent_requests.append(request)
@@ -96,7 +97,7 @@ class DurableReconciliationDraftingAdapter(CleanupTrackingDraftingAdapter):
         super().finish_job(job_ref)
         self.started_job_refs.discard(job_ref)
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         assert request.job_ref is not None
         self.proposal_job_refs.append(request.job_ref)
         if request.job_ref not in self.started_job_refs:
@@ -107,7 +108,7 @@ class DurableReconciliationDraftingAdapter(CleanupTrackingDraftingAdapter):
             )
         if request.job_ref not in self.sealed_job_refs:
             raise DraftingUnavailable("codex_job_outcome_unknown")
-        return ProposalDraftResult(
+        return synthesis_result(request,
             content=QUESTION, adapter_kind="test_durable_reconciliation"
         )
 
@@ -143,7 +144,7 @@ class LegacyContractTransitionDraftingAdapter(CleanupTrackingDraftingAdapter):
             return "pending"
         return "terminal"
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         assert request.job_ref is not None
         self.proposal_job_refs.append(request.job_ref)
         if self.legacy_job_ref is None:
@@ -152,7 +153,7 @@ class LegacyContractTransitionDraftingAdapter(CleanupTrackingDraftingAdapter):
         if request.job_ref == self.legacy_job_ref:
             raise DraftingUnavailable("codex_execution_contract_outdated")
         self.draft_calls += 1
-        return ProposalDraftResult(
+        return synthesis_result(request,
             content=QUESTION, adapter_kind="test_current_drafting_contract"
         )
 
@@ -218,11 +219,11 @@ class BlockingProposalAdapter(DeterministicDraftingAdapter):
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         self.started.set()
         if not self.release.wait(timeout=3):
             raise AssertionError("blocking proposal adapter was not released")
-        return super().draft(request)
+        return super().synthesize_first_question(request)
 
 
 class ExpiringProposalAdapter(DeterministicDraftingAdapter):
@@ -232,14 +233,14 @@ class ExpiringProposalAdapter(DeterministicDraftingAdapter):
         self.release = (threading.Event(), threading.Event())
         self._lock = threading.Lock()
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         with self._lock:
             attempt = self.draft_calls
             self.draft_calls += 1
         self.started[attempt].set()
         if not self.release[attempt].wait(timeout=3):
             raise AssertionError("leased proposal attempt was not released")
-        return ProposalDraftResult(
+        return synthesis_result(request,
             content={
                 **QUESTION,
                 "title": "expired-old" if attempt == 0 else "replacement-new",
@@ -287,9 +288,9 @@ class ExpiringIntentAdapter(DeterministicDraftingAdapter):
 
 
 class OversizedProposalAdapter(DeterministicDraftingAdapter):
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         self.draft_calls += 1
-        return ProposalDraftResult(
+        return synthesis_result(request,
             content={**QUESTION, "title": "题" * 501},
             adapter_kind="test_oversized",
         )
@@ -311,11 +312,11 @@ class InterruptedOnceAdapter(DeterministicDraftingAdapter):
         self._interrupt_proposal = True
         self._interrupt_intent = True
 
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         if self._interrupt_proposal:
             self._interrupt_proposal = False
             raise DraftingUnavailable("codex_cli_stopped")
-        return super().draft(request)
+        return super().synthesize_first_question(request)
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
         if self._interrupt_intent:
@@ -963,7 +964,7 @@ def test_cancel_fences_a_claimed_proposal_before_provider_spawn(
     tmp_path: Path,
 ) -> None:
     runner = ClaimToSpawnBarrierRunner(QUESTION)
-    adapter = CodexDraftingAdapter(
+    adapter = CodexCompanionAdapter(
         tmp_path / "cancel-before-proposal-spawn-provider",
         process_runner=runner,
     )
@@ -1043,7 +1044,7 @@ def test_confirm_fences_a_claimed_intent_turn_before_provider_spawn(
             '{"type":"thread.started","thread_id":"barrier-native-session"}\n'
         ),
     )
-    intent_adapter = CodexDraftingAdapter(
+    intent_adapter = CodexCompanionAdapter(
         tmp_path / "confirm-before-intent-spawn-provider",
         process_runner=runner,
     )

@@ -11,7 +11,6 @@ from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, cast
 
-from meta_research.codex_ledger import CodexSessionLedgerReader
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -345,8 +344,6 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
-        codex_ledger_reader: CodexSessionLedgerReader | None = None,
-        codex_home: Path | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -354,8 +351,6 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             model_ref=model_ref,
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
-            codex_ledger_reader=codex_ledger_reader,
-            codex_home=codex_home,
         )
 
     @resource_preparation
@@ -793,10 +788,6 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
                     "obligations",
                 ],
             },
-            "evidence_reuse_set": {
-                "type": "array",
-                "items": evidence_use,
-            },
             "coverage": {
                 "type": "array",
                 "minItems": 1,
@@ -825,11 +816,6 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
                         "insufficiency",
                     ],
                 },
-            },
-            "gap_set": {
-                "type": "array",
-                "items": text,
-                "uniqueItems": True,
             },
             "experiment_briefs": {
                 "type": "array",
@@ -868,68 +854,6 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
                     ],
                 },
             },
-            "idea_trace": {
-                "type": "array",
-                "minItems": 0,
-                "maxItems": len(candidate_refs),
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "idea_ref": idea_ref,
-                        "obligation_roles": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "obligation_key": text,
-                                    "role": {
-                                        "type": "string",
-                                        "enum": [
-                                            "query_lens",
-                                            "experiment_lens",
-                                            "not_relevant",
-                                        ],
-                                    },
-                                },
-                                "required": ["obligation_key", "role"],
-                            },
-                        },
-                    },
-                    "required": ["idea_ref", "obligation_roles"],
-                },
-            },
-            "bundle_disposition": {
-                "type": "string",
-                "enum": [
-                    "experiments_required",
-                    "no_new_experiment_required",
-                ],
-            },
-            "source_bindings": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "question_ref": {"const": request.question_ref},
-                    "idea_set_ref": {"const": request.idea_set_ref},
-                    "context_pack_ref": {"const": request.context_pack_ref},
-                    "context_pack_hash": {"const": request.context_pack_hash},
-                    "evidence_reference_revision": {
-                        "const": request.context_pack.get(
-                            "evidence_reference_revision", 0
-                        )
-                    },
-                },
-                "required": [
-                    "question_ref",
-                    "idea_set_ref",
-                    "context_pack_ref",
-                    "context_pack_hash",
-                    "evidence_reference_revision",
-                ],
-            },
         },
         "required": [
             "schema_ref",
@@ -938,20 +862,11 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             "idea_set_ref",
             "context_pack_ref",
             "answer_contract",
-            "evidence_reuse_set",
             "coverage",
-            "gap_set",
             "experiment_briefs",
-            "idea_trace",
-            "bundle_disposition",
-            "source_bindings",
         ],
     }
 
-    # These views repeat information already fixed by the request and decisions.
-    for field in ("evidence_reuse_set", "gap_set", "idea_trace", "bundle_disposition", "source_bindings"):
-        schema["properties"].pop(field)
-        schema["required"].remove(field)
     schema["properties"]["notes"] = {"type": "string"}
     schema["required"].append("notes")
     # Owner bindings vary by source type. Reuse the existing canonical-object

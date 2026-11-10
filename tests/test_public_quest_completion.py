@@ -13,6 +13,9 @@ The four durable facts intentionally remain distinct::
 
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 from pathlib import Path
 
 from stage_provider_fixture_helpers import ReasoningPrimaryGuidance
@@ -32,8 +35,6 @@ from meta_research.quest_drafting import (
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 from meta_research.reasoning_contract import (
     CANDIDATE_COMPLETION_SCHEMA_REF,
@@ -60,8 +61,8 @@ _QUESTION = {
 
 
 class _DeterministicDraftingAdapter:
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
-        return ProposalDraftResult(dict(_QUESTION), "test_deterministic")
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
+        return synthesis_result(request, dict(_QUESTION), "test_deterministic")
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
         return IntentTurnResult(

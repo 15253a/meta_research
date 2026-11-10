@@ -12,10 +12,9 @@ from meta_research.owners.common import canonical_hash
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
 from meta_research.runtime_conditions import split_runtime_prompt
 from test_binding_compatibility import request as dispatch_request
-from test_bundle_runtime_conditions_compatibility import _SignedDispatchRunner
+from bundle_signed_runner import _SignedDispatchRunner
 from test_bundle_skill_adapter import _question_content
 from test_bundle_skill_adapter import _FullConformanceAuthority, _fake_codex, _inbox_checkpoint, _plan_document, _target_plan
-from test_bundle_frozen_input_recovery_compatibility import FIXTURES, _binding
 from test_public_guidance_delivery import _developer
 
 
@@ -153,7 +152,7 @@ def test_model_edit_applies_to_next_call_and_preserves_sealed_replay(sealed_disp
 def test_instruction_replay_keeps_request_identity_and_signed_invocation_exact(sealed_dispatch, mutation):
     provider, runner, _, dispatch, _, directory, original = sealed_dispatch
     if mutation == "request":
-        dispatch = replace(dispatch, state={**dispatch.state, "target_commit_refs": ["target-commit:changed"]})
+        dispatch = replace(dispatch, frontier=({"target_ref": "target:followup", "target_key": "changed"},))
     elif mutation == "native":
         dispatch = replace(dispatch, native_session_ref="native-session:changed")
     else:
@@ -166,49 +165,10 @@ def test_instruction_replay_keeps_request_identity_and_signed_invocation_exact(s
         path.write_text(json.dumps(value), encoding="utf-8")
         original["invocation.json"] = path.read_bytes()
 
-    expected = "codex_operation_spool_invalid" if mutation == "request" else "codex_operation_identity_conflict"
-    with pytest.raises(BundleSkillUnavailable, match=expected):
+    expected = "bundle_review_result_contract_invalid" if mutation == "request" else "codex_operation_identity_conflict"
+    with pytest.raises(BundleSkillUnavailable, match=expected) as failure:
         provider.schedule_target(dispatch)
+    if mutation == "request":
+        assert failure.value.recovery_checkpoint["contract_failure_detail_code"] == "bundle_operation_inputs_changed"
     assert len(runner.calls) == 1
     assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == original
-
-
-def _actual_sealed_prompt():
-    path = Path(__file__).parent / "fixtures" / "bundle_sealed_prompt_20260930" / "prompt.txt"
-    sealed = path.read_text(encoding="utf-8")
-    _, body = split_runtime_prompt(sealed)
-    resources = bundle_skill._bundle_skill_resources()
-    resources["references/owner-operations.md"] = (FIXTURES / "owner-operations-before.md").read_text(encoding="utf-8")
-    old_instructions = "\n\n".join(f"<!-- bundled resource: {name} -->\n{content}" for name, content in resources.items())
-    assert body.startswith(old_instructions)
-    assert canonical_hash(resources) == _binding("before").packaged_skill_bundle_hash
-    current = bundle_skill._bundle_skill_instructions() + body[len(old_instructions):]
-    return sealed, body, current
-
-
-def test_actual_generation_two_prompt_restores_only_frozen_resource_prefix():
-    sealed, body, current = _actual_sealed_prompt()
-    assert current != body
-    assert bundle_skill._restore_frozen_bundle_instruction_prefix(current, sealed, _binding("before")) == body
-
-
-@pytest.mark.parametrize("mutation", ["request", "resource", "marker", "package_hash", "resource_hash", "duplicate_resource"])
-def test_actual_generation_two_rejects_changed_tail_or_unbound_resource_prefix(mutation):
-    sealed, _, current = _actual_sealed_prompt()
-    frozen = _binding("before")
-    if mutation == "request":
-        current += "\nChanged frozen request."
-    elif mutation == "resource":
-        sealed = sealed.replace("<!-- bundled resource: SKILL.md -->\n", "<!-- bundled resource: SKILL.md -->\nUnreviewed text.\n", 1)
-    elif mutation == "marker":
-        sealed = sealed.replace("<!-- bundled resource: SKILL.md -->", "<!-- bundled resource: other.md -->", 1)
-    elif mutation == "package_hash":
-        frozen = replace(frozen, packaged_skill_bundle_hash="f" * 64)
-    else:
-        entry = next(entry for entry in frozen.resource_bindings if entry.startswith("package:meta_research.skills.bundle_stage/SKILL.md@sha256:"))
-        frozen = replace(frozen, resource_bindings=(
-            frozen.resource_bindings + (entry,) if mutation == "duplicate_resource"
-            else tuple(entry.rsplit(":", 1)[0] + ":" + "f" * 64 if value == entry else value for value in frozen.resource_bindings)
-        ))
-    with pytest.raises(BundleSkillUnavailable, match="codex_operation_spool_invalid"):
-        bundle_skill._restore_frozen_bundle_instruction_prefix(current, sealed, frozen)

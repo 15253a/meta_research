@@ -16,7 +16,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from meta_research import context_presentation, idea_skill
+from meta_research import context_presentation, idea_skill, resource_preparation
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.owners.common import canonical_json
 from test_plan_skill_adapter import _fake_codex, _plan, _request, _SequenceRunner
@@ -85,7 +85,7 @@ def measure_plan_preparation(directory: Path, level: int):
     def source_sha256(*args, **kwargs):
         digest = original_sha256(*args, **kwargs)
         caller = sys._getframe(1)
-        if caller.f_code.co_name == "_file_sha256":
+        if caller.f_code.co_name == "_resource_sha256":
             path = Path(caller.f_locals["path"]).resolve()
             if path.suffix == ".py" and path.parent == package_root:
                 counts = entry("source_hashes", path.name)
@@ -123,7 +123,7 @@ def measure_plan_preparation(directory: Path, level: int):
     try:
         with ExitStack() as stack:
             stack.enter_context(patch.object(Path, "open", opened))
-            stack.enter_context(patch.object(idea_skill, "hashlib", SimpleNamespace(sha256=source_sha256)))
+            stack.enter_context(patch.object(resource_preparation, "hashlib", SimpleNamespace(sha256=source_sha256)))
             stack.enter_context(patch.object(context_presentation, "hashlib", SimpleNamespace(sha256=observed_sha256)))
             stack.enter_context(patch.object(context_presentation, "_json", observed_json))
             stack.enter_context(patch.object(context_presentation, "_observe_context_projection", observe))

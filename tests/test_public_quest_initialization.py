@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from creation_provider_support import synthesis_result
+from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+
 import json
 import os
 import shutil
@@ -20,8 +23,6 @@ from meta_research.quest_drafting import (
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
-    ProposalDraftRequest,
-    ProposalDraftResult,
 )
 from meta_research.web import create_app
 
@@ -37,10 +38,10 @@ QUESTION = {
 
 
 class DeterministicDraftingAdapter:
-    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
         assert request.draft["goal"]
         assert request.draft["completion_criteria"]
-        return ProposalDraftResult(
+        return synthesis_result(request,
             content=QUESTION,
             adapter_kind="test_deterministic",
         )

@@ -143,15 +143,6 @@ class StartHarnessConformanceRequest(BaseModel):
 
     codex_model_ref: str = Field(default=CODEX_MODEL_REF, min_length=1, max_length=160)
     codex_auth_profile_ref: str = Field(min_length=1, max_length=160)
-    # Accepted only so an older diagnostic client does not fail at the HTTP
-    # decoder boundary.  Production selection is Codex-only and ignores them.
-    claude_model_ref: str | None = Field(
-        default=None, min_length=1, max_length=160
-    )
-    claude_auth_profile_ref: str | None = Field(
-        default=None, min_length=1, max_length=160
-    )
-
     @field_validator("codex_model_ref")
     @classmethod
     def configured_codex_model(cls, value: str) -> str:

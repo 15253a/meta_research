@@ -11,13 +11,12 @@ from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.composition import build_production_runtime
 from meta_research.harness import (
     FULL_CONFORMANCE_OPERATION_IDS,
-    FULL_CONFORMANCE_V1,
+    FULL_CONFORMANCE_V2,
     FullConformanceRequest,
     HarnessAdmissionError,
     HarnessProbeRequest,
 )
 from meta_research.harness_adapters import (
-    CLAUDE_LOCKED_VERSION,
     CODEX_LOCKED_VERSION,
     HARNESS_CAPABILITIES,
     HarnessInvocation,
@@ -33,11 +32,7 @@ class _FullConformanceAdapter:
         self, family: str, *, missing_capability: str | None = None
     ) -> None:
         self.family = family
-        self.locked_version = (
-            CODEX_LOCKED_VERSION
-            if family == "codex"
-            else CLAUDE_LOCKED_VERSION
-        )
+        self.locked_version = CODEX_LOCKED_VERSION
         self._missing_capability = missing_capability
         self.invocations: list[HarnessInvocation] = []
 
@@ -112,27 +107,24 @@ def _runtime(tmp_path: Path, *, codex_missing: str | None = None):
     codex = _FullConformanceAdapter(
         "codex", missing_capability=codex_missing
     )
-    claude = _FullConformanceAdapter("claude")
     runtime = build_production_runtime(
         data_root,
-        harness_adapters=(codex, claude),
+        harness_adapters=(codex,),
     )
-    return runtime, codex, claude
+    return runtime, codex
 
 
 def _full_request() -> FullConformanceRequest:
     return FullConformanceRequest(
         codex_model_ref=CODEX_MODEL_REF,
         codex_auth_profile_ref="harness-profile:codex-default",
-        claude_model_ref="claude-conformance",
-        claude_auth_profile_ref="harness-profile:claude-default",
     )
 
 
 def test_full_conformance_rejects_a_non_sol_codex_model_before_admission(
     tmp_path: Path,
 ) -> None:
-    runtime, _codex, _claude = _runtime(tmp_path / "wrong-codex-model")
+    runtime, _codex = _runtime(tmp_path / "wrong-codex-model")
     try:
         with pytest.raises(
             HarnessAdmissionError,
@@ -142,8 +134,6 @@ def test_full_conformance_rejects_a_non_sol_codex_model_before_admission(
                 FullConformanceRequest(
                     codex_model_ref="gpt-conformance",
                     codex_auth_profile_ref="harness-profile:codex-default",
-                    claude_model_ref="claude-conformance",
-                    claude_auth_profile_ref="harness-profile:claude-default",
                 )
             )
         assert runtime.harnesses.query_status()["conformance"][
@@ -156,7 +146,7 @@ def test_full_conformance_rejects_a_non_sol_codex_model_before_admission(
 def test_old_partial_probe_can_never_make_product_harness_ready(
     tmp_path: Path,
 ) -> None:
-    runtime, _codex, _claude = _runtime(tmp_path / "partial")
+    runtime, _codex = _runtime(tmp_path / "partial")
     try:
         admission = runtime.harnesses.admit_probe(
             HarnessProbeRequest(
@@ -190,17 +180,16 @@ def test_old_partial_probe_can_never_make_product_harness_ready(
         runtime.close()
 
 
-def test_only_one_completed_family_is_not_ready_then_both_are_ready(
+def test_selected_codex_completes_initial_and_resume_conformance(
     tmp_path: Path,
 ) -> None:
-    runtime, codex, claude = _runtime(tmp_path / "complete")
+    runtime, codex = _runtime(tmp_path / "complete")
     try:
         admitted = runtime.harnesses.start_full_conformance(_full_request())
-        assert admitted.contract_ref == FULL_CONFORMANCE_V1
+        assert admitted.contract_ref == FULL_CONFORMANCE_V2
         assert len(admitted.contract_hash) == 64
         assert {run.harness_family for run in admitted.runs} == {
             "codex",
-            "claude",
         }
         assert all(
             admitted.contract_hash in run.request_ref for run in admitted.runs
@@ -220,47 +209,35 @@ def test_only_one_completed_family_is_not_ready_then_both_are_ready(
         assert runtime.harnesses.advance_full_conformance(
             mcp_base_url="http://127.0.0.1:8765"
         )
-        one_family = runtime.harnesses.query_status()
-        assert one_family["status"] == "capability_unavailable"
-        assert [item["status"] for item in one_family["adapters"]] == [
-            "ready",
-            "capability_unavailable",
-        ]
         assert len(codex.invocations) == 2
-        assert len(claude.invocations) == 0
-
-        assert runtime.harnesses.advance_full_conformance(
-            mcp_base_url="http://127.0.0.1:8765"
-        )
-        assert runtime.harnesses.advance_full_conformance(
+        assert not runtime.harnesses.advance_full_conformance(
             mcp_base_url="http://127.0.0.1:8765"
         )
         complete = runtime.harnesses.query_status()
         assert complete["status"] == "ready"
         assert all(item["status"] == "ready" for item in complete["adapters"])
         assert complete["conformance"] == {
-            "contract_ref": FULL_CONFORMANCE_V1,
+            "contract_ref": FULL_CONFORMANCE_V2,
             "contract_hash": admitted.contract_hash,
             "conformance_ref": admitted.conformance_ref,
-            "required_families": ["codex", "claude"],
+            "required_families": ["codex"],
             "required_capabilities": list(HARNESS_CAPABILITIES),
             "required_operation_ids": list(FULL_CONFORMANCE_OPERATION_IDS),
         }
         binding = runtime.harnesses.require_full_conformance_binding()
-        assert binding.contract_ref == FULL_CONFORMANCE_V1
+        assert binding.contract_ref == FULL_CONFORMANCE_V2
         assert binding.contract_hash == admitted.contract_hash
         assert binding.conformance_ref == admitted.conformance_ref
-        assert len(binding.profile_receipts) == 2
+        assert len(binding.profile_receipts) == 1
         assert all(
             receipt.startswith(
                 f"harness-artifact:full-conformance-profile:{family}:"
             )
             for family, receipt in zip(
-                ("codex", "claude"), binding.profile_receipts, strict=True
+                ("codex",), binding.profile_receipts, strict=True
             )
         )
         assert len(binding.binding_hash) == 64
-        assert len(claude.invocations) == 2
     finally:
         runtime.close()
 
@@ -268,7 +245,7 @@ def test_only_one_completed_family_is_not_ready_then_both_are_ready(
 def test_one_missing_capability_keeps_full_matrix_unavailable(
     tmp_path: Path,
 ) -> None:
-    runtime, _codex, _claude = _runtime(
+    runtime, _codex = _runtime(
         tmp_path / "missing", codex_missing="web_fetch"
     )
     try:
@@ -280,10 +257,10 @@ def test_one_missing_capability_keeps_full_matrix_unavailable(
             runtime.harnesses.advance_full_conformance(
                 mcp_base_url="http://127.0.0.1:8765"
             )
-        assert runtime.harnesses.advance_full_conformance(
+        assert not runtime.harnesses.advance_full_conformance(
             mcp_base_url="http://127.0.0.1:8765"
         )
-        assert runtime.harnesses.advance_full_conformance(
+        assert not runtime.harnesses.advance_full_conformance(
             mcp_base_url="http://127.0.0.1:8765"
         )
 
@@ -293,7 +270,6 @@ def test_one_missing_capability_keeps_full_matrix_unavailable(
         assert status["adapters"][0]["missing_reason"] == {
             "code": "required_harness_capability_unavailable"
         }
-        assert status["adapters"][1]["status"] == "ready"
     finally:
         runtime.close()
 
@@ -327,7 +303,7 @@ def test_cli_conformance_start_posts_only_provider_configuration(
         return {
             "status": "admitted",
             "conformance_ref": "hfc_cli",
-            "contract_ref": FULL_CONFORMANCE_V1,
+            "contract_ref": FULL_CONFORMANCE_V2,
             "contract_hash": "a" * 64,
             "runs": [],
         }
@@ -341,8 +317,6 @@ def test_cli_conformance_start_posts_only_provider_configuration(
                 "start",
                 "--data-root",
                 str(data_root.root),
-                "--claude-model",
-                "claude-conformance",
                 "--json",
             ]
         )
@@ -351,18 +325,16 @@ def test_cli_conformance_start_posts_only_provider_configuration(
     assert captured["path"] == "/internal/harness-conformance"
     assert captured["method"] == "POST"
     assert captured["payload"] == {
-        "codex_model_ref": "gpt-5.6-sol",
+        "codex_model_ref": CODEX_MODEL_REF,
         "codex_auth_profile_ref": "harness-profile:codex-default",
-        "claude_model_ref": "claude-conformance",
-        "claude_auth_profile_ref": "harness-profile:claude-default",
     }
     assert "hfc_cli" in capsys.readouterr().out
 
 
-def test_internal_product_route_admits_the_fixed_two_family_set(
+def test_internal_product_route_admits_selected_codex(
     tmp_path: Path,
 ) -> None:
-    runtime, _codex, _claude = _runtime(tmp_path / "internal-route")
+    runtime, _codex = _runtime(tmp_path / "internal-route")
     base_url = "http://127.0.0.1:8765"
     client = TestClient(
         create_app(
@@ -379,8 +351,6 @@ def test_internal_product_route_admits_the_fixed_two_family_set(
             json={
                 "codex_model_ref": "gpt-conformance",
                 "codex_auth_profile_ref": "harness-profile:codex-default",
-                "claude_model_ref": "claude-conformance",
-                "claude_auth_profile_ref": "harness-profile:claude-default",
             },
         )
         assert rejected.status_code == 422
@@ -388,18 +358,15 @@ def test_internal_product_route_admits_the_fixed_two_family_set(
             "/internal/harness-conformance",
             headers={"X-Meta-Research-Control": "control-secret"},
             json={
-                "codex_model_ref": "gpt-5.6-sol",
+                "codex_model_ref": CODEX_MODEL_REF,
                 "codex_auth_profile_ref": "harness-profile:codex-default",
-                "claude_model_ref": "claude-conformance",
-                "claude_auth_profile_ref": "harness-profile:claude-default",
             },
         )
         assert response.status_code == 200
         payload = response.json()
-        assert payload["contract_ref"] == FULL_CONFORMANCE_V1
+        assert payload["contract_ref"] == FULL_CONFORMANCE_V2
         assert [run["harness_family"] for run in payload["runs"]] == [
             "codex",
-            "claude",
         ]
         assert runtime.harnesses.query_status()["status"] == (
             "capability_unavailable"
@@ -414,4 +381,44 @@ def test_internal_product_route_admits_the_fixed_two_family_set(
         assert runtime.harnesses.query_status()["status"] == "ready"
     finally:
         client.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize("field", ["claude_model_ref", "claude_auth_profile_ref"])
+def test_internal_conformance_rejects_retired_provider_fields(tmp_path, field):
+    runtime, _codex = _runtime(tmp_path / field)
+    try:
+        with TestClient(create_app(runtime, base_url="http://127.0.0.1:8765", control_key="control-secret"), base_url="http://127.0.0.1:8765") as client:
+            response = client.post("/internal/harness-conformance",
+                headers={"X-Meta-Research-Control": "control-secret"},
+                json={"codex_model_ref": CODEX_MODEL_REF,
+                      "codex_auth_profile_ref": "harness-profile:codex-default", field: "retired"})
+            assert response.status_code == 422
+            assert any(item["loc"][-1] == field and item["type"] == "extra_forbidden" for item in response.json()["detail"])
+            assert runtime.harnesses.query_status()["conformance"]["conformance_ref"] is None
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("flag", ["--claude-model", "--claude-auth-profile"])
+def test_cli_rejects_retired_provider_flags_before_sending(flag, monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("retired flag reached the daemon")
+    monkeypatch.setattr(cli, "_internal_request", unexpected)
+    with pytest.raises(SystemExit) as error:
+        cli.main(["conformance", "start", flag, "retired"])
+    assert error.value.code == 2
+
+
+def test_unselected_family_remains_rejected(tmp_path):
+    runtime, _codex = _runtime(tmp_path / "unselected")
+    try:
+        with pytest.raises(HarnessAdmissionError, match="research_harness_family_not_selected"):
+            _full_request().provider_configuration("claude")
+        with pytest.raises(HarnessAdmissionError, match="harness_probe_request_invalid"):
+            runtime.harnesses.admit_probe(HarnessProbeRequest(
+                request_ref="retired-family", harness_family="claude", model_ref="retired",
+                auth_profile_ref="retired", required_operation_ids=("research_graph.snapshot.read",),
+                required_capabilities=("native_session",)), idempotency_key="retired-family")
+    finally:
         runtime.close()

@@ -428,7 +428,6 @@ def _reasoning_runtime(
         acquisition_provider=(acquisition_provider or DeterministicAcquisitionProvider()),
         harness_adapters=(
             _FullConformanceAdapter("codex"),
-            _FullConformanceAdapter("claude"),
         ),
     )
     if runtime.harnesses.query_status()["status"] != "ready":

@@ -190,12 +190,12 @@ def test_changed_signed_source_cannot_publish_child_status(child_api, damage):
 ])
 def test_claude_verified_task_update_is_terminal_without_a_later_notification(tmp_path, native_status, expected):
     from test_child_session_native_harness_api import (
-        admit_claude_root, authenticated_client, replay_native_stream, target_root,
+        seed_historical_claude_root, authenticated_client, seed_signed_native_stream, target_root,
     )
     runtime = _bundle_runtime(tmp_path / "native-update-http")
     client = None
     try:
-        _target, run, quest = admit_claude_root(runtime)
+        _target, run, quest = seed_historical_claude_root(runtime)
         events = [
             {"type": "system", "subtype": "init", "session_id": "native-claude-root"},
             {"type": "assistant", "session_id": "native-claude-root", "parent_tool_use_id": None,
@@ -209,7 +209,7 @@ def test_claude_verified_task_update_is_terminal_without_a_later_notification(tm
                                                      "error": "private task details"}},
         ]
         source = "".join(json.dumps(event) + "\n" for event in events).encode()
-        operation, _path = replay_native_stream(runtime, run, source, "native-claude-root")
+        operation, _path = seed_signed_native_stream(runtime, run, source, "native-claude-root")
         client = authenticated_client(runtime)
         children = target_root(client, quest, run.root_session_ref)["children"]
         assert [(child["native_session_ref"], child["status"]) for child in children] == [

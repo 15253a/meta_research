@@ -181,7 +181,7 @@ def _resolve_run_variant_declarations(connection, *, runs, target):
         run["variant_ref"] = str(row[0])
 
 
-def _persist_runs(connection, *, completion, manifest, target, authority, runs, source_owner):
+def _verify_runs(connection, *, completion, manifest, target, authority, runs, source_owner):
     from meta_research.owners.research_graph import _accepted_experiment_input_binding
 
     def ensure(table, key, values):
@@ -339,7 +339,7 @@ def query_unassessed_runs(owner, target_ref):
         if runs is None:
             raise OwnerConflict("target_unassessed_execution_integrity_invalid")
         with owner._database.read() as connection:
-            records.extend(_persist_runs(connection, completion=completion, manifest=manifest,
+            records.extend(_verify_runs(connection, completion=completion, manifest=manifest,
                 target=target, authority=authority, runs=runs, source_owner=owner))
     if {record["association_ref"] for record in records} != {row["association_ref"] for row in rows}:
         raise OwnerConflict("target_unassessed_execution_integrity_invalid")
