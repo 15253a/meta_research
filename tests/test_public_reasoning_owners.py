@@ -620,6 +620,32 @@ def _accept_content(
     )
 
 
+def _accepted_root_for_owner_tests(memory, graph):
+    """Use the production HC draft/preview/confirmation before RG acceptance."""
+    from sqlalchemy import text
+    from test_public_idea_stage import (
+        _DeterministicIdeaSkill, _confirm_direct_quest, _runtime,
+    )
+
+    database = memory._database
+    with database.read() as connection:
+        initialization_id = connection.execute(text(
+            "SELECT initialization_id FROM hc_quest_initializations "
+            "WHERE status='completed' ORDER BY created_at LIMIT 1"
+        )).scalar_one_or_none()
+    if initialization_id is None:
+        runtime = _runtime(database.path.parent, _DeterministicIdeaSkill())
+        try:
+            confirmed = _confirm_direct_quest(runtime)
+            initialization_id = confirmed["initialization_id"]
+        finally:
+            runtime.close()
+    quest = graph.query_quest(initialization_id)
+    question = graph.query_question(initialization_id)
+    assert quest is not None and question is not None
+    return quest, question
+
+
 def _accept_real_root_next_cycle_content(
     memory: SQLiteResearchMemory,
     graph: SQLiteResearchGraph,
@@ -627,55 +653,7 @@ def _accept_real_root_next_cycle_content(
     submission_ref: str,
     outcome_ref: str,
 ):
-    initialization_id = f"initialization:{submission_ref}"
-    draft = {"goal": "Continue the accepted root Question."}
-    draft_hash = canonical_hash(draft)
-    question_content = {
-        "title": "A real issuer-owned root Question",
-        "unknown_statement": "Which bounded result remains unresolved?",
-        "answer_shape": "A comparison with explicit evidence boundaries.",
-        "applicability_scope": "The accepted local research scope.",
-        "background_context": "The current root Question remains open.",
-        "requirements_constraints": "Use only accepted evidence.",
-    }
-    proposal = {
-        "schema_ref": QUESTION_PROPOSAL_SCHEMA,
-        "basis_revision": 1,
-        "basis_hash": draft_hash,
-        "content": question_content,
-    }
-    proposal_hash = canonical_hash(proposal)
-    confirmation = _receipt(
-        "human_collaboration",
-        "quest_bundle_confirmation",
-        initialization_id,
-        submission_ref,
-    )
-    quest = graph.accept_quest(
-        initialization_id=initialization_id,
-        draft=draft,
-        draft_revision=1,
-        draft_hash=draft_hash,
-        proposal_ref=f"proposal:{submission_ref}",
-        proposal_hash=proposal_hash,
-        preview_ref=f"preview:{submission_ref}",
-        preview_hash=canonical_hash({"preview": submission_ref}),
-        confirmation=confirmation,
-    )
-    content = memory.accept_question_content(
-        initialization_id=initialization_id,
-        quest=quest,
-        content=question_content,
-        content_hash=canonical_hash(question_content),
-    )
-    question = graph.accept_root_question(
-        initialization_id=initialization_id,
-        quest=quest,
-        content_ref=content.content_ref,
-        content_hash=content.content_hash,
-        schema_ref=content.schema_ref,
-        content_receipt=content.receipt,
-    )
+    quest, question = _accepted_root_for_owner_tests(memory, graph)
     goal_revision = graph.query_current_quest_goal_revision(quest.quest_ref)
     assert goal_revision is not None
     graph_binding = graph.query_reasoning_research_context(
@@ -1397,23 +1375,7 @@ def test_rg_candidate_completion_rejects_goal_outside_frozen_reasoning_lineage(
 ) -> None:
     database, memory, _receipts, graph, _graph_receipts = _owners(tmp_path)
     try:
-        draft = {"goal": "Close only the exact frozen completion basis."}
-        quest = graph.accept_quest(
-            initialization_id="initialization:completion-lineage",
-            draft=draft,
-            draft_revision=1,
-            draft_hash=canonical_hash(draft),
-            proposal_ref="proposal:completion-lineage",
-            proposal_hash=canonical_hash({"proposal": "completion-lineage"}),
-            preview_ref="preview:completion-lineage",
-            preview_hash=canonical_hash({"preview": "completion-lineage"}),
-            confirmation=_receipt(
-                "human_collaboration",
-                "quest_bundle_confirmation",
-                "initialization:completion-lineage",
-                "completion-lineage",
-            ),
-        )
+        quest, _question = _accepted_root_for_owner_tests(memory, graph)
         current_goal = graph.query_current_quest_goal_revision(quest.quest_ref)
         assert current_goal is not None
 
