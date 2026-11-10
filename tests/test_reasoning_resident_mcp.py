@@ -148,7 +148,9 @@ def test_malformed_effect_admission_fails_before_provider(
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     request = replace(_request(), runtime_binding=adapter.runtime_binding())
 
-    with pytest.raises(ReasoningSkillUnavailable, match=code):
+    # The shared channel rejects descriptor drift against the exact admitted
+    # catalog hash before the role-specific descriptor checks can run.
+    with pytest.raises(ReasoningSkillUnavailable, match="semantic_mcp_channel_invalid"):
         adapter.generate_draft(request)
 
     assert runner.calls == []
@@ -246,9 +248,11 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
         )
 
         provider_runner = _SequenceRunner([_stage_output()])
-        adapter = _adapter(
-            tmp_path / "real-adapter",
-            provider_runner,
+        adapter_root = tmp_path / "real-adapter"
+        adapter_root.mkdir()
+        adapter = CodexReasoningSkillAdapter(
+            adapter_root / "provider", executable=str(_fake_codex(adapter_root / "codex")),
+            process_runner=provider_runner,
         )
         adapter.bind_full_conformance_authority(runtime.harnesses)
         binding = adapter.runtime_binding()

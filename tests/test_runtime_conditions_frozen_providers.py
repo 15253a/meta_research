@@ -46,6 +46,10 @@ def test_saved_model_changes_preserve_existing_binding_and_signed_operation(root
     reconstructed = adapter_type(workspace, executable=sys.executable, process_runner=runner)
     existing = stage_provider(reconstructed, model_ref=frozen_binding.model_ref)
     assert existing.runtime_binding() == frozen_binding
+    # Simulate loss of the derived completion checkpoint before an Owner
+    # observes it. Recovery must verify the original signed exit and rebuild
+    # that checkpoint, without sending a second physical provider call.
+    (directory / "completed.json").unlink()
     assert call(existing, "frozen-one") == first
     assert len(runner.calls) == 1
     assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == original

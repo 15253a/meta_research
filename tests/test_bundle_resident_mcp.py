@@ -131,7 +131,7 @@ def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
         assert response is not None
         assert response["error"]["code"] == "mcp_channel_authentication_required"
 
-        with pytest.raises(HarnessAdmissionError, match="attempt_fence_invalid"):
+        with pytest.raises(HarnessAdmissionError, match="root_agent_human_request_scope_stale"):
             runtime.harnesses.issue_resident_mcp_channel(
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
