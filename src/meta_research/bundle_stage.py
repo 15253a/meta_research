@@ -361,6 +361,8 @@ class BundleStageWorker:
             return True
         managed = self._agent_runtime.query_managed_run(run.run_ref)
         if managed is not None and managed["status"] not in {"running", "completed"}:
+            if managed["status"] == "suspended" and managed.get("terminal_reason") == "human_request_wait":
+                self._observation = BundleObservation("waiting", "human_request_wait")
             return False
         if run.status in {"running", "awaiting_acceptance"}:
             self._drain_bundle_inbox(run)

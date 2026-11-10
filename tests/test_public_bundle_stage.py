@@ -1836,6 +1836,9 @@ def test_rolling_worker_waits_for_native_commit_without_legacy_execution(
             request_ref
         ) is None
         assert _target_commit_count(runtime) == before
+        assert not runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.observation.kind == "waiting"
+        assert runtime.bundle_stage.observation.code in {"target_root_running", "target_launch_pending"}
     finally:
         runtime.close()
 
@@ -2521,6 +2524,13 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         assert runtime.owners.agent_runtime.query_human_request(
             request["request_ref"]
         )["status"] == "open"
+        for _ in range(8):
+            if not runtime.bundle_stage.process_once():
+                break
+        else:
+            raise AssertionError("Open HumanRequest did not settle at a waiting boundary")
+        assert runtime.bundle_stage.observation.kind == "waiting"
+        assert runtime.bundle_stage.observation.code == "human_request_wait"
 
         invalid_response = (
             runtime.owners.human_collaboration.respond_to_human_request(

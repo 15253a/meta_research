@@ -76,6 +76,8 @@ def test_bundle_stage_is_daemon_owned_and_has_a_read_only_current_endpoint(
             runtime.bundle_stage.query_current = (  # type: ignore[method-assign]
                 lambda: eligible
             )
+            with runtime._database.write() as connection:
+                runtime.feed.record(connection, "test.bundle_projection_changed", {})
             assert client.get("/api/v1/snapshot").json()["bundle_stage"] == eligible
 
             # Bundle admission and Target scheduling belong to the daemon.
@@ -131,7 +133,9 @@ def test_bundle_provider_failure_is_visible_without_hiding_partial_truth(
                 "/internal/readiness",
                 headers={"X-Meta-Research-Control": "control-secret"},
             ).json()
-            assert readiness["status"] == "ready"
+            # Internal service readiness includes every worker, whereas the
+            # public research snapshot keeps independently healthy content visible.
+            assert readiness["status"] == "unavailable"
             assert readiness["target_root"] == checks["target_root_lifecycle"]
             assert readiness["bundle_stage"] == {
                 "status": "unavailable",

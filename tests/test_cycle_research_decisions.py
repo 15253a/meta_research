@@ -187,6 +187,8 @@ def test_replan_waits_for_admitted_target_before_a_frontier_exists(tmp_path):
         assert runtime.owners.agent_runtime.query_target_frontier_entry(target.target_ref) is None
         for _ in range(3):
             assert runtime.bundle_stage.process_once() is False
+            assert runtime.bundle_stage.observation.kind == "waiting"
+            assert runtime.bundle_stage.observation.code == "bundle_replan_waiting_for_target_terminal"
         assert runtime.owners.agent_runtime.query_bundle_run_report(run.run_ref) is None
         assert runtime.owners.advancement_engine.query_bundle_stage_commit(run.request_ref) is None
         assert runtime.owners.advancement_engine.query_foreground(graph.quest_ref)["stage"] == "bundle"
