@@ -4643,13 +4643,6 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 if not isinstance(open_effect, dict)
                 else open_effect.get("operation_binding")
             )
-            legacy_acquisition_target = bool(
-                isinstance(target, dict)
-                and target.get("schema_ref")
-                == "meta-research/acquisition-human-request-target/v1"
-                and target.get("operation") == "resume_acquisition_item"
-                and isinstance(target.get("session_ref"), str)
-            )
             root_acquisition_target = bool(
                 isinstance(target, dict)
                 and target.get("schema_ref")
@@ -4662,7 +4655,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             if (
                 owner is self._agent_runtime
                 and request.get("kind") == "library_reconnect"
-                and (legacy_acquisition_target or root_acquisition_target)
+                and root_acquisition_target
                 and isinstance(responses, list)
                 and any(
                     isinstance(response, dict)
@@ -4675,10 +4668,6 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             ):
                 session = (
                     self._agent_runtime.query_acquisition_session(
-                        session_ref=cast(str, target["session_ref"])
-                    )
-                    if legacy_acquisition_target
-                    else self._agent_runtime.query_acquisition_session(
                         session_ref=cast(str, operation_binding["root_session_ref"]))
                     if operation_binding.get("root_kind") == "acquisition"
                     else self._agent_runtime.query_acquisition_session(
