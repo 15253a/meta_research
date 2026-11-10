@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from functools import partial
+
+from meta_research.stage_provider_failure import settle_stage_provider_failure
+
 from meta_research.bundle_source_projection import target_projection, target_commit_projection
 from meta_research.idea_skill import stage_provider
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
@@ -2862,18 +2866,17 @@ class BundleStageWorker:
                         provider_safe = False
                         self._observation = BundleObservation("failure", error.code)
                         return True
-                    if error.code == "codex_operation_reconciliation_pending":
-                        provider_safe = False
-                    elif error.recovery_checkpoint is not None:
-                        provider_safe = False
-                        self._agent_runtime.record_stage_provider_hard_ceiling(
+                    provider_safe = False
+                    provider_safe = settle_stage_provider_failure(
+                        error,
+                        partial(
+                            self._agent_runtime.record_stage_provider_hard_ceiling,
                             unit_ref=unit_ref,
                             run_ref=run.run_ref,
                             attempt_ref=run.attempt_ref,
                             fence_ref=run.fence_ref,
-                            failure_code=error.code,
-                            provider_exit=error.recovery_checkpoint,
-                        )
+                        ),
+                    )
                     self._observation = BundleObservation("failure", error.code)
                     return False
                 except RecoverableBundleSkillCandidateError as error:

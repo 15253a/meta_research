@@ -8300,14 +8300,46 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         except RuntimeProtectionUnavailable as error:
             raise OwnerConflict(error.code) from error
 
-    def reject_stage_completion_candidate(self, **kwargs) -> RootCompletionRejection:
+    def reject_stage_completion_candidate(
+        self, *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        candidate: dict[str, object],
+        reason_code: str,
+        detail_code: str,
+        feedback: tuple[str, ...],
+    ) -> RootCompletionRejection:
         """Reject an actual, active provider completion before primary sealing."""
-        return self._reject_stage_completion_candidate(**kwargs)
+        return self._reject_stage_completion_candidate(
+            unit_ref=unit_ref, run_ref=run_ref, attempt_ref=attempt_ref,
+            fence_ref=fence_ref, native_session_ref=native_session_ref,
+            candidate=candidate, reason_code=reason_code,
+            detail_code=detail_code, feedback=feedback,
+        )
 
-    def reject_stage_local_candidate(self, *, primary_draft_hash: str, **kwargs) -> RootCompletionRejection:
+    def reject_stage_local_candidate(
+        self, *,
+        primary_draft_hash: str,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        candidate: dict[str, object],
+        reason_code: str,
+        detail_code: str,
+        feedback: tuple[str, ...],
+    ) -> RootCompletionRejection:
         """Reject local validation of an exact persisted primary without changing it."""
         return self._reject_stage_completion_candidate(
-            primary_draft_hash=primary_draft_hash, **kwargs
+            primary_draft_hash=primary_draft_hash,
+            unit_ref=unit_ref, run_ref=run_ref, attempt_ref=attempt_ref,
+            fence_ref=fence_ref, native_session_ref=native_session_ref,
+            candidate=candidate, reason_code=reason_code,
+            detail_code=detail_code, feedback=feedback,
         )
 
     def _reject_stage_completion_candidate(
@@ -8357,7 +8389,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         now = time.time()
         effect: RuntimeEffectIdentity | None = None
         rejected_attempt_ref: str | None = None
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             control = connection.execute(
                 text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
                 {"run_ref": run_ref},
