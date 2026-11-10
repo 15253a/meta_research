@@ -277,6 +277,9 @@ def _transport_contract_codex(
         "if '--version' in sys.argv:\n"
         "    print('codex-cli 0.156.1')\n"
         "    raise SystemExit(0)\n"
+        "if 'features' in sys.argv and 'list' in sys.argv:\n"
+        "    print('multi_agent stable true')\n"
+        "    raise SystemExit(0)\n"
         "sys.stdin.buffer.read()\n"
         f"counter = Path({str(call_counter)!r})\n"
         "count = int(counter.read_text()) if counter.exists() else 0\n"
@@ -823,7 +826,11 @@ def test_idea_known_terminal_failure_preserves_evidence_and_creates_successor(
     try:
         _confirm_question(runtime)
         runtime.idea_stage.start("idea-terminal-failure-start")
-        before = runtime.idea_stage.query_current()["run"]
+        original_view = runtime.idea_stage.query_current()
+        before = original_view["run"]
+        request_ref = original_view["stage_run_request"]["request_ref"]
+        original_run = runtime.owners.agent_runtime.query_idea_stage_run(request_ref)
+        assert original_run is not None
         assert not runtime.idea_stage.process_once()
         run = runtime.idea_stage.query_current()["run"]
         assert run["status"] == "admitted"
@@ -835,9 +842,10 @@ def test_idea_known_terminal_failure_preserves_evidence_and_creates_successor(
         assert checkpoint["action"] == "provider_result_correction"
         assert checkpoint["attempt_ref"] == before["attempt_ref"]
         assert checkpoint["provider_exit"] == _signed_ceiling_evidence(termination_reason)
-        original = before["provider_operations"]["primary"]
-        assert run["provider_operations"]["primary"]["operation_ref"] != original["operation_ref"]
-        rows = _provider_terminal_rows(runtime, original["operation_ref"])
+        successor = runtime.owners.agent_runtime.query_idea_stage_run(request_ref)
+        assert successor is not None
+        assert successor.primary_invocation.operation_ref != original_run.primary_invocation.operation_ref
+        rows = _provider_terminal_rows(runtime, original_run.primary_invocation.operation_ref)
         assert any(row[1] == "completed" for row in rows["units"])
         assert any(row[1:3] == ("finished", "terminal") for row in rows["responsibilities"])
         assert provider.generate_calls == 1
@@ -1408,7 +1416,7 @@ def test_plan_native_session_transport_failure_is_terminal_without_replay(
         "codex_native_session_mismatch",
     ],
 )
-def test_plan_restart_terminalizes_preexisting_native_session_failure(
+def test_plan_restart_rejects_rebinding_preexisting_native_session_failure(
     tmp_path: Path,
     detail_code: str,
 ) -> None:
@@ -1458,6 +1466,11 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
         exit_marker = json.loads(
             (operation / "exit.json").read_text(encoding="utf-8")
         )
+        original_files = {name: (operation / name).read_bytes() for name in (
+            "invocation.json", "prompt.txt", "output-schema.json", "stdout.jsonl",
+            "last-message.json", "supervisor-exit.json", "exit.json",
+        )}
+        calls_before_restart = call_counter.read_text(encoding="utf-8")
         assert not (operation / "completed.json").exists()
         operation_ref = run.primary_invocation.operation_ref
         interrupted = _provider_terminal_rows(runtime, operation_ref)
@@ -1478,11 +1491,15 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
         assert blocked["status"] == "admitted"
         assert blocked["attempt_ref"] != run.attempt_ref
         assert blocked["root_session_ref"] == run.root_session_ref
-        checkpoint = _managed_checkpoint(restarted, run.run_ref)
-        assert checkpoint["action"] == "provider_result_correction"
-        assert checkpoint["attempt_ref"] == run.attempt_ref
-        provider_exit = checkpoint["provider_exit"]
-        assert provider_exit == first_checkpoint
+        # Orderly shutdown revoked the active unit. Its replacement cannot
+        # rebind the signed operation's original guidance/fence to a new scope.
+        assert restarted.plan_stage.transient_error == "codex_operation_identity_conflict"
+        assert blocked["recovery_checkpoint"] is None
+        assert blocked["completion_rejection"] is None
+        assert blocked["attempt_execution_receipt"] is None
+        assert blocked["primary_draft_checkpoint"] is None
+        from meta_research.sealed_provider_operations import write_exit_marker
+        provider_exit = write_exit_marker(operation, invocation_hash=first_checkpoint["invocation_hash"])
         for field in (
             "invocation_hash",
             "prompt_hash",
@@ -1492,15 +1509,24 @@ def test_plan_restart_terminalizes_preexisting_native_session_failure(
             "supervisor_receipt_hash",
         ):
             assert provider_exit[field] == exit_marker[field]
+            assert provider_exit[field] == first_checkpoint[field]
         terminal_rows = _provider_terminal_rows(restarted, operation_ref)
-        assert any(row[1] == "completed" for row in terminal_rows["units"])
-        calls_after_restart_fence = call_counter.read_text(encoding="utf-8")
+        assert any(row[0] == run.primary_invocation.invocation_ref and row[1] == "revoked"
+                   for row in terminal_rows["units"])
+        assert call_counter.read_text(encoding="utf-8") == calls_before_restart
 
-        assert _managed_checkpoint(restarted, run.run_ref) == checkpoint
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert call_counter.read_text(encoding="utf-8") == (
-            calls_after_restart_fence
-        )
+        assert not restarted.plan_stage.process_once()
+        assert restarted.plan_stage.transient_error == "codex_operation_identity_conflict"
+        after_retry = _provider_terminal_rows(restarted, operation_ref)
+        original_unit = lambda rows: next(row for row in rows["units"]
+            if row[0] == run.primary_invocation.invocation_ref)
+        assert original_unit(after_retry) == original_unit(terminal_rows)
+        assert set(terminal_rows["responsibilities"]).issubset(after_retry["responsibilities"])
+        assert set(terminal_rows["receipts"]).issubset(after_retry["receipts"])
+        assert all(row[1] in {"completed", "revoked"} for row in after_retry["units"])
+        assert call_counter.read_text(encoding="utf-8") == calls_before_restart
+        assert {name: (operation / name).read_bytes() for name in original_files} == original_files
+        assert not (operation / "completed.json").exists()
     finally:
         restarted.close()
 
