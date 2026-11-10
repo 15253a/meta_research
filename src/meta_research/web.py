@@ -2500,7 +2500,7 @@ def create_app(
     @app.get("/api/v1/quests/{quest_ref}/runtime-conditions")
     def get_runtime_conditions(quest_ref: str) -> dict[str, object]:
         from meta_research.runtime_conditions import read_runtime_conditions
-        return read_runtime_conditions(runtime.data_root.root, quest_ref)
+        return read_runtime_conditions(runtime.data_root.root, quest_ref, database=runtime._database)
 
     @app.get("/api/v1/quests/{quest_ref}/research-time")
     def get_research_time(quest_ref: str) -> dict[str, object]:
@@ -2536,7 +2536,7 @@ def create_app(
     def put_runtime_conditions(quest_ref: str, conditions: RuntimeConditionsRequest) -> dict[str, object]:
         from meta_research.runtime_conditions import save_runtime_conditions
         return save_runtime_conditions(runtime.data_root.root, quest_ref,
-                                       **conditions.model_dump())
+                                       database=runtime._database, **conditions.model_dump())
 
     @app.put("/api/v1/preferences")
     def set_preferences(preference: OutputLanguagePreference) -> dict[str, object]:

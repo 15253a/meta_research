@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from contextlib import closing
+from contextlib import contextmanager
 from pathlib import Path
-import sqlite3
-import threading
 import time
 
 from sqlalchemy import text as sql_text
@@ -14,10 +12,9 @@ from sqlalchemy import text as sql_text
 from meta_research.codex_runtime import DEFAULT_STAGE_MODEL, RESEARCH_STAGES, SUPPORTED_CODEX_MODEL_REFS
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.research_style import validate_research_style, render_research_style
-from meta_research.quest_research_time import read_quest_research_time
+from meta_research.quest_research_time import read_quest_research_time_in_transaction
 
 
-_LOCK = threading.RLock()
 _PREFIX = "[meta-research runtime conditions v1; characters="
 _LIMIT = 24000
 _INIT_PREFIX = "initialization:"
@@ -29,11 +26,21 @@ def _data_root(workspace: Path) -> Path | None:
                  if (path / "data-root.json").is_file()), None)
 
 
-def _initial_conditions(root: Path, *, quest_ref=None, run_ref=None,
+@contextmanager
+def _conditions_database(root: Path, database=None):
+    if database is not None:
+        yield database
+        return
+    from meta_research.database import Database
+    owned = Database(root / "meta-research.sqlite3")
+    try:
+        yield owned
+    finally:
+        owned.close()
+
+
+def _initial_conditions(db, *, quest_ref=None, run_ref=None,
                         initialization_id=None, target_ref=None):
-    database = root / "meta-research.sqlite3"
-    if not database.is_file():
-        return None
     def agree(left, right):
         if left is not None and right is not None and left != right:
             raise OwnerConflict("runtime_conditions_scope_conflict")
@@ -45,91 +52,88 @@ def _initial_conditions(root: Path, *, quest_ref=None, run_ref=None,
     for ref in (quest_ref, run_ref, initialization_id, target_ref):
         if ref is not None and (not isinstance(ref, str) or not ref or len(ref) > 160):
             raise OwnerConflict("runtime_conditions_scope_invalid")
-    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA query_only=ON")
-        db.execute("BEGIN")
-        if run_ref is not None:
-            row = db.execute("SELECT quest_ref FROM ar_run_controls WHERE run_ref=?", (run_ref,)).fetchone()
-            if row is not None:
-                quest_ref = agree(quest_ref, row["quest_ref"])
-            # Target Harness runs need not have an ar_run_controls row. Read
-            # their frozen request identity, never infer scope from the worker.
-            harness = db.execute("SELECT request_json,request_hash FROM ar_harness_runs WHERE run_ref=?",
-                                 (run_ref,)).fetchone()
-            if harness is not None:
-                try:
-                    request = json.loads(harness["request_json"])
-                except (ValueError, TypeError) as error:
-                    raise OwnerConflict("runtime_conditions_run_invalid") from error
-                if (not isinstance(request, dict)
-                        or canonical_hash(request) != harness["request_hash"]):
-                    raise OwnerConflict("runtime_conditions_run_invalid")
-                if "target_ref" in request or "target_run_ref" in request:
-                    if (request.get("target_run_ref") != run_ref
-                            or not isinstance(request.get("target_ref"), str)
-                            or not request["target_ref"]):
-                        raise OwnerConflict("runtime_conditions_run_invalid")
-                    target_ref = agree(target_ref, request["target_ref"])
-            # Initial DeepFetch has no accepted Quest yet. Later DeepFetch uses
-            # the manual request table; neither may inherit the foreground Quest.
-            deepfetch = db.execute(
-                "SELECT d.initialization_id,NULL AS quest_ref FROM ar_deepfetch_runs r "
-                "JOIN hc_deepfetch_requests d ON d.request_ref=r.request_ref WHERE r.run_ref=? "
-                "UNION ALL SELECT d.initialization_id,d.quest_ref FROM ar_deepfetch_runs r "
-                "JOIN hc_manual_deepfetch_requests d ON d.request_ref=r.request_ref WHERE r.run_ref=?",
-                (run_ref, run_ref),
-            ).fetchall()
-            if row is None and harness is None and not deepfetch:
-                raise OwnerConflict("runtime_conditions_run_not_found")
-            for item in deepfetch:
-                initialization_id = agree(initialization_id, item["initialization_id"])
-                quest_ref = agree(quest_ref, item["quest_ref"])
-        if target_ref is not None:
-            row = db.execute("SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g "
-                             "ON g.graph_ref=t.graph_ref WHERE t.target_ref=?", (target_ref,)).fetchone()
-            if row is None:
-                raise OwnerConflict("runtime_conditions_target_not_found")
+    if run_ref is not None:
+        row = db.exec_driver_sql("SELECT quest_ref FROM ar_run_controls WHERE run_ref=?", (run_ref,)).mappings().fetchone()
+        if row is not None:
             quest_ref = agree(quest_ref, row["quest_ref"])
-        if initialization_id is not None:
-            row = db.execute("SELECT quest_ref FROM rg_quests WHERE initialization_id=?",
-                             (initialization_id,)).fetchone()
-            if row is not None:
-                quest_ref = agree(quest_ref, row["quest_ref"])
-        if quest_ref is not None:
-            row = db.execute("SELECT initialization_id,goal_json,draft_hash FROM rg_quests WHERE quest_ref=?", (quest_ref,)).fetchone()
-            if row is None:
-                raise OwnerConflict("runtime_conditions_quest_not_found")
-            initialization_id = agree(initialization_id, row["initialization_id"])
-            encoded, draft_hash = row["goal_json"], row["draft_hash"]
-        elif initialization_id is not None:
-            row = db.execute("SELECT draft_json,draft_hash FROM hc_quest_initializations WHERE initialization_id=?", (initialization_id,)).fetchone()
-            if row is None:
-                raise OwnerConflict("runtime_conditions_initialization_not_found")
-            encoded, draft_hash = row["draft_json"], row["draft_hash"]
-        else:
-            return None
-        try:
-            draft = json.loads(encoded)
-        except (ValueError, TypeError) as error:
-            raise OwnerConflict("runtime_conditions_draft_invalid") from error
-        if not isinstance(draft, dict) or canonical_hash(draft) != draft_hash:
-            raise OwnerConflict("runtime_conditions_draft_invalid")
-        envelope = None
-        if bool(draft.get("resource_envelope_ref")) != bool(draft.get("resource_envelope_hash")):
-            raise OwnerConflict("runtime_conditions_resource_invalid")
-        if draft.get("resource_envelope_ref"):
-            row = db.execute("SELECT envelope_json,envelope_hash FROM hc_resource_envelopes "
-                             "WHERE envelope_ref=? AND initialization_id=?",
-                             (draft["resource_envelope_ref"], initialization_id)).fetchone()
-            if row is None or row["envelope_hash"] != draft.get("resource_envelope_hash"):
-                raise OwnerConflict("runtime_conditions_resource_invalid")
+        # Target Harness runs need not have an ar_run_controls row. Read
+        # their frozen request identity, never infer scope from the worker.
+        harness = db.exec_driver_sql("SELECT request_json,request_hash FROM ar_harness_runs WHERE run_ref=?",
+                             (run_ref,)).mappings().fetchone()
+        if harness is not None:
             try:
-                envelope = json.loads(row["envelope_json"])
+                request = json.loads(harness["request_json"])
             except (ValueError, TypeError) as error:
-                raise OwnerConflict("runtime_conditions_resource_invalid") from error
-            if not isinstance(envelope, dict) or canonical_hash(envelope) != row["envelope_hash"]:
-                raise OwnerConflict("runtime_conditions_resource_invalid")
+                raise OwnerConflict("runtime_conditions_run_invalid") from error
+            if (not isinstance(request, dict)
+                    or canonical_hash(request) != harness["request_hash"]):
+                raise OwnerConflict("runtime_conditions_run_invalid")
+            if "target_ref" in request or "target_run_ref" in request:
+                if (request.get("target_run_ref") != run_ref
+                        or not isinstance(request.get("target_ref"), str)
+                        or not request["target_ref"]):
+                    raise OwnerConflict("runtime_conditions_run_invalid")
+                target_ref = agree(target_ref, request["target_ref"])
+        # Initial DeepFetch has no accepted Quest yet. Later DeepFetch uses
+        # the manual request table; neither may inherit the foreground Quest.
+        deepfetch = db.exec_driver_sql(
+            "SELECT d.initialization_id,NULL AS quest_ref FROM ar_deepfetch_runs r "
+            "JOIN hc_deepfetch_requests d ON d.request_ref=r.request_ref WHERE r.run_ref=? "
+            "UNION ALL SELECT d.initialization_id,d.quest_ref FROM ar_deepfetch_runs r "
+            "JOIN hc_manual_deepfetch_requests d ON d.request_ref=r.request_ref WHERE r.run_ref=?",
+            (run_ref, run_ref),
+        ).mappings().fetchall()
+        if row is None and harness is None and not deepfetch:
+            raise OwnerConflict("runtime_conditions_run_not_found")
+        for item in deepfetch:
+            initialization_id = agree(initialization_id, item["initialization_id"])
+            quest_ref = agree(quest_ref, item["quest_ref"])
+    if target_ref is not None:
+        row = db.exec_driver_sql("SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g "
+                         "ON g.graph_ref=t.graph_ref WHERE t.target_ref=?", (target_ref,)).mappings().fetchone()
+        if row is None:
+            raise OwnerConflict("runtime_conditions_target_not_found")
+        quest_ref = agree(quest_ref, row["quest_ref"])
+    if initialization_id is not None:
+        row = db.exec_driver_sql("SELECT quest_ref FROM rg_quests WHERE initialization_id=?",
+                         (initialization_id,)).mappings().fetchone()
+        if row is not None:
+            quest_ref = agree(quest_ref, row["quest_ref"])
+    if quest_ref is not None:
+        row = db.exec_driver_sql("SELECT initialization_id,goal_json,draft_hash,draft_revision FROM rg_quests WHERE quest_ref=?", (quest_ref,)).mappings().fetchone()
+        if row is None:
+            raise OwnerConflict("runtime_conditions_quest_not_found")
+        initialization_id = agree(initialization_id, row["initialization_id"])
+        encoded, draft_hash = row["goal_json"], row["draft_hash"]
+    elif initialization_id is not None:
+        row = db.exec_driver_sql("SELECT draft_json,draft_hash,draft_revision FROM hc_quest_initializations WHERE initialization_id=?", (initialization_id,)).mappings().fetchone()
+        if row is None:
+            raise OwnerConflict("runtime_conditions_initialization_not_found")
+        encoded, draft_hash = row["draft_json"], row["draft_hash"]
+    else:
+        return None
+    draft_revision = row["draft_revision"]
+    try:
+        draft = json.loads(encoded)
+    except (ValueError, TypeError) as error:
+        raise OwnerConflict("runtime_conditions_draft_invalid") from error
+    if not isinstance(draft, dict) or canonical_hash(draft) != draft_hash:
+        raise OwnerConflict("runtime_conditions_draft_invalid")
+    envelope = None
+    if bool(draft.get("resource_envelope_ref")) != bool(draft.get("resource_envelope_hash")):
+        raise OwnerConflict("runtime_conditions_resource_invalid")
+    if draft.get("resource_envelope_ref"):
+        row = db.exec_driver_sql("SELECT envelope_json,envelope_hash FROM hc_resource_envelopes "
+                         "WHERE envelope_ref=? AND initialization_id=?",
+                         (draft["resource_envelope_ref"], initialization_id)).mappings().fetchone()
+        if row is None or row["envelope_hash"] != draft.get("resource_envelope_hash"):
+            raise OwnerConflict("runtime_conditions_resource_invalid")
+        try:
+            envelope = json.loads(row["envelope_json"])
+        except (ValueError, TypeError) as error:
+            raise OwnerConflict("runtime_conditions_resource_invalid") from error
+        if not isinstance(envelope, dict) or canonical_hash(envelope) != row["envelope_hash"]:
+            raise OwnerConflict("runtime_conditions_resource_invalid")
     values = {key: draft[key] for key in ("time_budget", "key_configuration")
               if draft.get(key) is not None}
     literature = draft.get("literature")
@@ -159,11 +163,6 @@ def _initial_conditions(root: Path, *, quest_ref=None, run_ref=None,
     )
     scope = quest_ref or _INIT_PREFIX + initialization_id
     style = validate_research_style(draft.get('research_style', 'balanced'))
-    # An accepted Quest inherits edits made during its own initialization. A
-    # Quest-specific save then takes precedence without changing accepted facts.
-    if quest_ref is not None:
-        inherited = _read(root, _INIT_PREFIX + initialization_id, initial_text, style)
-        initial_text, style = inherited['text'], inherited['research_style']
     configuration = {"mode": literature.get("mode", "oa_only"),
                      "library_entry_url": literature.get("library_entry_url", ""),
                      "institution_required": literature.get("institution_required", False)} if isinstance(literature, dict) else None
@@ -174,7 +173,7 @@ def _initial_conditions(root: Path, *, quest_ref=None, run_ref=None,
             # Historical conditions remain readable; invalid private connection
             # data is never promoted to a newly editable configuration.
             configuration = None
-    return scope, initial_text, style, configuration
+    return scope, initial_text, style, configuration, draft_revision, draft_hash
 
 
 def _literature_configuration(value):
@@ -205,10 +204,11 @@ def selected_stage_model(workspace: Path, stage: str, *, quest_ref=None, run_ref
     root = _data_root(workspace)
     if root is None or not any((quest_ref, run_ref, target_ref)):
         return default
-    initial = _initial_conditions(root, quest_ref=quest_ref, run_ref=run_ref, target_ref=target_ref)
-    if initial is None:
-        return default
-    return _stage_models(_read(root, *initial).get("stage_models"))[stage]
+    with _conditions_database(root) as database, database.read_snapshot() as connection:
+        initial = _initial_conditions(connection, quest_ref=quest_ref, run_ref=run_ref, target_ref=target_ref)
+        if initial is None:
+            return default
+        return _stage_models(_read(connection, *initial).get("stage_models"))[stage]
 
 
 def _value(quest_ref: str, text: str, research_style: str = 'balanced', literature_configuration=None, stage_models=None) -> dict[str, object]:
@@ -219,29 +219,6 @@ def _value(quest_ref: str, text: str, research_style: str = 'balanced', literatu
     if stage_models is not None:
         fields['stage_models'] = _stage_models(stage_models)
     return {**fields, 'revision': canonical_hash(fields)}
-
-
-def _legacy_value(
-    root: Path, quest_ref: str, default_text: str, default_style: str
-) -> tuple[dict[str, str], str]:
-    path = root / "runtime-conditions" / (canonical_hash(quest_ref) + ".json")
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return _value(quest_ref, default_text, default_style), "initial_default"
-    except (ValueError, UnicodeError) as error:
-        raise OwnerConflict("runtime_conditions_invalid") from error
-    if (not isinstance(saved, dict) or saved.get("quest_ref") != quest_ref
-            or not isinstance(saved.get("text"), str) or len(saved["text"]) > _LIMIT):
-        raise OwnerConflict("runtime_conditions_invalid")
-    if 'research_style' not in saved:
-        legacy = {'quest_ref': quest_ref, 'text': saved['text']}
-        if saved != {**legacy, 'revision': canonical_hash(legacy)}:
-            raise OwnerConflict('runtime_conditions_invalid')
-        return _value(quest_ref, saved['text'], default_style), "legacy_file"
-    if saved != _value(quest_ref, saved['text'], saved['research_style']):
-        raise OwnerConflict('runtime_conditions_invalid')
-    return saved, "legacy_file"
 
 
 def _stored_value(scope: str, encoded: str, revision: str) -> dict[str, str]:
@@ -266,68 +243,44 @@ def _stored_value(scope: str, encoded: str, revision: str) -> dict[str, str]:
     return expected
 
 
-def _read(
-    root: Path, quest_ref: str, default_text: str, default_style: str = "balanced", default_literature=None
-) -> dict[str, str]:
-    def with_library(value):
-        # Existing stored revisions remain valid. Their fallback is the immutable
-        # accepted Quest draft; the next explicit save versions the configuration.
-        if "literature_configuration" not in value and default_literature is not None:
-            return {**value, "literature_configuration": default_literature}
-        return value
-    database = root / "meta-research.sqlite3"
-    with closing(sqlite3.connect(database)) as db:
-        db.row_factory = sqlite3.Row
-        row = db.execute(
-            "SELECT v.value_json,v.revision FROM hc_runtime_condition_heads h "
-            "JOIN hc_runtime_condition_versions v ON v.scope_ref=h.scope_ref "
-            "AND v.revision=h.current_revision WHERE h.scope_ref=?",
-            (quest_ref,),
-        ).fetchone()
-        if row is not None:
-            return with_library(_stored_value(quest_ref, row["value_json"], row["revision"]))
-    imported, source_kind = _legacy_value(
-        root, quest_ref, default_text, default_style
-    )
-    with closing(sqlite3.connect(database, timeout=5.0)) as db:
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA busy_timeout=5000")
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute(
-            "SELECT v.value_json,v.revision FROM hc_runtime_condition_heads h "
-            "JOIN hc_runtime_condition_versions v ON v.scope_ref=h.scope_ref "
-            "AND v.revision=h.current_revision WHERE h.scope_ref=?",
-            (quest_ref,),
-        ).fetchone()
-        if row is None:
-            now = time.time()
-            db.execute(
-                "INSERT INTO hc_runtime_condition_versions "
-                "(scope_ref,revision,value_json,source_kind,created_at) "
-                "VALUES (?,?,?,?,?)",
-                (
-                    quest_ref,
-                    imported["revision"],
-                    json.dumps(
-                        imported,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                    source_kind,
-                    now,
-                ),
-            )
-            db.execute(
-                "INSERT INTO hc_runtime_condition_heads "
-                "(scope_ref,current_revision,updated_at) VALUES (?,?,?)",
-                (quest_ref, imported["revision"], now),
-            )
-            db.commit()
-            return with_library(imported)
-        db.commit()
-        return with_library(_stored_value(quest_ref, row["value_json"], row["revision"]))
+def _read(connection, scope: str, default_text: str, default_style: str,
+          default_literature, draft_revision: int, draft_hash: str):
+    row = connection.execute(sql_text(
+        "SELECT v.value_json,v.revision FROM hc_runtime_condition_heads h "
+        "JOIN hc_runtime_condition_versions v ON v.scope_ref=h.scope_ref "
+        "AND v.revision=h.current_revision WHERE h.scope_ref=:scope"
+    ), {"scope": scope}).first()
+    if row is not None:
+        return _stored_value(scope, row.value_json, row.revision)
+    if not scope.startswith(_INIT_PREFIX):
+        raise OwnerConflict("runtime_conditions_unseeded")
+    value = _value(scope, default_text, default_style, default_literature, _stage_models(None))
+    # A default belongs to this exact editable draft even when its effective
+    # resource text happens to be unchanged. It is never persisted by a read.
+    value["revision"] = canonical_hash({**value, "draft_revision": draft_revision,
+                                        "draft_hash": draft_hash})
+    return value
+
+
+def materialize_quest_conditions(connection, *, initialization_id: str,
+                                 quest_ref: str, draft_revision: int, draft_hash: str):
+    initial = _initial_conditions(connection, initialization_id=initialization_id)
+    if initial is None or initial[0] != _INIT_PREFIX + initialization_id or initial[-2:] != (draft_revision, draft_hash):
+        raise OwnerConflict("quest_draft_stale")
+    current = _read(connection, *initial)
+    saved = _value(quest_ref, current["text"], current["research_style"],
+                   current.get("literature_configuration"), current.get("stage_models"))
+    now = time.time()
+    connection.execute(sql_text(
+        "INSERT INTO hc_runtime_condition_versions "
+        "(scope_ref,revision,value_json,source_kind,created_at) VALUES "
+        "(:scope,:revision,:value,'initial_default',:now)"
+    ), {"scope": quest_ref, "revision": saved["revision"], "value": json.dumps(
+        saved, ensure_ascii=False, sort_keys=True, separators=(",", ":")), "now": now})
+    connection.execute(sql_text(
+        "INSERT INTO hc_runtime_condition_heads (scope_ref,current_revision,updated_at) "
+        "VALUES (:scope,:revision,:now)"
+    ), {"scope": quest_ref, "revision": saved["revision"], "now": now})
 
 
 def read_runtime_conditions_in_transaction(
@@ -357,22 +310,23 @@ def read_runtime_conditions_in_transaction(
     return _stored_value(quest_ref, row.value_json, row.revision)
 
 
-def read_runtime_conditions(workspace: Path, quest_ref: str) -> dict[str, object]:
+def read_runtime_conditions(workspace: Path, quest_ref: str, *, database=None) -> dict[str, object]:
     root = _data_root(workspace)
     if root is None:
         raise OwnerConflict("runtime_conditions_unavailable")
-    initial = _initial_conditions(root, quest_ref=quest_ref)
-    if initial is None:
-        raise OwnerConflict("runtime_conditions_quest_not_found")
-    return _editable_conditions(_read(root, *initial))
+    with _conditions_database(root, database) as database, database.read_snapshot() as connection:
+        initial = _initial_conditions(connection, quest_ref=quest_ref)
+        if initial is None:
+            raise OwnerConflict("runtime_conditions_quest_not_found")
+        return _editable_conditions(_read(connection, *initial))
 
 
-def _with_research_time(root: Path, value):
+def _with_research_time(connection, value):
     # A live clock observation is not part of the editable scientific conditions
     # revision. Replaying a provider operation retains its first observation.
     if str(value["quest_ref"]).startswith(_INIT_PREFIX):
         return value
-    return {**value, "research_time": read_quest_research_time(root, value["quest_ref"])}
+    return {**value, "research_time": read_quest_research_time_in_transaction(connection, value["quest_ref"])}
 
 
 def _editable_conditions(value):
@@ -383,69 +337,72 @@ def _editable_conditions(value):
 def save_runtime_conditions(workspace: Path, quest_ref: str, *, text: str,
                             expected_revision: str, research_style: str | None = None,
                             literature_configuration=None, stage_models=None,
-                            time_budget_change=None) -> dict[str, object]:
+                            time_budget_change=None, database=None) -> dict[str, object]:
     if not isinstance(text, str) or not text.strip() or len(text) > _LIMIT:
         raise OwnerConflict("runtime_conditions_text_invalid")
-    with _LOCK:
-        current = read_runtime_conditions(workspace, quest_ref)
-        if time_budget_change is None and expected_revision != current["revision"]:
-            raise OwnerConflict("runtime_conditions_stale")
-        root = _data_root(workspace)
-        assert root is not None
-        scope = current["quest_ref"]
-        saved = _value(scope, text, current['research_style'] if research_style is None else research_style,
-                       current.get("literature_configuration") if literature_configuration is None else literature_configuration,
-                       current["stage_models"] if stage_models is None else stage_models)
-        from meta_research.database import Database
-        database = Database(root / "meta-research.sqlite3")
-        try:
-            with database.fenced_write() as db:
-                approval_ref = None
-                if time_budget_change is not None:
-                    if (not isinstance(time_budget_change, dict)
-                            or set(time_budget_change) != {"expected_revision", "total_seconds"}
-                            or not isinstance(time_budget_change["expected_revision"], str)
-                            or scope.startswith(_INIT_PREFIX)):
-                        raise OwnerConflict("quest_time_budget_change_invalid")
-                    # The full human submission is the effect identity, including
-                    # the runtime-condition edit committed in this transaction.
-                    approval_ref = "conditions-time:" + canonical_hash({
-                        "quest_ref": scope, "text": text, "expected_revision": expected_revision,
-                        "research_style": research_style, "literature_configuration": literature_configuration,
-                        "stage_models": stage_models, "time_budget_change": time_budget_change,
-                    })
-                    replay = db.execute(sql_text(
-                        "SELECT response_ref FROM ae_quest_time_budget_approvals WHERE approval_ref=:ref"
-                    ), {"ref": approval_ref}).first()
-                    if replay is not None:
-                        recorded = read_runtime_conditions_in_transaction(db, scope, revision=replay.response_ref)
-                        return _editable_conditions(recorded)
-                head = db.execute(sql_text(
-                    "SELECT current_revision FROM hc_runtime_condition_heads WHERE scope_ref=:scope"
-                ), {"scope": scope}).first()
-                if head is None or head.current_revision != expected_revision:
-                    raise OwnerConflict("runtime_conditions_stale")
-                if approval_ref is not None:
-                    from meta_research.quest_research_time import apply_quest_time_budget
-                    apply_quest_time_budget(db, quest_ref=scope,
-                        expected_revision=time_budget_change["expected_revision"],
-                        approval_ref=approval_ref, request_ref="human-runtime-conditions",
-                        response_ref=saved["revision"], new_total_seconds=time_budget_change["total_seconds"])
-                now = time.time()
-                db.execute(sql_text(
-                    "INSERT OR IGNORE INTO hc_runtime_condition_versions "
-                    "(scope_ref,revision,value_json,source_kind,created_at) "
-                    "VALUES (:scope,:revision,:value,'human_update',:now)"
-                ), {"scope": scope, "revision": saved["revision"], "value": json.dumps(
-                    saved, ensure_ascii=False, sort_keys=True, separators=(",", ":")), "now": now})
+    root = _data_root(workspace)
+    if root is None:
+        raise OwnerConflict("runtime_conditions_unavailable")
+    with _conditions_database(root, database) as database:
+        with database.fenced_write() as db:
+            initial = _initial_conditions(db, quest_ref=quest_ref)
+            if initial is None:
+                raise OwnerConflict("runtime_conditions_quest_not_found")
+            current = _editable_conditions(_read(db, *initial))
+            scope = current["quest_ref"]
+            saved = _value(scope, text, current['research_style'] if research_style is None else research_style,
+                           current.get("literature_configuration") if literature_configuration is None else literature_configuration,
+                           current["stage_models"] if stage_models is None else stage_models)
+            approval_ref = None
+            if time_budget_change is not None:
+                if (not isinstance(time_budget_change, dict)
+                        or set(time_budget_change) != {"expected_revision", "total_seconds"}
+                        or not isinstance(time_budget_change["expected_revision"], str)
+                        or scope.startswith(_INIT_PREFIX)):
+                    raise OwnerConflict("quest_time_budget_change_invalid")
+                # The full human submission is the effect identity, including
+                # the runtime-condition edit committed in this transaction.
+                approval_ref = "conditions-time:" + canonical_hash({
+                    "quest_ref": scope, "text": text, "expected_revision": expected_revision,
+                    "research_style": research_style, "literature_configuration": literature_configuration,
+                    "stage_models": stage_models, "time_budget_change": time_budget_change,
+                })
+                replay = db.execute(sql_text(
+                    "SELECT response_ref FROM ae_quest_time_budget_approvals WHERE approval_ref=:ref"
+                ), {"ref": approval_ref}).first()
+                if replay is not None:
+                    recorded = read_runtime_conditions_in_transaction(db, scope, revision=replay.response_ref)
+                    return _editable_conditions(recorded)
+            head = db.execute(sql_text(
+                "SELECT current_revision FROM hc_runtime_condition_heads WHERE scope_ref=:scope"
+            ), {"scope": scope}).first()
+            if current["revision"] != expected_revision:
+                raise OwnerConflict("runtime_conditions_stale")
+            if approval_ref is not None:
+                from meta_research.quest_research_time import apply_quest_time_budget
+                apply_quest_time_budget(db, quest_ref=scope,
+                    expected_revision=time_budget_change["expected_revision"],
+                    approval_ref=approval_ref, request_ref="human-runtime-conditions",
+                    response_ref=saved["revision"], new_total_seconds=time_budget_change["total_seconds"])
+            now = time.time()
+            db.execute(sql_text(
+                "INSERT OR IGNORE INTO hc_runtime_condition_versions "
+                "(scope_ref,revision,value_json,source_kind,created_at) "
+                "VALUES (:scope,:revision,:value,'human_update',:now)"
+            ), {"scope": scope, "revision": saved["revision"], "value": json.dumps(
+                saved, ensure_ascii=False, sort_keys=True, separators=(",", ":")), "now": now})
+            if head is None:
+                changed = db.execute(sql_text(
+                    "INSERT INTO hc_runtime_condition_heads (scope_ref,current_revision,updated_at) "
+                    "VALUES (:scope,:revision,:now)"
+                ), {"scope": scope, "revision": saved["revision"], "now": now}).rowcount
+            else:
                 changed = db.execute(sql_text(
                     "UPDATE hc_runtime_condition_heads SET current_revision=:revision,updated_at=:now "
                     "WHERE scope_ref=:scope AND current_revision=:prior"
                 ), {"revision": saved["revision"], "now": now, "scope": scope, "prior": expected_revision}).rowcount
-                if changed != 1:
-                    raise OwnerConflict("runtime_conditions_stale")
-        finally:
-            database.close()
+            if changed != 1:
+                raise OwnerConflict("runtime_conditions_stale")
         return _editable_conditions(saved)
 
 
@@ -454,11 +411,12 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
     root = _data_root(workspace)
     if root is None:
         return ""
-    initial = _initial_conditions(root, quest_ref=quest_ref, run_ref=run_ref,
-                                  initialization_id=initialization_id, target_ref=target_ref)
-    if initial is None:
-        return ""
-    current = _with_research_time(root, _read(root, *initial))
+    with _conditions_database(root) as database, database.read_snapshot() as connection:
+        initial = _initial_conditions(connection, quest_ref=quest_ref, run_ref=run_ref,
+                                      initialization_id=initialization_id, target_ref=target_ref)
+        if initial is None:
+            return ""
+        current = _with_research_time(connection, _read(connection, *initial))
     public = {key: value for key, value in current.items() if key not in {"literature_configuration", "stage_models"}}
     clock_guidance = (
         "research_time 是 Quest 共用的当前计时观察，优先于正文中的初始总预算。安排新工作、长调用后及人类答复后，"

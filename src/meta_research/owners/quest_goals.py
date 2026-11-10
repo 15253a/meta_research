@@ -25,7 +25,6 @@ from meta_research.quest_goal import (
     work_basis,
 )
 from meta_research.runtime_conditions import (
-    read_runtime_conditions,
     read_runtime_conditions_in_transaction,
 )
 
@@ -823,7 +822,6 @@ class QuestGoalOwnerMixin:
         history_offset: int = 0,
         history_limit: int = 20,
     ) -> dict[str, object]:
-        read_runtime_conditions(Path(self._database.path).parent, quest_ref)
         current = self.query_current_quest_goal_revision(quest_ref)
         if current is None:
             raise OwnerConflict("quest_goal_revision_not_found")

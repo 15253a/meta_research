@@ -16,7 +16,6 @@ from meta_research.owners.common import (
 )
 from meta_research.owners.human_collaboration_ladder import guidance_binding_from_row
 from meta_research.quest_goal import ResearchRoot
-from meta_research.runtime_conditions import read_runtime_conditions
 
 
 class HumanGuidanceMixin:
@@ -109,10 +108,6 @@ class HumanGuidanceMixin:
             self._agent_runtime.verify_stage_guidance_operation
             if isinstance(operation, StageGuidanceOperation)
             else self._agent_runtime.verify_target_guidance_preparation
-        )
-        prepared_work = verifier(operation)
-        read_runtime_conditions(
-            Path(self._database.path).parent, prepared_work.quest_ref
         )
         with self._database.fenced_write() as connection:
             work = verifier(operation)

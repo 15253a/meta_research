@@ -22,9 +22,9 @@ def root(tmp_path, monkeypatch):
     with sqlite3.connect(tmp_path / "meta-research.sqlite3") as db:
         db.executescript("""
             CREATE TABLE rg_quests(quest_ref TEXT PRIMARY KEY, initialization_id TEXT UNIQUE,
-                goal_json TEXT, draft_hash TEXT);
+                goal_json TEXT, draft_hash TEXT, draft_revision INTEGER DEFAULT 1);
             CREATE TABLE hc_quest_initializations(initialization_id TEXT PRIMARY KEY,
-                draft_json TEXT, draft_hash TEXT);
+                draft_json TEXT, draft_hash TEXT, draft_revision INTEGER DEFAULT 1);
             CREATE TABLE hc_resource_envelopes(envelope_ref TEXT PRIMARY KEY,
                 initialization_id TEXT, envelope_json TEXT, envelope_hash TEXT);
             CREATE TABLE ar_run_controls(run_ref TEXT PRIMARY KEY, quest_ref TEXT);
@@ -62,13 +62,13 @@ def root(tmp_path, monkeypatch):
                      "resource_envelope_hash": canonical_hash(envelope) if count else None,
                      "literature": {"mode": "oa_only", "scope_exclusions": "排除非同行评审来源",
                                     "library_entry_url": "secret-url", "auth_path": "secret-auth"}}
-            db.execute("INSERT INTO hc_quest_initializations VALUES (?,?,?)",
+            db.execute("INSERT INTO hc_quest_initializations(initialization_id,draft_json,draft_hash) VALUES (?,?,?)",
                        (f"init-{name}", json.dumps(draft), canonical_hash(draft)))
             if count:
                 db.execute("INSERT INTO hc_resource_envelopes VALUES (?,?,?,?)",
                            (f"envelope-{name}", f"init-{name}", json.dumps(envelope), canonical_hash(envelope)))
             if accepted:
-                db.execute("INSERT INTO rg_quests VALUES (?,?,?,?)",
+                db.execute("INSERT INTO rg_quests(quest_ref,initialization_id,goal_json,draft_hash) VALUES (?,?,?,?)",
                            (f"quest-{name}", f"init-{name}", json.dumps(draft), canonical_hash(draft)))
                 db.execute("INSERT INTO ar_run_controls VALUES (?,?)", (f"run-{name}", f"quest-{name}"))
                 db.execute("INSERT INTO ae_quest_time_budgets VALUES (?,?,2592000,0,0,0,0,0,'[]',0,'[]')",
@@ -83,6 +83,20 @@ def root(tmp_path, monkeypatch):
         request = {"target_ref": "target-one", "target_run_ref": "harness-one"}
         db.execute("INSERT INTO ar_harness_runs VALUES (?,?,?)",
                    ("harness-one", json.dumps(request), canonical_hash(request)))
+    from meta_research.database import Database
+    from meta_research.runtime_conditions import _initial_conditions, _value
+    database = Database(tmp_path / "meta-research.sqlite3")
+    try:
+        with database.fenced_write() as connection:
+            for quest_ref in ("quest-one", "quest-two"):
+                scope, text, style, config, *_ = _initial_conditions(connection, quest_ref=quest_ref)
+                value = _value(scope, text, style, config)
+                connection.exec_driver_sql("INSERT INTO hc_runtime_condition_versions VALUES (?,?,?,?,?)",
+                    (scope, value["revision"], json.dumps(value), "initial_default", 1000))
+                connection.exec_driver_sql("INSERT INTO hc_runtime_condition_heads VALUES (?,?,?)",
+                    (scope, value["revision"], 1000))
+    finally:
+        database.close()
     return tmp_path
 
 
@@ -215,8 +229,17 @@ def test_initialization_edits_survive_acceptance_without_changing_other_scope(ro
     original = read_runtime_conditions(root, scope)
     save_runtime_conditions(root, scope, text="仅使用 CPU，预算三天。", expected_revision=original["revision"])
     assert "仅使用 CPU" in render_runtime_conditions(root, run_ref="deepfetch-draft")
+    from meta_research.database import Database
+    from meta_research.runtime_conditions import materialize_quest_conditions
+    database = Database(root / "meta-research.sqlite3")
+    try:
+        with database.fenced_write() as connection:
+            draft = connection.exec_driver_sql("SELECT draft_hash FROM hc_quest_initializations WHERE initialization_id='init-draft'").scalar_one()
+            materialize_quest_conditions(connection, initialization_id="init-draft", quest_ref="quest-new", draft_revision=1, draft_hash=draft)
+    finally:
+        database.close()
     with sqlite3.connect(root / "meta-research.sqlite3") as db:
-        db.execute("INSERT INTO rg_quests SELECT 'quest-new',initialization_id,draft_json,draft_hash "
+        db.execute("INSERT INTO rg_quests SELECT 'quest-new',initialization_id,draft_json,draft_hash,draft_revision "
                    "FROM hc_quest_initializations WHERE initialization_id='init-draft'")
         db.execute("INSERT INTO ae_quest_time_budgets VALUES ('quest-new','budget-new',2592000,0,0,0,0,0,'[]',0,'[]')")
     inherited = read_runtime_conditions(root, "quest-new")
@@ -252,7 +275,7 @@ def test_empty_or_oversized_edit_is_rejected_without_new_file(root):
     assert not (root / "runtime-conditions").exists()
 
 
-def test_legacy_file_is_imported_once_and_retained_as_evidence(root):
+def test_retired_legacy_file_is_not_imported_or_modified(root):
     scope = "quest-one"
     legacy = {"quest_ref": scope, "text": "旧条件"}
     legacy["revision"] = canonical_hash(legacy)
@@ -263,7 +286,7 @@ def test_legacy_file_is_imported_once_and_retained_as_evidence(root):
     path.write_bytes(original_bytes)
 
     imported = read_runtime_conditions(root, scope)
-    assert imported["text"] == "旧条件"
+    assert imported["text"] != "旧条件"
     assert imported["research_style"] == "balanced"
     updated = save_runtime_conditions(
         root,
@@ -279,7 +302,7 @@ def test_legacy_file_is_imported_once_and_retained_as_evidence(root):
             "SELECT source_kind FROM hc_runtime_condition_versions "
             "WHERE scope_ref=? AND revision=?",
             (scope, imported["revision"]),
-        ).fetchone() == ("legacy_file",)
+        ).fetchone() == ("initial_default",)
 
 
 def test_prompt_framing_round_trip_and_invalid_length():

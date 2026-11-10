@@ -1048,7 +1048,7 @@ class ManualQuestionCreation:
             "library_entry_url": literature.get("library_entry_url"),
             "institution_required": literature.get("institution_required", False),
         }
-        current_conditions = read_runtime_conditions(self._database.path.parent, quest.quest_ref)
+        current_conditions = read_runtime_conditions(self._database.path.parent, quest.quest_ref, database=self._database)
         config = current_conditions.get("literature_configuration", config)
         frozen_scope = json.loads(previous_request.scope_json) if previous_request is not None else None
         if frozen_scope is not None:

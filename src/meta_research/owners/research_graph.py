@@ -8745,7 +8745,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             preview_hash=preview_hash,
             receipt=confirmation,
         )
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
                     "SELECT * FROM rg_quests WHERE initialization_id = :initialization_id"
@@ -8770,6 +8770,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 return _accepted_quest(existing)
 
             quest_ref = new_ref("quest")
+            from meta_research.runtime_conditions import materialize_quest_conditions
+            materialize_quest_conditions(
+                connection, initialization_id=initialization_id, quest_ref=quest_ref,
+                draft_revision=draft_revision, draft_hash=draft_hash,
+            )
             receipt_ref = new_ref("rg_quest_receipt")
             bindings = {
                 "initialization_id": initialization_id,
