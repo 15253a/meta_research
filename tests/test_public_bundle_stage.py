@@ -1091,7 +1091,7 @@ def test_bundle_admission_uses_operation_binding_without_global_conformance(
         assert admitted["run"]["status"] == "admitted"
         assert admitted["run"]["attempt_execution_receipt"] is None
         _advance_to_public_bundle_execution(runtime)
-        assert runtime.bundle_stage.transient_error is None
+        assert runtime.bundle_stage.observation.code is None
     finally:
         runtime.close()
 
@@ -1116,7 +1116,7 @@ def test_partial_global_conformance_does_not_gate_bundle_operation_binding(
         assert admitted["run"]["status"] == "admitted"
         assert admitted["run"]["attempt_execution_receipt"] is None
         _advance_to_public_bundle_execution(runtime)
-        assert runtime.bundle_stage.transient_error is None
+        assert runtime.bundle_stage.observation.code is None
     finally:
         runtime.close()
 
@@ -1170,7 +1170,7 @@ def test_bundle_freezes_operation_binding_independently_of_global_conformance(
             for key in execution_identity
         } == execution_identity
         assert projected["run"]["runtime_binding"] == frozen_binding
-        assert runtime.bundle_stage.transient_error is None
+        assert runtime.bundle_stage.observation.code is None
     finally:
         runtime.close()
 
@@ -2060,7 +2060,7 @@ def test_bundle_dispatch_is_fail_closed_until_runtime_protection_is_confirmed(
         inhibitor.available = False
         for _step in range(4):
             changed = runtime.bundle_stage.process_once()
-            if runtime.bundle_stage.transient_error == (
+            if runtime.bundle_stage.observation.code == (
                 "power_inhibitor_acquisition_failed"
             ):
                 assert not changed
@@ -2270,7 +2270,7 @@ def test_bundle_dispatch_restart_does_not_ack_unknown_turn_as_completed_review(
         assert run is not None
         for _step in range(4):
             changed = runtime.bundle_stage.process_once()
-            if runtime.bundle_stage.transient_error == (
+            if runtime.bundle_stage.observation.code == (
                 "codex_operation_reconciliation_pending"
             ):
                 assert not changed
@@ -2355,7 +2355,7 @@ def test_bundle_target_batch_is_fail_closed_until_runtime_protection_is_confirme
         inhibitor.available = False
         for _step in range(4):
             changed = runtime.bundle_stage.process_once()
-            if runtime.bundle_stage.transient_error == (
+            if runtime.bundle_stage.observation.code == (
                 "power_inhibitor_acquisition_failed"
             ):
                 assert not changed
@@ -2632,7 +2632,7 @@ def test_legacy_quest_scoped_high_risk_authorization_remains_restartable(
         for _step in range(12):
             runtime.bundle_stage.process_once()
             if (
-                runtime.bundle_stage.transient_error
+                runtime.bundle_stage.observation.code
                 == "target_high_risk_authorization_required"
             ):
                 break

@@ -148,7 +148,7 @@ def test_bundle_stage_resolves_frozen_question_before_real_adapter_delivery(tmp_
         request = runtime.owners.advancement_engine.query_bundle_stage_request(current["cycle_ref"])
         with pytest.raises(Delivered):
             for _ in range(4):
-                assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
+                assert runtime.bundle_stage.process_once(), runtime.bundle_stage.observation.code
         assert observed == [_QUESTION]
     finally:
         runtime.close()

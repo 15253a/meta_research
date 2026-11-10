@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from meta_research.bundle_skill import CodexBundleSkillAdapter
+from meta_research.bundle_stage import BundleObservation
 from meta_research.composition import build_production_runtime
 from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
@@ -141,22 +142,25 @@ def test_bundle_provider_failure_is_visible_without_hiding_partial_truth(
 
 
 @pytest.mark.parametrize(
-    ("pending_code", "expected_status"),
+    ("kind", "pending_code", "expected_status"),
     (
-        ("target_launch_pending", "ready"),
-        ("target_root_running", "ready"),
-        ("target_high_risk_authorization_required", "ready"),
-        ("bundle_unknown_integrity_error", "unavailable"),
+        ("waiting", "target_launch_pending", "ready"),
+        ("waiting", "target_root_running", "ready"),
+        ("waiting", "target_high_risk_authorization_required", "ready"),
+        ("failure", "bundle_unknown_integrity_error", "unavailable"),
+        ("waiting", "bundle_replan_waiting_for_target_terminal", "ready"),
+        ("failure", "bundle_runtime_binding_drift", "unavailable"),
     ),
 )
 def test_bundle_worker_health_distinguishes_waits_from_unknown_failures(
+    kind: str,
     pending_code: str,
     expected_status: str,
 ) -> None:
-    stage = SimpleNamespace(transient_error=None)
+    stage = SimpleNamespace(observation=BundleObservation("ready"))
 
     def process_once() -> bool:
-        stage.transient_error = pending_code
+        stage.observation = BundleObservation(kind, pending_code)
         return False
 
     stage.process_once = process_once

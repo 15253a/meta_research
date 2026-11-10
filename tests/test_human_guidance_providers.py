@@ -239,7 +239,7 @@ def test_actual_bundle_transport_binds_rolling_dispatch_separately(tmp_path):
         for _ in range(4):
             if runtime.bundle_stage.query_current()["run"] is not None and runtime.bundle_stage.query_current()["run"]["attempt_execution_receipt"] is not None:
                 break
-            assert runtime.bundle_stage.process_once(), (runtime.bundle_stage.transient_error, runtime.bundle_stage.query_current())
+            assert runtime.bundle_stage.process_once(), (runtime.bundle_stage.observation.code, runtime.bundle_stage.query_current())
         for _ in range(5):
             runtime.bundle_stage.process_once()
             if any(seal["operation_name"].startswith("dispatch-") for seal in _seals(provider)):

@@ -39,7 +39,7 @@ def test_actual_bundle_target_batch_has_its_own_cut_on_the_same_rolling_job(tmp_
         for _ in range(12):
             if any(item["operation_name"].startswith("target-batch-") for item in _seals(provider)):
                 break
-            assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
+            assert runtime.bundle_stage.process_once(), runtime.bundle_stage.observation.code
         seals = _seals(provider)
         batch = next(item for item in seals if item["operation_name"] == "target-batch-1")
         dispatch = next(item for item in seals if item["operation_name"] == "dispatch-1")

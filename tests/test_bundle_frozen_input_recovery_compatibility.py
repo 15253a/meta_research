@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import meta_research.bundle_skill as bundle_skill
-from meta_research.bundle_stage import BundleStageWorker
+from meta_research.bundle_stage import BundleObservation, BundleStageWorker
 from meta_research.owners.agent_runtime import BundleRuntimeBinding
 from meta_research.owners.common import canonical_hash
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
@@ -45,10 +45,10 @@ def test_actual_frozen_run_passes_worker_gate_without_rebinding() -> None:
     assert bundle_bindings_compatible(candidate, frozen)
 
     worker = object.__new__(BundleStageWorker)
-    worker._transient_error = None
+    worker._observation = BundleObservation("ready")
     worker._current_runtime_binding = lambda: candidate
     assert worker._runtime_binding_is_current(SimpleNamespace(runtime_binding=frozen))
-    assert worker._transient_error is None
+    assert worker._observation.code is None
     assert frozen.as_dict() == original
 
 

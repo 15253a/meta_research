@@ -74,7 +74,7 @@ def test_checkpoint_race_yields_before_retrying_a_fresh_boundary(monkeypatch, co
 
     worker = _worker_at_inbox_boundary(monkeypatch, drain, execute)
     assert worker.process_once() is False
-    assert worker.transient_error is None
+    assert worker.observation.code is None
     assert reads == 1
     assert provider_calls == 0
     worker._research_graph.query_target_graph.assert_not_called()
@@ -170,3 +170,19 @@ def test_checkpoint_retry_does_not_swallow_integrity_errors(monkeypatch, code):
     with pytest.raises(OwnerConflict, match=code):
         worker.process_once()
     worker._research_graph.query_target_graph.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [OwnerConflict("unclassified_reason"), RuntimeError("unexpected failure")])
+def test_unknown_exception_is_a_failure_and_next_public_call_recovers(monkeypatch, error):
+    worker = _worker_at_inbox_boundary(monkeypatch, lambda _run: None, lambda: True)
+    def fail(_run):
+        raise error
+    monkeypatch.setattr(worker, "_drain_bundle_inbox", fail)
+    with pytest.raises(type(error)):
+        worker.process_once()
+    assert worker.observation.kind == "failure"
+    assert worker.observation.code == str(error)
+    monkeypatch.setattr(worker, "_drain_bundle_inbox", lambda _run: None)
+    assert worker.process_once() is True
+    assert worker.observation.kind == "ready"
+    assert worker.observation.code is None

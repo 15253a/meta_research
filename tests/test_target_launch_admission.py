@@ -242,7 +242,7 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
         assert launch_kwargs["human_waiter_ref"] is None
         assert launch_kwargs["human_waiter_generation"] is None
         assert launch_kwargs["human_authorization_receipt_ref"] is None
-        assert runtime.bundle_stage.transient_error == "target_launch_admitted"
+        assert runtime.bundle_stage.observation.code == "target_launch_admitted"
 
         admitted = _side_effect_counts(runtime)
         assert admitted["ar_target_launches"] == before["ar_target_launches"] + 1
@@ -256,7 +256,7 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
         assert ack is not None
         for _step in range(4):
             advanced = runtime.bundle_stage.process_once()
-            if runtime.bundle_stage.transient_error == "target_launch_pending":
+            if runtime.bundle_stage.observation.code == "target_launch_pending":
                 assert advanced is False
                 break
         else:
@@ -269,7 +269,7 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
             runtime.owners.agent_runtime.query_target_launch_ack(target.target_ref)
             == ack
         )
-        assert runtime.bundle_stage.transient_error == "target_launch_pending"
+        assert runtime.bundle_stage.observation.code == "target_launch_pending"
 
         # Once AR exposes a durable running frontier, Bundle must stop driving
         # the Target lifecycle.  The independent Web daemon is now the sole
@@ -289,7 +289,7 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
         )
         for _step in range(4):
             advanced = runtime.bundle_stage.process_once()
-            if runtime.bundle_stage.transient_error == "target_root_running":
+            if runtime.bundle_stage.observation.code == "target_root_running":
                 assert advanced is False
                 break
         else:
@@ -509,14 +509,14 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
         assert admitted["rm_asset_versions"] == before["rm_asset_versions"]
         for _step in range(4):
             advanced = runtime.bundle_stage.process_once()
-            if runtime.bundle_stage.transient_error == "target_launch_pending":
+            if runtime.bundle_stage.observation.code == "target_launch_pending":
                 assert advanced is False
                 break
         else:
             raise AssertionError("Bundle did not yield the admitted Target")
         assert len(launch_calls) == 1
         assert _side_effect_counts(runtime) == admitted
-        assert runtime.bundle_stage.transient_error == "target_launch_pending"
+        assert runtime.bundle_stage.observation.code == "target_launch_pending"
     finally:
         runtime.close()
 

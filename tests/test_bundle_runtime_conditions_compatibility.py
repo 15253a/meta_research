@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from meta_research.bundle_skill import BundleSkillUnavailable, BundleTargetBatchRequest, CodexBundleSkillAdapter
-from meta_research.bundle_stage import BundleStageWorker
+from meta_research.bundle_stage import BundleObservation, BundleStageWorker
 from meta_research.bundle_target_contract import FORMAL_STRATEGY_UPDATE_SCHEMA_REF
 from meta_research.owners.common import canonical_hash
 from meta_research.provider_supervisor import read_supervisor_request, read_transport_key_for_operation, write_exit_receipt
@@ -72,7 +72,7 @@ def test_three_committed_targets_allow_next_dispatch_without_rebinding(adapter, 
         "target-commit:one", "target-commit:two", "target-commit:three",
     ]})
     worker = object.__new__(BundleStageWorker)
-    worker._harnesses, worker._provider, worker._transient_error = object(), provider, None
+    worker._harnesses, worker._provider, worker._observation = object(), provider, BundleObservation("ready")
     assert worker._runtime_binding_is_current(SimpleNamespace(runtime_binding=frozen))
     assert bundle_bindings_compatible(current, frozen)
 

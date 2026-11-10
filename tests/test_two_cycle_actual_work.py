@@ -114,7 +114,7 @@ def _sibling(runtime,quest):
 
 def _ready_existing(runtime):
     for _ in range(20):
-        assert runtime.bundle_stage.process_once(),runtime.bundle_stage.transient_error
+        assert runtime.bundle_stage.process_once(),runtime.bundle_stage.observation.code
         current=runtime.bundle_stage.query_current()
         request=current['stage_run_request']
         if not request:continue

@@ -306,7 +306,7 @@ def _advance_to_rg_rejection(runtime):
             )
             if rejection is not None:
                 return request, run, rejection
-        assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
+        assert runtime.bundle_stage.process_once(), runtime.bundle_stage.observation.code
     raise AssertionError("RG did not durably reject the first TargetPlan")
 
 

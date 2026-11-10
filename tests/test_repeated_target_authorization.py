@@ -186,7 +186,7 @@ def test_duplicate_grant_after_root_resume_still_launches_exactly_one_target(tmp
             ack = runtime.owners.agent_runtime.query_target_launch_ack(target_ref)
             if ack is not None:
                 break
-        assert ack is not None, runtime.bundle_stage.transient_error
+        assert ack is not None, runtime.bundle_stage.observation.code
         assert ack.target_ref == target_ref
         # Replays may read the original response/consumption; never regrant or relaunch.
         persisted = runtime.owners.agent_runtime.query_human_request(request_ref)

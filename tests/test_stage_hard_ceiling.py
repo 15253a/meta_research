@@ -956,7 +956,7 @@ def test_bundle_local_target_plan_review_failure_does_not_invent_provider_phase(
         assert current["status"] == "admitted"
         assert current["attempt_ref"] == before["attempt_ref"]
         assert current["completion_rejection"] is None
-        assert runtime.bundle_stage.transient_error == (
+        assert runtime.bundle_stage.observation.code == (
             "bundle_review_result_contract_invalid"
         )
         with runtime._database.read() as connection:
@@ -1737,7 +1737,7 @@ def test_bundle_production_adapter_persists_primary_without_second_review_turn(
         )
 
         assert runtime.bundle_stage.process_once()
-        assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
+        assert runtime.bundle_stage.process_once(), runtime.bundle_stage.observation.code
         accepted = runtime.bundle_stage.query_current()["run"]
         assert accepted["status"] == "awaiting_acceptance"
         assert accepted["fence_status"] == "submitted"
@@ -1957,7 +1957,7 @@ def test_bundle_exhaustion_primary_assessment_reaches_owner_acceptance(
             current = runtime.bundle_stage.query_current()
             if current["stage_commit"] is not None:
                 break
-            assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
+            assert runtime.bundle_stage.process_once(), runtime.bundle_stage.observation.code
         assert current["stage_commit"]["disposition"] == "exhausted"
         assert current["run"]["status"] == "completed"
         assert current["run"]["blocker"] is None

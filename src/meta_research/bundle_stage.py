@@ -10,7 +10,7 @@ import json
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from typing import Callable, cast
+from typing import Callable, Literal, cast
 
 from meta_research.bundle_contract import (
     BUNDLE_CONTEXT_PACK_SCHEMA_REF,
@@ -122,6 +122,14 @@ _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS = (
 
 
 @dataclass(frozen=True)
+class BundleObservation:
+    """Ephemeral worker observation; only failures affect public health."""
+
+    kind: Literal["ready", "waiting", "failure"]
+    code: str | None = None
+
+
+@dataclass(frozen=True)
 class _CurrentCycle:
     revision: int
     cycle_ref: str
@@ -179,13 +187,13 @@ class BundleStageWorker:
         self._human_collaboration = human_collaboration
         self._harnesses = harnesses
         self._stopped_provider_checkpoint = stopped_provider_checkpoint
-        self._transient_error: str | None = None
+        self._observation = BundleObservation("ready")
         self._worker_cursor_cycle_ref: str | None = None
         self._input_error_recheck_at: dict[str, float] = {}
 
     @property
-    def transient_error(self) -> str | None:
-        return self._transient_error
+    def observation(self) -> BundleObservation:
+        return self._observation
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         configure = getattr(self._provider, "configure_resident_mcp_endpoint", None)
@@ -215,18 +223,23 @@ class BundleStageWorker:
     def process_once(self) -> bool:
         """Advance at most one durable Bundle boundary."""
 
+        self._observation = BundleObservation("ready")
         try:
             return self._process_boundary_once()
         except OwnerConflict as error:
             if error.code not in {
                 "bundle_inbox_ack_stale", "bundle_inbox_checkpoint_stale",
             }:
+                self._observation = BundleObservation("failure", error.code)
                 raise
             # Another Owner advanced the inbox while this boundary was being
             # assembled. Yield so the next pass reads a fresh run/checkpoint;
             # this optimistic concurrency retry is not a worker health fault.
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return False
+        except Exception as error:
+            self._observation = BundleObservation("failure", str(error) or type(error).__name__)
+            raise
 
     def _process_boundary_once(self) -> bool:
         if self._agent_runtime.reconcile_pending_provider_cleanup(
@@ -234,7 +247,7 @@ class BundleStageWorker:
             unit_kinds=("bundle_primary", "bundle_review"),
         ):
             return True
-        self._transient_error = None
+        self._observation = BundleObservation("ready")
         cycles = self._discover_active_cycles()
         if not cycles:
             self._worker_cursor_cycle_ref = None
@@ -340,7 +353,7 @@ class BundleStageWorker:
                 _operation_key("bundle-admit", request.request_ref),
                 runtime_binding=runtime_binding,
             )
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return True
         managed = self._agent_runtime.query_managed_run(run.run_ref)
         if managed is not None and managed["status"] not in {"running", "completed"}:
@@ -562,7 +575,7 @@ class BundleStageWorker:
                         unit_kind="bundle_review",
                     )
                 except OwnerConflict as error:
-                    self._transient_error = error.code
+                    self._observation = BundleObservation("failure", error.code)
                     return False
                 provider_safe = True
                 result = None
@@ -578,7 +591,7 @@ class BundleStageWorker:
                         elif error.recovery_checkpoint is not None:
                             provider_safe = False
                             if self._rolling_identity_unresolved(run, error.recovery_checkpoint, error.code):
-                                self._transient_error = "codex_operation_reconciliation_pending"
+                                self._observation = BundleObservation("failure", "codex_operation_reconciliation_pending")
                                 return False
                             self._agent_runtime.record_stage_provider_hard_ceiling(
                                 unit_ref=batch_unit_ref,
@@ -588,11 +601,11 @@ class BundleStageWorker:
                                 failure_code=error.code,
                                 provider_exit=error.recovery_checkpoint,
                             )
-                        self._transient_error = error.code
+                        self._observation = BundleObservation("failure", error.code)
                         return False
                     except BundleSkillContractError as error:
                         if result is None:
-                            self._transient_error = str(error)
+                            self._observation = BundleObservation("failure", str(error))
                             return False
                         failure_code = "bundle_review_result_contract_invalid"
                         try:
@@ -609,11 +622,11 @@ class BundleStageWorker:
                             )
                         except BundleSkillUnavailable as checkpoint_error:
                             provider_safe = False
-                            self._transient_error = checkpoint_error.code
+                            self._observation = BundleObservation("failure", checkpoint_error.code)
                             return False
                         if terminal:
                             provider_safe = False
-                        self._transient_error = failure_code
+                        self._observation = BundleObservation("failure", failure_code)
                         return False
                     self._bind_rolling_replacement(run, graph, batch_unit_ref,
                         result.native_session_ref, replacement_context)
@@ -635,7 +648,7 @@ class BundleStageWorker:
                             inbox_checkpoint.checkpoint_hash,
                         ),
                     )
-                    self._transient_error = None
+                    self._observation = BundleObservation("ready")
                     return True
                 finally:
                     if provider_safe:
@@ -659,7 +672,7 @@ class BundleStageWorker:
                 )
             except OwnerConflict as error:
                 if error.code == "completed_strategy_cell_coverage_invalid":
-                    self._transient_error = "bundle_strategy_incomplete"
+                    self._observation = BundleObservation("waiting", "bundle_strategy_incomplete")
                     return False
                 if error.code in BASELINE_METHOD_REJECTION_FEEDBACK:
                     return self._correct_target_batch_identity(
@@ -668,7 +681,7 @@ class BundleStageWorker:
                         native_session_ref=pending.native_session_ref, detail_code=error.code,
                     )
                 raise
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return True
         # RG's dependency frontier includes admitted/running Targets until
         # their result is committed.  It is not a list of new launches.  Once
@@ -820,7 +833,7 @@ class BundleStageWorker:
                     # The root already saw these errors. Check the Owner again
                     # later; new inbox or frontier facts can wake the root sooner.
                     self._input_error_recheck_at[run.run_ref] = time.monotonic() + _DISPATCH_RECHECK_SECONDS
-                    self._transient_error = next(iter(input_errors.values()))
+                    self._observation = BundleObservation("failure", next(iter(input_errors.values())))
                     return False
             replacement_context = self._rolling_replacement_context(request, run, graph, commits)
             dispatch_request = BundleDispatchRequest(
@@ -854,7 +867,7 @@ class BundleStageWorker:
                     unit_kind="bundle_review",
                 )
             except OwnerConflict as error:
-                self._transient_error = error.code
+                self._observation = BundleObservation("failure", error.code)
                 return False
             provider_safe = True
             result = None
@@ -866,7 +879,7 @@ class BundleStageWorker:
                     if result.action == "dispatch":
                         selected = cast(str, result.selected_target_ref)
                         if selected not in {target.target_ref for target in launchable}:
-                            self._transient_error = "target_high_risk_authorization_required"
+                            self._observation = BundleObservation("waiting", "target_high_risk_authorization_required")
                             return False
                         if selected in input_errors:
                             raise BundleSkillContractError(input_errors[selected])
@@ -885,7 +898,7 @@ class BundleStageWorker:
                     elif error.recovery_checkpoint is not None:
                         provider_safe = False
                         if self._rolling_identity_unresolved(run, error.recovery_checkpoint, error.code):
-                            self._transient_error = "codex_operation_reconciliation_pending"
+                            self._observation = BundleObservation("failure", "codex_operation_reconciliation_pending")
                             return False
                         self._agent_runtime.record_stage_provider_hard_ceiling(
                             unit_ref=dispatch_unit_ref,
@@ -895,11 +908,11 @@ class BundleStageWorker:
                             failure_code=error.code,
                             provider_exit=error.recovery_checkpoint,
                         )
-                    self._transient_error = error.code
+                    self._observation = BundleObservation("failure", error.code)
                     return False
                 except BundleSkillContractError as error:
                     if result is None:
-                        self._transient_error = str(error)
+                        self._observation = BundleObservation("failure", str(error))
                         return False
                     failure_code = "bundle_review_result_contract_invalid"
                     try:
@@ -914,11 +927,11 @@ class BundleStageWorker:
                         )
                     except BundleSkillUnavailable as checkpoint_error:
                         provider_safe = False
-                        self._transient_error = checkpoint_error.code
+                        self._observation = BundleObservation("failure", checkpoint_error.code)
                         return False
                     if terminal:
                         provider_safe = False
-                    self._transient_error = failure_code
+                    self._observation = BundleObservation("failure", failure_code)
                     return False
                 self._bind_rolling_replacement(run, graph, dispatch_unit_ref,
                     result.native_session_ref, replacement_context)
@@ -939,13 +952,7 @@ class BundleStageWorker:
                         "bundle-dispatch", run.run_ref, str(len(decisions) + 1)
                     ),
                 )
-                self._transient_error = (
-                    None
-                    if result.action == "dispatch"
-                    else "bundle_replan_required"
-                    if result.action == "replan_required"
-                    else "bundle_root_waiting"
-                )
+                self._observation = (BundleObservation("ready") if result.action == "dispatch" else BundleObservation("waiting", "bundle_replan_required" if result.action == "replan_required" else "bundle_root_waiting"))
                 return True
             finally:
                 if provider_safe:
@@ -966,7 +973,7 @@ class BundleStageWorker:
                 operation_ref=pending_dispatch.decision_ref,
                 checkpoint=launch_checkpoint,
             ):
-                self._transient_error = None
+                self._observation = BundleObservation("ready")
                 return True
             target = next(
                 target
@@ -1008,7 +1015,7 @@ class BundleStageWorker:
             if ack.target_ref != target.target_ref:
                 raise OwnerConflict("target_launch_ack_invalid")
             if admitted_now:
-                self._transient_error = "target_launch_admitted"
+                self._observation = BundleObservation("waiting", "target_launch_admitted")
                 return True
             current_frontier = self._agent_runtime.query_target_frontier_entry(
                 target.target_ref
@@ -1018,17 +1025,16 @@ class BundleStageWorker:
                 # durable TargetRun frontier, the independent Target daemon is
                 # the sole lifecycle driver; Bundle only consumes Inbox and
                 # authoritative frontier/handoff projections.
-                self._transient_error = "target_root_running"
+                self._observation = BundleObservation("waiting", "target_root_running")
                 return False
             # Launch is the last Bundle-owned Target mutation.  The light
             # Target daemon discovers this admitted launch independently and
             # wakes the one long-lived root Session; Bundle never drives that
             # Session or interprets its implementation/training progress.
-            self._transient_error = "target_launch_pending"
+            self._observation = BundleObservation("waiting", "target_launch_pending")
             return False
         if not frontier and dispatch_state["running_targets"]:
-            self._transient_error = (
-                "target_root_running"
+            self._observation = BundleObservation("waiting", "target_root_running"
                 if any(
                     self._agent_runtime.query_target_frontier_entry(
                         cast(str, item["target_ref"])
@@ -1037,8 +1043,7 @@ class BundleStageWorker:
                         list[dict[str, object]], dispatch_state["running_targets"]
                     )
                 )
-                else "target_launch_pending"
-            )
+                else "target_launch_pending")
         return False
 
     def _prepare_launch_inputs(self, target: AcceptedTarget) -> bool:
@@ -1087,7 +1092,7 @@ class BundleStageWorker:
                     if (frontier.state != "terminal"
                         or frontier.currentness_known is not True
                         or frontier.current is not True):
-                        self._transient_error = "bundle_replan_waiting_for_target_terminal"
+                        self._observation = BundleObservation("waiting", "bundle_replan_waiting_for_target_terminal")
                         return False
                     continue
                 notice = self._agent_runtime.query_target_work_notice(
@@ -1104,7 +1109,7 @@ class BundleStageWorker:
                         continue
                     raise OwnerConflict("bundle_report_handoff_invalid")
                 if self._agent_runtime.query_target_launch_ack(target.target_ref) is not None:
-                    self._transient_error = "bundle_replan_waiting_for_target_terminal"
+                    self._observation = BundleObservation("waiting", "bundle_replan_waiting_for_target_terminal")
                     return False
             if disposition != "blocked":
                 disposition = "replan_required"
@@ -1147,7 +1152,7 @@ class BundleStageWorker:
                     "bundle-report-accept", run.run_ref, report_hash
                 ),
             )
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return True
         return self._consume_bundle_report(request, run, latest)
 
@@ -1240,7 +1245,7 @@ class BundleStageWorker:
                         "bundle-report-complete", run.run_ref, accepted.report_ref
                     ),
                 )
-                self._transient_error = None
+                self._observation = BundleObservation("ready")
                 return True
             if (
                 completion.outcome_ref != accepted.report_ref
@@ -1266,10 +1271,10 @@ class BundleStageWorker:
                     ),
                 )
                 self._finish_bundle_jobs(run)
-                self._transient_error = None
+                self._observation = BundleObservation("ready")
                 return True
             self._finish_bundle_jobs(run)
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return False
 
         recorded = self._advancement_engine.query_bundle_report_disposition(
@@ -1287,7 +1292,7 @@ class BundleStageWorker:
                     accepted.report_ref,
                 ),
             )
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return True
         if (
             recorded.request_ref != request.request_ref
@@ -1299,7 +1304,7 @@ class BundleStageWorker:
         ):
             raise OwnerConflict("bundle_report_disposition_invalid")
         if disposition == "blocked":
-            self._transient_error = "bundle_report_blocked"
+            self._observation = BundleObservation("waiting", "bundle_report_blocked")
             return False
         raise OwnerConflict("bundle_report_disposition_invalid")
 
@@ -1320,7 +1325,7 @@ class BundleStageWorker:
                     "target-candidate-projection", target.target_ref
                 ),
             )
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return None, True
         if projection.source_spec_hash != target.spec_hash:
             raise OwnerConflict("target_candidate_projection_source_invalid")
@@ -1344,7 +1349,7 @@ class BundleStageWorker:
             # The durable frontier below carries the exact command to the
             # current Bundle root Agent.  A daemon/provider path must never
             # impersonate that root by opening the formal request itself.
-            self._transient_error = "target_high_risk_authorization_required"
+            self._observation = BundleObservation("waiting", "target_high_risk_authorization_required")
             return None, False
         responses = cast(list[dict[str, object]], request.get("responses", []))
         if request.get("status") == "open":
@@ -1365,7 +1370,7 @@ class BundleStageWorker:
                         "target-human-decline", target.target_ref
                     ),
                 )
-                self._transient_error = "target_high_risk_authorization_declined"
+                self._observation = BundleObservation("waiting", "target_high_risk_authorization_declined")
                 return None, True
             authorization_ref = self._target_authorization_receipt(
                 request, requirement
@@ -1400,13 +1405,13 @@ class BundleStageWorker:
                     ),
                 )
                 return None, True
-            self._transient_error = "target_high_risk_authorization_required"
+            self._observation = BundleObservation("waiting", "target_high_risk_authorization_required")
             return None, False
         if request.get("status") == "declined":
-            self._transient_error = "target_high_risk_authorization_declined"
+            self._observation = BundleObservation("waiting", "target_high_risk_authorization_declined")
             return None, False
         if request.get("status") != "satisfied":
-            self._transient_error = "target_high_risk_authorization_required"
+            self._observation = BundleObservation("waiting", "target_high_risk_authorization_required")
             return None, False
         current_waiter = self._target_human_waiter(
             request,
@@ -1418,7 +1423,7 @@ class BundleStageWorker:
             request, requirement
         )
         if current_waiter is None or authorization_ref is None:
-            self._transient_error = "target_high_risk_authorization_stale"
+            self._observation = BundleObservation("failure", "target_high_risk_authorization_stale")
             return None, False
         if current_waiter.get("status") == "blocked":
             validation = self._agent_runtime.validate_human_request_waiter(
@@ -1437,16 +1442,14 @@ class BundleStageWorker:
             if validation.get("status") == "released":
                 return None, True
             reason = validation.get("reason")
-            self._transient_error = (
-                cast(str, reason["code"])
+            self._observation = BundleObservation("failure", cast(str, reason["code"])
                 if isinstance(reason, dict) and isinstance(reason.get("code"), str)
-                else "target_high_risk_authorization_stale"
-            )
+                else "target_high_risk_authorization_stale")
             return None, False
         if current_waiter.get("status") not in {"released", "consumed"}:
-            self._transient_error = "target_high_risk_authorization_stale"
+            self._observation = BundleObservation("failure", "target_high_risk_authorization_stale")
             return None, False
-        self._transient_error = None
+        self._observation = BundleObservation("ready")
         return (
             _TargetAuthorization(
                 request_ref=cast(str, request["request_ref"]),
@@ -2667,20 +2670,16 @@ class BundleStageWorker:
                 )
             )
             if reconciled is None:
-                self._transient_error = "bundle_exhaustion_outcome_unknown"
+                self._observation = BundleObservation("waiting", "bundle_exhaustion_outcome_unknown")
                 return False
             changed = (
                 reconciled.status != operation.status
                 or reconciled.decision_receipt != operation.decision_receipt
             )
-            self._transient_error = (
-                None
-                if reconciled.status == "accepted"
-                else f"bundle_exhaustion_{reconciled.status}"
-            )
+            self._observation = (BundleObservation("ready") if reconciled.status == "accepted" else BundleObservation("waiting" if reconciled.status in {"rejected", "stale", "needs_input", "outcome_unknown", "technical_blocker"} else "failure", f"bundle_exhaustion_{reconciled.status}"))
             return changed
         if operation.status != "accepted":
-            self._transient_error = f"bundle_exhaustion_{operation.status}"
+            self._observation = (BundleObservation("ready") if operation.status == "accepted" else BundleObservation("waiting" if operation.status in {"rejected", "stale", "needs_input", "outcome_unknown", "technical_blocker"} else "failure", f"bundle_exhaustion_{operation.status}"))
             return False
         if operation.accepted_proposal_ref is None:
             raise OwnerConflict("bundle_exhaustion_acceptance_invalid")
@@ -2697,7 +2696,7 @@ class BundleStageWorker:
                     operation.accepted_proposal_ref,
                 ),
             )
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return True
         if (
             self._advancement_engine.query_bundle_stage_commit(
@@ -2720,10 +2719,10 @@ class BundleStageWorker:
                 ),
             )
             self._finish_bundle_jobs(run)
-            self._transient_error = None
+            self._observation = BundleObservation("ready")
             return True
         self._finish_bundle_jobs(run)
-        self._transient_error = None
+        self._observation = BundleObservation("ready")
         return False
 
     def _execute_target_plan(
@@ -2740,7 +2739,7 @@ class BundleStageWorker:
         if runtime_binding is None:
             return False
         if not bundle_bindings_compatible(runtime_binding, run.runtime_binding):
-            self._transient_error = "bundle_runtime_binding_drift"
+            self._observation = BundleObservation("failure", "bundle_runtime_binding_drift")
             return False
         invocation = (
             run.primary_invocation
@@ -2822,7 +2821,7 @@ class BundleStageWorker:
                     unit_kind="bundle_primary",
                 )
             except OwnerConflict as error:
-                self._transient_error = error.code
+                self._observation = BundleObservation("failure", error.code)
                 return False
             provider_safe = True
             draft = None
@@ -2845,7 +2844,7 @@ class BundleStageWorker:
                         )
                     ):
                         self._finish_provider_job(job_ref)
-                        self._transient_error = None
+                        self._observation = BundleObservation("ready")
                         return True
                     if error.rejected_candidate is not None:
                         if (
@@ -2865,7 +2864,7 @@ class BundleStageWorker:
                             detail_code=error.rejected_detail_code,
                         )
                         provider_safe = False
-                        self._transient_error = error.code
+                        self._observation = BundleObservation("failure", error.code)
                         return True
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
@@ -2879,11 +2878,11 @@ class BundleStageWorker:
                             failure_code=error.code,
                             provider_exit=error.recovery_checkpoint,
                         )
-                    self._transient_error = error.code
+                    self._observation = BundleObservation("failure", error.code)
                     return False
                 except RecoverableBundleSkillCandidateError as error:
                     if draft is None:
-                        self._transient_error = str(error)
+                        self._observation = BundleObservation("failure", str(error))
                         return False
                     if self._agent_runtime.park_root_provider_session_for_human_request(
                         root_kind="bundle",
@@ -2895,7 +2894,7 @@ class BundleStageWorker:
                         runtime_binding_hash=run.runtime_binding_hash,
                     ):
                         self._finish_provider_job(job_ref)
-                        self._transient_error = None
+                        self._observation = BundleObservation("ready")
                         return True
                     failure_code = "bundle_primary_result_contract_invalid"
                     self._reject_completion_candidate(
@@ -2908,10 +2907,10 @@ class BundleStageWorker:
                         detail_code=str(error),
                     )
                     provider_safe = False
-                    self._transient_error = failure_code
+                    self._observation = BundleObservation("failure", failure_code)
                     return True
                 except BundleSkillContractError as error:
-                    self._transient_error = str(error)
+                    self._observation = BundleObservation("failure", str(error))
                     return False
                 try:
                     checkpoint = self._agent_runtime.record_bundle_primary_draft(
@@ -2930,11 +2929,11 @@ class BundleStageWorker:
                     if error.code != "runtime_run_suspended":
                         raise
                     self._finish_provider_job(job_ref)
-                    self._transient_error = None
+                    self._observation = BundleObservation("ready")
                     return True
                 if checkpoint.draft_hash != draft_hash:
                     raise OwnerConflict("bundle_primary_draft_hash_mismatch")
-                self._transient_error = None
+                self._observation = BundleObservation("ready")
                 return True
             finally:
                 if provider_safe:
@@ -2963,7 +2962,7 @@ class BundleStageWorker:
                     unit_kind="bundle_review",
                 )
             except OwnerConflict as error:
-                self._transient_error = error.code
+                self._observation = BundleObservation("failure", error.code)
                 return False
             provider_safe = True
             result = None
@@ -2996,7 +2995,7 @@ class BundleStageWorker:
                         )
                     ):
                         self._finish_provider_job(job_ref)
-                        self._transient_error = None
+                        self._observation = BundleObservation("ready")
                         return True
                     if error.rejected_candidate is not None:
                         if (
@@ -3016,7 +3015,7 @@ class BundleStageWorker:
                             detail_code=error.rejected_detail_code,
                         )
                         provider_safe = False
-                        self._transient_error = error.code
+                        self._observation = BundleObservation("failure", error.code)
                         return True
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
@@ -3030,11 +3029,11 @@ class BundleStageWorker:
                             failure_code=error.code,
                             provider_exit=error.recovery_checkpoint,
                         )
-                    self._transient_error = error.code
+                    self._observation = BundleObservation("failure", error.code)
                     return False
                 except RecoverableBundleSkillCandidateError as error:
                     if result is None:
-                        self._transient_error = str(error)
+                        self._observation = BundleObservation("failure", str(error))
                         return False
                     if self._agent_runtime.park_root_provider_session_for_human_request(
                         root_kind="bundle",
@@ -3046,7 +3045,7 @@ class BundleStageWorker:
                         runtime_binding_hash=run.runtime_binding_hash,
                     ):
                         self._finish_provider_job(job_ref)
-                        self._transient_error = None
+                        self._observation = BundleObservation("ready")
                         return True
                     failure_code = "bundle_review_result_contract_invalid"
                     self._reject_completion_candidate(
@@ -3059,10 +3058,10 @@ class BundleStageWorker:
                         detail_code=str(error),
                     )
                     provider_safe = False
-                    self._transient_error = failure_code
+                    self._observation = BundleObservation("failure", failure_code)
                     return True
                 except BundleSkillContractError as error:
-                    self._transient_error = str(error)
+                    self._observation = BundleObservation("failure", str(error))
                     return False
                 if self._agent_runtime.park_root_provider_session_for_human_request(
                     root_kind="bundle",
@@ -3074,14 +3073,14 @@ class BundleStageWorker:
                     runtime_binding_hash=run.runtime_binding_hash,
                 ):
                     self._finish_provider_job(job_ref)
-                    self._transient_error = None
+                    self._observation = BundleObservation("ready")
                     return True
                 self._accept_exhaustion_review(
                     request=request,
                     run=run,
                     result=result,
                 )
-                self._transient_error = None
+                self._observation = BundleObservation("ready")
                 return True
             finally:
                 if provider_safe:
@@ -3093,7 +3092,7 @@ class BundleStageWorker:
                     )
 
         if draft.output_kind != "target_plan":
-            self._transient_error = "bundle_skill_output_kind_invalid"
+            self._observation = BundleObservation("failure", "bundle_skill_output_kind_invalid")
             return False
         result = None
         try:
@@ -3106,17 +3105,15 @@ class BundleStageWorker:
                 validate_bundle_skill_result(skill_request, result)
             )
         except BundleSkillUnavailable as error:
-            self._transient_error = error.code
+            self._observation = BundleObservation("failure", error.code)
             return False
         except RecoverableBundleSkillCandidateError as error:
-            self._transient_error = (
-                str(error)
+            self._observation = BundleObservation("failure", str(error)
                 if result is None
-                else "bundle_review_result_contract_invalid"
-            )
+                else "bundle_review_result_contract_invalid")
             return False
         except BundleSkillContractError as error:
-            self._transient_error = str(error)
+            self._observation = BundleObservation("failure", str(error))
             return False
         review = review_record(
             result,
@@ -3148,7 +3145,7 @@ class BundleStageWorker:
                 "bundle-execute", run.run_ref, run.attempt_ref
             ),
         )
-        self._transient_error = None
+        self._observation = BundleObservation("ready")
         return True
 
     def _owner_rejection_context(
@@ -3267,10 +3264,10 @@ class BundleStageWorker:
                 native_session_ref=native_session_ref,
                 failure_code="bundle_review_result_contract_invalid", detail_code=detail_code,
             )
-            self._transient_error = None if corrected else detail_code
+            self._observation = BundleObservation("ready") if corrected else BundleObservation("failure", detail_code)
             return corrected
         except BundleSkillUnavailable as error:
-            self._transient_error = error.code
+            self._observation = BundleObservation("failure", error.code)
             return False
         finally:
             if not corrected:
@@ -3515,14 +3512,12 @@ class BundleStageWorker:
 
     def _current_runtime_binding(self, provider) -> BundleRuntimeBinding | None:
         if self._harnesses is None:
-            self._transient_error = (
-                "bundle_harness_operation_binding_unavailable"
-            )
+            self._observation = BundleObservation("failure", "bundle_harness_operation_binding_unavailable")
             return None
         try:
             runtime_binding = provider.runtime_binding()
         except (BundleSkillUnavailable, HarnessAdmissionError) as error:
-            self._transient_error = error.code
+            self._observation = BundleObservation("failure", error.code)
             return None
         return runtime_binding
 
@@ -3534,7 +3529,7 @@ class BundleStageWorker:
         if current is None:
             return False
         if not bundle_bindings_compatible(current, run.runtime_binding):
-            self._transient_error = "bundle_runtime_binding_drift"
+            self._observation = BundleObservation("failure", "bundle_runtime_binding_drift")
             return False
         return True
 

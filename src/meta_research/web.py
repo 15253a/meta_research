@@ -88,33 +88,6 @@ PROVIDER_WORKER_WATCHDOG_SECONDS: None = None
 WRITING_DELIVERY_STALL_SECONDS = 910.0
 REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS = 30.0
 BACKGROUND_WORKER_STARTUP_GRACE_SECONDS = 0.1
-# ``BundleStage.transient_error`` predates the durable pause/wait contract and
-# carries both actual failures and normal no-progress states.  Keep this list
-# closed: an unfamiliar code must remain fail-closed as worker-unavailable.
-_BUNDLE_STAGE_HEALTHY_WAIT_CODES = frozenset(
-    {
-        # Root policy and rolling-plan control flow.
-        "bundle_strategy_incomplete",
-        "bundle_replan_required",
-        "bundle_root_waiting",
-        # Target launch and the independently owned root lifecycle.
-        "target_launch_admitted",
-        "target_launch_pending",
-        "target_root_running",
-        # Human/domain waits and mechanical terminal transitions.
-        "target_high_risk_authorization_required",
-        "target_high_risk_authorization_declined",
-        "bundle_report_blocked",
-        "bundle_replan_activated",
-        "bundle_exhaustion_rejected",
-        "bundle_exhaustion_stale",
-        "bundle_exhaustion_needs_input",
-        "bundle_exhaustion_outcome_unknown",
-        "bundle_exhaustion_technical_blocker",
-    }
-)
-_T = TypeVar("_T")
-
 
 @dataclass
 class ReconciliationHealth:
@@ -4178,9 +4151,9 @@ async def _process_bundle_stage(
         timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
         transient_error=lambda: (
-            None
-            if runtime.bundle_stage.transient_error in _BUNDLE_STAGE_HEALTHY_WAIT_CODES
-            else runtime.bundle_stage.transient_error
+            runtime.bundle_stage.observation.code
+            if runtime.bundle_stage.observation.kind == "failure"
+            else None
         ),
     )
 

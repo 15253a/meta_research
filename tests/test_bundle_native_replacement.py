@@ -263,7 +263,7 @@ def test_unbound_replacement_without_authenticated_native_keeps_the_original_ope
             if provider.failed_once:
                 break
         assert provider.failed_once
-        assert runtime.bundle_stage.transient_error == "codex_operation_reconciliation_pending"
+        assert runtime.bundle_stage.observation.code == "codex_operation_reconciliation_pending"
         current = ar.query_bundle_stage_run(old.request_ref)
         assert current.attempt_ref == pending.attempt_ref and current.native_session_ref is None
         assert runtime.owners.research_graph.query_target_graph(old.request_ref) == graph

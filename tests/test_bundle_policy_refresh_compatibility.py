@@ -5,7 +5,7 @@ import pytest
 
 import meta_research.bundle_skill as bundle_skill
 from meta_research.bundle_skill import BundleSkillUnavailable, BundleTargetBatchRequest, CodexBundleSkillAdapter
-from meta_research.bundle_stage import BundleStageWorker
+from meta_research.bundle_stage import BundleObservation, BundleStageWorker
 from meta_research.bundle_target_contract import FORMAL_STRATEGY_UPDATE_SCHEMA_REF
 from meta_research.owners.common import canonical_hash
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
@@ -39,7 +39,7 @@ def test_later_policy_edits_resume_existing_run_without_hash_registration(adapte
     worker = object.__new__(BundleStageWorker)
     worker._harnesses = object()
     worker._provider = provider
-    worker._transient_error = None
+    worker._observation = BundleObservation("ready")
     assert worker._runtime_binding_is_current(SimpleNamespace(runtime_binding=frozen))
     result = provider.schedule_target(request(frozen))
     assert result.selected_target_ref == "target:followup"
@@ -145,7 +145,7 @@ def test_completed_target_allows_next_batch_after_policy_refresh(tmp_path, monke
     resources["references/contract.md"] += "\nRetain source lineage on continuation.\n"
     monkeypatch.setattr(bundle_skill, "_bundle_skill_resources", lambda: dict(resources))
     worker = object.__new__(BundleStageWorker)
-    worker._harnesses, worker._provider, worker._transient_error = object(), provider, None
+    worker._harnesses, worker._provider, worker._observation = object(), provider, BundleObservation("ready")
     assert worker._runtime_binding_is_current(SimpleNamespace(runtime_binding=frozen))
     result = provider.propose_target_batch(batch)
     assert result.strategy_update["strategy_complete"] is True

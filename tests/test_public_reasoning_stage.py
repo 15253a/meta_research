@@ -1196,7 +1196,7 @@ def test_historical_direct_bundle_keeps_exact_accepted_formal_plan_readable(
             if direct_commit is not None:
                 break
             assert runtime.bundle_stage.process_once(), {
-                "transient_error": runtime.bundle_stage.transient_error,
+                "transient_error": runtime.bundle_stage.observation.code,
                 "current": runtime.bundle_stage.query_current(),
                 "successor_context": context,
             }

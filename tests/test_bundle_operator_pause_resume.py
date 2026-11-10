@@ -64,7 +64,7 @@ def test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history(tm
     calls = root / "provider-calls.jsonl"
     deadline = time.monotonic() + 15
     while not calls.exists():
-        assert time.monotonic() < deadline, (failures, runtime.bundle_stage.transient_error)
+        assert time.monotonic() < deadline, (failures, runtime.bundle_stage.observation.code)
         time.sleep(.01)
     _control(runtime, before, "pause")
     worker.join(15)
@@ -100,7 +100,7 @@ def test_hc_resume_stopped_bundle_primary_preserves_native_and_sealed_history(tm
         assert resumed.primary_invocation.operation_ref != before.primary_invocation.operation_ref
         assert restarted.bundle_stage.process_once()
         after = restarted.owners.agent_runtime.query_bundle_stage_run(request_ref)
-        assert after.primary_draft is not None and after.native_session_ref == NATIVE, restarted.bundle_stage.transient_error
+        assert after.primary_draft is not None and after.native_session_ref == NATIVE, restarted.bundle_stage.observation.code
         assert len(adapter.requests) == 1 and adapter.requests[0].native_session_ref == NATIVE
         with pytest.raises(OwnerConflict, match="runtime_fence_revoked"):
             restarted.owners.agent_runtime.record_bundle_primary_draft(
