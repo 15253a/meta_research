@@ -1295,30 +1295,19 @@ def test_rm_refuses_a_literature_snapshot_disguised_as_a_revision(
         database.close()
 
 
-def _domain_reasoning_decision(review):
-    """Exercise persisted domain rejection independently of advisory review."""
-    return "rejected", "scientific_domain_conflict", ("The accepted source binding conflicts with the proposed interpretation.",)
-
-
-def test_rg_persists_accepted_and_rejected_reasoning_decisions(
+def test_rg_accepts_current_and_reads_historical_rejected_reasoning_decisions(
     tmp_path: Path, monkeypatch,
 ) -> None:
     database, memory, _receipts, graph, graph_receipts = _owners(tmp_path)
     try:
-        revision = _revision(memory)
-        rejected_content = _accept_content(
-            memory,
-            revision,
-            submission_ref="reasoning-submission:rejected",
+        from reasoning_legacy_rejection_fixtures import seed_legacy_rejection
+        legacy_content = _accept_real_root_next_cycle_content(
+            memory, graph, submission_ref="reasoning-submission:rejected",
             outcome_ref="scientific-outcome:rejected",
-            unresolved=True,
         )
-        with monkeypatch.context() as domain:
-            domain.setattr(
-                research_graph_module, "_evaluate_reasoning_outcome",
-                _domain_reasoning_decision,
-            )
-            rejected = graph.decide_reasoning_outcome(content=rejected_content)
+        original = graph.decide_reasoning_outcome(content=legacy_content)
+        seed_legacy_rejection(database, original)
+        rejected = graph.query_reasoning_outcome_decision(original.submission_ref)
         assert rejected.decision == "rejected"
         assert rejected.outcome_ref is None
         assert rejected.receipt.kind == REASONING_REJECTED_RECEIPT_KIND

@@ -4,22 +4,13 @@ from test_reasoning_summary_decision_flow import runtime_at, SummarySkill
 
 import pytest
 
-from conftest import _isolate_platform_power_dependency
-
-import meta_research.owners.research_graph as graph_module
-from meta_research.owners.agent_runtime import SQLiteAgentRuntime
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from test_public_reasoning_autonomous_checkpoint import (
     _checkpoint, _review, _runtime_binding,
 )
 from test_public_plan_stage import (
-    _DeterministicIdeaSkill, _DeterministicPlanSkill,
-    _confirm_direct_quest, _finish_idea_stage, _runtime,
+    _confirm_direct_quest, _finish_idea_stage,
 )
-
-
-def test_owner_exposes_checkpoint_rejection_continuation():
-    assert hasattr(SQLiteAgentRuntime, 'continue_after_reasoning_checkpoint_rejection')
 
 
 def _record(runtime, request, run, *, reject, monkeypatch):
@@ -43,16 +34,11 @@ def _record(runtime, request, run, *, reject, monkeypatch):
     content = runtime.owners.research_memory.accept_reasoning_scientific_candidate(
         **summary_candidate_values(runtime, request, checkpoint)
     )
-    # A controlled current-domain rejection exercises durable Owner receipts;
-    # it is independent of review findings or any prior storage policy.
-    with monkeypatch.context() as domain:
-        if reject:
-            domain.setattr(
-                graph_module, "_evaluate_reasoning_outcome",
-                lambda review: ("rejected", "reasoning_scientific_reassessment_required",
-                                ("Reassess the scientific claim under its accepted evidence.",)),
-            )
-        decision = runtime.owners.research_graph.decide_reasoning_scientific_candidate(content=content)
+    decision = runtime.owners.research_graph.decide_reasoning_scientific_candidate(content=content)
+    if reject:
+        from reasoning_legacy_rejection_fixtures import seed_legacy_rejection
+        seed_legacy_rejection(runtime.owners.research_graph._database, decision, scientific=True)
+        decision = runtime.owners.research_graph.query_reasoning_scientific_decision(content.submission_ref)
     return checkpoint, decision
 
 
@@ -75,121 +61,51 @@ def setup(tmp_path, monkeypatch):
         runtime.close()
 
 
-def _continue(runtime, run, decision, key='checkpoint-revise'):
-    return runtime.owners.agent_runtime.continue_after_reasoning_checkpoint_rejection(
-        run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
-        decision_receipt=decision.receipt, idempotency_key=key,
+
+def test_historical_rejected_checkpoint_remains_exact_readable(setup):
+    runtime, request, run, monkeypatch = setup
+    checkpoint, decision = _record(runtime, request, run, reject=True, monkeypatch=monkeypatch)
+    graph = runtime.owners.research_graph
+    assert decision.decision == "rejected"
+    assert graph.query_reasoning_scientific_decision(decision.submission_ref) == decision
+    graph._receipt_verifier.verify_reasoning_scientific_decision(
+        request_ref=request.request_ref, submission_ref=decision.submission_ref,
+        decision="rejected", outcome_ref=None, receipt=decision.receipt,
+        checkpoint_ref=checkpoint.checkpoint_ref,
     )
-
-
-def test_rejection_replays_without_replacing_checkpoint_or_root(setup):
-    runtime, request, old, monkeypatch = setup
-    ar = runtime.owners.agent_runtime
-    checkpoint, decision = _record(runtime, request, old, reject=True, monkeypatch=monkeypatch)
-    successor = _continue(runtime, old, decision)
-    assert successor.attempt_ref != old.attempt_ref
-    assert successor.attempt_generation == old.attempt_generation + 1
-    assert successor.root_session_ref == old.root_session_ref
-    assert successor.native_session_ref == checkpoint.native_session_ref
-    assert successor.runtime_binding == old.runtime_binding
-    assert successor.fence_ref != old.fence_ref
-    assert successor.primary_draft is None
-    assert successor.autonomous_checkpoint is None
-    assert successor.execution is None
-    assert successor.predecessor_autonomous_checkpoint == checkpoint
-    assert successor.checkpoint_rejection_receipt == decision.receipt
-    assert ar.query_reasoning_autonomous_checkpoint(checkpoint.checkpoint_ref) == checkpoint
-    revision = ar.query_snapshot().revision
-    assert _continue(runtime, old, decision) == successor
-    assert ar.query_snapshot().revision == revision
-    assert ar.query_reasoning_stage_run(request.request_ref) == successor
-    with pytest.raises(OwnerConflict, match='attempt_fence_stale'):
-        _continue(runtime, old, decision, key='duplicate-old-rejection')
-    with pytest.raises(OwnerConflict, match='idempotency_conflict'):
-        _continue(runtime, old, replace(decision, receipt=replace(decision.receipt, payload_hash='0' * 64)))
-
-
-@pytest.mark.parametrize('forged', ['hash', 'accepted', 'active_provider'])
-def test_invalid_rejection_never_retires_current_attempt(setup, forged):
-    runtime, request, old, monkeypatch = setup
-    ar = runtime.owners.agent_runtime
-    checkpoint, decision = _record(runtime, request, old, reject=forged != 'accepted', monkeypatch=monkeypatch)
-    if forged == 'hash':
-        decision = replace(decision, receipt=replace(decision.receipt, payload_hash='0' * 64))
-    if forged == 'active_provider':
-        ar.begin_provider_unit(
-            unit_ref=old.review_invocation.invocation_ref,
-            operation_ref=old.review_invocation.operation_ref,
-            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
-            unit_kind='reasoning_review',
-        )
-    before = ar.query_snapshot().revision
     with pytest.raises(OwnerConflict):
-        _continue(runtime, old, decision)
-    assert ar.query_snapshot().revision == before
-    current = ar.query_reasoning_stage_run(request.request_ref)
-    assert current.attempt_ref == old.attempt_ref
-    assert current.autonomous_checkpoint == checkpoint
+        graph._receipt_verifier.verify_reasoning_scientific_decision(
+            request_ref=request.request_ref, submission_ref=decision.submission_ref,
+            decision="rejected", outcome_ref=None,
+            receipt=replace(decision.receipt, payload_hash="0" * 64),
+            checkpoint_ref=checkpoint.checkpoint_ref,
+        )
+    assert runtime.owners.agent_runtime.query_reasoning_autonomous_checkpoint(checkpoint.checkpoint_ref) == checkpoint
 
 
-def test_rejects_receipt_for_other_checkpoint_in_same_request(setup):
-    runtime, request, old, monkeypatch = setup
-    first_checkpoint, first_decision = _record(runtime, request, old, reject=True, monkeypatch=monkeypatch)
-    second = _continue(runtime, old, first_decision)
-    checkpoint, decision = _record(runtime, request, second, reject=True, monkeypatch=monkeypatch)
-    assert checkpoint.checkpoint_ref != first_checkpoint.checkpoint_ref
-    with pytest.raises(OwnerConflict, match='reasoning_scientific_receipt_invalid'):
-        _continue(runtime, second, first_decision, key='wrong-checkpoint')
-    third = _continue(runtime, second, decision, key='second-checkpoint')
-    assert third.predecessor_autonomous_checkpoint == checkpoint
-    assert third.checkpoint_rejection_receipt == decision.receipt
-
-
-def test_feedback_survives_later_completion_replacement(setup):
+def test_current_candidate_rejection_retains_same_root_correction(setup):
     runtime, request, old, monkeypatch = setup
     ar = runtime.owners.agent_runtime
-    checkpoint, decision = _record(runtime, request, old, reject=True, monkeypatch=monkeypatch)
-    second = _continue(runtime, old, decision)
-    ar.begin_provider_unit(
-        unit_ref=second.primary_invocation.invocation_ref,
-        operation_ref=second.primary_invocation.operation_ref,
-        run_ref=second.run_ref, attempt_ref=second.attempt_ref, fence_ref=second.fence_ref,
-        unit_kind='reasoning_primary',
+    primary = old.primary_invocation
+    ar.begin_provider_unit(unit_ref=primary.invocation_ref, operation_ref=primary.operation_ref,
+        run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
+        unit_kind="reasoning_primary")
+    rejection = ar.reject_stage_completion_candidate(
+        unit_ref=primary.invocation_ref, run_ref=old.run_ref, attempt_ref=old.attempt_ref,
+        fence_ref=old.fence_ref, native_session_ref="candidate-revision-native",
+        candidate={"phase": "primary", "result": {"invalid_science": True}},
+        reason_code="reasoning_primary_result_contract_invalid",
+        detail_code="reasoning_scientific_outcome_invalid",
+        feedback=("Return the complete scientific result.",),
     )
-    ar.reject_stage_completion_candidate(
-        unit_ref=second.primary_invocation.invocation_ref,
-        run_ref=second.run_ref, attempt_ref=second.attempt_ref, fence_ref=second.fence_ref,
-        native_session_ref=second.native_session_ref,
-        candidate={'phase': 'primary', 'result': {'invalid_science': True}},
-        reason_code='reasoning_primary_result_contract_invalid',
-        detail_code='reasoning_scientific_outcome_invalid',
-        feedback=('Return the complete scientific result.',),
-    )
-    third = ar.query_reasoning_stage_run(request.request_ref)
-    assert third.attempt_generation == 3
-    assert third.completion_rejection is not None
-    assert third.predecessor_autonomous_checkpoint == checkpoint
-    assert third.checkpoint_rejection_receipt == decision.receipt
-    assert third.autonomous_checkpoint is None
-    next_checkpoint, next_decision = _record(runtime, request, third, reject=False, monkeypatch=monkeypatch)
-    assert next_decision.decision == 'accepted'
-    assert ar.query_reasoning_stage_run(request.request_ref).autonomous_checkpoint == next_checkpoint
-
-
-def test_rejection_successor_and_feedback_survive_runtime_restart(setup):
-    runtime, request, old, monkeypatch = setup
-    checkpoint, decision = _record(runtime, request, old, reject=True, monkeypatch=monkeypatch)
-    successor = _continue(runtime, old, decision)
-    path = runtime.data_root.root
-    runtime.close()
-    restarted = runtime_at(path, SummarySkill('create'))
-    try:
-        recovered = restarted.owners.agent_runtime.query_reasoning_stage_run(request.request_ref)
-        assert recovered == successor
-        assert _continue(restarted, old, decision) == successor
-        next_checkpoint, next_decision = _record(restarted, request, recovered, reject=False, monkeypatch=monkeypatch)
-        assert next_decision.decision == 'accepted'
-        assert restarted.owners.agent_runtime.query_reasoning_autonomous_checkpoint(checkpoint.checkpoint_ref) == checkpoint
-        assert restarted.owners.agent_runtime.query_reasoning_stage_run(request.request_ref).autonomous_checkpoint == next_checkpoint
-    finally:
-        restarted.close()
+    current = ar.query_reasoning_stage_run(request.request_ref)
+    assert current.attempt_generation == old.attempt_generation + 1
+    assert current.root_session_ref == old.root_session_ref
+    assert current.native_session_ref == "candidate-revision-native"
+    assert current.completion_rejection == rejection
+    checkpoint, decision = _record(runtime, request, current, reject=False, monkeypatch=monkeypatch)
+    assert decision.decision == "accepted"
+    facts = runtime.owners.research_graph.query_snapshot().facts
+    assert facts["reasoning_scientific_outcome_count"] == 1
+    assert facts["reasoning_scientific_rejection_count"] == 0
+    assert ar.query_reasoning_stage_run(request.request_ref).autonomous_checkpoint == checkpoint

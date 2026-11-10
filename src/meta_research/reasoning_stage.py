@@ -242,20 +242,6 @@ class ReasoningStageWorker:
         if decision is None:
             self._research_graph.decide_reasoning_outcome(content=content)
             return _CycleStep(True)
-        if decision.decision == "rejected":
-            self._agent_runtime.continue_after_reasoning_rejection(
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                decision_receipt=decision.receipt,
-                idempotency_key=_operation_key(
-                    "reasoning-revise",
-                    run.run_ref,
-                    run.attempt_ref,
-                    decision.receipt.receipt_ref,
-                ),
-            )
-            return _CycleStep(True)
         if decision.decision != "accepted" or decision.outcome_ref is None:
             raise OwnerConflict("reasoning_outcome_decision_invalid")
 
@@ -349,20 +335,6 @@ class ReasoningStageWorker:
         if decision is None:
             self._research_graph.decide_reasoning_scientific_candidate(
                 content=candidate
-            )
-            return _CycleStep(True)
-        if decision.decision == "rejected":
-            self._agent_runtime.continue_after_reasoning_checkpoint_rejection(
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                decision_receipt=decision.receipt,
-                idempotency_key=_operation_key(
-                    "reasoning-checkpoint-revise",
-                    run.run_ref,
-                    run.attempt_ref,
-                    decision.receipt.receipt_ref,
-                ),
             )
             return _CycleStep(True)
         scientific_outcome = revised_checkpoint.get("scientific_outcome")

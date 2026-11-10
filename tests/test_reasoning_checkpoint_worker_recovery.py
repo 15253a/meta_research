@@ -1,4 +1,4 @@
-"""The real worker recovers a persisted checkpoint rejection through Owners."""
+"""The real worker revises an actual provider candidate rejection through Owners."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from meta_research.reasoning_skill import (
 )
 from meta_research.reasoning_stage import ReasoningStageWorker
 from test_public_reasoning_autonomous_checkpoint import _checkpoint, _runtime_binding
-from test_reasoning_checkpoint_recovery_owner import _record, setup
+from test_reasoning_checkpoint_recovery_owner import setup
 
 
 class _RevisingCheckpointProvider:
@@ -74,63 +74,40 @@ def _worker(runtime, provider):
     )
 
 
-@pytest.mark.parametrize("completion_retry", [False, True], ids=["domain-only", "domain-and-completion"])
-def test_worker_revises_rejected_checkpoint_then_reads_summary_and_accepts_science(setup, completion_retry):
+@pytest.mark.parametrize("rejections", [1, 2])
+def test_worker_revises_candidate_then_reads_summary_and_accepts_science(setup, rejections):
     runtime, request, initial_run, monkeypatch = setup
     ar = runtime.owners.agent_runtime
     memory = runtime.owners.research_memory
     graph = runtime.owners.research_graph
-    old_checkpoint, rejected = _record(
-        runtime, request, initial_run, reject=True, monkeypatch=monkeypatch
-    )
-    assert rejected.decision == "rejected"
-    provider = _RevisingCheckpointProvider(request)
-    worker = _worker(runtime, provider)
-
-    # The live symptom: the old worker repeatedly returned False here without
-    # creating a revision Attempt or ever invoking the Provider.
-    assert worker.process_once() is True, worker.transient_error
-    successor = ar.query_reasoning_stage_run(request.request_ref)
-    assert successor.attempt_generation == initial_run.attempt_generation + 1
-    assert successor.attempt_ref != initial_run.attempt_ref
-    assert successor.fence_ref != initial_run.fence_ref
-    assert successor.root_session_ref == initial_run.root_session_ref
-    assert successor.native_session_ref == old_checkpoint.native_session_ref
-    assert successor.autonomous_checkpoint is None
-    assert successor.predecessor_autonomous_checkpoint == old_checkpoint
-    assert successor.checkpoint_rejection_receipt == rejected.receipt
-    assert provider.calls == []
-
-    expected_feedback = rejected.feedback
-    expected_predecessor = rejected.submission_ref
-    expected_receipt_ref = rejected.receipt.receipt_ref
-    if completion_retry:
-        # A later malformed Provider completion must add correction feedback
-        # while retaining the earlier checkpoint's authenticated domain reason.
+    successor = initial_run
+    for _ in range(rejections):
+        primary = successor.primary_invocation
         ar.begin_provider_unit(
-            unit_ref=successor.primary_invocation.invocation_ref,
-            operation_ref=successor.primary_invocation.operation_ref,
+            unit_ref=primary.invocation_ref, operation_ref=primary.operation_ref,
             run_ref=successor.run_ref, attempt_ref=successor.attempt_ref,
             fence_ref=successor.fence_ref, unit_kind="reasoning_primary",
         )
-        ar.reject_stage_completion_candidate(
-            unit_ref=successor.primary_invocation.invocation_ref,
-            run_ref=successor.run_ref, attempt_ref=successor.attempt_ref,
-            fence_ref=successor.fence_ref,
-            native_session_ref=successor.native_session_ref,
+        rejected = ar.reject_stage_completion_candidate(
+            unit_ref=primary.invocation_ref, run_ref=successor.run_ref,
+            attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref,
+            native_session_ref="candidate-worker-native",
             candidate={"phase": "primary", "result": {"incomplete": True}},
             reason_code="reasoning_primary_result_contract_invalid",
             detail_code="reasoning_scientific_outcome_invalid",
             feedback=("Return the complete scientific result.",),
         )
         successor = ar.query_reasoning_stage_run(request.request_ref)
-        assert successor.attempt_generation == initial_run.attempt_generation + 2
-        correction = successor.completion_rejection
-        assert correction is not None
-        expected_feedback += correction.feedback
-        expected_predecessor = correction.candidate_ref
-        expected_receipt_ref = correction.receipt.receipt_ref
-
+    assert successor.attempt_generation == initial_run.attempt_generation + rejections
+    assert successor.root_session_ref == initial_run.root_session_ref
+    assert successor.native_session_ref == "candidate-worker-native"
+    assert successor.autonomous_checkpoint is None
+    assert successor.predecessor_autonomous_checkpoint is None
+    assert successor.checkpoint_rejection_receipt is None
+    expected_feedback = rejected.feedback
+    expected_predecessor = rejected.candidate_ref
+    expected_receipt_ref = rejected.receipt.receipt_ref
+    provider = _RevisingCheckpointProvider(request)
     # Reconstructing the worker must recover feedback from durable Owner facts.
     worker = _worker(runtime, provider)
     decision = None
@@ -155,16 +132,13 @@ def test_worker_revises_rejected_checkpoint_then_reads_summary_and_accepts_scien
     assert decision is not None and decision.decision == "accepted"
     current = ar.query_reasoning_stage_run(request.request_ref)
     assert current.attempt_ref == successor.attempt_ref
-    assert current.autonomous_checkpoint.checkpoint_ref != old_checkpoint.checkpoint_ref
     assert set(current.autonomous_checkpoint.review) == {"schema_ref", "reviewed_draft_hash", "final_output_hash"}
-    assert ar.query_reasoning_autonomous_checkpoint(old_checkpoint.checkpoint_ref) == old_checkpoint
-    assert graph.query_reasoning_scientific_decision(rejected.submission_ref) == rejected
     assert [phase for phase, _ in provider.calls] == ["primary", "review", "summary"]
     for _, delivered in provider.calls[:2]:
         assert delivered.attempt_ref == successor.attempt_ref
         assert delivered.root_session_ref == initial_run.root_session_ref
-        assert delivered.native_session_ref == old_checkpoint.native_session_ref
-        assert delivered.owner_rejection_kind == "domain"
+        assert delivered.native_session_ref == "candidate-worker-native"
+        assert delivered.owner_rejection_kind == "completion"
         assert delivered.owner_rejection_receipt_ref == expected_receipt_ref
         assert delivered.owner_feedback == expected_feedback
         assert delivered.predecessor_candidate_ref == expected_predecessor

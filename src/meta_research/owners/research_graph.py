@@ -10346,7 +10346,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             not in {"affirmed", "denied", "uncertain", "insufficient_evidence"}
         ):
             raise OwnerConflict("reasoning_scientific_content_invalid")
-        decision, reason_code, feedback = _evaluate_reasoning_outcome(content.review)
+        decision, reason_code, feedback = "accepted", None, ()
         feedback_json = canonical_json(list(feedback))
         feedback_hash = canonical_hash(list(feedback))
         bindings = {
@@ -10385,14 +10385,8 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     raise OwnerConflict("reasoning_scientific_decision_conflict")
                 return _reasoning_scientific_decision(existing)
             decision_ref = new_ref("reasoning_scientific_decision")
-            outcome_ref = (
-                content.scientific_outcome_ref if decision == "accepted" else None
-            )
-            receipt_kind = (
-                REASONING_SCIENTIFIC_ACCEPTED_RECEIPT_KIND
-                if decision == "accepted"
-                else REASONING_SCIENTIFIC_REJECTED_RECEIPT_KIND
-            )
+            outcome_ref = content.scientific_outcome_ref
+            receipt_kind = REASONING_SCIENTIFIC_ACCEPTED_RECEIPT_KIND
             subject_ref = outcome_ref or decision_ref
             receipt_ref = new_ref("rg_reasoning_scientific_decision_receipt")
             receipt_hash = _receipt_hash(
@@ -10434,9 +10428,6 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             counter = (
                 "reasoning_scientific_outcome_count = "
                 "reasoning_scientific_outcome_count + 1"
-                if decision == "accepted"
-                else "reasoning_scientific_rejection_count = "
-                "reasoning_scientific_rejection_count + 1"
             )
             connection.execute(
                 text(
@@ -10446,7 +10437,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             self._feed.record(
                 connection,
-                f"research_graph.reasoning_scientific_{decision}",
+                "research_graph.reasoning_scientific_accepted",
                 {
                     "request_ref": content.request_ref,
                     "submission_ref": content.submission_ref,
@@ -10941,12 +10932,10 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             not in {"affirmed", "denied", "uncertain", "insufficient_evidence"}
         ):
             raise OwnerConflict("reasoning_outcome_content_invalid")
-        decision, reason_code, feedback = _evaluate_reasoning_outcome(
-            content.review
-        )
+        decision, reason_code, feedback = "accepted", None, ()
         source_current_question_kind = None
         prevalidated_target: dict[str, object] | None = None
-        if decision == "accepted" and content.transition_kind == "next_cycle_proposal":
+        if content.transition_kind == "next_cycle_proposal":
             self._receipt_verifier.validate_reasoning_transition_route(
                 outcome_ref=scientific_outcome_ref,
                 transition=content.transition,
@@ -11021,17 +11010,16 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 ):
                     raise OwnerConflict("reasoning_outcome_decision_conflict")
                 return _reasoning_decision(existing)
-            if decision == "accepted":
-                accepted = connection.execute(
-                    text(
-                        "SELECT submission_ref FROM "
-                        "rg_reasoning_outcome_decisions WHERE request_ref = "
-                        ":request_ref AND decision = 'accepted'"
-                    ),
-                    {"request_ref": content.request_ref},
-                ).first()
-                if accepted is not None:
-                    raise OwnerConflict("reasoning_outcome_already_accepted")
+            accepted = connection.execute(
+                text(
+                    "SELECT submission_ref FROM "
+                    "rg_reasoning_outcome_decisions WHERE request_ref = "
+                    ":request_ref AND decision = 'accepted'"
+                ),
+                {"request_ref": content.request_ref},
+            ).first()
+            if accepted is not None:
+                raise OwnerConflict("reasoning_outcome_already_accepted")
             selection_facts_inserted = False
             target_aggregate = prevalidated_target
             if source_current_question_kind is not None:
@@ -11053,15 +11041,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 else canonical_hash(target_aggregate)
             )
             decision_ref = new_ref("reasoning_decision")
-            outcome_ref = (
-                scientific_outcome_ref if decision == "accepted" else None
-            )
+            outcome_ref = scientific_outcome_ref
             receipt_ref = new_ref("rg_reasoning_decision_receipt")
-            receipt_kind = (
-                REASONING_ACCEPTED_RECEIPT_KIND
-                if decision == "accepted"
-                else REASONING_REJECTED_RECEIPT_KIND
-            )
+            receipt_kind = REASONING_ACCEPTED_RECEIPT_KIND
             subject_ref = outcome_ref or decision_ref
             receipt_bindings = {
                 **bindings,
@@ -11127,11 +11109,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     "decided_at": now,
                 },
             )
-            counter = (
-                "reasoning_outcome_count = reasoning_outcome_count + 1"
-                if decision == "accepted"
-                else "reasoning_rejection_count = reasoning_rejection_count + 1"
-            )
+            counter = "reasoning_outcome_count = reasoning_outcome_count + 1"
             connection.execute(
                 text(
                     "UPDATE research_graph_state SET revision = revision + 1, "
@@ -11145,7 +11123,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             self._feed.record(
                 connection,
-                f"research_graph.reasoning_outcome_{decision}",
+                "research_graph.reasoning_outcome_accepted",
                 {
                     "request_ref": content.request_ref,
                     "submission_ref": content.submission_ref,
@@ -18593,14 +18571,6 @@ def _evaluate_idea_outcome(
                         "testable intervention axis.",
                     ),
                 )
-    return "accepted", None, ()
-
-
-def _evaluate_reasoning_outcome(
-    review: dict[str, object],
-) -> tuple[str, str | None, tuple[str, ...]]:
-    # The RM receipt already binds the draft and final content hashes. Native
-    # child feedback is advisory conversation, not a scientific admission form.
     return "accepted", None, ()
 
 
