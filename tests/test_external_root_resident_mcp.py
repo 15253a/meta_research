@@ -146,7 +146,6 @@ class _WaitingAcquisitionDelegate(_AcquisitionDelegate):
 
 class _QuestDrafter:
     def synthesize_first_question(self, request: object) -> FirstQuestionSynthesisResult:
-        del request
         return synthesis_result(request,
             content={
                 "title": "Resident MCP acquisition",

@@ -11,6 +11,7 @@ from meta_research.creation_basis import (
     FirstQuestionSynthesisResult, InitializationUnderstandingResult, empty_understanding,
 )
 from meta_research.paths import prepare_data_root
+from meta_research.owners.common import canonical_hash
 from meta_research.research_content import read_content
 from test_public_first_question_deepfetch import (
     DeterministicDeepFetchProvider, HonestEmptyDeepFetchProvider, RecordingAcquisitionProvider,
@@ -45,6 +46,17 @@ class ExistingWorkAdapter:
     def bind_workspaces(self, workspaces):
         self.workspaces = workspaces
 
+    def _context_document(self, request, name):
+        binding = self.workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
+        path = request.context["relative_root"] + "/" + name
+        manifest = request.context["manifest"]
+        assert canonical_hash(manifest) == request.context["context_hash"]
+        entry = next(item for item in manifest if item["path"] == path)
+        content = (binding.directory / path).read_bytes()
+        assert len(content) == entry["bytes"]
+        assert hashlib.sha256(content).hexdigest() == entry["sha256"]
+        return json.loads(content)
+
     def understand_initialization(self, request):
         understanding = empty_understanding()
         for entry in request.manifest["entries"]:
@@ -69,13 +81,15 @@ class ExistingWorkAdapter:
         return InitializationUnderstandingResult(understanding)
 
     def synthesize_first_question(self, request):
-        binding = self.workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
-        basis = json.loads((binding.directory / request.context["relative_root"] / "basis.json").read_text())
-        assert basis["understanding"]["claims_and_conditions"][0]["text"] == "Room improves and cold worsens."
+        basis = self._context_document(request, "basis.json")
+        assert basis["basis_ref"] == request.basis["basis_ref"]
+        assert basis["basis_hash"] == request.basis["basis_hash"]
+        understanding = self._context_document(request, "understanding.json")
+        assert understanding["claims_and_conditions"][0]["text"] == "Room improves and cold worsens."
         revision = None
         question = {**QUESTION, "title": "Continue condition-specific calibration", "background_context": "Room improves and cold worsens."}
         if request.literature_snapshot is not None:
-            revised = copy.deepcopy(basis["understanding"])
+            revised = copy.deepcopy(understanding)
             empty = request.literature_snapshot["completion"] == "honest_empty"
             corrections = []
             if not empty:
@@ -248,8 +262,8 @@ def test_literature_revision_updates_source_coverage_without_changing_the_prepar
         def synthesize_first_question(self, request):
             result = super().synthesize_first_question(request)
             binding = self.workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
-            basis = json.loads((binding.directory / request.context["relative_root"] / "basis.json").read_text())
-            source = next(item for item in basis["sources"] if item["relative_path"] == "project/raw.log")
+            sources = self._context_document(request, "sources.json")
+            source = next(item for item in sources if item["relative_path"] == "project/raw.log")
             content = (binding.directory / source["path"]).read_bytes()
             assert hashlib.sha256(content).hexdigest() == source["sha256"]
             coverage = {"material_key": source["material_key"], "kind": "read", "read_ranges": [{
