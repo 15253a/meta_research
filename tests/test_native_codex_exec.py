@@ -18,7 +18,7 @@ def _invoke(tmp_path, executable, *, timeout=10):
     home = tmp_path / 'home'
     home.mkdir()
     adapter = _AcquisitionCodexAdapter(tmp_path / 'provider', executable=str(executable),
-        timeout_seconds=timeout, codex_home=home,
+        timeout_seconds=timeout,
         process_runner=_CancellableProcessRunner(protected_environment={'CODEX_HOME': str(home)}))
     return adapter._invoke_optional_root_task_operation(operation_name='acquisition-root-turn',
         prompt='Do not use tools. Return {"ok":true}.',

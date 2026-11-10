@@ -94,7 +94,7 @@ def test_resident_acquisition_shell_has_tools_and_proxy_without_bearer_or_host_s
     runner = _SequenceRunner([{'results': [{'paper_id': 'paper:1', 'status': 'waiting_user',
         'path': None, 'format': None, 'failure': {'code': 'institutional_login_required', 'detail': 'Login required.'}}]}])
     adapter = CodexAcquisitionRootAdapter(tmp_path / 'provider', _WaitingAcquisitionDelegate(),
-        executable=str(executable), process_runner=runner, codex_home=codex_home)
+        executable=str(executable), process_runner=runner)
     adapter.bind_resident_mcp_authority(_authority('acquisition', 'acquisition-root-turn'))
     adapter.configure_resident_mcp_endpoint('http://127.0.0.1:8766')
     request = AcquisitionBatchRequest('shell-env', 'oa_first_then_institution',
