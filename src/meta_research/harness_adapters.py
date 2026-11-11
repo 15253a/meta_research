@@ -1584,7 +1584,8 @@ class HarnessSupervisorTransport:
 
         Human-wait checkpoints can precede capability profile acceptance. Their
         signed spools remain authority even when no profile index was retained.
-        No Provider is run and no spool or Owner record is changed here.
+        No Provider is run. A verified same-host reboot may record only local
+        closure in the existing recovery envelope; the Owner result stays unknown.
         """
         if family not in {"codex", "claude"} or not operation_ref or len(operation_ref) > 128:
             raise OSError("provider operation identity unavailable")
@@ -1595,7 +1596,7 @@ class HarnessSupervisorTransport:
             if not isinstance(owner_invocation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", owner_invocation_hash):
                 raise OSError("owner invocation identity unavailable")
             path = self._workspace / "owner-invocation-bindings" / owner_invocation_hash[:2] / (owner_invocation_hash + ".json")
-            if path.is_symlink() or path.parent.is_symlink():
+            if any(candidate.is_symlink() for candidate in (path, path.parent, path.parent.parent)):
                 raise OSError("invalid provider operation binding")
             if not path.exists():
                 # Owner-directed reconciliation only reads this original
@@ -1659,6 +1660,16 @@ class HarnessSupervisorTransport:
                 self._verify_terminal_request(directory / "supervisor-request.json",
                     self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds"),
                         Path(request["working_directory"]) if "working_directory" in request else None))
+                if digest is not None and not receipt_path.exists():
+                    if any(path.is_symlink() for path in (
+                        operation_root, directory.parent, directory,
+                        directory / "supervisor-request.json", directory / "supervisor-ready.json",
+                        directory / "supervisor-recovery.json", receipt_path,
+                    )):
+                        raise ProviderSupervisorError("provider_supervisor_spool_invalid")
+                    from meta_research.streaming_provider_supervisor import reconcile_rebooted_supervisor
+                    reconcile_rebooted_supervisor(directory / "supervisor-request.json")
+                    continue
                 receipt, envelope = read_verified_exit_receipt(
                     receipt_path, key=self._transport_key, invocation_hash=invocation_hash,
                     prompt_path=prompt_path, schema_path=directory / "output-schema.json",

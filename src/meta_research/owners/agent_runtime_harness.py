@@ -208,6 +208,10 @@ class TargetProviderCeilingReceiptVerifier(Protocol):
         owner_invocation_hash: str | None = None,
     ) -> dict[str, object]: ...
 
+    def verify_signed_reboot_recovery(
+        self, operation_ref: str, *, owner_invocation_hash: str,
+    ) -> dict[str, object]: ...
+
 
 @dataclass(frozen=True)
 class TargetRootObservation:
@@ -440,7 +444,7 @@ class AgentRuntimeHarnessInterface(Protocol):
     def target_run_failed(self, run_ref: str) -> bool: ...
 
     def reconcile_failed_target_operation(
-        self, operation_ref: str, transport_receipt: dict[str, object],
+        self, operation_ref: str, transport_receipt: dict[str, object] | None,
     ) -> AgentRuntimeHarnessOperation: ...
 
     def begin_reconciliation(self, operation_ref: str) -> int: ...
@@ -2707,7 +2711,7 @@ class SQLiteAgentRuntimeHarness:
             ), {"ref": run_ref}).first() is not None
 
     def reconcile_failed_target_operation(
-        self, operation_ref: str, transport_receipt: dict[str, object],
+        self, operation_ref: str, transport_receipt: dict[str, object] | None,
     ) -> AgentRuntimeHarnessOperation:
         """Accept late local termination evidence without reopening the Target."""
         with self._database.fenced_write() as connection:
@@ -2725,11 +2729,31 @@ class SQLiteAgentRuntimeHarness:
                 row.status == "failed" and row.outcome_code == "provider_terminal_reconciled"
             )):
                 raise AgentRuntimeHarnessError("provider_reconciliation_not_required")
-            self._verify_terminal_target_receipt(operation_ref, transport_receipt, str(row.invocation_hash))
             profile = _profile_from_row(row) or {
                 "schema_ref": "meta-research/harness-failed-transport-profile/v1",
                 "harness_family": str(row.harness_family), "run_ref": str(row.run_ref),
             }
+            if transport_receipt is None:
+                if row.status != "unknown_outcome":
+                    raise AgentRuntimeHarnessError("provider_reconciliation_not_required")
+                self._verify_target_reboot_recovery(operation_ref, str(row.invocation_hash))
+                diagnostic = {"provider_operation_ref": operation_ref, "reasons": [
+                    "provider_terminal_proof_missing", "provider_local_tree_closed_after_host_reboot",
+                ]}
+                if profile.get("terminal_proof_diagnostic") != diagnostic:
+                    profile["terminal_proof_diagnostic"] = diagnostic
+                    connection.execute(text(
+                        "UPDATE ar_harness_runs SET profile_json=:profile, profile_hash=:hash, "
+                        "updated_at=:now WHERE run_ref=:ref"
+                    ), {"ref": str(row.run_ref), "profile": canonical_json(profile),
+                        "hash": canonical_hash(profile), "now": time.time()})
+                    self._record_owner_change(connection, "agent_runtime.harness_operation_failed", {
+                        "run_ref": str(row.run_ref), "operation_ref": operation_ref,
+                        "status": "unknown_outcome", "failure_code": "provider_terminal_proof_missing",
+                        "terminal_proof_diagnostic": diagnostic,
+                    })
+                return _operation_from_row(row)
+            self._verify_terminal_target_receipt(operation_ref, transport_receipt, str(row.invocation_hash))
             receipts = profile.setdefault("provider_transport_receipts", [])
             if not isinstance(receipts, list) or any(not isinstance(item, dict) for item in receipts):
                 raise AgentRuntimeHarnessError("harness_profile_corrupt")
@@ -2854,6 +2878,15 @@ class SQLiteAgentRuntimeHarness:
             raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
         self._verify_terminal_target_receipt(str(operation.operation_ref),
             {name: value for name, value in matching[0].items() if name != "provider_operation_ref"}, str(operation.invocation_hash))
+
+    def _verify_target_reboot_recovery(self, operation_ref: str, owner_invocation_hash: str) -> None:
+        verifier = self._target_provider_ceiling_receipt_verifier
+        if verifier is None:
+            raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+        try:
+            verifier.verify_signed_reboot_recovery(operation_ref, owner_invocation_hash=owner_invocation_hash)
+        except (TargetRawOutputUnavailable, OSError) as error:
+            raise AgentRuntimeHarnessError("provider_terminal_proof_missing") from error
 
     def _verify_terminal_target_receipt(self, operation_ref: str, receipt: object, owner_invocation_hash: str) -> None:
         verifier = self._target_provider_ceiling_receipt_verifier
@@ -3025,6 +3058,14 @@ class SQLiteAgentRuntimeHarness:
                 ),
                 {"operation_ref": operation_ref},
             ).one()
+            if terminal_proof_diagnostic is not None and "provider_local_tree_closed_after_host_reboot" in terminal_proof_diagnostic:
+                try:
+                    self._verify_target_reboot_recovery(operation_ref, str(row.invocation_hash))
+                except AgentRuntimeHarnessError:
+                    terminal_proof_diagnostic = tuple(
+                        "provider_reboot_evidence_invalid" if reason == "provider_local_tree_closed_after_host_reboot" else reason
+                        for reason in terminal_proof_diagnostic
+                    )
             preparation_failed = durable_outcome == "not_started" and int(row.reconciliation_generation) == 0
             if row.target_ref is not None and not unknown and not preparation_failed:
                 try:

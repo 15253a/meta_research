@@ -705,6 +705,11 @@ def test_target_provider_return_checkpoints_session_then_resumes_once(
     _target, _candidate, _formal_plan, admission, _handle = (
         _admit_independent_target_root(setup_runtime)
     )
+    launch = setup_runtime.owners.agent_runtime.query_admitted_target_launch(_target.target_ref)
+    setup_runtime.target_root_lifecycle.activate(
+        launch_ref=launch.launch_ref, handle=_handle, candidate=_candidate,
+        formal_plan=_formal_plan, idempotency_key="activate-human-wait-root",
+    )
     request_ref = admission.run.request_ref
     target_run_ref = admission.run.run_ref
     setup_runtime.close()

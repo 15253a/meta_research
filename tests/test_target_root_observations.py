@@ -24,6 +24,7 @@ from meta_research.harness_adapters import (
     HarnessSupervisorTransport,
 )
 from meta_research.migration import upgrade_database
+from meta_research.paths import prepare_data_root
 from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeHarnessError,
     SQLiteAgentRuntimeHarness,
@@ -530,6 +531,9 @@ def test_target_root_observation_web_page_is_authenticated_bounded_and_redacted(
         configure_resident_mcp_endpoint=lambda _base_url: None
     )
     runtime = SimpleNamespace(
+        data_root=prepare_data_root(tmp_path / "observation-web"),
+        _database=database,
+        target_run_authorities=SimpleNamespace(agent_runtime=None),
         configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
@@ -628,6 +632,9 @@ def test_long_target_root_output_emits_gaps_and_keeps_web_cursor_advancing(
         configure_resident_mcp_endpoint=lambda _base_url: None
     )
     runtime = SimpleNamespace(
+        data_root=prepare_data_root(tmp_path / "observation-web"),
+        _database=database,
+        target_run_authorities=SimpleNamespace(agent_runtime=None),
         configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
@@ -749,6 +756,9 @@ def test_authenticated_target_raw_output_keeps_two_streams_isolated_across_recon
     )
     harness = _raw_output_harness(owner, transport, store, tmp_path)
     runtime = SimpleNamespace(
+        data_root=prepare_data_root(tmp_path / "observation-web"),
+        _database=database,
+        target_run_authorities=SimpleNamespace(agent_runtime=None),
         configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,

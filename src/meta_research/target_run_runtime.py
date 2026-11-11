@@ -157,9 +157,12 @@ class TargetRunRuntime:
             if harness is None:
                 raise OwnerConflict("target_harness_run_not_found")
             try:
-                self._harnesses.reconcile_failed_target_operation(harness.harness_request_ref)
+                operation = self._harnesses.reconcile_failed_target_operation(harness.harness_request_ref)
             except HarnessAdmissionError as error:
                 self._set_status(target_ref, "failed", error.code)
+                return False
+            if operation.status == "unknown_outcome":
+                self._set_status(target_ref, "failed", "provider_terminal_proof_missing")
                 return False
             self._set_status(target_ref, "failed", "provider_terminal_reconciled")
             return True

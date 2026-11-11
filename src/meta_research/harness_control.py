@@ -130,7 +130,8 @@ class DurableHarnessOperationCanceller:
                 lock.release()
             from meta_research.streaming_provider_supervisor import reconcile_rebooted_supervisor
             try:
-                reconcile_rebooted_supervisor(operation / "supervisor-request.json")
+                if reconcile_rebooted_supervisor(operation / "supervisor-request.json") is not None:
+                    proof_error = ProviderSupervisorError("provider_local_tree_closed_after_host_reboot")
             except (OSError, ProviderSupervisorError) as error:
                 proof_error = error
             # The free lock diagnoses a missing supervisor; it cannot prove

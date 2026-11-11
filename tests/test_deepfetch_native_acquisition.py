@@ -100,8 +100,9 @@ def test_native_acquisition_is_reattested_and_replays_without_dispatch(tmp_path)
 
 def test_native_trace_without_owner_commit_cannot_supply_fulltext_proof(tmp_path):
     adapter, request, authority, _ = _setup(tmp_path, commit=False)
-    with pytest.raises(DeepFetchUnavailable, match="deepfetch_acquisition_reattestation_required"):
+    with pytest.raises(DeepFetchUnavailable, match="deepfetch_provider_reconciliation_pending") as caught:
         adapter.execute(request)
+    assert caught.value.durable_outcome == "pending"
     assert not authority.calls
 
 

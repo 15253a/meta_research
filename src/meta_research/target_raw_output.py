@@ -287,6 +287,40 @@ class TargetRawOutputStore:
             )
         return cast(dict[str, object], dict(receipt))
 
+    def verify_signed_reboot_recovery(
+        self, operation_ref: str, *, owner_invocation_hash: str,
+    ) -> dict[str, object]:
+        """Verify local closure for the exact original operation, not its result."""
+        from meta_research.streaming_provider_supervisor import read_verified_reboot_recovery
+
+        if (not isinstance(operation_ref, str) or not operation_ref or len(operation_ref) > 128
+                or not isinstance(owner_invocation_hash, str)
+                or _INVOCATION_HASH.fullmatch(owner_invocation_hash) is None):
+            raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+        try:
+            _, key = read_transport_key_for_operation(self._source_path(owner_invocation_hash).parent)
+            binding_path = self._workspace / "owner-invocation-bindings" / owner_invocation_hash[:2] / (owner_invocation_hash + ".json")
+            if any(path.is_symlink() for path in (binding_path, binding_path.parent, binding_path.parent.parent)):
+                raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+            binding = read_transport_envelope(binding_path, key)
+            digest = binding.get("transport_invocation_hash")
+            if (set(binding) != {"schema_ref", "owner_invocation_hash", "provider_operation_ref", "family", "transport_invocation_hash"}
+                    or binding.get("schema_ref") != "meta-research/harness-operation-binding/v1"
+                    or binding.get("family") not in {"codex", "claude"}
+                    or binding.get("owner_invocation_hash") != owner_invocation_hash
+                    or binding.get("provider_operation_ref") != operation_ref
+                    or not isinstance(digest, str) or _INVOCATION_HASH.fullmatch(digest) is None):
+                raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+            directory = self._workspace / "provider-operations" / digest[:2] / digest
+            if any(path.is_symlink() for path in (directory, directory.parent, directory.parent.parent)):
+                raise TargetRawOutputUnavailable("target_raw_output_path_invalid")
+            recovery = read_verified_reboot_recovery(directory / "supervisor-request.json")
+            if recovery is None or recovery.get("invocation_hash") != digest:
+                raise TargetRawOutputUnavailable("provider_reboot_evidence_invalid")
+            return recovery
+        except (OSError, ValueError, ProviderSupervisorError) as error:
+            raise TargetRawOutputUnavailable("provider_reboot_evidence_invalid") from error
+
     def query(
         self,
         operation_ref: str,

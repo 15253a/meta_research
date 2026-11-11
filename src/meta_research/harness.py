@@ -2011,9 +2011,9 @@ class HarnessRuntime:
             adapter = self._adapters[record.harness_family]
             recover = getattr(adapter, "recover_transport_receipt", None)
             receipt = recover(operation.operation_ref, owner_invocation_hash=operation.invocation_hash) if callable(recover) else None
-            if receipt is None:
-                raise HarnessAdmissionError("provider_terminal_proof_missing")
             settled = self._owner.reconcile_failed_target_operation(operation.operation_ref, receipt)
+            if settled.status == "unknown_outcome":
+                return settled
         except (AgentRuntimeHarnessError, HarnessAdapterUnavailable) as error:
             raise HarnessAdmissionError(error.code) from error
         except OSError as error:

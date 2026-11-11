@@ -492,7 +492,12 @@ def test_target_harness_records_reconciled_native_terminal_failure(tmp_path, sta
     runtime = _current_bundle_runtime(tmp_path / 'runtime')
     runtime.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
     try:
-        _target, _, _, admission, _ = _admit_independent_target_root(runtime)
+        target, candidate, formal_plan, admission, handle = _admit_independent_target_root(runtime)
+        launch = runtime.owners.agent_runtime.query_admitted_target_launch(target.target_ref)
+        runtime.target_root_lifecycle.activate(
+            launch_ref=launch.launch_ref, handle=handle, candidate=candidate,
+            formal_plan=formal_plan, idempotency_key="activate-guidance-root",
+        )
         # Replace only the external native-provider boundary after the fixture's
         # existing conformance setup. All HC/Harness/Owner paths remain real.
         transport_root = runtime.harnesses._target_raw_output_store._workspace

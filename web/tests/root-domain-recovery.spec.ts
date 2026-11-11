@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 
-async function workspace(page: Page, proofMissing = false) {
+async function workspace(page: Page, proofMissing = false, rebooted = false) {
   const snapshot = JSON.parse(await readFile(resolve("tests/snapshot-before.json"), "utf8"));
   const foreground = { ...snapshot.research_control.foreground, stage: "bundle", status: "active" };
   snapshot.research_control.foreground = foreground;
@@ -35,7 +35,7 @@ async function workspace(page: Page, proofMissing = false) {
           run_ref: "same-target-run", target_ref: "same-target", cycle_ref: foreground.cycle_ref, question_ref: foreground.question_ref,
           created_at: 1, updated_at: Date.now() / 1000, operations: proofMissing ? [{ operation_ref: "original-unknown-operation", label: "执行 1", phase: "target-turn",
             status: "waiting", created_at: 1, updated_at: 1, reason: "provider_terminal_proof_missing",
-            terminal_proof_diagnostic: { provider_operation_ref: "original-unknown-operation", reasons: ["provider_supervisor_seal_invalid"] } }] : [] }] });
+            terminal_proof_diagnostic: { provider_operation_ref: "original-unknown-operation", reasons: [rebooted ? "provider_local_tree_closed_after_host_reboot" : "provider_supervisor_seal_invalid"] } }] : [] }] });
     }
     if (path.endsWith("/output")) return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ detail: { code: "root_session_output_unavailable" } }) });
     if (path === "/api/v1/preferences") return json({ output_language: "zh" });
@@ -78,4 +78,15 @@ test("missing termination proof remains visible even when original output cannot
   await expect(operation).toContainText("original-unknown-operation");
   await expect(operation).toContainText("provider_supervisor_seal_invalid");
   await expect(operation).toContainText("部分记录暂时无法读取");
+});
+
+test("reboot closure remains separate from the unknown original outcome", async ({ page }) => {
+  await workspace(page, true, true);
+  await page.goto("http://localhost:18774/?workspace=1");
+  const operation = page.locator('[data-operation-ref="original-unknown-operation"]');
+  await expect(operation).toContainText("主机重启证据已确认本机进程树结束");
+  await expect(operation).toContainText("原操作结果仍未知，系统不会重复投递");
+  await expect(operation).not.toContainText("尚不能确认旧执行已结束");
+  await operation.getByText("终态证据详情", { exact: true }).click();
+  await expect(operation).toContainText("provider_local_tree_closed_after_host_reboot");
 });
