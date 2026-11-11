@@ -27,6 +27,7 @@ import {
   downloadHumanRequestHandoff,
   executeHumanCommand,
   hydratePendingHumanRequestRecovery,
+  humanRequestRecoveryCollectionError,
   pendingHumanRequestResponse,
   pendingHumanRequestResponsePreview,
   humanResponseDeliveryState,
@@ -2141,6 +2142,7 @@ export function HumanRequestSurface({
     : null;
   const dialogRef = useRef<HTMLDialogElement>(null);
   const onCloseRef = useRef(onClose);
+  const [recoveryDiagnostic, setRecoveryDiagnostic] = useState<string | null>(null);
   const recoveryChanged = useRef(onChanged);
   recoveryChanged.current = onChanged;
   useEffect(() => {
@@ -2163,6 +2165,7 @@ export function HumanRequestSurface({
       } catch {
         failures += 1;
       } finally {
+        if (active) setRecoveryDiagnostic(humanRequestRecoveryCollectionError());
         running = false;
         schedule(failures ? Math.min(1000 * 2 ** Math.min(failures - 1, 5), 30_000) : 30_000);
       }
@@ -2294,6 +2297,7 @@ export function HumanRequestSurface({
           : ""}`}
         data-blocking={blocking ? "true" : "false"}
       >
+        {recoveryDiagnostic ? <p role="status">有本地回应恢复记录无法识别，原内容已保留。{recoveryDiagnostic}</p> : null}
         {selected ? (
           <HumanRequestView
             key={`${selected.request_ref}:${selected.revision}`}
@@ -3052,7 +3056,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     setPending(true);
     setError(null);
     try {
-      await hydratePendingHumanRequestRecovery();
+      await hydratePendingHumanRequestRecovery(request.request_ref);
       const pendingResponse = pendingHumanRequestResponse(request.request_ref);
       if (pendingResponse) {
         if (pendingResponse.request_ref !== request.request_ref) {
@@ -3108,7 +3112,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     }
   };
 
-  const unresolvedResponse = !recorded && Boolean(sealedResponse || pendingHumanRequestResponse(request.request_ref));
+  const unresolvedResponse = !recorded && Boolean(sealedResponse);
   const latestResponse = request.responses?.at(-1);
   const retryReceipt = request.kind === "system_operation_help"
     ? submittedRetry ?? latestResponse : undefined;
@@ -3184,7 +3188,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         <button type="button" disabled={pending} onClick={() => void submit()}>核对原提交</button>
         <p>正在自动核对原提交；安全重投只使用封存正文、原材料及原请求身份，新草稿不能替换它。</p>
       </section>}
-      {hasLegacyHumanRequestMaterial(request.request_ref) ? <p role="status">检测到旧版材料恢复记录。原入库回执保留；请重新选择文件或原路径后提交，旧记录不会自动重放。</p> : null}
+      {recoveryReady && hasLegacyHumanRequestMaterial(request.request_ref) ? <p role="status">检测到旧版材料恢复记录。原入库回执保留；请重新选择文件或原路径后提交，旧记录不会自动重放。</p> : null}
       {request.kind === "library_reconnect" ? (
         <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending || !!sealedResponse || !recoveryReady} workspacePath={workspacePath} />
       ) : null}
@@ -3253,7 +3257,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
       {error || !["library_reconnect", "capability_authorization"].includes(request.kind) ? (
       <div className="hc-response-boundary" role="status">
         {error ? (
-          <><b>{request.kind === "system_operation_help" ? "重试未成功" : sealedResponse || pendingHumanRequestResponse(request.request_ref) ? "提交结果待确认" : "回应未提交"}</b><br />{sealedResponse || pendingHumanRequestResponse(request.request_ref) ? "已保留本次回应，正在自动核对原提交。" : error}</>
+          <><b>{request.kind === "system_operation_help" ? "重试未成功" : sealedResponse ? "提交结果待确认" : "回应未提交"}</b><br />{sealedResponse ? "已保留本次回应，正在自动核对原提交。" : error}</>
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
           <><b>正式提交将回应交回请求原根</b><br />负责当前请求的 Agent 会解释回应、核验材料并决定下一步。</>
         ) : request.kind === "system_operation_help" ? (

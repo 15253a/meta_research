@@ -1,4 +1,3 @@
-"""Autonomous acquisition uses saved conditions through its borrowed Database."""
 from sqlalchemy import event
 
 from meta_research.acquisition import effective_acquisition_config

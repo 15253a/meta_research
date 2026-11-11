@@ -1,4 +1,3 @@
-"""Plan acceptance retains RM/RG provenance while reusing verified content."""
 from types import SimpleNamespace
 
 import pytest

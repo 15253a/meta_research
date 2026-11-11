@@ -221,3 +221,18 @@ test("handoff Retry-After survives background returns while prior text, expansio
   expect(await page.locator(".hc-request-core").evaluate(el => el.scrollTop)).toBeGreaterThan(100);
   await expect(handoff.getByRole("alert")).toHaveCount(0);
 });
+
+
+test("unidentifiable legacy recovery stays visible while a healthy request accepts a response", async ({ page }) => {
+  const bodies: Json[] = [];
+  await workspace(page, async route => { bodies.push(route.request().postDataJSON()); await route.abort("connectionreset"); });
+  await page.evaluate(() => sessionStorage.setItem("meta_research_pending_human_request_response", "{broken"));
+  await page.reload();
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项", exact: true });
+  await expect(dialog.getByText(/有本地回应恢复记录无法识别/)).toContainText("human_request_recovery_manifest_invalid");
+  await expect(dialog.getByRole("textbox", { name: "自然语言回应", exact: true })).toBeEnabled();
+  await submit(page, "healthy despite unknown legacy");
+  await expect(dialog).toContainText("提交结果待确认");
+  expect(bodies[0]).toEqual({ decision: "provided", facts: {}, materials: [], note: "healthy despite unknown legacy" });
+  expect(await page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"))).toBe("{broken");
+});
