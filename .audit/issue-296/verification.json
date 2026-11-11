@@ -1,0 +1,807 @@
+{
+  "baseline": "c2392b4b37964d963ce1477a65025e252c7802b7",
+  "implementation_commit": "069cdab4c75f775bcd7d4281ebb2e059f3c56b8b",
+  "implementation_tree": "78d8a7c87a104fbbbdf6e9d059ce02aade36af33",
+  "runs": [
+    {
+      "label": "red-local-tree01",
+      "source_archive_sha256": "da5fcd28bc98745606ac3c4fb3384c70cb9fdb3704d6cbe250ce36cba6c13029",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "da5fcd28bc98745606ac3c4fb3384c70cb9fdb3704d6cbe250ce36cba6c13029",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 1,
+        "elapsed_seconds": 1.4143102243542671
+      }
+    },
+    {
+      "label": "green-local-tree01",
+      "source_archive_sha256": "7b24586507f60892f033e95443e72d48911597089fc264ab7722ff21d836f601",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "7b24586507f60892f033e95443e72d48911597089fc264ab7722ff21d836f601",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 0,
+        "elapsed_seconds": 1.5069563686847687
+      }
+    },
+    {
+      "label": "tree-green08",
+      "source_archive_sha256": "030ca4e6a6cda0cc766fd304d2a91363f1c8ac3bf8ca4657cc989e7c8d5fdd77",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "030ca4e6a6cda0cc766fd304d2a91363f1c8ac3bf8ca4657cc989e7c8d5fdd77",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 0,
+        "elapsed_seconds": 18.26346768811345
+      }
+    },
+    {
+      "label": "phase1-gate01",
+      "source_archive_sha256": "3a079d5bb56fa130d0765bcffe55f05582e870fcaa07baed96c2c26a47b385f1",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "3a079d5bb56fa130d0765bcffe55f05582e870fcaa07baed96c2c26a47b385f1",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_deepfetch_adapter.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_quest_drafting_adapters.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_harness_target_root.py",
+            "returncode": 0,
+            "index": 3
+          },
+          {
+            "file": "tests/test_harness_adapters.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_harness_target_root_recovery.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_native_codex_guidance.py",
+            "returncode": 1,
+            "index": 7
+          },
+          {
+            "file": "tests/test_bundle_replacement_native_proof.py",
+            "returncode": 0,
+            "index": 9
+          },
+          {
+            "file": "tests/test_root_session_observations.py",
+            "returncode": 1,
+            "index": 6
+          },
+          {
+            "file": "tests/test_issue296_recovery_admission.py",
+            "returncode": 0,
+            "index": 8
+          },
+          {
+            "file": "tests/test_research_notes_and_call_observations.py",
+            "returncode": 0,
+            "index": 11
+          },
+          {
+            "file": "tests/test_target_root_unknown_exit.py",
+            "returncode": 0,
+            "index": 10
+          },
+          {
+            "file": "tests/test_native_session_cleanup.py",
+            "returncode": 0,
+            "index": 12
+          },
+          {
+            "file": "tests/test_root_provider_observations.py",
+            "returncode": 0,
+            "index": 15
+          },
+          {
+            "file": "tests/test_root_workspace.py",
+            "returncode": 0,
+            "index": 13
+          },
+          {
+            "file": "tests/test_provider_supervisor_platform.py",
+            "returncode": 0,
+            "index": 17
+          },
+          {
+            "file": "tests/test_target_run_daemon.py",
+            "returncode": 0,
+            "index": 14
+          },
+          {
+            "file": "tests/test_acquisition_native_replacement.py",
+            "returncode": 0,
+            "index": 18
+          },
+          {
+            "file": "tests/test_harness_stopped_profile_resume.py",
+            "returncode": 1,
+            "index": 16
+          },
+          {
+            "file": "tests/test_orphaned_harness_supervisor.py",
+            "returncode": 0,
+            "index": 20
+          },
+          {
+            "file": "tests/test_provider_process_tree.py",
+            "returncode": 0,
+            "index": 22
+          },
+          {
+            "file": "tests/test_stage_native_replacement.py",
+            "returncode": 0,
+            "index": 21
+          },
+          {
+            "file": "tests/test_harness_cancel_control.py",
+            "returncode": 0,
+            "index": 24
+          },
+          {
+            "file": "tests/test_harness_frozen_terminal_recovery.py",
+            "returncode": 0,
+            "index": 23
+          },
+          {
+            "file": "tests/test_quest_goal_history.py",
+            "returncode": 0,
+            "index": 25
+          },
+          {
+            "file": "tests/test_native_codex_exec.py",
+            "returncode": 0,
+            "index": 27
+          },
+          {
+            "file": "tests/test_root_workspace_history.py",
+            "returncode": 0,
+            "index": 19
+          },
+          {
+            "file": "tests/test_harness_terminal_replay.py",
+            "returncode": 0,
+            "index": 29
+          },
+          {
+            "file": "tests/test_child_session_native_harness_api.py",
+            "returncode": 0,
+            "index": 30
+          },
+          {
+            "file": "tests/test_target_root_cancel.py",
+            "returncode": 0,
+            "index": 28
+          },
+          {
+            "file": "tests/test_deepfetch_host_completion_time.py",
+            "returncode": 0,
+            "index": 31
+          },
+          {
+            "file": "tests/test_target_raw_output_interrupted_tail.py",
+            "returncode": 0,
+            "index": 32
+          },
+          {
+            "file": "tests/test_target_root_suspended_wait.py",
+            "returncode": 0,
+            "index": 33
+          },
+          {
+            "file": "tests/test_target_daemon_health_retention.py",
+            "returncode": 0,
+            "index": 35
+          },
+          {
+            "file": "tests/test_human_wait_runtime_control.py",
+            "returncode": 0,
+            "index": 34
+          },
+          {
+            "file": "tests/test_provider_supervisor_exception_cleanup.py",
+            "returncode": 0,
+            "index": 37
+          },
+          {
+            "file": "tests/test_sealed_provider_operations.py",
+            "returncode": 0,
+            "index": 38
+          },
+          {
+            "file": "tests/test_provider_supervisor_control.py",
+            "returncode": 0,
+            "index": 39
+          },
+          {
+            "file": "tests/test_stopped_target_native_checkpoint.py",
+            "returncode": 0,
+            "index": 26
+          },
+          {
+            "file": "tests/test_target_successor_terminal_gate.py",
+            "returncode": 0,
+            "index": 41
+          },
+          {
+            "file": "tests/test_workspace_guidance_delivery.py",
+            "returncode": 0,
+            "index": 42
+          },
+          {
+            "file": "tests/test_issue296_root_recovery_frontier.py",
+            "returncode": 0,
+            "index": 40
+          },
+          {
+            "file": "tests/test_issue296_late_receipt_reconciliation.py",
+            "returncode": 0,
+            "index": 43
+          },
+          {
+            "file": "tests/test_issue296_unknown_observation.py",
+            "returncode": 0,
+            "index": 44
+          },
+          {
+            "file": "tests/test_target_stop_damaged_transport.py",
+            "returncode": 0,
+            "index": 36
+          },
+          {
+            "file": "tests/test_completed_workspace_cleanup.py",
+            "returncode": 0,
+            "index": 5
+          }
+        ],
+        "collected": 686,
+        "counts": {
+          "passed": 677,
+          "failed": 7,
+          "skipped": 2,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 836.7396368980408
+      }
+    },
+    {
+      "label": "phase1-profile-gate04",
+      "source_archive_sha256": "d8ae5f6bed0e311bd02bca365adb5c3e0abef79ea26c470248fd93ba4f6be1d0",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "d8ae5f6bed0e311bd02bca365adb5c3e0abef79ea26c470248fd93ba4f6be1d0",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_recovery_admission.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_harness_target_root_recovery.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_harness_stopped_profile_resume.py",
+            "returncode": 0,
+            "index": 3
+          },
+          {
+            "file": "tests/test_target_successor_terminal_gate.py",
+            "returncode": 0,
+            "index": 5
+          },
+          {
+            "file": "tests/test_harness_frozen_terminal_recovery.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_issue296_unknown_observation.py",
+            "returncode": 0,
+            "index": 7
+          },
+          {
+            "file": "tests/test_issue296_root_recovery_frontier.py",
+            "returncode": 0,
+            "index": 6
+          },
+          {
+            "file": "tests/test_root_session_observations.py",
+            "returncode": 0,
+            "index": 1
+          }
+        ],
+        "collected": 108,
+        "counts": {
+          "passed": 108,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 174.3826127536595
+      }
+    },
+    {
+      "label": "phase1-native-guidance-fix01",
+      "source_archive_sha256": "dd0af0db809c862b46366f983c3453d47bc5ca1030b669da8a605179d2cba0e2",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "dd0af0db809c862b46366f983c3453d47bc5ca1030b669da8a605179d2cba0e2",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 73.21676013991237
+      }
+    },
+    {
+      "label": "stage2-red07",
+      "source_archive_sha256": "06bb3461f52aeb685348804c17d74659970b9e53a39ef2c7d15ecd26c3c0e2ac",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "06bb3461f52aeb685348804c17d74659970b9e53a39ef2c7d15ecd26c3c0e2ac",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 1,
+        "elapsed_seconds": 47.55782715976238
+      }
+    },
+    {
+      "label": "stage2-stable-green01",
+      "source_archive_sha256": "00192f62318c70717a9dff44acdfc06db4a67fced22122dbe6d94f1a478e30d1",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "00192f62318c70717a9dff44acdfc06db4a67fced22122dbe6d94f1a478e30d1",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 47.96839650347829
+      }
+    },
+    {
+      "label": "stage2-chain02",
+      "source_archive_sha256": "1d362c0f463026b9f55d38ce227902638a199682fafa310dc54d67a2f2a18847",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "1d362c0f463026b9f55d38ce227902638a199682fafa310dc54d67a2f2a18847",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 20.333075024187565
+      }
+    },
+    {
+      "label": "stage2-generic01",
+      "source_archive_sha256": "fc575b55af80c88364715d078986418706e149ffb5613839cb98391575fa1f94",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "fc575b55af80c88364715d078986418706e149ffb5613839cb98391575fa1f94",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 73.26438235118985
+      }
+    },
+    {
+      "label": "stage2-hr-reopen-green02",
+      "source_archive_sha256": "c0623297dc5cda202a26f728b1fb660292f0321db0d188a9afbbdc103992c3b1",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "c0623297dc5cda202a26f728b1fb660292f0321db0d188a9afbbdc103992c3b1",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_human_unknown_consumers.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_issue296_workspace_consumers.py",
+            "returncode": 0,
+            "index": 0
+          }
+        ],
+        "collected": 5,
+        "counts": {
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 74.69474055245519
+      }
+    },
+    {
+      "label": "stage2-failed-gc-green01",
+      "source_archive_sha256": "22a561666e0c8933348cb2cb05aaafe251e2bfcbe3ada65923f59764e8f00719",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "22a561666e0c8933348cb2cb05aaafe251e2bfcbe3ada65923f59764e8f00719",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_failed_workspace_cleanup.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_completed_workspace_cleanup.py",
+            "returncode": 0,
+            "index": 0
+          }
+        ],
+        "collected": 32,
+        "counts": {
+          "passed": 32,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 809.7716911621392
+      }
+    },
+    {
+      "label": "stage2-failed-gc-green02",
+      "source_archive_sha256": "8f31f1e0c3f461cef0536a350eb497bb02e55fbb1f20010b28da2dfe2316e932",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "8f31f1e0c3f461cef0536a350eb497bb02e55fbb1f20010b28da2dfe2316e932",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 170.47757102921605
+      }
+    },
+    {
+      "label": "stage2-gc-crossquest01",
+      "source_archive_sha256": "6afd9721a9d4f14784bba6892bbf11911640e4bf0a35fcaf94a8dd55148cb1d4",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "6afd9721a9d4f14784bba6892bbf11911640e4bf0a35fcaf94a8dd55148cb1d4",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 20.23624736815691
+      }
+    },
+    {
+      "label": "stage2-final-phase1-upgrade01",
+      "source_archive_sha256": "cf08ad5d7fcb969fd8b5f2529ee0ecb8dd67a9ec2255064fc51d60136ae63c2f",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "cf08ad5d7fcb969fd8b5f2529ee0ecb8dd67a9ec2255064fc51d60136ae63c2f",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 5.186780445277691
+      }
+    },
+    {
+      "label": "base-migration01",
+      "source_archive_sha256": "28d47044684459dc4203b537e5cd899579bb182bcdbdd8b11fe1e52d92b9c981",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "28d47044684459dc4203b537e5cd899579bb182bcdbdd8b11fe1e52d92b9c981",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "files": [
+          {
+            "file": "tests/test_runtime_protection_migration.py",
+            "returncode": 1,
+            "index": 2
+          },
+          {
+            "file": "tests/test_bundle_stage_migration.py",
+            "returncode": 1,
+            "index": 1
+          },
+          {
+            "file": "tests/test_reasoning_successor_context_migration.py",
+            "returncode": 1,
+            "index": 3
+          },
+          {
+            "file": "tests/test_deepfetch_runtime_binding_transition_migration.py",
+            "returncode": 1,
+            "index": 4
+          },
+          {
+            "file": "tests/test_bundle_inbox_migration.py",
+            "returncode": 1,
+            "index": 5
+          },
+          {
+            "file": "tests/test_harness_migration_recovery.py",
+            "returncode": 1,
+            "index": 6
+          },
+          {
+            "file": "tests/test_target_root_lifecycle_migration.py",
+            "returncode": 1,
+            "index": 7
+          },
+          {
+            "file": "tests/test_migration_recovery.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 45,
+        "counts": {
+          "passed": 22,
+          "failed": 23,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 145.17197311669588
+      }
+    },
+    {
+      "label": "base-migration-merge02",
+      "source_archive_sha256": "28d5f9e6fa2460744542aa901224d7eef49c18e5822162a54c8d5fb3db5903a5",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "28d5f9e6fa2460744542aa901224d7eef49c18e5822162a54c8d5fb3db5903a5",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "files": [
+          {
+            "file": "tests/test_goal_creation_migration_merge.py",
+            "returncode": 1,
+            "index": 1
+          },
+          {
+            "file": "tests/test_material_companion_search_migration_merge.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 7,
+        "counts": {
+          "passed": 0,
+          "failed": 7,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 22.084537640213966
+      }
+    },
+    {
+      "label": "migration-green03",
+      "source_archive_sha256": "ba3276842771a1b6040bab156f5d237f4006acf52f3d1c0cda02f945053516f5",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "ba3276842771a1b6040bab156f5d237f4006acf52f3d1c0cda02f945053516f5",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_bundle_stage_migration.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_runtime_protection_migration.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_material_companion_search_migration_merge.py",
+            "returncode": 0,
+            "index": 3
+          },
+          {
+            "file": "tests/test_deepfetch_runtime_binding_transition_migration.py",
+            "returncode": 0,
+            "index": 6
+          },
+          {
+            "file": "tests/test_reasoning_successor_context_migration.py",
+            "returncode": 0,
+            "index": 5
+          },
+          {
+            "file": "tests/test_harness_migration_recovery.py",
+            "returncode": 1,
+            "index": 8
+          },
+          {
+            "file": "tests/test_goal_creation_migration_merge.py",
+            "returncode": 0,
+            "index": 7
+          },
+          {
+            "file": "tests/test_bundle_inbox_migration.py",
+            "returncode": 0,
+            "index": 9
+          },
+          {
+            "file": "tests/test_target_root_lifecycle_migration.py",
+            "returncode": 0,
+            "index": 10
+          },
+          {
+            "file": "tests/test_migration_recovery.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_root_session_observations.py",
+            "returncode": 0,
+            "index": 1
+          }
+        ],
+        "collected": 69,
+        "counts": {
+          "passed": 68,
+          "failed": 1,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 176.83624556660652
+      }
+    },
+    {
+      "label": "migration-harness-green04",
+      "source_archive_sha256": "bbc7b676579365e3d8d35c0386eaa670bcc9829503a890d2b6ca38cff6095630",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "bbc7b676579365e3d8d35c0386eaa670bcc9829503a890d2b6ca38cff6095630",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 8.078660540282726
+      }
+    },
+    {
+      "label": "browser-control05",
+      "source_archive_sha256": "c1c0598d673b3c774f526603663725be53199b233b3645f0a3a0de03db2800a3",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "c1c0598d673b3c774f526603663725be53199b233b3645f0a3a0de03db2800a3",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 41.886668775230646
+      }
+    },
+    {
+      "label": "native-workspace-write01",
+      "source_archive_sha256": "b6a86c4212b454d053ab4771cef00c402d639f9184ee6fd9b54fe0eb9b0803d5",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "b6a86c4212b454d053ab4771cef00c402d639f9184ee6fd9b54fe0eb9b0803d5",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_native_workspace_write.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 1,
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 6.9813914485275745
+      }
+    },
+    {
+      "label": "base-human-missing01",
+      "source_archive_sha256": "ce9cd502ed822cbacec4ea1d6bf36e5b7ac5160881bfa50e47b4df8334b9f898",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "ce9cd502ed822cbacec4ea1d6bf36e5b7ac5160881bfa50e47b4df8334b9f898",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 1,
+        "elapsed_seconds": 14.390163134783506
+      }
+    },
+    {
+      "label": "final-human01",
+      "source_archive_sha256": "f25c1179f03868eb538110bff91e5a9b4b8201accfbd2398f0044a48c849faea",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "f25c1179f03868eb538110bff91e5a9b4b8201accfbd2398f0044a48c849faea",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_public_human_reply_delivery.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_root_human_request_lifecycle.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 24,
+        "counts": {
+          "passed": 23,
+          "failed": 1,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 129.28501887992024
+      }
+    }
+  ],
+  "pending": [
+    "final-backend01",
+    "final-browser01",
+    "final-human02",
+    "native workspace-write CI",
+    "full response-time CI",
+    "actual final Claude Code deep review",
+    "final independent review"
+  ],
+  "limitations": [
+    "All data are isolated engineering fixtures, not scientific-chain acceptance.",
+    "Changed boot identity is injected; no host was rebooted.",
+    "Two fixed-version native child-session ledger fixtures unavailable.",
+    "SSH host native workspace-write rejected by namespace policy; mandatory CI gate pending."
+  ]
+}
