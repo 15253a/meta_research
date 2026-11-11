@@ -38,6 +38,7 @@ jobs:
           uv sync --frozen
           version=$(uv run python -c 'from meta_research.codex_runtime import CODEX_LOCKED_VERSION; print(CODEX_LOCKED_VERSION)')
           npm install --ignore-scripts --prefix "$META_RESEARCH_PROVIDER_TOOLS/codex-cli/installs/$version" "@openai/codex@$version"
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g; s|mirror+file:/etc/apt/apt-mirrors-security.txt|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y bubblewrap
       - name: Verify Linux process ownership and stable Target recovery
@@ -98,7 +99,9 @@ jobs:
 
       - name: Install Chromium and system dependencies
         working-directory: web
-        run: npx playwright install --with-deps chromium
+        run: |
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g; s|mirror+file:/etc/apt/apt-mirrors-security.txt|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+          npx playwright install --with-deps chromium
 
       - name: Check frontend logic and latency gate calculations
         working-directory: web
