@@ -60,27 +60,29 @@ class GuidanceRuntimeMixin:
     ) -> tuple[StageGuidanceOperation, VerifiedGuidanceWork]:
         if scope.root_kind != "reasoning":
             raise OwnerConflict("guidance_operation_invalid")
-        verified = self.verify_root_agent_runtime_scope(**scope.as_dict())
-        with self._database.read() as connection:
-            request_ref = connection.execute(text(
-                "SELECT request_ref FROM ar_stage_runs WHERE run_ref=:run_ref AND stage='reasoning'"
-            ), {"run_ref": scope.run_ref}).scalar_one_or_none()
-        run = self.query_reasoning_stage_run(request_ref) if request_ref else None
-        if (run is None or run.primary_draft is None
-                or run.attempt_ref != scope.attempt_ref or run.fence_ref != scope.fence_ref
-                or run.primary_invocation.status != "completed"):
-            raise OwnerConflict("guidance_provider_unit_unbound")
-        source_ref = run.primary_draft.primary_provider_unit_ref
-        if source_ref is None:
-            raise OwnerConflict("reasoning_primary_source_missing")
-        with self._database.read() as connection:
-            unit = connection.execute(text(
-                "SELECT * FROM ar_provider_units WHERE unit_ref=:ref"
-            ), {"ref": source_ref}).first()
-        if unit is None:
-            raise OwnerConflict("reasoning_primary_source_invalid")
-        return (StageGuidanceOperation(scope, unit.operation_ref, "primary", source_ref),
-            VerifiedGuidanceWork("reasoning", scope.run_ref, verified["quest_ref"], request_ref))
+        with self._database.read_snapshot():
+            verified = self.verify_root_agent_runtime_scope(**scope.as_dict())
+            with self._database.read() as connection:
+                request_ref = connection.execute(text(
+                    "SELECT request_ref FROM ar_stage_runs WHERE run_ref=:run_ref AND stage='reasoning'"
+                ), {"run_ref": scope.run_ref}).scalar_one_or_none()
+            run = self.query_reasoning_stage_run(request_ref) if request_ref else None
+            if (run is None or run.primary_draft is None
+                    or run.attempt_ref != scope.attempt_ref or run.fence_ref != scope.fence_ref
+                    or run.primary_invocation.status != "completed"):
+                raise OwnerConflict("guidance_provider_unit_unbound")
+            source_ref = run.primary_draft.primary_provider_unit_ref
+            if source_ref is None:
+                raise OwnerConflict("reasoning_primary_source_missing")
+            with self._database.read() as connection:
+                unit = connection.execute(text(
+                    "SELECT * FROM ar_provider_units WHERE unit_ref=:ref"
+                ), {"ref": source_ref}).first()
+            if unit is None:
+                raise OwnerConflict("reasoning_primary_source_invalid")
+            return (StageGuidanceOperation(scope, unit.operation_ref, "primary", source_ref),
+                VerifiedGuidanceWork("reasoning", scope.run_ref, verified["quest_ref"], request_ref))
+
 
     def verify_reasoning_primary_completion_operation(
         self, operation: StageGuidanceOperation,
