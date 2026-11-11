@@ -238,17 +238,27 @@ test("paged inventory keeps an exact off-page version reachable", async ({
     );
     expect(response.status()).toBe(201);
   }
-  const compactResponse = page.waitForResponse((response) =>
-    new URL(response.url()).pathname === "/api/v1/snapshot" && response.ok());
-  await page.reload({ waitUntil: "domcontentloaded" });
-  const compact = (await (await compactResponse).json()).research_assets;
+  const workspaceUrl = page.url();
+  await page.goto("about:blank");
+  const compactRequest = page.waitForEvent("requestfinished", (request) =>
+    new URL(request.url()).pathname === "/api/v1/snapshot"
+    && request.headers()["x-meta-research-snapshot-assets"] === "defer");
+  await page.goto(workspaceUrl, { waitUntil: "domcontentloaded" });
+  const compactResponse = await (await compactRequest).response();
+  if (!compactResponse) throw new Error("completed compact snapshot has no response");
+  expect(compactResponse.ok()).toBe(true);
+  const compact = (await compactResponse.json()).research_assets;
   expect(compact.items).toEqual([]);
   expect(compact.total_count).toBe(52);
-  const hydratedResponse = page.waitForResponse(async (response) =>
-    new URL(response.url()).pathname === "/api/v1/snapshot"
-    && response.ok() && (await response.json()).research_assets.items.length === 50);
+  const hydratedRequest = page.waitForEvent("requestfinished", (request) =>
+    new URL(request.url()).pathname === "/api/v1/snapshot"
+    && request.headers()["x-meta-research-snapshot-assets"] === "include");
   await page.getByRole("button", { name: "研究资料", exact: true }).click();
-  const hydrated = (await (await hydratedResponse).json()).research_assets;
+  const hydratedResponse = await (await hydratedRequest).response();
+  if (!hydratedResponse) throw new Error("completed hydrated snapshot has no response");
+  expect(hydratedResponse.ok()).toBe(true);
+  const hydrated = (await hydratedResponse.json()).research_assets;
+  expect(hydrated.items).toHaveLength(50);
   expect(hydrated.inventory_revision).toBe(compact.inventory_revision);
   const dialog = page.getByRole("dialog", { name: "研究资料" });
   await dialog.locator(".asset-storage-details > summary").click();
