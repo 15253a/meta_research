@@ -1,0 +1,92 @@
+{
+  "date": "2026-11-11",
+  "review": {
+    "head": "568da247b30389b180571774b25516544d0c9ddb",
+    "exitcode": 0,
+    "elapsed_seconds": 21.35899999999674,
+    "source_unchanged": true,
+    "session_id": "789037bf-68e3-4d75-9763-b5876f611026",
+    "is_error": false,
+    "models": [
+      "claude-opus-5-5"
+    ],
+    "tool_calls": 0,
+    "result_subtype": "success"
+  },
+  "first_review": {
+    "head": "568da247b30389b180571774b25516544d0c9ddb",
+    "exitcode": 0,
+    "elapsed_seconds": 128.95299999999406,
+    "source_unchanged": true,
+    "session_id": "789037bf-68e3-4d75-9763-b5876f611026",
+    "is_error": false,
+    "models": [
+      "claude-opus-5-5"
+    ],
+    "tool_calls": 0,
+    "result_subtype": "success"
+  },
+  "claude_cli_version": "2.1.285",
+  "review_mode": "read-only supplied source/evidence packet, tools disabled, effort max",
+  "source_equivalence": {
+    "head": "568da247b30389b180571774b25516544d0c9ddb",
+    "prior_reviewed_head": "8fe94e5e0469bb2fd1128831d832fd2be7ef17a8",
+    "base": "7746456a15351b16fb8fd659e80c3c29250c62d8",
+    "incremental_changed_files": [
+      "web/tests/experiment-log-fallback.test.mjs",
+      "web/tests/response-time/workspace.spec.ts"
+    ],
+    "production_diff_from_prior": "",
+    "baseline_identical_before_fix": {
+      "web/tests/experiment-log-fallback.test.mjs": true,
+      "web/src/main.tsx": true,
+      "web/src/MetaTrace.tsx": true,
+      "web/src/RootConversations.tsx": true,
+      "web/src/ExecutionElapsed.tsx": true,
+      "web/tests/response-time/workspace.spec.ts": true,
+      "web/package.json": true,
+      "web/package-lock.json": true,
+      ".github/workflows/response-time.yml": true,
+      "web/tests/response-time/budgets.json": true
+    },
+    "worktree_status": "",
+    "test_sha256": "4b186765eb0da4a1ef322ba8ff4cdcc3bd16b609b344907cacd1c7d5df2b3edc"
+  },
+  "ci": {
+    "url": "https://github.com/15253a/meta_research/actions/runs/42967795536",
+    "head": "568da247b30389b180571774b25516544d0c9ddb",
+    "base": "7746456a15351b16fb8fd659e80c3c29250c62d8",
+    "tested_merge": "d0e8860fcefbb1e25038aefb46d5872dca6b056b",
+    "head_and_merge_tree": "f2a1d28e36e69b6f75d44669f55ce46c7ae400ed",
+    "npm_test": {
+      "passed": 45,
+      "failed": 0,
+      "skipped": 0
+    },
+    "typecheck_app": "passed",
+    "typecheck_e2e": "passed",
+    "build": "passed",
+    "response_time": {
+      "passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "flaky": 0
+    }
+  },
+  "local_evidence_directory": "D:\\meta_research\\optimier_with_claude\\pr-297-ci-20261111",
+  "sha256": {
+    "repro-focused.log": "c60b0794a591191f2ad794d91bd84f34a107af0f0faab826e2fc34517b472073",
+    "repro-npm-test.log": "19bc240625a15348ae4f7330f7013058d6e07d261cbc8ebe6894e10ac58d0826",
+    "green-focused.log": "43363780c9eb0b7a2703c442716bdc4a9e285f09ce8fe37a5207fecaaac8f8f2",
+    "green-npm-test.log": "459d747e369cff67aa25e0de9ee8f1707f686b3f7b6916d89f693b85b10a7dce",
+    "green-build.log": "d21b52c760653da4d7ac4890c06ccfbbed49466f0c0cb461df492af8119ac2c9",
+    "initial-ci.log": "554cd3daaca538537be5bf4048107999a374a2e919b1fb3cc31a3b7c2295a9cb",
+    "dispatch-ci.log": "3e62bb940c67134775ae82383cb343169d907787c217aa5bd3d9d6731955f715",
+    "fix-ci.log": "ee150d9d55b4b435911b489ddb11c0e4ea4977204a5fb2bc4e090160a77a8135",
+    "selectors-ci.log": "679a3e88338786ea392912ca15e85417a888f00fa4ae940ef084910cf2c92b7d",
+    "selectors-artifacts.zip": "c6e707935aeba131f76d1e54f3c2184a190b7f03486611db58e2a1e4a2f86f2d",
+    "cc-packet.txt": "c13de221b000bcb4a9a94b7b56142cf1060f09272cb502ae8c26342f19e45bb3",
+    "fix-cc/final-ci/stream.jsonl": "dd3ee94336c28a5a05e64ced06bb681cdbb37e70838fbc36616fcf14932222a9",
+    "fix-cc/final-ci-confirmed/stream.jsonl": "64a9b9a43fac853a8a0ca6f38a71069acc6c52b4b7480deb9fee1046879002b5"
+  }
+}
