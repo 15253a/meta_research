@@ -287,3 +287,123 @@ def test_primary_write_refuses_missing_and_unrelated_unit(tmp_path, monkeypatch)
         assert len(provider.requests) == 1
     finally:
         runtime.close()
+
+
+def test_completed_unit_before_first_write_refuses_atomically_then_retries(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    provider = CompletionAfterHR(False)
+    runtime = _runtime(tmp_path / "safe-point-before-write", provider)
+    owner = runtime.owners.agent_runtime
+    record = owner.record_reasoning_primary_draft
+    checked = []
+
+    def record_after_safe_point(**values):
+        unit_ref = values["primary_provider_unit_ref"]
+        scope = {key: values[key] for key in ("run_ref", "attempt_ref", "fence_ref")}
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(owner.acknowledge_provider_safe_point,
+                unit_ref=unit_ref, **scope).result(timeout=15)
+        with pytest.raises(OwnerConflict, match="reasoning_primary_source_invalid"):
+            record(**values)
+        with owner._database.read() as connection:
+            assert connection.execute(text("SELECT primary_draft_json FROM ar_stage_attempts "
+                "WHERE attempt_ref=:attempt_ref"), scope).scalar_one() is None
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_stage_commands "
+                "WHERE idempotency_key=:key"), {"key": values["idempotency_key"]}).scalar_one() == 0
+            unit = connection.execute(text("SELECT operation_ref,status FROM ar_provider_units "
+                "WHERE unit_ref=:ref"), {"ref": unit_ref}).one()
+        assert unit.status == "completed"
+        owner.begin_provider_unit(unit_ref=unit_ref, operation_ref=unit.operation_ref,
+            unit_kind="reasoning_primary", **scope)
+        result = record(**values)
+        checked.append(unit_ref)
+        return result
+
+    monkeypatch.setattr(owner, "record_reasoning_primary_draft", record_after_safe_point)
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        for _ in range(12):
+            if runtime.reasoning_stage.query_current()["reasoning_acceptance"]["status"] == "accepted":
+                break
+            assert runtime.reasoning_stage.process_once()
+        assert runtime.reasoning_stage.query_current()["reasoning_acceptance"]["status"] == "accepted"
+        assert len(checked) == 1
+        assert len(provider.requests) == 1
+    finally:
+        runtime.close()
+
+
+def test_completion_resolution_pins_snapshot_across_attempt_replacement(saved_primary, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import time
+    _, runtime, _, run = saved_primary
+    owner = runtime.owners.agent_runtime
+    original = owner.reasoning_primary_completion_operation(_scope(run))[0]
+    verify = owner.verify_root_agent_runtime_scope
+
+    def replace_attempt():
+        now = time.time()
+        with owner._database.write() as connection:
+            control = connection.execute(text("SELECT * FROM ar_run_controls WHERE run_ref=:run"),
+                {"run": run.run_ref}).one()
+            connection.execute(text("UPDATE ar_execution_fences SET status='rejected', closed_at=:now "
+                "WHERE fence_ref=:fence"), {"now": now, "fence": run.fence_ref})
+            replacement = owner._replace_fenced_managed_attempt(connection, control, now,
+                reuse_checkpoint=True, reuse_operation_refs=False, preserve_native_session=True,
+                replacement_reason_code="provider_result_correction")
+            connection.execute(text("UPDATE ar_run_controls SET attempt_ref=:attempt, fence_ref=:fence, "
+                "control_revision=control_revision+1 WHERE run_ref=:run"),
+                {"attempt": replacement.attempt_ref, "fence": replacement.fence_ref, "run": run.run_ref})
+
+    def verify_then_replace(**values):
+        result = verify(**values)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(replace_attempt).result(timeout=15)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, "verify_root_agent_runtime_scope", verify_then_replace)
+        resolved, work = owner.reasoning_primary_completion_operation(_scope(run))
+    assert resolved == original
+    assert work.provenance_ref == run.request_ref
+    adopted = owner.query_reasoning_stage_run(run.request_ref)
+    assert adopted.attempt_ref != run.attempt_ref
+    assert owner.reasoning_primary_completion_operation(_scope(adopted))[0].identity == original.identity
+    with pytest.raises(OwnerConflict):
+        runtime.owners.human_collaboration.bind_reasoning_completion_conditions(
+            operation=resolved, submission_ref="stale-completion", output={}, payload_hash="stale")
+    with owner._database.read() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM hc_reasoning_completion_conditions "
+            "WHERE submission_ref='stale-completion'")).scalar_one() == 0
+
+
+def test_concurrent_hc_pause_rejects_resolved_completion_then_resume_accepts(saved_primary, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from test_reasoning_operator_pause_resume import _control
+    _, runtime, provider, run = saved_primary
+    owner = runtime.owners.agent_runtime
+    verify = owner.verify_root_agent_runtime_scope
+
+    def verify_then_pause(**values):
+        result = verify(**values)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(_control, runtime, run, "pause").result(timeout=15)["executed"] is True
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, "verify_root_agent_runtime_scope", verify_then_pause)
+        resolved, _ = owner.reasoning_primary_completion_operation(_scope(run))
+    with pytest.raises(OwnerConflict):
+        runtime.owners.human_collaboration.bind_reasoning_completion_conditions(
+            operation=resolved, submission_ref="paused-completion", output={}, payload_hash="paused")
+    with owner._database.read() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM hc_reasoning_completion_conditions "
+            "WHERE submission_ref='paused-completion'")).scalar_one() == 0
+    assert _control(runtime, run, "resume")["executed"] is True
+    for _ in range(8):
+        if runtime.reasoning_stage.query_current()["reasoning_acceptance"]["status"] == "accepted":
+            break
+        assert runtime.reasoning_stage.process_once()
+    assert runtime.reasoning_stage.query_current()["reasoning_acceptance"]["status"] == "accepted"
+    assert len(provider.requests) == 2
