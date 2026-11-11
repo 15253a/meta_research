@@ -1,0 +1,328 @@
+{
+  "scope": "User-selected local full-access acceptance; other environment defaults unchanged",
+  "policy": "META_RESEARCH_TARGET_SANDBOX_MODE=danger-full-access",
+  "baseline_commit": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+  "source_archive_sha256": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+  "source_file_sha256": {
+    "src/meta_research/owners/target_run_runtime.py": "d27a925f62bfec916a35da940aa12a861eb1b7c91d9ee8b529acad6b3a83e553",
+    "src/meta_research/harness_adapters.py": "aabbe96ff30cfef957d968f9bd04706a1f467433bd1941ce72b5a9f29696b22c",
+    "tests/test_issue296_native_full_access.py": "ee52a3be34ded6707af06b7342858f13fbdfa7b6402d67679a138757cc788caf",
+    "tests/test_issue296_stable_workspace.py": "26d32efc7e2925f7f2518f9e28693939fd950c1e8872388c97f3a2a0c4f27531",
+    "tests/test_issue296_full_access_review.py": "2e28ecc3a9e6ac7ae09a6e9621792b84c27975739277a8f463bc64884964e18d",
+    ".github/workflows/response-time.yml": "1637a9fdaa257f309765bfa99da8f67d3b1ecbfd65e8ab1923ea68fd0ee1ff21"
+  },
+  "run_label": "full-access-final-matrix-03",
+  "result": {
+    "snapshot": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+    "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+    "ref": null,
+    "files": [
+      {
+        "file": "tests/test_harness_adapters.py",
+        "returncode": 0,
+        "index": 0
+      },
+      {
+        "file": "tests/test_provider_process_tree.py",
+        "returncode": 0,
+        "index": 2
+      },
+      {
+        "file": "tests/test_issue296_native_full_access.py",
+        "returncode": 0,
+        "index": 4
+      },
+      {
+        "file": "tests/test_issue296_stable_workspace.py",
+        "returncode": 0,
+        "index": 1
+      },
+      {
+        "file": "tests/test_issue296_full_access_review.py",
+        "returncode": 0,
+        "index": 3
+      }
+    ],
+    "collected": 51,
+    "counts": {
+      "passed": 51,
+      "failed": 0,
+      "skipped": 0,
+      "incomplete": 0
+    },
+    "exitcode": 0,
+    "elapsed_seconds": 120.36843575909734
+  },
+  "coverage": {
+    "linux_process_tree": 17,
+    "stable_workspace": 3,
+    "actual_native_full_access": 2,
+    "owner_review_policy": 8,
+    "existing_adapter_review_negative_cases": 21
+  },
+  "native_checkpoint_segments": [
+    1,
+    2,
+    3
+  ],
+  "owner_boundary": "Actual admission, reservation, Harness, adapter verification, durable profile, Owner public discovery and common acceptance verifier, domain child binding. Controlled native child ledger fixtures.",
+  "red_evidence": [
+    "review-policy-red-05: exact workspace-write code-lineage mismatch and configured full-access root-policy rejection",
+    "full-access-final-matrix-01: 48 pass, three code review failures from actor-field mismatch"
+  ],
+  "claims_not_made": [
+    "OS cross-directory write isolation under full-access",
+    "Real-model scientific review or complete formal research-review submission",
+    "Actual Claude Code review",
+    "Deployment"
+  ],
+  "full_access_independent_review": {
+    "schema": "issue296-independent-full-access-review/v1",
+    "generated_at_utc": "2026-11-11T16:10:28.855704+00:00",
+    "reviewer": "/root/review_full_access",
+    "verdict": "PASS_NO_UNRESOLVED_FINDINGS_IN_SCOPE",
+    "base_commit": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+    "head_at_review": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+    "base_tree": "8b31a46053d5df4412a750e3410a8c83348a8f51",
+    "reviewed_file_sha256": {
+      "src/meta_research/owners/target_run_runtime.py": "d27a925f62bfec916a35da940aa12a861eb1b7c91d9ee8b529acad6b3a83e553",
+      "src/meta_research/harness_adapters.py": "aabbe96ff30cfef957d968f9bd04706a1f467433bd1941ce72b5a9f29696b22c",
+      "tests/test_issue296_full_access_review.py": "2e28ecc3a9e6ac7ae09a6e9621792b84c27975739277a8f463bc64884964e18d",
+      "tests/test_issue296_native_full_access.py": "ee52a3be34ded6707af06b7342858f13fbdfa7b6402d67679a138757cc788caf",
+      "tests/test_issue296_stable_workspace.py": "26d32efc7e2925f7f2518f9e28693939fd950c1e8872388c97f3a2a0c4f27531",
+      ".github/workflows/response-time.yml": "1637a9fdaa257f309765bfa99da8f67d3b1ecbfd65e8ab1923ea68fd0ee1ff21"
+    },
+    "deleted_file": {
+      "path": "tests/test_issue296_native_workspace_write.py",
+      "base_blob_sha256": "81d527e2ff0683de1dd800d8d1a3fb039f466206cf4a2a516369babebc07b5a2",
+      "replaced_by": "tests/test_issue296_native_full_access.py"
+    },
+    "open_findings": [],
+    "verified_design": [
+      "Existing explicit META_RESEARCH_TARGET_SANDBOX_MODE selects full-access; default remains workspace-write. Owner reuses the same adapter allowlist; danger-full-access is not unconditionally accepted.",
+      "Result children retain read-only/workspace-write compatibility and accept full-access only under the explicit configuration. Code children reject read-only and malformed/missing/unsupported policy.",
+      "Code expected lineage includes the already-persisted sandbox_mode and still compares all lineage fields exactly. Parent/session/cwd/version/originator, payload/ledger hashes, operation reservation, skill proof and actor identities remain checked.",
+      "Post-binding actor comparison selects existing skill_actor_session_ref for code and review_actor_session_ref for result, each verified against the native child before binding. No actor evidence is invented or backfilled.",
+      "New tests consume profiles emitted by the real adapter and persisted by Harness, not database-injected profiles. Corruption negatives modify only an in-memory copy of that actual evidence.",
+      "CI removes bubblewrap only from native recovery setup, keeps actual pinned CLI execution, exact native test presence and no-skip assertions. Response-time dependency/budget behavior remains unchanged."
+    ],
+    "green": {
+      "run": "D:\\meta_research\\optimier_with_claude\\issue-296-evidence-20261111\\env\\runs\\full-access-final-matrix-03",
+      "summary": {
+        "snapshot": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+        "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_harness_adapters.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_provider_process_tree.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_issue296_native_full_access.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_issue296_stable_workspace.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_issue296_full_access_review.py",
+            "returncode": 0,
+            "index": 3
+          }
+        ],
+        "collected": 51,
+        "counts": {
+          "passed": 51,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 120.36843575909734
+      },
+      "per_file": {
+        "tests/test_harness_adapters.py": {
+          "tests": 21,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-0.xml",
+          "junit_sha256": "ab86b8ca0aaa9ab4e263c6bd748f1a1cf0a1860a5d31607f5c09930b41ce4ce8"
+        },
+        "tests/test_provider_process_tree.py": {
+          "tests": 17,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-2.xml",
+          "junit_sha256": "1982a4f97f375c14e0da601fbee990e377118a87f2cda1ab37c5fccce648974d"
+        },
+        "tests/test_issue296_native_full_access.py": {
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-4.xml",
+          "junit_sha256": "d0d2757de0b70c78893804e18bc537127762f005e32b06e3d13a51f8ff729ddd"
+        },
+        "tests/test_issue296_stable_workspace.py": {
+          "tests": 3,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-1.xml",
+          "junit_sha256": "e1b229a8156550c60e027980daf82377b2f270571ea5a781e5911734164c29f8"
+        },
+        "tests/test_issue296_full_access_review.py": {
+          "tests": 8,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-3.xml",
+          "junit_sha256": "d84d012cca0d4f81bf7d1a35ae2ffafd25a2c543ea493916e68bcc2e16bfc867"
+        }
+      },
+      "selectors": [
+        "tests/test_provider_process_tree.py",
+        "tests/test_issue296_stable_workspace.py",
+        "tests/test_issue296_native_full_access.py",
+        "tests/test_issue296_full_access_review.py",
+        "tests/test_harness_adapters.py::test_codex_subagent_evidence_records_exact_code_review_skill_invocation",
+        "tests/test_harness_adapters.py::test_codex_result_review_uses_native_child_ledger_evidence",
+        "tests/test_harness_adapters.py::test_codex_result_review_fails_closed_without_exact_native_child_proof",
+        "tests/test_harness_adapters.py::test_codex_code_review_proof_fails_closed_without_exact_child_chain",
+        "tests/test_harness_adapters.py::test_codex_code_review_proof_requires_wait_message_equal_child_terminal",
+        "tests/test_harness_adapters.py::test_codex_code_review_requires_a_package_verifying_reader",
+        "tests/test_harness_adapters.py::test_codex_code_review_rejects_child_danger_full_access_sandbox",
+        "tests/test_harness_adapters.py::test_codex_code_review_requires_structured_spawn_skill_path_binding"
+      ],
+      "manifest_sha256": "46952197a6bf77d188422e1d34fc8478b832ae673ba908e225d6e9f2be9e70bf",
+      "archive_sha256": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+      "all_archive_files_match_manifest": true,
+      "archive_file_count": 1362,
+      "all_reviewed_current_bytes_match_frozen_snapshot": true,
+      "all_51_case_outcomes_passed": true,
+      "native_tools": {
+        "codex": {
+          "path": "/vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta_research_8771_v1_test/runtime/provider-tools/codex-cli/installs/0.159.0/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+          "resolved_path": "/vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta_research_8771_v1_test/runtime/provider-tools/codex-cli/installs/0.159.0/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+          "sha256": "d2752c52353401f7f6efbfcea68796f4f7a3d3e4769f5d1da53fa49d4856b72f",
+          "version": "codex-cli 0.159.0"
+        },
+        "node": {
+          "path": "/usr/local/bin/node",
+          "resolved_path": "/usr/local/bin/node",
+          "sha256": "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068",
+          "version": "v22.23.1"
+        },
+        "scope_files": [
+          "tests/test_issue296_native_full_access.py"
+        ],
+        "tools_root": "/dev/shm/issue-296-05AIRsHp/native-test-provider-tools",
+        "path_prefix": "/dev/shm/issue-296-05AIRsHp/native-test-bin",
+        "credentials_copied": false,
+        "source_changes": false,
+        "other_files_use_original_environment": true,
+        "executables_unchanged_after_tests": true
+      }
+    },
+    "valid_red_evidence": [
+      {
+        "run": "review-policy-red-05",
+        "summary": {
+          "snapshot": "375baa93d540c7698e70b05ffe7e827a16eb54dc5bb7c492860bff07735dad5c",
+          "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+          "ref": null,
+          "exitcode": 1,
+          "elapsed_seconds": 32.77262695133686
+        },
+        "failed_cases": [
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[workspace-write-code]",
+            "message": "meta_research.owners.common.OwnerConflict: target_code_review_skill_evidence_invalid"
+          },
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[danger-full-access-result]",
+            "message": "meta_research.owners.common.OwnerConflict: target_review_harness_invalid"
+          }
+        ]
+      },
+      {
+        "run": "full-access-final-matrix-01",
+        "summary": {
+          "snapshot": "6c641f666bf6de6400928f53e2fbdd4f49f4c4b3c600d0cd48a5f8c9a20427c5",
+          "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+          "ref": null,
+          "files": [
+            {
+              "file": "tests/test_harness_adapters.py",
+              "returncode": 0,
+              "index": 0
+            },
+            {
+              "file": "tests/test_provider_process_tree.py",
+              "returncode": 0,
+              "index": 2
+            },
+            {
+              "file": "tests/test_issue296_native_full_access.py",
+              "returncode": 0,
+              "index": 4
+            },
+            {
+              "file": "tests/test_issue296_stable_workspace.py",
+              "returncode": 0,
+              "index": 1
+            },
+            {
+              "file": "tests/test_issue296_full_access_review.py",
+              "returncode": 1,
+              "index": 3
+            }
+          ],
+          "collected": 51,
+          "counts": {
+            "passed": 48,
+            "failed": 3,
+            "skipped": 0,
+            "incomplete": 0
+          },
+          "exitcode": 1,
+          "elapsed_seconds": 119.3243328332901
+        },
+        "failed_cases": [
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[code-workspace-write-workspace-write]",
+            "message": "KeyError: 'review_actor_session_ref'"
+          },
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[code-danger-full-access-danger-full-access]",
+            "message": "KeyError: 'review_actor_session_ref'"
+          },
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[code-danger-full-access-workspace-write]",
+            "message": "KeyError: 'review_actor_session_ref'"
+          }
+        ]
+      }
+    ],
+    "excluded_red_attempts": "review-policy-red-01 through -03 were fixture setup failures, not product RED evidence; -05 isolates the policy/lineage defects. Matrix-01 separately exposes the actor-key defect.",
+    "limitations": [
+      "Independent source/evidence review, not a Claude Code or semantic model review; no CC was invoked.",
+      "Native tests execute pinned Codex app-server command/exec. Recovery provider termination outcomes are controlled signed fixtures; the 17 Linux process-tree cases separately exercise actual local process ownership and closure.",
+      "Review transport and native child ledger content are controlled fixtures. Real admission, child reservation, Harness/adapter verification, durable profile/event persistence, public Owner evidence discovery and common acceptance verifier/binding are exercised. This does not assert a complete formal/scientific review submission.",
+      "Full-access does not establish OS directory confinement. Unchanged sibling bytes prove only that these prescribed operations did not modify that file.",
+      "The 51-case matrix covers this increment. Earlier 947-backend/112-browser evidence applies to its recorded earlier source and is not relabeled as this final snapshot.",
+      "Final audit prose, GitHub CI/publication, merge and deployment state are outside this fixed source review. No network or repository mutation was performed by this reviewer."
+    ]
+  }
+}

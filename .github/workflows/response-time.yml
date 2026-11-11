@@ -38,8 +38,6 @@ jobs:
           uv sync --frozen
           version=$(uv run python -c 'from meta_research.codex_runtime import CODEX_LOCKED_VERSION; print(CODEX_LOCKED_VERSION)')
           npm install --ignore-scripts --prefix "$META_RESEARCH_PROVIDER_TOOLS/codex-cli/installs/$version" "@openai/codex@$version"
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
       - name: Verify Linux process ownership and stable Target recovery
         run: |
           uv run python - <<'PY'
@@ -51,13 +49,13 @@ jobs:
           environment = {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(), 'platform': platform.platform(), 'python': platform.python_version(), 'codex': subprocess.check_output([str(executable), '--version'], text=True).strip(), 'codex_sha256': hashlib.sha256(executable.read_bytes()).hexdigest()}
           (directory / 'environment.json').write_text(json.dumps(environment, indent=2))
           PY
-          uv run pytest -q tests/test_provider_process_tree.py tests/test_issue296_stable_workspace.py tests/test_issue296_native_workspace_write.py --basetemp="$RUNNER_TEMP/issue296-test-data" --junitxml=target-recovery-results/results.xml
+          uv run pytest -q tests/test_provider_process_tree.py tests/test_issue296_stable_workspace.py tests/test_issue296_native_full_access.py tests/test_issue296_full_access_review.py --basetemp="$RUNNER_TEMP/issue296-test-data" --junitxml=target-recovery-results/results.xml
           uv run python - <<'PY'
           import xml.etree.ElementTree as ET
           result = ET.parse('target-recovery-results/results.xml')
           assert not result.findall('.//skipped'), 'Linux Target recovery acceptance must not skip cases'
-          native = {case.attrib['name'] for case in result.findall('.//testcase') if case.attrib.get('classname') == 'tests.test_issue296_native_workspace_write'}
-          assert native == {'test_native_workspace_write_keeps_parallel_workspace_read_only', 'test_two_recoveries_use_native_workspace_write_at_the_same_cwd'}, native
+          native = {case.attrib['name'] for case in result.findall('.//testcase') if case.attrib.get('classname') == 'tests.test_issue296_native_full_access'}
+          assert native == {'test_native_full_access_runs_in_assigned_workspace', 'test_two_recoveries_use_native_full_access_at_the_same_cwd'}, native
           PY
       - name: Upload Target recovery evidence
         if: always()

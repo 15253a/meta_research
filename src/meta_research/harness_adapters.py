@@ -3693,7 +3693,7 @@ def _verified_child_sandbox_mode(
     expected_working_directory: str,
     allowed_sandbox_modes: frozenset[str],
 ) -> str | None:
-    """Require every persisted child turn context to retain Target confinement."""
+    """Require every persisted child turn to retain one allowed execution policy."""
 
     contexts = [
         record.get("payload")

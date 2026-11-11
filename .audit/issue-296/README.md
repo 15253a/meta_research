@@ -1,9 +1,10 @@
 # #296 stable TargetRun workspace
 
-Status: implementation and the affected Linux/backend/browser verification are
-complete. Native sandbox and GitHub response-time acceptance remain blocked by
-Ubuntu dependency DNS failures before test execution. Actual Claude Code final
-review is deferred at the user's latest request. The PR remains unmerged.
+Status: the user's 2026-11-11 update selects explicitly configured local
+full-access for this ticket. The final native execution, recovery, process-tree
+and review-policy matrix passes 51 cases without skips. GitHub response-time
+acceptance remains affected by Ubuntu dependency DNS failure. Actual Claude
+Code final review is deferred at the user's request. The PR remains unmerged.
 The reboot-consumer finding is fixed in `0ef5e3d`, including the actual late
 caller. Independent Linux verification covers both stop/reboot orderings.
 This report does not establish #274 scientific-chain acceptance or deployment.
@@ -21,12 +22,35 @@ the user's review and validation gates.
 Work uses `feat/296-stable-target-workspace`. The original clean
 `fix/295-stability-review@1b78578f` branch was preserved. Implementation commit
 `069cdab4c75f775bcd7d4281ebb2e059f3c56b8b` has tree
-`78d8a7c87a104fbbbdf6e9d059ce02aade36af33`. The validated delivery source is
+`78d8a7c87a104fbbbdf6e9d059ce02aade36af33`. The prior validated delivery source was
 `debbbd2`, including final test synchronization, dynamic GC coverage and the
 exact frontend build used by the browser and response-time runs. The complete
 commit and tree are in [source-equivalence.json](source-equivalence.json).
+The subsequent full-access policy increment is verified separately and does
+not retroactively change the scope of that source-equivalence record.
 
 ## Decisions and preserved contracts
+
+For this ticket's local execution scope, the operator selects
+`META_RESEARCH_TARGET_SANDBOX_MODE=danger-full-access` using the existing
+configuration entry. The project default for other environments is unchanged.
+An assigned workspace is a cwd and work-ownership convention, not an OS
+permission boundary. No cross-directory write-denial claim is made for
+full-access. This user decision supersedes the prior workspace-write sandbox
+acceptance requirement. Old sandbox failures remain historical evidence.
+
+The configured policy now reaches the Owner review consumer as well as the
+adapter. Existing code/result review consumers had retained workspace-write
+assumptions, an older code-review lineage shape and a result-only actor field.
+The fix reuses the existing allowed-policy function, includes the verified
+policy in exact code-child lineage, and selects the already verified actor by
+review kind. All parent/child, cwd, operation, authorization and hash checks
+remain. Unconfigured full-access and corrupt policy, actor, cwd or parent data
+are rejected. [Full-access verification](full-access-verification.json) records
+the exact frozen files and 51-case result. Independent review passed after
+checking every original JUnit result and all six changed execution/test/CI
+files against the frozen manifest. This controlled review-evidence chain
+does not claim a real model's semantic review or full scientific acceptance.
 
 One private Linux subreaper helper owns native and adopted children for one
 provider operation. Only it calls waitpid on those children. The outer Popen
@@ -134,7 +158,8 @@ The completed runs have distinct scopes:
 
 - `final-backend02` collected 949 cases across 83 affected files. It passed 947
   with zero failures and two existing fixed-ledger skips. Its 1,358 source files
-  match `0ef5e3d` exactly. Subsequent non-generated product source is unchanged.
+  match `0ef5e3d` exactly. Non-generated product source remained unchanged through
+  `041b21d`. The later Owner review-policy correction has its own affected matrix.
 - `gc-reading-dependency01` adds one passing case with no skips. It pauses a
   real RM intake after the first MiB, observes `processing`, verifies GC holds
   scratch, then completes exact managed readback and actually deletes scratch.
@@ -164,8 +189,10 @@ the 112-case browser run and the performance run. See
 CI runs 43036588107 and 43040924994 failed while installing Ubuntu dependencies.
 Run 43045744741 tested direct official Ubuntu repositories and also failed DNS
 resolution before native tests. The ineffective source rewrite was reverted.
-Bubblewrap installation, Chromium system dependencies, original budgets and
-the no-skips native acceptance check remain required.
+After the user's full-access decision, the native recovery job no longer needs
+bubblewrap and runs the actual configured full-access test instead. Chromium
+system dependencies, original budgets and the no-skips native acceptance check
+remain required for their respective jobs.
 
 The phase-one gate was composite, not a claimed single green snapshot.
 `phase1-gate01` ran 686 tests with 677 passes, seven failures and two skips.
@@ -178,11 +205,13 @@ at 13:18 UTC on 2026-11-11.
 
 Two existing adapter tests require unavailable fixed-version Codex 0.147
 child-session ledgers. Their skips remain explicit coverage gaps, not process
-tree proof. New Linux process-tree acceptance has no skipped cases. Actual
-Codex 0.159.0 workspace-write fails on the SSH host's namespace policy. A
-dedicated Ubuntu 24.04 CI job runs the actual native sandbox at both recovered
-cwds, requires both native cases and rejects any skipped acceptance test.
-That job must pass before claiming native sandbox acceptance.
+tree proof. New Linux process-tree acceptance has no skipped cases. The earlier
+Codex 0.159.0 workspace-write attempt failed on the SSH host's namespace policy.
+The current full-access run invokes the same pinned native CLI successfully
+before recovery and after each of two recoveries, with checkpoint segments
+1, 2 and 3 in the same cwd. It retains old-grant rejection and checks that its
+normal operations leave the parallel original unchanged. It does not assert
+that the OS prevents a full-access process from writing that original.
 
 Controlled-provider integration executes actual finite Python work, retains
 its checkpoint across a legal recovery, publishes through the real
@@ -217,7 +246,7 @@ this continuation. No new CC invocation was made and no independent review is
 reported as CC. Deferral does not establish the earlier merge prerequisite.
 
 Before merge, require final affected backend/browser, npm tests, type checks,
-build, the full response-time CI and native sandbox job; independent review
+build, the full response-time CI and configured native full-access job; independent review
 of the exact patch; actual Claude Code deep review with all blocking findings
 resolved; and a fresh target-branch, CI, protection and tested-tree check.
 No auto-merge is armed. No deployment is authorized. #295 and #274 remain open.

@@ -63,6 +63,7 @@ from meta_research.bundle_target_contract import (
     normalized_completion_contract_to_dict,
 )
 from meta_research.database import Database
+from meta_research.harness_adapters import _target_review_sandbox_modes
 from meta_research.owners.asset_lifecycle import assert_asset_usable
 from meta_research.read_snapshot_cache import snapshot_cached
 from meta_research.feed import DurableFeed
@@ -6456,7 +6457,7 @@ class SQLiteTargetRunAgentAuthority:
         profile = self._harness.query_profile(handle.target_run_ref)
         if not isinstance(profile, dict):
             return None
-        if profile.get("sandbox_mode") != "workspace-write":
+        if profile.get("sandbox_mode") not in _target_review_sandbox_modes():
             raise OwnerConflict("target_review_harness_invalid")
         values = profile.get("subagent_evidence")
         if not isinstance(values, list):
@@ -9034,7 +9035,7 @@ class SQLiteTargetRunAgentAuthority:
             not isinstance(evidence_values, list)
             or not isinstance(operation_refs, list)
             or operation_ref not in operation_refs
-            or profile.get("sandbox_mode") != "workspace-write"
+            or profile.get("sandbox_mode") not in _target_review_sandbox_modes()
         ):
             raise OwnerConflict("target_review_harness_invalid")
         matches = []
@@ -9119,7 +9120,11 @@ class SQLiteTargetRunAgentAuthority:
             or bound.native_parent_session_ref != evidence["parent_session_ref"]
             or bound.native_child_session_ref != evidence["child_session_ref"]
             or bound.native_child_session_ref
-            != evidence["review_actor_session_ref"]
+            != evidence.get(
+                "skill_actor_session_ref"
+                if review_kind == "code"
+                else "review_actor_session_ref"
+            )
             or bound.spawn_evidence_ref != evidence["spawn_evidence_ref"]
             or bound.completion_evidence_ref
             != evidence["completion_evidence_ref"]
@@ -9280,7 +9285,7 @@ class SQLiteTargetRunAgentAuthority:
                     "reviewed_asset_manifest_ref",
                 )
             )
-            or lineage_sandbox not in {"read-only", "workspace-write"}
+            or lineage_sandbox not in _target_review_sandbox_modes(read_only=True)
             or lineage != expected_lineage
             or not valid_hashes
             or review_completion_ref != expected_completion_ref
@@ -9450,6 +9455,9 @@ class SQLiteTargetRunAgentAuthority:
                     }
                 )
             )
+            lineage_sandbox = (
+                lineage.get("sandbox_mode") if isinstance(lineage, dict) else None
+            )
             expected_lineage = {
                 "session_id": child_session_ref,
                 "parent_session_id": run.native_session_ref,
@@ -9457,6 +9465,7 @@ class SQLiteTargetRunAgentAuthority:
                 "cwd": expected_cwd,
                 "originator": "codex_exec",
                 "cli_version": profile.get("provider_version"),
+                "sandbox_mode": lineage_sandbox,
             }
             valid_hashes = all(
                 isinstance(value, str)
@@ -9487,6 +9496,7 @@ class SQLiteTargetRunAgentAuthority:
                 and skill_path.parent.name == "code-review"
                 and valid_hashes
                 and expected_cwd is not None
+                and lineage_sandbox in _target_review_sandbox_modes()
                 and lineage == expected_lineage
                 and evidence.get("skill_actor_session_ref")
                 == child_session_ref

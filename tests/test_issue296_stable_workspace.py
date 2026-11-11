@@ -38,10 +38,11 @@ from test_public_bundle_stage import _ParallelTwoTargetBundleSkill
 
 
 class _SignedCeilingRunner:
-    """Control only native transport; preserve default Codex workspace arguments."""
+    """Control native transport and verify the expected execution policy."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, expected_sandbox="workspace-write") -> None:
         self.runtime = None
+        self.expected_sandbox = expected_sandbox
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.pause_run_ref = None
         self.pause_operation_ref = None
@@ -55,7 +56,7 @@ class _SignedCeilingRunner:
             return subprocess.CompletedProcess(argv, 0, "", "")
         assert self.runtime is not None
         self.calls.append((list(argv), dict(environment)))
-        assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+        assert argv[argv.index("--sandbox") + 1] == self.expected_sandbox
         # Perform real, bounded local work at the adapter's exact cwd. This is
         # checkpoint continuation evidence, not a native-provider tree fixture.
         subprocess.run(
@@ -210,9 +211,10 @@ def _workspace(runtime, handle):
 
 
 def _exercise_two_recoveries(
-    tmp_path: Path, runner: _SignedCeilingRunner, interrupt_after_reservation: bool
+    tmp_path: Path, runner: _SignedCeilingRunner, interrupt_after_reservation: bool,
+    *, run_after_second_recovery: bool = False,
 ) -> None:
-    """Shared real Owner exercise for controlled and actual sandbox runners."""
+    """Shared real Owner exercise for controlled and actual native runners."""
     path = tmp_path / "issue296-stable-workspace"
     runtime = _runtime(path, runner)
     try:
@@ -312,6 +314,18 @@ def _exercise_two_recoveries(
         assert len(recorded) == 2
         assert all(item.status == "failed" and item.outcome_code == "provider_descendant_process"
                    for item in recorded)
+        if run_after_second_recovery:
+            with pytest.raises(HarnessAdmissionError, match="provider_descendant_process"):
+                runtime.harnesses.run_or_resume_target_root(
+                    admission.run.request_ref,
+                    prompt="issue296 work after second recovery",
+                    mcp_base_url="http://127.0.0.1:8999",
+                )
+            assert len(runner.calls) == 3
+            assert json.loads((cwd / "issue296-checkpoint.json").read_text()) == {
+                "segments": 3,
+                "sum": sum(i * i for i in range(30000)),
+            }
         original.write_bytes(b"sample,value\none,999\n")
         with pytest.raises(OwnerConflict, match="asset_custody_unavailable"):
             runtime.owners.research_memory.materialize_asset(asset.version_ref)
