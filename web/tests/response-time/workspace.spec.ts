@@ -82,9 +82,9 @@ async function visibleSession(page: Page, session: RootSession) {
   const conversation = page.locator(".root-session-conversation");
   await expect(conversation).toBeVisible();
   await expect(conversation).toHaveAttribute("data-session-ref", session.session_ref);
-  await expect(conversation.locator(".root-session-context")).toContainText(session.question_ref!);
+  await expect(page.getByTestId("current-cycle-overview")).toHaveAttribute("data-question-ref", session.question_ref!);
   // The clock only exists once the real output HTTP body has been read.
-  await expect(conversation.locator(".root-operation-clock").first()).toBeVisible();
+  await expect(conversation.locator(".root-session-live-time .research-execution-clock")).toBeVisible();
   await expect(conversation.locator(".root-session-warning")).toHaveCount(0);
   await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => {
     requestAnimationFrame(() => done());
