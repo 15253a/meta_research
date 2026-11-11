@@ -1,18 +1,18 @@
 # #296 stable TargetRun workspace
 
-Status: implementation and component validation are available. Final integrated
-checks, native sandbox CI and actual Claude Code deep review are merge gates.
-Independent review also found that reboot evidence lacked an original-operation
-consumer. Its isolated Linux reproduction is recorded as
-`process-review-reboot-red01`; a repair is in progress and this finding blocks
-completion until verified.
+Status: implementation and the affected Linux/backend/browser verification are
+complete. Native sandbox and GitHub response-time acceptance remain blocked by
+Ubuntu dependency DNS failures before test execution. Actual Claude Code final
+review is deferred at the user's latest request. The PR remains unmerged.
+The reboot-consumer finding is fixed in `0ef5e3d`, including the actual late
+caller. Independent Linux verification covers both stop/reboot orderings.
 This report does not establish #274 scientific-chain acceptance or deployment.
 
 ## Scope and baseline
 
 The baseline is `v1-test@c2392b4b37964d963ce1477a65025e252c7802b7`, the merged
 #297 implementation and stability fixes for #295. Its complete CI run
-42969218821 passed. GitHub was rechecked on 2026-11-11 at 14:00 UTC. The base
+42969218821 passed. GitHub was rechecked on 2026-11-11 at 15:08 UTC. The base
 had not moved. #296 remained open, unassigned and without native blocked-by
 dependencies. #262, #295 and #274 remained open. Branch protection and rules
 were absent; no protection setting was changed and that absence does not waive
@@ -21,7 +21,10 @@ the user's review and validation gates.
 Work uses `feat/296-stable-target-workspace`. The original clean
 `fix/295-stability-review@1b78578f` branch was preserved. Implementation commit
 `069cdab4c75f775bcd7d4281ebb2e059f3c56b8b` has tree
-`78d8a7c87a104fbbbdf6e9d059ce02aade36af33`.
+`78d8a7c87a104fbbbdf6e9d059ce02aade36af33`. The validated delivery source is
+`debbbd2`, including final test synchronization, dynamic GC coverage and the
+exact frontend build used by the browser and response-time runs. The complete
+commit and tree are in [source-equivalence.json](source-equivalence.json).
 
 ## Decisions and preserved contracts
 
@@ -127,6 +130,43 @@ The tests themselves are committed and can run with the locked dependencies.
 All Linux data is newly created under isolated temporary paths. Existing
 services and research data were not modified.
 
+The completed runs have distinct scopes:
+
+- `final-backend02` collected 949 cases across 83 affected files. It passed 947
+  with zero failures and two existing fixed-ledger skips. Its 1,358 source files
+  match `0ef5e3d` exactly. Subsequent non-generated product source is unchanged.
+- `gc-reading-dependency01` adds one passing case with no skips. It pauses a
+  real RM intake after the first MiB, observes `processing`, verifies GC holds
+  scratch, then completes exact managed readback and actually deletes scratch.
+  The isolated negative control fails at premature deletion when processing
+  protection is removed. No new lease or production state was introduced.
+- `final-browser03` passes all 112 functional cases with zero skips or flaky
+  results. `material-browser05` separately passes its one real-material case.
+  npm passes 45 tests; application and E2E types and production build pass.
+  The fixed Windows-font raster project is not claimed tested on Linux.
+- The pagination baseline control fails on offset 0 instead of 50. The revised
+  test binds to a completed snapshot request and preserves compact/hydrated
+  revision, item-count, offset and exact-selection assertions. Five repetitions
+  pass before the full browser run. No threshold was relaxed.
+- `response-time-local01` passes the original npm response-time command with
+  three cases and zero retries, skips or flaky results. The wrapper's exit 1
+  is retained: its final immutability assertion incorrectly included generated
+  build files. An independent post-run comparison found no non-generated-file
+  changes. Original metrics and separate command exit codes are preserved in
+  [verification.json](verification.json). This does not replace GitHub CI.
+
+The committed frontend bundle previously predated the #295/#296 source changes.
+The packaged build is now byte-identical to the four files actually served in
+the 112-case browser run and the performance run. See
+[packaged-frontend.json](packaged-frontend.json). The new bundle is
+`index-tpvNNB6h.js`; the obsolete JS bundle is removed.
+
+CI runs 43036588107 and 43040924994 failed while installing Ubuntu dependencies.
+Run 43045744741 tested direct official Ubuntu repositories and also failed DNS
+resolution before native tests. The ineffective source rewrite was reverted.
+Bubblewrap installation, Chromium system dependencies, original budgets and
+the no-skips native acceptance check remain required.
+
 The phase-one gate was composite, not a claimed single green snapshot.
 `phase1-gate01` ran 686 tests with 677 passes, seven failures and two skips.
 The seven failures were resolved: one observation fixture field, two native
@@ -162,11 +202,19 @@ No performance threshold was relaxed.
 
 ## Review and delivery gates
 
+Independent workspace/consumer review passed at `0ef5e3d`. The final increment
+review is `PASS_WITH_DELIVERY_GATES` at `debbbd28d15751077c1b6e1eed46880109663f7e`,
+tree `73922c9c490948c42775c8d126bd405301b6fac3`. It found no blocking code issue
+in the two tests and packaged build. Its independent comparison proves all four
+packaged files match the actual browser/performance build and the CI workflow
+matches `0ef5e3d`. These are independent agent reviews, not Claude Code.
+
 The actual Claude Code design attempt used `claude-opus-5-5`, maximum effort,
 read-only tools, and eight Read calls. It exited with an HTTP 403 quota error
 before a verdict ($0.39 available, $1.16 requested). Source bytes were unchanged.
-It is not a successful review. Final-increment Claude Code review remains
-required; independent Codex review cannot substitute for it.
+It is not a successful review. The latest user instruction defers CC review for
+this continuation. No new CC invocation was made and no independent review is
+reported as CC. Deferral does not establish the earlier merge prerequisite.
 
 Before merge, require final affected backend/browser, npm tests, type checks,
 build, the full response-time CI and native sandbox job; independent review

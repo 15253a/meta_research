@@ -787,21 +787,505 @@
         "exitcode": 1,
         "elapsed_seconds": 129.28501887992024
       }
+    },
+    {
+      "label": "final-backend02",
+      "source_archive_sha256": "3e5bf0ad5ca56fbc971a4cfc27ed082cd6cd21b16298f7e33951ca1e5aaa6bd0",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "3e5bf0ad5ca56fbc971a4cfc27ed082cd6cd21b16298f7e33951ca1e5aaa6bd0",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "collected": 949,
+        "counts": {
+          "passed": 947,
+          "failed": 0,
+          "skipped": 2,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 865.1785586252809
+      }
+    },
+    {
+      "label": "final-browser03",
+      "source_archive_sha256": "065ee98b17aea2ca640d7d61ef93926c65baf454ce13c01b3f89783e0abea076",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "065ee98b17aea2ca640d7d61ef93926c65baf454ce13c01b3f89783e0abea076",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 250.08975897356868
+      },
+      "browser": {
+        "exitcode": 0,
+        "elapsed_seconds": 249.21595031768084,
+        "mode": "full",
+        "command": [
+          "/usr/local/bin/node",
+          "/tmp/issue274-retry-9pWdVe/web/node_modules/@playwright/test/cli.js",
+          "test",
+          "--project=functional",
+          "--workers=4",
+          "--output=/dev/shm/issue-296-LlVjtFCr/ui-output",
+          "--reporter=line,json",
+          "tests/root-domain-recovery.spec.ts",
+          "tests/research-control.spec.ts",
+          "tests/human-request-recovery.spec.ts",
+          "tests/root-operation-output-time.spec.ts",
+          "tests/work-material-treatment.spec.ts",
+          "tests/guidance-confirmation.spec.ts",
+          "tests/human-collaboration.spec.ts",
+          "tests/human-request-storage.spec.ts",
+          "tests/human-request-handoff.spec.ts",
+          "tests/research-assets.spec.ts",
+          "tests/research-trace-status.spec.ts"
+        ],
+        "stats": {
+          "startTime": "2026-11-11T15:09:16.238Z",
+          "duration": 229458.554,
+          "expected": 112,
+          "skipped": 0,
+          "unexpected": 0,
+          "flaky": 0
+        }
+      }
+    },
+    {
+      "label": "material-browser05",
+      "source_archive_sha256": "c593098d1b7856fce9a690a16b759a58a0ff66ce7a4e30e52bbca855a5a6be7c",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "c593098d1b7856fce9a690a16b759a58a0ff66ce7a4e30e52bbca855a5a6be7c",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 49.028569493442774
+      }
+    },
+    {
+      "label": "gc-reading-dependency01",
+      "source_archive_sha256": "7709f6d86168243bdfcf63af92e532411f48800aa2830748b886f77fc0f2b7c2",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "7709f6d86168243bdfcf63af92e532411f48800aa2830748b886f77fc0f2b7c2",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 45.4257799051702
+      }
+    },
+    {
+      "label": "gc-reading-dependency-negative01",
+      "source_archive_sha256": "4180f874aa9b06e4be919cff43752ecaad6011983c04bbecfa2226ca171b6d93",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "4180f874aa9b06e4be919cff43752ecaad6011983c04bbecfa2226ca171b6d93",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 1,
+        "elapsed_seconds": 43.87420820072293
+      }
+    },
+    {
+      "label": "final-experiment-semantics01",
+      "source_archive_sha256": "201f09defc6593615581a2b246f8531f72679c64707bf5165bc9cb9c749adabb",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "201f09defc6593615581a2b246f8531f72679c64707bf5165bc9cb9c749adabb",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 1.7283889092504978
+      }
+    },
+    {
+      "label": "process-review-reboot-caller-green01",
+      "source_archive_sha256": "1e1363b89a8e0bc20bad6315c3dd19e94dd3fa28f4c3c3ec7bdf83ba2bc1c3d6",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "1e1363b89a8e0bc20bad6315c3dd19e94dd3fa28f4c3c3ec7bdf83ba2bc1c3d6",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "collected": 26,
+        "counts": {
+          "passed": 26,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 38.911001197993755
+      }
+    },
+    {
+      "label": "recorder-bootstrap-green01",
+      "source_archive_sha256": "7934fc6af98b9aba2771e6d22c4299ce9c8a6d480d3ed6b59fb1e085f3abc51c",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "7934fc6af98b9aba2771e6d22c4299ce9c8a6d480d3ed6b59fb1e085f3abc51c",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "collected": 38,
+        "counts": {
+          "passed": 38,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 61.49740656465292
+      }
+    },
+    {
+      "label": "browser-assets-pagination-sync03",
+      "source_archive_sha256": "611aa12231532ed95588e82895045ae89f1b187b5d8c60a36f48f13a1190803d",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "611aa12231532ed95588e82895045ae89f1b187b5d8c60a36f48f13a1190803d",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 48.46783109754324
+      },
+      "browser": {
+        "exitcode": 0,
+        "elapsed_seconds": 48.37625524774194,
+        "mode": "full",
+        "command": [
+          "/usr/local/bin/node",
+          "/tmp/issue274-retry-9pWdVe/web/node_modules/@playwright/test/cli.js",
+          "test",
+          "--project=functional",
+          "--workers=4",
+          "--output=/dev/shm/issue-296-Gh5SZTM7/ui-output",
+          "--reporter=line,json",
+          "--repeat-each",
+          "5",
+          "tests/research-assets.spec.ts",
+          "--grep",
+          "paged inventory"
+        ],
+        "stats": {
+          "startTime": "2026-11-11T14:50:31.458Z",
+          "duration": 31592.879,
+          "expected": 5,
+          "skipped": 0,
+          "unexpected": 0,
+          "flaky": 0
+        }
+      }
+    },
+    {
+      "label": "browser-assets-pagination-sync-base03",
+      "source_archive_sha256": "2d71e60b2630a52ba908389acfee0282342d6ae2399dc19efe51d672f04d89d6",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "2d71e60b2630a52ba908389acfee0282342d6ae2399dc19efe51d672f04d89d6",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 1,
+        "elapsed_seconds": 35.26022936031222
+      },
+      "browser": {
+        "exitcode": 1,
+        "elapsed_seconds": 34.717337403446436,
+        "mode": "full",
+        "command": [
+          "/usr/local/bin/node",
+          "/tmp/issue274-retry-9pWdVe/web/node_modules/@playwright/test/cli.js",
+          "test",
+          "--project=functional",
+          "--workers=4",
+          "--output=/dev/shm/issue-296-01m4TIjV/ui-output",
+          "--reporter=line,json",
+          "tests/research-assets.spec.ts",
+          "--grep",
+          "paged inventory"
+        ],
+        "stats": {
+          "startTime": "2026-11-11T14:50:30.039Z",
+          "duration": 15841.271,
+          "expected": 0,
+          "skipped": 0,
+          "unexpected": 1,
+          "flaky": 0
+        }
+      }
+    },
+    {
+      "label": "response-time-local01",
+      "source_archive_sha256": "d511e893621fa39cfe6960897fffe552adc96931a524802d9cdbc002b2adc547",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "result": {
+        "snapshot": "d511e893621fa39cfe6960897fffe552adc96931a524802d9cdbc002b2adc547",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "exitcode": 1,
+        "elapsed_seconds": 66.2122018225491
+      }
     }
   ],
   "pending": [
-    "final-backend01",
-    "final-browser01",
-    "final-human02",
-    "native workspace-write CI",
-    "full response-time CI",
-    "actual final Claude Code deep review",
-    "final independent review"
+    "Actual native workspace-write CI acceptance remains blocked by Ubuntu dependency DNS failure.",
+    "Latest-head GitHub response-time CI must execute and pass.",
+    "Actual Claude Code final review is deferred by the latest user instruction, not passed.",
+    "Normal merge remains gated; no auto-merge or deployment."
   ],
   "limitations": [
-    "All data are isolated engineering fixtures, not scientific-chain acceptance.",
-    "Changed boot identity is injected; no host was rebooted.",
-    "Two fixed-version native child-session ledger fixtures unavailable.",
-    "SSH host native workspace-write rejected by namespace policy; mandatory CI gate pending."
-  ]
+    "947 backend passes plus two existing Codex 0.147 child-ledger skips, followed by one new GC test pass. These are separate runs.",
+    "112 functional browser cases and one material case ran separately; Windows-specific font raster cases were not run on Linux.",
+    "Local response-time gate passed 3/3, but its external wrapper exited 1 because it treated expected build outputs as immutable. Post-run comparison found zero non-generated-file changes.",
+    "Boot identity changes were injected on Linux; no host was physically rebooted.",
+    "Controlled provider and finite Python work exercise actual product owners, not #274 real scientific/model-chain acceptance."
+  ],
+  "validated_source_commit": "debbbd28d15751077c1b6e1eed46880109663f7e",
+  "validated_source_tree": "73922c9c490948c42775c8d126bd405301b6fac3",
+  "local_response_time": {
+    "status": "PASS: unchanged npm response-time gate; original wrapper assertion error retained",
+    "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+    "source_archive_sha256": "d511e893621fa39cfe6960897fffe552adc96931a524802d9cdbc002b2adc547",
+    "remote": "/dev/shm/issue-296-CvL9kKGH",
+    "runner_exitcode": 1,
+    "npm_test_exitcode": 0,
+    "npm_response_time_exitcode": 0,
+    "npm_tests": {
+      "passed": 45,
+      "failed": 0,
+      "skipped": 0
+    },
+    "playwright": {
+      "startTime": "2026-11-11T15:10:23.129Z",
+      "duration": 46651.926,
+      "expected": 3,
+      "skipped": 0,
+      "unexpected": 0,
+      "flaky": 0
+    },
+    "metrics": [
+      {
+        "test": "warm-public-api-response",
+        "metric": "status",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 8.006165499999042,
+        "p95_ms": 47.381346999995,
+        "max_ms": 48.248467000004894,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      },
+      {
+        "test": "warm-public-api-response",
+        "metric": "snapshot",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 8.874156499998207,
+        "p95_ms": 49.47261199999775,
+        "max_ms": 49.52977700000338,
+        "p95_budget_ms": 3000,
+        "max_budget_ms": 6000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-390",
+        "metric": "workspace",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 330.05593950000184,
+        "p95_ms": 346.7314299999998,
+        "max_ms": 393.0130830000053,
+        "p95_budget_ms": 5000,
+        "max_budget_ms": 10000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-390",
+        "metric": "stage_switch",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 100.7891129999989,
+        "p95_ms": 131.74226700000145,
+        "max_ms": 133.56804399999965,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-1440",
+        "metric": "workspace",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 358.7838424999991,
+        "p95_ms": 382.6651559999991,
+        "max_ms": 398.73848799999905,
+        "p95_budget_ms": 5000,
+        "max_budget_ms": 10000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-1440",
+        "metric": "stage_switch",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 109.6848245000001,
+        "p95_ms": 124.77617499999906,
+        "max_ms": 130.24691999999777,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      }
+    ],
+    "postverification": {
+      "all_manifest_files": 1358,
+      "non_generated_changes": [],
+      "generated_changes": [
+        "src/meta_research/web_dist/assets/index-D4VhawRe.js",
+        "src/meta_research/web_dist/index.html"
+      ],
+      "generated_distribution": {
+        "assets/favicon.svg": "9af5b0493df50798741bd5e6d82d041a1c04cb1c733c87c6885c475d2dbc2fef",
+        "assets/index-CLC2XBFr.css": "6a7e311660af69412cf1331a45b865e929263b574e321c3df6c1fd384be6fcb1",
+        "assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+        "index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2"
+      },
+      "html_asset_refs": [
+        "/assets/favicon.svg",
+        "/assets/index-tpvNNB6h.js",
+        "/assets/index-CLC2XBFr.css"
+      ],
+      "html_references_present": true,
+      "remaining_test_processes": [],
+      "remaining_product_data_roots": []
+    },
+    "generated_web_dist_path": "D:\\meta_research\\optimier_with_claude\\issue-296-evidence-20261111\\generated-web-dist-final",
+    "generated_web_dist_equal_final_browser03": true,
+    "artifact_archive_sha256": "a3a8af4408f62ec13db6b4f8279be9eda1d79d5ed67f92a8ce76e00449182304",
+    "generated_distribution_archive_sha256": "48ec6b65b7bd6aacc5120b3c0479714da749b93ad14821818f90296f52244e5b",
+    "source_dist_last_commit": "b70ea0f2d067a0cdc4ec81aa8aa50199f43e4ac6",
+    "notes": [
+      "Raw runner exit1 arose only from external integrity assertion treating npm build outputs as immutable; raw evidence has not been changed.",
+      "External probe now separates generated static output from source/config/test bytes. Postverification checks the original run without rerunning the already-passed gate.",
+      "Generated distribution was stale since #293; seven frontend source files changed in #295/#296. Exact build output retrieved for parent to synchronize, no checkout file changed by this subtask.",
+      "Same new bundle is recorded in final-browser02 build log and hashes independently match final-browser03 four-file build.",
+      "Single isolated deterministic engineering run is not a baseline speed comparison, GitHub CI, native sandbox proof, deployment or #274 real scientific chain."
+    ]
+  },
+  "packaged_frontend": {
+    "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+    "origin": "env/runs/response-time-local01",
+    "files": {
+      "assets/favicon.svg": "9af5b0493df50798741bd5e6d82d041a1c04cb1c733c87c6885c475d2dbc2fef",
+      "assets/index-CLC2XBFr.css": "6a7e311660af69412cf1331a45b865e929263b574e321c3df6c1fd384be6fcb1",
+      "assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+      "index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2"
+    },
+    "final_browser03_files_equal": true
+  },
+  "independent_final_increment": {
+    "verdict": "PASS_WITH_DELIVERY_GATES",
+    "head": "debbbd28d15751077c1b6e1eed46880109663f7e",
+    "tree": "73922c9c490948c42775c8d126bd405301b6fac3",
+    "pr_base": "c2392b4b37964d963ce1477a65025e252c7802b7",
+    "review_base": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+    "pr_patch_id": "7f3d6864338fa5bb078e4d43943b725b62f8608f",
+    "changed_files": {
+      "src/meta_research/web_dist/assets/index-D4VhawRe.js": null,
+      "src/meta_research/web_dist/assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+      "src/meta_research/web_dist/index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2",
+      "tests/test_issue296_gc_read_dependency.py": "5d631b77835b475b0fbb2677bac4f83b74641e52040895c0c0e218ca84e35c2b",
+      "web/tests/research-assets.spec.ts": "9b73ad56c2c96aa399e1f68806d3812955ea242d742ef8437c9297bd5b672aa5"
+    },
+    "workflow_restored_to_review_base": true,
+    "distribution_sha256": {
+      "assets/favicon.svg": "9af5b0493df50798741bd5e6d82d041a1c04cb1c733c87c6885c475d2dbc2fef",
+      "assets/index-CLC2XBFr.css": "6a7e311660af69412cf1331a45b865e929263b574e321c3df6c1fd384be6fcb1",
+      "assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+      "index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2"
+    },
+    "source_checks": [
+      {
+        "run": "final-browser03",
+        "files_checked": 473,
+        "differences": []
+      },
+      {
+        "run": "response-time-local01",
+        "files_checked": 473,
+        "differences": []
+      },
+      {
+        "run": "gc-reading-dependency01",
+        "files_checked": 473,
+        "differences": []
+      },
+      {
+        "run": "gc-reading-dependency-negative01",
+        "files_checked": 473,
+        "differences": [
+          "src/meta_research/target_workspace_cleanup.py"
+        ]
+      }
+    ],
+    "gc_positive": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "1",
+      "time": "44.271",
+      "timestamp": "2026-11-11T15:09:30.940249+00:00",
+      "hostname": "di-20260202214316-n5b25"
+    },
+    "gc_negative": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "1",
+      "skipped": "0",
+      "tests": "1",
+      "time": "42.652",
+      "timestamp": "2026-11-11T15:10:41.428426+00:00",
+      "hostname": "di-20260202214316-n5b25"
+    },
+    "browser": {
+      "startTime": "2026-11-11T15:09:16.238Z",
+      "duration": 229458.554,
+      "expected": 112,
+      "skipped": 0,
+      "unexpected": 0,
+      "flaky": 0
+    },
+    "performance": {
+      "startTime": "2026-11-11T15:10:23.129Z",
+      "duration": 46651.926,
+      "expected": 3,
+      "skipped": 0,
+      "unexpected": 0,
+      "flaky": 0
+    },
+    "performance_command_exitcodes": [
+      0,
+      0
+    ],
+    "performance_wrapper_exitcode": 1,
+    "blocking_code_findings": [],
+    "limits": [
+      "No new runtime suite was executed by this reviewer.",
+      "CI native sandbox and response-time acceptance remain unpassed.",
+      "Actual Claude Code review is deferred by the user, not replaced by this review.",
+      "Subsequent audit edits and final publication need provenance checks."
+    ]
+  }
 }
