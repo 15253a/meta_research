@@ -599,6 +599,7 @@ class ReasoningStageWorker:
                     return _CycleStep(False, provider_boundary_attempted=True)
                 try:
                     checkpoint = self._agent_runtime.record_reasoning_primary_draft(
+                        primary_provider_unit_ref=unit_ref,
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
                         fence_ref=run.fence_ref,
@@ -640,11 +641,9 @@ class ReasoningStageWorker:
         )
         result = None
         try:
-            operation = (None if self._human_guidance is None else StageGuidanceOperation(
-                GuidanceRuntimeScope("reasoning", run.run_ref, run.attempt_ref,
-                    run.root_session_ref, run.fence_ref, run.runtime_binding_hash),
-                job_ref, "primary", run.primary_invocation.invocation_ref,
-            ))
+            operation = (None if self._human_guidance is None else GuidanceRuntimeScope(
+                "reasoning", run.run_ref, run.attempt_ref, run.root_session_ref,
+                run.fence_ref, run.runtime_binding_hash))
             result = provider.finalize_draft(skill_request, draft)
             result = _assemble_provider_result(skill_request, result)
             if isinstance(result, ReasoningAutonomousCheckpointResult):
@@ -732,7 +731,7 @@ class ReasoningStageWorker:
                 "review_hash": review_hash,
             }
         )[:32]
-        self._bind_completion_conditions(
+        completion_operation = self._bind_completion_conditions(
             operation, submission_ref, result.outcome_document(),
             result.reviewed_draft, review,
         )
@@ -757,7 +756,7 @@ class ReasoningStageWorker:
         self._transient_error = None
         finish_job = getattr(self._provider, "finish_job", None)
         if callable(finish_job):
-            finish_job(job_ref)
+            finish_job(completion_operation.job_ref if completion_operation is not None else job_ref)
         return _CycleStep(True, provider_boundary_attempted=False)
 
     def _skill_request(
@@ -1141,9 +1140,9 @@ class ReasoningStageWorker:
 
     def _bind_completion_conditions(
         self, operation, submission_ref, output, reviewed_draft, review,
-    ):
+    ) -> StageGuidanceOperation | None:
         if operation is not None and isinstance(output.get("candidate_completion"), dict):
-            self._human_guidance.bind_reasoning_completion_conditions(
+            return self._human_guidance.bind_reasoning_completion_conditions(
                 operation=operation, submission_ref=submission_ref, output=output,
                 payload_hash=canonical_hash({
                     "schema_ref": REASONING_ATTEMPT_EXECUTION_SCHEMA,

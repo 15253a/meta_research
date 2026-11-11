@@ -1,3 +1,5 @@
+
+from reasoning_primary_source_helpers import record_reasoning_primary
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -71,7 +73,8 @@ def seed_checkpoint(runtime):
     request = ae.ensure_reasoning_stage_request(cycle_ref=quest["cycle_ref"], accepted_question=graph.query_question_by_ref(quest["question_ref"]).as_binding(), idempotency_key="summary-request")
     run = ar.admit_reasoning_stage(request, "summary-admit", runtime_binding=_runtime_binding())
     draft = _checkpoint(request, question_title="Initial draft before literature")
-    ar.record_reasoning_primary_draft(run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref="native:summary", runtime_binding=run.runtime_binding, draft=draft, adapter_kind="test_deterministic", idempotency_key="summary-draft")
+    record_reasoning_primary(ar, run,
+        run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref="native:summary", runtime_binding=run.runtime_binding, draft=draft, adapter_kind="test_deterministic", idempotency_key="summary-draft")
     checkpoint = ar.record_reasoning_autonomous_checkpoint(run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref="native:summary", runtime_binding=run.runtime_binding, checkpoint=draft, review=_review(draft,draft), idempotency_key="summary-checkpoint")
     return request, checkpoint
 
