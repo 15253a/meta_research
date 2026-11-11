@@ -895,6 +895,7 @@ def build_production_runtime(
         research_memory,
         research_graph,
         acquisition_provider,
+        database=database,
         workspace=data_root.root,
     )
     quest_completion = QuestCompletionService(

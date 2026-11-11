@@ -1,0 +1,293 @@
+[
+  {
+    "schema": "meta-research/response-time-ci/v1",
+    "status": "passed",
+    "error": null,
+    "test": "warm-public-api-response",
+    "generated_at": "2026-11-11T05:47:00.315Z",
+    "environment": {
+      "node": "v22.23.1",
+      "platform": "linux",
+      "architecture": "x64",
+      "browser": "140.0.7339.186",
+      "commit": "d0e8860fcefbb1e25038aefb46d5872dca6b056b"
+    },
+    "workload": {
+      "quest_count": 1,
+      "held_provider": "plan-primary",
+      "stages": [
+        "idea",
+        "plan"
+      ]
+    },
+    "warmups": 2,
+    "percentile_method": "nearest-rank",
+    "timer": "Monotonic elapsed time through validated UI content plus two animation frames, or through the complete API JSON body",
+    "boundaries": [
+      "Fresh browser contexts for navigation; backend process and static files are warmed.",
+      "Stage-switch samples alternate Idea and Plan in an already open workspace.",
+      "Warm snapshot measures complete HTTP delivery including retained results, not fresh projection computation.",
+      "Temporary deterministic product data; no production service or real model calls."
+    ],
+    "metrics": {
+      "status": {
+        "count": 20,
+        "expected_samples": 20,
+        "raw_ms": [
+          48.43540199999552,
+          47.405157000001054,
+          46.98617899999954,
+          47.13193399999727,
+          46.90324700000201,
+          47.8859569999986,
+          47.395173000004434,
+          46.72095600000466,
+          46.94233399999939,
+          46.89060800000152,
+          47.43247800000245,
+          47.74450699999579,
+          46.84264699999767,
+          47.01582300000155,
+          47.06626700000197,
+          46.89217099999951,
+          47.0809489999956,
+          47.999784999999974,
+          47.28519999999844,
+          48.16461800000252
+        ],
+        "median_ms": 47.106441499996436,
+        "p95_ms": 48.16461800000252,
+        "max_ms": 48.43540199999552,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      },
+      "snapshot": {
+        "count": 20,
+        "expected_samples": 20,
+        "raw_ms": [
+          47.25570699999662,
+          48.82799099999829,
+          46.96790699999838,
+          46.929756000005,
+          47.214937000004284,
+          46.9207630000019,
+          47.8341900000014,
+          48.40285999999469,
+          49.795602999998664,
+          46.81256199999916,
+          47.04488500000298,
+          47.14300999999978,
+          47.96172800000204,
+          48.15777700000035,
+          47.858736000001954,
+          48.013474999999744,
+          48.1853190000038,
+          48.13366099999985,
+          47.63365400000475,
+          47.81898799999908
+        ],
+        "median_ms": 47.82658900000024,
+        "p95_ms": 48.82799099999829,
+        "max_ms": 49.795602999998664,
+        "p95_budget_ms": 3000,
+        "max_budget_ms": 6000,
+        "passed": true
+      }
+    }
+  },
+  {
+    "schema": "meta-research/response-time-ci/v1",
+    "status": "passed",
+    "error": null,
+    "test": "workspace-and-stage-switch-1440",
+    "generated_at": "2026-11-11T05:46:41.681Z",
+    "environment": {
+      "node": "v22.23.1",
+      "platform": "linux",
+      "architecture": "x64",
+      "browser": "140.0.7339.186",
+      "commit": "d0e8860fcefbb1e25038aefb46d5872dca6b056b"
+    },
+    "workload": {
+      "quest_count": 1,
+      "held_provider": "plan-primary",
+      "stages": [
+        "idea",
+        "plan"
+      ]
+    },
+    "warmups": 2,
+    "percentile_method": "nearest-rank",
+    "timer": "Monotonic elapsed time through validated UI content plus two animation frames, or through the complete API JSON body",
+    "boundaries": [
+      "Fresh browser contexts for navigation; backend process and static files are warmed.",
+      "Stage-switch samples alternate Idea and Plan in an already open workspace.",
+      "Warm snapshot measures complete HTTP delivery including retained results, not fresh projection computation.",
+      "Temporary deterministic product data; no production service or real model calls."
+    ],
+    "metrics": {
+      "workspace": {
+        "count": 20,
+        "expected_samples": 20,
+        "raw_ms": [
+          432.0636740000009,
+          466.0495129999981,
+          469.38194099999964,
+          440.31762399999934,
+          480.0347299999994,
+          445.88989700000093,
+          596.6572960000012,
+          469.3984359999995,
+          524.8019700000004,
+          498.665481,
+          506.02434099999664,
+          570.4255320000011,
+          461.9679309999992,
+          473.3397060000025,
+          531.8179799999998,
+          463.63622100000066,
+          451.74287299999924,
+          484.4474169999994,
+          484.4700950000042,
+          487.7745040000009
+        ],
+        "median_ms": 476.68721800000094,
+        "p95_ms": 570.4255320000011,
+        "max_ms": 596.6572960000012,
+        "p95_budget_ms": 5000,
+        "max_budget_ms": 10000,
+        "passed": true
+      },
+      "stage_switch": {
+        "count": 20,
+        "expected_samples": 20,
+        "raw_ms": [
+          125.02416500000254,
+          108.57922900000267,
+          127.84834599999886,
+          104.76707599999645,
+          123.521593999998,
+          110.47653700000228,
+          126.47463399999833,
+          106.62247200000274,
+          124.48279600000387,
+          125.2232589999985,
+          220.52468300000328,
+          146.01186600000074,
+          126.5297689999934,
+          106.28579699999682,
+          122.82151599999634,
+          111.07300699999905,
+          125.90542400000413,
+          107.09389799999917,
+          130.39175200000318,
+          136.75634400000126
+        ],
+        "median_ms": 124.7534805000032,
+        "p95_ms": 146.01186600000074,
+        "max_ms": 220.52468300000328,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      }
+    }
+  },
+  {
+    "schema": "meta-research/response-time-ci/v1",
+    "status": "passed",
+    "error": null,
+    "test": "workspace-and-stage-switch-390",
+    "generated_at": "2026-11-11T05:46:58.005Z",
+    "environment": {
+      "node": "v22.23.1",
+      "platform": "linux",
+      "architecture": "x64",
+      "browser": "140.0.7339.186",
+      "commit": "d0e8860fcefbb1e25038aefb46d5872dca6b056b"
+    },
+    "workload": {
+      "quest_count": 1,
+      "held_provider": "plan-primary",
+      "stages": [
+        "idea",
+        "plan"
+      ]
+    },
+    "warmups": 2,
+    "percentile_method": "nearest-rank",
+    "timer": "Monotonic elapsed time through validated UI content plus two animation frames, or through the complete API JSON body",
+    "boundaries": [
+      "Fresh browser contexts for navigation; backend process and static files are warmed.",
+      "Stage-switch samples alternate Idea and Plan in an already open workspace.",
+      "Warm snapshot measures complete HTTP delivery including retained results, not fresh projection computation.",
+      "Temporary deterministic product data; no production service or real model calls."
+    ],
+    "metrics": {
+      "workspace": {
+        "count": 20,
+        "expected_samples": 20,
+        "raw_ms": [
+          412.7469720000008,
+          410.14573999999993,
+          440.8334820000018,
+          445.64351799999713,
+          496.10785999999644,
+          412.7208010000031,
+          432.12766199999896,
+          397.3375869999945,
+          506.06001999999717,
+          393.9185540000035,
+          412.6345000000001,
+          460.9740590000001,
+          394.8571690000026,
+          742.7625079999998,
+          395.5119579999955,
+          393.5376709999982,
+          395.33081700000184,
+          390.7109829999972,
+          401.6210859999992,
+          412.46932899999956
+        ],
+        "median_ms": 412.55191449999984,
+        "p95_ms": 506.06001999999717,
+        "max_ms": 742.7625079999998,
+        "p95_budget_ms": 5000,
+        "max_budget_ms": 10000,
+        "passed": true
+      },
+      "stage_switch": {
+        "count": 20,
+        "expected_samples": 20,
+        "raw_ms": [
+          116.65099099999497,
+          116.56766300000163,
+          116.70105599999806,
+          116.7209640000001,
+          116.62000199999602,
+          116.65422000000399,
+          116.67659400000412,
+          116.44357099999615,
+          116.74263100000098,
+          116.65986500000145,
+          133.21841900000436,
+          116.49089300000196,
+          117.03255500000523,
+          117.23772599999938,
+          115.76580000000104,
+          116.61789799999679,
+          141.96945899999992,
+          108.27319599999464,
+          116.630465000002,
+          116.60041199999978
+        ],
+        "median_ms": 116.65260549999948,
+        "p95_ms": 133.21841900000436,
+        "max_ms": 141.96945899999992,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      }
+    }
+  }
+]

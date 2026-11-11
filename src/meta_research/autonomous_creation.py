@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from meta_research.acquisition import AcquisitionProvider, effective_acquisition_config
+from meta_research.database import Database
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
 from meta_research.runtime_conditions import read_runtime_conditions
 
@@ -180,6 +181,7 @@ class AutonomousCreationService:
         research_graph: AutonomousResearchGraph,
         acquisition_provider: AcquisitionProvider,
         *,
+        database: Database,
         workspace: Path | None = None,
     ) -> None:
         self._human_collaboration = human_collaboration
@@ -188,6 +190,7 @@ class AutonomousCreationService:
         self._research_memory = research_memory
         self._research_graph = research_graph
         self._acquisition_provider = acquisition_provider
+        self._database = database
         self._workspace = workspace
         self._scheduler_cursor: str | None = None
 
@@ -403,7 +406,9 @@ class AutonomousCreationService:
             )
             config = None
             if self._workspace is not None:
-                config = read_runtime_conditions(self._workspace, quest_ref).get("literature_configuration")
+                config = read_runtime_conditions(
+                    self._workspace, quest_ref, database=self._database
+                ).get("literature_configuration")
             config_hash = None if config is None else canonical_hash({
                 "schema_ref": "meta-research/acquisition-session-config/v1",
                 **effective_acquisition_config(config),

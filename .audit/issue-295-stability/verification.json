@@ -1,0 +1,267 @@
+{
+  "application_commit": "7753d56d329a7c0c9a744200810307384aa49433",
+  "repair_base": "7746456a15351b16fb8fd659e80c3c29250c62d8",
+  "integrated": {
+    "snapshot": "d54862e83e44329cb6ec34ae362053a06fc9daa155f0543ebe5815dbac17c099",
+    "head": "60661a389124830cba5b76343a39d2124c03ff95",
+    "ref": "60661a3",
+    "files": [
+      {
+        "file": "tests/test_public_reasoning_stage.py",
+        "returncode": 0,
+        "index": 3
+      },
+      {
+        "file": "tests/test_public_autonomous_creation.py",
+        "returncode": 0,
+        "index": 2
+      },
+      {
+        "file": "tests/test_migration_recovery.py",
+        "returncode": 1,
+        "index": 0
+      },
+      {
+        "file": "tests/test_public_quest_completion.py",
+        "returncode": 1,
+        "index": 6
+      },
+      {
+        "file": "tests/test_public_plan_stage.py",
+        "returncode": 0,
+        "index": 5
+      },
+      {
+        "file": "tests/test_public_reasoning_autonomous_checkpoint.py",
+        "returncode": 0,
+        "index": 7
+      },
+      {
+        "file": "tests/test_public_idea_stage.py",
+        "returncode": 1,
+        "index": 8
+      },
+      {
+        "file": "tests/test_root_human_request_lifecycle.py",
+        "returncode": 1,
+        "index": 4
+      },
+      {
+        "file": "tests/test_autonomous_creation_scheduler.py",
+        "returncode": 0,
+        "index": 11
+      },
+      {
+        "file": "tests/test_quest_goal_completion_race.py",
+        "returncode": 0,
+        "index": 9
+      },
+      {
+        "file": "tests/test_reasoning_rejection_diagnostics.py",
+        "returncode": 0,
+        "index": 13
+      },
+      {
+        "file": "tests/test_reasoning_primary_source.py",
+        "returncode": 0,
+        "index": 12
+      },
+      {
+        "file": "tests/test_reasoning_summary_decision_flow.py",
+        "returncode": 0,
+        "index": 10
+      },
+      {
+        "file": "tests/test_public_bundle_stage.py",
+        "returncode": 1,
+        "index": 1
+      },
+      {
+        "file": "tests/test_human_guidance_continuations.py",
+        "returncode": 0,
+        "index": 15
+      },
+      {
+        "file": "tests/test_reasoning_stage_provider_protection.py",
+        "returncode": 0,
+        "index": 16
+      },
+      {
+        "file": "tests/test_reasoning_operator_pause_resume.py",
+        "returncode": 0,
+        "index": 17
+      },
+      {
+        "file": "tests/test_runtime_protection_migration.py",
+        "returncode": 1,
+        "index": 20
+      },
+      {
+        "file": "tests/test_plan_owner_acceptance.py",
+        "returncode": 0,
+        "index": 19
+      },
+      {
+        "file": "tests/test_reasoning_checkpoint_worker_recovery.py",
+        "returncode": 0,
+        "index": 22
+      },
+      {
+        "file": "tests/test_stage_local_acceptance.py",
+        "returncode": 0,
+        "index": 14
+      },
+      {
+        "file": "tests/test_human_guidance_inboxes.py",
+        "returncode": 0,
+        "index": 18
+      },
+      {
+        "file": "tests/test_runtime_conditions_lifecycle.py",
+        "returncode": 0,
+        "index": 23
+      },
+      {
+        "file": "tests/test_runtime_conditions_frozen_providers.py",
+        "returncode": 0,
+        "index": 25
+      },
+      {
+        "file": "tests/test_formal_plan_decision_read_snapshot.py",
+        "returncode": 0,
+        "index": 27
+      },
+      {
+        "file": "tests/test_reasoning_checkpoint_recovery_owner.py",
+        "returncode": 0,
+        "index": 24
+      },
+      {
+        "file": "tests/test_snapshot_runtime_conditions.py",
+        "returncode": 0,
+        "index": 26
+      },
+      {
+        "file": "tests/test_autonomous_creation_database.py",
+        "returncode": 0,
+        "index": 28
+      },
+      {
+        "file": "tests/test_reasoning_checkpoint_final_acceptance.py",
+        "returncode": 0,
+        "index": 21
+      },
+      {
+        "file": "tests/test_plan_admission_cost.py",
+        "returncode": 0,
+        "index": 31
+      },
+      {
+        "file": "tests/test_plan_content_provenance.py",
+        "returncode": 0,
+        "index": 29
+      },
+      {
+        "file": "tests/test_bundle_contract_fact_reuse.py",
+        "returncode": 0,
+        "index": 30
+      }
+    ],
+    "collected": 249,
+    "counts": {
+      "passed": 222,
+      "failed": 27,
+      "skipped": 0,
+      "incomplete": 0
+    },
+    "exitcode": 1,
+    "elapsed_seconds": 477.4986341819167
+  },
+  "final_focused": {
+    "snapshot": "268006be7f66dda19951c2b8ac192ceebfdec4d46d5c61cc4c3bac9442ea778b",
+    "head": "60661a389124830cba5b76343a39d2124c03ff95",
+    "ref": "60661a3",
+    "files": [
+      {
+        "file": "tests/test_hc_completion_concurrency.py",
+        "returncode": 0,
+        "index": 2
+      },
+      {
+        "file": "tests/test_reasoning_operator_pause_resume.py",
+        "returncode": 0,
+        "index": 1
+      },
+      {
+        "file": "tests/test_reasoning_primary_source.py",
+        "returncode": 0,
+        "index": 0
+      }
+    ],
+    "collected": 22,
+    "counts": {
+      "passed": 22,
+      "failed": 0,
+      "skipped": 0,
+      "incomplete": 0
+    },
+    "exitcode": 0,
+    "elapsed_seconds": 87.01882312074304
+  },
+  "source_equivalence": {
+    "commit": "7753d56d329a7c0c9a744200810307384aa49433",
+    "manifest_files": 1324,
+    "hash_mismatches": [],
+    "extra_git_files": []
+  },
+  "browser": {
+    "head": "67395cd036fa2e5c912c0bc9dc411674ec46d124",
+    "files": {
+      "web/src/api.ts": "649dfabcbbdb1becef4d03219bd6ec0abf75f6821c96543e667166d093cafbfd",
+      "web/src/HumanCollaboration.tsx": "c9d9592c7511e1d324f9e446eb8fe8231d0f9836cef6b2d4c262a75374a1c520",
+      "web/tests/human-request-storage.spec.ts": "c9f173a400e28cf43575d1617ef569c3a5110b7ad469a03495dd365c6544fa7b",
+      "web/tests/human-request-recovery.spec.ts": "a39a04a2c349bed4c74955a68a6ca39e2338f182ae073c658532e420333d1251"
+    },
+    "commands": [
+      "npm --prefix web run typecheck",
+      "npx --no-install vite build --outDir D:/meta_research/optimier_with_claude/issue-295-deep-review-20261111/fix-hr-dist-freeze",
+      "$env:META_RESEARCH_WEB_DIST=\"D:/meta_research/optimier_with_claude/issue-295-deep-review-20261111/fix-hr-dist-freeze\"; npx --no-install playwright test tests/human-request-storage.spec.ts tests/human-request-recovery.spec.ts tests/quest-creation-materials.spec.ts --project functional --output D:/meta_research/optimier_with_claude/issue-295-deep-review-20261111/fix-hr-browser-freeze --reporter line",
+      "$env:META_RESEARCH_TEST_API_SOURCE=\"D:/meta_research/optimier_with_claude/issue-295-deep-review-20261111/fix-hr-baseline-api.ts\"; npx --no-install playwright test tests/human-request-storage.spec.ts --grep \"damaged A\" --project functional --output D:/meta_research/optimier_with_claude/issue-295-deep-review-20261111/fix-hr-expanded-red --reporter line"
+    ],
+    "results": {
+      "baseline": "11 isolation cases fail against 7746456 api.ts",
+      "review_red": "alias-key and authenticated invalid body both fail before correction",
+      "ack_red": "successful B/C loses aliased key before correction",
+      "final": "46 passed in Chrome channel. 32 storage, 9 UI recovery, 5 quest materials. App and E2E typechecks passed. External Vite build succeeded."
+    },
+    "principles": {
+      "Model the Domain": "ready/failed collection represents per-request recovery outcomes with no durable diagnostic ledger",
+      "Test Behavior, Not Implementation": "real IndexedDB/WebCrypto public API and UI assertions check exact bodies, HTTP deliveries, damaged originals and repaired retries"
+    },
+    "limitations": "No backend edits, deployment, or commits. Parent owns integrated freeze and final independent Claude review."
+  },
+  "baseline_comparison": {
+    "failing_nodes": 27,
+    "literal_message_matches": 13,
+    "same_obsolete_0038_assertion_with_0082_vs_0083_actual": 14,
+    "focused_baseline_collected": 104,
+    "focused_baseline_passed": 77,
+    "focused_baseline_failed": 27,
+    "skipped": 0,
+    "incomplete": 0
+  },
+  "claude": {
+    "head": "7753d56d329a7c0c9a744200810307384aa49433",
+    "exitcode": 0,
+    "elapsed_seconds": 63.421999999991385,
+    "source_unchanged": true,
+    "session_id": "b1c29ac1-0cea-4d8e-a627-b435e0cdd4d6",
+    "is_error": false,
+    "models": [
+      "claude-opus-5-5"
+    ],
+    "tool_calls": 0,
+    "result_subtype": "success"
+  },
+  "claude_packet_sha256": "d279f49a8099a1070bb4644a3bfcce1965c571c6cdc01c3db472d4365c2d20c9"
+}

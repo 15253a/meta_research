@@ -673,6 +673,7 @@ class IdeaPrimaryDraft:
     draft: dict[str, object]
     draft_hash: str
     adapter_kind: str
+    primary_provider_unit_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1376,6 +1377,7 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         draft: dict[str, object],
         adapter_kind: str,
         idempotency_key: str,
+        primary_provider_unit_ref: str | None = None,
     ) -> IdeaPrimaryDraft: ...
 
     def record_reasoning_autonomous_checkpoint(
@@ -8493,6 +8495,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         or invocation.response_hash != _primary_provider_response_hash(
                             native_session_ref=persisted.native_session_ref,
                             draft=persisted.draft, adapter_kind=persisted.adapter_kind,
+                            primary_provider_unit_ref=persisted.primary_provider_unit_ref,
                             stage=run.stage)):
                     raise OwnerConflict("stage_completion_rejection_stale")
             elif (invocation is None or invocation.phase != phase
@@ -8861,7 +8864,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or invocation.response_hash != _primary_provider_response_hash(
                     native_session_ref=known_facts.get("candidate_native_session_ref"),
                     draft=decoded_object(rejected_attempt.primary_draft_json),
-                    adapter_kind=rejected_attempt.primary_adapter_kind, stage=row.stage)
+                    adapter_kind=rejected_attempt.primary_adapter_kind, stage=row.stage,
+                    primary_provider_unit_ref=rejected_attempt.primary_provider_unit_ref)
             ))
             or not isinstance(feedback_value, list)
             or not feedback_value
@@ -10968,11 +10972,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "INSERT INTO ar_stage_attempts (attempt_ref, run_ref, generation, "
                 "root_session_ref, fence_ref, predecessor_attempt_ref, status, "
                 "primary_draft_json, primary_draft_hash, primary_adapter_kind, "
-                "primary_recorded_at, created_at) VALUES (:attempt_ref, :run_ref, "
+                "primary_recorded_at, primary_provider_unit_ref, created_at) VALUES (:attempt_ref, :run_ref, "
                 ":generation, :session_ref, :fence_ref, "
                 ":predecessor_attempt_ref, 'running', :primary_draft_json, "
                 ":primary_draft_hash, :primary_adapter_kind, "
-                ":primary_recorded_at, :now)"
+                ":primary_recorded_at, :primary_provider_unit_ref, :now)"
             ),
             {
                 "attempt_ref": attempt_ref,
@@ -10993,6 +10997,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "primary_recorded_at": (
                     old_attempt.primary_recorded_at if reuse_checkpoint else None
                 ),
+                "primary_provider_unit_ref": (old_attempt.primary_provider_unit_ref if reuse_checkpoint else None),
                 "now": now,
             },
         )
@@ -18594,6 +18599,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 receipt=execution.receipt,
             )
         primary_draft = _primary_draft(run, attempt, session)
+        if primary_draft is not None and primary_draft.primary_provider_unit_ref is not None:
+            with self._database.read() as connection:
+                source = connection.execute(text(
+                    "SELECT u.*, a.root_session_ref FROM ar_provider_units u "
+                    "JOIN ar_stage_attempts a ON a.attempt_ref=u.attempt_ref "
+                    "AND a.run_ref=u.run_ref AND a.fence_ref=u.fence_ref WHERE u.unit_ref=:ref"
+                ), {"ref": primary_draft.primary_provider_unit_ref}).first()
+            if (run.stage != "reasoning" or source is None
+                    or source.run_ref != run.run_ref or source.unit_kind != "reasoning_primary"
+                    or source.root_session_ref != run.root_session_ref):
+                raise OwnerConflict("reasoning_primary_source_invalid")
         if primary_draft is None:
             if primary_invocation.status != "prepared":
                 raise OwnerConflict("idea_provider_invocation_invalid")
@@ -18604,6 +18620,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 native_session_ref=primary_draft.native_session_ref,
                 draft=primary_draft.draft,
                 adapter_kind=primary_draft.adapter_kind,
+                primary_provider_unit_ref=primary_draft.primary_provider_unit_ref,
                 stage=run.stage,
             )
         ):
@@ -18797,6 +18814,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         draft: dict[str, object],
         adapter_kind: str,
         idempotency_key: str,
+        primary_provider_unit_ref: str | None = None,
     ) -> IdeaPrimaryDraft:
         return self._record_stage_primary_draft(
             run_ref=run_ref,
@@ -18808,6 +18826,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             adapter_kind=adapter_kind,
             idempotency_key=idempotency_key,
             expected_stage="reasoning",
+            primary_provider_unit_ref=primary_provider_unit_ref,
         )
 
     def record_reasoning_autonomous_checkpoint(
@@ -19211,6 +19230,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         adapter_kind: str,
         idempotency_key: str,
         expected_stage: str,
+        primary_provider_unit_ref: str | None = None,
     ) -> IdeaPrimaryDraft:
         """Bind the real native Session immediately after primary generation.
 
@@ -19247,6 +19267,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             draft=draft,
             adapter_kind=adapter_kind,
             stage=expected_stage,
+            primary_provider_unit_ref=primary_provider_unit_ref,
         )
         command_kind = f"record_{expected_stage}_primary_draft"
         command_hash = canonical_hash(
@@ -19286,6 +19307,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or run.runtime_binding_hash != runtime_binding_hash
             ):
                 raise OwnerConflict("idea_runtime_binding_drift")
+            if expected_stage == "reasoning" and attempt.primary_draft_json is None:
+                if primary_provider_unit_ref is None:
+                    raise OwnerConflict("reasoning_primary_source_missing")
+                invocation, _ = _provider_invocations(connection, run, attempt, fence)
+                expected_job = self.root_provider_continuation_job_ref(
+                    root_kind="reasoning", phase="primary", run_ref=run_ref,
+                    root_session_ref=run.root_session_ref,
+                    base_job_ref=invocation.operation_ref,
+                )
+                expected_unit = (invocation.invocation_ref
+                    if expected_job == invocation.operation_ref else "provider_unit_" + canonical_hash({
+                        "invocation_ref": invocation.invocation_ref, "job_ref": expected_job}))
+                unit = connection.execute(text(
+                    "SELECT * FROM ar_provider_units WHERE unit_ref=:ref"
+                ), {"ref": primary_provider_unit_ref}).first()
+                if (unit is None or unit.unit_ref != expected_unit
+                        or unit.operation_ref != expected_job or unit.run_ref != run_ref
+                        or unit.attempt_ref != attempt_ref or unit.fence_ref != fence_ref
+                        or unit.unit_kind != "reasoning_primary" or unit.status != "active"):
+                    raise OwnerConflict("reasoning_primary_source_invalid")
             primary_invocation = _complete_provider_invocation(
                 connection,
                 run,
@@ -19353,6 +19394,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "UPDATE ar_stage_attempts SET primary_draft_json = "
                         ":draft_json, primary_draft_hash = :draft_hash, "
                         "primary_adapter_kind = :adapter_kind, "
+                        "primary_provider_unit_ref = :primary_provider_unit_ref, "
                         "primary_recorded_at = :recorded_at WHERE attempt_ref = "
                         ":attempt_ref"
                     ),
@@ -19360,6 +19402,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "draft_json": draft_json,
                         "draft_hash": draft_hash,
                         "adapter_kind": adapter_kind,
+                        "primary_provider_unit_ref": primary_provider_unit_ref,
                         "recorded_at": now,
                         "attempt_ref": attempt_ref,
                     },
@@ -19627,6 +19670,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     native_session_ref=primary_draft.native_session_ref,
                     draft=primary_draft.draft,
                     adapter_kind=primary_draft.adapter_kind,
+                    primary_provider_unit_ref=primary_draft.primary_provider_unit_ref,
                     stage=preview_run.stage,
                 )
             ):
@@ -23241,6 +23285,7 @@ def _primary_draft(run, attempt, session) -> IdeaPrimaryDraft | None:
         draft=draft,
         draft_hash=attempt.primary_draft_hash,
         adapter_kind=attempt.primary_adapter_kind,
+        primary_provider_unit_ref=attempt.primary_provider_unit_ref,
     )
 
 
@@ -23320,6 +23365,7 @@ def _primary_provider_response_hash(
     draft: dict[str, object],
     adapter_kind: str,
     stage: str = "idea",
+    primary_provider_unit_ref: str | None = None,
 ) -> str:
     return canonical_hash(
         {
@@ -23327,6 +23373,8 @@ def _primary_provider_response_hash(
             "native_session_ref": native_session_ref,
             "draft": draft,
             "adapter_kind": adapter_kind,
+            **({"primary_provider_unit_ref": primary_provider_unit_ref}
+               if primary_provider_unit_ref is not None else {}),
         }
     )
 
@@ -23529,6 +23577,7 @@ def _verify_provider_execution_chain(
             native_session_ref=checkpoint.native_session_ref,
             draft=checkpoint.draft,
             adapter_kind=checkpoint.adapter_kind,
+            primary_provider_unit_ref=checkpoint.primary_provider_unit_ref,
             stage=row.stage,
         )
         or (

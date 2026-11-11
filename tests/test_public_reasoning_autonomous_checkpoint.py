@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from reasoning_primary_source_helpers import record_reasoning_primary
+
 from dataclasses import replace
 from pathlib import Path
 
@@ -242,7 +244,7 @@ def test_reasoning_autonomous_checkpoint_is_current_durable_and_non_terminal(
             request,
             question_title="Bound the cross-domain preservation limit.",
         )
-        primary = runtime.owners.agent_runtime.record_reasoning_primary_draft(
+        primary = record_reasoning_primary(runtime.owners.agent_runtime, run,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
@@ -448,7 +450,7 @@ def test_reasoning_autonomous_resume_parks_the_exact_human_request_session(
             request,
             question_title="Bound the cross-domain preservation limit.",
         )
-        primary = owner.record_reasoning_primary_draft(
+        primary = record_reasoning_primary(owner, run,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,

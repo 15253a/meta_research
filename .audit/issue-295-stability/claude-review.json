@@ -1,0 +1,7 @@
+{
+  "verdict": "通过：在 7753d56 所给源码范围内，未发现可复现的阻塞缺陷。",
+  "independent_review": "唯一的生产改动是把 reasoning_primary_completion_operation 整体收进 read_snapshot。核对实现：read_snapshot 设置 ContextVar，因此 query_reasoning_stage_run 的两次读取会并入同一连接；BEGIN 是 deferred，快照实际由 verify_root_agent_runtime_scope 的首次 SELECT 确定，而替换写必然在其后，所以新测试（另一线程完成替换、resolved==original、采纳后 identity 不变、旧 scope 在 HC 被拒且不落行）证明的是公开行为，而非实现细节；60661a3 上的 guidance_provider_unit_unbound 红结果与之对应。外层 fenced_write 既不共享连接也不设置 _read_cut，内层只读连接在 WAL 下不与写者互斥，无死锁；缺陷只剩“快照内若发生写会抛 RuntimeError”这一前提，由 22 例间接覆盖。",
+  "dispositions": "F1 维持撤回：19328 的 active 要求与“先原子拒绝、再经 begin_provider_unit 重启后重写”一致，provider.requests==1 证明未重生成，残留时序缺口已闭合。F2 原文有误：读写两端都已在 70–72 行按 run 行比对 attempt/fence，未比对的只是 unit 自身的 attempt/fence/status，而这恰是 adopt 后必须放行的部分，无需改动或加注释。F3 拒绝正确：19310–19312 在写事务内，局部参数在 UPDATE 前不变；provider_response_hash 对新行含 unit_ref，重放篡改会命中 command_hash 冲突；legacy 条件拼接必须保留。F4 已修，未引入新状态或签名，HC 仍在最外层只解析一次。",
+  "unresolved": [],
+  "attention": "非阻塞证据项：(1)「unit 单独 revoked 不可达」依赖强制控制分支同时撤销 fence，该路径源码不在本包，仅有断言；(2) 快照起点为首个 SELECT，若 verify 将来不再读则确定点后移；(3) adoption 仍经 _replace_fenced_managed_attempt 内部签发缝，非真实停机替换；(4) 27 例为差分复现，不等于受影响面通过；(5) 未运行测试、未复算哈希，等价性 1324/0 与 22/22 仅作证据采信。不得据此声称 249 全绿或真实 provider/部署验收。"
+}

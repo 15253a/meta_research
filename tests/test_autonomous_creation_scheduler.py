@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from unittest.mock import Mock
 
 from meta_research.autonomous_creation import AutonomousCreationService
+from meta_research.database import Database
 from meta_research.owners.common import AcceptanceReceipt, canonical_hash
 
 
@@ -334,7 +336,8 @@ def _service(
         }
     return (
         AutonomousCreationService(
-            human, advancement, agent, memory, graph, object()  # type: ignore[arg-type]
+            human, advancement, agent, memory, graph, object(),  # type: ignore[arg-type]
+            database=Mock(spec=Database),
         ),
         human,
         advancement,
@@ -379,6 +382,7 @@ def test_restart_skips_terminal_waiting_human_and_stale_contexts() -> None:
         memory,
         graph,
         object(),  # type: ignore[arg-type]
+        database=Mock(spec=Database),
     )
     assert restarted.query_current()["context_ref"] == (
         "autonomous-context:pending"

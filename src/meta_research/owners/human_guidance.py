@@ -24,18 +24,20 @@ class HumanGuidanceMixin:
         return prepare_live_guidance(self, scope=scope, binding=binding)
 
     def bind_reasoning_completion_conditions(
-        self, *, operation: StageGuidanceOperation, submission_ref: str,
+        self, *, operation: StageGuidanceOperation | GuidanceRuntimeScope, submission_ref: str,
         output: dict[str, object], payload_hash: str,
-    ) -> None:
-        if operation.scope.root_kind != "reasoning" or not submission_ref:
+    ) -> StageGuidanceOperation:
+        scope = operation if isinstance(operation, GuidanceRuntimeScope) else operation.scope
+        if scope.root_kind != "reasoning" or not submission_ref:
             raise OwnerConflict("reasoning_completion_conditions_invalid")
-        # Local acceptance consumes the original primary cut. Only actual
-        # provider turns may freeze a new cut or require an active unit.
-        local_primary = operation.operation_name == "primary"
-        verifier = (self._agent_runtime.verify_reasoning_primary_completion_operation
-                    if local_primary else self._agent_runtime.verify_stage_guidance_operation)
+        local_primary = isinstance(operation, GuidanceRuntimeScope) or operation.operation_name == "primary"
         with self._database.fenced_write() as connection:
-            work = verifier(operation)
+            if isinstance(operation, GuidanceRuntimeScope):
+                operation, work = self._agent_runtime.reasoning_primary_completion_operation(operation)
+            elif local_primary:
+                work = self._agent_runtime.verify_reasoning_primary_completion_operation(operation)
+            else:
+                work = self._agent_runtime.verify_stage_guidance_operation(operation)
             cut = (self.recover_operation_guidance(operation.identity) if local_primary
                    else self.freeze_operation_guidance(operation))
             if cut.binding.quest_ref != work.quest_ref or cut.provenance_ref != work.provenance_ref:
@@ -57,7 +59,7 @@ class HumanGuidanceMixin:
                 if (decoded_object(row.binding_json) != binding
                         or row.binding_hash != canonical_hash(binding)):
                     raise OwnerConflict("reasoning_completion_conditions_conflict")
-                return
+                return operation
             connection.execute(text(
                 "INSERT INTO hc_reasoning_completion_conditions "
                 "(submission_ref,binding_json,binding_hash) VALUES "
@@ -65,6 +67,7 @@ class HumanGuidanceMixin:
             ), {"submission_ref": submission_ref,
                 "binding_json": canonical_json(binding),
                 "binding_hash": canonical_hash(binding)})
+        return operation
 
     def submit_human_guidance(
         self, *, quest_ref: str, original_text: str, strength: int = 3,

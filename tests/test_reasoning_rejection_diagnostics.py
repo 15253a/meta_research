@@ -1,3 +1,5 @@
+
+from reasoning_primary_source_helpers import record_reasoning_primary
 """Content diagnostics survive the adapter, durable rejection and native resume."""
 
 from copy import deepcopy
@@ -183,7 +185,7 @@ def test_continuation_diagnostic_is_durable_and_delivered_after_restart(tmp_path
         )
         run = ar.admit_reasoning_stage(request, "diagnostic-continuation-admit", runtime_binding=_runtime_binding())
         draft = _checkpoint(request, question_title="Continue a bounded uncertainty")
-        ar.record_reasoning_primary_draft(
+        record_reasoning_primary(ar, run,
             run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
             native_session_ref="native:summary", runtime_binding=run.runtime_binding,
             draft=draft, adapter_kind="test_deterministic", idempotency_key="diagnostic-continuation-draft",

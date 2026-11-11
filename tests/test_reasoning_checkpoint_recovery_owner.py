@@ -1,3 +1,5 @@
+
+from reasoning_primary_source_helpers import record_reasoning_primary
 from dataclasses import replace
 from reasoning_current_fixtures import summary_candidate_values
 from test_reasoning_summary_decision_flow import runtime_at, SummarySkill
@@ -19,7 +21,7 @@ def _record(runtime, request, run, *, reject, monkeypatch):
     value['scientific_outcome']['outcome_ref'] += f':{run.attempt_generation}'
     value['autonomous_scope']['source_scientific_outcome_ref'] = value['scientific_outcome']['outcome_ref']
     review = _review(value, value)
-    ar.record_reasoning_primary_draft(
+    record_reasoning_primary(ar, run,
         run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
         native_session_ref=run.native_session_ref or 'checkpoint-rejection-native',
         runtime_binding=run.runtime_binding, draft=value, adapter_kind='test_deterministic',
