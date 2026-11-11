@@ -4988,6 +4988,8 @@ class SQLiteResearchGraphReceiptVerifier:
                 or decision.plan_document_hash != row.plan_document_hash
                 or decision.plan_content_receipt_ref != row.plan_content_receipt_ref
                 or decision.plan_content_receipt_hash != row.plan_content_receipt_hash
+                or decision.reviewed_draft_hash != content.reviewed_draft_hash
+                or decision.review_hash != content.review_hash
                 or decision.receipt_ref != row.formal_plan_receipt_ref
                 or decision.receipt_hash != row.formal_plan_receipt_hash
                 or content.content_ref != row.plan_content_ref
