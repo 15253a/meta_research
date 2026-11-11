@@ -191,3 +191,52 @@ for (const damage of ["key", "cipher", "json"] as const) {
     expect(error).toMatch(/invalid|missing/); expect(await state(page)).toEqual(before);
   });
 }
+
+for (const damage of ["key", "cipher", "json", "binding", "legacy-json", "legacy-conflict"] as const) {
+  test(`damaged A ${damage} leaves B and new C usable across reload and tabs`, async ({ page }) => {
+    await install(page);
+    const b = "research_graph:HR-healthy:r1", c = "research_graph:HR-new:r1";
+    await draft(page); await draft(page, b, "healthy exact body");
+    await page.evaluate(async ({ manifestKey, legacySlot, damage }) => {
+      const db = await new Promise<IDBDatabase>(resolve => { const r = indexedDB.open("meta_research_human_request_recovery"); r.onsuccess = () => resolve(r.result); });
+      await new Promise<void>(resolve => {
+        const tx = db.transaction(["recovery_manifests", "sealed_response_keys", "sealed_payloads"], "readwrite");
+        const store = tx.objectStore("recovery_manifests"), get = store.get(manifestKey);
+        get.onsuccess = () => {
+          const value = JSON.parse(get.result);
+          if (damage === "key") tx.objectStore("sealed_response_keys").delete(value.sealed_response.key_ref);
+          if (damage === "cipher") tx.objectStore("sealed_payloads").put(new Uint8Array([1, 2, 3]).buffer, value.sealed_response.ciphertext_ref);
+          if (damage === "json") store.put("{broken", manifestKey);
+          if (damage === "binding") { value.response_idempotency_key = "forged"; store.put(JSON.stringify(value), manifestKey); }
+          if (damage === "legacy-json") sessionStorage.setItem(legacySlot, "{broken");
+          if (damage === "legacy-conflict") sessionStorage.setItem(legacySlot, JSON.stringify(value, null, 2));
+        };
+        tx.oncomplete = () => resolve();
+      }); db.close();
+    }, { manifestKey, legacySlot, damage });
+    const before = await state(page);
+    await page.reload(); await page.waitForFunction(() => Boolean(window.recoveryApi));
+    const bodies: unknown[] = [];
+    await page.context().route(`${origin}/api/**`, async route => { bodies.push(route.request().postDataJSON()); await route.abort("connectionreset"); });
+    const other = await page.context().newPage(); await open(other);
+    for (const tab of [page, other]) {
+      expect(await tab.evaluate(ref => window.recoveryApi.pendingHumanRequestResponsePreview(ref), b)).toEqual({ decision: "provided", facts: {}, note: "healthy exact body" });
+      await tab.evaluate(async ref => { try { await window.recoveryApi.deliverPendingHumanRequestResponse(ref); } catch {} }, b);
+    }
+    expect(bodies).toEqual(Array(2).fill({ decision: "provided", facts: {}, note: "healthy exact body" }));
+    await draft(page, c, "new exact body");
+    expect(bodies[2]).toEqual({ decision: "provided", facts: {}, note: "new exact body" });
+    expect((await state(page)).manifests[`meta-research/human-request-recovery/v2:response:${encodeURIComponent(c)}`]).toContain('"request_ref":"research_graph:HR-new:r1"');
+    if (damage !== "legacy-json") {
+      const error = await page.evaluate(async ref => { try { await window.recoveryApi.pendingHumanRequestResponsePreview(ref); return null; } catch (error) { return (error as Error).message; } }, requestRef);
+      expect(error).toMatch(/invalid|missing|conflict/);
+      expect(await draft(other, requestRef, "must not replace A")).toMatch(/invalid|missing|conflict/);
+    }
+    expect(await hydrate(page)).toMatch(/invalid|missing|conflict/);
+    const after = await state(page);
+    expect(after.manifests[manifestKey]).toBe(before.manifests[manifestKey]);
+    expect(after.session[legacySlot]).toBe(before.session[legacySlot]);
+    expect(after.keys).toEqual(expect.arrayContaining(before.keys));
+    expect(after.ciphertexts).toEqual(expect.arrayContaining(before.ciphertexts));
+  });
+}
