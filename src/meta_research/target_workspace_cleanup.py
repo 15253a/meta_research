@@ -15,6 +15,8 @@ import stat
 from sqlalchemy import bindparam, text
 
 from meta_research.owners.advancement_engine import recent_workspace_cycles
+from meta_research.owners.agent_runtime import _bundle_inbox_checkpoint_from_row
+from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 
 
@@ -151,7 +153,11 @@ def _cycle_dependencies(connection, cycle_refs):
             SELECT r.cycle_ref, 'handoff_incomplete' FROM ar_target_launches a
               JOIN ae_stage_run_requests r ON r.request_ref=a.stage_request_ref
               LEFT JOIN ar_target_root_lifecycles l ON l.target_ref=a.target_ref
-              WHERE r.cycle_ref IN :cycles AND (l.status IS NULL OR l.status NOT IN ('completed','cancelled'))
+              WHERE r.cycle_ref IN :cycles AND (l.status IS NULL OR l.status NOT IN ('completed','cancelled','failed'))
+            UNION ALL
+            SELECT cycle_ref, 'unfinished_runtime_responsibility' FROM runs r
+              JOIN ar_execution_responsibilities effects ON effects.root_run_ref=r.run_ref
+              WHERE effects.status!='finished'
             UNION ALL
             SELECT cycle_ref, 'pending_human_request' FROM runs JOIN owner_human_request_waiters w
               ON (w.waiter_ref='root_run:'||run_ref OR w.waiter_ref=runs.target_ref)
@@ -174,7 +180,36 @@ def _cycle_dependencies(connection, cycle_refs):
         )
         SELECT cycle_ref, reason FROM pending GROUP BY cycle_ref, reason ORDER BY cycle_ref, reason
         """).bindparams(bindparam("cycles", expanding=True)), {"cycles": sorted(cycle_refs)})
-    return {cycle: reason for cycle, reason in rows}
+    pending = {cycle: reason for cycle, reason in rows}
+    failed = connection.execute(text("SELECT requests.cycle_ref, launches.target_ref "
+        "FROM ar_target_launches launches JOIN ae_stage_run_requests requests "
+        "ON requests.request_ref=launches.stage_request_ref JOIN ar_target_root_lifecycles lifecycle "
+        "ON lifecycle.target_ref=launches.target_ref WHERE requests.cycle_ref IN :cycles "
+        "AND lifecycle.status='failed'").bindparams(bindparam("cycles", expanding=True)),
+        {"cycles": sorted(cycle_refs)})
+    for cycle, target in failed:
+        try:
+            _verify_failed_notice_ack(connection, target)
+        except OwnerConflict as error:
+            pending[cycle] = error.code
+    return pending
+
+
+def _verify_failed_notice_ack(connection, target_ref):
+    # A closed historical Bundle cannot use the current-execution checkpoint API.
+    # Its immutable checkpoint still authenticates the exact published prefix.
+    row = connection.execute(text("SELECT checkpoints.* FROM ar_target_work_notices notice "
+        "JOIN ar_bundle_inbox_entries entries ON entries.notice_ref=notice.notice_ref "
+        "JOIN ar_target_launches launches ON launches.target_ref=notice.target_ref "
+        "JOIN ar_bundle_dispatch_decisions dispatch ON dispatch.decision_ref=launches.dispatch_decision_ref "
+        "AND dispatch.run_ref=entries.run_ref "
+        "JOIN ar_bundle_inbox_checkpoints checkpoints ON checkpoints.run_ref=entries.run_ref "
+        "AND checkpoints.cursor>=entries.sequence AND checkpoints.generation>=entries.published_generation "
+        "WHERE notice.target_ref=:target ORDER BY checkpoints.checkpoint_revision LIMIT 1"),
+        {"target": target_ref}).first()
+    if row is None:
+        raise OwnerConflict('bundle_notice_unacknowledged')
+    _bundle_inbox_checkpoint_from_row(row)
 
 
 def _path_dependency(workspace, path, pending_uploads, pending_intakes):
@@ -347,7 +382,7 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
             "JOIN ae_cycles cycle ON cycle.cycle_ref=r.cycle_ref "
             "LEFT JOIN rm_target_root_completion_manifests m ON m.completion_ref=l.completion_ref "
             "LEFT JOIN rg_target_commits c ON c.target_ref=w.target_ref "
-            "WHERE l.status IN ('completed','cancelled') UNION ALL "
+            "WHERE l.status IN ('completed','cancelled','failed') UNION ALL "
             "SELECT NULL,NULL,NULL,s.run_ref,s.stage,s.cycle_ref,cycle.quest_ref,cycle.status,s.status, "
             "NULL,NULL,c.commit_ref FROM ar_stage_runs s "
             "JOIN ae_cycles cycle USING(cycle_ref) JOIN ae_stage_commits c ON c.request_ref=s.request_ref "
@@ -392,7 +427,8 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
             if candidate['cycle_status'] != 'completed':
                 record['reason'] = 'cycle_incomplete'
                 continue
-            if candidate['lifecycle_status'] != 'completed' or not candidate['commit_ref']:
+            failed_target = candidate['root_kind'] == 'target' and candidate['lifecycle_status'] == 'failed'
+            if not failed_target and (candidate['lifecycle_status'] != 'completed' or not candidate['commit_ref']):
                 record['reason'] = 'handoff_incomplete'
                 continue
             if window_reasons[candidate['work_ref']]:
@@ -400,7 +436,19 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
                 continue
             # Public Owner readbacks authenticate the immutable handoff and all
             # retained manifest bindings without exporting another whole copy.
-            if candidate['root_kind'] == 'target':
+            if failed_target:
+                owner = runtime._agent_runtime
+                notice = owner.query_target_work_notice(candidate['target_ref'])
+                if notice is None:
+                    raise OwnerConflict('handoff_incomplete')
+                handoff = owner.read_target_run_handoff(notice.handoff_manifest_ref)
+                if handoff.handle_history[-1].target_run_ref != candidate['work_ref']:
+                    raise OwnerConflict('handoff_incomplete')
+                operation = owner.harness_runs.latest_operation(candidate['work_ref'])
+                if operation is None:
+                    raise OwnerConflict('provider_terminal_proof_missing')
+                owner.harness_runs.verify_operation_terminal(operation.operation_ref)
+            elif candidate['root_kind'] == 'target':
                 graph = runtime._research_graph
                 manifest = graph._target_root_manifest_reader.query(candidate['manifest_ref'])
                 transition = graph.query_target_root_commit_transition(candidate['target_ref'])
@@ -418,8 +466,8 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
                     record['reason'] = 'handoff_incomplete'
                     continue
             eligible.append((candidate, path, root, record))
-        except (OwnerConflict, OSError) as error:
-            record['reason'] = error.code if isinstance(error, OwnerConflict) else type(error).__name__
+        except (OwnerConflict, AgentRuntimeHarnessError, OSError) as error:
+            record['reason'] = error.code if isinstance(error, (OwnerConflict, AgentRuntimeHarnessError)) else type(error).__name__
     if not eligible:
         return tuple(report)
     with database.fenced_write() as connection:
@@ -465,7 +513,8 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
                 if reason:
                     record['reason'] = reason
                     continue
-                record['reason'] = 'published_verified_completed_cycle_workspace'
+                record['reason'] = ('reconciled_failed_cycle_workspace' if candidate['lifecycle_status'] == 'failed'
+                    else 'published_verified_completed_cycle_workspace')
                 record['action'] = 'candidate'
                 if not dry_run:
                     # Recheck immediately before the fd-based recursive remove.

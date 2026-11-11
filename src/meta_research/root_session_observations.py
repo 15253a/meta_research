@@ -314,6 +314,9 @@ class RootSessionObservations:
         roots = []
         for current_row in current_rows:
             current = dict(current_row)
+            if current["failure_code"] == "provider_terminal_proof_missing":
+                profile = self.runtime.harnesses._owner.query_profile(current["run_ref"]) or {}
+                current["_terminal_proof_diagnostic"] = profile.get("terminal_proof_diagnostic")
             current["_current_root_session_ref"] = current["root_session_ref"]
             current["_historical"] = False
             history = connection.execute(text("""
@@ -486,12 +489,19 @@ class RootSessionObservations:
                 executing = _process_is_bound(store._source_path(invocation_hash).parent, invocation_hash)
             except Exception:
                 pass
+        diagnostic = row.get("_terminal_proof_diagnostic")
+        diagnostic = diagnostic if (isinstance(diagnostic, dict)
+            and diagnostic.get("provider_operation_ref") == operation["operation_ref"]
+            and operation["outcome_code"] == "provider_terminal_proof_missing") else None
         return {
             "operation_ref": operation["operation_ref"], "phase": "target-turn",
             "label": f"执行 {operation['generation']}",
             "status": _operation_status(operation["status"], executing),
             "created_at": operation["created_at"],
             "updated_at": operation["completed_at"] or operation["created_at"],
+            **({"reason": "provider_terminal_proof_missing"}
+               if operation["outcome_code"] == "provider_terminal_proof_missing" else {}),
+            **({"terminal_proof_diagnostic": diagnostic} if diagnostic is not None else {}),
         }
 
     def _target_sessions(self, connection, quest_ref, foreground):

@@ -28,6 +28,9 @@ def test_failed_target_stays_unavailable_while_retry_is_pending(
     class Inventory:
         iterations = 0
 
+        def list_target_root_reconciliation_refs(self):
+            return ()
+
         def list_target_root_work_refs(self):
             self.iterations += 1
             if self.iterations >= 3:
@@ -104,6 +107,9 @@ def test_retired_target_no_longer_keeps_worker_unavailable() -> None:
     health = ReconciliationHealth()
 
     class Inventory:
+        def list_target_root_reconciliation_refs(self):
+            return ()
+
         def list_target_root_work_refs(self):
             return () if retired.is_set() else ("target-retired",)
 

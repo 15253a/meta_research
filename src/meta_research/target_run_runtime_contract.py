@@ -320,15 +320,19 @@ class TargetHarnessAdmission:
 
 @dataclass(frozen=True, slots=True)
 class TargetRunWorkspace:
-    """Opaque Owner lease for one Target Harness attempt's private tree."""
+    """Stable TargetRun directory with immutable reservation provenance.
+
+    Reservation identities describe its creation, never current permissions.
+    Current execution authority is verified independently through TargetWorkHandle.
+    """
 
     workspace_ref: str
     target_ref: str
     target_run_ref: str
-    root_session_ref: str
-    target_attempt_ref: str
-    target_fence_ref: str
-    ordinal: int
+    reservation_root_session_ref: str
+    reservation_attempt_ref: str
+    reservation_fence_ref: str
+    reservation_ordinal: int
     implementation_relative_path: str
     inputs_relative_path: str
     payload_hash: str

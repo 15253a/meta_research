@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 from sqlalchemy import text
@@ -15,6 +16,7 @@ from meta_research.provider_supervisor import (
     read_supervisor_request,
     read_transport_key_for_operation,
     write_exit_receipt,
+    supervisor_host_identity,
 )
 from meta_research.quest_drafting import _ProcessStopped
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -73,6 +75,9 @@ class _StoppedThenSuccessfulProvider(_StoppedWithLostReply):
             result_path=Path(request["result_path"]), returncode=0,
             input_bytes=prompt_path.stat().st_size, termination_reason="completed",
             schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+            process_tree={"schema_ref": "meta-research/provider-process-tree/v1", "state": "closed",
+                          "mechanism": "linux-subreaper-echild" if sys.platform == "linux" else "windows-job",
+                          **supervisor_host_identity()},
         )
         return subprocess.CompletedProcess(args[1], 0, stream, "")
 
@@ -213,7 +218,7 @@ def _replace_profile(database, run_ref, profile):
     "receipt_seal", "stdout_hash", "profile_family", "profile_run",
     "missing_receipt", "foreign_operation", "not_stopped", "malformed_receipt",
 ))
-def test_untrusted_failed_history_rejects_then_reconciles_same_successful_spool(harness_case, damage):
+def test_untrusted_failed_history_cannot_advance_until_original_evidence_restored(harness_case, damage):
     database, owner, request, handle, runner, runtime, _store = harness_case
     original, failed_profile = _checkpoint_stop(harness_case)
     runtime().recover_failed_target_root(request.request_ref)
@@ -244,14 +249,21 @@ def test_untrusted_failed_history_rejects_then_reconciles_same_successful_spool(
         _turn(runtime, request)
 
     operation = owner.latest_operation(original.run_ref)
-    assert operation.generation == 2
-    assert operation.status == "unknown_outcome", "A merge rejection must not strand a running operation."
+    blocked_before_launch = damage not in {"profile_family", "profile_run"}
+    if blocked_before_launch:
+        assert operation.generation == 1 and operation.status == "failed"
+        assert runner.calls == 1
+        successful_spool = None
+        success_bytes = {}
+    else:
+        assert operation.generation == 2
+        assert operation.status == "unknown_outcome", "A merge rejection must not strand a running operation."
+        assert runner.calls == 2
+        successful_spool = runner.successful_request_paths[-1]
+        success_bytes = {name: successful_spool.with_name(name).read_bytes()
+                         for name in (successful_spool.name, "stdout.jsonl", "supervisor-exit.json")}
     assert owner.query_target_root_completion_evidence(handle.target_ref) is None
     assert owner.query_run(request.request_ref).native_session_ref == NATIVE
-    assert runner.calls == 2
-    successful_spool = runner.successful_request_paths[-1]
-    success_bytes = {name: successful_spool.with_name(name).read_bytes()
-                     for name in (successful_spool.name, "stdout.jsonl", "supervisor-exit.json")}
 
     if changed_path is not None:
         changed_path.write_bytes(old_bytes)
@@ -260,12 +272,14 @@ def test_untrusted_failed_history_rejects_then_reconciles_same_successful_spool(
 
     assert recovered.status == "executed"
     reconciled = owner.latest_operation(original.run_ref)
-    assert reconciled.operation_ref == operation.operation_ref
-    assert reconciled.generation == 2 and reconciled.reconciliation_generation == 1
+    assert reconciled.operation_ref == f"{original.run_ref}:harness_turn:2"
+    assert reconciled.generation == 2
+    assert reconciled.reconciliation_generation == (0 if blocked_before_launch else 1)
     assert reconciled.status == "executed" and runner.calls == 2
-    assert {name: successful_spool.with_name(name).read_bytes() for name in success_bytes} == success_bytes
+    if successful_spool is not None:
+        assert {name: successful_spool.with_name(name).read_bytes() for name in success_bytes} == success_bytes
     evidence = owner.query_target_root_completion_evidence(handle.target_ref)
-    assert evidence is not None and evidence.operation_ref == operation.operation_ref
+    assert evidence is not None and evidence.operation_ref == reconciled.operation_ref
     assert owner.verify_target_root_completion_evidence(handle, evidence)
 
 
@@ -274,7 +288,7 @@ def test_native_resume_with_no_previous_profile_remains_unavailable(harness_case
     original, _profile = _checkpoint_stop(harness_case)
     runtime().recover_failed_target_root(request.request_ref)
     _replace_profile(database, original.run_ref, None)
-    with pytest.raises(HarnessAdmissionError, match="native_session_resume_unavailable"):
+    with pytest.raises(HarnessAdmissionError, match="provider_terminal_proof_missing"):
         _turn(runtime, request)
     assert owner.query_target_root_completion_evidence(handle.target_ref) is None
 

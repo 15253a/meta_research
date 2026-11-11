@@ -25,6 +25,8 @@ RM 提供两种保管方式：
 | `managed` | RM 管理所选内容的独立副本及精确版本，承担相应复制与存储成本。 |
 | `linked_local` | RM 正式保管所选内容的本地读取位置及精确版本关系，保留该文件；这种方式本身不产生独立备份，来源漂移或失效如实呈现。 |
 
+正式原件保持原位、按准确版本读取。需要编辑时另建工作文件，只复制本次需要的内容；按材料选择或 Target 正式交接接纳新文件及其来源，旧原件仍保持原版本。直接改写 `linked_local` 原件会触发漂移，恢复执行也不改变这一边界。
+
 综合研究用途、体积、复制成本、位置可靠性和后续使用便利选择方式。正式保管以工具确认的结果、版本和可读入口为依据，尚未成功或结果未知的部分保持未决，按当前合同核实；长期内容与临时内容的清理边界见 [交接与工作区收尾](#交接与工作区收尾)。
 
 ## 资源整理与正式登记
@@ -86,7 +88,7 @@ Target 过程中发现、取得或阅读的 Literature 也进入整理范围。�
 
 ## 工作资料的当前处理与后继交接
 
-HumanRequest 答复始终由原请求根处理；软指导附带材料、主动意见与新闻论文先交给提交时绑定的当前研究根，不需要伪装成求助答复。Agent 自行取得的服务器材料用 `research_workspace.materials.acquire` 提交 `absolute_path` 由系统安全检查生成引用，或提交既有原样 ServerSelection，并说明真实取得路线；材料绑定本根，不按后来前台改投。三种来源均先作为工作资料；保存引用、收到、实际读过、采用与足以支持科研结论是不同事实。新闻、人的判断、论文及实际实验产物保留各自性质。
+HumanRequest 答复的绑定与恢复接续见[当前工作目录与回复材料](#当前工作目录与回复材料)；软指导附带材料、主动意见与新闻论文先交给提交时绑定的当前研究根。Agent 自行取得的服务器材料用 `research_workspace.materials.acquire` 提交 `absolute_path` 由系统安全检查生成引用，或提交既有原样 ServerSelection，并说明真实取得路线；材料绑定本根，不按后来前台改投。三种来源均先作为工作资料；保存引用、收到、实际读过、采用与足以支持科研结论是不同事实。新闻、人的判断、论文及实际实验产物保留各自性质。
 
 先用 `research_workspace.materials.discover` 发现可见 reference_ref，按需要展开目录，再以 observation_ref 调 `research_workspace.materials.read`，沿字节范围继续。未读、只读局部、缺失或权限失败均如实说明。需要修改或轻量试跑时，用共同 `research_workspace.materials.copy` 按需取得单个独立可写副本；返回的 working_path 可用本根原生工具处理，重试用同一 effect_id 或 `.copy.reconcile`，不会覆盖已编辑副本。运行根副本在 `.work-materials/`，临时结果也可放此处；不要把未选材料移入 Target 的常规 outputs 目录。原件保持完整，不递归复制或预读整个目录。
 
@@ -118,13 +120,15 @@ reader 指针只把 operation 以外的参数交给指定工具；summary_only �
 
 ## 当前工作目录与回复材料
 
+同一 TargetRun 恢复时沿用原 `workspace_ref`、物理目录与工作字节，按已保存 checkpoint 继续；执行身份和工具权限由宿主重新签发、核验。旧路径与旧授权不能替代现任权限，已冻结输入、准确版本及 Owner 接纳仍沿原合同处理。
+
 宿主在本次输入的 `Work directories` 中列出实际可达且属于本根范围的工作目录；每项的 `directory` 是原生文件／shell 的入口，`workspace_ref`、`work_ref`、`root_kind`、`cycle_ref` 及适用的 `target_ref` 说明工作归属，`access` 说明读写范围。只在自己的 `read_write` 目录内编辑工作文件，`read` 目录用于只读参考；Target 的正式 inputs 等受保护内容仍按原合同使用。原生执行沿实例已有 Harness 权限，路径提示不扩大权限；父目录、私有 spool、内部数据库及越出获授范围的符号链接不在授权内。普通目录查找和读取直接用原生能力，无须经过专用 RW 工具或工具索引。
 
 Cycle 根的路径来自同一 Quest 当前及前两轮窗口，并按本根实际工作筛选：本轮列出自己的工作目录及已存在的上游阶段目录；Bundle／Reasoning 还可见本轮已启用 Target 的目录，Target 可见本 Target 的工作目录历史。窗口内较早轮次的可见阶段与 Target 目录可供参考。晚到的旧根仍受当前窗口与自身工作限制，不因恢复而取得更新轮次或重新开放完整第四轮。Companion、Acquisition 等不属于 Cycle 的工作只按自身获授范围访问，不套用三轮目录承诺。
 
 缺失、不可读或不在本根范围的目录不出现在路径提示中。未列出不等于没有历史、材料已删除或已被读完，也不能从相邻路径推断权限；需要相关内容时沿已有准确引用或 RG／RM 等正式 reader 核实，仍不可达则说明具体缺口。路径已经给出而读取失败时，保留实际失败与未读范围。目录可达不表示内容已被正式接纳；窗口外原件和研究历史沿准确 reader 读取，回收边界见[交接与工作区收尾](#交接与工作区收尾)。
 
-正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle。用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read；无 Quest 时须传精确 request_ref 与 response_ref。delivery.reply_file 与 uploaded_files 给出 workspace_ref、相对 path 与 sha256，在该工作实际目录用原生工具读取 reply.json 和需要的上传文件；核对字节后再作为准确依据。linked_locators 保留所选原件的位置说明；其目录或文件也进入 delivery.work_materials 的既有授权材料引用，按当前授权及实际可用性读取，先展开必要条目，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
+正式回复的 delivery 绑定原 HumanRequest、根 Session、work 与可选 Cycle。同一 TargetRun 恢复后的现任根可处理合法历史根的答复，保留原 request/root/work/delivery 与去重身份；其他 TargetRun 的根不能承接该投递。原根用原 effect_id 调用 human_request.open.reconcile 后，按 resolution.response_ref 调用 human_request.read；恢复后的现任根沿原 request_ref 与 response_ref 读取，保留原接收关系。delivery.reply_file 与 uploaded_files 给出 workspace_ref、相对 path 与 sha256，在该工作实际目录用原生工具读取 reply.json 和需要的上传文件；核对字节后再作为准确依据。linked_locators 保留所选原件的位置说明；其目录或文件也进入 delivery.work_materials 的既有授权材料引用，按当前授权及实际可用性读取，先展开必要条目，不复制全目录。library_reconnect 的 provided_material 路线也先读工作文件再继续原工作；OA 路线与恢复机构访问仍按实际路线处理。提交回应不自动登记 Literature、Dataset、Environment 或 ResearchAsset；Agent 判断有复用价值时，再沿既有 RM／RG 接纳与登记流程处理。Target 的 implementation、inputs 和 outputs 按原正式交接合同使用。
 
 宿主使用同一研究序列窗口判定目录可见和回收时机。清理的执行仍由系统负责，单个 Target 结束不能证明整个 Cycle 或目录已可回收；实际执行、恢复、待接纳及后继读取依赖继续保护，精确保管原件不作为临时材料删除。
 

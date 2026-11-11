@@ -127,6 +127,7 @@ class _TargetRootAdapter:
         missing_capabilities: frozenset[str] = frozenset(),
         evidence_free_capability: str | None = None,
         target_root_timeout_seconds: float = 30 * 24 * 60 * 60,
+        recorded_terminals: dict | None = None,
     ) -> None:
         self.family = family
         self.fail_first_code = fail_first_code
@@ -134,6 +135,8 @@ class _TargetRootAdapter:
         self.evidence_free_capability = evidence_free_capability
         self.target_root_timeout_seconds = target_root_timeout_seconds
         self.invocations: list[HarnessInvocation] = []
+        self.launches: list[HarnessInvocation] = []
+        self.recorded_terminals = {} if recorded_terminals is None else recorded_terminals
 
     def provider_operation_timeout_seconds(self, *, target_root: bool) -> float:
         return self.target_root_timeout_seconds if target_root else 300.0
@@ -148,9 +151,23 @@ class _TargetRootAdapter:
 
     def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
         self.invocations.append(invocation)
+        self.launches.append(invocation)
+        result = self._terminal_evidence(invocation)
+        self.recorded_terminals[invocation.provider_operation_ref] = (
+            invocation.owner_invocation_hash, result,
+        )
         if self.fail_first_code is not None and len(self.invocations) == 1:
             raise HarnessAdapterUnavailable(self.fail_first_code)
+        return result
 
+    def invoke_terminal(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
+        self.invocations.append(invocation)
+        terminal = self.recorded_terminals.get(invocation.provider_operation_ref)
+        if terminal is None or terminal[0] != invocation.owner_invocation_hash:
+            raise HarnessAdapterUnavailable("provider_outcome_unknown", durable_outcome="unknown")
+        return terminal[1]
+
+    def _terminal_evidence(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
         native_session_ref = invocation.native_session_ref or "native-target-root"
         available = set(_TARGET_ROOT_CAPABILITIES)
         if invocation.native_session_ref is not None:
@@ -280,7 +297,8 @@ class _Gateway:
         self._operation_ids_by_token.pop(token, None)
 
     def dispatch(
-        self, _token: str | None, message: object
+        self, _token: str | None, message: object,
+        *, allowed_operation_ids: tuple[str, ...] | None = None,
     ) -> tuple[int, dict[str, object] | None]:
         assert isinstance(message, dict)
         operation_ids = self._operation_ids_by_token.get(_token or "")
@@ -291,6 +309,8 @@ class _Gateway:
                     "message": "A current scope-bound MCP channel is required.",
                 }
             }
+        if allowed_operation_ids is not None:
+            operation_ids = tuple(item for item in operation_ids if item in allowed_operation_ids)
         if message.get("method") == "initialize":
             return 200, {
                 "jsonrpc": "2.0",
@@ -418,6 +438,14 @@ class _Owner:
         self.observation_query_error: str | None = None
         self.observation_query: tuple[str, str | None, int] | None = None
         self.recovery_transitions = 0
+        self.terminal_operations: set[str] = set()
+
+    def target_run_failed(self, run_ref: str) -> bool:
+        assert run_ref == self.run.run_ref
+        return False
+
+    def verify_operation_terminal(self, operation_ref: str) -> None:
+        assert operation_ref in self.terminal_operations
 
     def query_run(self, request_ref: str) -> AgentRuntimeHarnessRun | None:
         return self.run if request_ref == self.run.request_ref else None
@@ -551,15 +579,16 @@ class _Owner:
         return reconciliation_generation
 
     def record_operation_failure(
-        self, operation_ref: str, code: str
+        self, operation_ref: str, code: str, *, durable_outcome=None,
+        transport_receipt=None, runtime_effect=None, predecessor_effects=(),
     ) -> AgentRuntimeHarnessRetry | None:
         operation = self.operations[-1]
         assert operation.operation_ref == operation_ref
-        unknown = code in {
+        unknown = durable_outcome != "not_started" and (durable_outcome == "unknown" or code in {
             "provider_timeout",
             "provider_io_unavailable",
             "provider_outcome_unknown",
-        } or code.startswith(("power_inhibitor_", "runtime_"))
+        } or code.startswith(("power_inhibitor_", "runtime_")))
         self.operations[-1] = replace(
             operation,
             status="unknown_outcome" if unknown else "failed",
@@ -572,6 +601,7 @@ class _Owner:
         )
         if unknown:
             return None
+        self.terminal_operations.add(operation_ref)
         return AgentRuntimeHarnessRetry(
             request_ref=self.run.request_ref,
             target_ref=self.request.target_ref,
@@ -596,6 +626,7 @@ class _Owner:
         operation = self.operations[-1]
         assert operation.operation_ref == operation_ref
         assert run_ref == self.run.run_ref
+        self.terminal_operations.add(operation_ref)
         self.operations[-1] = replace(
             operation, status="executed", outcome_code=None
         )
@@ -1495,6 +1526,7 @@ def test_target_root_lifecycle_reconciles_unknown_outcome_inside_one_call(
     assert completed.status == "executed"
     assert len(owner.operations) == 1
     assert len(adapter.invocations) == 2
+    assert len(adapter.launches) == 1
     assert (
         adapter.invocations[0].provider_operation_ref
         == adapter.invocations[1].provider_operation_ref
@@ -1573,7 +1605,9 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     assert owner.operations[0].status == "unknown_outcome"
     assert protection.query_evidence()["inhibitor"]["active_count"] == 1
 
-    recovery_adapter = _TargetRootAdapter("codex")
+    recovery_adapter = _TargetRootAdapter(
+        "codex", recorded_terminals=interrupted_adapter.recorded_terminals,
+    )
     recovered = HarnessRuntime(
         owner,
         _Gateway(),
@@ -1591,6 +1625,7 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     assert completed.status == "executed"
     assert len(owner.operations) == 1
     assert recovery_adapter.invocations[0].provider_operation_ref == operation_ref
+    assert recovery_adapter.launches == []
     assert protection.query_evidence()["inhibitor"]["active_count"] == 0
     protection.close()
     database.close()
@@ -1628,7 +1663,8 @@ def test_target_root_reconciliation_keeps_the_admitted_operation_timeout(
     original_operation = owner.operations[0]
 
     restarted_adapter = _TargetRootAdapter(
-        "codex", target_root_timeout_seconds=60.0
+        "codex", target_root_timeout_seconds=60.0,
+        recorded_terminals=interrupted_adapter.recorded_terminals,
     )
     restarted = HarnessRuntime(
         owner,
@@ -1652,6 +1688,7 @@ def test_target_root_reconciliation_keeps_the_admitted_operation_timeout(
     assert restarted_adapter.invocations[0].provider_operation_timeout_seconds == (
         admitted_timeout_seconds
     )
+    assert restarted_adapter.launches == []
 
     changed_request = replace(
         request, provider_operation_timeout_seconds=60.0
@@ -1684,7 +1721,7 @@ def test_target_root_reconciliation_keeps_the_admitted_operation_timeout(
     )
 
 
-def test_legacy_target_request_without_frozen_timeout_fails_closed(
+def test_target_request_preserves_explicit_unbounded_timeout_after_adapter_change(
     tmp_path: Path,
 ) -> None:
     request = _target_request(provider_operation_timeout_seconds=None)
@@ -1699,18 +1736,16 @@ def test_legacy_target_request_without_frozen_timeout_fails_closed(
     )
     runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
 
-    with pytest.raises(
-        HarnessAdmissionError,
-        match="target_harness_runtime_binding_unavailable",
-    ):
-        runtime.run_or_resume_target_root(
-            request.request_ref,
-            prompt="Own implementation through final training completion.",
-            mcp_base_url="http://127.0.0.1:8765",
-        )
+    completed = runtime.run_or_resume_target_root(
+        request.request_ref,
+        prompt="Own implementation through final training completion.",
+        mcp_base_url="http://127.0.0.1:8765",
+    )
 
-    assert "provider_operation_timeout_seconds" not in owner.run.request
-    assert restarted_adapter.invocations == []
+    assert completed.status == "executed"
+    assert owner.run.request["provider_operation_timeout_seconds"] is None
+    assert len(restarted_adapter.launches) == 1
+    assert restarted_adapter.launches[0].provider_operation_timeout_seconds is None
 
 
 def test_target_root_repeated_unknown_reconciliation_keeps_one_operation_and_hold(
@@ -1728,10 +1763,14 @@ def test_target_root_repeated_unknown_reconciliation_keeps_one_operation_and_hol
 
     class TwiceUnknownAdapter(_TargetRootAdapter):
         def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
+            super().invoke(invocation)
+            raise HarnessAdapterUnavailable("provider_outcome_unknown")
+
+        def invoke_terminal(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
             if len(self.invocations) < 3:
                 self.invocations.append(invocation)
                 raise HarnessAdapterUnavailable("provider_outcome_unknown")
-            return super().invoke(invocation)
+            return super().invoke_terminal(invocation)
 
     adapter = TwiceUnknownAdapter("codex")
 
@@ -1781,6 +1820,7 @@ def test_target_root_repeated_unknown_reconciliation_keeps_one_operation_and_hol
 
     assert completed.status == "executed"
     assert len(owner.operations) == 1
+    assert len(adapter.launches) == 1
     assert [item.provider_operation_ref for item in adapter.invocations] == [
         operation_ref,
         operation_ref,
@@ -1852,7 +1892,7 @@ def test_target_root_restart_replays_owner_commit_before_runtime_finish(
     database.close()
 
 
-def test_target_root_power_wait_never_calls_provider_and_can_reconcile(
+def test_target_root_power_preparation_failure_recovers_without_prior_provider_launch(
     tmp_path: Path,
 ) -> None:
     data_root = prepare_data_root(tmp_path / "runtime-protection-power-wait")
@@ -1888,10 +1928,11 @@ def test_target_root_power_wait_never_calls_provider_and_can_reconcile(
             mcp_base_url="http://127.0.0.1:8765",
         )
     assert adapter.invocations == []
-    assert owner.run.status == "running"
-    assert owner.operations[0].status == "unknown_outcome"
-    assert protection.query_evidence()["durable_waiting"]
+    assert owner.run.status == "failed"
+    assert owner.operations[0].status == "failed"
+    assert not protection.query_evidence()["durable_waiting"]
 
+    runtime.recover_failed_target_root(request.request_ref)
     completed = runtime.run_or_resume_target_root(
         request.request_ref,
         prompt=prompt,
@@ -1900,6 +1941,8 @@ def test_target_root_power_wait_never_calls_provider_and_can_reconcile(
 
     assert completed.status == "executed"
     assert len(adapter.invocations) == 1
+    assert len(adapter.launches) == 1
+    assert [operation.status for operation in owner.operations] == ["failed", "executed"]
     evidence = protection.query_evidence()
     assert evidence["responsibilities"] == []
     assert evidence["inhibitor"]["active_count"] == 0

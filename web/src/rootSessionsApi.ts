@@ -2,6 +2,8 @@ export type RootSessionStatus = "executing" | "waiting" | "completed" | "failed"
 export type RootOperation = {
   operation_ref: string; label: string; phase: string | null; status: RootSessionStatus;
   created_at: number | null; updated_at: number | null;
+  reason?: string | null;
+  terminal_proof_diagnostic?: { provider_operation_ref: string; reasons: string[] };
 };
 export type DelegatedChild = {
   session_ref: string; native_session_ref: string | null;

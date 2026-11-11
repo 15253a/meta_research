@@ -10,7 +10,7 @@
 
 Target 的候选交接见[正式工作交接](formal-work.md)；接纳后由 Bundle／Reasoning 按[资源整理与正式登记](../../references/materials-and-custody.md#资源整理与正式登记)选择值得复用的 Dataset、Environment、Literature 和用途。文献原作保持其外部来源，本次阅读与分析按实际工作归属保存。源版本、派生版本及多个来源的真实处理分别关联，核对精确版本、当前用途与原件；关系不复制原件，也不自动构成科学结论。
 
-`linked_local` 不构成备份。正式保管文件、临时工作副本和外部原件的保留与清理按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理。已有版本保持不可变，有意义的内容变化沿当前 intake 形成新版本。
+编辑 `linked_local` 等已保管材料时，按[阅读、工作副本与保管选择](../../references/materials-and-custody.md#阅读工作副本与保管选择)保留原件并另建工作文件；保留与清理按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理。
 
 Target 交接只结束当前工作，后续 Bundle／Reasoning 仍可按授权使用本轮资料。跨 Cycle 接续、正式内容保留及物理清理统一按上述共享生命周期处理，核对执行、恢复和待接纳等真实依赖。
 

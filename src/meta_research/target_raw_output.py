@@ -14,6 +14,7 @@ from meta_research.provider_supervisor import (
     ProviderSupervisorError,
     read_transport_key_for_operation,
     read_verified_exit_receipt,
+    read_transport_envelope,
 )
 
 
@@ -169,6 +170,8 @@ class TargetRawOutputStore:
         self,
         operation_ref: str,
         receipt: object,
+        *,
+        owner_invocation_hash: str | None = None,
     ) -> dict[str, object]:
         """Re-open and verify the exact signed supervisor exit receipt.
 
@@ -177,6 +180,32 @@ class TargetRawOutputStore:
         the signed exit envelope and every bound artifact hash are checked on
         every recovery-history read.
         """
+
+        if receipt is None:
+            # Human-wait checkpoints and pre-upgrade profiles may lack the
+            # display index. Resolve only the durable exact Owner binding.
+            if not isinstance(owner_invocation_hash, str) or _INVOCATION_HASH.fullmatch(owner_invocation_hash) is None:
+                raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+            try:
+                _, key = read_transport_key_for_operation(self._source_path(owner_invocation_hash).parent)
+                binding_path = self._workspace / "owner-invocation-bindings" / owner_invocation_hash[:2] / (owner_invocation_hash + ".json")
+                if binding_path.is_symlink() or binding_path.parent.is_symlink():
+                    raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+                binding = read_transport_envelope(binding_path, key)
+                digest = binding.get("transport_invocation_hash")
+                if (not isinstance(digest, str) or _INVOCATION_HASH.fullmatch(digest) is None
+                        or binding.get("provider_operation_ref") != operation_ref
+                        or binding.get("owner_invocation_hash") != owner_invocation_hash):
+                    raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+                path = self._source_path(digest).parent / "supervisor-exit.json"
+                payload = read_transport_envelope(path, key)
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+                receipt = {"schema_ref": "meta-research/harness-provider-transport-receipt/v1",
+                    "spool_ref": "provider-spool:" + digest, "transport_invocation_hash": digest,
+                    "supervisor_receipt_hash": canonical_hash(envelope),
+                    "termination_reason": payload.get("termination_reason"), "provider_returncode": payload.get("returncode")}
+            except (OSError, ValueError, ProviderSupervisorError) as error:
+                raise TargetRawOutputUnavailable("target_raw_output_receipt_unavailable") from error
 
         if (
             not isinstance(operation_ref, str)
@@ -197,7 +226,7 @@ class TargetRawOutputStore:
             or not isinstance(receipt.get("transport_invocation_hash"), str)
             or not isinstance(receipt.get("supervisor_receipt_hash"), str)
             or not isinstance(receipt.get("termination_reason"), str)
-            or not isinstance(receipt.get("provider_returncode"), int)
+            or (receipt.get("provider_returncode") is not None and not isinstance(receipt.get("provider_returncode"), int))
             or isinstance(receipt.get("provider_returncode"), bool)
         ):
             raise TargetRawOutputUnavailable(
@@ -218,6 +247,20 @@ class TargetRawOutputStore:
         directory = self._source_path(invocation_hash).parent
         try:
             _key_path, key = read_transport_key_for_operation(directory)
+            if owner_invocation_hash is not None:
+                if _INVOCATION_HASH.fullmatch(owner_invocation_hash) is None:
+                    raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+                binding_path = self._workspace / "owner-invocation-bindings" / owner_invocation_hash[:2] / (owner_invocation_hash + ".json")
+                if binding_path.is_symlink() or binding_path.parent.is_symlink():
+                    raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
+                binding = read_transport_envelope(binding_path, key)
+                if (set(binding) != {"schema_ref", "owner_invocation_hash", "provider_operation_ref", "family", "transport_invocation_hash"}
+                        or binding.get("family") not in {"codex", "claude"}
+                        or binding.get("schema_ref") != "meta-research/harness-operation-binding/v1"
+                        or binding.get("owner_invocation_hash") != owner_invocation_hash
+                        or binding.get("provider_operation_ref") != operation_ref
+                        or binding.get("transport_invocation_hash") != invocation_hash):
+                    raise TargetRawOutputUnavailable("target_raw_output_binding_invalid")
             signed_receipt, envelope = read_verified_exit_receipt(
                 directory / "supervisor-exit.json",
                 key=key,

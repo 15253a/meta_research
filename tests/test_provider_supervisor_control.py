@@ -7,14 +7,17 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from meta_research.provider_supervisor import (
     request_supervisor_stop,
+    ProviderSupervisorError,
     supervisor_request_never_started,
     write_transport_envelope,
 )
 
 
-def test_stop_accepts_the_signed_provider_ready_marker(tmp_path: Path) -> None:
+def test_stop_rejects_an_unsigned_terminal_file(tmp_path: Path) -> None:
     operation = tmp_path / "provider-operations" / "operation" / "phase"
     operation.mkdir(parents=True)
     request_path = (operation / "supervisor-request.json").resolve()
@@ -61,12 +64,13 @@ def test_stop_accepts_the_signed_provider_ready_marker(tmp_path: Path) -> None:
             b"k" * 32,
         )
 
-        assert request_supervisor_stop(
-            operation,
-            key=b"k" * 32,
-            invocation_hash="a" * 64,
-            ready_schema="meta-research/codex-provider-supervisor-ready/v1",
-        )
+        with pytest.raises(ProviderSupervisorError):
+            request_supervisor_stop(
+                operation,
+                key=b"k" * 32,
+                invocation_hash="a" * 64,
+                ready_schema="meta-research/codex-provider-supervisor-ready/v1",
+            )
         assert process.wait(timeout=2) == 0
     finally:
         if process.poll() is None:
@@ -74,7 +78,7 @@ def test_stop_accepts_the_signed_provider_ready_marker(tmp_path: Path) -> None:
             process.wait(timeout=2)
 
 
-def test_aged_request_is_not_safe_while_exact_supervisor_is_still_live(
+def test_unissued_request_cannot_be_fenced_while_supervisor_owns_lock(
     tmp_path: Path,
 ) -> None:
     operation = tmp_path / "provider-operations" / "operation" / "phase"
@@ -90,18 +94,25 @@ def test_aged_request_is_not_safe_while_exact_supervisor_is_still_live(
         },
         b"k" * 32,
     )
-    old = time.time() - 30
-    os.utime(request_path, (old, old))
+    ready = operation / "lock-held"
     process = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "import time; time.sleep(60)",
+            "import sys,time; from pathlib import Path; "
+            "from meta_research.provider_supervisor import SupervisorFileLock; "
+            "lock=SupervisorFileLock(Path(sys.argv[1]).parent/'supervisor.lock'); "
+            "lock.acquire(); Path(sys.argv[2]).touch(); time.sleep(60)",
             str(request_path),
+            str(ready),
         ],
         start_new_session=True,
     )
     try:
+        deadline = time.monotonic() + 2
+        while not ready.exists():
+            assert time.monotonic() < deadline
+            time.sleep(.01)
         assert not supervisor_request_never_started(
             operation,
             key=b"k" * 32,

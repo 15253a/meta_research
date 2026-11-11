@@ -48,14 +48,13 @@ while not (operation / 'provider-started.json').exists():
     time.sleep(.01)
 print('provider output preserved', flush=True)
 if sys.argv[2] == 'external_writer':
-    # Simulate an unkillable descendant still holding both capture pipes.
     fd = os.open(sys.argv[sys.argv.index('--output-last-message') + 1], os.O_WRONLY)
     child = os.fork()
     if child == 0:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        (operation / 'external-writer-ready').touch()
-        while True:
-            time.sleep(.1)
+        (operation / 'external-writer-ready').write_text(str(os.getpid()))
+        time.sleep(3)
+        os._exit(0)
     while not (operation / 'external-writer-ready').exists():
         time.sleep(.01)
 """
@@ -74,11 +73,12 @@ from pathlib import Path
 import sys
 import meta_research.provider_supervisor as module
 if sys.argv[2] == 'True':
-    module.ProviderProcessPlatform.process_group_running = lambda self, pid: True
-    def cleanup_failure(self, pid):
+    original_result = module.LinuxProviderJob.result
+    def cleanup_failure(self):
+        original_result(self)
         (Path(sys.argv[1]).parent / 'cleanup-failed').touch()
-        return False
-    module.ProviderProcessPlatform.terminate_process_group = cleanup_failure
+        raise module.ProviderTreeError('provider_tree_proof_missing')
+    module.LinuxProviderJob.result = cleanup_failure
 raise SystemExit(module.main([sys.argv[1]]))
 """
     process = subprocess.Popen(

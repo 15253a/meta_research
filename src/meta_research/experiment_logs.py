@@ -57,7 +57,7 @@ class _Scope:
 class TargetExperimentLogs:
     """Observe only named experiment output files in an accepted Target workspace.
 
-    The authority supplies the current immutable workspace binding. Discovery
+    The authority supplies the accepted TargetRun workspace binding. Discovery
     never accepts a user pathname, follows links, invokes a provider, or creates
     a workspace. The bounded metadata cache only detects file generations.
     """
@@ -77,10 +77,9 @@ class TargetExperimentLogs:
             workspace = self._authority.query_target_workspace(admission.target_run_ref)
             if workspace is None:
                 raise ExperimentLogError('experiment_log_workspace_unavailable', 503)
-            if (workspace.target_ref, workspace.target_run_ref, workspace.root_session_ref,
-                workspace.target_attempt_ref, workspace.target_fence_ref) != (
-                target_ref, admission.target_run_ref, admission.root_session_ref,
-                admission.execution_attempt_ref, admission.execution_fence_ref):
+            # Execution identities rotate within this work; its reservation
+            # provenance does not grant execution or change a read-only log scope.
+            if (workspace.target_ref, workspace.target_run_ref) != (target_ref, admission.target_run_ref):
                 raise ExperimentLogError('experiment_log_workspace_binding_invalid')
             return _Scope(target_ref, admission.target_run_ref, workspace.workspace_ref, admission.status)
         except (OwnerConflict, AgentRuntimeHarnessError) as error:

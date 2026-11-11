@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from provider_supervisor_support import closed_tree_fixture
+
 import copy
 import hashlib
 import json
@@ -1041,7 +1043,7 @@ class DurableSegmentSequenceRunner:
         )
         write_exit_receipt(
             stdout_path.parent / "supervisor-exit.json",
-            key=key,
+            process_tree=closed_tree_fixture(), key=key,
             invocation_hash=canonical_hash(invocation),
             prompt_path=stdout_path.parent / "prompt.txt",
             schema_path=stdout_path.parent / "output-schema.json",
@@ -1106,7 +1108,7 @@ class OversizedDurableStreamRunner:
         )
         write_exit_receipt(
             stdout_path.parent / "supervisor-exit.json",
-            key=key,
+            process_tree=closed_tree_fixture(), key=key,
             invocation_hash=canonical_hash(invocation),
             prompt_path=stdout_path.parent / "prompt.txt",
             schema_path=stdout_path.parent / "output-schema.json",
@@ -1154,7 +1156,7 @@ class OutputLimitedDurableStreamRunner:
         )
         write_exit_receipt(
             stdout_path.parent / "supervisor-exit.json",
-            key=key,
+            process_tree=closed_tree_fixture(), key=key,
             invocation_hash=canonical_hash(invocation),
             prompt_path=stdout_path.parent / "prompt.txt",
             schema_path=stdout_path.parent / "output-schema.json",

@@ -550,6 +550,13 @@ function RootOperationOutput({ questRef, sessionRef, operation, sessionState, or
   }, [questRef, sessionRef, operation.operation_ref, operation.status, active, followLive, retry, browseOffset]);
   useEffect(onOutput, [page?.next_offset, page?.stream_ref, onOutput]);
   return <article className="root-operation" data-operation-ref={operation.operation_ref}>
+    {operation.reason === "provider_terminal_proof_missing" ? <div className="root-session-warning" role="status">
+      尚不能确认旧执行已结束，系统不会据此启动后续执行。原操作仍保留并等待对账。
+      <details><summary>终态证据详情</summary><code>{operation.operation_ref}</code>
+        {operation.terminal_proof_diagnostic?.provider_operation_ref === operation.operation_ref
+          ? operation.terminal_proof_diagnostic.reasons.map(reason => <p key={reason}><code>{reason}</code></p>) : <p>缺少可信的进程树终态证明。</p>}
+      </details>
+    </div> : null}
     {clockHost ? createPortal(page ? <ExecutionElapsed sample={clock} ended={page.status === "terminal"}
       state={error ? "unknown" : sessionState && sessionState !== "executing" ? sessionState : page.status === "waiting" ? "waiting" : "executing"} />
       : <RootOutputTimestamp sourceUpdatedAt={null} />, clockHost) : null}

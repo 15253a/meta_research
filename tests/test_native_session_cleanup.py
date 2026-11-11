@@ -1,4 +1,6 @@
 """Physical cleanup against the locked Codex CLI in a fresh deployment home."""
+
+from provider_supervisor_support import closed_tree_fixture
 from contextlib import contextmanager
 import json
 import os
@@ -210,7 +212,7 @@ def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool
         (directory / "stdout.jsonl").write_bytes(raw)
         (directory / "prompt.txt").write_bytes(b"stage prompt")
         (directory / "output-schema.json").write_text("{}")
-        write_exit_receipt(directory / "supervisor-exit.json", key=key, invocation_hash=canonical_hash(invocation),
+        write_exit_receipt(directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key, invocation_hash=canonical_hash(invocation),
             prompt_path=directory / "prompt.txt", schema_path=directory / "output-schema.json",
             stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
             returncode=0, input_bytes=len(b"stage prompt"))

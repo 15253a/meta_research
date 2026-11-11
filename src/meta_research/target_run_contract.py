@@ -40,6 +40,7 @@ from meta_research.bundle_protocol import (
     TargetWorkHandle,
     TargetWorkNotice,
     TechnicalBlocker,
+    is_target_root_interruption,
     canonical_projection_bytes,
     projection_plain_value,
     validate_closed_bundle_projection,
@@ -1091,7 +1092,7 @@ def validate_goal_work_nonstart_notice(
     return digest
 
 
-def _validate_goal_work_cancellation_handoff_notice(
+def _validate_target_root_non_scientific_handoff_notice(
     handoff: TargetRunHandoff,
     notice: TargetWorkNotice,
     frontier: TargetFrontierEntry,
@@ -1105,8 +1106,8 @@ def _validate_goal_work_cancellation_handoff_notice(
 ) -> str:
     terminal = handoff.terminal
     if (
-        type(terminal) is not GoalWorkDisposition
-        or terminal.disposition != "cancelled"
+        not (type(terminal) is GoalWorkDisposition and terminal.disposition == "cancelled"
+             or is_target_root_interruption(terminal))
         or expected_review_scopes
         or not handoff.handle_history
         or handoff.handle_history[0] != initial_handle
@@ -1143,6 +1144,10 @@ def _validate_goal_work_cancellation_handoff_notice(
     if not required_recovery_evidence.issubset(handoff.recovery_evidence_refs):
         _fail("Target cancellation recovery evidence is incomplete")
     final_handle = handoff.handle_history[-1]
+    if is_target_root_interruption(terminal):
+        required_recovery_evidence.update(_validate_terminal_blocker(terminal, final_handle))
+        if not required_recovery_evidence.issubset(handoff.recovery_evidence_refs):
+            _fail("Target interruption evidence is incomplete")
     if (
         terminal.target_ref != final_handle.target_ref
         or terminal.target_run_ref != final_handle.target_run_ref
@@ -1360,10 +1365,10 @@ def validate_target_run_handoff_notice(
             target_spec_acceptance_receipt=target_spec_acceptance_receipt,
             expected_review_scopes=expected_review_scopes,
         )
-    if type(handoff.terminal) is GoalWorkDisposition:
-        if handoff.terminal.disposition != "cancelled":
+    if type(handoff.terminal) is GoalWorkDisposition or is_target_root_interruption(handoff.terminal):
+        if type(handoff.terminal) is GoalWorkDisposition and handoff.terminal.disposition != "cancelled":
             _fail("Target non-start disposition requires the non-start validator")
-        return _validate_goal_work_cancellation_handoff_notice(
+        return _validate_target_root_non_scientific_handoff_notice(
             handoff,
             notice,
             frontier,

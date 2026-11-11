@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 from sqlalchemy import text
@@ -32,11 +33,19 @@ from meta_research.owners.agent_runtime_harness import (
 )
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.paths import prepare_data_root
+from meta_research.provider_supervisor import (
+    SUPERVISOR_EXIT_SCHEMA_V2,
+    ensure_transport_key,
+    supervisor_host_identity,
+    write_exit_receipt,
+    write_transport_envelope,
+)
 from meta_research.semantic_owner_gateway import TARGET_ROOT_SEMANTIC_OPERATION_IDS
 from meta_research.semantic_mcp import (
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
     SemanticMcpError,
 )
+from meta_research.target_raw_output import TargetRawOutputStore
 from test_harness_target_root import (
     _Gateway,
     _TargetRootAdapter,
@@ -53,6 +62,97 @@ class _Clock:
 
     def time(self) -> float:
         return self.now
+
+
+def _receipt_store(owner: SQLiteAgentRuntimeHarness) -> TargetRawOutputStore:
+    store = owner._target_provider_ceiling_receipt_verifier
+    if store is None:
+        store = TargetRawOutputStore(owner._database.path.with_suffix(".transport"))
+        owner.bind_target_provider_ceiling_receipt_verifier(store)
+    return store
+
+
+def _signed_fixture_receipt(
+    owner: SQLiteAgentRuntimeHarness,
+    operation_ref: str,
+    invocation_hash: str,
+    *,
+    prompt: str = "fixture",
+    stdout: str = "",
+    returncode: int = 1,
+) -> dict[str, object]:
+    store = _receipt_store(owner)
+    _, key = ensure_transport_key(store._workspace)
+    digest = canonical_hash(
+        {"operation_ref": operation_ref, "invocation_hash": invocation_hash}
+    )
+    directory = store._workspace / "provider-operations" / digest[:2] / digest
+    directory.mkdir(parents=True)
+    (directory / "prompt.txt").write_text(prompt)
+    (directory / "output-schema.json").write_text("{}")
+    (directory / "stdout.jsonl").write_text(stdout)
+    write_exit_receipt(
+        directory / "supervisor-exit.json",
+        key=key,
+        invocation_hash=digest,
+        prompt_path=directory / "prompt.txt",
+        schema_path=directory / "output-schema.json",
+        stdout_path=directory / "stdout.jsonl",
+        result_path=directory / "last-message.json",
+        returncode=returncode,
+        input_bytes=len(prompt.encode()),
+        schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+        process_tree={
+            "schema_ref": "meta-research/provider-process-tree/v1",
+            "state": "closed",
+            "mechanism": (
+                "windows-job" if sys.platform == "win32" else "linux-subreaper-echild"
+            ),
+            **supervisor_host_identity(),
+        },
+    )
+    binding = (
+        store._workspace / "owner-invocation-bindings" / invocation_hash[:2]
+        / (invocation_hash + ".json")
+    )
+    binding.parent.mkdir(parents=True, exist_ok=True)
+    write_transport_envelope(
+        binding,
+        {
+            "schema_ref": "meta-research/harness-operation-binding/v1",
+            "owner_invocation_hash": invocation_hash,
+            "provider_operation_ref": operation_ref,
+            "family": "codex",
+            "transport_invocation_hash": digest,
+        },
+        key,
+    )
+    store.bind_operation(operation_ref, digest, family="codex")
+    return {
+        "schema_ref": "meta-research/harness-provider-transport-receipt/v1",
+        "spool_ref": "provider-spool:" + digest,
+        "transport_invocation_hash": digest,
+        "supervisor_receipt_hash": canonical_hash(
+            json.loads((directory / "supervisor-exit.json").read_text())
+        ),
+        "termination_reason": "completed",
+        "provider_returncode": returncode,
+    }
+
+
+def _record_proven_failure(
+    owner: SQLiteAgentRuntimeHarness, operation_ref: str, code: str
+):
+    with owner._database.read() as connection:
+        invocation = connection.execute(
+            text(
+                "SELECT invocation_hash FROM ar_harness_provider_operations "
+                "WHERE operation_ref=:ref"
+            ),
+            {"ref": operation_ref},
+        ).scalar_one()
+    receipt = _signed_fixture_receipt(owner, operation_ref, invocation)
+    return owner.record_operation_failure(operation_ref, code, transport_receipt=receipt)
 
 
 class _TargetHumanRequestRunner:
@@ -162,12 +262,19 @@ class _TargetHumanRequestRunner:
         failed_after_open = (
             self.fail_first_after_open and len(self.provider_calls) == 1
         )
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             1 if failed_after_open else 0,
             "\n".join(json.dumps(item) for item in stream) + "\n",
             "provider exited after opening HumanRequest" if failed_after_open else "",
         )
+        completed.meta_research_transport_receipt = _signed_fixture_receipt(
+            self.runtime.owners.agent_runtime.harness_runs,
+            environment["META_RESEARCH_PROVIDER_OPERATION_REF"],
+            environment["META_RESEARCH_OWNER_INVOCATION_HASH"],
+            prompt=prompt, stdout=completed.stdout, returncode=completed.returncode,
+        )
+        return completed
 
     def _tool_call(
         self,
@@ -501,6 +608,7 @@ def test_recovery_preserves_human_request_suspension_without_session_checkpoint(
             restarted_database,
             DurableFeed(restarted_database),
         )
+        _receipt_store(restarted_owner)
         try:
             recovered = restarted_owner.query_run(request.request_ref)
             recovered_operation = restarted_owner.latest_operation(run.run_ref)
@@ -640,13 +748,13 @@ def test_target_provider_return_checkpoints_session_then_resumes_once(
             "codex-target-human-request-session" if resumable else None
         )
         assert suspended.failure_code == (
-            "human_request_wait" if resumable else None
+            "human_request_wait" if resumable else "native_session_identity_changed"
         )
         assert first_operation is not None
         assert (first_operation.status, first_operation.outcome_code) == (
             ("executed", "human_request_wait")
             if resumable
-            else ("running", None)
+            else ("unknown_outcome", "native_session_identity_changed")
         )
         assert (
             runtime.owners.agent_runtime.harness_runs.query_profile(
@@ -824,6 +932,7 @@ def test_owner_replays_lost_recovery_ack_after_process_restart(
         restarted_database,
         DurableFeed(restarted_database),
     )
+    _receipt_store(restarted_owner)
     try:
         replayed = restarted_owner.reopen_failed_target_root(request.request_ref)
 
@@ -860,6 +969,7 @@ def test_owner_reopens_only_drained_failed_turn_and_preserves_operation_ledger(
                 invocation_hash="1" * 64,
                 resume=False,
             )
+            _signed_fixture_receipt(owner, first_ref, "1" * 64, returncode=0)
             owner.complete_operation(
                 operation_ref=first_ref,
                 run_ref=run.run_ref,
@@ -878,7 +988,7 @@ def test_owner_reopens_only_drained_failed_turn_and_preserves_operation_ledger(
             invocation_hash="2" * 64,
             resume=prior_success,
         )
-        owner.record_operation_failure(failed_ref, "provider_process_failed")
+        _record_proven_failure(owner, failed_ref, "provider_process_failed")
         identity = (
             run.run_ref,
             run.root_session_ref,
@@ -1017,7 +1127,7 @@ def test_owner_durably_rate_limits_failed_root_and_pending_channel_replays(
         invocation_hash="4" * 64,
         resume=False,
     )
-    owner.record_operation_failure(operation_ref, "provider_process_failed")
+    _record_proven_failure(owner, operation_ref, "provider_process_failed")
     baseline_feed = DurableFeed(database).current_revision()
 
     for now in (100.0, 100.2, 100.8):
@@ -1037,6 +1147,7 @@ def test_owner_durably_rate_limits_failed_root_and_pending_channel_replays(
         restarted_database,
         DurableFeed(restarted_database),
     )
+    _receipt_store(restarted_owner)
     try:
         with pytest.raises(AgentRuntimeHarnessRetryLater) as restarted_wait:
             restarted_owner.reopen_failed_target_root(request.request_ref)
@@ -1067,6 +1178,7 @@ def test_owner_durably_rate_limits_failed_root_and_pending_channel_replays(
             replay_database,
             DurableFeed(replay_database),
         )
+        _receipt_store(replay_owner)
         try:
             with pytest.raises(AgentRuntimeHarnessRetryLater) as replay_wait:
                 replay_owner.reopen_failed_target_root(request.request_ref)
@@ -1111,8 +1223,8 @@ def test_target_retry_streak_spans_failure_codes_and_success_resets_it(
             invocation_hash="5" * 64,
             resume=False,
         )
-        first_retry = owner.record_operation_failure(
-            first_ref, "provider_process_failed"
+        first_retry = _record_proven_failure(
+            owner, first_ref, "provider_process_failed"
         )
         assert first_retry is not None
         assert first_retry.consecutive_failures == 1
@@ -1130,7 +1242,7 @@ def test_target_retry_streak_spans_failure_codes_and_success_resets_it(
             resume=False,
         )
         second_retry = owner.record_operation_failure(
-            second_ref, "required_harness_capability_unavailable"
+            second_ref, "required_harness_capability_unavailable", durable_outcome="not_started"
         )
         assert second_retry is not None
         assert second_retry.failure_code == (
@@ -1150,6 +1262,7 @@ def test_target_retry_streak_spans_failure_codes_and_success_resets_it(
             invocation_hash="7" * 64,
             resume=False,
         )
+        _signed_fixture_receipt(owner, third_ref, "7" * 64, returncode=0)
         owner.complete_operation(
             operation_ref=third_ref,
             run_ref=run.run_ref,
@@ -1167,8 +1280,8 @@ def test_target_retry_streak_spans_failure_codes_and_success_resets_it(
             invocation_hash="8" * 64,
             resume=True,
         )
-        reset_retry = owner.record_operation_failure(
-            fourth_ref, "provider_process_failed"
+        reset_retry = _record_proven_failure(
+            owner, fourth_ref, "provider_process_failed"
         )
         assert reset_retry is not None
         assert reset_retry.consecutive_failures == 1
@@ -1198,7 +1311,7 @@ def test_harness_runtime_rate_limits_channel_attempts_across_restart(
         invocation_hash="9" * 64,
         resume=False,
     )
-    owner.record_operation_failure(operation_ref, "provider_process_failed")
+    _record_proven_failure(owner, operation_ref, "provider_process_failed")
 
     class FlakyGateway(_Gateway):
         attempts = 0
@@ -1244,6 +1357,7 @@ def test_harness_runtime_rate_limits_channel_attempts_across_restart(
         restarted_database,
         DurableFeed(restarted_database),
     )
+    _receipt_store(restarted_owner)
     restarted_gateway = FlakyGateway()
     restarted = HarnessRuntime(
         restarted_owner,

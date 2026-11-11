@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import sqlite3
 from dataclasses import fields, replace
 from pathlib import Path
@@ -206,8 +208,8 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
             launch_calls.append((request, kwargs))
             return original_admit(request, **kwargs)
 
-        def forbidden_legacy_path(*_args, **_kwargs):
-            raise AssertionError("launch-first worker entered legacy execution")
+        def forbidden_execution(*_args, **_kwargs):
+            raise AssertionError("launch-first worker entered Target execution")
 
         monkeypatch.setattr(
             runtime.owners.research_graph,
@@ -220,14 +222,14 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
             observe_admit,
         )
         monkeypatch.setattr(
-            runtime.owners.agent_runtime,
+            runtime.harnesses,
             "admit_target_run",
-            forbidden_legacy_path,
+            forbidden_execution,
         )
         monkeypatch.setattr(
-            runtime.owners.research_graph,
-            "bind_target_run",
-            forbidden_legacy_path,
+            runtime.target_run_authorities.research_graph,
+            "accept_execution_input_binding",
+            forbidden_execution,
         )
 
         assert runtime.bundle_stage.process_once() is True
@@ -646,7 +648,7 @@ def test_interrupted_target_launch_migration_is_atomic_and_retryable(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0038_deepfetch_binding_audit",)
+        ).fetchone() == (schema_head(),)
         tables = {
             row[0]
             for row in connection.execute(

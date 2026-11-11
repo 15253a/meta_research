@@ -929,6 +929,11 @@ def validate_bundle_inbox_batch(batch: BundleInboxBatch) -> str:
     return digest
 
 
+def is_target_root_interruption(terminal: object) -> bool:
+    return (type(terminal) is TechnicalBlocker
+            and terminal.reason == "provider_terminal_proof_missing")
+
+
 def validate_target_run_handoff(handoff: TargetRunHandoff) -> str:
     digest = validate_closed_bundle_projection(
         handoff,
@@ -936,6 +941,13 @@ def validate_target_run_handoff(handoff: TargetRunHandoff) -> str:
         max_serialized_bytes=BUNDLE_HANDOFF_MAX_SERIALIZED_BYTES,
     )
     terminal = handoff.terminal
+    if is_target_root_interruption(terminal):
+        if (not handoff.handle_history or handoff.code_review_preflights
+                or handoff.stop_decisions
+                or len(handoff.recovered_blockers) != len(handoff.handle_history) - 1
+                or handoff.recovery_evidence_refs != tuple(sorted(set(handoff.recovery_evidence_refs)))):
+            raise BundleProtocolError("Target root interruption history is incomplete")
+        return digest
     if type(terminal) is GoalWorkDisposition:
         _validate_goal_work_disposition(terminal)
         if terminal.disposition == "not_started":

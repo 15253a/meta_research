@@ -1271,6 +1271,7 @@ export type TargetRootObservationPage = {
   head_cursor: string | null;
   has_more: boolean;
   observation_only: true;
+  terminal_proof_diagnostic?: { provider_operation_ref: string; reasons: string[] };
 };
 
 export type TargetRootObservationPointer = {

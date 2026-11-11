@@ -946,10 +946,6 @@ def build_production_runtime(
     owners.research_graph.bind_target_execution_closure_verifier(
         target_run_agent
     )
-    # Human Responses commit independently of their issuing Owner disposition.
-    # Replay only after every proof/scope verifier has been bound.
-    owners.agent_runtime.recover_root_human_requests()
-    owners.human_collaboration.recover_root_library_reconnect_responses()
     workspace_providers = {
         "idea": idea_skill_provider, "plan": plan_skill_provider,
         "bundle": bundle_skill_provider, "reasoning": reasoning_skill_provider,
@@ -966,7 +962,6 @@ def build_production_runtime(
     )
     human_collaboration.bind_reply_workspaces(root_workspaces)
     root_workspaces.configure_creation_runtime(executable=codex_executable, credentials_home=data_root.codex_home)
-    human_collaboration.recover_response_deliveries()
     for provider in (*workspace_providers.values(), proposal_drafter, deepfetch_provider):
         bind_workspaces = getattr(provider, "bind_workspaces", None)
         if callable(bind_workspaces):
@@ -1211,6 +1206,9 @@ def build_production_runtime(
         if callable(bind_external):
             bind_external(external_mcp)
     harnesses.bind_external_mcp(external_mcp)
+    human_collaboration.recover_response_deliveries()
+    owners.agent_runtime.recover_root_human_requests()
+    owners.human_collaboration.recover_root_library_reconnect_responses()
     runtime = ProductionRuntime(
         recorder_channels=recorder_channels,
         external_mcp=external_mcp,

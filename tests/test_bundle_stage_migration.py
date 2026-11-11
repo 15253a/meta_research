@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import sqlite3
 from pathlib import Path
 
@@ -165,7 +167,7 @@ def test_interrupted_rolling_target_migration_is_atomic_and_retryable(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0038_deepfetch_binding_audit",)
+        ).fetchone() == (schema_head(),)
         tables = {
             row[0]
             for row in connection.execute(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
@@ -203,6 +204,8 @@ class TargetProviderCeilingReceiptVerifier(Protocol):
         self,
         operation_ref: str,
         receipt: object,
+        *,
+        owner_invocation_hash: str | None = None,
     ) -> dict[str, object]: ...
 
 
@@ -256,6 +259,7 @@ class TargetRootObservationPage:
     head_cursor: str | None
     has_more: bool
     observation_only: bool = True
+    terminal_proof_diagnostic: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -273,6 +277,8 @@ class TargetRootObservationPage:
             "head_cursor": self.head_cursor,
             "has_more": self.has_more,
             "observation_only": self.observation_only,
+            **({"terminal_proof_diagnostic": self.terminal_proof_diagnostic}
+               if self.terminal_proof_diagnostic is not None else {}),
         }
 
 
@@ -422,11 +428,20 @@ class AgentRuntimeHarnessInterface(Protocol):
         operation_ref: str,
         run_ref: str,
         native_session_ref: str,
+        transport_receipt: dict[str, object] | None = None,
     ) -> AgentRuntimeHarnessRun | None: ...
 
     def target_root_human_request_continuation_generation(
         self, run_ref: str
     ) -> int | None: ...
+
+    def verify_operation_terminal(self, operation_ref: str) -> None: ...
+
+    def target_run_failed(self, run_ref: str) -> bool: ...
+
+    def reconcile_failed_target_operation(
+        self, operation_ref: str, transport_receipt: dict[str, object],
+    ) -> AgentRuntimeHarnessOperation: ...
 
     def begin_reconciliation(self, operation_ref: str) -> int: ...
 
@@ -435,10 +450,11 @@ class AgentRuntimeHarnessInterface(Protocol):
         operation_ref: str,
         code: str,
         *,
-        durable_outcome: Literal["terminal", "unknown"] | None = None,
+        durable_outcome: Literal["terminal", "unknown", "not_started"] | None = None,
         transport_receipt: dict[str, object] | None = None,
         native_session_ref: str | None = None,
         expected_running_run_ref: str | None = None,
+        terminal_proof_diagnostic: tuple[str, ...] | None = None,
         runtime_effect: RuntimeEffectIdentity | None = None,
         predecessor_effects: tuple[RuntimeEffectIdentity, ...] = (),
     ) -> AgentRuntimeHarnessRetry | None: ...
@@ -1231,7 +1247,7 @@ class SQLiteAgentRuntimeHarness:
             ).one()
             latest_operation = connection.execute(
                 text(
-                    "SELECT operation_ref, generation, status, outcome_code, "
+                    "SELECT operation_ref, invocation_hash, generation, status, outcome_code, "
                     "completed_at FROM ar_harness_provider_operations WHERE "
                     "run_ref = :run_ref ORDER BY generation DESC LIMIT 1"
                 ),
@@ -1271,6 +1287,9 @@ class SQLiteAgentRuntimeHarness:
                 frontier=frontier,
                 lifecycle=lifecycle,
             )
+
+            if latest_operation is not None:
+                self._verify_target_failure_recovery_proof(row, run, latest_operation)
 
             reopened_status = _target_root_reopened_status(
                 run, operation_count=operation_count
@@ -1616,6 +1635,43 @@ class SQLiteAgentRuntimeHarness:
                 raise AgentRuntimeHarnessError(
                     "target_harness_recovery_state_invalid"
                 )
+            latest_operation = self.latest_operation(target_run_ref)
+            retained_profile = None
+            if latest_operation is not None:
+                # Rotation is not a way around the same terminal prerequisite
+                # enforced by retry and by the next operation's start gate.
+                self.verify_operation_terminal(latest_operation.operation_ref)
+                prior_profile = _profile_from_row(row) or {}
+                expected_preparation = {
+                    "provider_operation_ref": latest_operation.operation_ref,
+                    "run_ref": target_run_ref, "attempt_ref": str(row.attempt_ref),
+                    "root_session_ref": str(row.root_session_ref), "fence_ref": str(row.fence_ref),
+                    "failure_code": latest_operation.outcome_code,
+                }
+                preparation = [fact for fact in prior_profile.get("provider_preparation_failures", [])
+                               if isinstance(fact, dict) and fact.get("provider_operation_ref")
+                               == latest_operation.operation_ref]
+                if preparation == [expected_preparation]:
+                    # Keep only this unissued operation's fact, not the old
+                    # capability profile. Its identity is verified against the
+                    # existing successor reservation on the next start.
+                    retained_profile = {
+                        "schema_ref": "meta-research/harness-failed-transport-profile/v1",
+                        "harness_family": str(row.harness_family), "run_ref": target_run_ref,
+                        "provider_preparation_failures": preparation,
+                        "provider_transport_receipts": [],
+                    }
+                else:
+                    receipts = [receipt for receipt in prior_profile.get("provider_transport_receipts", [])
+                                if isinstance(receipt, dict) and receipt.get("provider_operation_ref")
+                                == latest_operation.operation_ref]
+                    if len(receipts) != 1:
+                        raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+                    retained_profile = {
+                        "schema_ref": "meta-research/harness-failed-transport-profile/v1",
+                        "harness_family": str(row.harness_family), "run_ref": target_run_ref,
+                        "provider_transport_receipts": receipts,
+                    }
             generation = int(row.attempt_generation) + 1
             attempt_ref = new_ref("harness_attempt")
             root_session_ref = new_ref("harness_session")
@@ -1657,7 +1713,7 @@ class SQLiteAgentRuntimeHarness:
                     "attempt_generation = :generation, root_session_ref = "
                     ":root_session_ref, native_session_ref = NULL, fence_ref = "
                     ":fence_ref, mcp_binding_json = NULL, mcp_binding_hash = "
-                    "NULL, profile_json = NULL, profile_hash = NULL, status = "
+                    "NULL, profile_json = :retained_profile, profile_hash = :retained_hash, status = "
                     "'admitting', failure_code = :recovery_pending, "
                     "pending_recovery_ref = :recovery_ref, "
                     "pending_recovery_old_handle_json = :old_handle_json, "
@@ -1673,6 +1729,8 @@ class SQLiteAgentRuntimeHarness:
                 ),
                 {
                     "attempt_ref": attempt_ref,
+                    "retained_profile": None if retained_profile is None else canonical_json(retained_profile),
+                    "retained_hash": None if retained_profile is None else canonical_hash(retained_profile),
                     "generation": generation,
                     "root_session_ref": root_session_ref,
                     "fence_ref": fence_ref,
@@ -1865,7 +1923,7 @@ class SQLiteAgentRuntimeHarness:
                     "events.summary_json, events.summary_hash, "
                     "operations.operation_ref, operations.run_ref, "
                     "operations.generation AS operation_generation, "
-                    "operations.status AS operation_status, "
+                    "operations.status AS operation_status, operations.invocation_hash AS operation_invocation_hash, "
                     "operations.outcome_code, runs.request_ref, "
                     "admissions.target_ref FROM ar_harness_evidence_events "
                     "AS events JOIN ar_harness_provider_operations AS "
@@ -2180,6 +2238,7 @@ class SQLiteAgentRuntimeHarness:
                 verified_receipt = verifier.verify_signed_transport_receipt(
                     str(value["failed_operation_ref"]),
                     receipt,
+                    owner_invocation_hash=str(row.invocation_hash),
                 )
             except Exception as error:
                 raise AgentRuntimeHarnessError(
@@ -2299,6 +2358,10 @@ class SQLiteAgentRuntimeHarness:
             ).fetchone()
             if row is None:
                 raise AgentRuntimeHarnessError("harness_run_not_found")
+            if connection.execute(text(
+                "SELECT 1 FROM ar_target_root_lifecycles WHERE target_run_ref=:ref AND status='failed'"
+            ), {"ref": run_ref}).first() is not None:
+                raise AgentRuntimeHarnessError("target_root_lifecycle_unavailable")
             current = _run_from_row(row)
             if current.status not in {"admitted", "running", "executed"}:
                 raise AgentRuntimeHarnessError("harness_run_not_resumable")
@@ -2389,6 +2452,7 @@ class SQLiteAgentRuntimeHarness:
         operation_ref: str,
         run_ref: str,
         native_session_ref: str,
+        transport_receipt: dict[str, object] | None = None,
     ) -> AgentRuntimeHarnessRun | None:
         """Seal one returned provider turn that explicitly yielded to a human.
 
@@ -2410,6 +2474,7 @@ class SQLiteAgentRuntimeHarness:
                     "SELECT runs.*, operations.run_ref AS operation_run_ref, "
                     "operations.generation AS operation_generation, "
                     "operations.status AS operation_status, "
+                    "operations.invocation_hash AS operation_invocation_hash, "
                     "operations.outcome_code AS operation_outcome_code, "
                     "admissions.target_ref AS admission_target_ref, "
                     "launches.target_ref AS launch_target_ref, "
@@ -2454,6 +2519,7 @@ class SQLiteAgentRuntimeHarness:
                 != 1
             ):
                 return None
+            self._verify_terminal_target_receipt(operation_ref, transport_receipt, str(row.operation_invocation_hash))
             operation_transition = connection.execute(
                 text(
                     "UPDATE ar_harness_provider_operations SET status = "
@@ -2526,6 +2592,11 @@ class SQLiteAgentRuntimeHarness:
     ) -> None:
         now = time.time()
         with self._database.write() as connection:
+            failed_target = connection.execute(text(
+                "SELECT 1 FROM ar_target_root_lifecycles WHERE target_run_ref=:run_ref AND status='failed'"
+            ), {"run_ref": run_ref}).first()
+            if failed_target is not None:
+                raise AgentRuntimeHarnessError("target_root_lifecycle_unavailable")
             row = connection.execute(
                 text(
                     "SELECT status, invocation_hash FROM "
@@ -2542,6 +2613,14 @@ class SQLiteAgentRuntimeHarness:
                     if row.status in {"running", "unknown_outcome"}
                     else "harness_operation_already_terminal"
                 )
+            target_prior = connection.execute(text(
+                "SELECT operations.operation_ref FROM ar_harness_provider_operations AS operations "
+                "JOIN ar_target_harness_admissions AS admissions ON admissions.target_run_ref=operations.run_ref "
+                "WHERE operations.run_ref=:ref AND operations.status IN ('failed', 'executed') "
+                "ORDER BY operations.generation DESC LIMIT 1"
+            ), {"ref": run_ref}).first()
+            if target_prior is not None:
+                self.verify_operation_terminal(str(target_prior.operation_ref))
             continuation_generation = (
                 _target_root_human_request_continuation_generation(
                     connection, run_ref
@@ -2597,6 +2676,92 @@ class SQLiteAgentRuntimeHarness:
                 },
             )
 
+    def verify_operation_terminal(self, operation_ref: str) -> None:
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT runs.* FROM ar_harness_runs AS runs JOIN ar_harness_provider_operations AS operations "
+                "ON operations.run_ref=runs.run_ref WHERE operations.operation_ref=:ref AND operations.status IN ('failed', 'executed')"
+            ), {"ref": operation_ref}).first()
+            operation_row = connection.execute(text(
+                "SELECT operations.*, runs.harness_family FROM ar_harness_provider_operations AS operations "
+                "JOIN ar_harness_runs AS runs ON runs.run_ref=operations.run_ref WHERE operation_ref=:ref"
+            ), {"ref": operation_ref}).first()
+            if row is None or operation_row is None:
+                raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+            operation = _operation_from_row(operation_row)
+            if operation.status == "executed":
+                verifier = self._target_provider_ceiling_receipt_verifier
+                if verifier is None:
+                    raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+                try:
+                    verifier.verify_signed_transport_receipt(operation_ref, None, owner_invocation_hash=operation.invocation_hash)
+                except (TargetRawOutputUnavailable, OSError) as error:
+                    raise AgentRuntimeHarnessError("provider_terminal_proof_missing") from error
+            else:
+                self._verify_target_failure_recovery_proof(row, _run_from_row(row), operation)
+
+    def target_run_failed(self, run_ref: str) -> bool:
+        with self._database.read() as connection:
+            return connection.execute(text(
+                "SELECT 1 FROM ar_target_root_lifecycles WHERE target_run_ref=:ref AND status='failed'"
+            ), {"ref": run_ref}).first() is not None
+
+    def reconcile_failed_target_operation(
+        self, operation_ref: str, transport_receipt: dict[str, object],
+    ) -> AgentRuntimeHarnessOperation:
+        """Accept late local termination evidence without reopening the Target."""
+        with self._database.fenced_write() as connection:
+            row = connection.execute(text(
+                "SELECT operations.*, runs.profile_json, runs.profile_hash, runs.harness_family "
+                "FROM ar_harness_provider_operations AS operations JOIN ar_harness_runs AS runs "
+                "ON runs.run_ref=operations.run_ref JOIN ar_target_root_lifecycles AS lifecycle "
+                "ON lifecycle.target_run_ref=runs.run_ref WHERE operations.operation_ref=:ref "
+                "AND lifecycle.status='failed' AND lifecycle.root_session_ref=runs.root_session_ref "
+                "AND lifecycle.target_attempt_ref=runs.attempt_ref AND lifecycle.target_fence_ref=runs.fence_ref "
+                "AND operations.generation=(SELECT MAX(generation) FROM ar_harness_provider_operations "
+                "WHERE run_ref=runs.run_ref)"
+            ), {"ref": operation_ref}).first()
+            if row is None or (row.status != "unknown_outcome" and not (
+                row.status == "failed" and row.outcome_code == "provider_terminal_reconciled"
+            )):
+                raise AgentRuntimeHarnessError("provider_reconciliation_not_required")
+            self._verify_terminal_target_receipt(operation_ref, transport_receipt, str(row.invocation_hash))
+            profile = _profile_from_row(row) or {
+                "schema_ref": "meta-research/harness-failed-transport-profile/v1",
+                "harness_family": str(row.harness_family), "run_ref": str(row.run_ref),
+            }
+            receipts = profile.setdefault("provider_transport_receipts", [])
+            if not isinstance(receipts, list) or any(not isinstance(item, dict) for item in receipts):
+                raise AgentRuntimeHarnessError("harness_profile_corrupt")
+            receipt = {"provider_operation_ref": operation_ref, **transport_receipt}
+            existing = [item for item in receipts if item.get("provider_operation_ref") == operation_ref]
+            if row.status == "failed":
+                if existing != [receipt]:
+                    raise AgentRuntimeHarnessError("harness_operation_state_conflict")
+                return _operation_from_row(row)
+            if existing and existing != [receipt]:
+                raise AgentRuntimeHarnessError("harness_operation_state_conflict")
+            if not existing:
+                receipts.append(receipt)
+            now = time.time()
+            connection.execute(text(
+                "UPDATE ar_harness_provider_operations SET status='failed', outcome_code='provider_terminal_reconciled', "
+                "completed_at=:now WHERE operation_ref=:ref AND status='unknown_outcome'"
+            ), {"ref": operation_ref, "now": now})
+            connection.execute(text(
+                "UPDATE ar_harness_runs SET status='failed', profile_json=:profile, profile_hash=:hash, "
+                "updated_at=:now, completed_at=:now WHERE run_ref=:ref"
+            ), {"ref": str(row.run_ref), "profile": canonical_json(profile), "hash": canonical_hash(profile), "now": now})
+            self._record_owner_change(connection, "agent_runtime.harness_operation_reconciled", {
+                "run_ref": str(row.run_ref), "operation_ref": operation_ref,
+                "outcome_code": "provider_terminal_reconciled", "transport_receipt_hash": canonical_hash(receipt),
+            })
+            settled = connection.execute(text(
+                "SELECT operations.*, runs.harness_family FROM ar_harness_provider_operations AS operations "
+                "JOIN ar_harness_runs AS runs ON runs.run_ref=operations.run_ref WHERE operation_ref=:ref"
+            ), {"ref": operation_ref}).one()
+            return _operation_from_row(settled)
+
     def begin_reconciliation(self, operation_ref: str) -> int:
         now = time.time()
         with self._database.write() as connection:
@@ -2612,6 +2777,11 @@ class SQLiteAgentRuntimeHarness:
                 raise AgentRuntimeHarnessError(
                     "provider_reconciliation_not_required"
                 )
+            failed_target = connection.execute(text(
+                "SELECT 1 FROM ar_target_root_lifecycles WHERE target_run_ref=:run_ref AND status='failed'"
+            ), {"run_ref": str(row.run_ref)}).first()
+            if failed_target is not None:
+                raise AgentRuntimeHarnessError("target_root_lifecycle_unavailable")
             transition = connection.execute(
                 text(
                     "UPDATE ar_harness_provider_operations SET status = "
@@ -2655,6 +2825,45 @@ class SQLiteAgentRuntimeHarness:
                 },
             )
         return reconciliation_generation
+
+    def _verify_target_failure_recovery_proof(self, row, run, operation) -> None:
+        profile = _profile_from_row(row) or {}
+        facts = profile.get("provider_preparation_failures", [])
+        matching = [fact for fact in facts if isinstance(fact, dict)
+                    and fact.get("provider_operation_ref") == operation.operation_ref]
+        expected = {"provider_operation_ref": str(operation.operation_ref), "run_ref": run.run_ref,
+                    "attempt_ref": run.attempt_ref, "root_session_ref": run.root_session_ref,
+                    "fence_ref": run.fence_ref, "failure_code": str(operation.outcome_code)}
+        if matching == [expected]:
+            return
+        if matching:
+            reservation = self.query_target_successor_reservation(run.run_ref)
+            if reservation is not None:
+                old_handle = json.loads(reservation.old_handle_json)
+                previous = {**expected,
+                    "attempt_ref": old_handle["execution_attempt_ref"],
+                    "root_session_ref": old_handle["root_session_ref"],
+                    "fence_ref": old_handle["execution_fence_ref"],
+                }
+                if matching == [previous]:
+                    return
+        receipts = profile.get("provider_transport_receipts", [])
+        matching = [receipt for receipt in receipts if isinstance(receipt, dict)
+                    and receipt.get("provider_operation_ref") == operation.operation_ref]
+        if len(matching) != 1:
+            raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+        self._verify_terminal_target_receipt(str(operation.operation_ref),
+            {name: value for name, value in matching[0].items() if name != "provider_operation_ref"}, str(operation.invocation_hash))
+
+    def _verify_terminal_target_receipt(self, operation_ref: str, receipt: object, owner_invocation_hash: str) -> None:
+        verifier = self._target_provider_ceiling_receipt_verifier
+        if verifier is None or not isinstance(receipt, dict):
+            raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+        try:
+            if verifier.verify_signed_transport_receipt(operation_ref, receipt, owner_invocation_hash=owner_invocation_hash) != receipt:
+                raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+        except (TargetRawOutputUnavailable, OSError) as error:
+            raise AgentRuntimeHarnessError("provider_terminal_proof_missing") from error
 
     def _verify_stopped_target_native_receipt(
         self, operation_ref: str, native_session_ref: str, receipt: object,
@@ -2735,14 +2944,23 @@ class SQLiteAgentRuntimeHarness:
         operation_ref: str,
         code: str,
         *,
-        durable_outcome: Literal["terminal", "unknown"] | None = None,
+        durable_outcome: Literal["terminal", "unknown", "not_started"] | None = None,
         transport_receipt: dict[str, object] | None = None,
         native_session_ref: str | None = None,
         expected_running_run_ref: str | None = None,
+        terminal_proof_diagnostic: tuple[str, ...] | None = None,
         runtime_effect: RuntimeEffectIdentity | None = None,
         predecessor_effects: tuple[RuntimeEffectIdentity, ...] = (),
     ) -> AgentRuntimeHarnessRetry | None:
         now = time.time()
+        if terminal_proof_diagnostic is not None and (
+            durable_outcome != "unknown" or code != "provider_terminal_proof_missing"
+            or type(terminal_proof_diagnostic) is not tuple
+            or not 1 <= len(terminal_proof_diagnostic) <= 4
+            or any(type(reason) is not str or re.fullmatch(r"[A-Za-z0-9_]{1,96}", reason) is None
+                   for reason in terminal_proof_diagnostic)
+        ):
+            raise AgentRuntimeHarnessError("harness_terminal_proof_diagnostic_invalid")
         signed_ceiling = _verified_provider_ceiling_code(transport_receipt)
         terminal_ceiling = (
             durable_outcome == "terminal"
@@ -2775,22 +2993,25 @@ class SQLiteAgentRuntimeHarness:
             if expected_running_run_ref is not None:
                 guarded = connection.execute(
                     text(
-                        "SELECT 1 FROM ar_harness_provider_operations AS operations "
+                        "SELECT operations.status, operations.outcome_code FROM ar_harness_provider_operations AS operations "
                         "JOIN ar_harness_runs AS runs ON runs.run_ref=operations.run_ref "
                         "WHERE operations.operation_ref=:operation_ref AND "
-                        "runs.run_ref=:run_ref AND runs.status='running' AND "
-                        "operations.status='running' AND operations.generation="
+                        "runs.run_ref=:run_ref AND (runs.status IN ('running', 'suspended') OR "
+                        "(runs.status IN ('failed', 'executed') AND :code='provider_terminal_proof_missing')) AND "
+                        "(operations.status IN ('running', 'unknown_outcome') OR "
+                        "(operations.status IN ('failed', 'executed') AND :code='provider_terminal_proof_missing')) AND operations.generation="
                         "(SELECT MAX(generation) FROM ar_harness_provider_operations "
                         "WHERE run_ref=:run_ref)"
                     ),
-                    {"operation_ref": operation_ref, "run_ref": expected_running_run_ref},
+                    {"operation_ref": operation_ref, "run_ref": expected_running_run_ref, "code": code},
                 ).first()
-                if guarded is None:
+                if guarded is None or (guarded.status == "unknown_outcome" and guarded.outcome_code == code
+                                       and terminal_proof_diagnostic is None):
                     return None
             row = connection.execute(
                 text(
-                    "SELECT operations.run_ref, operations.generation, "
-                    "runs.request_ref, runs.attempt_ref, "
+                    "SELECT operations.run_ref, operations.invocation_hash, operations.generation, operations.reconciliation_generation, "
+                    "runs.request_ref, runs.status AS run_status, runs.attempt_ref, "
                     "runs.root_session_ref, runs.fence_ref, "
                     "runs.harness_family, runs.profile_json, "
                     "runs.profile_hash, "
@@ -2804,6 +3025,21 @@ class SQLiteAgentRuntimeHarness:
                 ),
                 {"operation_ref": operation_ref},
             ).one()
+            preparation_failed = durable_outcome == "not_started" and int(row.reconciliation_generation) == 0
+            if row.target_ref is not None and not unknown and not preparation_failed:
+                try:
+                    self._verify_terminal_target_receipt(operation_ref, transport_receipt, str(row.invocation_hash))
+                except AgentRuntimeHarnessError:
+                    unknown = True
+                    terminal_ceiling = False
+                    stopped_native = None
+                    code = "provider_terminal_proof_missing"
+            if durable_outcome == "not_started" and not preparation_failed:
+                unknown = True
+                code = "provider_terminal_proof_missing"
+            operation_status = "unknown_outcome" if unknown else "failed"
+            run_status = ("suspended" if unknown and row.run_status == "suspended"
+                          else "running" if unknown or terminal_ceiling else "failed")
             if stopped_native is not None:
                 self._validate_stopped_target_native_scope(connection, operation_ref, str(row.run_ref), stopped_native)
             if terminal_ceiling:
@@ -2826,11 +3062,15 @@ class SQLiteAgentRuntimeHarness:
             transition = connection.execute(
                 text(
                     "UPDATE ar_harness_provider_operations SET status = "
-                    ":status, outcome_code = :code, completed_at = :now WHERE "
-                    "operation_ref = :operation_ref AND status = 'running'"
+                    ":status, outcome_code = :code, completed_at = :completed_at WHERE "
+                    "operation_ref = :operation_ref AND (status = 'running' OR "
+                    "(:unknown = 1 AND (status = 'unknown_outcome' OR "
+                    "(status IN ('failed', 'executed') AND :code='provider_terminal_proof_missing'))))"
                 ),
                 {
                     "status": operation_status,
+                    "unknown": int(unknown),
+                    "completed_at": None if unknown else now,
                     "code": code,
                     "now": now,
                     "operation_ref": operation_ref,
@@ -2842,8 +3082,9 @@ class SQLiteAgentRuntimeHarness:
                 )
             failure_profile_json: str | None = None
             failure_profile_hash: str | None = None
-            if terminal_ceiling or stopped_native is not None:
-                assert transport_receipt is not None
+            if terminal_proof_diagnostic is not None or (
+                not unknown and (transport_receipt is not None or preparation_failed)
+            ):
                 prior_profile = _profile_from_row(row)
                 failure_profile = (
                     dict(prior_profile)
@@ -2856,34 +3097,47 @@ class SQLiteAgentRuntimeHarness:
                         "run_ref": str(row.run_ref),
                     }
                 )
-                prior_receipts = failure_profile.get(
-                    "provider_transport_receipts"
-                )
-                if prior_receipts is None:
-                    receipt_rows: list[object] = []
-                elif isinstance(prior_receipts, list):
-                    receipt_rows = list(prior_receipts)
-                else:
-                    raise AgentRuntimeHarnessError(
-                        "harness_profile_corrupt"
+                if terminal_proof_diagnostic is not None:
+                    failure_profile["terminal_proof_diagnostic"] = {
+                        "provider_operation_ref": operation_ref,
+                        "reasons": list(terminal_proof_diagnostic),
+                    }
+                if not unknown and preparation_failed:
+                    facts = list(failure_profile.get("provider_preparation_failures", []))
+                    facts.append({"provider_operation_ref": operation_ref, "run_ref": str(row.run_ref),
+                        "attempt_ref": str(row.attempt_ref), "root_session_ref": str(row.root_session_ref),
+                        "fence_ref": str(row.fence_ref), "failure_code": code})
+                    failure_profile["provider_preparation_failures"] = facts
+                    failure_profile.setdefault("provider_transport_receipts", [])
+                elif not unknown:
+                    prior_receipts = failure_profile.get(
+                        "provider_transport_receipts"
                     )
-                receipt_row = {
-                    "provider_operation_ref": operation_ref,
-                    **transport_receipt,
-                }
-                existing_receipts = [
-                    item
-                    for item in receipt_rows
-                    if isinstance(item, dict)
-                    and item.get("provider_operation_ref") == operation_ref
-                ]
-                if existing_receipts and existing_receipts != [receipt_row]:
-                    raise AgentRuntimeHarnessError(
-                        "harness_profile_conflict"
-                    )
-                if not existing_receipts:
-                    receipt_rows.append(receipt_row)
-                failure_profile["provider_transport_receipts"] = receipt_rows
+                    if prior_receipts is None:
+                        receipt_rows: list[object] = []
+                    elif isinstance(prior_receipts, list):
+                        receipt_rows = list(prior_receipts)
+                    else:
+                        raise AgentRuntimeHarnessError(
+                            "harness_profile_corrupt"
+                        )
+                    receipt_row = {
+                        "provider_operation_ref": operation_ref,
+                        **transport_receipt,
+                    }
+                    existing_receipts = [
+                        item
+                        for item in receipt_rows
+                        if isinstance(item, dict)
+                        and item.get("provider_operation_ref") == operation_ref
+                    ]
+                    if existing_receipts and existing_receipts != [receipt_row]:
+                        raise AgentRuntimeHarnessError(
+                            "harness_profile_conflict"
+                        )
+                    if not existing_receipts:
+                        receipt_rows.append(receipt_row)
+                    failure_profile["provider_transport_receipts"] = receipt_rows
                 failure_profile_json = canonical_json(failure_profile)
                 failure_profile_hash = canonical_hash(failure_profile)
             connection.execute(
@@ -3356,7 +3610,7 @@ class SQLiteAgentRuntimeHarness:
                 text(
                     "SELECT runs.run_ref, runs.attempt_ref, "
                     "runs.attempt_generation, runs.root_session_ref, "
-                    "runs.native_session_ref, runs.fence_ref, runs.status, "
+                    "runs.native_session_ref, runs.fence_ref, runs.status, runs.profile_json, runs.profile_hash, "
                     "(SELECT MAX(generation) FROM ar_harness_provider_operations "
                     "WHERE run_ref = runs.run_ref) AS latest_generation "
                     "FROM ar_target_harness_admissions AS admissions JOIN "
@@ -3547,6 +3801,7 @@ class SQLiteAgentRuntimeHarness:
             next_cursor=next_cursor,
             head_cursor=head_cursor,
             has_more=has_more,
+            terminal_proof_diagnostic=(_profile_from_row(run) or {}).get("terminal_proof_diagnostic"),
         )
 
     def query_target_root_completion_evidence(
@@ -3958,7 +4213,7 @@ class SQLiteAgentRuntimeHarness:
                     text(
                         "UPDATE ar_harness_provider_operations SET status = "
                         "'unknown_outcome', outcome_code = "
-                        "'provider_outcome_unknown', completed_at = :now WHERE "
+                        "'provider_outcome_unknown', completed_at = NULL WHERE "
                         "status = 'running'"
                     ),
                     {"now": now},

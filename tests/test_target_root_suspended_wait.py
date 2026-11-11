@@ -99,7 +99,8 @@ def test_daemon_reports_ready_after_observing_the_suspended_target():
         health.last_error="target_run_harness_identity_invalid"
         ready=asyncio.Event()
         shell=SimpleNamespace(target_run_runtime=runtime,owners=SimpleNamespace(
-            agent_runtime=SimpleNamespace(list_target_root_work_refs=lambda:(state.handle.target_ref,))))
+            agent_runtime=SimpleNamespace(list_target_root_work_refs=lambda:(state.handle.target_ref,),
+                                          list_target_root_reconciliation_refs=lambda:())))
         worker=asyncio.create_task(_process_target_runs(shell,health,ready.set))
         try:
             await asyncio.wait_for(ready.wait(),timeout=2)

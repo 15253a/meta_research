@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from provider_supervisor_support import closed_tree_fixture
+
 import copy
 import json
 import subprocess
@@ -62,7 +64,7 @@ class NativeAcquisitionRunner(SequencedPrototypeRunner):
         result_path = Path(argv[argv.index("--output-last-message") + 1])
         _, key = ensure_transport_key(self.workspace)
         invocation = read_transport_envelope(stdout_path.parent / "invocation.json", key)
-        write_exit_receipt(stdout_path.parent / "supervisor-exit.json", key=key,
+        write_exit_receipt(stdout_path.parent / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key,
             invocation_hash=canonical_hash(invocation),
             prompt_path=stdout_path.parent / "prompt.txt",
             schema_path=stdout_path.parent / "output-schema.json",

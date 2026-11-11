@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import sqlite3
 from pathlib import Path
 
@@ -10,7 +12,6 @@ from meta_research.migration import upgrade_database
 from test_quest_goal_evolution_migration import _migration_config, _upgrade_to_revision
 
 
-LATEST_REVISION = "0073_merge_search_source"
 
 
 def _seed_existing_creation(database: Path) -> dict[str, tuple]:
@@ -73,11 +74,11 @@ def test_goal_creation_merge_preserves_existing_data_from_each_head(
     upgrade_database(database)
     upgrade_database(database)
 
-    assert ScriptDirectory.from_config(_migration_config()).get_heads() == [LATEST_REVISION]
+    assert ScriptDirectory.from_config(_migration_config()).get_heads() == [schema_head()]
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
         assert connection.execute("SELECT version_num FROM alembic_version").fetchall() == [
-            (LATEST_REVISION,),
+            (schema_head(),),
         ]
         for table, original in original_rows.items():
             actual = connection.execute(f"SELECT * FROM {table}").fetchone()

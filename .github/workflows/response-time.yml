@@ -15,6 +15,58 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  target-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      META_RESEARCH_PROVIDER_TOOLS: ${{ runner.temp }}/issue296-provider-tools
+      OPENAI_BASE_URL: http://127.0.0.1:9/v1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: 0.11.3
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked Python and native Codex dependencies
+        run: |
+          uv sync --frozen
+          version=$(uv run python -c 'from meta_research.codex_runtime import CODEX_LOCKED_VERSION; print(CODEX_LOCKED_VERSION)')
+          npm install --ignore-scripts --prefix "$META_RESEARCH_PROVIDER_TOOLS/codex-cli/installs/$version" "@openai/codex@$version"
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+      - name: Verify Linux process ownership and stable Target recovery
+        run: |
+          uv run python - <<'PY'
+          import hashlib, json, os, pathlib, platform, subprocess
+          from meta_research.codex_runtime import CODEX_LOCKED_VERSION
+          executable = pathlib.Path(os.environ['META_RESEARCH_PROVIDER_TOOLS']) / 'codex-cli/installs' / CODEX_LOCKED_VERSION / 'node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex'
+          directory = pathlib.Path('target-recovery-results')
+          directory.mkdir()
+          environment = {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(), 'platform': platform.platform(), 'python': platform.python_version(), 'codex': subprocess.check_output([str(executable), '--version'], text=True).strip(), 'codex_sha256': hashlib.sha256(executable.read_bytes()).hexdigest()}
+          (directory / 'environment.json').write_text(json.dumps(environment, indent=2))
+          PY
+          uv run pytest -q tests/test_provider_process_tree.py tests/test_issue296_stable_workspace.py tests/test_issue296_native_workspace_write.py --basetemp="$RUNNER_TEMP/issue296-test-data" --junitxml=target-recovery-results/results.xml
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+          result = ET.parse('target-recovery-results/results.xml')
+          assert not result.findall('.//skipped'), 'Linux Target recovery acceptance must not skip cases'
+          native = {case.attrib['name'] for case in result.findall('.//testcase') if case.attrib.get('classname') == 'tests.test_issue296_native_workspace_write'}
+          assert native == {'test_native_workspace_write_keeps_parallel_workspace_read_only', 'test_two_recoveries_use_native_workspace_write_at_the_same_cwd'}, native
+          PY
+      - name: Upload Target recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-recovery-results
+          path: target-recovery-results/
+          if-no-files-found: warn
+          retention-days: 14
+
   response-time:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

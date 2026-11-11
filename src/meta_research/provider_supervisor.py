@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import platform as system_platform
 import secrets
 import signal
 import subprocess
@@ -16,6 +17,8 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol, cast
+
+from meta_research.linux_provider_tree import LinuxProviderJob, ProviderTreeError
 
 
 TRANSPORT_KEY_BYTES = 32
@@ -672,8 +675,22 @@ def request_supervisor_stop(
     """
 
     receipt_path = operation_directory / "supervisor-exit.json"
-    if receipt_path.is_file():
+    def terminal_receipt() -> bool:
+        if not receipt_path.is_file():
+            return False
+        read_verified_exit_receipt(
+            receipt_path, key=key, invocation_hash=invocation_hash,
+            prompt_path=operation_directory / "prompt.txt",
+            schema_path=operation_directory / "output-schema.json",
+            stdout_path=operation_directory / "stdout.jsonl",
+            result_path=operation_directory / "last-message.json",
+            expected_schema_ref=(SUPERVISOR_EXIT_SCHEMA_V2
+                if ready_schema == "meta-research/provider-supervisor-ready/v2"
+                else SUPERVISOR_EXIT_SCHEMA),
+        )
         return True
+    if receipt_path.is_file():
+        return terminal_receipt()
     ready = read_transport_envelope(
         operation_directory / "supervisor-ready.json", key
     )
@@ -687,7 +704,8 @@ def request_supervisor_stop(
     }
     if (
         frozenset(ready)
-        not in {frozenset(ready_keys), frozenset({*ready_keys, "phase"})}
+        not in {frozenset(ready_keys), frozenset({*ready_keys, "phase"}),
+                frozenset({*ready_keys, "boot_identity_hash", "host_identity_hash"})}
         or ready.get("schema_ref") != ready_schema
         or ("phase" in ready and ready.get("phase") != "ready")
         or ready.get("invocation_hash") != invocation_hash
@@ -701,7 +719,6 @@ def request_supervisor_stop(
         raise ProviderSupervisorError("provider_supervisor_ready_invalid")
     platform = process_platform or ProviderProcessPlatform()
     request_path = (operation_directory / "supervisor-request.json").resolve()
-    supervisor_running = False
     if platform.platform_name == "posix":
         try:
             live_group = platform.process_group_for_pid(process_id)
@@ -728,11 +745,10 @@ def request_supervisor_stop(
                 key=key,
                 invocation_hash=invocation_hash,
             )
-            supervisor_running = True
             try:
                 os.kill(process_id, signal.SIGTERM)
             except ProcessLookupError:
-                supervisor_running = False
+                pass
     elif platform.platform_name == "nt":
         # The exact sealed operation file is the Windows control channel. Do
         # not signal a possibly reused PID merely because its numeric value is
@@ -742,35 +758,12 @@ def request_supervisor_stop(
             key=key,
             invocation_hash=invocation_hash,
         )
-        supervisor_running = platform.process_group_running(process_id)
     else:
         raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
     deadline = time.monotonic() + wait_seconds
     while not receipt_path.is_file() and time.monotonic() < deadline:
         time.sleep(0.02)
-    if receipt_path.is_file():
-        return True
-    if platform.platform_name == "posix":
-        try:
-            supervisor_running = (
-                platform.process_group_for_pid(process_id) == process_group
-            )
-        except ProcessLookupError:
-            supervisor_running = False
-        except OSError as error:
-            raise ProviderSupervisorError(
-                "provider_supervisor_identity_invalid"
-            ) from error
-    else:
-        supervisor_running = platform.process_group_running(process_id)
-    if supervisor_running:
-        return False
-    return _terminate_or_verify_bound_provider_absent(
-        operation_directory,
-        key=key,
-        invocation_hash=invocation_hash,
-        process_platform=platform,
-    )
+    return terminal_receipt()
 
 
 def supervisor_request_never_started(
@@ -779,208 +772,33 @@ def supervisor_request_never_started(
     key: bytes,
     invocation_hash: str,
     request_schema: str,
-    now: float | None = None,
     platform_name: str | None = None,
-    supervisor_lock_held: Callable[[Path], bool] | None = None,
 ) -> bool:
-    """Prove that a durable request aged past its launch window without Popen.
-
-    The supervisor protocol publishes ``ready`` before ``started`` and before
-    the provider Popen.  Age alone is not proof, however: the daemon that owned
-    the five-second readiness deadline may have died while a detached supervisor
-    was scheduled but had not yet published ``ready``.  We therefore also prove
-    that no same-user live process is bound to the exact request path.
-    """
+    """Fence an unissued request under the same lock used by its supervisor."""
 
     request_path = operation_directory / "supervisor-request.json"
     if not request_path.is_file():
-        return True
+        return False
     request = read_transport_envelope(request_path, key)
     if (
         request.get("schema_ref") != request_schema
         or request.get("invocation_hash") != invocation_hash
     ):
         raise ProviderSupervisorError("provider_supervisor_request_invalid")
-    if any(
-        (operation_directory / name).exists()
-        for name in (
-            "supervisor-ready.json",
-            "provider-started.json",
-            "supervisor-exit.json",
-        )
-    ):
-        return False
-    observed_at = time.time() if now is None else now
-    if (
-        observed_at - request_path.stat().st_mtime
-        < SUPERVISOR_STARTUP_GRACE_SECONDS
-    ):
-        return False
-    selected_platform = platform_name or os.name
-    if selected_platform == "nt":
-        lock_probe = supervisor_lock_held or (
-            lambda path: _supervisor_lock_is_held(
-                path,
-                platform_name=selected_platform,
-            )
-        )
-        return not lock_probe(operation_directory / "supervisor.lock")
-    if selected_platform != "posix":
-        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
-    return not _supervisor_processes_for_request(request_path.resolve())
-
-
-def _supervisor_lock_is_held(path: Path, *, platform_name: str) -> bool:
-    lock = SupervisorFileLock(path, platform_name=platform_name)
+    lock = SupervisorFileLock(operation_directory / "supervisor.lock",
+                              platform_name=platform_name)
     if not lock.acquire(blocking=False):
-        return True
-    lock.release()
-    return False
-
-
-def _supervisor_processes_for_request(request_path: Path) -> set[int]:
-    """Find same-user live supervisors carrying one exact durable request path."""
-
-    request_token = str(request_path).encode("utf-8")
-    process_ids: set[int] = set()
-    current_uid = os.getuid()
-    for process_directory in Path("/proc").glob("[0-9]*"):
-        try:
-            metadata = process_directory.stat()
-            if metadata.st_uid != current_uid:
-                continue
-            command_line = (process_directory / "cmdline").read_bytes().split(b"\0")
-            if request_token not in command_line:
-                continue
-            process_id = int(process_directory.name)
-            os.getpgid(process_id)
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        except PermissionError as error:
-            # Same-uid identity becoming unreadable is an unknown effect, not
-            # evidence that the supervisor never launched.
-            raise ProviderSupervisorError(
-                "provider_supervisor_identity_unavailable"
-            ) from error
-        except OSError as error:
-            if error.errno in {errno.ENOENT, errno.ESRCH}:
-                continue
-            raise ProviderSupervisorError(
-                "provider_supervisor_identity_unavailable"
-            ) from error
-        except ValueError as error:
-            raise ProviderSupervisorError(
-                "provider_supervisor_identity_unavailable"
-            ) from error
-        if process_id <= 1:
-            raise ProviderSupervisorError("provider_supervisor_identity_invalid")
-        process_ids.add(process_id)
-    return process_ids
-
-
-def _terminate_or_verify_bound_provider_absent(
-    operation_directory: Path,
-    *,
-    key: bytes,
-    invocation_hash: str,
-    process_platform: ProviderProcessPlatform | None = None,
-) -> bool:
-    """Terminate provider groups bound to this exact sealed operation path."""
-
-    platform = process_platform or ProviderProcessPlatform()
-    request_path = (operation_directory / "supervisor-request.json").resolve()
-    marker_path = operation_directory / "provider-started.json"
-    marker_group: int | None = None
-    if marker_path.is_file():
-        marker = read_transport_envelope(marker_path, key)
-        base_keys = {
-            "schema_ref",
-            "invocation_hash",
-            "supervisor_process_id",
-            "supervisor_process_group",
-            "provider_process_id",
-            "provider_process_group",
-            "provider_operation_path",
-        }
-        if (
-            frozenset(marker)
-            not in {frozenset(base_keys), frozenset({*base_keys, "phase"})}
-            or marker.get("invocation_hash") != invocation_hash
-            or marker.get("schema_ref")
-            not in {
-                "meta-research/codex-provider-started/v2",
-                "meta-research/provider-started/v2",
-            }
-            or ("phase" in marker and marker.get("phase") != "started")
-            or marker.get("provider_operation_path") != str(request_path)
-            or not isinstance(marker.get("provider_process_id"), int)
-            or isinstance(marker.get("provider_process_id"), bool)
-            or int(marker["provider_process_id"]) <= 1
-            or not isinstance(marker.get("provider_process_group"), int)
-            or isinstance(marker.get("provider_process_group"), bool)
-            or marker.get("provider_process_group")
-            != marker.get("provider_process_id")
-        ):
-            raise ProviderSupervisorError("provider_started_marker_invalid")
-        marker_group = int(marker["provider_process_group"])
-
-    groups = _provider_groups_for_operation(
-        request_path,
-        platform_name=platform.platform_name,
-    )
-    if marker_group is not None and platform.process_group_running(marker_group):
-        # A reused numeric PGID is never enough: at least one live group member
-        # must still carry the exact operation token inherited at Popen.
-        if marker_group not in groups:
-            return False
-        groups.add(marker_group)
-    for group in groups:
-        if not platform.terminate_process_group(group):
-            return False
-    remaining = _provider_groups_for_operation(
-        request_path,
-        platform_name=platform.platform_name,
-    )
-    if remaining:
         return False
-    return marker_group is None or not platform.process_group_running(marker_group)
-
-
-def _provider_groups_for_operation(
-    request_path: Path,
-    *,
-    platform_name: str | None = None,
-) -> set[int]:
-    if (platform_name or os.name) != "posix":
-        # A Windows PID marker without a creation identity is not sufficient
-        # authority to terminate a possibly reused process. Keep reconciliation
-        # pending if the owning supervisor did not seal a receipt.
-        return set()
-    token = f"{PROVIDER_OPERATION_ENV}={request_path}".encode("utf-8")
-    groups: set[int] = set()
-    for process_directory in Path("/proc").glob("[0-9]*"):
-        try:
-            values = (process_directory / "environ").read_bytes().split(b"\0")
-            if token not in values:
-                continue
-            process_id = int(process_directory.name)
-            process_group = os.getpgid(process_id)
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
-            continue
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.EPERM, errno.ENOENT, errno.ESRCH}:
-                continue
-            raise ProviderSupervisorError(
-                "provider_process_identity_unavailable"
-            ) from error
-        except ValueError as error:
-            raise ProviderSupervisorError(
-                "provider_process_identity_unavailable"
-            ) from error
-        if process_id <= 1 or process_group <= 1:
-            raise ProviderSupervisorError("provider_process_identity_invalid")
-        groups.add(process_group)
-    return groups
+    try:
+        if any((operation_directory / name).exists() for name in (
+            "supervisor-ready.json", "provider-started.json", "supervisor-exit.json",
+        )):
+            return False
+        write_supervisor_stop_request(operation_directory / "supervisor-stop.json",
+                                      key=key, invocation_hash=invocation_hash)
+        return True
+    finally:
+        lock.release()
 
 
 def read_transport_key_for_operation(
@@ -1036,6 +854,47 @@ def supervisor_stop_requested(
     return True
 
 
+def supervisor_host_identity() -> dict[str, str | None]:
+    if sys.platform == "linux":
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        machine = Path("/etc/machine-id").read_text().strip()
+        if not boot or not machine:
+            raise ProviderSupervisorError("provider_host_identity_unavailable")
+        return {
+            "boot_identity_hash": hashlib.sha256(
+                _canonical_json({"boot_identity": boot}).encode()
+            ).hexdigest(),
+            "host_identity_hash": hashlib.sha256(
+                _canonical_json({"machine_id": machine, "node": system_platform.node()}).encode()
+            ).hexdigest(),
+        }
+    return {
+        "boot_identity_hash": None,
+        "host_identity_hash": hashlib.sha256(system_platform.node().encode()).hexdigest(),
+    }
+
+
+def verify_process_tree_closed(payload: object) -> None:
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_ref", "state", "mechanism", "boot_identity_hash", "host_identity_hash",
+    } or payload.get("schema_ref") != "meta-research/provider-process-tree/v1" or (
+        payload.get("state") != "closed"
+    ) or payload.get("mechanism") not in {
+        "linux-subreaper-echild", "windows-job", "not-started", "host-reboot",
+    }:
+        raise ProviderSupervisorError("provider_process_tree_proof_invalid")
+    for name in ("boot_identity_hash", "host_identity_hash"):
+        value = payload[name]
+        if name == "boot_identity_hash" and value is None and payload["mechanism"] in {
+            "windows-job", "not-started",
+        }:
+            continue
+        if not isinstance(value, str) or len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ProviderSupervisorError("provider_process_tree_proof_invalid")
+
+
 def write_exit_receipt(
     path: Path,
     *,
@@ -1045,13 +904,17 @@ def write_exit_receipt(
     schema_path: Path,
     stdout_path: Path,
     result_path: Path,
-    returncode: int,
+    returncode: int | None,
     input_bytes: int,
+    process_tree: dict[str, object],
     termination_reason: str = "completed",
     schema_ref: str = SUPERVISOR_EXIT_SCHEMA,
     codex_home: Path | None = None,
 ) -> None:
     if schema_ref not in _SUPERVISOR_EXIT_SCHEMAS:
+        raise ProviderSupervisorError("provider_supervisor_exit_invalid")
+    verify_process_tree_closed(process_tree)
+    if process_tree["mechanism"] == "host-reboot":
         raise ProviderSupervisorError("provider_supervisor_exit_invalid")
     prompt_bytes = prompt_path.stat().st_size
     payload: dict[str, object] = {
@@ -1059,6 +922,7 @@ def write_exit_receipt(
         "invocation_hash": invocation_hash,
         "returncode": returncode,
         "termination_reason": termination_reason,
+        "process_tree": process_tree,
         "prompt_file_hash": _file_sha256(prompt_path),
         "prompt_bytes": prompt_bytes,
         "input_bytes": input_bytes,
@@ -1113,7 +977,9 @@ def read_verified_exit_receipt(
         "output_schema_file_hash",
         "stdout_file_hash",
         "result_file_hash",
+        "process_tree",
     }
+    verify_process_tree_closed(payload.get("process_tree"))
     returncode = payload.get("returncode")
     termination_reason = payload.get("termination_reason")
     prompt_bytes = payload.get("prompt_bytes")
@@ -1125,8 +991,11 @@ def read_verified_exit_receipt(
         set(payload) != expected_keys
         or payload.get("schema_ref") != expected_schema_ref
         or payload.get("invocation_hash") != invocation_hash
-        or not isinstance(returncode, int)
-        or isinstance(returncode, bool)
+        or (type(returncode) is not int and not (
+            returncode is None and payload["process_tree"]["mechanism"] == "not-started"
+            and termination_reason in {"stopped", "launch_failed"}
+        ))
+        or payload["process_tree"]["mechanism"] == "host-reboot"
         or termination_reason
         not in {
             "completed",
@@ -1399,30 +1268,15 @@ def _terminate_provider(
     process_platform: ProviderProcessPlatform,
     provider_job: ProviderProcessJob | None,
 ) -> int:
-    if provider_job is not None:
-        if not provider_job.terminate():
-            raise ProviderSupervisorError("provider_job_termination_failed")
-    elif process_platform.platform_name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    else:
-        raise ProviderSupervisorError("provider_windows_job_required")
+    if provider_job is None or not provider_job.terminate():
+        raise ProviderSupervisorError("provider_job_termination_failed")
     if process.poll() is None:
         try:
             process.wait(timeout=1.0)
         except subprocess.TimeoutExpired as error:
-            if process_platform.platform_name == "posix":
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=1.0)
-            else:
-                raise ProviderSupervisorError(
-                    "provider_process_termination_unconfirmed"
-                ) from error
+            raise ProviderSupervisorError(
+                "provider_process_termination_unconfirmed"
+            ) from error
     assert process.returncode is not None
     return process.returncode
 
@@ -1570,6 +1424,7 @@ def _write_phase_marker(
         "invocation_hash": invocation_hash,
         "supervisor_process_id": os.getpid(),
         "supervisor_process_group": platform.current_process_group(),
+        **supervisor_host_identity(),
     }
     if provider_process is not None:
         if operation_path is None:
@@ -1614,46 +1469,43 @@ def supervise(
     with SupervisorFileLock(paths["lock_path"]):
         if paths["receipt_path"].exists():
             return
-        if paths["started_path"].exists():
+        if paths["started_path"].exists() or paths["ready_path"].exists():
             raise ProviderSupervisorError("provider_outcome_unknown")
-        _write_phase_marker(
-            paths["ready_path"],
-            schema_ref=(
-                "meta-research/provider-supervisor-ready/v2"
-                if generic_schema
-                else "meta-research/codex-provider-supervisor-ready/v1"
-            ),
-            invocation_hash=invocation_hash,
-            key=key,
-            process_platform=platform,
-        )
-        _supervise_locked(
-            argv=argv,
-            paths=paths,
-            invocation_hash=invocation_hash,
-            key=key,
-            timeout_seconds=timeout_seconds,
-            stream_max_bytes=stream_max_bytes,
-            result_max_bytes=result_max_bytes,
-            stop_requested=lambda: stop_requested
-            or supervisor_stop_requested(
-                paths["stop_path"], key=key, invocation_hash=invocation_hash
-            ),
-            started_schema_ref=(
-                "meta-research/provider-started/v2"
-                if generic_schema
-                else "meta-research/codex-provider-started/v2"
-            ),
-            exit_schema_ref=(
-                SUPERVISOR_EXIT_SCHEMA_V2
-                if generic_schema
-                else SUPERVISOR_EXIT_SCHEMA
-            ),
-            process_platform=platform,
-            provider_job_factory=provider_job_factory,
-            working_directory=(validated_working_directory(payload["working_directory"])
-                if "working_directory" in payload else None),
-        )
+        try:
+            _supervise_locked(
+                argv=argv,
+                paths=paths,
+                invocation_hash=invocation_hash,
+                key=key,
+                timeout_seconds=timeout_seconds,
+                stream_max_bytes=stream_max_bytes,
+                result_max_bytes=result_max_bytes,
+                stop_requested=lambda: stop_requested
+                or supervisor_stop_requested(
+                    paths["stop_path"], key=key, invocation_hash=invocation_hash
+                ),
+                ready_schema_ref=(
+                    "meta-research/provider-supervisor-ready/v2"
+                    if generic_schema
+                    else "meta-research/codex-provider-supervisor-ready/v1"
+                ),
+                started_schema_ref=(
+                    "meta-research/provider-started/v2"
+                    if generic_schema
+                    else "meta-research/codex-provider-started/v2"
+                ),
+                exit_schema_ref=(
+                    SUPERVISOR_EXIT_SCHEMA_V2
+                    if generic_schema
+                    else SUPERVISOR_EXIT_SCHEMA
+                ),
+                process_platform=platform,
+                provider_job_factory=provider_job_factory,
+                working_directory=(validated_working_directory(payload["working_directory"])
+                    if "working_directory" in payload else None),
+            )
+        except ProviderTreeError as error:
+            raise ProviderSupervisorError(str(error)) from error
 
 
 def _supervise_locked(
@@ -1666,6 +1518,7 @@ def _supervise_locked(
     stream_max_bytes: int,
     result_max_bytes: int,
     stop_requested: Callable[[], bool],
+    ready_schema_ref: str,
     started_schema_ref: str,
     exit_schema_ref: str,
     process_platform: ProviderProcessPlatform,
@@ -1678,7 +1531,8 @@ def _supervise_locked(
     result_path = paths["result_path"]
     receipt_path = paths["receipt_path"]
     termination_reason = "completed"
-    returncode = 143
+    returncode: int | None = None
+    native_started = False
     stdout_exceeded = threading.Event()
     result_exceeded = threading.Event()
     stdout_errors: list[BaseException] = []
@@ -1691,6 +1545,16 @@ def _supervise_locked(
     ):
         raise ProviderSupervisorError("provider_supervisor_spool_invalid")
     selected_platform = process_platform.platform_name
+    operation_path = (paths["ready_path"].parent / "supervisor-request.json").resolve()
+    provider_environment = dict(os.environ)
+    provider_environment[PROVIDER_OPERATION_ENV] = str(operation_path)
+    if working_directory is not None:
+        for name in ("META_RESEARCH_PROVIDER_CWD", "META_RESEARCH_HARNESS_WORKSPACE"):
+            supplied = provider_environment.get(name)
+            if supplied is not None and supplied != str(working_directory):
+                raise ProviderSupervisorError("provider_working_directory_conflict")
+        provider_environment["META_RESEARCH_PROVIDER_CWD"] = str(working_directory)
+    ensure_provider_account_current(argv, provider_environment)
     invocation_codex_home: Path | None = None
     result_read_fd: int | None = None
     result_write_fd: int | None = None
@@ -1728,6 +1592,9 @@ def _supervise_locked(
                 provider_job_factory or WindowsProviderJob
             )()
             stack.callback(provider_job.close)
+        elif selected_platform == "posix":
+            provider_job = LinuxProviderJob()
+            stack.callback(provider_job.close)
         prompt_stream = stack.enter_context(
             prompt_path.open("rb", buffering=0)
         )
@@ -1749,9 +1616,7 @@ def _supervise_locked(
                         process_platform=process_platform,
                         provider_job=provider_job,
                     )
-                    if provider_job is None:
-                        process_platform.terminate_process_group(process.pid)
-                except (OSError, ProviderSupervisorError, subprocess.SubprocessError):
+                except (OSError, ProviderSupervisorError, ProviderTreeError, subprocess.SubprocessError):
                     pass  # Preserve the original error and the unsealed spool.
             close_result_pipe()
             for drainer in (stdout_drainer, result_drainer):
@@ -1770,25 +1635,17 @@ def _supervise_locked(
         # writer can still prevent EOF: daemon readers are only an error-path
         # fallback; the normal path below requires both readers to finish.
         stack.push(finish_capture)
+        _write_phase_marker(
+            paths["ready_path"], schema_ref=ready_schema_ref,
+            invocation_hash=invocation_hash, key=key, process_platform=process_platform,
+        )
         if stop_requested():
             termination_reason = "stopped"
             close_result_pipe()
         else:
             try:
-                operation_path = (
-                    paths["ready_path"].parent / "supervisor-request.json"
-                ).resolve()
-                provider_environment = dict(os.environ)
                 if provider_environment.get("CODEX_HOME"):
                     invocation_codex_home = Path(provider_environment["CODEX_HOME"])
-                provider_environment[PROVIDER_OPERATION_ENV] = str(operation_path)
-                if working_directory is not None:
-                    for name in ("META_RESEARCH_PROVIDER_CWD", "META_RESEARCH_HARNESS_WORKSPACE"):
-                        supplied = provider_environment.get(name)
-                        if supplied is not None and supplied != str(working_directory):
-                            raise ProviderSupervisorError("provider_working_directory_conflict")
-                    provider_environment["META_RESEARCH_PROVIDER_CWD"] = str(working_directory)
-                ensure_provider_account_current(provider_argv, provider_environment)
                 spawn_options: dict[str, object] = {
                     "stdin": prompt_stream,
                     "stdout": subprocess.PIPE,
@@ -1805,8 +1662,8 @@ def _supervise_locked(
             except OSError:
                 close_result_pipe()
                 termination_reason = "launch_failed"
-                returncode = 127
             else:
+                native_started = True
                 _write_phase_marker(
                     paths["started_path"],
                     schema_ref=started_schema_ref,
@@ -1898,15 +1755,16 @@ def _supervise_locked(
                 if termination_reason == "completed":
                     assert process.returncode is not None
                     returncode = process.returncode
-                if provider_job is None and process_platform.process_group_running(
-                    process.pid
-                ):
-                    if termination_reason == "completed":
+                if isinstance(provider_job, LinuxProviderJob):
+                    native_result = provider_job.result()
+                    returncode = cast(int | None, native_result["returncode"])
+                    native_started = bool(native_result["native_started"])
+                    if native_result["launch_failed"]:
+                        termination_reason = "launch_failed"
+                    elif not native_started:
+                        termination_reason = "stopped"
+                    elif termination_reason == "completed" and native_result["descendants_terminated"]:
                         termination_reason = "descendant_process"
-                    if not process_platform.terminate_process_group(process.pid):
-                        raise ProviderSupervisorError(
-                            "provider_descendant_cleanup_failed"
-                        )
                 close_result_pipe()
                 stdout_drainer.join(timeout=1.0)
                 if result_drainer is not None:
@@ -1919,8 +1777,6 @@ def _supervise_locked(
                             raise ProviderSupervisorError(
                                 "provider_job_termination_failed"
                             )
-                    else:
-                        process_platform.terminate_process_group(process.pid)
                     stdout_drainer.join(timeout=1.0)
                     if result_drainer is not None:
                         result_drainer.join(timeout=1.0)
@@ -1972,6 +1828,12 @@ def _supervise_locked(
         result_path=result_path,
         returncode=returncode,
         input_bytes=input_bytes,
+        process_tree={
+            "schema_ref": "meta-research/provider-process-tree/v1", "state": "closed",
+            "mechanism": ("not-started" if not native_started else
+                          "linux-subreaper-echild" if selected_platform == "posix" else "windows-job"),
+            **supervisor_host_identity(),
+        },
         termination_reason=termination_reason,
         schema_ref=exit_schema_ref,
         codex_home=invocation_codex_home,
@@ -1984,7 +1846,7 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     try:
         supervise(Path(arguments[0]))
-    except (OSError, ProviderSupervisorError, subprocess.SubprocessError):
+    except (OSError, ProviderSupervisorError, ProviderTreeError, subprocess.SubprocessError):
         return 70
     return 0
 

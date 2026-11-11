@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +21,9 @@ from meta_research.bundle_protocol import (
     TargetCandidate,
     TargetWorkHandle,
     TechnicalBlocker,
+    ContentBindingProof,
+    ReceiptProof,
+    TargetRunHandoff,
     projection_plain_value,
 )
 from meta_research.database import Database
@@ -38,18 +41,17 @@ from meta_research.owners.common import (
     new_ref,
 )
 from meta_research.owners.target_run_runtime import (
-    AR_TARGET_ROOT_WORKSPACE_CONTINUITY_RECEIPT_KIND,
     SQLiteTargetRunAgentAuthority,
     TargetProviderCeilingRecoveryProjection,
-    _decode_target_workspace_continuity_manifest,
     _decode_stored_record,
     _receipt,
-    _target_workspace_continuity_payload,
 )
 from meta_research.runtime_protection import RuntimeEffectIdentity
 from meta_research.target_run_contract import (
     TargetRunContractError,
     validate_technical_blocker_recovery,
+    _bundle_escalation_digest,
+    _validate_terminal_blocker,
 )
 from meta_research.target_run_runtime_contract import (
     TargetCompletionHandoff,
@@ -634,17 +636,17 @@ class SQLiteTargetRootLifecycleAuthority:
                         if len(active_workspaces) == 1
                         else None
                     )
-                    if workspace is None or (
-                        workspace.target_run_ref,
-                        workspace.root_session_ref,
-                        workspace.target_attempt_ref,
-                        workspace.target_fence_ref,
-                    ) != (
-                        old_handle.target_run_ref,
-                        old_handle.root_session_ref,
-                        old_handle.execution_attempt_ref,
-                        old_handle.execution_fence_ref,
-                    ):
+                    accepted_workspace = self._target_agent.query_target_workspace(
+                        old_handle.target_run_ref
+                    )
+                    if (workspace is None or accepted_workspace is None
+                        or workspace.workspace_ref != accepted_workspace.workspace_ref
+                        or (workspace.target_ref, workspace.target_run_ref)
+                        != (old_handle.target_ref, old_handle.target_run_ref)
+                        or not any((workspace.root_session_ref, workspace.target_attempt_ref,
+                                    workspace.target_fence_ref)
+                                   == (item.root_session_ref, item.execution_attempt_ref,
+                                       item.execution_fence_ref) for item in prior_handles)):
                         raise OwnerConflict(
                             "target_root_provider_recovery_workspace_invalid"
                         )
@@ -723,7 +725,7 @@ class SQLiteTargetRootLifecycleAuthority:
                             "INSERT INTO ar_target_root_provider_recoveries "
                             "(transition_ref, recovery_ref, target_ref, ordinal, "
                             "blocker_ref, old_execution_attempt_ref, "
-                            "new_execution_attempt_ref, retired_workspace_ref, "
+                            "new_execution_attempt_ref, "
                             "failed_provider_operation_ref, failure_code, "
                             "blocker_json, blocker_hash, "
                             "transport_receipt_json, transport_receipt_hash, "
@@ -739,7 +741,7 @@ class SQLiteTargetRootLifecycleAuthority:
                             "request_hash, recovered_at) VALUES "
                             "(:transition_ref, :recovery_ref, :target_ref, "
                             ":ordinal, :blocker_ref, :old_attempt_ref, "
-                            ":new_attempt_ref, :retired_workspace_ref, "
+                            ":new_attempt_ref, "
                             ":operation_ref, :failure_code, "
                             ":blocker_json, :blocker_hash, :receipt_json, "
                             ":receipt_hash, :evidence_ref, :evidence_json, "
@@ -758,7 +760,6 @@ class SQLiteTargetRootLifecycleAuthority:
                             "new_attempt_ref": (
                                 replacement_handle.execution_attempt_ref
                             ),
-                            "retired_workspace_ref": workspace.workspace_ref,
                             "operation_ref": issued.evidence.failed_operation_ref,
                             "failure_code": issued.evidence.failure_code,
                             "blocker_json": canonical_json(blocker_value),
@@ -812,18 +813,6 @@ class SQLiteTargetRootLifecycleAuthority:
                                 "transition_ref": transition_ref,
                                 "now": now,
                             },
-                        )
-                    retired_workspace = connection.execute(
-                        text(
-                            "UPDATE ar_target_run_workspaces SET status = "
-                            "'retired' WHERE workspace_ref = :workspace_ref "
-                            "AND status = 'active'"
-                        ),
-                        {"workspace_ref": workspace.workspace_ref},
-                    )
-                    if retired_workspace.rowcount != 1:
-                        raise OwnerConflict(
-                            "target_root_provider_recovery_workspace_invalid"
                         )
                     connection.execute(
                         text(
@@ -1314,7 +1303,7 @@ class SQLiteTargetRootLifecycleAuthority:
             ).first()
         if row is None:
             return None
-        if row.status not in {"running", "finalizing", "completed", "cancelled"}:
+        if row.status not in {"running", "finalizing", "completed", "cancelled", "failed"}:
             raise OwnerConflict("target_root_lifecycle_integrity_invalid")
         return TargetRootLifecycleRecord(
             lifecycle_ref=row.lifecycle_ref,
@@ -1384,21 +1373,6 @@ class SQLiteTargetRootLifecycleAuthority:
                 ),
                 {"target_ref": target_ref},
             ).all()
-            workspace_rows = connection.execute(
-                text(
-                    "SELECT * FROM ar_target_run_workspaces WHERE target_ref "
-                    "= :target_ref ORDER BY ordinal"
-                ),
-                {"target_ref": target_ref},
-            ).all()
-            continuity_rows = connection.execute(
-                text(
-                    "SELECT * FROM ar_target_root_workspace_continuities WHERE "
-                    "target_ref = :target_ref ORDER BY accepted_at, "
-                    "continuity_ref"
-                ),
-                {"target_ref": target_ref},
-            ).all()
 
         handles = tuple(
             self._stored_record(
@@ -1461,7 +1435,7 @@ class SQLiteTargetRootLifecycleAuthority:
                 )
             )
             or (
-                lifecycle.status in {"completed", "cancelled"}
+                lifecycle.status in {"completed", "cancelled", "failed"}
                 and frontier.state != "terminal"
             )
         ):
@@ -1479,11 +1453,6 @@ class SQLiteTargetRootLifecycleAuthority:
 
         recoveries: list[TargetRootProviderRecoveryRecord] = []
         aggregate_evidence: set[str] = set()
-        continuity_by_transition = {
-            str(item.transition_ref): item for item in continuity_rows
-        }
-        if len(continuity_by_transition) != len(continuity_rows):
-            raise OwnerConflict("target_root_handle_history_integrity_invalid")
         for index, row in enumerate(recovery_rows):
             old_handle = handles[index]
             replacement_handle = handles[index + 1]
@@ -1522,39 +1491,6 @@ class SQLiteTargetRootLifecycleAuthority:
                 ("execution_attempt", old_handle.execution_attempt_ref),
                 ("execution_fence", old_handle.execution_fence_ref),
             }
-            retired_workspaces = tuple(
-                item
-                for item in workspace_rows
-                if (
-                    item.target_run_ref,
-                    item.root_session_ref,
-                    item.target_attempt_ref,
-                    item.target_fence_ref,
-                )
-                == (
-                    old_handle.target_run_ref,
-                    old_handle.root_session_ref,
-                    old_handle.execution_attempt_ref,
-                    old_handle.execution_fence_ref,
-                )
-            )
-            successor_workspaces = tuple(
-                item
-                for item in workspace_rows
-                if (
-                    item.target_run_ref,
-                    item.root_session_ref,
-                    item.target_attempt_ref,
-                    item.target_fence_ref,
-                )
-                == (
-                    replacement_handle.target_run_ref,
-                    replacement_handle.root_session_ref,
-                    replacement_handle.execution_attempt_ref,
-                    replacement_handle.execution_fence_ref,
-                )
-            )
-            continuity = continuity_by_transition.get(str(row.transition_ref))
             if (
                 type(recovery_evidence_refs) is not tuple
                 or any(type(item) is not str for item in recovery_evidence_refs)
@@ -1580,20 +1516,6 @@ class SQLiteTargetRootLifecycleAuthority:
                 or row.failure_code != evidence.failure_code
                 or retired_by_transition.get(str(row.transition_ref), set())
                 != expected_retired
-                or len(retired_workspaces) != 1
-                or retired_workspaces[0].status != "retired"
-                or row.retired_workspace_ref
-                != retired_workspaces[0].workspace_ref
-                or len(successor_workspaces) > 1
-                or (continuity is not None and len(successor_workspaces) != 1)
-                or (
-                    continuity is None
-                    and (
-                        index != len(recovery_rows) - 1
-                        or lifecycle.status
-                        not in {"running", "cancelled"}
-                    )
-                )
             ):
                 raise OwnerConflict(
                     "target_root_handle_history_integrity_invalid"
@@ -1636,65 +1558,6 @@ class SQLiteTargetRootLifecycleAuthority:
                 raise OwnerConflict(
                     "target_root_handle_history_authority_invalid"
                 )
-            if continuity is not None:
-                successor_workspace = successor_workspaces[0]
-                _decode_target_workspace_continuity_manifest(
-                    continuity.manifest_json,
-                    continuity.manifest_hash,
-                )
-                continuity_payload = _target_workspace_continuity_payload(
-                    continuity_ref=str(continuity.continuity_ref),
-                    transition_ref=str(row.transition_ref),
-                    target_ref=target_ref,
-                    predecessor_workspace_ref=str(
-                        retired_workspaces[0].workspace_ref
-                    ),
-                    predecessor_workspace_payload_hash=str(
-                        retired_workspaces[0].payload_hash
-                    ),
-                    successor_workspace_ref=str(
-                        successor_workspace.workspace_ref
-                    ),
-                    successor_workspace_payload_hash=str(
-                        successor_workspace.payload_hash
-                    ),
-                    manifest_hash=str(continuity.manifest_hash),
-                )
-                continuity_receipt = _receipt(
-                    "agent_runtime",
-                    AR_TARGET_ROOT_WORKSPACE_CONTINUITY_RECEIPT_KIND,
-                    continuity.receipt_ref,
-                    continuity.continuity_ref,
-                    {
-                        "payload_hash": canonical_hash(continuity_payload),
-                        **continuity_payload,
-                    },
-                )
-                if (
-                    continuity.target_ref != target_ref
-                    or continuity.predecessor_workspace_ref
-                    != retired_workspaces[0].workspace_ref
-                    or continuity.successor_workspace_ref
-                    != successor_workspace.workspace_ref
-                    or continuity.payload_json
-                    != canonical_json(continuity_payload)
-                    or continuity.payload_hash
-                    != canonical_hash(continuity_payload)
-                    or continuity.request_hash
-                    != canonical_hash(
-                        {
-                            "command": (
-                                "accept_target_root_workspace_continuity"
-                            ),
-                            **continuity_payload,
-                        }
-                    )
-                    or continuity.receipt_hash
-                    != continuity_receipt.payload_hash
-                ):
-                    raise OwnerConflict(
-                        "target_root_handle_history_integrity_invalid"
-                    )
             aggregate_evidence.update(recovery_evidence_refs)
             recoveries.append(
                 TargetRootProviderRecoveryRecord(
@@ -1712,9 +1575,7 @@ class SQLiteTargetRootLifecycleAuthority:
             )
         if set(retired_by_transition) != {
             item.transition_ref for item in recoveries
-        } or not set(continuity_by_transition).issubset(
-            {item.transition_ref for item in recoveries}
-        ):
+        }:
             raise OwnerConflict("target_root_handle_history_integrity_invalid")
         return TargetRootHandleHistory(
             target_ref=target_ref,
@@ -1955,11 +1816,11 @@ class SQLiteTargetRootLifecycleAuthority:
                 ),
                 {"target_ref": target_ref},
             ).first()
-            if row is None or row.status not in {"running", "cancelled"}:
+            if row is None or row.status not in {"running", "cancelled", "failed"}:
                 raise OwnerConflict("target_root_cancel_not_running")
             if row.cancel_ref is not None:
                 if row.cancel_reason != normalized_reason:
-                    if row.status == "cancelled":
+                    if row.status in {"cancelled", "failed"}:
                         raise OwnerConflict("target_root_cancel_not_running")
                     raise OwnerConflict("target_root_cancel_reason_conflict")
             else:
@@ -2209,6 +2070,84 @@ class SQLiteTargetRootLifecycleAuthority:
                 "target_run_ref": work["run_ref"],
                 "intent_ref": intent_ref,
             }
+
+    def query_unknown_failure_handoff(self, target_ref: str) -> TargetRunHandoff:
+        history = self.query_handle_history(target_ref)
+        if history is None:
+            raise OwnerConflict("target_root_unknown_failure_invalid")
+        handle = history.handle_history[-1]
+        with self._database.read() as connection:
+            return self.verify_unknown_failure_handoff(connection, handle, history)
+
+    def verify_unknown_failure_handoff(self, connection, handle, history) -> TargetRunHandoff:
+        """Bind failed logical work to the original unresolved native operation.
+
+        This receipt records interruption and reconciliation responsibility. It
+        does not certify process termination or an external effect outcome.
+        """
+        row = connection.execute(text(
+            "SELECT l.*,o.operation_ref,o.invocation_hash,o.status AS operation_status,"
+            "o.outcome_code,h.attempt_ref AS harness_attempt,h.fence_ref AS harness_fence,"
+            "f.state AS frontier_state,f.terminal_fact_ref "
+            "FROM ar_target_root_lifecycles l JOIN ar_harness_runs h "
+            "ON h.run_ref=l.target_run_ref JOIN ar_harness_provider_operations o "
+            "ON o.run_ref=h.run_ref JOIN ar_target_frontier_entries f ON f.target_ref=l.target_ref "
+            "WHERE l.target_ref=:target AND o.generation="
+            "(SELECT MAX(generation) FROM ar_harness_provider_operations WHERE run_ref=h.run_ref)"
+        ), {"target": handle.target_ref}).first()
+        if (row is None or row.status not in {"running", "failed"}
+                or row.cancel_ref is None or row.cancel_requested_at is None
+                or row.completion_ref is not None or row.cancelled_at is not None
+                or (row.status == "running" and (
+                    row.operation_status != "unknown_outcome"
+                    or row.outcome_code != "provider_terminal_proof_missing"))
+                or (row.target_run_ref, row.root_session_ref, row.target_attempt_ref, row.target_fence_ref)
+                != (handle.target_run_ref, handle.root_session_ref, handle.execution_attempt_ref, handle.execution_fence_ref)
+                or row.harness_attempt != handle.execution_attempt_ref
+                or row.harness_fence != handle.execution_fence_ref):
+            raise OwnerConflict("target_root_unknown_failure_invalid")
+        digest = canonical_hash({"cancel_ref": row.cancel_ref, "operation_ref": row.operation_ref,
+                                 "invocation_hash": row.invocation_hash,
+                                 "handle": projection_plain_value(handle)})
+        blocker_ref = "target-root-interruption:" + digest
+        # Once published, this is a historical interruption fact. A later
+        # authenticated receipt may reconcile this same operation in place;
+        # it cannot erase the already accepted failure or create new work.
+        if row.status == "failed" and (
+                row.frontier_state != "terminal" or row.terminal_fact_ref != blocker_ref):
+            raise OwnerConflict("target_root_unknown_failure_integrity_invalid")
+        blocker = TechnicalBlocker(
+            target_ref=handle.target_ref, target_run_ref=handle.target_run_ref,
+            execution_attempt_ref=handle.execution_attempt_ref, execution_fence_ref=handle.execution_fence_ref,
+            blocker_ref=blocker_ref,
+            blocker_receipt=ReceiptProof("target-root-failure:" + digest, blocker_ref, True, True, True),
+            reason="provider_terminal_proof_missing", recovery_ready=False,
+            bundle_decision_required=True, escalation_scope="authority",
+            pending_obligation_refs=(str(row.operation_ref),),
+        )
+        escalation_hash = _bundle_escalation_digest(blocker)
+        blocker = replace(blocker,
+            escalation_evidence=ContentBindingProof(str(row.operation_ref), escalation_hash),
+            escalation_receipt=ReceiptProof("target-root-escalation:" + digest, escalation_hash, True, True, True))
+        return TargetRunHandoff(
+            handle_history=history.handle_history, code_review_preflights=(), stop_decisions=(),
+            recovered_blockers=history.recovered_blockers,
+            recovery_evidence_refs=tuple(sorted(set(history.recovery_evidence_refs) |
+                                              set(_validate_terminal_blocker(blocker, handle)))),
+            terminal=blocker,
+        )
+
+    def mark_failed_unknown(self, *, target_ref: str) -> TargetRootLifecycleRecord:
+        publisher = self._work_disposition_publisher
+        if publisher is None:
+            raise OwnerConflict("target_root_unknown_failure_authority_unavailable")
+        handoff = self.query_unknown_failure_handoff(target_ref)
+        publisher.publish_target_run_handoff(
+            handoff, idempotency_key=handoff.terminal.blocker_ref)
+        failed = self.query(target_ref)
+        if failed is None or failed.status != "failed":
+            raise OwnerConflict("target_root_unknown_failure_integrity_invalid")
+        return failed
 
     def mark_cancelled(self, *, target_ref: str) -> TargetRootLifecycleRecord:
         """Record a verified mechanical stop without minting formal results."""

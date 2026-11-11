@@ -29,6 +29,28 @@ from meta_research.paths import prepare_data_root
 from meta_research.runtime_protection import InhibitorLease
 
 
+@pytest.mark.parametrize("native_signal", (15, 9))
+def test_signed_supervisor_receipt_preserves_native_signal_returncode(
+    tmp_path: Path, native_signal: int,
+) -> None:
+    transport = HarnessSupervisorTransport(tmp_path / "signal-transport")
+    working = tmp_path / "working"
+    working.mkdir()
+    completed = transport(
+        [sys.executable, "-c", f"import os; os.kill(os.getpid(),{native_signal})"],
+        "Observe the native signal exit.",
+        10.0,
+        {
+            "META_RESEARCH_HARNESS_FAMILY": "codex",
+            "META_RESEARCH_PROVIDER_OPERATION_REF": "target-run:signal:harness_turn:1",
+            "META_RESEARCH_OWNER_INVOCATION_HASH": "e" * 64,
+            "META_RESEARCH_HARNESS_WORKSPACE": str(working),
+        },
+    )
+    assert completed.returncode == -native_signal
+    assert completed.meta_research_transport_receipt["provider_returncode"] == -native_signal
+
+
 _REAL_CODEX_CHILD_LEDGER = Path(
     "/root/.codex-openai-account/sessions/2026/08/24/"
     "rollout-2026-08-24T07-44-41-01a032ba-8aec-7f32-a9ce-736ca44fa8a8.jsonl"
@@ -4070,13 +4092,17 @@ def test_signed_supervisor_ceiling_fences_attempt_until_explicit_recovery(
     counter = tmp_path / "provider-count"
     provider = tmp_path / "provider.py"
     provider.write_text(
-        "import json, pathlib, sys, time\n"
+        "import json, os, pathlib, sys, time\n"
         f"counter = pathlib.Path({str(counter)!r})\n"
         "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "counter.write_text(str(count))\n"
         "sys.stdin.read()\n"
         "if count == 1:\n"
-        "    time.sleep(2)\n"
+        "    if os.fork() == 0:\n"
+        "        os.close(1)\n"
+        "        os.close(2)\n"
+        "        time.sleep(2)\n"
+        "        os._exit(0)\n"
         "else:\n"
         "    print(json.dumps({'type':'thread.started',"
         "'thread_id':'recovered-root'}), flush=True)\n"

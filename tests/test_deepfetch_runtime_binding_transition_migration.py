@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import json
 import sqlite3
 from pathlib import Path
@@ -138,7 +140,7 @@ def test_0038_backfills_attempt_binding_and_session_without_losing_contract(
                 (attempt_ref,),
             )
 
-    assert version == ("0038_deepfetch_binding_audit",)
+    assert version == (schema_head(),)
     assert migrated == (
         binding_json,
         binding_hash,

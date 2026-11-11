@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 from pathlib import Path
 
 from sqlalchemy import create_engine, inspect, text
@@ -54,7 +56,7 @@ def test_target_root_lifecycle_migration_is_single_head_and_adds_owner_tables(
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "0038_deepfetch_binding_audit"
+            ).scalar_one() == schema_head()
             ar = connection.execute(
                 text(
                     "SELECT target_root_lifecycle_count, "

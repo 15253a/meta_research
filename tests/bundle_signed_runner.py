@@ -1,3 +1,5 @@
+
+from provider_supervisor_support import closed_tree_fixture
 from pathlib import Path
 from meta_research.provider_supervisor import read_supervisor_request, read_transport_key_for_operation, write_exit_receipt
 from test_bundle_skill_adapter import _SequenceRunner
@@ -10,7 +12,7 @@ class _SignedDispatchRunner(_SequenceRunner):
         _, key = read_transport_key_for_operation(request_path.parent)
         sealed = read_supervisor_request(request_path, key)
         write_exit_receipt(
-            Path(sealed["receipt_path"]), key=key,
+            Path(sealed["receipt_path"]), process_tree=closed_tree_fixture(), key=key,
             invocation_hash=sealed["invocation_hash"],
             prompt_path=Path(sealed["prompt_path"]),
             schema_path=Path(sealed["schema_path"]), stdout_path=stdout_path,

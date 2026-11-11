@@ -240,3 +240,18 @@ def test_missing_owner_evidence_waits_then_reconciles_same_operation(interrupted
     assert reconciled.status == "failed"
     assert owner.query_run(request.request_ref).native_session_ref == "retained-native-session"
     assert runner.calls == 1
+
+
+def test_same_frozen_input_without_terminal_receipt_cannot_relaunch_unknown(interrupted_root):
+    _database, owner, request, runner, runtime = interrupted_root
+    run = owner.query_run(request.request_ref)
+    original = owner.latest_operation(run.run_ref)
+    assert original.frozen_prompt
+    runner.request_path.with_name("supervisor-exit.json").unlink()
+    with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
+        runtime().run_or_resume_target_root(request.request_ref, prompt=original.frozen_prompt,
+                                           mcp_base_url="http://127.0.0.1:8999")
+    assert runner.calls == 1
+    retained = owner.latest_operation(run.run_ref)
+    assert retained.operation_ref == original.operation_ref
+    assert retained.status == "unknown_outcome"

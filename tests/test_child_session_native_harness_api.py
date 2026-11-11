@@ -3,6 +3,8 @@
 The fixture seeds persisted Owner records and signed spool bytes. It never
 admits or executes a new Claude Harness operation in the current runtime.
 """
+
+from provider_supervisor_support import closed_tree_fixture
 import json
 
 from fastapi.testclient import TestClient
@@ -72,7 +74,7 @@ def seed_signed_native_stream(runtime, run, source_bytes, native_root):
     prompt.write_text("Historical native lifecycle fixture", encoding="utf-8")
     schema.write_text('{"type":"object"}', encoding="utf-8")
     _, key = ensure_transport_key(store._workspace)
-    write_exit_receipt(directory / "supervisor-exit.json", key=key,
+    write_exit_receipt(directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key,
         invocation_hash=invocation_hash, prompt_path=prompt, schema_path=schema,
         stdout_path=source, result_path=directory / "last-message.json", returncode=0,
         input_bytes=prompt.stat().st_size, schema_ref=SUPERVISOR_EXIT_SCHEMA_V2)

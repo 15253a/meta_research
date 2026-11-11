@@ -76,24 +76,17 @@ def _call(transport):
     })
 
 
-def test_real_durable_transport_converges_exited_provider_without_reexecution(tmp_path):
+def test_real_durable_transport_keeps_lost_provider_unknown(tmp_path):
+    from meta_research.harness_adapters import HarnessRunnerOutcomeUnknown
     transport, runner = _transport(tmp_path)
-    completed = _call(transport)
-    assert completed.returncode == 143
-    assert completed.stdout.encode() == STDOUT
-    assert completed.meta_research_transport_receipt['termination_reason'] == 'stopped'
+    for _ in range(2):
+        with pytest.raises(HarnessRunnerOutcomeUnknown):
+            _call(transport)
     directory = runner.request_path.parent
-    _, key = read_transport_key_for_operation(directory)
-    recovery = read_transport_envelope(directory / 'supervisor-recovery.json', key)
-    assert recovery['reason'] == 'orphaned_provider_without_exit_receipt'
-    assert recovery['recorded_bridge_returncode'] == 101
-    assert recovery['boundary_returncode'] == 143
-    assert recovery['bridge_result_file_hash'] == hashlib.sha256(BRIDGE).hexdigest()
+    assert not (directory / 'supervisor-exit.json').exists()
+    assert not (directory / 'supervisor-recovery.json').exists()
+    assert (directory / 'stdout.jsonl').read_bytes() == STDOUT
     assert (directory / '.last-message.supervisor.tmp').read_bytes() == BRIDGE
-    assert not (directory / 'last-message.json').exists()
-    before = (directory / 'supervisor-exit.json').read_bytes()
-    assert _call(transport).returncode == 143
-    assert (directory / 'supervisor-exit.json').read_bytes() == before
 
 
 class _InterruptedRunner(_OrphanRunner):
@@ -135,7 +128,7 @@ def test_live_process_or_reused_pid_never_sealed_or_signalled(tmp_path, kind):
             (request_path.parent / 'supervisor-ready.json').unlink()
             (request_path.parent / 'provider-started.json').unlink()
             _seed(request_path, **{('supervisor_pid' if kind == 'supervisor' else 'provider_pid'): process.pid})
-        assert not module._seal_absent_provider_interruption(request_path, process_platform=module.StreamingProviderProcessPlatform())
+        assert module.main([str(request_path)]) == 70
         assert process.poll() is None
         assert not (request_path.parent / 'supervisor-exit.json').exists()
     finally:
@@ -168,13 +161,12 @@ def test_damaged_identity_or_seal_is_not_recovered(tmp_path, damage):
             value['provider_process_id'] = True
         marker.unlink()
         write_transport_envelope(marker, value, key)
-    with pytest.raises((ProviderSupervisorError, OSError)):
-        module._seal_absent_provider_interruption(request_path, process_platform=module.StreamingProviderProcessPlatform())
+    assert module.main([str(request_path)]) == 70
     assert not (directory / 'supervisor-exit.json').exists()
 
 
 @pytest.mark.parametrize('bridge', (b'{"schema_ref":"meta-research/harness-bridge-result/v1","returncode":0}', b'{', None))
-def test_absence_can_only_seal_failure_even_with_success_or_missing_bridge(tmp_path, bridge):
+def test_absence_never_seals_with_success_or_missing_bridge(tmp_path, bridge):
     import meta_research.streaming_provider_supervisor as module
     transport, request_path = _pending(tmp_path)
     bridge_path = request_path.parent / '.last-message.supervisor.tmp'
@@ -182,15 +174,18 @@ def test_absence_can_only_seal_failure_even_with_success_or_missing_bridge(tmp_p
         bridge_path.unlink()
     else:
         bridge_path.write_bytes(bridge)
-    assert module._seal_absent_provider_interruption(request_path, process_platform=module.StreamingProviderProcessPlatform())
-    assert _call(transport).returncode == 143
+    from meta_research.harness_adapters import HarnessRunnerOutcomeUnknown
+    assert module.main([str(request_path)]) == 70
+    with pytest.raises(HarnessRunnerOutcomeUnknown):
+        _call(transport)
     assert (request_path.parent / 'stdout.jsonl').read_bytes() == STDOUT
 
 
-def test_two_unknown_reconciliations_finish_then_owner_admits_next_turn(tmp_path, monkeypatch):
+def test_repeated_unknown_reconciliation_never_admits_next_turn(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from sqlalchemy import text
     from meta_research.harness import HarnessRuntime, HarnessAdmission, HarnessAdmissionError, _probe_run_from_owner
+    from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError
     from meta_research.harness_adapters import CodexHarnessAdapter
     from meta_research.semantic_mcp import McpConnection
     from meta_research.runtime_protection import RuntimeProtection, RuntimeBoundaryRecorder, RuntimeEventLogger
@@ -229,24 +224,14 @@ def test_two_unknown_reconciliations_finish_then_owner_admits_next_turn(tmp_path
                 assert owner.begin_reconciliation(operation_ref) == generation
             with pytest.raises(HarnessAdmissionError) as failure:
                 runtime._invoke_provider_turn(admission, request, prompt='Retain exact Target input.', mcp_base_url='http://127.0.0.1:8999', operation_ref=operation_ref, owner_invocation_hash='f' * 64, resume=False, reconciling=generation > 0, reconciliation_generation=generation)
-            assert failure.value.code == ('provider_outcome_unknown' if generation < 2 else 'provider_stopped')
+            assert failure.value.code == 'provider_outcome_unknown'
             latest = owner.latest_operation(run.run_ref)
-            assert latest.status == ('unknown_outcome' if generation < 2 else 'failed')
+            assert latest.status == 'unknown_outcome'
         with database.read() as connection:
-            assert connection.execute(text('SELECT completed_at FROM ar_harness_provider_operations WHERE operation_ref=:ref'), {'ref': operation_ref}).scalar_one() is not None
-        recovered = owner.reopen_failed_target_root(request.request_ref)
-        assert recovered.reopened
-        assert recovered.run.native_session_ref == 'orphan-native-session'
-        assert recovered.run.status == 'executed'
-        assert (recovered.run.run_ref, recovered.run.root_session_ref, recovered.run.attempt_ref, recovered.run.fence_ref) == (run.run_ref, run.root_session_ref, run.attempt_ref, run.fence_ref)
-        _replace_channel(owner, request, suffix='after-orphan')
-        next_ref = f'{run.run_ref}:harness_turn:2'
-        owner.start_operation(run_ref=run.run_ref, operation_ref=next_ref, generation=2, invocation_hash='e' * 64, resume=True)
-        assert owner.latest_operation(run.run_ref).operation_ref == next_ref
-        events = [json.loads(line) for line in (tmp_path / 'runtime.jsonl').read_text().splitlines()]
-        finished = [event for event in events if event['status'] == 'finished']
-        assert len(finished) == 3
-        assert finished[-1]['active_count'] == 0
+            assert connection.execute(text('SELECT completed_at FROM ar_harness_provider_operations WHERE operation_ref=:ref'), {'ref': operation_ref}).scalar_one() is None
+        with pytest.raises(AgentRuntimeHarnessError):
+            owner.reopen_failed_target_root(request.request_ref)
+        assert owner.latest_operation(run.run_ref).operation_ref == operation_ref
     finally:
         protection.close()
         database.close()
@@ -267,14 +252,16 @@ def test_orphan_failure_does_not_reopen_explicit_cancel(tmp_path, monkeypatch, a
         lifecycle = SQLiteTargetRootLifecycleAuthority(database, DurableFeed(database), None)
         intent = lifecycle.request_cancel(handle.target_ref, reason='Explicit operator stop')
         transport, _ = _transport(tmp_path)
-        assert _call(transport).returncode == 143
+        from meta_research.harness_adapters import HarnessRunnerOutcomeUnknown
+        with pytest.raises(HarnessRunnerOutcomeUnknown):
+            _call(transport)
         owner.record_operation_failure(operation_ref, 'provider_stopped')
         if acknowledged:
             lifecycle.mark_cancelled(target_ref=handle.target_ref)
         with pytest.raises(AgentRuntimeHarnessError, match='target_root_failure_recovery_unsafe'):
             owner.reopen_failed_target_root(request.request_ref)
         assert lifecycle.query(handle.target_ref).cancel_ref == intent.cancel_ref
-        assert owner.query_run(request.request_ref).status == 'failed'
+        assert owner.query_run(request.request_ref).status == 'running'
         assert owner.next_operation_generation(run.run_ref) == 2
         assert owner.latest_operation(run.run_ref).operation_ref == operation_ref
     finally:

@@ -484,7 +484,7 @@ def test_target_harness_records_reconciled_native_terminal_failure(tmp_path, sta
     if os.name != 'posix':
         pytest.skip('The production durable provider boundary runs on Linux')
     from meta_research.harness import HarnessAdmissionError
-    from meta_research.harness_adapters import CodexHarnessAdapter
+    from meta_research.harness_adapters import CodexHarnessAdapter, HarnessSupervisorTransport
     from test_target_root_finalizer import _current_bundle_runtime, _admit_independent_target_root
     server = tmp_path / 'lost-target-codex'
     _lost_start_server(server)
@@ -495,8 +495,9 @@ def test_target_harness_records_reconciled_native_terminal_failure(tmp_path, sta
         _target, _, _, admission, _ = _admit_independent_target_root(runtime)
         # Replace only the external native-provider boundary after the fixture's
         # existing conformance setup. All HC/Harness/Owner paths remain real.
+        transport_root = runtime.harnesses._target_raw_output_store._workspace
         runtime.harnesses._adapters['codex'] = CodexHarnessAdapter(
-            tmp_path / 'native-target-provider', executable=str(server))
+            transport_root, executable=str(server), runner=HarnessSupervisorTransport(transport_root))
         with pytest.raises(HarnessAdmissionError, match='provider_native_turn_' + status):
             runtime.harnesses.run_or_resume_target_root(admission.run.request_ref,
                 prompt='One bounded exact native Target operation.', mcp_base_url='http://127.0.0.1:8999')
@@ -505,7 +506,7 @@ def test_target_harness_records_reconciled_native_terminal_failure(tmp_path, sta
         calls = [json.loads(line)['method'] for line in server.with_suffix('.requests').read_text().splitlines()]
         assert calls.count('turn/start') == 1
         assert calls.count('thread/read') == 1
-        proofs = list((tmp_path / 'native-target-provider').rglob('native-reconciled.json'))
+        proofs = list(transport_root.rglob('native-reconciled.json'))
         assert len(proofs) == 1
         assert json.loads(proofs[0].read_text())['payload']['turn']['status'] == status
     finally:

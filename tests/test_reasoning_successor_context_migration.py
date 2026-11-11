@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import sqlite3
 from importlib.resources import files
 from pathlib import Path
@@ -131,7 +133,7 @@ def test_0033_reasoning_successor_context_round_trips_from_0032(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0038_deepfetch_binding_audit",)
+        ).fetchone() == (schema_head(),)
         assert connection.execute(
             "PRAGMA foreign_key_list(rg_question_selection_facts)"
         ).fetchall() == []

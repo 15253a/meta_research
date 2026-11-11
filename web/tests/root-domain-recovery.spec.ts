@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 
-async function workspace(page: Page) {
+async function workspace(page: Page, proofMissing = false) {
   const snapshot = JSON.parse(await readFile(resolve("tests/snapshot-before.json"), "utf8"));
   const foreground = { ...snapshot.research_control.foreground, stage: "bundle", status: "active" };
   snapshot.research_control.foreground = foreground;
@@ -31,10 +31,13 @@ async function workspace(page: Page) {
         observed_at: Date.now() / 1000, limited: false, reasons: [], active_session_refs: captured === "root-data-a" ? ["same-session"] : [],
         sessions: [{ session_ref: "same-session", root_session_ref: "same-root", kind: "target", title: captured === "root-data-a" ? "实例 A 执行中的 Target" : "实例 B 等待中的 Target",
           short_title: "T1", stage: "bundle", related_stages: ["bundle"], scope_label: "当前轮", owner_session_ref: null,
-          status: captured === "root-data-a" ? "executing" : "waiting", is_current: true, is_executing: captured === "root-data-a",
+          status: proofMissing ? "failed" : captured === "root-data-a" ? "executing" : "waiting", is_current: true, is_executing: !proofMissing && captured === "root-data-a",
           run_ref: "same-target-run", target_ref: "same-target", cycle_ref: foreground.cycle_ref, question_ref: foreground.question_ref,
-          created_at: 1, updated_at: Date.now() / 1000, operations: [] }] });
+          created_at: 1, updated_at: Date.now() / 1000, operations: proofMissing ? [{ operation_ref: "original-unknown-operation", label: "执行 1", phase: "target-turn",
+            status: "waiting", created_at: 1, updated_at: 1, reason: "provider_terminal_proof_missing",
+            terminal_proof_diagnostic: { provider_operation_ref: "original-unknown-operation", reasons: ["provider_supervisor_seal_invalid"] } }] : [] }] });
     }
+    if (path.endsWith("/output")) return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ detail: { code: "root_session_output_unavailable" } }) });
     if (path === "/api/v1/preferences") return json({ output_language: "zh" });
     if (path === "/api/v1/events") return route.fulfill({ contentType: "text/event-stream", body: "" });
     if (path === "/api/v1/research-overview") return json({ schema_ref: "meta-research/research-overview/v1", status: "ready",
@@ -63,4 +66,16 @@ for (const detailed of [false, true]) test(`${detailed ? "workspace" : "home"} d
   app.release();
   if (detailed) await expect(page.locator(".root-conversations")).toContainText("实例 B 等待中的 Target");
   else await expect(observation).toHaveText("实例 B 等待");
+});
+
+test("missing termination proof remains visible even when original output cannot be read", async ({ page }) => {
+  await workspace(page, true);
+  await page.goto("http://localhost:18774/?workspace=1");
+  const operation = page.locator('[data-operation-ref="original-unknown-operation"]');
+  await expect(operation).toContainText("尚不能确认旧执行已结束，系统不会据此启动后续执行");
+  await expect(operation).toContainText("原操作仍保留并等待对账");
+  await operation.getByText("终态证据详情", { exact: true }).click();
+  await expect(operation).toContainText("original-unknown-operation");
+  await expect(operation).toContainText("provider_supervisor_seal_invalid");
+  await expect(operation).toContainText("部分记录暂时无法读取");
 });
