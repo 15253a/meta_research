@@ -47,7 +47,7 @@ function mount(props) {
     useEffect(effect, deps) { const i = cursor++; if (!effects[i] || deps.some((v, k) => v !== effects[i][k])) {
       effects[i] = deps; pending.push(effect);
     } },
-    TargetTerminalDialog: "TargetTerminalDialog", ExperimentLogs: "ExperimentLogs",
+    TargetTerminalDialog: "TargetTerminalDialog", ExperimentLogs: "ExperimentLogs", MetaTrace: "MetaTrace",
   };
   vm.runInNewContext(compiled, context);
   const render = () => { cursor = 0; tree = context.exports.launcher({ ...props, onOpenOutput() { outputOpens++; } }); return tree; };
