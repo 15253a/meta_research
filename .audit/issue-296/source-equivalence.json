@@ -1,0 +1,51 @@
+{
+  "validated_source_commit": "debbbd28d15751077c1b6e1eed46880109663f7e",
+  "validated_source_tree": "73922c9c490948c42775c8d126bd405301b6fac3",
+  "comparisons": [
+    {
+      "label": "final-backend02",
+      "archive_sha256": "3e5bf0ad5ca56fbc971a4cfc27ed082cd6cd21b16298f7e33951ca1e5aaa6bd0",
+      "different_files": [
+        "src/meta_research/web_dist/assets/index-D4VhawRe.js",
+        "src/meta_research/web_dist/assets/index-tpvNNB6h.js",
+        "src/meta_research/web_dist/index.html",
+        "tests/test_issue296_gc_read_dependency.py",
+        "web/tests/research-assets.spec.ts"
+      ],
+      "non_generated_product_differences": []
+    },
+    {
+      "label": "final-browser03",
+      "archive_sha256": "065ee98b17aea2ca640d7d61ef93926c65baf454ce13c01b3f89783e0abea076",
+      "different_files": [
+        "src/meta_research/web_dist/assets/index-D4VhawRe.js",
+        "src/meta_research/web_dist/assets/index-tpvNNB6h.js",
+        "src/meta_research/web_dist/index.html",
+        "tests/test_issue296_gc_read_dependency.py"
+      ],
+      "non_generated_product_differences": []
+    },
+    {
+      "label": "gc-reading-dependency01",
+      "archive_sha256": "7709f6d86168243bdfcf63af92e532411f48800aa2830748b886f77fc0f2b7c2",
+      "different_files": [
+        "src/meta_research/web_dist/assets/index-D4VhawRe.js",
+        "src/meta_research/web_dist/assets/index-tpvNNB6h.js",
+        "src/meta_research/web_dist/index.html"
+      ],
+      "non_generated_product_differences": []
+    },
+    {
+      "label": "response-time-local01",
+      "archive_sha256": "d511e893621fa39cfe6960897fffe552adc96931a524802d9cdbc002b2adc547",
+      "different_files": [
+        "src/meta_research/web_dist/assets/index-D4VhawRe.js",
+        "src/meta_research/web_dist/assets/index-tpvNNB6h.js",
+        "src/meta_research/web_dist/index.html",
+        "tests/test_issue296_gc_read_dependency.py",
+        "web/tests/research-assets.spec.ts"
+      ],
+      "non_generated_product_differences": []
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+  "origin": "env/runs/response-time-local01",
+  "files": {
+    "assets/favicon.svg": "9af5b0493df50798741bd5e6d82d041a1c04cb1c733c87c6885c475d2dbc2fef",
+    "assets/index-CLC2XBFr.css": "6a7e311660af69412cf1331a45b865e929263b574e321c3df6c1fd384be6fcb1",
+    "assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+    "index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2"
+  },
+  "final_browser03_files_equal": true
+}

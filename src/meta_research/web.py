@@ -3999,6 +3999,10 @@ async def _process_target_runs(
             target_refs = await asyncio.to_thread(
                 runtime.owners.agent_runtime.list_target_root_work_refs
             )
+            reconciliation_refs = await asyncio.to_thread(
+                runtime.owners.agent_runtime.list_target_root_reconciliation_refs
+            )
+            target_refs = tuple(dict.fromkeys((*target_refs, *reconciliation_refs)))
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("TargetRun frontier discovery failed unexpectedly")

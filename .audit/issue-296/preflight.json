@@ -1,0 +1,38 @@
+{
+  "issue-262": {
+    "state": "open",
+    "updated_at": "2026-11-10T09:35:42Z",
+    "assignees": []
+  },
+  "issue-274": {
+    "state": "open",
+    "updated_at": "2026-11-10T18:29:12Z",
+    "assignees": [
+      "15253a"
+    ]
+  },
+  "issue-295": {
+    "state": "open",
+    "updated_at": "2026-11-10T18:29:16Z",
+    "assignees": []
+  },
+  "issue-296": {
+    "state": "open",
+    "updated_at": "2026-11-10T09:35:40Z",
+    "assignees": []
+  },
+  "comments-262": 1,
+  "comments-274": 2,
+  "comments-295": 2,
+  "comments-296": 0,
+  "blocked-by-274": 19,
+  "blocked-by-295": 0,
+  "blocked-by-296": 0,
+  "base": {
+    "sha": "c2392b4b37964d963ce1477a65025e252c7802b7",
+    "protected": false
+  },
+  "rules": 0,
+  "runs": "saved",
+  "observed_at": "2026-11-11T15:08:32.321323+00:00"
+}

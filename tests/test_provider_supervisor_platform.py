@@ -28,6 +28,7 @@ from meta_research.provider_supervisor import (
     write_supervisor_request,
     write_supervisor_stop_request,
     write_transport_envelope,
+    write_exit_receipt,
 )
 
 
@@ -313,7 +314,16 @@ def test_windows_stop_uses_the_sealed_operation_control_without_proc(
                 invocation_hash=invocation_hash,
             ):
                 stop_seen.set()
-                (operation / "supervisor-exit.json").touch()
+                for name in ("prompt.txt", "output-schema.json", "stdout.jsonl", "last-message.json"):
+                    (operation / name).write_text("")
+                write_exit_receipt(operation / "supervisor-exit.json", key=key,
+                    invocation_hash=invocation_hash, prompt_path=operation / "prompt.txt",
+                    schema_path=operation / "output-schema.json", stdout_path=operation / "stdout.jsonl",
+                    result_path=operation / "last-message.json", returncode=1, input_bytes=0,
+                    termination_reason="stopped", schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+                    process_tree={"schema_ref": "meta-research/provider-process-tree/v1",
+                        "state": "closed", "mechanism": "windows-job",
+                        "boot_identity_hash": None, "host_identity_hash": "a" * 64})
                 return
             time.sleep(0.01)
 
@@ -366,7 +376,7 @@ def test_windows_provider_result_target_is_a_private_file_not_proc(
 
 
 def test_windows_never_started_proof_uses_the_operation_lock_not_proc(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     operation = tmp_path / "provider-operations" / "operation" / "phase"
     operation.mkdir(parents=True)
@@ -381,26 +391,31 @@ def test_windows_never_started_proof_uses_the_operation_lock_not_proc(
         },
         b"k" * 32,
     )
-    old = time.time() - 30
-    os.utime(request_path, (old, old))
+    held = True
+    class TestLock:
+        def __init__(self, path, *, platform_name):
+            assert path.name == "supervisor.lock" and platform_name == "nt"
+        def acquire(self, *, blocking):
+            assert blocking is False
+            return not held
+        def release(self):
+            pass
+    monkeypatch.setattr("meta_research.provider_supervisor.SupervisorFileLock", TestLock)
 
     assert not supervisor_request_never_started(
         operation,
         key=b"k" * 32,
         invocation_hash=invocation_hash,
         request_schema=request_schema,
-        now=old + 30,
         platform_name="nt",
-        supervisor_lock_held=lambda path: path.name == "supervisor.lock",
     )
+    held = False
     assert supervisor_request_never_started(
         operation,
         key=b"k" * 32,
         invocation_hash=invocation_hash,
         request_schema=request_schema,
-        now=old + 30,
         platform_name="nt",
-        supervisor_lock_held=lambda _path: False,
     )
 
 

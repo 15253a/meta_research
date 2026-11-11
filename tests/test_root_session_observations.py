@@ -1,3 +1,5 @@
+
+from provider_supervisor_support import closed_tree_fixture
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,7 +156,7 @@ def test_targets_keep_independent_roots_and_waiting_bundle_is_not_active(root_re
             "created_at": 10.0 + index, "updated_at": 20.0 + index})
     monkeypatch.setattr(reader, "_target_rows", lambda *args: roots)
     monkeypatch.setattr(reader, "_target_operations", lambda connection, row: (
-        [{"operation_ref": "target-call-1", "status": "running", "generation": 1,
+        [{"operation_ref": "target-call-1", "status": "running", "generation": 1, "outcome_code": None,
           "created_at": 15.0, "completed_at": None}] if row["target_ref"] == "target-1" else []))
     store = SimpleNamespace(_operation_bindings={"target-call-1": ("a" * 64, "codex")},
                             _source_path=lambda _hash: Path("/fixture/stdout.jsonl"))
@@ -370,7 +372,7 @@ def target_history_reader(tmp_path, monkeypatch):
             (directory / "output-schema.json").write_text('{"type":"object"}')
             (directory / "stdout.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": native}) + "\n" +
                 json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": f"raw call {index}"}}) + "\n")
-            write_exit_receipt(directory / "supervisor-exit.json", key=key, invocation_hash=digest,
+            write_exit_receipt(directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key, invocation_hash=digest,
                 prompt_path=directory / "prompt.txt", schema_path=directory / "output-schema.json",
                 stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
                 returncode=124, input_bytes=0, termination_reason="timeout", schema_ref=SUPERVISOR_EXIT_SCHEMA_V2)
@@ -452,11 +454,9 @@ def test_failed_target_history_recovers_only_the_hashed_signed_receipt(target_hi
     reader, runtime, quest, old, new, store, receipts = target_history_reader
     receipt = receipts["target-history-call-2"]
     with runtime._database.write() as connection:
-        workspace_ref = connection.execute(text("SELECT workspace_ref FROM ar_target_run_workspaces WHERE target_ref=:ref"),
-                                           {"ref": old.target_ref}).scalar_one()
         values = {"transition_ref": "observe-recovery", "recovery_ref": "observe-recovery-ref", "target_ref": old.target_ref,
             "ordinal": 1, "blocker_ref": "observe-blocker", "old_execution_attempt_ref": old.execution_attempt_ref,
-            "new_execution_attempt_ref": new.execution_attempt_ref, "retired_workspace_ref": workspace_ref,
+            "new_execution_attempt_ref": new.execution_attempt_ref,
             "failed_provider_operation_ref": "target-history-call-2", "failure_code": "provider_timeout",
             "blocker_json": "{}", "blocker_hash": canonical_hash({}),
             "transport_receipt_json": canonical_json(receipt), "transport_receipt_hash": canonical_hash(receipt),

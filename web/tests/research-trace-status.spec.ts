@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Locator } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import type { PublicSnapshot } from "../src/api.js";
@@ -10,13 +10,28 @@ const sourceTime = Date.parse("2026-09-09T18:47:15+08:00") / 1_000;
 const message = (text: string, thread = "native-root") => JSON.stringify({ type: "item.completed", thread_id: thread, item: { type: "agent_message", text } }) + "\n";
 
 // All requests are intercepted: the built UI starts no research service.
+async function openWorkspace(page: Page) {
+  await page.goto("http://research-trace.test/?workspace=1");
+  await page.locator(".research-existing-details > summary").click();
+  for (const summary of await page.locator(".stage-root-sessions > summary").all()) await summary.click();
+}
+
+async function pauseAt(log: Locator, offset: number) {
+  await log.focus();
+  await log.press("Home");
+  await expect(log.locator("..").getByRole("button", { name: "回到最新输出 ↓", exact: true })).toBeVisible();
+  await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(0);
+  await log.evaluate((node, top) => { node.scrollTop = top; }, offset);
+  await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(offset);
+}
+
 async function fixture(page: Page) {
   const snapshot: PublicSnapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   const foreground = snapshot.research_control.foreground!;
   const operation = (ref: string, label: string, offset: number, status: RootOperation["status"] = "completed"): RootOperation => ({ operation_ref: ref, label, phase: ref, status, created_at: sourceTime + offset, updated_at: sourceTime + offset });
   const session = (ref: string, kind: RootSession["kind"], title: string, status: RootSession["status"], operations: RootOperation[], current = true): RootSession => ({
     session_ref: ref, root_session_ref: ref, kind, title, status, is_executing: status === "executing", is_current: current,
-    stage: kind === "stage" ? "bundle" : null, related_stages: kind === "acquisition" ? [] : ["bundle"], scope_label: kind === "acquisition" ? "Quest 共享" : "当前轮",
+    stage: kind === "stage" || kind === "target" ? "bundle" : null, related_stages: kind === "acquisition" ? [] : ["bundle"], scope_label: kind === "acquisition" ? "Quest 共享" : "当前轮",
     owner_session_ref: kind === "target" ? "session-bundle" : null, run_ref: `run-${ref}`, target_ref: kind === "target" ? `target-${ref}` : null,
     cycle_ref: kind === "acquisition" ? null : foreground.cycle_ref, question_ref: kind === "acquisition" ? null : foreground.question_ref,
     created_at: sourceTime, updated_at: sourceTime, operations,
@@ -91,7 +106,7 @@ test("waiting output shows a stable last record and resumes its elapsed clock on
   f.target1.is_executing = false;
   f.target1.status = "waiting";
   f.target1.operations[0].status = "waiting";
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity");
   await trace.getByLabel("选择查看的会话").selectOption(f.target1.session_ref);
   const clock = trace.locator(".research-execution-clock");
@@ -113,7 +128,7 @@ test("incomplete older history does not erase a verified executing Target", asyn
   f.catalog.limited = true;
   f.catalog.reasons = [{ code: "deepfetch_root_operation_unavailable" }, { code: "root_session_operations_limited" }];
   f.target1.limited = true;
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity");
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
   await expect(trace.locator(".root-session-heading")).toContainText("正在执行");
@@ -125,7 +140,7 @@ test("incomplete older history does not erase a verified executing Target", asyn
 
 test("current output follows an executing Target instead of its waiting stage and supports parallel roots", async ({ page }) => {
   const f = await fixture(page);
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity");
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
   await expect(trace).toContainText("T1 正在执行基线实验。");
@@ -164,7 +179,7 @@ test("real executing roots remain current when foreground advances ahead or has 
   f.target2.is_executing = false; f.target2.status = "completed";
   f.acquisition.is_executing = false; f.acquisition.status = "waiting";
   f.catalog.active_session_refs = [f.target1.session_ref];
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity");
   await expect(page.getByTestId("current-cycle-overview")).toHaveAttribute("data-cycle-ref", nextForeground.cycle_ref);
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
@@ -194,11 +209,11 @@ test("delegated children stay under their exact independent Target root as lifec
   Object.assign(oldTarget, { children: [historical] });
   f.catalog.sessions.push(oldTarget);
   f.output.set("historical-target-output", Array.from({ length: 90 }, (_, index) => message(`历史公开记录 ${index}：保留此次实验的观察与说明。`)).join(""));
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const bundle = page.locator('.spectrum-stage[data-stage="bundle"]'), trace = page.locator("#research-activity");
   await expect(bundle.locator(".stage-root-count")).toHaveText("4 个根 session");
   await bundle.locator(`button[data-session-ref="${f.target1.session_ref}"]`).click();
-  await expect(trace.locator(".root-session-heading")).toContainText("独立 Target 根");
+  await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
   const rows = trace.getByRole("region", { name: "委派子智能体" });
   await expect(rows.locator("[data-child-session-ref]")).toHaveCount(2);
   await expect(rows.locator('[data-child-session-ref="child-running"]')).toContainText("正在启动");
@@ -219,8 +234,8 @@ test("delegated children stay under their exact independent Target root as lifec
   await bundle.locator('button[data-session-ref="historical-target"]').click();
   await expect(trace).toContainText("历史公开记录 89");
   const scroll = trace.locator(".root-session-scroll");
-  await scroll.evaluate(node => { node.scrollTop = 150; node.dispatchEvent(new Event("scroll")); });
-  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  await pauseAt(scroll, 150);
+  await expect(trace.getByRole("button", { name: "回到最新输出 ↓" })).toBeVisible();
   const position = await scroll.evaluate(node => node.scrollTop);
   expect(position).toBeGreaterThan(0);
   historical.status = "failed";
@@ -242,8 +257,8 @@ test("long research sessions stay bounded and live polls request only newly appe
   const f = await fixture(page);
   f.bundle.operations = Array.from({ length: 1000 }, (_, index) => f.operation(`history-${index}`, `探索 ${index}`, index));
   for (const operation of f.bundle.operations) f.output.set(operation.operation_ref, message(operation.label));
-  await page.goto("http://research-trace.test/?workspace=1");
-  await page.locator('button[data-session-ref="session-bundle"]').click();
+  await openWorkspace(page);
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-bundle"]').click();
   const timeline = page.locator(".root-session-conversation");
   await expect(timeline.locator(".root-operation")).toHaveCount(4);
   await expect(timeline).toContainText("探索 999");
@@ -253,9 +268,9 @@ test("long research sessions stay bounded and live polls request only newly appe
   await expect(timeline).not.toContainText("探索 999");
   await expect(timeline.locator(".root-operation")).toHaveCount(4);
   await expect.poll(() => f.state.outputReads).toBeGreaterThan(beforeReads);
-  await timeline.getByRole("button", { name: "继续跟随 ↓" }).click();
+  await timeline.getByRole("button", { name: "回到最新输出 ↓" }).click();
   await expect(timeline).toContainText("探索 999");
-  await page.locator('button[data-session-ref="session-t1"]').click();
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-t1"]').click();
   await expect(timeline).toContainText("T1 正在执行基线实验。");
   const originalBytes = Buffer.byteLength(f.output.get("target-turn-1")!);
   await expect.poll(() => f.state.offsets.filter(item => item.ref === "target-turn-1").length).toBeGreaterThan(1);
@@ -280,7 +295,7 @@ test("accepted execution with pending evaluation exposes seven separate research
     evaluation_attempt_ref: "", target_spec_hash: target.spec_hash, closure_hash: "c".repeat(64), result_disposition: "uncertain",
     closure: { root_measurement: { evaluation_status: "pending", formal_entities: [{ variant_run_ref: "actual-run-1", evaluation_attempt_ref: null }], result_asset: { version_ref: "observations-v1" } } } };
   f.snapshot.bundle_stage!.target_commits = [accepted];
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const card = page.getByRole("region", { name: "当前研究工作状态" });
   await expect(card).toBeVisible();
   await card.getByText("查看输入、产物与交接", { exact: true }).click();
@@ -317,7 +332,7 @@ test("accepted work without an overall classification shows its evaluation and e
       result_asset: { asset_ref: "measured-result", version_ref: "measured-result:v2" },
     } },
   }];
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const card = page.getByRole("region", { name: "当前研究工作状态" });
   await expect(card.locator("header > p")).toHaveText("研究记录已接纳");
   await card.getByText("查看输入、产物与交接", { exact: true }).click();
@@ -357,7 +372,7 @@ test("current Target facts reflect an exact live worker failure while preserving
     current_task: { kind: "target", title: f.target1.title, target_ref: f.target1.target_ref, run_ref: f.target1.run_ref, status: "finalizing" },
     health: { status: "unavailable", checks: [{ name: "target_run_worker", status: "unavailable", reason: { code: "target_root_artifact_storage_unavailable" } }] },
   };
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const card = page.getByRole("region", { name: "当前研究工作状态" });
   const activity = page.getByRole("region", { name: "研究光谱" }).locator('.spectrum-stage[data-stage="bundle"]');
   const trace = page.locator("#research-activity");
@@ -381,12 +396,13 @@ test("current Target facts reflect an exact live worker failure while preserving
   await activity.locator('button[data-session-ref="session-t1"]').click();
   await expect(card.locator("header > p")).toHaveText("研究已暂停，保留 Target 记录");
   f.state.statusFailed = true;
-  await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
+  await expect(card.locator("header > p")).toHaveText("Target 执行状态待确认");
+  await expect(trace.locator(".root-session-heading")).toContainText("状态待确认 · 上次正在执行");
   await expect(trace).toContainText("T1 正在执行基线实验。");
   f.state.statusFailed = false;
   f.snapshot.revision = f.state.runtimeStatus.revision + 1;
   f.snapshot.observed_at = new Date().toISOString();
-  await page.reload();
+  await openWorkspace(page);
   await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
   expect(f.errors).toEqual([]);
   expect(f.writes).toEqual([]);
@@ -410,15 +426,15 @@ for (const [code, summary] of [
     current_task: { kind: "target", title: f.target1.title, target_ref: f.target1.target_ref, run_ref: f.target1.run_ref, status: "running" },
     health: { status: "unavailable", checks: [{ name: "target_run_worker", status: "unavailable", reason: { code } }] },
   };
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const card = page.getByRole("region", { name: "当前研究工作状态" });
   const trace = page.locator("#research-activity");
   const blocker = trace.getByTestId("research-current-worker-blocker");
   await expect(card.locator("header > p")).toHaveText(summary);
   await expect(blocker).toContainText(summary); await expect(blocker).toContainText(code);
-  await page.locator('button[data-session-ref="session-t2"]').click();
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-t2"]').click();
   await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
-  await page.locator('button[data-session-ref="session-t1"]').click();
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-t1"]').click();
   await expect(card.locator("header > p")).toHaveText(summary);
   await expect(trace).toContainText("T1 正在执行基线实验。");
   f.state.runtimeStatus.current_task!.status = "finalizing";
@@ -432,7 +448,7 @@ for (const [code, summary] of [
 
 test("root sessions preserve continuous work, parallel activity, historical scope and failure recovery", async ({ page }, testInfo) => {
   const f = await fixture(page);
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const spectrum = page.getByRole("region", { name: "研究光谱" });
   const activity = spectrum.locator('.spectrum-stage[data-stage="bundle"]');
   await expect(spectrum.locator(".spectrum-stage")).toHaveCount(4);
@@ -450,7 +466,7 @@ test("root sessions preserve continuous work, parallel activity, historical scop
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
   await activity.locator('button[data-session-ref="session-bundle"]').click();
   const timeline = trace.getByRole("region", { name: "Bundle 会话", exact: true });
-  for (const text of ["暂无模型调用在执行", "Bundle 已形成初始研究方案。", "同一 Bundle 会话已完成复核。", "现在等待两个 Target 的证据。"]) await expect(timeline).toContainText(text);
+  for (const text of ["等待继续", "Bundle 已形成初始研究方案。", "同一 Bundle 会话已完成复核。", "现在等待两个 Target 的证据。"]) await expect(timeline).toContainText(text);
   await expect(timeline.locator(".root-operation-time")).toHaveText([/初始方案/, /复核方案/, /安排实验/]);
   await expect(trace.getByRole("button", { name: /^(当前输出|主任务输出|审查输出|审查与调度)$/ })).toHaveCount(0);
   await expect(timeline).not.toContainText("CHILD_PRIVATE_CONVERSATION"); await expect(timeline).not.toContainText("HIDDEN_REASONING");
@@ -497,7 +513,7 @@ test("root sessions preserve continuous work, parallel activity, historical scop
   await expect(trace).toContainText("上一轮 Idea 已完成。");
   targetWorker.status = "ready"; delete targetWorker.reason; f.snapshot.revision += 1;
   await expect(trace.getByTestId("research-current-worker-blocker")).toHaveCount(0);
-  await trace.getByRole("button", { name: "返回当前阶段 ↗" }).click(); await expect(trace).toContainText("T1 正在执行基线实验。");
+  await trace.getByRole("button", { name: "返回当前执行" }).click(); await expect(trace).toContainText("T1 正在执行基线实验。");
   await activity.locator('button[data-session-ref="session-t1"]').click(); await expect(trace).toContainText("T1 正在执行基线实验。");
   f.state.outputFailed = true; await expect(trace).toContainText("记录暂时无法更新，已保留上次内容"); await expect(trace).toContainText("T1 正在执行基线实验。");
   f.state.outputFailed = false; await trace.getByRole("button", { name: "重试", exact: true }).click(); await expect(trace).not.toContainText("记录暂时无法更新，已保留上次内容");
@@ -512,9 +528,9 @@ test("large calls retain an explicit path to older bytes and resume the latest p
   const f = await fixture(page); f.catalog.sessions = [f.bundle]; f.catalog.active_session_refs = [];
   f.bundle.operations = [f.operation("large-call", "较长研究调用", 0)];
   f.output.set("large-call", message("这次调用最早的公开记录。") + " ".repeat(8 * 1024 * 1024 + 65536) + "\n" + message("这次调用最新的公开记录。"));
-  await page.goto("http://research-trace.test/?workspace=1"); const trace = page.locator("#research-activity");
-  await expect(trace).toContainText("这次调用最新的公开记录。", { timeout: 60_000 }); await expect(trace).toContainText("这次调用较早的记录已收起"); await expect(trace).not.toContainText("这次调用最早的公开记录。");
-  await trace.getByText("查看这次调用的分页记录", { exact: true }).click(); await trace.getByRole("button", { name: "最早记录", exact: true }).click();
+  await openWorkspace(page); const trace = page.locator("#research-activity");
+  await expect(trace).toContainText("这次调用最新的公开记录。", { timeout: 60_000 }); await expect(trace).toContainText("前文已收起 · 查看更早内容"); await expect(trace).not.toContainText("这次调用最早的公开记录。");
+  await trace.getByText("执行详情与历史分页", { exact: true }).click(); await trace.getByRole("button", { name: "最早记录", exact: true }).click();
   await expect(trace).toContainText("这次调用最早的公开记录。"); await expect(trace).not.toContainText("这次调用最新的公开记录。");
   await trace.getByRole("button", { name: "下一页", exact: true }).click(); await expect(trace.getByRole("button", { name: "上一页", exact: true })).toBeEnabled();
   await trace.getByRole("button", { name: "返回最新记录", exact: true }).click(); await expect(trace).toContainText("这次调用最新的公开记录。"); expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
@@ -526,7 +542,7 @@ test("manual history keeps its session and reading position through background S
     status: "completed", created_at: sourceTime - 100, operations: [f.operation("old-bundle-operation", "早先安排", -100)] };
   f.output.set("old-bundle-operation", message("同轮旧 Bundle 根会话记录。") + Array.from({ length: 60 }, (_, index) => message(`已记录的研究步骤 ${index}。`)).join(""));
   f.catalog.sessions.unshift(oldBundle);
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const card = page.locator('.spectrum-stage[data-stage="bundle"]'), trace = page.locator('#research-activity');
   await expect(card.locator('.stage-root-count')).toHaveText('5 个根 session');
   await expect(trace.locator('.root-session-conversation')).toHaveAttribute('data-session-ref', f.target1.session_ref);
@@ -536,8 +552,8 @@ test("manual history keeps its session and reading position through background S
   await expect.poll(() => f.state.listReads).toBeGreaterThan(reads);
   await expect(trace.locator('.root-session-conversation')).toHaveAttribute('data-session-ref', 'session-bundle-old');
   const log = trace.getByRole("log");
-  await log.evaluate(node => { node.scrollTop = 240; });
-  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  await pauseAt(log, 240);
+  await expect(trace.getByRole("button", { name: "回到最新输出 ↓" })).toBeVisible();
   f.snapshot.research_control.foreground!.stage = "Plan"; f.snapshot.revision += 1;
   await expect(page.locator('.spectrum-stage[data-stage="plan"]')).toHaveAttribute("aria-current", "step");
   await expect(trace.locator('.root-session-conversation')).toHaveAttribute('data-session-ref', oldBundle.session_ref);
@@ -556,7 +572,7 @@ test("manual history keeps its session and reading position through background S
   await expect.poll(() => f.state.listReads).toBeGreaterThan(reads + 1);
   await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
   await expect(trace).not.toContainText("后台补充的历史工作记录。");
-  await trace.getByRole('button', { name: '返回当前阶段 ↗' }).click();
+  await trace.getByRole('button', { name: '返回当前执行' }).click();
   await expect(trace.locator('.root-session-conversation')).toHaveAttribute('data-session-ref', next.session_ref);
   await expect(trace).toContainText('新一轮 Plan 根会话记录。');
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
@@ -566,14 +582,14 @@ test("temporarily unreadable selected history retains loaded output and scroll i
   const f = await fixture(page);
   f.history.status = "waiting"; f.history.operations[0].status = "waiting";
   f.output.set("idea-primary", message("上一轮 Idea 已完成。") + Array.from({ length: 60 }, (_, index) => message(`历史证据 ${index}。`)).join(""));
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity"), idea = page.locator('.spectrum-stage[data-stage="idea"]');
   await idea.locator(".stage-root-history > summary").click();
   await idea.locator('button[data-session-ref="session-history"]').click();
   await expect(trace).toContainText("上一轮 Idea 已完成。");
   const log = trace.getByRole("log");
-  await log.evaluate(node => { node.scrollTop = 240; });
-  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  await pauseAt(log, 240);
+  await expect(trace.getByRole("button", { name: "回到最新输出 ↓" })).toBeVisible();
   f.catalog.sessions = f.catalog.sessions.filter(item => item.session_ref !== f.history.session_ref);
   await expect(trace).toContainText("所选根会话暂不可读取");
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.history.session_ref);
@@ -585,7 +601,7 @@ test("temporarily unreadable selected history retains loaded output and scroll i
   await expect(trace).not.toContainText("所选根会话暂不可读取");
   await expect(trace.locator(".root-session-heading")).not.toContainText("状态待确认");
   await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
-  await trace.getByRole("button", { name: "返回当前阶段 ↗" }).click();
+  await trace.getByRole("button", { name: "返回当前执行" }).click();
   await expect(trace.locator(".root-session-conversation")).toHaveAttribute("data-session-ref", f.target1.session_ref);
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
@@ -596,23 +612,24 @@ test("switching roots restores a session's operation page, byte page, loaded out
   for (const op of f.bundle.operations) f.output.set(op.operation_ref, message(op.label));
   f.output.set("reading-1", message("历史调用的第一页。") + " ".repeat(65536) + "\n" + message("历史调用的第二页。"));
   f.output.set("reading-2", message("历史工作 2") + Array.from({ length: 20 }, (_, index) => message(`已有研究说明 ${index}。`)).join(""));
-  await page.goto("http://research-trace.test/?workspace=1");
-  const trace = page.locator("#research-activity"), bundleButton = page.locator('button[data-session-ref="session-bundle"]');
+  await openWorkspace(page);
+  const trace = page.locator("#research-activity"), bundleButton = page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-bundle"]');
   await bundleButton.click();
   await expect(trace).toContainText("历史工作 8");
   await trace.getByRole("button", { name: /读取更早工作/ }).click();
   await expect(trace).toContainText("历史工作 1");
   const call = trace.locator('[data-operation-ref="reading-1"]');
+  const paging = trace.locator('[data-operation-details-ref="reading-1"]');
   await expect(call).toContainText("历史调用的第二页。");
-  await call.getByText("查看这次调用的分页记录", { exact: true }).click();
-  await call.getByRole("button", { name: "最早记录", exact: true }).click();
+  await trace.getByText("执行详情与历史分页", { exact: true }).click();
+  await paging.getByRole("button", { name: "最早记录", exact: true }).click();
   await expect(call).toContainText("历史调用的第一页。");
   await expect(call).not.toContainText("历史调用的第二页。");
   const log = trace.getByRole("log");
-  await log.evaluate(node => { node.scrollTop = 120; });
+  await pauseAt(log, 120);
   const readingPosition = await log.evaluate(node => node.scrollTop);
   expect(readingPosition).toBeGreaterThan(0);
-  await page.locator('button[data-session-ref="session-t2"]').click();
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-t2"]').click();
   await expect(trace).toContainText("T2 正在执行对照实验。");
   f.state.outputFailed = true;
   await bundleButton.click();
@@ -620,9 +637,9 @@ test("switching roots restores a session's operation page, byte page, loaded out
   await expect(trace).not.toContainText("历史工作 8");
   await expect(call).toContainText("历史调用的第一页。");
   await expect(call).not.toContainText("历史调用的第二页。");
-  await expect(call.getByRole("button", { name: "返回最新记录", exact: true })).toBeVisible();
+  await expect(paging.getByRole("button", { name: "返回最新记录", exact: true })).toBeVisible();
   await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(readingPosition);
-  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  await expect(trace.getByRole("button", { name: "回到最新输出 ↓" })).toBeVisible();
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
 
@@ -630,36 +647,36 @@ test("returning current resumes latest output after manually reading the executi
   const f = await fixture(page);
   f.target1.operations = Array.from({ length: 9 }, (_, index) => f.operation(`target-history-${index}`, `Target 步骤 ${index}`, index, index === 8 ? "executing" : "completed"));
   for (const op of f.target1.operations) f.output.set(op.operation_ref, message(op.label));
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity");
   await expect(trace).toContainText("Target 步骤 8");
   await trace.getByRole("button", { name: /读取更早工作/ }).click();
   await expect(trace).toContainText("Target 步骤 1");
   await expect(trace).not.toContainText("Target 步骤 8");
-  await expect(trace.getByRole("button", { name: "返回当前阶段 ↗" })).toBeVisible();
-  await trace.getByRole("button", { name: "返回当前阶段 ↗" }).click();
+  await expect(trace.getByRole("button", { name: "返回当前执行" })).toBeVisible();
+  await trace.getByRole("button", { name: "返回当前执行" }).click();
   await expect(trace).toContainText("Target 步骤 8");
-  await expect(trace.getByRole("button", { name: "跟随最新 ✓" })).toBeVisible();
-  await expect(trace.getByRole("button", { name: "返回当前阶段 ↗" })).toHaveCount(0);
+  await expect(trace.getByRole("button", { name: "跟随最新输出 ✓" })).toBeVisible();
+  await expect(trace.getByRole("button", { name: "返回当前执行" })).toHaveCount(0);
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
 
 test("expanding older public messages pins the Session and keeps its expanded window across root and Cycle changes", async ({ page }) => {
   const f = await fixture(page);
   f.output.set("target-turn-1", Array.from({ length: 100 }, (_, index) => message(`较早公开步骤 ${index}。`)).join(""));
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity"), log = trace.getByRole("log");
   await expect(trace).toContainText("较早公开步骤 99。");
   await expect(trace).not.toContainText("较早公开步骤 0。");
   await trace.getByRole("button", { name: /显示更早的输出/ }).click();
   await expect(trace).toContainText("较早公开步骤 0。");
-  await expect(trace.getByRole("button", { name: "返回当前阶段 ↗" })).toBeVisible();
-  await log.evaluate(node => { node.scrollTop = 240; });
+  await expect(trace.getByRole("button", { name: "返回当前执行" })).toBeVisible();
+  await pauseAt(log, 240);
   await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
   await expect(trace).toContainText("较早公开步骤 0。");
-  await page.locator('button[data-session-ref="session-t2"]').click();
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-t2"]').click();
   await expect(trace).toContainText("T2 正在执行对照实验。");
-  await page.locator('button[data-session-ref="session-t1"]').click();
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-t1"]').click();
   await expect(trace).toContainText("较早公开步骤 0。");
   await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
   f.snapshot.research_control.foreground!.cycle_ref = "advanced-cycle"; f.snapshot.revision += 1;
@@ -674,37 +691,38 @@ test("paused in-call history keeps its readable page when appended bytes exceed 
   const f = await fixture(page);
   const initial = Array.from({ length: 100 }, (_, index) => message(`已读公开步骤 ${index}。`)).join("");
   f.output.set("target-turn-1", initial);
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity"), log = trace.getByRole("log");
   await expect(trace).toContainText("已读公开步骤 99。");
   await trace.getByRole("button", { name: /显示更早的输出/ }).click();
   await expect(trace).toContainText("已读公开步骤 0。");
-  await log.evaluate(node => { node.scrollTop = 240; });
+  await pauseAt(log, 240);
   const reads = f.state.listReads;
   f.output.set("target-turn-1", initial + " ".repeat(600 * 1024) + "\n" + Array.from({ length: 100 }, (_, index) => message(`后台追加公开步骤 ${index}。`)).join(""));
   await expect.poll(() => f.state.listReads).toBeGreaterThan(reads + 1);
   await expect(trace).toContainText("已读公开步骤 0。");
   await expect(trace).not.toContainText("后台追加公开步骤 99。");
   await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(240);
-  await expect(trace).toContainText("已固定当前已读视图");
-  await trace.getByRole("button", { name: "返回当前阶段 ↗" }).click();
+  await expect(trace).toContainText("正在回看");
+  await trace.getByRole("button", { name: "返回当前执行" }).click();
   await expect(trace).toContainText("后台追加公开步骤 99。", { timeout: 20_000 });
-  await expect(trace.getByRole("button", { name: "跟随最新 ✓" })).toBeVisible();
+  await expect(trace.getByRole("button", { name: "跟随最新输出 ✓" })).toBeVisible();
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
 
 test("explicit retry clears a recovered output warning after scrolling it into a frozen reading view", async ({ page }) => {
   const f = await fixture(page);
   f.output.set("target-turn-2", Array.from({ length: 100 }, (_, index) => message(`第二根已读公开步骤 ${index}。`)).join(""));
-  await page.goto("http://research-trace.test/?workspace=1");
-  await page.locator('button[data-session-ref="session-t2"]').click();
+  await openWorkspace(page);
+  await page.locator('.spectrum-stage[data-stage="bundle"] button[data-session-ref="session-t2"]').click();
   const trace = page.locator("#research-activity"), log = trace.getByRole("log");
   await expect(trace).toContainText("第二根已读公开步骤 99。");
   f.state.outputFailed = true;
   await expect(trace).toContainText("记录暂时无法更新，已保留上次内容。");
   const retry = trace.getByRole("button", { name: "重试", exact: true });
+  await pauseAt(log, 0);
   await retry.scrollIntoViewIfNeeded();
-  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  await expect(trace.getByRole("button", { name: "回到最新输出 ↓" })).toBeVisible();
   const position = await log.evaluate(node => node.scrollTop);
   const reads = f.state.outputReads;
   f.output.set("target-turn-2", f.output.get("target-turn-2") + message("恢复后新增公开说明。"));
@@ -714,7 +732,7 @@ test("explicit retry clears a recovered output warning after scrolling it into a
   await expect(trace).not.toContainText("记录暂时无法更新，已保留上次内容。");
   await expect(trace).toContainText("第二根已读公开步骤 99。");
   await expect(trace).not.toContainText("恢复后新增公开说明。");
-  await expect(trace.getByRole("button", { name: "继续跟随 ↓" })).toBeVisible();
+  await expect(trace.getByRole("button", { name: "回到最新输出 ↓" })).toBeVisible();
   await expect.poll(() => log.evaluate(node => node.scrollTop)).toBe(position);
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
@@ -725,7 +743,7 @@ test("an unstarted Reasoning role stays in its chosen Cycle and Quest changes cl
   const main = f.catalog.sessions.find(item => item.session_ref === "session-reasoning")!;
   f.snapshot.research_control.foreground!.stage = "Reasoning";
   f.catalog.sessions = f.catalog.sessions.filter(item => item.session_ref !== main.session_ref);
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const trace = page.locator("#research-activity"), reasoning = page.locator('.spectrum-stage[data-stage="reasoning"]');
   await reasoning.locator('button[data-root-role="deepfetch"]').click();
   await expect(trace).toContainText("Reasoning 尚未建立由本阶段发起的 DeepFetch 根会话。");
@@ -765,10 +783,12 @@ test("Reasoning keeps three roles, excludes unrelated DeepFetch roots and binds 
   const wrongOwner: RootSession = { ...init, session_ref: "wrong-owner-deepfetch", root_session_ref: "wrong-owner-deepfetch", creation_context_kind: "autonomous_question_creation",
     stage: "reasoning", related_stages: ["reasoning"], cycle_ref: foreground.cycle_ref, question_ref: foreground.question_ref, owner_session_ref: "session-plan" };
   const oldMain: RootSession = { ...main, session_ref: "historical-reasoning", root_session_ref: "historical-reasoning", cycle_ref: "old-cycle", is_current: false };
-  const historical: RootSession = { ...wrongOwner, session_ref: "historical-reasoning-deepfetch", root_session_ref: "historical-reasoning-deepfetch", cycle_ref: "old-cycle", owner_session_ref: oldMain.session_ref, question_ref: null };
+  const historical: RootSession = { ...wrongOwner, session_ref: "historical-reasoning-deepfetch", root_session_ref: "historical-reasoning-deepfetch", cycle_ref: "old-cycle", owner_session_ref: oldMain.session_ref, question_ref: null,
+    operations: [f.operation("historical-reasoning-deepfetch-op", "历史检索资料", -80)] };
+  f.output.set("historical-reasoning-deepfetch-op", message("由历史 Reasoning 发起的 DeepFetch 对话。"));
   const wrongCycle: RootSession = { ...wrongOwner, session_ref: "wrong-cycle-deepfetch", root_session_ref: "wrong-cycle-deepfetch", owner_session_ref: oldMain.session_ref };
   f.catalog.sessions.push(manual, wrongOwner, oldMain, historical, wrongCycle);
-  await page.goto("http://research-trace.test/?workspace=1");
+  await openWorkspace(page);
   const card = page.locator('.spectrum-stage[data-stage="reasoning"]'), trace = page.locator('#research-activity');
   const current = card.getByRole('group', { name: 'Reasoning 本轮根会话', exact: true });
   await expect(card.locator('.stage-root-count')).toHaveText('3 个根 session 入口 · 1 个已建立 · 2 个待启动');
@@ -798,8 +818,7 @@ test("Reasoning keeps three roles, excludes unrelated DeepFetch roots and binds 
   await expect(card.locator('.stage-root-count')).toHaveText('3 个根 session 入口 · 3 个已建立 · 0 个待启动');
   await expect(trace.locator('.root-session-conversation')).toHaveAttribute('data-session-ref', deepfetch.session_ref);
   await expect(trace).toContainText('由当前 Reasoning 发起的实际 DeepFetch 对话。');
-  await trace.locator('.root-session-context summary').click();
-  await expect(trace.locator('.root-session-context')).toContainText(`发起会话 ${main.session_ref}`);
+  await expect.poll(() => f.state.outputSessionRefs.includes(deepfetch.session_ref)).toBe(true);
   expect(f.state.outputSessionRefs.some(ref => [init.session_ref, manual.session_ref, wrongOwner.session_ref, wrongCycle.session_ref].includes(ref))).toBe(false);
 
   // A later root never steals the selection which was resolved from the pending role.
@@ -811,7 +830,8 @@ test("Reasoning keeps three roles, excludes unrelated DeepFetch roots and binds 
   await card.locator(`button[data-session-ref="${historical.session_ref}"]`).click();
   await expect(trace.locator('.root-session-conversation')).toHaveAttribute('data-session-ref', historical.session_ref);
   await expect(trace.locator('.root-session-heading')).toContainText('历史轮次');
-  await trace.locator('.root-session-context summary').click();
-  await expect(trace.locator('.root-session-context')).toContainText(`发起会话 ${oldMain.session_ref}`);
+  await expect(trace).toContainText("由历史 Reasoning 发起的 DeepFetch 对话。");
+  await expect.poll(() => f.state.outputSessionRefs.includes(historical.session_ref)).toBe(true);
+  expect(f.state.outputSessionRefs.some(ref => [init.session_ref, manual.session_ref, wrongOwner.session_ref, wrongCycle.session_ref].includes(ref))).toBe(false);
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });

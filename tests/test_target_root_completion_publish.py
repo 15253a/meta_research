@@ -13,6 +13,7 @@ from meta_research.bundle_protocol import (
     TargetWorkHandle,
     projection_plain_value,
 )
+from meta_research.owners.target_root_lifecycle import TargetRootHandleHistory
 from meta_research.database import Database
 from meta_research.migration import upgrade_database
 from meta_research.owners.common import (
@@ -70,6 +71,14 @@ class _CompletionReader:
                 {"target_ref": target_ref},
             ).one()
         return replace(self.lifecycle, status=row.status)
+
+    def query_handle_history(self, target_ref: str) -> TargetRootHandleHistory | None:
+        if target_ref != self.completion.handle.target_ref:
+            return None
+        return TargetRootHandleHistory(
+            target_ref=target_ref, handle_history=(self.completion.handle,),
+            recovered_blockers=(), recovery_evidence_refs=(), recoveries=(),
+        )
 
     def query_completion(self, target_ref: str) -> _Completion | None:
         return (

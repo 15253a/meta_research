@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import sqlite3
 from pathlib import Path
 
@@ -11,7 +13,6 @@ from test_goal_creation_migration_merge import _seed_existing_creation
 from test_quest_goal_evolution_migration import _migration_config, _upgrade_to_revision
 
 
-MERGED_REVISION = "0073_merge_search_source"
 STARTING_REVISIONS = (
     "0069_merge_goal_creation",
     "0070_material_processing",
@@ -176,12 +177,12 @@ def test_material_companion_search_merge_preserves_each_branch_and_constraints(
     first_schema = _schema_snapshot(database)
     upgrade_database(database)
 
-    assert ScriptDirectory.from_config(_migration_config()).get_heads() == [MERGED_REVISION]
+    assert ScriptDirectory.from_config(_migration_config()).get_heads() == [schema_head()]
     assert _schema_snapshot(database) == first_schema
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
         assert connection.execute("SELECT version_num FROM alembic_version").fetchall() == [
-            (MERGED_REVISION,),
+            (schema_head(),),
         ]
         for table, (columns, original) in existing_rows.items():
             actual = connection.execute(

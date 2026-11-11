@@ -137,7 +137,7 @@ class HarnessAdapterUnavailable(RuntimeError):
         self,
         code: str,
         *,
-        durable_outcome: Literal["terminal", "unknown"] = "terminal",
+        durable_outcome: Literal["terminal", "unknown", "not_started"] = "terminal",
         transport_receipt: dict[str, object] | None = None,
         native_session_ref: str | None = None,
         native_terminal_checkpoint: dict[str, object] | None = None,
@@ -408,23 +408,25 @@ class _NativeCliHarnessAdapter:
     def _invoke(
         self, invocation: HarnessInvocation, *, terminal_replay_only: bool
     ) -> HarnessTurnEvidence:
-        self._validate_invocation(invocation)
-        provider_version = self._provider_version()
-        self._record_provider_capability(provider_version)
         try:
-            # Verify the current packaged references before any provider launch.
-            root_capability_profile(invocation.root_kind or "target", invocation.model_ref).as_dict()
-        except (OSError, UnicodeError, ModuleNotFoundError) as error:
-            raise HarnessAdapterUnavailable("provider_resource_unavailable") from error
-        provider_feature_inventory = self._provider_feature_inventory(
-            invocation,
-            provider_version=provider_version,
-        )
-        argv = self._argv(invocation)
-        evidence_scope_ref = _harness_evidence_scope_ref(invocation)
-        observation_scope = _target_root_observation_scope(invocation)
-        timeout_seconds = invocation.provider_operation_timeout_seconds
-        environment = self._environment(invocation)
+            self._validate_invocation(invocation)
+            provider_version = self._provider_version()
+            self._record_provider_capability(provider_version)
+            try:
+                root_capability_profile(invocation.root_kind or "target", invocation.model_ref).as_dict()
+            except (OSError, UnicodeError, ModuleNotFoundError) as error:
+                raise HarnessAdapterUnavailable("provider_resource_unavailable") from error
+            provider_feature_inventory = self._provider_feature_inventory(
+                invocation,
+                provider_version=provider_version,
+            )
+            argv = self._argv(invocation)
+            evidence_scope_ref = _harness_evidence_scope_ref(invocation)
+            observation_scope = _target_root_observation_scope(invocation)
+            timeout_seconds = invocation.provider_operation_timeout_seconds
+            environment = self._environment(invocation)
+        except HarnessAdapterUnavailable as error:
+            raise HarnessAdapterUnavailable(error.code, durable_outcome="not_started") from error
         try:
             runner = (
                 getattr(self._runner, "replay_terminal", None)
@@ -487,11 +489,7 @@ class _NativeCliHarnessAdapter:
             )
             raise HarnessAdapterUnavailable(
                 code,
-                transport_receipt=(
-                    cast(dict[str, object], receipt)
-                    if signed_code is not None
-                    else None
-                ),
+                transport_receipt=(cast(dict[str, object], receipt) if isinstance(receipt, dict) else None),
                 native_session_ref=_verified_failed_native_session_ref(
                     family=self.family,
                     events=events,
@@ -499,7 +497,8 @@ class _NativeCliHarnessAdapter:
                 ),
             )
         if not events:
-            raise HarnessAdapterUnavailable("provider_stream_invalid")
+            raise HarnessAdapterUnavailable("provider_stream_invalid",
+                transport_receipt=getattr(completed, "meta_research_transport_receipt", None))
         try:
             evidence = _evidence_from_events(
                 family=self.family,
@@ -522,7 +521,7 @@ class _NativeCliHarnessAdapter:
             raise HarnessAdapterUnavailable(
                 error.code,
                 durable_outcome=error.durable_outcome,
-                transport_receipt=error.transport_receipt,
+                transport_receipt=error.transport_receipt or getattr(completed, "meta_research_transport_receipt", None),
                 native_session_ref=(
                     error.native_session_ref
                     or _verified_failed_native_session_ref(
@@ -541,6 +540,7 @@ class _NativeCliHarnessAdapter:
                 raise HarnessAdapterUnavailable(
                     "harness_profile_invalid",
                     native_session_ref=evidence.native_session_ref,
+                    transport_receipt=getattr(completed, "meta_research_transport_receipt", None),
                 )
             used_capabilities: list[str] = []
             usage_evidence_refs: dict[str, tuple[str, ...]] = {}
@@ -1400,7 +1400,7 @@ class HarnessSupervisorTransport:
         if tail is not None and tail.failure is not None:
             raise OSError("harness event sink unavailable") from tail.failure
         termination_reason = receipt["termination_reason"]
-        returncode = int(receipt["returncode"])
+        returncode = receipt["returncode"]
         if termination_reason != "completed":
             returncode = {
                 "timeout": 124,
@@ -1434,7 +1434,7 @@ class HarnessSupervisorTransport:
             "transport_invocation_hash": invocation_hash,
             "supervisor_receipt_hash": canonical_hash(envelope),
             "termination_reason": str(termination_reason),
-            "provider_returncode": int(receipt["returncode"]),
+            "provider_returncode": receipt["returncode"],
         }
         return completed
 
@@ -1584,9 +1584,10 @@ class HarnessSupervisorTransport:
 
         Human-wait checkpoints can precede capability profile acceptance. Their
         signed spools remain authority even when no profile index was retained.
-        No Provider is run and no spool or Owner record is changed here.
+        No Provider is run. A verified same-host reboot may record only local
+        closure in the existing recovery envelope; the Owner result stays unknown.
         """
-        if family != "codex" or not operation_ref or len(operation_ref) > 128:
+        if family not in {"codex", "claude"} or not operation_ref or len(operation_ref) > 128:
             raise OSError("provider operation identity unavailable")
         # The owner binding survives native launch scratch cleanup and identifies
         # the original CLI invocation even when it ran through a native bridge.
@@ -1595,8 +1596,13 @@ class HarnessSupervisorTransport:
             if not isinstance(owner_invocation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", owner_invocation_hash):
                 raise OSError("owner invocation identity unavailable")
             path = self._workspace / "owner-invocation-bindings" / owner_invocation_hash[:2] / (owner_invocation_hash + ".json")
-            if path.is_symlink() or path.parent.is_symlink():
+            if any(candidate.is_symlink() for candidate in (path, path.parent, path.parent.parent)):
                 raise OSError("invalid provider operation binding")
+            if not path.exists():
+                # Owner-directed reconciliation only reads this original
+                # operation. A missing binding cannot justify scanning other
+                # operations, nor borrowing their termination evidence.
+                return None
             if path.exists():
                 try:
                     binding = read_transport_envelope(path, self._transport_key)
@@ -1654,6 +1660,16 @@ class HarnessSupervisorTransport:
                 self._verify_terminal_request(directory / "supervisor-request.json",
                     self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds"),
                         Path(request["working_directory"]) if "working_directory" in request else None))
+                if digest is not None and not receipt_path.exists():
+                    if any(path.is_symlink() for path in (
+                        operation_root, directory.parent, directory,
+                        directory / "supervisor-request.json", directory / "supervisor-ready.json",
+                        directory / "supervisor-recovery.json", receipt_path,
+                    )):
+                        raise ProviderSupervisorError("provider_supervisor_spool_invalid")
+                    from meta_research.streaming_provider_supervisor import reconcile_rebooted_supervisor
+                    reconcile_rebooted_supervisor(directory / "supervisor-request.json")
+                    continue
                 receipt, envelope = read_verified_exit_receipt(
                     receipt_path, key=self._transport_key, invocation_hash=invocation_hash,
                     prompt_path=prompt_path, schema_path=directory / "output-schema.json",
@@ -3677,7 +3693,7 @@ def _verified_child_sandbox_mode(
     expected_working_directory: str,
     allowed_sandbox_modes: frozenset[str],
 ) -> str | None:
-    """Require every persisted child turn context to retain Target confinement."""
+    """Require every persisted child turn to retain one allowed execution policy."""
 
     contexts = [
         record.get("payload")

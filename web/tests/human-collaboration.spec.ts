@@ -912,8 +912,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
   });
 
   await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
-  await page.getByRole("dialog", { name: "需要你处理的事项" })
-    .getByRole("button", { name: "关闭需要你处理的事项" }).click();
+  await expect(page.getByRole("dialog", { name: "需要你处理的事项" })).toBeHidden();
   const companion = page.getByRole("complementary", { name: "研究助手" });
   await expect(companion).toContainText("需要你 · 只影响相关任务");
   await expect(companion).toContainText("当前研究授权");
@@ -932,9 +931,8 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
       },
     },
   });
-  const commandCard = companion.locator(".lumen-command").filter({
-    hasText: "revoked · broad_research",
-  });
+  const commandCard = companion.locator('.lumen-command[data-command-ref="intent-broad-revoke"]');
+  await expect(commandCard).toContainText("撤销权限 · broad_research");
   await commandCard.getByRole("button", { name: "查看操作影响" }).click();
   await commandCard.getByText("查看操作与影响", { exact: true }).click();
   await commandCard.getByRole("button", { name: "确认当前草案与预览" }).click();
@@ -1744,6 +1742,7 @@ test("an orphaned material delivery is discarded when its request revision is no
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem(
     "meta_research_pending_human_request_response",
   ))).toBeNull();
+  await dialog.getByRole("button", { name: /图书馆访问 · 恢复当前图书馆会话/ }).click();
   await dialog.getByRole("button", { name: "我已重连" }).click();
   await page.getByRole("dialog", { name: "审阅正式回应", exact: true }).getByRole("button", { name: "确认提交回应", exact: true }).click();
   await expect.poll(() => responseAttempts.at(-1)?.path).toContain(
@@ -1944,6 +1943,7 @@ test("human obligation copy keeps operation facts inside verification details", 
   await page.goto(`${product!.baseUrl}/?panel=human-request`, {
     waitUntil: "domcontentloaded",
   });
+  await expect(dialog.getByRole("heading", { name: "恢复当前图书馆会话，或选择合法全文替代路线。" })).toBeVisible();
   const ordinaryRequest = (await dialog.locator(
     ".hc-head, .hc-request-core > :not(.hc-request-details)",
   ).allTextContents()).join(" ");
@@ -2033,7 +2033,7 @@ test("the HumanRequest workspace puts assistant work first and preserves overflo
 }, testInfo) => {
   await installHumanCollaborationSnapshot(page);
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?panel=human-request`, { waitUntil: "domcontentloaded" });
   const railEntry = page.getByRole("button", { name: "需要你" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const closeButton = dialog.getByRole("button", { name: "关闭需要你处理的事项" });
@@ -2089,7 +2089,7 @@ test("human request Draft echoes immediately while its POST is pending", async (
     await gate;
     await route.fulfill({ status: 503, json: { error: { code: "temporarily_unavailable" } } });
   });
-  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?panel=human-request`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const input = dialog.getByLabel("就图书馆恢复事项发消息");
   await input.fill("请立即显示本条讨论消息");
@@ -2132,7 +2132,7 @@ test("human request Draft streams before its snapshot and keeps request conversa
   });
   await page.route("**/api/v1/companion/messages", (route) =>
     route.fulfill({ json: { interaction_ref: "request-stream", status: "queued" } }));
-  await page.goto(`${product!.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?panel=human-request`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await dialog.getByLabel("就图书馆恢复事项发消息").fill("这个事项请分段解释");
   await dialog.getByRole("button", { name: "发送消息" }).click();
@@ -2154,7 +2154,8 @@ test("human request Draft streams before its snapshot and keeps request conversa
   await expect(dialog.locator(".hc-draft-transcript article:not(.me)")).toHaveCount(1);
   await expect(dialog.locator(".hc-draft-transcript")).toContainText("事项正式完整回答。");
   await expect(dialog.getByText("正在回复…", { exact: true })).toHaveCount(0);
-  await dialog.getByRole("button", { name: "查看下一个待办" }).click();
+  await dialog.getByRole("navigation", { name: "求助类别" })
+    .getByRole("button", { name: /线上获取/ }).click();
   await expect(dialog.getByLabel("就外部材料事项发消息")).toHaveValue("");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("事项正式完整回答。");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("这个事项请分段解释");

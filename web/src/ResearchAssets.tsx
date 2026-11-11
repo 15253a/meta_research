@@ -323,9 +323,10 @@ export function ResearchAssetsWorkbench({
     ) {
       setHistoryCursor(emptyHistoryCursor(nextSelected));
     }
-    if (!inventoryStable) {
-      setNextOffset(initial.offset + initial.items.length);
-    }
+    const initialPageEnd = initial.offset + initial.items.length;
+    setNextOffset((current) => inventoryStable
+      ? Math.max(current, initialPageEnd)
+      : initialPageEnd);
     setSelectedRef(nextSelected);
   }, [initial]);
 

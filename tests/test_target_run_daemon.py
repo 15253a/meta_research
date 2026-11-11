@@ -308,6 +308,9 @@ def test_target_daemon_is_fair_single_flight_without_a_training_deadline() -> No
     calls = {"target-fast": 0, "target-stuck": 0}
 
     class Inventory:
+        def list_target_root_reconciliation_refs(self):
+            return ()
+
         def list_target_root_work_refs(self):
             with lock:
                 return tuple(sorted(active))
@@ -363,6 +366,9 @@ def test_target_daemon_delivers_cancel_control_while_root_flight_is_running() ->
     active = {"target-long-running"}
 
     class Inventory:
+        def list_target_root_reconciliation_refs(self):
+            return ()
+
         def list_target_root_work_refs(self):
             return tuple(sorted(active))
 

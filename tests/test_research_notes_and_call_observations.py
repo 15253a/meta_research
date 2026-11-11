@@ -1,3 +1,5 @@
+
+from provider_supervisor_support import closed_tree_fixture
 import hashlib
 import json
 from dataclasses import replace
@@ -63,7 +65,7 @@ def test_signed_call_observation_keeps_existing_receipt_and_exact_compaction_loc
     raw = b"".join(canonical_json(event).encode() + b"\n" for event in events)
     stdout.write_bytes(raw)
     receipt_path, key = directory / "supervisor-exit.json", b"k" * 32
-    write_exit_receipt(receipt_path, key=key, invocation_hash="a" * 64,
+    write_exit_receipt(receipt_path, process_tree=closed_tree_fixture(), key=key, invocation_hash="a" * 64,
         prompt_path=prompt, schema_path=schema, stdout_path=stdout, result_path=result,
         returncode=0, input_bytes=len(prompt.read_bytes()))
     receipt, _ = read_verified_exit_receipt(receipt_path, key=key, invocation_hash="a" * 64,
@@ -133,7 +135,7 @@ def test_signed_native_session_sample_survives_append_and_proposal_cleanup(tmp_p
     result.write_text("{}")
     stdout.write_text(canonical_json({"type": "thread.started", "thread_id": session}) + "\n")
     key = b"k" * 32
-    write_exit_receipt(directory / "supervisor-exit.json", key=key, invocation_hash="a" * 64,
+    write_exit_receipt(directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key, invocation_hash="a" * 64,
         prompt_path=prompt, schema_path=schema, stdout_path=stdout, result_path=result,
         returncode=0, input_bytes=len(prompt.read_bytes()), codex_home=tmp_path / "codex-home")
     observation = read_transport_envelope(directory / "call-observation.json", key)

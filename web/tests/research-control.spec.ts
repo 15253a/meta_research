@@ -1,5 +1,4 @@
 import { expect, test, type Route } from "@playwright/test";
-import { PNG } from "pngjs";
 
 import {
   DeterministicProduct,
@@ -193,6 +192,14 @@ test("Foreground controls require draft preview confirmation and execution in th
   };
 
   await page.route("**/api/v1/snapshot", (route) => fulfill(route, snapshot));
+  await page.route("**/api/v1/status", (route) => fulfill(route, {
+    schema_ref: "meta-research/runtime-status/v1", revision: snapshot.revision,
+    revision_domain: snapshot.revision_domain, observed_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(), state: "running",
+    current_task: { kind: "stage", title: "当前研究", run_ref: "idea-run-1", target_ref: null, status: "running" },
+    waiting_reason: null, pending_requests: 0, foreground: snapshot.research_control.foreground,
+    health: { status: "ready", checks: [] },
+  }));
   await page.route("**/api/v1/events*", (route) => route.abort("connectionrefused"));
   await page.route("**/api/v1/human-collaboration/commands", async (route) => {
     const body = route.request().postDataJSON() as JsonRecord;
@@ -381,7 +388,7 @@ test("Foreground controls require draft preview confirmation and execution in th
   });
 
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(product.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
   const companion = page.getByRole("complementary", { name: "研究助手" });
   const composer = companion.getByRole("region", { name: "研究控制" });
   await expect(composer).toContainText("Epoch 3 · idea");
@@ -412,7 +419,7 @@ test("Foreground controls require draft preview confirmation and execution in th
   await composer.getByRole("button", { name: "查看操作草案" }).click();
   await expect.poll(() => writes.at(-1)).toBe("draft:restore");
 
-  await page.getByRole("button", { name: "问题树", exact: true }).click();
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "问题树", exact: true }).click();
   const tree = page.getByTestId("question-tree");
   const branch = tree.locator('[data-question-ref="question_control_branch"]');
   await branch.hover();
@@ -426,7 +433,7 @@ test("Foreground controls require draft preview confirmation and execution in th
   await headerControl.click();
   const confirmation = page.getByRole("dialog", { name: "暂停当前研究？" });
   await expect(confirmation).toBeVisible();
-  await expect(confirmation).toContainText("当前界面与 Web 服务保持在线");
+  await expect(confirmation).toContainText("系统会等待当前步骤到达可以暂停的位置。暂停后仍可查看页面。");
   await expect(confirmation).toContainText("不会提交 Stage");
   await expect.poll(() => writes.slice(-2)).toEqual(["draft:pause", "preview"]);
   await confirmation.getByRole("button", { name: "确认并暂停研究" }).click();
@@ -551,13 +558,10 @@ test("production control seam preserves Companion order, focus, and responsive g
   await page.setViewportSize({ width: 1440, height: 1000 });
   await openAuthenticatedProduct(page, product);
 
-  const companion = page.getByRole("complementary", { name: "Quest Companion" });
+  const companion = page.getByRole("complementary", { name: "研究助手" });
   const control = companion.getByRole("region", { name: "研究控制" });
   const summary = control.locator("summary");
-  const dynamicAuthorizationIdentities = companion.locator([
-    ".lumen-broad-authorization p:first-of-type",
-    ".lumen-broad-authorization code",
-  ].join(", "));
+  const dynamicAuthorizationIdentities = companion.locator(".lumen-broad-authorization dd");
   await expect(summary).toBeVisible();
   await expect(control.getByLabel("控制动作")).not.toBeVisible();
   await expect(dynamicAuthorizationIdentities).toHaveCount(2);
@@ -570,7 +574,15 @@ test("production control seam preserves Companion order, focus, and responsive g
     await summary.focus();
     await expect(summary).toBeFocused();
     await page.setViewportSize(viewport);
+    if (viewport.width === 800) {
+      await expect(companion).not.toBeVisible();
+      await page.getByRole("button", { name: "研究助手", exact: true }).click();
+      await expect(companion.getByLabel("给研究助手发消息")).toBeFocused();
+      await summary.focus();
+    }
     await expect(summary).toBeFocused();
+    await expect(companion).toBeVisible();
+    await summary.scrollIntoViewIfNeeded();
     const geometry = await page.evaluate(() => {
       const box = (selector: string) => {
         const rect = document.querySelector(selector)?.getBoundingClientRect();
@@ -607,68 +619,25 @@ test("production control seam preserves Companion order, focus, and responsive g
         geometry.companion.x + 1,
       );
     } else {
-      expect(geometry.companion.y).toBeGreaterThanOrEqual(
-        geometry.main.y + geometry.main.height - 1,
-      );
-      if (viewport.width === 390) {
-        expect(geometry.companion.height).toBeGreaterThanOrEqual(560);
-      } else {
-        expect(geometry.companion.height).toBe(540);
-      }
+      await expect(page.locator(".lumen-main")).not.toBeVisible();
+      expect(geometry.companion.x).toBeGreaterThanOrEqual(0);
+      expect(geometry.companion.x + geometry.companion.width).toBeLessThanOrEqual(viewport.width);
+      expect(geometry.companion.height).toBeGreaterThanOrEqual(260);
+      expect(geometry.companion.y + geometry.companion.height).toBeLessThanOrEqual(viewport.height);
     }
-    const screenshotOptions = {
-      animations: "disabled" as const,
-      mask: [
-        dynamicAuthorizationIdentities.nth(0),
-        dynamicAuthorizationIdentities.nth(1),
-      ],
+    await expect(companion).toHaveScreenshot(`research-control-companion-${viewport.width}.png`, {
+      animations: "disabled",
+      mask: [companion.locator(".lumen-broad-authorization dd:visible")],
       maskColor: "#dfe4ee",
       maxDiffPixels: 0,
-    };
-    const screenshotName = `research-control-companion-${viewport.width}.png`;
-    if (viewport.width === 390) {
-      // Locator screenshots round both fractional document edges outward.  The
-      // Companion follows a content-height main surface, so its mobile Y origin
-      // can be fractional even though its audited 570px box is fixed.  Snap the
-      // screenshot-only margin to the device-pixel grid, then assert the raw
-      // locator image at zero tolerance.  A layout offset (rather than a
-      // compositor transform) also makes text rasterize from the same origin.
-      // Production layout remains unchanged after the capture.
-      await companion.scrollIntoViewIfNeeded();
-      await companion.evaluate((element) => {
-        const rect = element.getBoundingClientRect();
-        const shift = Math.round(rect.y) - rect.y;
-        const marginTop = Number.parseFloat(getComputedStyle(element).marginTop);
-        (element as HTMLElement).style.marginTop = `${marginTop + shift}px`;
-      });
-      await expect.poll(async () => companion.evaluate((element) => {
-        const y = element.getBoundingClientRect().y;
-        return Math.abs(y - Math.round(y));
-      })).toBeLessThan(0.01);
-      try {
-        const screenshot = await companion.screenshot({
-          animations: screenshotOptions.animations,
-          mask: screenshotOptions.mask,
-          maskColor: screenshotOptions.maskColor,
-        });
-        const dimensions = PNG.sync.read(screenshot);
-        expect({ width: dimensions.width, height: dimensions.height }).toEqual({
-          width: 374,
-          height: 570,
-        });
-        expect(screenshot).toMatchSnapshot(screenshotName, {
-          maxDiffPixels: screenshotOptions.maxDiffPixels,
-        });
-      } finally {
-        await companion.evaluate((element) => {
-          (element as HTMLElement).style.removeProperty("margin-top");
-        });
-      }
-    } else {
-      await expect(companion).toHaveScreenshot(
-        screenshotName,
-        screenshotOptions,
-      );
+    });
+    if (viewport.width < 881) {
+      const back = page.getByRole("button", { name: "返回研究", exact: true });
+      await back.click();
+      await expect(companion).not.toBeVisible();
+      await expect(page.getByRole("button", { name: "研究助手", exact: true })).toBeFocused();
+      await page.getByRole("button", { name: "研究助手", exact: true }).click();
+      await expect(companion.getByLabel("给研究助手发消息")).toBeFocused();
     }
   }
 

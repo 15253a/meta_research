@@ -4,27 +4,23 @@ Transport configuration stays outside the frozen provider adapter sources so
 already-admitted runs can retain their exact input and result contracts.
 """
 
-import errno
-import json
-import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import cast
 
 from meta_research.provider_supervisor import (
-    PROVIDER_OPERATION_ENV,
-    SUPERVISOR_EXIT_SCHEMA_V2,
-    SUPERVISOR_REQUEST_SCHEMA_V2,
     ProviderProcessPlatform,
+    ProviderSupervisorError,
     SupervisorFileLock,
-    _file_sha256,
-    _validated_request_paths,
+    SUPERVISOR_REQUEST_SCHEMA_V2,
     read_supervisor_request,
     read_transport_envelope,
     read_transport_key_for_operation,
-    write_exit_receipt,
+    supervisor_host_identity,
+    transport_file_sha256,
+    verify_process_tree_closed,
     write_transport_envelope,
-    ProviderSupervisorError,
     supervise,
 )
 
@@ -37,130 +33,83 @@ class StreamingProviderProcessPlatform(ProviderProcessPlatform):
         return {**super().provider_spawn_options(), "bufsize": 0}
 
 
-
-def _operation_processes_absent(request_path: Path) -> bool:
-    """Prove absence of same-user supervisors and escaped provider descendants."""
-    if os.name != "posix" or not Path("/proc").is_dir():
-        return False
-    request_token = str(request_path).encode("utf-8")
-    provider_token = f"{PROVIDER_OPERATION_ENV}={request_path}".encode("utf-8")
-    for directory in Path("/proc").glob("[0-9]*"):
-        try:
-            if int(directory.name) == os.getpid():
-                continue  # This reconciliation supervisor owns the spool lock.
-            if directory.stat().st_uid != os.getuid():
-                continue
-            argv = (directory / "cmdline").read_bytes().split(b"\0")
-            environment = (directory / "environ").read_bytes().split(b"\0")
-            if request_token in argv or provider_token in environment:
-                return False
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        except OSError as error:
-            if error.errno in {errno.ENOENT, errno.ESRCH}:
-                continue
-            raise ProviderSupervisorError("provider_process_identity_unavailable") from error
-    return True
-
-
-def _seal_absent_provider_interruption(
-    request_path: Path, *, process_platform: ProviderProcessPlatform
-) -> bool:
-    """Close a lost supervisor boundary as failure, without replaying its provider.
-
-    ``stopped`` is the existing transport interruption contract. The separately
-    signed recovery record distinguishes this absence proof from a user stop or
-    an observed SIGTERM and preserves the original bridge return code, if any.
-    No partial output is promoted to a successful result.
-    """
-    request_path = request_path.resolve()
-    if process_platform.platform_name != "posix" or not Path("/proc").is_dir():
-        return False
-    _, key = read_transport_key_for_operation(request_path.parent)
+def _reboot_recovery_binding(request_path: Path, key: bytes) -> dict[str, object] | None:
     request = read_supervisor_request(request_path, key)
-    # Generic v2 is the resident Harness transport. Legacy stage contracts stay
-    # on their existing exact-version recovery paths.
     if request.get("schema_ref") != SUPERVISOR_REQUEST_SCHEMA_V2:
-        return False
-    invocation_hash = request.get("invocation_hash")
-    if (
-        not isinstance(invocation_hash, str)
-        or len(invocation_hash) != 64
-        or any(character not in "0123456789abcdef" for character in invocation_hash)
-    ):
-        raise ProviderSupervisorError("provider_supervisor_request_invalid")
-    _, paths, _, stream_limit, result_limit = _validated_request_paths(request_path, request)
-    with SupervisorFileLock(paths["lock_path"]):
-        if paths["receipt_path"].exists():
-            return True  # The transport still verifies the complete signed receipt.
-        ready = read_transport_envelope(paths["ready_path"], key)
-        started = read_transport_envelope(paths["started_path"], key)
-        ready_keys = {"schema_ref", "invocation_hash", "supervisor_process_id", "supervisor_process_group"}
-        started_keys = ready_keys | {"provider_process_id", "provider_process_group", "provider_operation_path"}
-        if (
-            set(ready) != ready_keys or set(started) != started_keys
-            or ready.get("schema_ref") != "meta-research/provider-supervisor-ready/v2"
-            or started.get("schema_ref") != "meta-research/provider-started/v2"
-            or ready.get("invocation_hash") != invocation_hash
-            or started.get("invocation_hash") != invocation_hash
-            or started.get("provider_operation_path") != str(request_path)
-            or any(ready.get(name) != started.get(name) for name in ("supervisor_process_id", "supervisor_process_group"))
-        ):
-            raise ProviderSupervisorError("provider_started_marker_invalid")
-        for prefix in ("supervisor", "provider"):
-            pid = started.get(f"{prefix}_process_id")
-            group = started.get(f"{prefix}_process_group")
-            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or group != pid:
-                raise ProviderSupervisorError("provider_started_marker_invalid")
-            # Numeric PID reuse is not proof of absence. Do not signal it or seal
-            # this operation while either the recorded PID or group still exists.
-            if (Path("/proc") / str(pid)).exists() or process_platform.process_group_running(pid):
-                return False
-        if not _operation_processes_absent(request_path):
-            return False
-        bridge_path = request_path.parent / ".last-message.supervisor.tmp"
-        for file_path in (*paths.values(), bridge_path):
-            if file_path.is_symlink() or (file_path.exists() and not file_path.is_file()):
-                raise ProviderSupervisorError("provider_supervisor_spool_invalid")
-        if not paths["stdout_path"].is_file() or paths["stdout_path"].stat().st_size > stream_limit:
-            raise ProviderSupervisorError("provider_supervisor_spool_invalid")
-        if any(path.is_file() and path.stat().st_size > result_limit for path in (paths["result_path"], bridge_path)):
-            raise ProviderSupervisorError("provider_supervisor_spool_invalid")
-        bridge_returncode = None
-        if bridge_path.is_file() and bridge_path.stat().st_size <= 4096:
-            try:
-                bridge = json.loads(bridge_path.read_bytes())
-                code = bridge.get("returncode") if isinstance(bridge, dict) else None
-                if (
-                    isinstance(bridge, dict)
-                    and bridge.get("schema_ref") == "meta-research/harness-bridge-result/v1"
-                    and isinstance(code, int) and not isinstance(code, bool)
-                ):
-                    bridge_returncode = code
-            except (ValueError, UnicodeError):
-                pass  # A partial bridge result supplies no outcome evidence.
-        write_transport_envelope(
-            request_path.parent / "supervisor-recovery.json",
-            {
-                "schema_ref": "meta-research/provider-supervisor-recovery/v1",
-                "invocation_hash": invocation_hash,
-                "reason": "orphaned_provider_without_exit_receipt",
-                "boundary_returncode": 143,
-                "recorded_bridge_returncode": bridge_returncode,
-                "bridge_result_file_hash": _file_sha256(bridge_path) if bridge_path.is_file() else None,
-                "supervisor_request_file_hash": _file_sha256(request_path),
-                "supervisor_ready_file_hash": _file_sha256(paths["ready_path"]),
-                "provider_started_file_hash": _file_sha256(paths["started_path"]),
-            }, key,
-        )
-        write_exit_receipt(
-            paths["receipt_path"], key=key, invocation_hash=invocation_hash,
-            prompt_path=paths["prompt_path"], schema_path=paths["schema_path"],
-            stdout_path=paths["stdout_path"], result_path=paths["result_path"],
-            returncode=143, input_bytes=0, termination_reason="stopped",
-            schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
-        )
-    return True
+        return None
+    ready_path = request_path.parent / "supervisor-ready.json"
+    if not ready_path.is_file():
+        return None
+    ready = read_transport_envelope(ready_path, key)
+    current = supervisor_host_identity()
+    previous_boot = ready.get("boot_identity_hash")
+    if (ready.get("schema_ref") != "meta-research/provider-supervisor-ready/v2"
+            or ready.get("invocation_hash") != request.get("invocation_hash")
+            or ready.get("host_identity_hash") != current["host_identity_hash"]
+            or not isinstance(previous_boot, str) or len(previous_boot) != 64
+            or any(character not in "0123456789abcdef" for character in previous_boot)
+            or previous_boot == current["boot_identity_hash"]):
+        return None
+    tree = {"schema_ref": "meta-research/provider-process-tree/v1", "state": "closed",
+            "mechanism": "host-reboot", "boot_identity_hash": previous_boot,
+            "host_identity_hash": current["host_identity_hash"]}
+    verify_process_tree_closed(tree)
+    return {"schema_ref": "meta-research/provider-supervisor-recovery/v2",
+            "invocation_hash": request["invocation_hash"],
+            "supervisor_request_file_hash": transport_file_sha256(request_path),
+            "supervisor_ready_file_hash": transport_file_sha256(ready_path),
+            "process_tree": tree, "outcome": "unknown"}
+
+
+def read_verified_reboot_recovery(request_path: Path) -> dict[str, object] | None:
+    """Read original local closure only; never create an execution result."""
+    if sys.platform != "linux":
+        return None
+    operation = request_path.parent
+    recovery_path = operation / "supervisor-recovery.json"
+    if not recovery_path.is_file():
+        return None
+    if any(path.is_symlink() for path in (
+        request_path, operation / "supervisor-ready.json", recovery_path,
+    )):
+        raise ProviderSupervisorError("provider_reboot_evidence_invalid")
+    _, key = read_transport_key_for_operation(operation)
+    binding = _reboot_recovery_binding(request_path, key)
+    if binding is None:
+        raise ProviderSupervisorError("provider_reboot_evidence_invalid")
+    recovered = read_transport_envelope(recovery_path, key)
+    observed_boot = recovered.get("observed_boot_identity_hash")
+    if (set(recovered) != {*binding, "observed_boot_identity_hash"}
+            or not isinstance(observed_boot, str) or len(observed_boot) != 64
+            or any(character not in "0123456789abcdef" for character in observed_boot)
+            or observed_boot == cast(dict[str, object], binding["process_tree"])["boot_identity_hash"]
+            or {name: value for name, value in recovered.items() if name != "observed_boot_identity_hash"} != binding):
+        raise ProviderSupervisorError("provider_reboot_evidence_invalid")
+    return recovered
+
+
+def reconcile_rebooted_supervisor(request_path: Path) -> dict[str, object] | None:
+    """Record local closure after reboot without inventing a native outcome."""
+    if sys.platform != "linux":
+        return None
+    request_path = request_path.resolve()
+    operation = request_path.parent
+    _, key = read_transport_key_for_operation(operation)
+    lock = SupervisorFileLock(operation / "supervisor.lock")
+    if not lock.acquire(blocking=False):
+        return None
+    try:
+        recovery_path = operation / "supervisor-recovery.json"
+        if recovery_path.exists():
+            return read_verified_reboot_recovery(request_path)
+        binding = _reboot_recovery_binding(request_path, key)
+        if binding is None:
+            return None
+        recovered = {**binding, "observed_boot_identity_hash": supervisor_host_identity()["boot_identity_hash"]}
+        write_transport_envelope(recovery_path, recovered, key)
+        return recovered
+    finally:
+        lock.release()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -172,10 +121,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             supervise(Path(arguments[0]), process_platform=platform)
         except ProviderSupervisorError as error:
-            if str(error) != "provider_outcome_unknown" or not _seal_absent_provider_interruption(
-                Path(arguments[0]), process_platform=platform
-            ):
-                raise
+            if str(error) == "provider_outcome_unknown":
+                reconcile_rebooted_supervisor(Path(arguments[0]))
+            raise
     except (OSError, ProviderSupervisorError, subprocess.SubprocessError):
         return 70
     return 0

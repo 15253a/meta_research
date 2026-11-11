@@ -371,6 +371,14 @@ class NativeSessionCleanup:
             if recorder.exists() and recorder.resolve() == recorder:
                 with sqlite3.connect(recorder.as_uri() + "?mode=rw", uri=True, timeout=2) as db:
                     db.execute("BEGIN IMMEDIATE")
+                    tables = {row[0] for row in db.execute(
+                        "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('jobs','quests')"
+                    )}
+                    # The recorder creates its file before committing its schema.
+                    if tables != {"jobs", "quests"}:
+                        return [*reclaim(ids), {"root_kind": "native_session", "session_ref": None,
+                            "path": str(recorder), "bytes": 0, "action": "skipped",
+                            "reason": "native_recorder_schema_unavailable"}]
                     offset = self.offsets.get("recorder", 0)
                     retired = [r[0] for r in db.execute("""
                         SELECT DISTINCT j.native_session_ref FROM jobs j WHERE j.native_session_ref IS NOT NULL

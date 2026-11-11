@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from meta_research.provider_supervisor import (
     read_supervisor_request,
     read_transport_key_for_operation,
     write_exit_receipt,
+    supervisor_host_identity,
     write_supervisor_request,
 )
 from meta_research.quest_drafting import _CancellableProcessRunner
@@ -57,6 +59,9 @@ class _StoppedProvider(_CancellableProcessRunner):
             input_bytes=prompt_path.stat().st_size,
             termination_reason=self.termination_reason,
             schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+            process_tree={"schema_ref": "meta-research/provider-process-tree/v1", "state": "closed",
+                          "mechanism": "linux-subreaper-echild" if sys.platform == "linux" else "windows-job",
+                          **supervisor_host_identity()},
         )
         return subprocess.CompletedProcess(args[1], self.returncode, self.stdout, "")
 

@@ -1,5 +1,7 @@
 """Editable conditions affect new calls without rewriting sealed operations."""
 
+from provider_supervisor_support import closed_tree_fixture
+
 import json
 import subprocess
 import sys
@@ -50,7 +52,7 @@ class _SignedRunner:
         _, key = read_transport_key_for_operation(request_path.parent)
         request = read_supervisor_request(request_path, key)
         write_exit_receipt(
-            Path(request["receipt_path"]), key=key,
+            Path(request["receipt_path"]), process_tree=closed_tree_fixture(), key=key,
             invocation_hash=request["invocation_hash"],
             prompt_path=Path(request["prompt_path"]),
             schema_path=Path(request["schema_path"]), stdout_path=stdout_path,

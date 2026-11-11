@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import sqlite3
 from pathlib import Path
 
@@ -42,19 +44,8 @@ def test_existing_0015_data_upgrades_to_one_durable_harness_run_model(
             )
         }
 
-    upgrade_database(data_root.database)
-    upgrade_database(data_root.database)
-
+    _upgrade_to_revision(data_root.database, "0016_semantic_mcp_harness")
     with sqlite3.connect(data_root.database) as connection:
-        version = connection.execute(
-            "SELECT version_num FROM alembic_version"
-        ).fetchone()
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
         after_owner_rows = connection.execute(
             f"SELECT {', '.join(before_owner_columns)} FROM agent_runtime_state "
             "ORDER BY singleton"
@@ -66,12 +57,27 @@ def test_existing_0015_data_upgrades_to_one_durable_harness_run_model(
                 "AND name LIKE '%experiment%'"
             )
         }
+    assert after_owner_rows == before_owner_rows
+    assert after_experiment_tables == before_experiment_tables
+
+    upgrade_database(data_root.database)
+    upgrade_database(data_root.database)
+    with sqlite3.connect(data_root.database) as connection:
+        version = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         foreign_key_failures = connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
 
-        assert version == ("0038_deepfetch_binding_audit",)
+        assert version == (schema_head(),)
         assert _HARNESS_TABLES <= tables
         assert "ar_harness_sessions" not in tables
         assert "ar_harness_attempts" not in tables
@@ -93,7 +99,9 @@ def test_existing_0015_data_upgrades_to_one_durable_harness_run_model(
             "revoked_at",
         } <= _columns(connection, "ar_mcp_channel_grants")
 
-    assert after_owner_rows == before_owner_rows
-    assert after_experiment_tables == before_experiment_tables
+    assert before_experiment_tables - tables == {
+        "ar_experiment_events", "ar_experiment_attempts", "ar_experiment_sessions",
+        "ar_experiment_runs", "rg_experiment_idempotency", "rg_experiment_requests",
+    }
     assert foreign_key_failures == []
     assert integrity == ("ok",)

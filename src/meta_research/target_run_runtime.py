@@ -149,6 +149,23 @@ class TargetRunRuntime:
         if launch is None:
             self._set_status(target_ref, "launch_pending")
             return False
+        lifecycle = self._target_root_lifecycle.query(target_ref)
+        if lifecycle is not None and lifecycle.status == "failed":
+            # Receipt readback needs no new execution resources, candidate
+            # projection, channel or workspace. Logical work remains failed.
+            harness = self._target_agent.query_target_harness_admission(target_ref)
+            if harness is None:
+                raise OwnerConflict("target_harness_run_not_found")
+            try:
+                operation = self._harnesses.reconcile_failed_target_operation(harness.harness_request_ref)
+            except HarnessAdmissionError as error:
+                self._set_status(target_ref, "failed", error.code)
+                return False
+            if operation.status == "unknown_outcome":
+                self._set_status(target_ref, "failed", "provider_terminal_proof_missing")
+                return False
+            self._set_status(target_ref, "failed", "provider_terminal_reconciled")
+            return True
         # Receipt verification also consumes the installed capability identity.
         # Prepare it once before those reads and reuse it through this wake.
         try:
@@ -224,6 +241,11 @@ class TargetRunRuntime:
         if lifecycle is not None and lifecycle.status == "cancelled":
             self._set_status(target_ref, "cancelled")
             return False
+        if lifecycle is not None and lifecycle.status == "failed":
+            # A concurrent stop won while launch projections were read. The
+            # next receipt-only sweep performs reconciliation above.
+            self._set_status(target_ref, "failed", "provider_terminal_proof_missing")
+            return False
         if (
             lifecycle is not None
             and lifecycle.status == "running"
@@ -237,6 +259,10 @@ class TargetRunRuntime:
                     harness.harness_request_ref
                 )
             except HarnessAdmissionError as error:
+                if error.code == "provider_terminal_proof_missing":
+                    self._target_root_lifecycle.mark_failed_unknown(target_ref=target_ref)
+                    self._set_status(target_ref, "failed", error.code)
+                    return True
                 self._set_status(
                     target_ref,
                     "cancel_pending",

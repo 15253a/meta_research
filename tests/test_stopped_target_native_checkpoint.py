@@ -1,5 +1,6 @@
 """A signed interrupted first turn keeps its exact native root for recovery."""
 import json
+import sys
 
 import pytest
 from sqlalchemy import text
@@ -7,7 +8,7 @@ from sqlalchemy import text
 from meta_research.feed import DurableFeed
 from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError, SQLiteAgentRuntimeHarness
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.provider_supervisor import SUPERVISOR_EXIT_SCHEMA_V2, ensure_transport_key, write_exit_receipt
+from meta_research.provider_supervisor import SUPERVISOR_EXIT_SCHEMA_V2, ensure_transport_key, write_exit_receipt, supervisor_host_identity, write_transport_envelope
 from meta_research.target_raw_output import TargetRawOutputStore
 from test_harness_target_root_recovery import _owner_with_active_root, _replace_channel
 from test_target_root_observations import _event
@@ -40,10 +41,17 @@ def stopped(tmp_path, monkeypatch):
     write_exit_receipt(directory / "supervisor-exit.json", key=key, invocation_hash=digest,
         prompt_path=directory / "prompt.txt", schema_path=directory / "output-schema.json",
         stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
-        returncode=143, input_bytes=0, termination_reason="stopped", schema_ref=SUPERVISOR_EXIT_SCHEMA_V2)
+        returncode=143, input_bytes=0, termination_reason="stopped", schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+        process_tree={"schema_ref": "meta-research/provider-process-tree/v1", "state": "closed",
+                      "mechanism": "linux-subreaper-echild" if sys.platform == "linux" else "windows-job", **supervisor_host_identity()})
     receipt = {"schema_ref": "meta-research/harness-provider-transport-receipt/v1", "spool_ref": "provider-spool:" + digest,
                "transport_invocation_hash": digest, "supervisor_receipt_hash": canonical_hash(json.loads((directory / "supervisor-exit.json").read_text())),
                "termination_reason": "stopped", "provider_returncode": 143}
+    binding_path = workspace / "owner-invocation-bindings" / "ff" / (("f" * 64) + ".json")
+    binding_path.parent.mkdir(parents=True)
+    write_transport_envelope(binding_path, {"schema_ref": "meta-research/harness-operation-binding/v1",
+        "owner_invocation_hash": "f" * 64, "provider_operation_ref": operation,
+        "family": "codex", "transport_invocation_hash": digest}, key)
     store = TargetRawOutputStore(workspace)
     store.bind_operation(operation, digest, family="codex")
     owner.bind_target_provider_ceiling_receipt_verifier(store)
@@ -155,5 +163,12 @@ def test_rejected_checkpoint_fallback_cannot_overwrite_changed_state(stopped, ch
     before_operation = owner.latest_operation(run.run_ref)
     owner.record_operation_failure(operation, "provider_outcome_unknown", durable_outcome="unknown",
                                    expected_running_run_ref=expected)
-    assert owner.query_run(request.request_ref) == before_run
-    assert owner.latest_operation(run.run_ref) == before_operation
+    if change == "paused":
+        current = owner.query_run(request.request_ref)
+        assert current.status == "suspended"
+        assert (current.run_ref, current.attempt_ref, current.root_session_ref, current.fence_ref) == (
+            before_run.run_ref, before_run.attempt_ref, before_run.root_session_ref, before_run.fence_ref)
+        assert owner.latest_operation(run.run_ref).status == "unknown_outcome"
+    else:
+        assert owner.query_run(request.request_ref) == before_run
+        assert owner.latest_operation(run.run_ref) == before_operation

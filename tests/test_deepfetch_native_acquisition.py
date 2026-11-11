@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from provider_supervisor_support import closed_tree_fixture
+
 import copy
 import json
 import subprocess
@@ -62,7 +64,7 @@ class NativeAcquisitionRunner(SequencedPrototypeRunner):
         result_path = Path(argv[argv.index("--output-last-message") + 1])
         _, key = ensure_transport_key(self.workspace)
         invocation = read_transport_envelope(stdout_path.parent / "invocation.json", key)
-        write_exit_receipt(stdout_path.parent / "supervisor-exit.json", key=key,
+        write_exit_receipt(stdout_path.parent / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key,
             invocation_hash=canonical_hash(invocation),
             prompt_path=stdout_path.parent / "prompt.txt",
             schema_path=stdout_path.parent / "output-schema.json",
@@ -98,8 +100,9 @@ def test_native_acquisition_is_reattested_and_replays_without_dispatch(tmp_path)
 
 def test_native_trace_without_owner_commit_cannot_supply_fulltext_proof(tmp_path):
     adapter, request, authority, _ = _setup(tmp_path, commit=False)
-    with pytest.raises(DeepFetchUnavailable, match="deepfetch_acquisition_reattestation_required"):
+    with pytest.raises(DeepFetchUnavailable, match="deepfetch_provider_reconciliation_pending") as caught:
         adapter.execute(request)
+    assert caught.value.durable_outcome == "pending"
     assert not authority.calls
 
 

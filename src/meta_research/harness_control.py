@@ -9,12 +9,14 @@ from meta_research.provider_supervisor import (
     SUPERVISOR_EXIT_SCHEMA_V2,
     SUPERVISOR_REQUEST_SCHEMA_V2,
     ProviderSupervisorError,
+    SupervisorFileLock,
     ensure_transport_key,
     read_transport_envelope,
     read_supervisor_request,
     read_verified_exit_receipt,
     request_supervisor_stop,
     supervisor_request_never_started,
+    write_supervisor_stop_request,
 )
 
 
@@ -56,7 +58,7 @@ class DurableHarnessOperationCanceller:
             / transport_invocation_hash
         )
         if not operation.is_dir() or operation.is_symlink():
-            return False
+            raise HarnessCancellationError("provider_terminal_proof_missing")
         try:
             request = read_supervisor_request(
                 operation / "supervisor-request.json",
@@ -70,27 +72,71 @@ class DurableHarnessOperationCanceller:
                     "provider_supervisor_request_invalid"
                 )
             receipt_path = operation / "supervisor-exit.json"
+            proof_error = None
             if receipt_path.is_file():
-                self._verify_terminal(operation, transport_invocation_hash)
-                return True
+                try:
+                    self._verify_terminal(operation, transport_invocation_hash)
+                except (OSError, ProviderSupervisorError) as error:
+                    proof_error = error
+                else:
+                    return True
+            write_supervisor_stop_request(
+                operation / "supervisor-stop.json",
+                key=self._key,
+                invocation_hash=transport_invocation_hash,
+            )
             ready_path = operation / "supervisor-ready.json"
             if not ready_path.is_file():
-                return supervisor_request_never_started(
+                if supervisor_request_never_started(
                     operation,
                     key=self._key,
                     invocation_hash=transport_invocation_hash,
                     request_schema=SUPERVISOR_REQUEST_SCHEMA_V2,
-                )
-            if not request_supervisor_stop(
-                operation,
-                key=self._key,
-                invocation_hash=transport_invocation_hash,
-                ready_schema=self._READY_SCHEMA,
-            ):
+                ):
+                    return True
+                if (
+                    (operation / "provider-started.json").exists()
+                    and not ready_path.is_file()
+                ):
+                    proof_error = ProviderSupervisorError(
+                        "provider_supervisor_ready_invalid"
+                    )
+            else:
+                try:
+                    request_supervisor_stop(
+                        operation,
+                        key=self._key,
+                        invocation_hash=transport_invocation_hash,
+                        ready_schema=self._READY_SCHEMA,
+                    )
+                except (OSError, ProviderSupervisorError) as error:
+                    proof_error = error
+            lock = SupervisorFileLock(operation / "supervisor.lock")
+            if not lock.acquire(blocking=False):
+                if proof_error is not None:
+                    raise HarnessCancellationError(
+                        "provider_terminal_proof_missing"
+                    ) from proof_error
                 return False
-            if receipt_path.is_file():
-                self._verify_terminal(operation, transport_invocation_hash)
-            return True
+            try:
+                if receipt_path.is_file():
+                    try:
+                        self._verify_terminal(operation, transport_invocation_hash)
+                    except (OSError, ProviderSupervisorError) as error:
+                        proof_error = error
+                    else:
+                        return True
+            finally:
+                lock.release()
+            from meta_research.streaming_provider_supervisor import reconcile_rebooted_supervisor
+            try:
+                if reconcile_rebooted_supervisor(operation / "supervisor-request.json") is not None:
+                    proof_error = ProviderSupervisorError("provider_local_tree_closed_after_host_reboot")
+            except (OSError, ProviderSupervisorError) as error:
+                proof_error = error
+            # The free lock diagnoses a missing supervisor; it cannot prove
+            # descendants stopped. Preserve any verification error as its cause.
+            raise HarnessCancellationError("provider_terminal_proof_missing") from proof_error
         except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
             raise HarnessCancellationError(
                 "harness_cancel_transport_invalid"

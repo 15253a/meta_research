@@ -39,9 +39,9 @@ test("Research Asset is a real responsive intake, inventory, and receipt surface
   await expect(opener).toBeEnabled();
   await opener.click();
   const dialog = page.getByRole("dialog", { name: "研究资料" });
-  await dialog.locator(".asset-storage-details > summary").click();
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("button", { name: "关闭研究资料" })).toBeFocused();
+  await dialog.locator(".asset-storage-details > summary").click();
 
   const kinds = await dialog.getByLabel("Research Asset 来源类型").locator("option").allTextContents();
   expect(kinds).toEqual([
@@ -120,7 +120,7 @@ test("Quest server directory selection saves unread metadata without RM intake",
   await expect(materials).toContainText("已保存，尚未读取");
   expect(intakes).toEqual([]);
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: "创建研究任务" }).click();
+  await expect(quest).toBeVisible();
   await expect(materials).toContainText(linkedMaterialDirectory);
   await expect(materials).toContainText("Original directory description.");
   expect(references).toHaveLength(1);
@@ -177,7 +177,7 @@ test("an optional server candidate never gates the formal Direct Quest flow", as
     { timeout: 15_000 },
   );
   await expect(
-    quest.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
+    quest.getByText("创建前请核对以下影响", { exact: true }),
   ).toBeVisible();
   await expect(
     quest.getByRole("button", { name: "确认创建 Quest 与第一个问题" }),
@@ -238,13 +238,39 @@ test("paged inventory keeps an exact off-page version reachable", async ({
     );
     expect(response.status()).toBe(201);
   }
-  await page.reload({ waitUntil: "domcontentloaded" });
+  const workspaceUrl = page.url();
+  await page.goto("about:blank");
+  const compactRequest = page.waitForEvent("requestfinished", (request) =>
+    new URL(request.url()).pathname === "/api/v1/snapshot"
+    && request.headers()["x-meta-research-snapshot-assets"] === "defer");
+  await page.goto(workspaceUrl, { waitUntil: "domcontentloaded" });
+  const compactResponse = await (await compactRequest).response();
+  if (!compactResponse) throw new Error("completed compact snapshot has no response");
+  expect(compactResponse.ok()).toBe(true);
+  const compact = (await compactResponse.json()).research_assets;
+  expect(compact.items).toEqual([]);
+  expect(compact.total_count).toBe(52);
+  const hydratedRequest = page.waitForEvent("requestfinished", (request) =>
+    new URL(request.url()).pathname === "/api/v1/snapshot"
+    && request.headers()["x-meta-research-snapshot-assets"] === "include");
   await page.getByRole("button", { name: "研究资料", exact: true }).click();
+  const hydratedResponse = await (await hydratedRequest).response();
+  if (!hydratedResponse) throw new Error("completed hydrated snapshot has no response");
+  expect(hydratedResponse.ok()).toBe(true);
+  const hydrated = (await hydratedResponse.json()).research_assets;
+  expect(hydrated.items).toHaveLength(50);
+  expect(hydrated.inventory_revision).toBe(compact.inventory_revision);
   const dialog = page.getByRole("dialog", { name: "研究资料" });
   await dialog.locator(".asset-storage-details > summary").click();
-  await expect(dialog.getByText("50 / 52 versions", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("list", { name: "Research Asset 版本清单" }).getByRole("listitem")).toHaveCount(50);
+  await expect(dialog.locator(".asset-header-chip")).toHaveText("已保存内容版本：52");
+  const nextPageResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/v1/research-assets" && response.ok());
   await dialog.getByRole("button", { name: /加载更多（已显示 50 \/ 52）/ }).click();
-  await expect(dialog.getByText("52 / 52 versions", { exact: true })).toBeVisible();
+  const nextPage = await nextPageResponse;
+  expect(new URL(nextPage.url()).searchParams.get("offset")).toBe("50");
+  expect((await nextPage.json()).items).toHaveLength(2);
+  await expect(dialog.getByRole("list", { name: "Research Asset 版本清单" }).getByRole("listitem")).toHaveCount(52);
 
   const offPage = dialog.getByRole("listitem").filter({ hasText: "paged-00.txt" });
   await offPage.click();
@@ -258,7 +284,7 @@ test("paged inventory keeps an exact off-page version reachable", async ({
     dialog.getByRole("region", { name: "Research Asset 版本详情" }),
   ).toContainText("paged-00.txt");
   await dialog.getByRole("button", { name: /加载更多（已显示 51 \/ 52）/ }).click();
-  await expect(dialog.getByText("52 / 52 versions", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("list", { name: "Research Asset 版本清单" }).getByRole("listitem")).toHaveCount(52);
   await expect(dialog.getByRole("listitem")).toHaveCount(52);
 });
 
@@ -298,6 +324,7 @@ test("an authorization interruption retains the durable intake pointer and resum
   await expect.poll(async () => page.evaluate(() =>
     window.sessionStorage.getItem("meta_research_pending_asset_intake"),
   )).toBeNull();
+  await resumed.locator(".asset-storage-details > summary").click();
   await expect(resumed.getByRole("listitem").filter({ hasText: "durable-auth-note.md" }))
     .toContainText("integrity · verified");
 });

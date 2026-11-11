@@ -1,4 +1,6 @@
 """Physical cleanup against the locked Codex CLI in a fresh deployment home."""
+
+from provider_supervisor_support import closed_tree_fixture
 from contextlib import contextmanager
 import json
 import os
@@ -210,7 +212,7 @@ def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool
         (directory / "stdout.jsonl").write_bytes(raw)
         (directory / "prompt.txt").write_bytes(b"stage prompt")
         (directory / "output-schema.json").write_text("{}")
-        write_exit_receipt(directory / "supervisor-exit.json", key=key, invocation_hash=canonical_hash(invocation),
+        write_exit_receipt(directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key, invocation_hash=canonical_hash(invocation),
             prompt_path=directory / "prompt.txt", schema_path=directory / "output-schema.json",
             stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
             returncode=0, input_bytes=len(b"stage prompt"))
@@ -317,3 +319,28 @@ def test_unindexed_rollout_is_reported_and_preserved_without_triggering_cascade(
     path.write_text(json.dumps({"type": "session_meta", "payload": {"id": ref}}) + "\n")
     report, = delete_codex_sessions(root, "/unused", [ref], dry_run=False)
     assert report["reason"] == "native_index_binding_absent" and path.is_file()
+
+
+def test_recorder_bootstrap_does_not_interrupt_workspace_cleanup(tmp_path):
+    from meta_research.timeline_summaries import TimelineSummaryStore
+    from test_completed_workspace_cleanup import _cleanup_runtime
+    from test_timeline_summaries import node
+
+    runtime = _cleanup_runtime(tmp_path / "recorder-bootstrap")
+    try:
+        recorder = runtime.data_root.root / "research-recorder" / "summaries.sqlite3"
+        recorder.parent.mkdir(parents=True, exist_ok=True)
+        recorder.touch()
+        cleanup = runtime.target_run_runtime.cleanup_completed_workspaces
+        report = cleanup(dry_run=False, limit=10)
+        assert report == ({"root_kind": "native_session", "session_ref": None,
+            "path": str(recorder), "bytes": 0, "action": "skipped",
+            "reason": "native_recorder_schema_unavailable"},)
+        assert recorder.is_file()
+        store = TimelineSummaryStore(recorder)
+        store.sync("bootstrap-quest", [node("original observation")], 100)
+        assert cleanup(dry_run=False, limit=10) == ()
+        with sqlite3.connect(recorder) as db:
+            assert db.execute("SELECT count(*) FROM nodes").fetchone() == (1,)
+    finally:
+        runtime.close()

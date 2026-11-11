@@ -446,8 +446,14 @@ def test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect(
             )
             assert missing["isError"] is True
             assert missing["structuredContent"] == {
-                "status": "capability_unavailable",
                 "code": "effect_not_found",
+                "details": {
+                    "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+                    "execution_stage": "handler",
+                    "correction": "Restore reconciliation first. Keep the original identity and submission; the outcome is still unknown.",
+                    "effect_status": "unknown",
+                    "effect_id": "effect-that-was-never-opened",
+                },
             }
 
             forged = _tool_call(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from migration_support import schema_head
+
 import sqlite3
 from importlib.resources import files
 from pathlib import Path
@@ -134,7 +136,7 @@ def test_runtime_protection_migration_is_atomic_retryable_and_idempotent(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0038_deepfetch_binding_audit",)
+        ).fetchone() == (schema_head(),)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
     assert _schema_snapshot(database) == first_schema
@@ -145,7 +147,7 @@ def test_runtime_protection_migration_is_single_head_with_core_constraints(
 ) -> None:
     config = _migration_config()
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "0038_deepfetch_binding_audit"
+        schema_head()
     ]
 
     database = tmp_path / "runtime-protection-schema.sqlite3"

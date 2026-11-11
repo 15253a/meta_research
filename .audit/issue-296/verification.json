@@ -1,0 +1,1753 @@
+{
+  "baseline": "c2392b4b37964d963ce1477a65025e252c7802b7",
+  "implementation_commit": "069cdab4c75f775bcd7d4281ebb2e059f3c56b8b",
+  "implementation_tree": "78d8a7c87a104fbbbdf6e9d059ce02aade36af33",
+  "runs": [
+    {
+      "label": "red-local-tree01",
+      "source_archive_sha256": "da5fcd28bc98745606ac3c4fb3384c70cb9fdb3704d6cbe250ce36cba6c13029",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "da5fcd28bc98745606ac3c4fb3384c70cb9fdb3704d6cbe250ce36cba6c13029",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 1,
+        "elapsed_seconds": 1.4143102243542671
+      }
+    },
+    {
+      "label": "green-local-tree01",
+      "source_archive_sha256": "7b24586507f60892f033e95443e72d48911597089fc264ab7722ff21d836f601",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "7b24586507f60892f033e95443e72d48911597089fc264ab7722ff21d836f601",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 0,
+        "elapsed_seconds": 1.5069563686847687
+      }
+    },
+    {
+      "label": "tree-green08",
+      "source_archive_sha256": "030ca4e6a6cda0cc766fd304d2a91363f1c8ac3bf8ca4657cc989e7c8d5fdd77",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "030ca4e6a6cda0cc766fd304d2a91363f1c8ac3bf8ca4657cc989e7c8d5fdd77",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 0,
+        "elapsed_seconds": 18.26346768811345
+      }
+    },
+    {
+      "label": "phase1-gate01",
+      "source_archive_sha256": "3a079d5bb56fa130d0765bcffe55f05582e870fcaa07baed96c2c26a47b385f1",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "3a079d5bb56fa130d0765bcffe55f05582e870fcaa07baed96c2c26a47b385f1",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_deepfetch_adapter.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_quest_drafting_adapters.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_harness_target_root.py",
+            "returncode": 0,
+            "index": 3
+          },
+          {
+            "file": "tests/test_harness_adapters.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_harness_target_root_recovery.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_native_codex_guidance.py",
+            "returncode": 1,
+            "index": 7
+          },
+          {
+            "file": "tests/test_bundle_replacement_native_proof.py",
+            "returncode": 0,
+            "index": 9
+          },
+          {
+            "file": "tests/test_root_session_observations.py",
+            "returncode": 1,
+            "index": 6
+          },
+          {
+            "file": "tests/test_issue296_recovery_admission.py",
+            "returncode": 0,
+            "index": 8
+          },
+          {
+            "file": "tests/test_research_notes_and_call_observations.py",
+            "returncode": 0,
+            "index": 11
+          },
+          {
+            "file": "tests/test_target_root_unknown_exit.py",
+            "returncode": 0,
+            "index": 10
+          },
+          {
+            "file": "tests/test_native_session_cleanup.py",
+            "returncode": 0,
+            "index": 12
+          },
+          {
+            "file": "tests/test_root_provider_observations.py",
+            "returncode": 0,
+            "index": 15
+          },
+          {
+            "file": "tests/test_root_workspace.py",
+            "returncode": 0,
+            "index": 13
+          },
+          {
+            "file": "tests/test_provider_supervisor_platform.py",
+            "returncode": 0,
+            "index": 17
+          },
+          {
+            "file": "tests/test_target_run_daemon.py",
+            "returncode": 0,
+            "index": 14
+          },
+          {
+            "file": "tests/test_acquisition_native_replacement.py",
+            "returncode": 0,
+            "index": 18
+          },
+          {
+            "file": "tests/test_harness_stopped_profile_resume.py",
+            "returncode": 1,
+            "index": 16
+          },
+          {
+            "file": "tests/test_orphaned_harness_supervisor.py",
+            "returncode": 0,
+            "index": 20
+          },
+          {
+            "file": "tests/test_provider_process_tree.py",
+            "returncode": 0,
+            "index": 22
+          },
+          {
+            "file": "tests/test_stage_native_replacement.py",
+            "returncode": 0,
+            "index": 21
+          },
+          {
+            "file": "tests/test_harness_cancel_control.py",
+            "returncode": 0,
+            "index": 24
+          },
+          {
+            "file": "tests/test_harness_frozen_terminal_recovery.py",
+            "returncode": 0,
+            "index": 23
+          },
+          {
+            "file": "tests/test_quest_goal_history.py",
+            "returncode": 0,
+            "index": 25
+          },
+          {
+            "file": "tests/test_native_codex_exec.py",
+            "returncode": 0,
+            "index": 27
+          },
+          {
+            "file": "tests/test_root_workspace_history.py",
+            "returncode": 0,
+            "index": 19
+          },
+          {
+            "file": "tests/test_harness_terminal_replay.py",
+            "returncode": 0,
+            "index": 29
+          },
+          {
+            "file": "tests/test_child_session_native_harness_api.py",
+            "returncode": 0,
+            "index": 30
+          },
+          {
+            "file": "tests/test_target_root_cancel.py",
+            "returncode": 0,
+            "index": 28
+          },
+          {
+            "file": "tests/test_deepfetch_host_completion_time.py",
+            "returncode": 0,
+            "index": 31
+          },
+          {
+            "file": "tests/test_target_raw_output_interrupted_tail.py",
+            "returncode": 0,
+            "index": 32
+          },
+          {
+            "file": "tests/test_target_root_suspended_wait.py",
+            "returncode": 0,
+            "index": 33
+          },
+          {
+            "file": "tests/test_target_daemon_health_retention.py",
+            "returncode": 0,
+            "index": 35
+          },
+          {
+            "file": "tests/test_human_wait_runtime_control.py",
+            "returncode": 0,
+            "index": 34
+          },
+          {
+            "file": "tests/test_provider_supervisor_exception_cleanup.py",
+            "returncode": 0,
+            "index": 37
+          },
+          {
+            "file": "tests/test_sealed_provider_operations.py",
+            "returncode": 0,
+            "index": 38
+          },
+          {
+            "file": "tests/test_provider_supervisor_control.py",
+            "returncode": 0,
+            "index": 39
+          },
+          {
+            "file": "tests/test_stopped_target_native_checkpoint.py",
+            "returncode": 0,
+            "index": 26
+          },
+          {
+            "file": "tests/test_target_successor_terminal_gate.py",
+            "returncode": 0,
+            "index": 41
+          },
+          {
+            "file": "tests/test_workspace_guidance_delivery.py",
+            "returncode": 0,
+            "index": 42
+          },
+          {
+            "file": "tests/test_issue296_root_recovery_frontier.py",
+            "returncode": 0,
+            "index": 40
+          },
+          {
+            "file": "tests/test_issue296_late_receipt_reconciliation.py",
+            "returncode": 0,
+            "index": 43
+          },
+          {
+            "file": "tests/test_issue296_unknown_observation.py",
+            "returncode": 0,
+            "index": 44
+          },
+          {
+            "file": "tests/test_target_stop_damaged_transport.py",
+            "returncode": 0,
+            "index": 36
+          },
+          {
+            "file": "tests/test_completed_workspace_cleanup.py",
+            "returncode": 0,
+            "index": 5
+          }
+        ],
+        "collected": 686,
+        "counts": {
+          "passed": 677,
+          "failed": 7,
+          "skipped": 2,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 836.7396368980408
+      }
+    },
+    {
+      "label": "phase1-profile-gate04",
+      "source_archive_sha256": "d8ae5f6bed0e311bd02bca365adb5c3e0abef79ea26c470248fd93ba4f6be1d0",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "d8ae5f6bed0e311bd02bca365adb5c3e0abef79ea26c470248fd93ba4f6be1d0",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_recovery_admission.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_harness_target_root_recovery.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_harness_stopped_profile_resume.py",
+            "returncode": 0,
+            "index": 3
+          },
+          {
+            "file": "tests/test_target_successor_terminal_gate.py",
+            "returncode": 0,
+            "index": 5
+          },
+          {
+            "file": "tests/test_harness_frozen_terminal_recovery.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_issue296_unknown_observation.py",
+            "returncode": 0,
+            "index": 7
+          },
+          {
+            "file": "tests/test_issue296_root_recovery_frontier.py",
+            "returncode": 0,
+            "index": 6
+          },
+          {
+            "file": "tests/test_root_session_observations.py",
+            "returncode": 0,
+            "index": 1
+          }
+        ],
+        "collected": 108,
+        "counts": {
+          "passed": 108,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 174.3826127536595
+      }
+    },
+    {
+      "label": "phase1-native-guidance-fix01",
+      "source_archive_sha256": "dd0af0db809c862b46366f983c3453d47bc5ca1030b669da8a605179d2cba0e2",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "dd0af0db809c862b46366f983c3453d47bc5ca1030b669da8a605179d2cba0e2",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 73.21676013991237
+      }
+    },
+    {
+      "label": "stage2-red07",
+      "source_archive_sha256": "06bb3461f52aeb685348804c17d74659970b9e53a39ef2c7d15ecd26c3c0e2ac",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "06bb3461f52aeb685348804c17d74659970b9e53a39ef2c7d15ecd26c3c0e2ac",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 1,
+        "elapsed_seconds": 47.55782715976238
+      }
+    },
+    {
+      "label": "stage2-stable-green01",
+      "source_archive_sha256": "00192f62318c70717a9dff44acdfc06db4a67fced22122dbe6d94f1a478e30d1",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "00192f62318c70717a9dff44acdfc06db4a67fced22122dbe6d94f1a478e30d1",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 47.96839650347829
+      }
+    },
+    {
+      "label": "stage2-chain02",
+      "source_archive_sha256": "1d362c0f463026b9f55d38ce227902638a199682fafa310dc54d67a2f2a18847",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "1d362c0f463026b9f55d38ce227902638a199682fafa310dc54d67a2f2a18847",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 20.333075024187565
+      }
+    },
+    {
+      "label": "stage2-generic01",
+      "source_archive_sha256": "fc575b55af80c88364715d078986418706e149ffb5613839cb98391575fa1f94",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "fc575b55af80c88364715d078986418706e149ffb5613839cb98391575fa1f94",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 73.26438235118985
+      }
+    },
+    {
+      "label": "stage2-hr-reopen-green02",
+      "source_archive_sha256": "c0623297dc5cda202a26f728b1fb660292f0321db0d188a9afbbdc103992c3b1",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "c0623297dc5cda202a26f728b1fb660292f0321db0d188a9afbbdc103992c3b1",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_human_unknown_consumers.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_issue296_workspace_consumers.py",
+            "returncode": 0,
+            "index": 0
+          }
+        ],
+        "collected": 5,
+        "counts": {
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 74.69474055245519
+      }
+    },
+    {
+      "label": "stage2-failed-gc-green01",
+      "source_archive_sha256": "22a561666e0c8933348cb2cb05aaafe251e2bfcbe3ada65923f59764e8f00719",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "22a561666e0c8933348cb2cb05aaafe251e2bfcbe3ada65923f59764e8f00719",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_failed_workspace_cleanup.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_completed_workspace_cleanup.py",
+            "returncode": 0,
+            "index": 0
+          }
+        ],
+        "collected": 32,
+        "counts": {
+          "passed": 32,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 809.7716911621392
+      }
+    },
+    {
+      "label": "stage2-failed-gc-green02",
+      "source_archive_sha256": "8f31f1e0c3f461cef0536a350eb497bb02e55fbb1f20010b28da2dfe2316e932",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "8f31f1e0c3f461cef0536a350eb497bb02e55fbb1f20010b28da2dfe2316e932",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 170.47757102921605
+      }
+    },
+    {
+      "label": "stage2-gc-crossquest01",
+      "source_archive_sha256": "6afd9721a9d4f14784bba6892bbf11911640e4bf0a35fcaf94a8dd55148cb1d4",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "6afd9721a9d4f14784bba6892bbf11911640e4bf0a35fcaf94a8dd55148cb1d4",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 20.23624736815691
+      }
+    },
+    {
+      "label": "stage2-final-phase1-upgrade01",
+      "source_archive_sha256": "cf08ad5d7fcb969fd8b5f2529ee0ecb8dd67a9ec2255064fc51d60136ae63c2f",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "cf08ad5d7fcb969fd8b5f2529ee0ecb8dd67a9ec2255064fc51d60136ae63c2f",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 5.186780445277691
+      }
+    },
+    {
+      "label": "base-migration01",
+      "source_archive_sha256": "28d47044684459dc4203b537e5cd899579bb182bcdbdd8b11fe1e52d92b9c981",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "28d47044684459dc4203b537e5cd899579bb182bcdbdd8b11fe1e52d92b9c981",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "files": [
+          {
+            "file": "tests/test_runtime_protection_migration.py",
+            "returncode": 1,
+            "index": 2
+          },
+          {
+            "file": "tests/test_bundle_stage_migration.py",
+            "returncode": 1,
+            "index": 1
+          },
+          {
+            "file": "tests/test_reasoning_successor_context_migration.py",
+            "returncode": 1,
+            "index": 3
+          },
+          {
+            "file": "tests/test_deepfetch_runtime_binding_transition_migration.py",
+            "returncode": 1,
+            "index": 4
+          },
+          {
+            "file": "tests/test_bundle_inbox_migration.py",
+            "returncode": 1,
+            "index": 5
+          },
+          {
+            "file": "tests/test_harness_migration_recovery.py",
+            "returncode": 1,
+            "index": 6
+          },
+          {
+            "file": "tests/test_target_root_lifecycle_migration.py",
+            "returncode": 1,
+            "index": 7
+          },
+          {
+            "file": "tests/test_migration_recovery.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 45,
+        "counts": {
+          "passed": 22,
+          "failed": 23,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 145.17197311669588
+      }
+    },
+    {
+      "label": "base-migration-merge02",
+      "source_archive_sha256": "28d5f9e6fa2460744542aa901224d7eef49c18e5822162a54c8d5fb3db5903a5",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "28d5f9e6fa2460744542aa901224d7eef49c18e5822162a54c8d5fb3db5903a5",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "files": [
+          {
+            "file": "tests/test_goal_creation_migration_merge.py",
+            "returncode": 1,
+            "index": 1
+          },
+          {
+            "file": "tests/test_material_companion_search_migration_merge.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 7,
+        "counts": {
+          "passed": 0,
+          "failed": 7,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 22.084537640213966
+      }
+    },
+    {
+      "label": "migration-green03",
+      "source_archive_sha256": "ba3276842771a1b6040bab156f5d237f4006acf52f3d1c0cda02f945053516f5",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "ba3276842771a1b6040bab156f5d237f4006acf52f3d1c0cda02f945053516f5",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_bundle_stage_migration.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_runtime_protection_migration.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_material_companion_search_migration_merge.py",
+            "returncode": 0,
+            "index": 3
+          },
+          {
+            "file": "tests/test_deepfetch_runtime_binding_transition_migration.py",
+            "returncode": 0,
+            "index": 6
+          },
+          {
+            "file": "tests/test_reasoning_successor_context_migration.py",
+            "returncode": 0,
+            "index": 5
+          },
+          {
+            "file": "tests/test_harness_migration_recovery.py",
+            "returncode": 1,
+            "index": 8
+          },
+          {
+            "file": "tests/test_goal_creation_migration_merge.py",
+            "returncode": 0,
+            "index": 7
+          },
+          {
+            "file": "tests/test_bundle_inbox_migration.py",
+            "returncode": 0,
+            "index": 9
+          },
+          {
+            "file": "tests/test_target_root_lifecycle_migration.py",
+            "returncode": 0,
+            "index": 10
+          },
+          {
+            "file": "tests/test_migration_recovery.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_root_session_observations.py",
+            "returncode": 0,
+            "index": 1
+          }
+        ],
+        "collected": 69,
+        "counts": {
+          "passed": 68,
+          "failed": 1,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 176.83624556660652
+      }
+    },
+    {
+      "label": "migration-harness-green04",
+      "source_archive_sha256": "bbc7b676579365e3d8d35c0386eaa670bcc9829503a890d2b6ca38cff6095630",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "bbc7b676579365e3d8d35c0386eaa670bcc9829503a890d2b6ca38cff6095630",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 8.078660540282726
+      }
+    },
+    {
+      "label": "browser-control05",
+      "source_archive_sha256": "c1c0598d673b3c774f526603663725be53199b233b3645f0a3a0de03db2800a3",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "c1c0598d673b3c774f526603663725be53199b233b3645f0a3a0de03db2800a3",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 41.886668775230646
+      }
+    },
+    {
+      "label": "native-workspace-write01",
+      "source_archive_sha256": "b6a86c4212b454d053ab4771cef00c402d639f9184ee6fd9b54fe0eb9b0803d5",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "b6a86c4212b454d053ab4771cef00c402d639f9184ee6fd9b54fe0eb9b0803d5",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_issue296_native_workspace_write.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 1,
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 6.9813914485275745
+      }
+    },
+    {
+      "label": "base-human-missing01",
+      "source_archive_sha256": "ce9cd502ed822cbacec4ea1d6bf36e5b7ac5160881bfa50e47b4df8334b9f898",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "ce9cd502ed822cbacec4ea1d6bf36e5b7ac5160881bfa50e47b4df8334b9f898",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 1,
+        "elapsed_seconds": 14.390163134783506
+      }
+    },
+    {
+      "label": "final-human01",
+      "source_archive_sha256": "f25c1179f03868eb538110bff91e5a9b4b8201accfbd2398f0044a48c849faea",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": null,
+      "result": {
+        "snapshot": "f25c1179f03868eb538110bff91e5a9b4b8201accfbd2398f0044a48c849faea",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_public_human_reply_delivery.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_root_human_request_lifecycle.py",
+            "returncode": 1,
+            "index": 0
+          }
+        ],
+        "collected": 24,
+        "counts": {
+          "passed": 23,
+          "failed": 1,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 1,
+        "elapsed_seconds": 129.28501887992024
+      }
+    },
+    {
+      "label": "final-backend02",
+      "source_archive_sha256": "3e5bf0ad5ca56fbc971a4cfc27ed082cd6cd21b16298f7e33951ca1e5aaa6bd0",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "3e5bf0ad5ca56fbc971a4cfc27ed082cd6cd21b16298f7e33951ca1e5aaa6bd0",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "collected": 949,
+        "counts": {
+          "passed": 947,
+          "failed": 0,
+          "skipped": 2,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 865.1785586252809
+      }
+    },
+    {
+      "label": "final-browser03",
+      "source_archive_sha256": "065ee98b17aea2ca640d7d61ef93926c65baf454ce13c01b3f89783e0abea076",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "065ee98b17aea2ca640d7d61ef93926c65baf454ce13c01b3f89783e0abea076",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 250.08975897356868
+      },
+      "browser": {
+        "exitcode": 0,
+        "elapsed_seconds": 249.21595031768084,
+        "mode": "full",
+        "command": [
+          "/usr/local/bin/node",
+          "/tmp/issue274-retry-9pWdVe/web/node_modules/@playwright/test/cli.js",
+          "test",
+          "--project=functional",
+          "--workers=4",
+          "--output=/dev/shm/issue-296-LlVjtFCr/ui-output",
+          "--reporter=line,json",
+          "tests/root-domain-recovery.spec.ts",
+          "tests/research-control.spec.ts",
+          "tests/human-request-recovery.spec.ts",
+          "tests/root-operation-output-time.spec.ts",
+          "tests/work-material-treatment.spec.ts",
+          "tests/guidance-confirmation.spec.ts",
+          "tests/human-collaboration.spec.ts",
+          "tests/human-request-storage.spec.ts",
+          "tests/human-request-handoff.spec.ts",
+          "tests/research-assets.spec.ts",
+          "tests/research-trace-status.spec.ts"
+        ],
+        "stats": {
+          "startTime": "2026-11-11T15:09:16.238Z",
+          "duration": 229458.554,
+          "expected": 112,
+          "skipped": 0,
+          "unexpected": 0,
+          "flaky": 0
+        }
+      }
+    },
+    {
+      "label": "material-browser05",
+      "source_archive_sha256": "c593098d1b7856fce9a690a16b759a58a0ff66ce7a4e30e52bbca855a5a6be7c",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "c593098d1b7856fce9a690a16b759a58a0ff66ce7a4e30e52bbca855a5a6be7c",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 49.028569493442774
+      }
+    },
+    {
+      "label": "gc-reading-dependency01",
+      "source_archive_sha256": "7709f6d86168243bdfcf63af92e532411f48800aa2830748b886f77fc0f2b7c2",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "7709f6d86168243bdfcf63af92e532411f48800aa2830748b886f77fc0f2b7c2",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 45.4257799051702
+      }
+    },
+    {
+      "label": "gc-reading-dependency-negative01",
+      "source_archive_sha256": "4180f874aa9b06e4be919cff43752ecaad6011983c04bbecfa2226ca171b6d93",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "4180f874aa9b06e4be919cff43752ecaad6011983c04bbecfa2226ca171b6d93",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 1,
+        "elapsed_seconds": 43.87420820072293
+      }
+    },
+    {
+      "label": "final-experiment-semantics01",
+      "source_archive_sha256": "201f09defc6593615581a2b246f8531f72679c64707bf5165bc9cb9c749adabb",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "201f09defc6593615581a2b246f8531f72679c64707bf5165bc9cb9c749adabb",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 1.7283889092504978
+      }
+    },
+    {
+      "label": "process-review-reboot-caller-green01",
+      "source_archive_sha256": "1e1363b89a8e0bc20bad6315c3dd19e94dd3fa28f4c3c3ec7bdf83ba2bc1c3d6",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "1e1363b89a8e0bc20bad6315c3dd19e94dd3fa28f4c3c3ec7bdf83ba2bc1c3d6",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "collected": 26,
+        "counts": {
+          "passed": 26,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 38.911001197993755
+      }
+    },
+    {
+      "label": "recorder-bootstrap-green01",
+      "source_archive_sha256": "7934fc6af98b9aba2771e6d22c4299ce9c8a6d480d3ed6b59fb1e085f3abc51c",
+      "source_head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+      "source_ref": null,
+      "result": {
+        "snapshot": "7934fc6af98b9aba2771e6d22c4299ce9c8a6d480d3ed6b59fb1e085f3abc51c",
+        "head": "9dcab92df0da411e9b54e01f3c4712438d1abe32",
+        "ref": null,
+        "collected": 38,
+        "counts": {
+          "passed": 38,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 61.49740656465292
+      }
+    },
+    {
+      "label": "browser-assets-pagination-sync03",
+      "source_archive_sha256": "611aa12231532ed95588e82895045ae89f1b187b5d8c60a36f48f13a1190803d",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": null,
+      "result": {
+        "snapshot": "611aa12231532ed95588e82895045ae89f1b187b5d8c60a36f48f13a1190803d",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": null,
+        "exitcode": 0,
+        "elapsed_seconds": 48.46783109754324
+      },
+      "browser": {
+        "exitcode": 0,
+        "elapsed_seconds": 48.37625524774194,
+        "mode": "full",
+        "command": [
+          "/usr/local/bin/node",
+          "/tmp/issue274-retry-9pWdVe/web/node_modules/@playwright/test/cli.js",
+          "test",
+          "--project=functional",
+          "--workers=4",
+          "--output=/dev/shm/issue-296-Gh5SZTM7/ui-output",
+          "--reporter=line,json",
+          "--repeat-each",
+          "5",
+          "tests/research-assets.spec.ts",
+          "--grep",
+          "paged inventory"
+        ],
+        "stats": {
+          "startTime": "2026-11-11T14:50:31.458Z",
+          "duration": 31592.879,
+          "expected": 5,
+          "skipped": 0,
+          "unexpected": 0,
+          "flaky": 0
+        }
+      }
+    },
+    {
+      "label": "browser-assets-pagination-sync-base03",
+      "source_archive_sha256": "2d71e60b2630a52ba908389acfee0282342d6ae2399dc19efe51d672f04d89d6",
+      "source_head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "source_ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+      "result": {
+        "snapshot": "2d71e60b2630a52ba908389acfee0282342d6ae2399dc19efe51d672f04d89d6",
+        "head": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "ref": "c2392b4b37964d963ce1477a65025e252c7802b7",
+        "exitcode": 1,
+        "elapsed_seconds": 35.26022936031222
+      },
+      "browser": {
+        "exitcode": 1,
+        "elapsed_seconds": 34.717337403446436,
+        "mode": "full",
+        "command": [
+          "/usr/local/bin/node",
+          "/tmp/issue274-retry-9pWdVe/web/node_modules/@playwright/test/cli.js",
+          "test",
+          "--project=functional",
+          "--workers=4",
+          "--output=/dev/shm/issue-296-01m4TIjV/ui-output",
+          "--reporter=line,json",
+          "tests/research-assets.spec.ts",
+          "--grep",
+          "paged inventory"
+        ],
+        "stats": {
+          "startTime": "2026-11-11T14:50:30.039Z",
+          "duration": 15841.271,
+          "expected": 0,
+          "skipped": 0,
+          "unexpected": 1,
+          "flaky": 0
+        }
+      }
+    },
+    {
+      "label": "response-time-local01",
+      "source_archive_sha256": "d511e893621fa39cfe6960897fffe552adc96931a524802d9cdbc002b2adc547",
+      "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "source_ref": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+      "result": {
+        "snapshot": "d511e893621fa39cfe6960897fffe552adc96931a524802d9cdbc002b2adc547",
+        "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "ref": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+        "exitcode": 1,
+        "elapsed_seconds": 66.2122018225491
+      }
+    }
+  ],
+  "pending": [
+    "Latest-head configured native full-access CI and GitHub response-time CI must execute and pass.",
+    "Actual Claude Code review remains deferred by user.",
+    "Normal merge remains gated; no auto-merge or deployment."
+  ],
+  "limitations": [
+    "947 backend passes plus two existing Codex 0.147 child-ledger skips, followed by one new GC test pass. These are separate runs.",
+    "112 functional browser cases and one material case ran separately; Windows-specific font raster cases were not run on Linux.",
+    "Local response-time gate passed 3/3, but its external wrapper exited 1 because it treated expected build outputs as immutable. Post-run comparison found zero non-generated-file changes.",
+    "Boot identity changes were injected on Linux; no host was physically rebooted.",
+    "Controlled provider and finite Python work exercise actual product owners, not #274 real scientific/model-chain acceptance."
+  ],
+  "validated_source_commit": "debbbd28d15751077c1b6e1eed46880109663f7e",
+  "validated_source_tree": "73922c9c490948c42775c8d126bd405301b6fac3",
+  "local_response_time": {
+    "status": "PASS: unchanged npm response-time gate; original wrapper assertion error retained",
+    "head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+    "source_archive_sha256": "d511e893621fa39cfe6960897fffe552adc96931a524802d9cdbc002b2adc547",
+    "remote": "/dev/shm/issue-296-CvL9kKGH",
+    "runner_exitcode": 1,
+    "npm_test_exitcode": 0,
+    "npm_response_time_exitcode": 0,
+    "npm_tests": {
+      "passed": 45,
+      "failed": 0,
+      "skipped": 0
+    },
+    "playwright": {
+      "startTime": "2026-11-11T15:10:23.129Z",
+      "duration": 46651.926,
+      "expected": 3,
+      "skipped": 0,
+      "unexpected": 0,
+      "flaky": 0
+    },
+    "metrics": [
+      {
+        "test": "warm-public-api-response",
+        "metric": "status",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 8.006165499999042,
+        "p95_ms": 47.381346999995,
+        "max_ms": 48.248467000004894,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      },
+      {
+        "test": "warm-public-api-response",
+        "metric": "snapshot",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 8.874156499998207,
+        "p95_ms": 49.47261199999775,
+        "max_ms": 49.52977700000338,
+        "p95_budget_ms": 3000,
+        "max_budget_ms": 6000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-390",
+        "metric": "workspace",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 330.05593950000184,
+        "p95_ms": 346.7314299999998,
+        "max_ms": 393.0130830000053,
+        "p95_budget_ms": 5000,
+        "max_budget_ms": 10000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-390",
+        "metric": "stage_switch",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 100.7891129999989,
+        "p95_ms": 131.74226700000145,
+        "max_ms": 133.56804399999965,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-1440",
+        "metric": "workspace",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 358.7838424999991,
+        "p95_ms": 382.6651559999991,
+        "max_ms": 398.73848799999905,
+        "p95_budget_ms": 5000,
+        "max_budget_ms": 10000,
+        "passed": true
+      },
+      {
+        "test": "workspace-and-stage-switch-1440",
+        "metric": "stage_switch",
+        "count": 20,
+        "expected_samples": 20,
+        "median_ms": 109.6848245000001,
+        "p95_ms": 124.77617499999906,
+        "max_ms": 130.24691999999777,
+        "p95_budget_ms": 1000,
+        "max_budget_ms": 2000,
+        "passed": true
+      }
+    ],
+    "postverification": {
+      "all_manifest_files": 1358,
+      "non_generated_changes": [],
+      "generated_changes": [
+        "src/meta_research/web_dist/assets/index-D4VhawRe.js",
+        "src/meta_research/web_dist/index.html"
+      ],
+      "generated_distribution": {
+        "assets/favicon.svg": "9af5b0493df50798741bd5e6d82d041a1c04cb1c733c87c6885c475d2dbc2fef",
+        "assets/index-CLC2XBFr.css": "6a7e311660af69412cf1331a45b865e929263b574e321c3df6c1fd384be6fcb1",
+        "assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+        "index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2"
+      },
+      "html_asset_refs": [
+        "/assets/favicon.svg",
+        "/assets/index-tpvNNB6h.js",
+        "/assets/index-CLC2XBFr.css"
+      ],
+      "html_references_present": true,
+      "remaining_test_processes": [],
+      "remaining_product_data_roots": []
+    },
+    "generated_web_dist_path": "D:\\meta_research\\optimier_with_claude\\issue-296-evidence-20261111\\generated-web-dist-final",
+    "generated_web_dist_equal_final_browser03": true,
+    "artifact_archive_sha256": "a3a8af4408f62ec13db6b4f8279be9eda1d79d5ed67f92a8ce76e00449182304",
+    "generated_distribution_archive_sha256": "48ec6b65b7bd6aacc5120b3c0479714da749b93ad14821818f90296f52244e5b",
+    "source_dist_last_commit": "b70ea0f2d067a0cdc4ec81aa8aa50199f43e4ac6",
+    "notes": [
+      "Raw runner exit1 arose only from external integrity assertion treating npm build outputs as immutable; raw evidence has not been changed.",
+      "External probe now separates generated static output from source/config/test bytes. Postverification checks the original run without rerunning the already-passed gate.",
+      "Generated distribution was stale since #293; seven frontend source files changed in #295/#296. Exact build output retrieved for parent to synchronize, no checkout file changed by this subtask.",
+      "Same new bundle is recorded in final-browser02 build log and hashes independently match final-browser03 four-file build.",
+      "Single isolated deterministic engineering run is not a baseline speed comparison, GitHub CI, native sandbox proof, deployment or #274 real scientific chain."
+    ]
+  },
+  "packaged_frontend": {
+    "source_head": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+    "origin": "env/runs/response-time-local01",
+    "files": {
+      "assets/favicon.svg": "9af5b0493df50798741bd5e6d82d041a1c04cb1c733c87c6885c475d2dbc2fef",
+      "assets/index-CLC2XBFr.css": "6a7e311660af69412cf1331a45b865e929263b574e321c3df6c1fd384be6fcb1",
+      "assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+      "index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2"
+    },
+    "final_browser03_files_equal": true
+  },
+  "independent_final_increment": {
+    "verdict": "PASS_WITH_DELIVERY_GATES",
+    "head": "debbbd28d15751077c1b6e1eed46880109663f7e",
+    "tree": "73922c9c490948c42775c8d126bd405301b6fac3",
+    "pr_base": "c2392b4b37964d963ce1477a65025e252c7802b7",
+    "review_base": "0ef5e3db04d984d519f8bfb09a8c76b362603442",
+    "pr_patch_id": "7f3d6864338fa5bb078e4d43943b725b62f8608f",
+    "changed_files": {
+      "src/meta_research/web_dist/assets/index-D4VhawRe.js": null,
+      "src/meta_research/web_dist/assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+      "src/meta_research/web_dist/index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2",
+      "tests/test_issue296_gc_read_dependency.py": "5d631b77835b475b0fbb2677bac4f83b74641e52040895c0c0e218ca84e35c2b",
+      "web/tests/research-assets.spec.ts": "9b73ad56c2c96aa399e1f68806d3812955ea242d742ef8437c9297bd5b672aa5"
+    },
+    "workflow_restored_to_review_base": true,
+    "distribution_sha256": {
+      "assets/favicon.svg": "9af5b0493df50798741bd5e6d82d041a1c04cb1c733c87c6885c475d2dbc2fef",
+      "assets/index-CLC2XBFr.css": "6a7e311660af69412cf1331a45b865e929263b574e321c3df6c1fd384be6fcb1",
+      "assets/index-tpvNNB6h.js": "cb742d458b17d58116a924cc5c3bc9354cffe267e4762b4ec389bde9c615faac",
+      "index.html": "9fcd4bad74ded4833b3c2e67ad341063ae6340ab9f0c836418ebfc22487a8de2"
+    },
+    "source_checks": [
+      {
+        "run": "final-browser03",
+        "files_checked": 473,
+        "differences": []
+      },
+      {
+        "run": "response-time-local01",
+        "files_checked": 473,
+        "differences": []
+      },
+      {
+        "run": "gc-reading-dependency01",
+        "files_checked": 473,
+        "differences": []
+      },
+      {
+        "run": "gc-reading-dependency-negative01",
+        "files_checked": 473,
+        "differences": [
+          "src/meta_research/target_workspace_cleanup.py"
+        ]
+      }
+    ],
+    "gc_positive": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "1",
+      "time": "44.271",
+      "timestamp": "2026-11-11T15:09:30.940249+00:00",
+      "hostname": "di-20260202214316-n5b25"
+    },
+    "gc_negative": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "1",
+      "skipped": "0",
+      "tests": "1",
+      "time": "42.652",
+      "timestamp": "2026-11-11T15:10:41.428426+00:00",
+      "hostname": "di-20260202214316-n5b25"
+    },
+    "browser": {
+      "startTime": "2026-11-11T15:09:16.238Z",
+      "duration": 229458.554,
+      "expected": 112,
+      "skipped": 0,
+      "unexpected": 0,
+      "flaky": 0
+    },
+    "performance": {
+      "startTime": "2026-11-11T15:10:23.129Z",
+      "duration": 46651.926,
+      "expected": 3,
+      "skipped": 0,
+      "unexpected": 0,
+      "flaky": 0
+    },
+    "performance_command_exitcodes": [
+      0,
+      0
+    ],
+    "performance_wrapper_exitcode": 1,
+    "blocking_code_findings": [],
+    "limits": [
+      "No new runtime suite was executed by this reviewer.",
+      "CI native sandbox and response-time acceptance remain unpassed.",
+      "Actual Claude Code review is deferred by the user, not replaced by this review.",
+      "Subsequent audit edits and final publication need provenance checks."
+    ]
+  },
+  "current_execution_policy": {
+    "scope": "issue296 local acceptance",
+    "setting": "META_RESEARCH_TARGET_SANDBOX_MODE=danger-full-access",
+    "user_decision_date": "2026-11-11",
+    "supersedes": "workspace-write native sandbox acceptance for this local scope",
+    "os_filesystem_isolation_claim": false,
+    "other_environment_defaults_changed": false,
+    "existing_services_reconfigured": false
+  },
+  "native_full_access_initial": {
+    "status": "PASS",
+    "source_head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+    "source_ref": null,
+    "source_archive_sha256": "9f0007b517e2524f760971d0e888d30e298c4b1f5da070a9f876b6c7af7a22a8",
+    "remote": "/dev/shm/issue-296-4YL61Gu7",
+    "run": {
+      "snapshot": "9f0007b517e2524f760971d0e888d30e298c4b1f5da070a9f876b6c7af7a22a8",
+      "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+      "ref": null,
+      "files": [
+        {
+          "file": "tests/test_provider_process_tree.py",
+          "returncode": 0,
+          "index": 1
+        },
+        {
+          "file": "tests/test_issue296_native_full_access.py",
+          "returncode": 0,
+          "index": 2
+        },
+        {
+          "file": "tests/test_issue296_stable_workspace.py",
+          "returncode": 0,
+          "index": 0
+        }
+      ],
+      "collected": 22,
+      "counts": {
+        "passed": 22,
+        "failed": 0,
+        "skipped": 0,
+        "incomplete": 0
+      },
+      "exitcode": 0,
+      "elapsed_seconds": 60.615896597504616
+    },
+    "per_file": {
+      "tests/test_provider_process_tree.py": {
+        "tests": 17,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "tests/test_issue296_native_full_access.py": {
+        "tests": 2,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "tests/test_issue296_stable_workspace.py": {
+        "tests": 3,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      }
+    },
+    "native_tools": {
+      "codex": {
+        "path": "/vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta_research_8771_v1_test/runtime/provider-tools/codex-cli/installs/0.159.0/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+        "resolved_path": "/vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta_research_8771_v1_test/runtime/provider-tools/codex-cli/installs/0.159.0/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+        "sha256": "d2752c52353401f7f6efbfcea68796f4f7a3d3e4769f5d1da53fa49d4856b72f",
+        "version": "codex-cli 0.159.0"
+      },
+      "node": {
+        "path": "/usr/local/bin/node",
+        "resolved_path": "/usr/local/bin/node",
+        "sha256": "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068",
+        "version": "v22.23.1"
+      },
+      "scope_files": [
+        "tests/test_issue296_native_full_access.py"
+      ],
+      "tools_root": "/dev/shm/issue-296-4YL61Gu7/native-test-provider-tools",
+      "path_prefix": "/dev/shm/issue-296-4YL61Gu7/native-test-bin",
+      "credentials_copied": false,
+      "source_changes": false,
+      "other_files_use_original_environment": true,
+      "executables_unchanged_after_tests": true
+    },
+    "observation": {
+      "kernel": "5.4.250-2-velinux1u1-amd64",
+      "platform": "Linux-5.4.250-2-velinux1u1-amd64-x86_64-with-glibc2.35",
+      "checkpoints": {
+        "data-2/test_two_recoveries_use_native0/issue296-stable-workspace/run/target-workspaces/95ffe2f4de1bbc31bd537dc07d7401d142acf40b2554babc86658fbb63bc7cb3/issue296-checkpoint.json": {
+          "segments": 3,
+          "sum": 8999550005000
+        },
+        "data-2/test_two_recoveries_use_native0/issue296-stable-workspace/run/target-workspaces/95ffe2f4de1bbc31bd537dc07d7401d142acf40b2554babc86658fbb63bc7cb3/native-checkpoint.json": {
+          "segments": 3
+        },
+        "data-2/test_native_full_access_runs_i0/issue296-native/target-a/native-checkpoint.json": {
+          "segments": 1
+        }
+      },
+      "command_exec_schema_sha256": "fd034b4c85d7b6f466e30a3cbb73db86be1263aca3f81b89b547f14817dfb62e",
+      "native_full_access_policy": {
+        "properties": {
+          "type": {
+            "enum": [
+              "dangerFullAccess"
+            ],
+            "title": "DangerFullAccessSandboxPolicyType",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "DangerFullAccessSandboxPolicy",
+        "type": "object"
+      }
+    },
+    "product_changes_against_041b21d_at_freeze": [],
+    "test_sha256": {
+      "tests/test_issue296_native_full_access.py": "ee52a3be34ded6707af06b7342858f13fbdfa7b6402d67679a138757cc788caf",
+      "tests/test_issue296_stable_workspace.py": "26d32efc7e2925f7f2518f9e28693939fd950c1e8872388c97f3a2a0c4f27531"
+    },
+    "mode": "Explicit META_RESEARCH_TARGET_SANDBOX_MODE=danger-full-access; actual native command/exec uses dangerFullAccess",
+    "limits": [
+      "Full-access provides no OS directory isolation; unchanged sibling bytes demonstrate only this prescribed work touched no sibling file.",
+      "Provider termination outcomes in Owner recovery fixture remain controlled signed fixtures. Actual Linux tree closure is separately tested by 17 real process-tree cases.",
+      "No model/credentials, real scientific chain, deployment or CC review is claimed.",
+      "Existing production default remains workspace-write; this ticket uses the explicitly authorized full-access setting."
+    ]
+  },
+  "current_full_access_increment": {
+    "scope": "User-selected local full-access acceptance; other environment defaults unchanged",
+    "policy": "META_RESEARCH_TARGET_SANDBOX_MODE=danger-full-access",
+    "baseline_commit": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+    "source_archive_sha256": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+    "source_file_sha256": {
+      "src/meta_research/owners/target_run_runtime.py": "d27a925f62bfec916a35da940aa12a861eb1b7c91d9ee8b529acad6b3a83e553",
+      "src/meta_research/harness_adapters.py": "aabbe96ff30cfef957d968f9bd04706a1f467433bd1941ce72b5a9f29696b22c",
+      "tests/test_issue296_native_full_access.py": "ee52a3be34ded6707af06b7342858f13fbdfa7b6402d67679a138757cc788caf",
+      "tests/test_issue296_stable_workspace.py": "26d32efc7e2925f7f2518f9e28693939fd950c1e8872388c97f3a2a0c4f27531",
+      "tests/test_issue296_full_access_review.py": "2e28ecc3a9e6ac7ae09a6e9621792b84c27975739277a8f463bc64884964e18d",
+      ".github/workflows/response-time.yml": "1637a9fdaa257f309765bfa99da8f67d3b1ecbfd65e8ab1923ea68fd0ee1ff21"
+    },
+    "run_label": "full-access-final-matrix-03",
+    "result": {
+      "snapshot": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+      "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+      "ref": null,
+      "files": [
+        {
+          "file": "tests/test_harness_adapters.py",
+          "returncode": 0,
+          "index": 0
+        },
+        {
+          "file": "tests/test_provider_process_tree.py",
+          "returncode": 0,
+          "index": 2
+        },
+        {
+          "file": "tests/test_issue296_native_full_access.py",
+          "returncode": 0,
+          "index": 4
+        },
+        {
+          "file": "tests/test_issue296_stable_workspace.py",
+          "returncode": 0,
+          "index": 1
+        },
+        {
+          "file": "tests/test_issue296_full_access_review.py",
+          "returncode": 0,
+          "index": 3
+        }
+      ],
+      "collected": 51,
+      "counts": {
+        "passed": 51,
+        "failed": 0,
+        "skipped": 0,
+        "incomplete": 0
+      },
+      "exitcode": 0,
+      "elapsed_seconds": 120.36843575909734
+    },
+    "coverage": {
+      "linux_process_tree": 17,
+      "stable_workspace": 3,
+      "actual_native_full_access": 2,
+      "owner_review_policy": 8,
+      "existing_adapter_review_negative_cases": 21
+    },
+    "native_checkpoint_segments": [
+      1,
+      2,
+      3
+    ],
+    "owner_boundary": "Actual admission, reservation, Harness, adapter verification, durable profile, Owner public discovery and common acceptance verifier, domain child binding. Controlled native child ledger fixtures.",
+    "red_evidence": [
+      "review-policy-red-05: exact workspace-write code-lineage mismatch and configured full-access root-policy rejection",
+      "full-access-final-matrix-01: 48 pass, three code review failures from actor-field mismatch"
+    ],
+    "claims_not_made": [
+      "OS cross-directory write isolation under full-access",
+      "Real-model scientific review or complete formal research-review submission",
+      "Actual Claude Code review",
+      "Deployment"
+    ]
+  },
+  "full_access_independent_review": {
+    "schema": "issue296-independent-full-access-review/v1",
+    "generated_at_utc": "2026-11-11T16:10:28.855704+00:00",
+    "reviewer": "/root/review_full_access",
+    "verdict": "PASS_NO_UNRESOLVED_FINDINGS_IN_SCOPE",
+    "base_commit": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+    "head_at_review": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+    "base_tree": "8b31a46053d5df4412a750e3410a8c83348a8f51",
+    "reviewed_file_sha256": {
+      "src/meta_research/owners/target_run_runtime.py": "d27a925f62bfec916a35da940aa12a861eb1b7c91d9ee8b529acad6b3a83e553",
+      "src/meta_research/harness_adapters.py": "aabbe96ff30cfef957d968f9bd04706a1f467433bd1941ce72b5a9f29696b22c",
+      "tests/test_issue296_full_access_review.py": "2e28ecc3a9e6ac7ae09a6e9621792b84c27975739277a8f463bc64884964e18d",
+      "tests/test_issue296_native_full_access.py": "ee52a3be34ded6707af06b7342858f13fbdfa7b6402d67679a138757cc788caf",
+      "tests/test_issue296_stable_workspace.py": "26d32efc7e2925f7f2518f9e28693939fd950c1e8872388c97f3a2a0c4f27531",
+      ".github/workflows/response-time.yml": "1637a9fdaa257f309765bfa99da8f67d3b1ecbfd65e8ab1923ea68fd0ee1ff21"
+    },
+    "deleted_file": {
+      "path": "tests/test_issue296_native_workspace_write.py",
+      "base_blob_sha256": "81d527e2ff0683de1dd800d8d1a3fb039f466206cf4a2a516369babebc07b5a2",
+      "replaced_by": "tests/test_issue296_native_full_access.py"
+    },
+    "open_findings": [],
+    "verified_design": [
+      "Existing explicit META_RESEARCH_TARGET_SANDBOX_MODE selects full-access; default remains workspace-write. Owner reuses the same adapter allowlist; danger-full-access is not unconditionally accepted.",
+      "Result children retain read-only/workspace-write compatibility and accept full-access only under the explicit configuration. Code children reject read-only and malformed/missing/unsupported policy.",
+      "Code expected lineage includes the already-persisted sandbox_mode and still compares all lineage fields exactly. Parent/session/cwd/version/originator, payload/ledger hashes, operation reservation, skill proof and actor identities remain checked.",
+      "Post-binding actor comparison selects existing skill_actor_session_ref for code and review_actor_session_ref for result, each verified against the native child before binding. No actor evidence is invented or backfilled.",
+      "New tests consume profiles emitted by the real adapter and persisted by Harness, not database-injected profiles. Corruption negatives modify only an in-memory copy of that actual evidence.",
+      "CI removes bubblewrap only from native recovery setup, keeps actual pinned CLI execution, exact native test presence and no-skip assertions. Response-time dependency/budget behavior remains unchanged."
+    ],
+    "green": {
+      "run": "D:\\meta_research\\optimier_with_claude\\issue-296-evidence-20261111\\env\\runs\\full-access-final-matrix-03",
+      "summary": {
+        "snapshot": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+        "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+        "ref": null,
+        "files": [
+          {
+            "file": "tests/test_harness_adapters.py",
+            "returncode": 0,
+            "index": 0
+          },
+          {
+            "file": "tests/test_provider_process_tree.py",
+            "returncode": 0,
+            "index": 2
+          },
+          {
+            "file": "tests/test_issue296_native_full_access.py",
+            "returncode": 0,
+            "index": 4
+          },
+          {
+            "file": "tests/test_issue296_stable_workspace.py",
+            "returncode": 0,
+            "index": 1
+          },
+          {
+            "file": "tests/test_issue296_full_access_review.py",
+            "returncode": 0,
+            "index": 3
+          }
+        ],
+        "collected": 51,
+        "counts": {
+          "passed": 51,
+          "failed": 0,
+          "skipped": 0,
+          "incomplete": 0
+        },
+        "exitcode": 0,
+        "elapsed_seconds": 120.36843575909734
+      },
+      "per_file": {
+        "tests/test_harness_adapters.py": {
+          "tests": 21,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-0.xml",
+          "junit_sha256": "ab86b8ca0aaa9ab4e263c6bd748f1a1cf0a1860a5d31607f5c09930b41ce4ce8"
+        },
+        "tests/test_provider_process_tree.py": {
+          "tests": 17,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-2.xml",
+          "junit_sha256": "1982a4f97f375c14e0da601fbee990e377118a87f2cda1ab37c5fccce648974d"
+        },
+        "tests/test_issue296_native_full_access.py": {
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-4.xml",
+          "junit_sha256": "d0d2757de0b70c78893804e18bc537127762f005e32b06e3d13a51f8ff729ddd"
+        },
+        "tests/test_issue296_stable_workspace.py": {
+          "tests": 3,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-1.xml",
+          "junit_sha256": "e1b229a8156550c60e027980daf82377b2f270571ea5a781e5911734164c29f8"
+        },
+        "tests/test_issue296_full_access_review.py": {
+          "tests": 8,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "junit": "results-3.xml",
+          "junit_sha256": "d84d012cca0d4f81bf7d1a35ae2ffafd25a2c543ea493916e68bcc2e16bfc867"
+        }
+      },
+      "selectors": [
+        "tests/test_provider_process_tree.py",
+        "tests/test_issue296_stable_workspace.py",
+        "tests/test_issue296_native_full_access.py",
+        "tests/test_issue296_full_access_review.py",
+        "tests/test_harness_adapters.py::test_codex_subagent_evidence_records_exact_code_review_skill_invocation",
+        "tests/test_harness_adapters.py::test_codex_result_review_uses_native_child_ledger_evidence",
+        "tests/test_harness_adapters.py::test_codex_result_review_fails_closed_without_exact_native_child_proof",
+        "tests/test_harness_adapters.py::test_codex_code_review_proof_fails_closed_without_exact_child_chain",
+        "tests/test_harness_adapters.py::test_codex_code_review_proof_requires_wait_message_equal_child_terminal",
+        "tests/test_harness_adapters.py::test_codex_code_review_requires_a_package_verifying_reader",
+        "tests/test_harness_adapters.py::test_codex_code_review_rejects_child_danger_full_access_sandbox",
+        "tests/test_harness_adapters.py::test_codex_code_review_requires_structured_spawn_skill_path_binding"
+      ],
+      "manifest_sha256": "46952197a6bf77d188422e1d34fc8478b832ae673ba908e225d6e9f2be9e70bf",
+      "archive_sha256": "da570a42dd6316baf90f5dd6b4db177ad4352f46b94a591036775d4cd774b02b",
+      "all_archive_files_match_manifest": true,
+      "archive_file_count": 1362,
+      "all_reviewed_current_bytes_match_frozen_snapshot": true,
+      "all_51_case_outcomes_passed": true,
+      "native_tools": {
+        "codex": {
+          "path": "/vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta_research_8771_v1_test/runtime/provider-tools/codex-cli/installs/0.159.0/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+          "resolved_path": "/vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta_research_8771_v1_test/runtime/provider-tools/codex-cli/installs/0.159.0/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+          "sha256": "d2752c52353401f7f6efbfcea68796f4f7a3d3e4769f5d1da53fa49d4856b72f",
+          "version": "codex-cli 0.159.0"
+        },
+        "node": {
+          "path": "/usr/local/bin/node",
+          "resolved_path": "/usr/local/bin/node",
+          "sha256": "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068",
+          "version": "v22.23.1"
+        },
+        "scope_files": [
+          "tests/test_issue296_native_full_access.py"
+        ],
+        "tools_root": "/dev/shm/issue-296-05AIRsHp/native-test-provider-tools",
+        "path_prefix": "/dev/shm/issue-296-05AIRsHp/native-test-bin",
+        "credentials_copied": false,
+        "source_changes": false,
+        "other_files_use_original_environment": true,
+        "executables_unchanged_after_tests": true
+      }
+    },
+    "valid_red_evidence": [
+      {
+        "run": "review-policy-red-05",
+        "summary": {
+          "snapshot": "375baa93d540c7698e70b05ffe7e827a16eb54dc5bb7c492860bff07735dad5c",
+          "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+          "ref": null,
+          "exitcode": 1,
+          "elapsed_seconds": 32.77262695133686
+        },
+        "failed_cases": [
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[workspace-write-code]",
+            "message": "meta_research.owners.common.OwnerConflict: target_code_review_skill_evidence_invalid"
+          },
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[danger-full-access-result]",
+            "message": "meta_research.owners.common.OwnerConflict: target_review_harness_invalid"
+          }
+        ]
+      },
+      {
+        "run": "full-access-final-matrix-01",
+        "summary": {
+          "snapshot": "6c641f666bf6de6400928f53e2fbdd4f49f4c4b3c600d0cd48a5f8c9a20427c5",
+          "head": "041b21d011870b8bf060af5efb2bbc5b91ff0b86",
+          "ref": null,
+          "files": [
+            {
+              "file": "tests/test_harness_adapters.py",
+              "returncode": 0,
+              "index": 0
+            },
+            {
+              "file": "tests/test_provider_process_tree.py",
+              "returncode": 0,
+              "index": 2
+            },
+            {
+              "file": "tests/test_issue296_native_full_access.py",
+              "returncode": 0,
+              "index": 4
+            },
+            {
+              "file": "tests/test_issue296_stable_workspace.py",
+              "returncode": 0,
+              "index": 1
+            },
+            {
+              "file": "tests/test_issue296_full_access_review.py",
+              "returncode": 1,
+              "index": 3
+            }
+          ],
+          "collected": 51,
+          "counts": {
+            "passed": 48,
+            "failed": 3,
+            "skipped": 0,
+            "incomplete": 0
+          },
+          "exitcode": 1,
+          "elapsed_seconds": 119.3243328332901
+        },
+        "failed_cases": [
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[code-workspace-write-workspace-write]",
+            "message": "KeyError: 'review_actor_session_ref'"
+          },
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[code-danger-full-access-danger-full-access]",
+            "message": "KeyError: 'review_actor_session_ref'"
+          },
+          {
+            "name": "test_owner_consumes_review_under_configured_target_policy[code-danger-full-access-workspace-write]",
+            "message": "KeyError: 'review_actor_session_ref'"
+          }
+        ]
+      }
+    ],
+    "excluded_red_attempts": "review-policy-red-01 through -03 were fixture setup failures, not product RED evidence; -05 isolates the policy/lineage defects. Matrix-01 separately exposes the actor-key defect.",
+    "limitations": [
+      "Independent source/evidence review, not a Claude Code or semantic model review; no CC was invoked.",
+      "Native tests execute pinned Codex app-server command/exec. Recovery provider termination outcomes are controlled signed fixtures; the 17 Linux process-tree cases separately exercise actual local process ownership and closure.",
+      "Review transport and native child ledger content are controlled fixtures. Real admission, child reservation, Harness/adapter verification, durable profile/event persistence, public Owner evidence discovery and common acceptance verifier/binding are exercised. This does not assert a complete formal/scientific review submission.",
+      "Full-access does not establish OS directory confinement. Unchanged sibling bytes prove only that these prescribed operations did not modify that file.",
+      "The 51-case matrix covers this increment. Earlier 947-backend/112-browser evidence applies to its recorded earlier source and is not relabeled as this final snapshot.",
+      "Final audit prose, GitHub CI/publication, merge and deployment state are outside this fixed source review. No network or repository mutation was performed by this reviewer."
+    ]
+  }
+}

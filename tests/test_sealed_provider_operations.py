@@ -1,3 +1,5 @@
+
+from provider_supervisor_support import closed_tree_fixture
 import json
 
 import pytest
@@ -39,7 +41,7 @@ def sealed_operation(tmp_path):
         (directory / name).write_text(content, encoding="utf-8")
     write_transport_envelope(directory / "invocation.json", invocation, key)
     write_exit_receipt(
-        directory / "supervisor-exit.json", key=key, invocation_hash=canonical_hash(invocation),
+        directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key, invocation_hash=canonical_hash(invocation),
         prompt_path=directory / "prompt.txt", schema_path=directory / "output-schema.json",
         stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
         returncode=0, input_bytes=len(prompt.encode("utf-8")),

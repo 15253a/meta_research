@@ -6,10 +6,12 @@ from fastapi.testclient import TestClient
 
 from meta_research.runtime_conditions import (
     read_runtime_conditions,
+    read_runtime_conditions_in_transaction,
     save_runtime_conditions,
 )
 from meta_research.web import create_app
 from test_human_guidance_providers import _submit, _tool
+from test_harness_target_root_recovery import _signed_fixture_receipt
 from test_target_root_finalizer import (
     _admit_independent_target_root,
     _current_bundle_runtime,
@@ -22,9 +24,13 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
     runtime = _current_bundle_runtime(tmp_path / "history")
     runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
     try:
-        target, _, _, admission, _ = _admit_independent_target_root(runtime)
+        target, candidate, formal_plan, admission, handle = _admit_independent_target_root(runtime)
         launch = runtime.owners.agent_runtime.query_admitted_target_launch(
             target.target_ref
+        )
+        runtime.target_root_lifecycle.activate(
+            launch_ref=launch.launch_ref, handle=handle, candidate=candidate,
+            formal_plan=formal_plan, idempotency_key="activate-goal-history-root",
         )
         quest_ref = launch.quest_ref
         graph = runtime.owners.research_graph
@@ -122,7 +128,13 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
             observed.append(
                 {"cut": cut, "decision": decision, "result": result, "delivery": exact}
             )
-            return invoke(invocation)
+            evidence = invoke(invocation)
+            _signed_fixture_receipt(
+                runtime.owners.agent_runtime.harness_runs,
+                invocation.provider_operation_ref, invocation.owner_invocation_hash,
+                prompt=invocation.prompt, returncode=0,
+            )
+            return evidence
 
         adapter.invoke = evolve_with_sourced_conditions
         first = runtime.harnesses.run_or_resume_target_root(
@@ -186,7 +198,18 @@ def test_public_goal_history_preserves_conditions_and_supersession_review(
             "cause"
         ]["delivery_ref"]
         assert earlier["conditions_review"] == observed[0]["decision"]["conditions"]
-        assert current["conditions"]["runtime_conditions"] == updated_runtime
+        with runtime._database.read() as connection:
+            stored_runtime = read_runtime_conditions_in_transaction(
+                connection, quest_ref, revision=updated_runtime["revision"]
+            )
+        # The live editor includes today's model catalog. Accepted history is
+        # the exact persisted revision, never a replay of today's UI choices.
+        assert updated_runtime["available_stage_models"]
+        assert stored_runtime == {
+            key: value for key, value in updated_runtime.items()
+            if key != "available_stage_models"
+        }
+        assert current["conditions"]["runtime_conditions"] == stored_runtime
         superseded, = current["conditions"]["enduring"]
         superseding_source = superseded["superseding_source"]
         assert superseded == {

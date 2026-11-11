@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import type { WorkMaterialReceipt, WorkMaterialReference } from "../src/workMaterialApi";
 
 const receiptPath = process.env.META_RESEARCH_MATERIAL_BROWSER_RECEIPT;
-test.skip(!receiptPath, "Requires an immutable isolated Linux product fixture and SSH loopback receipt.");
+test.skip(!receiptPath, "Requires an immutable isolated Linux product fixture and loopback receipt.");
 test.setTimeout(180_000);
 
 type Fixture = {
@@ -234,6 +234,12 @@ test("real server selection and explicit receipts cover every material consumer"
   await expect(library.getByText("Proactive original description.", { exact: true }).first()).toBeVisible();
 
   await page.goto(`${base}/?panel=human-request&workspace=1`);
+  const originalRequestResponse = await page.request.get(`${base}/api/v1/human-requests/${encodeURIComponent(fixture.request_ref)}?revision=1`);
+  expect(originalRequestResponse.ok()).toBeTruthy();
+  const originalRequest = await originalRequestResponse.json() as { request_ref: string; obligation: string };
+  expect(originalRequest.request_ref).toBe(fixture.request_ref);
+  await page.getByRole("dialog", { name: "需要你处理的事项", exact: true })
+    .getByRole("button", { name: `线下操作 · ${originalRequest.obligation}`, exact: true }).click();
   const human = page.getByRole("dialog").filter({ has: page.getByLabel("自然语言回应", { exact: true }) });
   await expect(human).toBeVisible();
   await human.getByLabel("自然语言回应", { exact: true }).fill("Exact original-root response.");

@@ -30,7 +30,8 @@ def bind(authority, base, target='target-A', run='run-A', workspace='workspace-A
     authority.admissions[target] = SimpleNamespace(target_run_ref=run, root_session_ref='root-'+run,
         execution_attempt_ref='attempt-'+run, execution_fence_ref='fence-'+run, status='running')
     authority.workspaces[run] = SimpleNamespace(target_ref=target, target_run_ref=run,
-        root_session_ref='root-'+run, target_attempt_ref='attempt-'+run, target_fence_ref='fence-'+run,
+        reservation_root_session_ref='root-'+run, reservation_attempt_ref='attempt-'+run,
+        reservation_fence_ref='fence-'+run,
         workspace_ref=workspace)
     root = base / canonical_hash({'workspace_ref': workspace})
     root.mkdir(parents=True, exist_ok=True)

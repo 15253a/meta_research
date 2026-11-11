@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from provider_supervisor_support import closed_tree_fixture
+
 import hashlib
 import json
 import os
@@ -1087,7 +1089,7 @@ def test_durable_drafting_rejects_signed_terminal_basis_file_drift(
     receipt_path.unlink()
     write_exit_receipt(
         receipt_path,
-        key=key,
+        process_tree=closed_tree_fixture(), key=key,
         invocation_hash=hashlib.sha256(
             json.dumps(
                 invocation,

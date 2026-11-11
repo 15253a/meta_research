@@ -92,7 +92,7 @@ def test_locked_vendor_missing_native_has_signed_strict_exec_proof(tmp_path, mon
 
 def _exec_provider(path, behavior):
     path.write_text('#!' + sys.executable + '\n' + r'''
-import json,sys,time
+import json,os,sys,time
 from pathlib import Path
 if '--version' in sys.argv:
  print('codex-cli 0.159.0');sys.exit(0)
@@ -104,6 +104,7 @@ assert 'exec' in sys.argv and 'app-server' not in sys.argv
 native=sys.argv[sys.argv.index('resume')+1]
 result=Path(sys.argv[sys.argv.index('--output-last-message')+1])
 if behavior=='timeout':time.sleep(30)
+if behavior.startswith('signal:'):os.kill(os.getpid(),int(behavior.split(':')[1]))
 if behavior=='normal':
  sys.stdin.read();result.write_text('{"ok":true}')
  print(json.dumps({'type':'thread.started','thread_id':native}));sys.exit(0)
@@ -130,6 +131,9 @@ def test_strict_exec_cannot_promote_nonexact_or_effectful_failure(tmp_path, beha
     assert not failed.value.recovery_checkpoint or failed.value.recovery_checkpoint['schema_ref'] != 'meta-research/provider-native-session-unavailable/v1'
     if behavior == 'timeout':
         assert failed.value.code == 'codex_operation_timeout'
+        _, key = ensure_transport_key(tmp_path / 'provider')
+        receipt_path, = (tmp_path / 'provider').rglob('supervisor-exit.json')
+        assert read_transport_envelope(receipt_path, key)['returncode'] == -15
 
 
 def test_strict_exec_preserves_normal_stdout_policy_and_supervisor_result_fifo(tmp_path):
@@ -146,3 +150,15 @@ def test_strict_exec_preserves_normal_stdout_policy_and_supervisor_result_fifo(t
     assert 'sandbox_workspace_write.network_access=false' in argv
     assert 'web_search="disabled"' in argv
     assert not list((tmp_path / 'provider').rglob('native-resume-rejected.json'))
+
+
+@pytest.mark.parametrize('native_signal', (15, 9))
+def test_strict_exec_receipt_preserves_native_signal_returncode(tmp_path, native_signal):
+    provider = _exec_provider(tmp_path / 'codex', f'signal:{native_signal}')
+    with pytest.raises(IdeaSkillUnavailable):
+        _invoke(tmp_path, provider)
+    _, key = ensure_transport_key(tmp_path / 'provider')
+    receipt_path, = (tmp_path / 'provider').rglob('supervisor-exit.json')
+    receipt = read_transport_envelope(receipt_path, key)
+    assert receipt['returncode'] == -native_signal
+    assert receipt['process_tree']['mechanism'] == 'linux-subreaper-echild'

@@ -196,13 +196,32 @@ class RootWorkspaces:
             or bundle.cycle_ref != request.cycle_ref
             or request.accepted_question.quest_ref != launch.quest_ref):
             raise OwnerConflict("workspace_lineage_invalid")
-        facts = (self._target.read_target_workspace_locations(launch.target_run_ref) if history
-                 else (self._target.read_target_workspace_location(launch.target_run_ref),))
+        if history:
+            facts = self._target.read_target_workspace_locations(launch.target_run_ref)
+            issued = self._ar.query_target_root_handle_history(target_ref)
+            if issued is None:
+                raise OwnerConflict("target_root_handle_history_authority_unavailable")
+            if (issued.target_ref != target_ref or not issued.handle_history
+                or len({handle.root_session_ref for handle in issued.handle_history}) != len(issued.handle_history)):
+                raise OwnerConflict("target_root_handle_history_integrity_invalid")
+            # Reservations preserve original paths for already delivered material.
+            # Later verified roots of this same work share its active directory.
+            origins = {workspace.reservation_root_session_ref: (workspace, directory)
+                       for workspace, directory in facts}
+            selected = tuple((handle, *origins.get(handle.root_session_ref, facts[-1]))
+                             for handle in issued.handle_history)
+        else:
+            workspace, directory = self._target.read_target_workspace_location(launch.target_run_ref)
+            handle = self._target.query_current_target_work_handle(target_ref)
+            if handle is None:
+                raise OwnerConflict("target_run_workspace_unavailable")
+            selected = ((handle, workspace, directory),)
         locations = []
-        for workspace, directory in facts:
-            if workspace.target_ref != target_ref or workspace.target_run_ref != launch.target_run_ref:
+        for handle, workspace, directory in selected:
+            if ((workspace.target_ref, workspace.target_run_ref) != (target_ref, launch.target_run_ref)
+                or (handle.target_ref, handle.target_run_ref) != (target_ref, launch.target_run_ref)):
                 raise OwnerConflict("workspace_lineage_invalid")
-            locations.append(WorkspaceLocation(workspace.workspace_ref, "target", workspace.root_session_ref,
+            locations.append(WorkspaceLocation(workspace.workspace_ref, "target", handle.root_session_ref,
                 workspace.target_run_ref, directory, launch.quest_ref, bundle.cycle_ref,
                 launch.stage_request_ref, target_ref))
         return tuple(locations)

@@ -981,7 +981,7 @@ class QuestGoalOwnerMixin:
         for row in target_rows:
             if row.block_intent_ref is not None:
                 continue
-            if row.lifecycle_status in {"completed", "cancelled", "finalizing"}:
+            if row.lifecycle_status in {"completed", "cancelled", "failed", "finalizing"}:
                 continue
             state = (
                 "cancel_pending"
@@ -1268,8 +1268,8 @@ class QuestGoalOwnerMixin:
                     actual = "superseded"
                 else:
                     actual = (
-                        "cancelled"
-                        if lifecycle.status == "cancelled"
+                        lifecycle.status
+                        if lifecycle.status in {"cancelled", "failed"}
                         else "cancel_pending"
                     )
             elif lifecycle.status == "running":

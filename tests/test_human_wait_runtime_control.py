@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import quote
 
@@ -57,10 +58,12 @@ def test_pause_resume_preserves_exact_root_human_wait_until_retry(
     try:
         run, channel = _bundle_root_channel(runtime)
         owner = runtime.owners.agent_runtime
-        with TestClient(
+        # This fixture drives Owner transitions; unrelated workers must not
+        # replace the current preview between its issue and confirmation.
+        with closing(TestClient(
             create_app(runtime, base_url="http://testserver", control_key="control-key"),
             base_url="http://testserver",
-        ) as client:
+        )) as client:
             agent_headers = _initialized_child(client, channel.connection.token)
             opened = _structured(
                 _tool_call(

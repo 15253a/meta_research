@@ -1,4 +1,6 @@
 """Verify signed interrupted stdout remains readable without inventing events."""
+
+from provider_supervisor_support import closed_tree_fixture
 import json
 
 import pytest
@@ -31,7 +33,7 @@ def _spool(tmp_path, stdout, *, reason="stopped", returncode=143, sealed=True):
 
     def seal():
         write_exit_receipt(
-            directory / "supervisor-exit.json", key=key, invocation_hash=INVOCATION,
+            directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key, invocation_hash=INVOCATION,
             prompt_path=directory / "prompt.txt", schema_path=directory / "output-schema.json",
             stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
             returncode=returncode,

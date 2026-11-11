@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -186,4 +187,11 @@ def _looks_like_auth_failure(stderr: str) -> bool:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if os.name == "posix" and exit_code < 0:
+        native_signal = -exit_code
+        if native_signal not in {signal.SIGKILL, signal.SIGSTOP}:
+            signal.signal(native_signal, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {native_signal})
+        os.kill(os.getpid(), native_signal)
+    raise SystemExit(exit_code)

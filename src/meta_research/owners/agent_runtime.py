@@ -59,6 +59,7 @@ from meta_research.bundle_protocol import (
     TargetWorkHandle,
     TargetWorkNotice,
     TechnicalBlocker,
+    is_target_root_interruption,
     canonical_projection_bytes,
     projection_plain_value,
     validate_bundle_inbox_batch,
@@ -75,6 +76,7 @@ from meta_research.bundle_completion import (
     verify_accepted_closure,
 )
 from meta_research.bundle_target_contract import completion_contract_hash
+from meta_research.target_run_runtime_contract import TargetRunWorkspace
 from meta_research.target_run_contract import (
     TargetRunContractError,
     _is_target_root_completion_terminal,
@@ -1760,6 +1762,8 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     def list_target_root_work_refs(self) -> tuple[str, ...]: ...
 
+    def list_target_root_reconciliation_refs(self) -> tuple[str, ...]: ...
+
     def list_bundle_target_root_work_refs(
         self, run_ref: str
     ) -> tuple[str, ...]: ...
@@ -2165,6 +2169,8 @@ class TargetRunHarnessVerifier(Protocol):
         recovery_ref: str,
     ) -> TargetWorkHandle: ...
 
+    def query_target_workspace(self, target_run_ref: str) -> TargetRunWorkspace | None: ...
+
     def query_target_execution_failure(self, handle: TargetWorkHandle) -> object: ...
 
     def query_target_execution_outcome_unknown(
@@ -2188,6 +2194,10 @@ class TargetRootCompletionReader(Protocol):
     def query_completion(self, target_ref: str) -> object | None: ...
 
     def query_handle_history(self, target_ref: str) -> object | None: ...
+
+    def verify_unknown_failure_handoff(
+        self, connection, handle: TargetWorkHandle, history,
+    ) -> TargetRunHandoff: ...
 
 
 class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
@@ -3476,6 +3486,48 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 result.append(target_ref)
         return tuple(result)
 
+    def list_target_root_reconciliation_refs(self) -> tuple[str, ...]:
+        """Find failed roots whose original provider operation still needs proof.
+
+        This is receipt readback only, separate from the runnable inventory.
+        The existing daemon may settle that one operation but cannot reopen it.
+        """
+        with self._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT lifecycle.target_ref, lifecycle.target_run_ref "
+                "FROM ar_target_root_lifecycles AS lifecycle JOIN "
+                "ar_harness_provider_operations AS operations ON "
+                "operations.run_ref=lifecycle.target_run_ref WHERE "
+                "lifecycle.status='failed' AND (operations.status='unknown_outcome' OR "
+                "(operations.status='failed' AND operations.outcome_code='provider_terminal_reconciled' "
+                "AND EXISTS (SELECT 1 FROM ar_execution_responsibilities AS effects WHERE "
+                "effects.root_run_ref=lifecycle.target_run_ref AND "
+                "effects.attempt_ref=lifecycle.target_attempt_ref AND "
+                "effects.fence_ref=lifecycle.target_fence_ref AND "
+                "effects.operation_ref=operations.operation_ref AND effects.owner_scope='agent_runtime' "
+                "AND effects.effect_kind IN ('harness_root','runtime_reconciliation') "
+                "AND effects.status!='finished'))) "
+                "AND operations.generation=(SELECT MAX(generation) FROM "
+                "ar_harness_provider_operations WHERE run_ref=lifecycle.target_run_ref) "
+                "ORDER BY lifecycle.target_ref LIMIT :limit"
+            ), {"limit": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS + 1}).all()
+        if len(rows) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
+            raise OwnerConflict("target_root_reconciliation_inventory_oversized")
+        result: list[str] = []
+        for row in rows:
+            target_ref, run_ref = str(row.target_ref), str(row.target_run_ref)
+            launch = self.query_admitted_target_launch(target_ref)
+            if launch is None or launch.target_run_ref != run_ref:
+                raise OwnerConflict("target_root_reconciliation_inventory_invalid")
+            # Re-enter the operation issuer. A racing receipt settlement simply
+            # removes this root from the next inventory; it never becomes work.
+            operation = self.harness_runs.latest_operation(run_ref)
+            if (self.harness_runs.target_run_failed(run_ref)
+                    and operation is not None and (operation.status == "unknown_outcome"
+                        or operation.status == "failed" and operation.outcome_code == "provider_terminal_reconciled")):
+                result.append(target_ref)
+        return tuple(result)
+
     def list_bundle_target_root_work_refs(
         self, run_ref: str
     ) -> tuple[str, ...]:
@@ -4009,22 +4061,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     ),
                     {"target_ref": target_ref},
                 ).all()
-                if len(active_workspaces) > 1 or (
-                    active_workspaces
-                    and (
-                        active_workspaces[0].target_run_ref,
-                        active_workspaces[0].root_session_ref,
-                        active_workspaces[0].target_attempt_ref,
-                        active_workspaces[0].target_fence_ref,
-                    )
-                    != (
-                        frontier.current_handle.target_run_ref,
-                        frontier.current_handle.root_session_ref,
-                        frontier.current_handle.execution_attempt_ref,
-                        frontier.current_handle.execution_fence_ref,
-                    )
-                ):
+                if len(active_workspaces) > 1:
                     raise OwnerConflict("target_run_recovery_integrity_invalid")
+                if active_workspaces:
+                    workspace = active_workspaces[0]
+                    accepted_workspace = harness_verifier.query_target_workspace(
+                        frontier.current_handle.target_run_ref
+                    )
+                    if (accepted_workspace is None
+                        or accepted_workspace.workspace_ref != workspace.workspace_ref
+                        or (workspace.target_ref, workspace.target_run_ref)
+                        != (target_ref, frontier.current_handle.target_run_ref)
+                        or not any((workspace.target_run_ref, workspace.root_session_ref,
+                                    workspace.target_attempt_ref, workspace.target_fence_ref)
+                                   == (item.target_run_ref, item.root_session_ref,
+                                       item.execution_attempt_ref, item.execution_fence_ref)
+                                   for item in prior_handles)):
+                        raise OwnerConflict("target_run_recovery_integrity_invalid")
                 retired = {
                     row.identity_ref
                     for row in connection.execute(
@@ -4183,7 +4236,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             "retired_at": now,
                         },
                     )
-                if active_workspaces:
+                if active_workspaces and replacement_handle.target_run_ref != old.target_run_ref:
                     connection.execute(
                         text(
                             "UPDATE ar_target_run_workspaces SET status = "
@@ -4613,6 +4666,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         except (BundleProtocolError, IndexError, TypeError, ValueError) as error:
             raise OwnerConflict("target_run_handoff_invalid") from error
         root_completion = _is_target_root_completion_terminal(handoff.terminal)
+        root_interruption = is_target_root_interruption(handoff.terminal)
         goal_disposition = type(handoff.terminal) is GoalWorkDisposition
         verified_goal_history = None
         if goal_disposition and handoff.terminal.disposition == "cancelled":
@@ -4630,7 +4684,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "target_root_cancel_publication_authority_invalid"
                 )
         terminal_blocker_verified = False
-        if type(handoff.terminal) is TechnicalBlocker:
+        if type(handoff.terminal) is TechnicalBlocker and not root_interruption:
             verifier = self._target_run_harness_verifier
             try:
                 verified_blocker = (
@@ -4831,6 +4885,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             recovery_evidence_refs=(),
                             admission_block=existing_block,
                         )
+                elif root_interruption:
+                    context = _target_root_interruption_context(
+                        connection, handoff, self._target_root_completion_reader)
                 elif root_completion:
                     final_handle = handoff.handle_history[-1]
                     graph_verifier = self._target_graph_verifier
@@ -4971,7 +5028,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             "target_run_handoff_target_commit_invalid"
                         )
                     measurement_transition_verified = True
-                if not root_completion and not goal_disposition:
+                if not root_completion and not goal_disposition and not root_interruption:
                     _validate_persisted_target_terminal(
                         handoff,
                         candidate=context.candidate,
@@ -5111,12 +5168,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                                 handoff.terminal.implementation_revision_ref
                                 if root_completion
                                 else "goal-work-disposition"
-                                if goal_disposition
+                                if goal_disposition or root_interruption
                                 else context.candidate.implementation_revision_ref
                             ),
                             expected_initial_code_changed=(
                                 False
-                                if root_completion or goal_disposition
+                                if root_completion or goal_disposition or root_interruption
                                 else context.candidate.code_changed
                             ),
                             semantic_barrier_fact_ref=semantic_fact_ref,
@@ -5248,6 +5305,27 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             "target_commit_ref": terminal_fact_ref,
                         },
                     )
+                elif root_interruption:
+                    run_ref = context.handles[-1].target_run_ref
+                    failure = connection.execute(text(
+                        "UPDATE ar_target_root_lifecycles SET status='failed',updated_at=:now "
+                        "WHERE target_ref=:target AND status='running' AND cancel_ref IS NOT NULL "
+                        "AND completion_ref IS NULL"
+                    ), {"target": target_ref, "now": now})
+                    if failure.rowcount != 1:
+                        raise OwnerConflict("target_root_unknown_failure_conflict")
+                    connection.execute(text(
+                        "UPDATE ar_mcp_channel_grants SET status='revoked',revoked_at=:now "
+                        "WHERE run_ref=:run AND status='current'"), {"run": run_ref, "now": now})
+                    connection.execute(text(
+                        "UPDATE ar_execution_fences SET status='rejected',closed_at=:now "
+                        "WHERE fence_ref=:fence AND status IN ('current','submitted')"
+                    ), {"fence": context.handles[-1].execution_fence_ref, "now": now})
+                    self._feed.record(connection, "agent_runtime.target_root_failed", {
+                        "target_ref": target_ref, "reason": terminal.reason,
+                        "operation_ref": terminal.pending_obligation_refs[0],
+                        "handoff_manifest_ref": manifest_ref,
+                    })
                 elif goal_disposition and terminal.disposition == "cancelled":
                     lifecycle_update = connection.execute(
                         text(
@@ -5460,13 +5538,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             target_refs = tuple(notice.target_ref for notice in batch.notices)
             if len(set(target_refs)) != len(target_refs):
                 raise OwnerConflict("bundle_inbox_ack_invalid")
-            evidence, missing = _bundle_report_target_evidence(
-                connection,
-                target_refs,
-                target_run_verifier=self._target_run_harness_verifier,
-                target_root_completion_reader=self._target_root_completion_reader,
-                target_graph_verifier=self._target_graph_verifier,
-            )
+            try:
+                evidence, missing = _bundle_report_target_evidence(
+                    connection,
+                    target_refs,
+                    target_run_verifier=self._target_run_harness_verifier,
+                    target_root_completion_reader=self._target_root_completion_reader,
+                    target_graph_verifier=self._target_graph_verifier,
+                )
+            except OwnerConflict as error:
+                if error.code not in {"bundle_report_handoff_missing", "bundle_report_handoff_invalid"}:
+                    raise
+                raise OwnerConflict("bundle_inbox_notice_frontier_invalid") from error
             if missing or tuple(item.notice.notice_ref for item in evidence) != tuple(
                 notice.notice_ref for notice in batch.notices
             ):
@@ -5743,6 +5826,37 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 connection,
                 row=row,
                 handoff=handoff,
+            )
+            return
+        if is_target_root_interruption(handoff.terminal):
+            context = _target_root_interruption_context(
+                connection, handoff, self._target_root_completion_reader)
+            lifecycle = connection.execute(text(
+                "SELECT status FROM ar_target_root_lifecycles WHERE target_ref=:target"
+            ), {"target": context.handles[-1].target_ref}).scalar_one()
+            notice_row = connection.execute(text(
+                "SELECT * FROM ar_target_work_notices WHERE manifest_ref=:manifest"
+            ), {"manifest": row.manifest_ref}).one()
+            notice = _target_notice_from_row(notice_row)
+            inbox = connection.execute(text(
+                "SELECT entries.sequence FROM ar_bundle_inbox_entries entries "
+                "JOIN ar_target_launches launches ON launches.target_ref=:target "
+                "JOIN ar_bundle_dispatch_decisions decisions ON "
+                "decisions.decision_ref=launches.dispatch_decision_ref "
+                "AND decisions.run_ref=entries.run_ref WHERE entries.notice_ref=:notice"
+            ), {"target": row.target_ref, "notice": notice.notice_ref}).first()
+            if (lifecycle != "failed" or inbox is None or inbox.sequence < 1
+                    or row.target_ref != context.handles[-1].target_ref
+                    or notice.handoff_manifest_ref != row.manifest_ref
+                    or row.semantic_barrier_fact_ref is not None):
+                raise OwnerConflict("target_root_unknown_failure_integrity_invalid")
+            validate_target_run_handoff_notice(
+                handoff, notice, context.frontier, context.frontier,
+                initial_handle=context.handles[0],
+                target_spec_binding=context.request.target_spec_binding,
+                target_spec_acceptance_receipt=context.request.target_spec_acceptance_receipt,
+                expected_review_scopes=(), expected_initial_implementation_revision_ref="root-interruption",
+                expected_initial_code_changed=False,
             )
             return
         try:
@@ -7398,8 +7512,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         fence_ref: str,
         runtime_binding_hash: str,
         allowed_statuses: frozenset[str],
+        request_provenance: bool = False,
     ) -> dict[str, object]:
-        """Verify a Root identity, optionally while its exact task is suspended."""
+        """Verify current execution or an internal immutable request source."""
 
         if not _is_sha256(runtime_binding_hash):
             raise OwnerConflict("root_agent_human_request_scope_invalid")
@@ -7429,14 +7544,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "root_agent_human_request_effect_unauthorized"
                 )
             if (
-                target.run_status not in allowed_statuses
-                or target.launch_status not in {"admitted", "active"}
+                target.launch_status not in {"admitted", "active"}
                 or target.launch_target_run_ref != run_ref
                 or target.launch_target_ref != target.target_ref
                 or target.runtime_binding_hash != runtime_binding_hash
-                or target.attempt_ref != attempt_ref
-                or target.root_session_ref != root_session_ref
-                or target.fence_ref != fence_ref
                 or not isinstance(target.generation, int)
                 or isinstance(target.generation, bool)
                 or int(target.generation) < 1
@@ -7447,12 +7558,35 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 or root_kind not in {None, "target"}
             ):
                 raise OwnerConflict("root_agent_human_request_scope_stale")
+            current_identity = (target.attempt_ref, target.root_session_ref, target.fence_ref) == (
+                attempt_ref, root_session_ref, fence_ref)
+            generation = int(target.generation)
+            historical_request = False
+            if request_provenance and not current_identity:
+                history = self.query_target_root_handle_history(target.target_ref)
+                matches = (() if history is None or history.target_ref != target.target_ref else tuple(
+                    recovery for recovery in history.recoveries
+                    if (recovery.old_handle.target_ref, recovery.old_handle.target_run_ref,
+                        recovery.old_handle.execution_attempt_ref, recovery.old_handle.root_session_ref,
+                        recovery.old_handle.execution_fence_ref)
+                    == (target.target_ref, run_ref, attempt_ref, root_session_ref, fence_ref)))
+                if len(matches) != 1:
+                    raise OwnerConflict("root_agent_human_request_scope_stale")
+                # Issuer history revalidates this exact recovery and its strong
+                # terminal receipt. It proves the request's source, not a grant.
+                generation = matches[0].reservation.generation - 1
+                historical_request = True
+            if (not current_identity and not historical_request
+                or not request_provenance and target.run_status not in allowed_statuses
+                or generation < 1):
+                raise OwnerConflict("root_agent_human_request_scope_stale")
             return {
                 "run_kind": "target",
                 "quest_ref": target.quest_ref,
                 "target_ref": target.target_ref,
                 "waiter_ref": f"root_run:{run_ref}",
-                "waiter_generation": int(target.generation),
+                "waiter_generation": generation,
+                **({"historical_request": True} if historical_request else {}),
             }
         if (
             managed.get("status") not in allowed_statuses
@@ -12257,7 +12391,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     def reconcile_root_human_request(
         self, request_ref: str
     ) -> dict[str, object] | None:
-        """Dispose and resume one operation-scoped HumanRequest idempotently."""
+        """Settle an exact request; resume only its current checkpointed root."""
 
         request = self.query_human_request(request_ref)
         if (
@@ -12279,8 +12413,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             consumed_binding = open_effect.get("operation_binding")
             return request
 
-        binding = self._verify_root_human_request_operation_binding(request, waiter)
-        if not self._root_human_request_resume_checkpoint_ready(binding):
+        binding, historical_request = self._verify_root_human_request_operation_binding(request, waiter)
+        if not historical_request and not self._root_human_request_resume_checkpoint_ready(binding):
             return request
         if request.get("status") == "open":
             responses = request.get("responses")
@@ -12402,7 +12536,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "request_ref": request_ref,
                     "disposition": request["status"],
                     "operation_binding": binding,
-                    "resumed_status": "running",
+                    "resumed_status": "historical_request_reconciled" if historical_request else "running",
+                    **({"response_proof": request["evaluation"]} if historical_request else {}),
                 }
             )
             with self._database.write() as connection:
@@ -12414,11 +12549,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     work_ref=work_ref,
                     work_hash=work_hash,
                 )
-                self._resume_operation_after_human_request(
-                    connection,
-                    operation_binding=binding,
-                    request_ref=request_ref,
-                )
+                if not historical_request:
+                    self._resume_operation_after_human_request(
+                        connection,
+                        operation_binding=binding,
+                        request_ref=request_ref,
+                    )
         return self.query_human_request(request_ref)
 
     def consume_system_operation_help_waiter(
@@ -12528,7 +12664,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self,
         request: dict[str, object],
         waiter: dict[str, object],
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], bool]:
+        """Return original request provenance and whether its root was recovered."""
         open_effect = cast(dict[str, object], request["open_effect"])
         binding = open_effect.get("operation_binding")
         if not isinstance(binding, dict):
@@ -12565,6 +12702,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             fence_ref=cast(str, binding["fence_ref"]),
             runtime_binding_hash=cast(str, binding["runtime_binding_hash"]),
             allowed_statuses=frozenset({"suspended"}),
+            request_provenance=True,
         )
         expected_generation = scope.get("waiter_generation")
         predecessor_ref = request.get("predecessor_request_ref")
@@ -12614,7 +12752,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or request.get("quest_ref") != binding.get("quest_ref")
         ):
             raise OwnerConflict("root_human_request_scope_stale")
-        return binding
+        return binding, bool(scope.get("historical_request", False))
 
     def _root_human_request_provided_proof(
         self,
@@ -25974,7 +26112,16 @@ def _bundle_report_target_evidence(
             )
             continue
         root_completion = _is_target_root_completion_terminal(handoff.terminal)
-        if root_completion:
+        root_interruption = is_target_root_interruption(handoff.terminal)
+        if root_interruption:
+            context = _target_root_interruption_context(
+                connection, handoff, target_root_completion_reader)
+            status = connection.execute(text(
+                "SELECT status FROM ar_target_root_lifecycles WHERE target_ref=:target"
+            ), {"target": target_ref}).scalar_one()
+            if status != "failed":
+                raise OwnerConflict("bundle_report_handoff_invalid")
+        elif root_completion:
             final_handle = handoff.handle_history[-1]
             transition = _query_verified_target_commit_transition(
                 target_graph_verifier,
@@ -26147,17 +26294,17 @@ def _bundle_report_target_evidence(
                 expected_review_scopes=context.review_scopes,
                 expected_initial_implementation_revision_ref=(
                     "goal-work-disposition"
-                    if goal_disposition
+                    if goal_disposition or root_interruption
                     else context.candidate.implementation_revision_ref
                 ),
                 expected_initial_code_changed=(
-                    False if goal_disposition else context.candidate.code_changed
+                    False if goal_disposition or root_interruption else context.candidate.code_changed
                 ),
                 semantic_barrier_fact_ref=manifest_row.semantic_barrier_fact_ref,
             )
         except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
             raise OwnerConflict("bundle_report_handoff_invalid") from error
-        if not root_completion and not goal_disposition:
+        if not root_completion and not goal_disposition and not root_interruption:
             _validate_persisted_target_terminal(
                 handoff,
                 candidate=context.candidate,
@@ -28002,6 +28149,36 @@ class _TargetHandoffContext:
     stop_decisions: tuple[StopDecisionProof, ...]
     recovered_blockers: tuple[TechnicalBlocker, ...]
     recovery_evidence_refs: tuple[str, ...]
+
+
+def _target_root_interruption_context(connection, handoff, reader):
+    """Recheck native unknown-operation authority for every handoff consumer."""
+    if reader is None:
+        raise OwnerConflict("target_root_unknown_failure_authority_unavailable")
+    handle = handoff.handle_history[-1]
+    history = reader.query_handle_history(handle.target_ref)
+    if history is None:
+        raise OwnerConflict("target_root_unknown_failure_invalid")
+    verified = reader.verify_unknown_failure_handoff(connection, handle, history)
+    if verified != handoff:
+        raise OwnerConflict("target_root_unknown_failure_invalid")
+    frontier, request = _target_frontier_and_request_for_local_write(connection, handle.target_ref)
+    if frontier.current_handle != handle:
+        raise OwnerConflict("target_root_unknown_failure_invalid")
+    lifecycle = connection.execute(text(
+        "SELECT candidate_json,candidate_hash,formal_plan_json,formal_plan_hash "
+        "FROM ar_target_root_lifecycles WHERE target_ref=:target"
+    ), {"target": handle.target_ref}).one()
+    candidate = _stored_bundle_record(lifecycle.candidate_json, lifecycle.candidate_hash,
+                                     TargetCandidate, "target_root_unknown_failure_invalid")
+    formal_plan = _stored_bundle_record(lifecycle.formal_plan_json, lifecycle.formal_plan_hash,
+                                       FormalPlan, "target_root_unknown_failure_invalid")
+    return SimpleNamespace(
+        request=request, frontier=frontier, monitor=SimpleNamespace(snapshot_required=0),
+        candidate=candidate, formal_plan=formal_plan, handles=history.handle_history, preflights=(),
+        review_scopes=(), stop_decisions=(), recovered_blockers=history.recovered_blockers,
+        recovery_evidence_refs=history.recovery_evidence_refs,
+    )
 
 
 def _target_handoff_context(
