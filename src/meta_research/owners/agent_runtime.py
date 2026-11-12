@@ -8026,7 +8026,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if control is not None and root_kind in FORMAL_STAGES:
             interrupted_unit = connection.execute(
                 text(
-                    "SELECT units.unit_ref FROM ar_provider_units AS units JOIN "
+                    "SELECT units.unit_ref, units.unit_kind FROM ar_provider_units AS units JOIN "
                     "ar_fence_revocations AS revocations ON revocations.fence_ref = "
                     "units.fence_ref AND revocations.run_ref = units.run_ref WHERE "
                     "units.run_ref = :run_ref AND units.attempt_ref = :attempt_ref "
@@ -8048,12 +8048,22 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     ),
                     {"now": now, "fence_ref": operation_binding["fence_ref"]},
                 )
+                retained_primary = connection.execute(text(
+                    "SELECT primary_draft_hash FROM ar_stage_attempts WHERE attempt_ref=:attempt "
+                    "AND run_ref=:run"), {"attempt": control.attempt_ref, "run": task_ref}).first()
+                replace_bundle_review_operation = (
+                    root_kind == "bundle" and interrupted_unit.unit_kind == "bundle_review"
+                    and retained_primary is not None and retained_primary.primary_draft_hash is not None
+                )
                 replacement = self._replace_fenced_managed_attempt(
                     connection,
                     control,
                     now,
                     reuse_checkpoint=True,
-                    reuse_operation_refs=True,
+                    # Retain accepted primary work and its native root. A new
+                    # review phase needs a new job so its new Attempt cannot
+                    # collide with the sealed pre-restart batch identity.
+                    reuse_operation_refs=not replace_bundle_review_operation,
                     preserve_native_session=True,
                     replacement_reason_code="human_request_resume_after_restart",
                 )
@@ -8061,7 +8071,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     text(
                         "UPDATE ar_run_controls SET attempt_ref = :attempt_ref, "
                         "fence_ref = :fence_ref, control_revision = "
-                        "control_revision + 1, updated_at = :now WHERE run_ref = "
+                        "control_revision + 1, cleanup_status = CASE WHEN run_kind = "
+                        "'bundle_stage' THEN 'pending' ELSE cleanup_status END, "
+                        "updated_at = :now WHERE run_ref = "
                         ":run_ref AND status = 'running' AND attempt_ref = "
                         ":old_attempt_ref AND fence_ref = :old_fence_ref"
                     ),
@@ -9307,17 +9319,61 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         """Project the predecessor's retained correction into its current Attempt."""
         from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
         with self._database.read() as connection:
+            control = connection.execute(text(
+                "SELECT * FROM ar_run_controls WHERE run_ref=:run AND attempt_ref=:attempt "
+                "AND fence_ref=:fence"),
+                {"run": run_ref, "attempt": attempt_ref, "fence": fence_ref}).first()
+            if control is None:
+                return None
+            feedback_attempt_ref = attempt_ref
+            cursor_fence_ref = fence_ref
+            while True:
+                replacement = connection.execute(text(
+                    "SELECT * FROM ar_stage_attempt_replacements WHERE run_ref=:run "
+                    "AND replacement_attempt_ref=:attempt"),
+                    {"run": run_ref, "attempt": feedback_attempt_ref}).first()
+                if replacement is None or replacement.reason_code != "human_request_resume_after_restart":
+                    break
+                run, current, session, current_fence = _load_stage_fence(
+                    connection, run_ref, feedback_attempt_ref, cursor_fence_ref)
+                previous = connection.execute(text(
+                    "SELECT * FROM ar_stage_attempts WHERE attempt_ref=:attempt AND run_ref=:run"),
+                    {"attempt": replacement.retired_attempt_ref, "run": run_ref}).first()
+                if previous is None:
+                    raise OwnerConflict("stage_provider_feedback_invalid")
+                _, retired, _, retired_fence = _load_stage_fence(
+                    connection, run_ref, previous.attempt_ref, previous.fence_ref)
+                current_primary, _ = _provider_invocations(connection, run, current, current_fence)
+                retired_primary, _ = _provider_invocations(connection, run, retired, retired_fence)
+                if (run.root_session_ref != control.root_session_ref
+                        or session.session_ref != control.root_session_ref
+                        or current.root_session_ref != retired.root_session_ref
+                        or int(current.generation) != int(retired.generation) + 1
+                        or retired_fence.status != "rejected"
+                        or (current_primary.operation_ref != retired_primary.operation_ref and not (
+                            run.stage == "bundle" and current.primary_draft_hash is not None
+                            and current.primary_draft_hash == retired.primary_draft_hash
+                            and current_primary.status == retired_primary.status == "completed"
+                            and current_primary.response_hash == retired_primary.response_hash
+                        ))):
+                    raise OwnerConflict("stage_provider_feedback_invalid")
+                # HR restart retains the exact invocation or accepted primary
+                # under a new review job. No other replacement reason inherits
+                # a correction diagnostic through this reader.
+                feedback_attempt_ref = retired.attempt_ref
+                cursor_fence_ref = retired.fence_ref
             row = connection.execute(text(
                 "SELECT s.* FROM ar_stage_attempt_replacements r "
                 "JOIN ar_run_controls c ON c.run_ref=r.run_ref "
                 "JOIN ar_safe_points s ON s.run_ref=r.run_ref "
                 "AND s.attempt_ref=r.retired_attempt_ref "
                 "AND s.root_session_ref=c.root_session_ref "
-                "WHERE r.run_ref=:run_ref AND r.replacement_attempt_ref=:attempt_ref "
+                "WHERE r.run_ref=:run_ref AND r.replacement_attempt_ref=:feedback_attempt_ref "
                 "AND r.reason_code='provider_result_correction' "
                 "AND c.attempt_ref=:attempt_ref AND c.fence_ref=:fence_ref "
                 "ORDER BY s.created_at DESC LIMIT 1"
-            ), {"run_ref": run_ref, "attempt_ref": attempt_ref, "fence_ref": fence_ref}).first()
+            ), {"run_ref": run_ref, "attempt_ref": attempt_ref, "fence_ref": fence_ref,
+                "feedback_attempt_ref": feedback_attempt_ref}).first()
             if row is None:
                 return None
             try:
@@ -9985,6 +10041,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 continue
             if reconcile(str(row.operation_ref)) is not True:
                 continue
+            finish = getattr(provider, "finish_job", None)
+            if callable(finish):
+                # A verified terminal job may retain an in-memory cancellation
+                # latch. Release it before clearing pending cleanup, so a
+                # failed release remains retryable and cannot unblock new work.
+                finish(str(row.operation_ref))
             self.acknowledge_provider_safe_point(
                 unit_ref=row.unit_ref,
                 run_ref=row.run_ref,

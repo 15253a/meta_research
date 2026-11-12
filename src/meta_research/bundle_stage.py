@@ -506,7 +506,42 @@ class BundleStageWorker:
         # Stage completion is exclusively authorized by the durable report
         # path above, after AR has reread every current terminal handoff and
         # exact FormalPlan measurement cell.
-        if len(commits) == len(graph.targets) and not graph.strategy_complete:
+        all_targets_committed = len(commits) == len(graph.targets)
+        coordination_after_no_action = False
+        if all_targets_committed and not graph.strategy_complete:
+            feedback = self._agent_runtime.query_stage_provider_correction_feedback(
+                run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+            )
+            # A rejected empty batch is not an accepted strategy or a research
+            # conclusion. Give its exact current successor the existing root
+            # decision channel instead of demanding another impossible batch.
+            # The physical unit also binds the rejected graph generation: old
+            # feedback must not divert later, legitimately appended work.
+            coordination_after_no_action = bool(
+                feedback is not None
+                and feedback.get("failure_code") == "bundle_review_result_contract_invalid"
+                and feedback.get("detail_code") == "strategy_update_has_no_actionable_work"
+                and feedback.get("provider_unit_ref") == _rolling_provider_unit_ref(
+                    operation_ref=feedback["provider_operation_ref"],
+                    operation_name=f"target-batch-{graph.head_generation + 1}",
+                    attempt_ref=feedback["rejected_attempt_ref"],
+                )
+            )
+            if coordination_after_no_action:
+                decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+                latest = decisions[-1] if decisions else None
+                if (latest is not None and latest.action == "wait" and not latest.frontier
+                        and latest.attempt_ref == run.attempt_ref
+                        and latest.fence_ref == run.fence_ref and latest.graph_ref == graph.graph_ref):
+                    # A wait consumes this exact research input, not the right to
+                    # propose later work. Fresh inbox facts reopen the normal
+                    # batch path; unchanged inputs retain the durable wait.
+                    checkpoint = self._drain_bundle_inbox(run)
+                    coordination_after_no_action = self._operation_uses_inbox_checkpoint(
+                        operation_kind="dispatch", operation_ref=latest.decision_ref,
+                        checkpoint=checkpoint,
+                    )
+        if all_targets_committed and not graph.strategy_complete and not coordination_after_no_action:
             inbox_checkpoint = self._drain_bundle_inbox(run)
             proposals = self._agent_runtime.query_bundle_target_proposals(
                 run.run_ref
@@ -793,7 +828,7 @@ class BundleStageWorker:
             in {target.target_ref for target in launchable}
             else None
         )
-        coordination_needed = bool(frontier)
+        coordination_needed = bool(frontier) or coordination_after_no_action
         dispatch_generation = (
             pending_dispatch.generation
             if pending_dispatch is not None
