@@ -223,7 +223,7 @@
 .research-output-panel .root-parallel-targets button { min-height: 29px; padding: 4px 9px; border-color: #e0e4ee; border-radius: 7px; background: #f8f9fc; color: #48556c; font-size: 12px; }
 .research-output-panel .root-parallel-targets button:hover { border-color: #c2b9de; }
 .research-output-panel .root-parallel-targets button[aria-pressed=true] { border-color: #d1c8e8; background: #f0edf8; color: #554683; }
-.research-output-panel .root-session-controls > :is(.root-worker-notice, .root-session-warning) { margin: 6px 18px; }
+.research-output-panel .root-session-controls > :is(.root-worker-notice, .root-session-warning, .root-output-pending) { margin: 6px 18px; }
 .research-output-panel .root-session-conversation {
   display: flex;
   flex-direction: column;

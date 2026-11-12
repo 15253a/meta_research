@@ -8,6 +8,7 @@
 .root-view-toolbar .root-session-select[data-executing=true] > select { padding-inline-start:31px; }
 .root-session-select > .root-running-spinner { position:absolute; inset-inline-start:10px; top:50%; translate:0 -50%; pointer-events:none; }
 .root-follow-label { color:#626f85; }
+.root-output-pending { margin:10px 21px; font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
 .root-parallel-targets { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:12px 21px; border-bottom:1px solid #e4e7f1; }
 .root-parallel-targets > span { margin-right:4px; font-size:10px; color:#8992a7; }
 .root-parallel-targets button { display:inline-flex; align-items:center; gap:6px; border:1px solid #e0e2ef; border-radius:20px; background:#fafaff; color:#7b8199; font-family:inherit; font-size:11px; padding:6px 11px; cursor:pointer; }

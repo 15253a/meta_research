@@ -23,6 +23,7 @@ export type RootSession = {
   run_ref: string | null; target_ref: string | null; cycle_ref: string | null; question_ref: string | null;
   created_at: number | null; updated_at: number | null; operations: RootOperation[];
   limited?: boolean;
+  output_pending?: boolean;
   children?: DelegatedChild[];
 };
 export type RootSessions = {

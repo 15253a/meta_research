@@ -6,6 +6,7 @@ uses review reservations as activity, or publishes child text or prompts.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from meta_research.harness_adapters import _codex_item_actor
@@ -39,14 +40,27 @@ def _status(value):
     return "unknown"
 
 
-def read_child_sessions(directory: Path, *, invocation_hash: str,
+@dataclass(frozen=True)
+class ChildSessionObservation:
+    children: list[dict]
+    limited: bool = False
+    pending_tail: bool = False
+
+
+def read_child_sessions(directory: Path, **scope):
+    """Compatibility view of bounded child metadata and actual read limits."""
+    observation = observe_child_sessions(directory, **scope)
+    return observation.children, observation.limited
+
+
+def observe_child_sessions(directory: Path, *, invocation_hash: str,
                         parent_session_ref: str, operation_ref: str,
                         executing: bool, expected_native: str | None = None,
                         known_children=(), provider="codex"):
-    """Return bounded safe metadata; a vanished active process means unknown."""
+    """Keep a live unfinished tail distinct from unreadable or terminal output."""
     source = directory / "stdout.jsonl"
     if not source.exists():
-        return [], False
+        return ChildSessionObservation([])
     if source.is_symlink() or not source.is_file() or source.stat().st_size > _MAX_BYTES:
         raise ValueError("child_session_source_unavailable")
     receipt_path = directory / "supervisor-exit.json"
@@ -61,13 +75,18 @@ def read_child_sessions(directory: Path, *, invocation_hash: str,
             raise ValueError("child_session_source_unavailable")
         executing = False
     native, children, requests, limited, read_bytes = expected_native, {}, {}, False, 0
+    pending_tail = False
     known_loaded = False
     updated_at = source.stat().st_mtime
     with source.open("rb") as stream:
         while raw := stream.readline(_MAX_LINE + 1):
             read_bytes += len(raw)
-            if len(raw) > _MAX_LINE or read_bytes > _MAX_BYTES or not raw.endswith(b"\n"):
+            if len(raw) > _MAX_LINE or read_bytes > _MAX_BYTES:
                 limited = True
+                break
+            if not raw.endswith(b"\n"):
+                pending_tail = executing
+                limited = limited or not executing
                 break
             try:
                 event = json.loads(raw)
@@ -173,7 +192,7 @@ def read_child_sessions(directory: Path, *, invocation_hash: str,
     for child in children.values():
         if limited or child["status"] not in _TERMINAL and not executing:
             child["status"] = "unknown"
-    return list(children.values()), limited
+    return ChildSessionObservation(list(children.values()), limited, pending_tail)
 
 
 def _child(parent, operation, native, child, provider, updated_at, *, request=None):

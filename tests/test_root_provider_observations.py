@@ -241,6 +241,23 @@ def test_nonterminal_deepfetch_without_bound_process_is_waiting(setup):
     assert session["operations"][0]["status"] == "waiting"
 
 
+def test_bound_deepfetch_partial_tail_is_pending_without_a_read_failure(setup, monkeypatch):
+    directory, _, _ = deepfetch(setup)
+    reader = setup[2]
+    monkeypatch.setattr('meta_research.root_session_observations._process_is_bound', lambda *args: True)
+    source = directory / 'stdout.jsonl'
+    with source.open('ab') as stream:
+        stream.write(b'{"type":')
+    pending = reader.query('q1')
+    assert pending['limited'] is False
+    assert pending['sessions'][0]['output_pending'] is True
+    with source.open('ab') as stream:
+        stream.write(b'"fixture"}\n')
+    caught_up = reader.query('q1')
+    assert caught_up['limited'] is False
+    assert caught_up['sessions'][0]['output_pending'] is False
+
+
 def test_acquisition_download_activity_does_not_require_a_root_model_turn(setup):
     acquisition(setup)
     db = setup[0]

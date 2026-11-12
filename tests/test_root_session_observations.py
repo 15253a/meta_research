@@ -1,6 +1,7 @@
 
 from provider_supervisor_support import closed_tree_fixture
 from pathlib import Path
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,82 @@ class _NoProviderRoots:
 
     def query_output(self, *args, **kwargs):
         raise ValueError("root_session_not_found")
+
+
+def test_active_target_partial_tail_keeps_verified_prefix_without_read_failure(root_reader, monkeypatch, tmp_path):
+    reader, runtime, request, run = root_reader
+    source = tmp_path / 'stdout.jsonl'
+    prefix = [
+        {'type': 'thread.started', 'thread_id': 'native-target'},
+        {'type': 'item.completed', 'thread_id': 'native-target', 'item': {
+            'type': 'collab_tool_call', 'tool': 'spawn_agent', 'status': 'completed',
+            'receiver_thread_ids': ['native-child'], 'agents_states': {'native-child': {'status': 'running'}}}},
+    ]
+    tail = json.dumps({'type': 'item.started', 'thread_id': 'native-target',
+        'item': {'type': 'command_execution', 'id': 'tool-1', 'command': 'fixture command'}}).encode() + b'\n'
+    source.write_bytes(b''.join(json.dumps(event).encode() + b'\n' for event in prefix) + tail[:45])
+    row = {'root_session_ref': 'target-session', 'run_ref': 'target-run', 'target_ref': 'target-one',
+        'target_key': 'T1', 'target_ordinal': 0, 'stage': 'bundle', 'cycle_ref': request.cycle_ref,
+        'question_ref': request.accepted_question.question_ref, 'epoch': request.epoch,
+        'owner_session_ref': run.root_session_ref, 'status': 'running', 'lifecycle_status': 'active',
+        'created_at': 10.0, 'updated_at': 11.0}
+    operation = {'operation_ref': 'target-call', 'status': 'running', 'generation': 1,
+        'outcome_code': None, 'created_at': 10.0, 'completed_at': None}
+    store = SimpleNamespace(_operation_bindings={'target-call': ('a' * 64, 'codex')}, _source_path=lambda _: source)
+    monkeypatch.setattr(reader, '_stage_rows', lambda *args: [])
+    monkeypatch.setattr(reader, '_target_rows', lambda *args: [row])
+    monkeypatch.setattr(reader, '_target_operations', lambda *args: [operation])
+    monkeypatch.setattr(reader, '_target_store', lambda *args: (store, SimpleNamespace(harness_family='codex')))
+    monkeypatch.setattr(observations, '_process_is_bound', lambda *args: True)
+    listing = reader.query(request.accepted_question.quest_ref)
+    session, = listing['sessions']
+    assert listing['limited'] is False
+    assert session['limited'] is False
+    assert session['output_pending'] is True
+    assert session['children'][0]['status'] == 'running'
+    with source.open('ab') as stream:
+        stream.write(tail[45:])
+    caught_up = reader.query(request.accepted_question.quest_ref)
+    assert caught_up['limited'] is False
+    assert caught_up['sessions'][0]['output_pending'] is False
+    assert caught_up['sessions'][0]['children'][0]['session_ref'] == session['children'][0]['session_ref']
+    with source.open('ab') as stream:
+        stream.write(tail[:45])
+    monkeypatch.setattr(observations, '_process_is_bound', lambda *args: False)
+    stopped = reader.query(request.accepted_question.quest_ref)
+    assert stopped['limited'] is True
+    assert stopped['sessions'][0]['output_pending'] is False
+    assert {'code': 'root_session_operations_limited'} in stopped['reasons']
+
+
+def test_unreadable_stage_output_stays_limited(root_reader, monkeypatch):
+    reader, runtime, request, run = root_reader
+    _add_stage_call(runtime, run, 'primary')
+    def unreadable(*args, **kwargs):
+        raise PermissionError('fixture output denied')
+
+    monkeypatch.setattr(observations, 'observe_child_sessions', unreadable)
+    listing = reader.query(request.accepted_question.quest_ref)
+    assert listing['limited'] is True
+    assert listing['sessions'][0]['output_pending'] is False
+    assert {'code': 'root_session_operations_limited'} in listing['reasons']
+
+
+def test_active_stage_partial_tail_is_pending_until_the_same_file_completes(root_reader, monkeypatch):
+    reader, runtime, request, run = root_reader
+    _, directory = _add_stage_call(runtime, run, 'primary', status='active')
+    source = directory / 'stdout.jsonl'
+    # An active stream has not emitted the terminal event seeded by the helper.
+    source.write_bytes(source.read_bytes().splitlines(keepends=True)[0] + b'{"type":')
+    monkeypatch.setattr(observations, '_process_is_bound', lambda *args: True)
+    pending = reader.query(request.accepted_question.quest_ref)
+    assert pending['limited'] is False
+    assert pending['sessions'][0]['output_pending'] is True
+    with source.open('ab') as stream:
+        stream.write(b'"fixture"}\n')
+    caught_up = reader.query(request.accepted_question.quest_ref)
+    assert caught_up['limited'] is False
+    assert caught_up['sessions'][0]['output_pending'] is False
 
 
 @pytest.fixture
