@@ -985,11 +985,10 @@ def creation_basis_operations(memory, runtime, collaboration):
         except KeyError as error:
             raise SemanticMcpError("creation_basis_unbound") from error
     return (SemanticOperation(semantic_operation_id="research_memory.creation_basis.read", owning_module="research_memory",
-        description="Read the exact authorized existing-work basis, source or prior literature. Directory references describe coverage, not file content: follow their retained_files' exact readers. Applicability distinguishes retained claims, changed scope and unresolved creation limits. Protected reassessment can read only its exact historical predecessor. DeepFetch can read its bound basis and exact prior snapshots with view=literature and snapshot_ref; reuse never creates a new run or snapshot binding. Unselected or linked historical bytes may be unavailable. Imported work retains external provenance.",
+        description="Read the exact authorized existing-work basis, source or prior literature. Applicability distinguishes retained claims, changed scope and unresolved creation limits. Protected reassessment can read only its exact historical predecessor. DeepFetch can read its bound basis and exact prior snapshots with view=literature and snapshot_ref; reuse never creates a new run or snapshot binding. Unselected or linked historical bytes may be unavailable. Imported work retains external provenance.",
         input_schema={"type": "object", "additionalProperties": False, "properties": {
             "basis_ref": {"type": "string", "minLength": 1}, "expected_basis_hash": {"type": "string", "minLength": 64, "maxLength": 64},
             "view": {"type": "string", "enum": ["understanding", "source", "literature"]}, "material_key": {"type": "string"},
-            "snapshot_ref": {"type": "string", "minLength": 1}, "entry_path": {"type": "string", "minLength": 1,
-                "description": "Used only with view=literature. For creation source files, use a retained file's material_key or exact reader; directory references are not content readers."},
+            "snapshot_ref": {"type": "string", "minLength": 1}, "entry_path": {"type": "string", "minLength": 1},
             "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 65536}},
             "required": ["basis_ref", "expected_basis_hash", "view"]}, output_schema={"type": "object"}, handler=read),)
