@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from meta_research.owners.common import canonical_hash
-from meta_research.child_session_observations import read_child_sessions, append_child_sessions
+from meta_research.child_session_observations import observe_child_sessions, append_child_sessions
 from meta_research.provider_supervisor import (
     ProviderSupervisorError, provider_operation_ref, read_transport_envelope, read_verified_exit_receipt,
 )
@@ -38,15 +38,17 @@ class ProviderRootObservations:
         sessions, operations, reasons = self._catalog(quest_ref)
         for session in sessions:
             session["children"] = []
+            session["output_pending"] = False
             for public in session["operations"]:
                 operation = operations[(session["session_ref"], public["operation_ref"])]
                 try:
-                    children, limited = read_child_sessions(operation["directory"],
+                    observation = observe_child_sessions(operation["directory"],
                         invocation_hash=operation["invocation_hash"], parent_session_ref=session["session_ref"],
                         operation_ref=public["operation_ref"], executing=public["status"] == "executing",
                         expected_native=operation["native"], known_children=session["children"])
-                    append_child_sessions(session, children)
-                    if limited:
+                    append_child_sessions(session, observation.children)
+                    session["output_pending"] = session["output_pending"] or observation.pending_tail
+                    if observation.limited:
                         reasons.add("child_session_observation_limited")
                 except (OSError, ValueError, ProviderSupervisorError):
                     reasons.add("child_session_observation_unavailable")

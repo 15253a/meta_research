@@ -302,6 +302,7 @@ export function RootConversations({ model, connected, polling = false, targetRet
       <details><summary>错误详情</summary><code>{failure.reason?.code ?? "worker_unavailable"}</code></details>
     </div> : null}
     {model.error || model.data?.limited ? <div className="root-session-warning" role="status">{model.error ? "会话暂时无法更新，保留已读取记录。" : "部分会话记录未完整载入。"}<button onClick={model.refresh}>重新读取</button>{model.error ? <details><summary>状态详情</summary><code>{model.error}</code></details> : null}</div> : null}
+    {selectedExecuting && model.selected?.output_pending ? <p className="root-follow-label root-output-pending" role="status">当前输出仍在写入，已有记录可继续阅读；新内容会自动更新。</p> : null}
     {model.selectedUnavailable && model.selected ? <div className="root-session-warning" role="status">所选根会话暂不可读取，保留已读取内容和阅读位置。<button onClick={model.refresh}>重新读取所选会话</button></div> : null}
     </div>
     {model.selected && model.questRef ? <RootSessionTimeline key={`${model.scope}:${model.selected.session_ref}:${model.manualSelection ? "selected" : "current"}`} questRef={model.questRef} session={model.selected} scope={sessionScope(model.selected, model.context)} active={model.active} stale={!sessionKnown(model.selected) || model.selectedUnavailable} readingCache={model.readingCache} followCurrent={!model.manualSelection} onReadHistory={model.pinReading} />

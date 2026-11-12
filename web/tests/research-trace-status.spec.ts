@@ -173,6 +173,45 @@ test("incomplete older history does not erase a verified executing Target", asyn
   expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
 });
 
+test("a live output tail keeps readable records and clears its writing notice automatically", async ({ page }, testInfo) => {
+  const f = await fixture(page);
+  f.target1.output_pending = true;
+  await openWorkspace(page);
+  const trace = page.locator("#research-activity");
+  const writing = trace.getByText("当前输出仍在写入，已有记录可继续阅读；新内容会自动更新。", { exact: true });
+  await expect(writing).toBeVisible();
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  await expect(trace).not.toContainText("部分会话记录未完整载入");
+  await expect(trace.getByRole("button", { name: "重新读取", exact: true })).toHaveCount(0);
+  await trace.screenshot({ path: testInfo.outputPath("live-tail-writing.png") });
+  f.target1.output_pending = false;
+  f.output.set("target-turn-1", f.output.get("target-turn-1")! + message("同一输出流已自然补齐。"));
+  await expect(writing).toHaveCount(0);
+  await expect(trace).toContainText("同一输出流已自然补齐。");
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
+test("a pending live tail preserves independent read errors and retry controls", async ({ page }) => {
+  const f = await fixture(page);
+  f.target1.output_pending = true;
+  f.target1.limited = true;
+  f.catalog.limited = true;
+  f.catalog.reasons = [{ code: "root_session_operations_limited" }];
+  await openWorkspace(page);
+  const trace = page.locator("#research-activity");
+  await expect(trace).toContainText("当前输出仍在写入");
+  await expect(trace).toContainText("部分会话记录未完整载入");
+  const reads = f.state.listReads;
+  await trace.getByRole("button", { name: "重新读取", exact: true }).click();
+  await expect.poll(() => f.state.listReads).toBeGreaterThan(reads);
+  f.state.listFailed = true;
+  await expect(trace).toContainText("会话暂时无法更新，保留已读取记录。");
+  await expect(trace).not.toContainText("当前输出仍在写入");
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
 test("current output follows an executing Target instead of its waiting stage and supports parallel roots", async ({ page }) => {
   const f = await fixture(page);
   await openWorkspace(page);

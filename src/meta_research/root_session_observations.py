@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from meta_research.bundle_protocol import TargetWorkHandle
-from meta_research.child_session_observations import read_child_sessions, append_child_sessions
+from meta_research.child_session_observations import observe_child_sessions, append_child_sessions
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.owners.agent_runtime_harness import _validated_target_root_event
 from meta_research.owners.target_run_runtime import _decode_stored_record
@@ -165,7 +165,7 @@ class RootSessionObservations:
             "run_ref": row["run_ref"], "target_ref": row.get("target_ref"),
             "cycle_ref": row.get("cycle_ref"), "question_ref": row.get("question_ref"),
             "created_at": row["created_at"], "updated_at": row["updated_at"],
-            "operations": [], "children": [], "limited": False,
+            "operations": [], "children": [], "limited": False, "output_pending": False,
         }
 
     def _stage_rows(self, connection, quest_ref, session_ref=None):
@@ -282,12 +282,13 @@ class RootSessionObservations:
                 return
             directory, invocation_hash, _phase, native = resolved
             operation = session["operations"][-1]
-            children, limited = read_child_sessions(directory, invocation_hash=invocation_hash,
+            observation = observe_child_sessions(directory, invocation_hash=invocation_hash,
                 parent_session_ref=session["session_ref"], operation_ref=operation["operation_ref"],
                 executing=operation["status"] == "executing", expected_native=native,
                 known_children=session["children"])
-            append_child_sessions(session, children)
-            session["limited"] = session["limited"] or limited
+            append_child_sessions(session, observation.children)
+            session["limited"] = session["limited"] or observation.limited
+            session["output_pending"] = session["output_pending"] or observation.pending_tail
         except Exception:
             session["limited"] = True
 
@@ -525,13 +526,14 @@ class RootSessionObservations:
                 try:
                     store, _run = self._target_store(row, operation)
                     invocation_hash, _family = store._operation_bindings[operation["operation_ref"]]
-                    children, limited = read_child_sessions(store._source_path(invocation_hash).parent,
+                    observation = observe_child_sessions(store._source_path(invocation_hash).parent,
                         invocation_hash=invocation_hash, parent_session_ref=session["session_ref"],
                         operation_ref=operation["operation_ref"], executing=public["status"] == "executing",
                         expected_native=operation.get("_native_session_ref"), known_children=session["children"],
                         provider=getattr(_run, "harness_family", _family))
-                    append_child_sessions(session, children)
-                    session["limited"] = session["limited"] or limited
+                    append_child_sessions(session, observation.children)
+                    session["limited"] = session["limited"] or observation.limited
+                    session["output_pending"] = session["output_pending"] or observation.pending_tail
                 except Exception:
                     session["limited"] = True
             session["is_executing"] = any(o["status"] == "executing" for o in session["operations"])

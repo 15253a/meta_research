@@ -19,6 +19,7 @@
 .writing-request button:disabled { opacity: .5; cursor: default; }
 .writing-request-materials { list-style: none; padding: 0; }
 .writing-request-materials li { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; margin: 8px 0; }
+.writing-request-materials li > span { min-width: 0; overflow-wrap: anywhere; }
 .writing-request-location { overflow-wrap: anywhere; color: #69665f; }
 .writing-request footer { display: flex; align-items: center; justify-content: flex-end; gap: 16px; margin-top: 20px; }
 .writing-request footer p { margin: 0; flex: 1; overflow-wrap: anywhere; color: #9a402c; }
