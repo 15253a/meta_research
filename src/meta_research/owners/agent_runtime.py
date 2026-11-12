@@ -6474,6 +6474,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._recover_completed_bundle_rolling_provider_units()
         self._recover_interrupted_provider_units()
         self._recover_daemon_stopped_stage_runs()
+        self._recover_resumed_bundle_checkpoints()
         self._recover_interrupted_acquisition()
         self._recover_interrupted_deepfetch()
 
@@ -6661,6 +6662,54 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 attempt_ref=attempt_ref,
                 fence_ref=fence_ref,
             )
+
+    def _recover_resumed_bundle_checkpoints(self) -> None:
+        """Repair only an unused successor of the former stopped-resume bug."""
+        with self._database.write() as connection:
+            controls = connection.execute(text(
+                "SELECT c.* FROM ar_run_controls c JOIN ar_stage_sessions s ON "
+                "s.session_ref=c.root_session_ref AND s.run_ref=c.run_ref "
+                "WHERE c.run_kind='bundle_stage' AND c.status='running' "
+                "AND c.safe_point_ref IS NOT NULL AND s.native_session_ref IS NULL"
+            )).all()
+            for control in controls:
+                if _prepared_control_affects_run(connection, control.run_ref):
+                    continue
+                try:
+                    recovered = _resumed_bundle_checkpoint(connection, control)
+                except (OwnerConflict, TypeError, ValueError):
+                    # Unproven or changed work remains fenced by the normal
+                    # worker checks; startup must never guess a native identity.
+                    continue
+                if recovered is None:
+                    continue
+                old, native, decisions = recovered
+                connection.execute(text(
+                    "UPDATE ar_stage_attempts SET primary_draft_json=:draft, primary_draft_hash=:hash, "
+                    "primary_adapter_kind=:adapter, primary_recorded_at=:recorded, "
+                    "primary_provider_unit_ref=:unit WHERE attempt_ref=:attempt"
+                ), {"draft": old.primary_draft_json, "hash": old.primary_draft_hash,
+                    "adapter": old.primary_adapter_kind, "recorded": old.primary_recorded_at,
+                    "unit": old.primary_provider_unit_ref, "attempt": control.attempt_ref})
+                primary = connection.execute(text("SELECT * FROM ar_stage_provider_invocations "
+                    "WHERE attempt_ref=:ref AND phase='primary'"), {"ref": old.attempt_ref}).one()
+                connection.execute(text("UPDATE ar_stage_provider_invocations SET status='completed', "
+                    "response_hash=:hash, completed_at=:completed WHERE attempt_ref=:ref AND phase='primary'"),
+                    {"hash": primary.response_hash, "completed": primary.completed_at, "ref": control.attempt_ref})
+                now = time.time()
+                connection.execute(text("UPDATE ar_stage_sessions SET native_session_ref=:native, "
+                    "updated_at=:now WHERE session_ref=:ref"),
+                    {"native": native, "now": now, "ref": control.root_session_ref})
+                connection.execute(text("UPDATE ar_run_controls SET control_revision=control_revision+1, "
+                    "updated_at=:now WHERE run_ref=:run"), {"now": now, "run": control.run_ref})
+                connection.execute(text("UPDATE agent_runtime_state SET revision=revision+1 WHERE singleton='owner'"))
+                self._feed.record(connection, "agent_runtime.stopped_bundle_checkpoint_recovered", {
+                    "run_ref": control.run_ref, "attempt_ref": control.attempt_ref,
+                    "fence_ref": control.fence_ref, "root_session_ref": control.root_session_ref,
+                    "source_attempt_ref": old.attempt_ref, "safe_point_ref": control.safe_point_ref,
+                    "native_session_ref": native, "dispatch_decision_refs": decisions,
+                    "primary_draft_hash": old.primary_draft_hash,
+                })
 
     def _recover_daemon_stopped_stage_runs(self) -> None:
         """Resume only a physically stopped Stage proven to be daemon shutdown.
@@ -10595,17 +10644,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         usage_wait = (saved is not None
                             and saved["checkpoint"].get("action") == "provider_hard_ceiling"
                             and saved["checkpoint"].get("failure", {}).get("code") == "codex_usage_limit")
+                        stopped = _stopped_stage_checkpoint(connection, row) is not None
                         row = self._replace_fenced_managed_attempt(
                             connection,
                             row,
                             now,
                             reuse_checkpoint=(
-                                usage_wait or _stage_resume_reuses_checkpoint(connection, row)
+                                usage_wait or stopped or _stage_resume_reuses_checkpoint(connection, row)
                                 if _is_formal_stage_run_kind(row.run_kind)
                                 else True
                             ),
-                            reuse_operation_refs=False if usage_wait else None,
-                            preserve_native_session=True if usage_wait else None,
+                            reuse_operation_refs=False if usage_wait or stopped else None,
+                            preserve_native_session=True if usage_wait or stopped else None,
                         )
                     next_status = "suspended" if human_wait_pending else "running"
                     cleanup_status = "none"
@@ -29308,6 +29358,189 @@ def _daemon_stopped_stage_evidence(connection, control) -> str | None:
                 + canonical_hash(proof)):
             return str(interruption.interruption_ref)
     return None
+
+
+def _resumed_bundle_checkpoint(connection, control):
+    run, current, session, fence = _load_stage_fence(connection,
+        control.run_ref, control.attempt_ref, control.fence_ref)
+    if (run.stage != "bundle" or run.status != "running" or current.status != "running"
+            or session.status != "active" or session.native_session_ref is not None
+            or fence.status != "current" or run.current_attempt_ref != current.attempt_ref
+            or run.current_fence_ref != fence.fence_ref
+            or current.root_session_ref != control.root_session_ref
+            or any(getattr(current, key) is not None for key in (
+                "primary_draft_json", "primary_draft_hash", "primary_adapter_kind", "primary_recorded_at",
+                "primary_provider_unit_ref", "submission_ref", "payload_json", "payload_hash",
+                "execution_receipt_ref", "execution_receipt_hash"))):
+        return None
+    if (connection.execute(text("SELECT 1 FROM ar_provider_units WHERE attempt_ref=:ref LIMIT 1"),
+            {"ref": current.attempt_ref}).first() is not None
+            or connection.execute(text("SELECT 1 FROM ar_execution_responsibilities WHERE attempt_ref=:ref LIMIT 1"),
+                {"ref": current.attempt_ref}).first() is not None):
+        return None
+    primary, review = _provider_invocations(connection, run, current, fence)
+    if any(item is not None and (item.status != "prepared" or item.response_hash is not None)
+           for item in (primary, review)):
+        return None
+    replacement = connection.execute(text("SELECT * FROM ar_stage_attempt_replacements "
+        "WHERE replacement_attempt_ref=:ref AND run_ref=:run"),
+        {"ref": current.attempt_ref, "run": run.run_ref}).first()
+    if replacement is None or replacement.reason_code != "runtime_fence_replaced":
+        return None
+    old = connection.execute(text("SELECT * FROM ar_stage_attempts WHERE attempt_ref=:ref"),
+        {"ref": replacement.retired_attempt_ref}).one()
+    if (old.run_ref != run.run_ref or old.root_session_ref != session.session_ref
+            or old.status != "executed" or int(old.generation) + 1 != int(current.generation)
+            or old.primary_draft_json is None or old.submission_ref is None):
+        return None
+    historical = SimpleNamespace(**{**dict(control._mapping),
+        "attempt_ref": old.attempt_ref, "fence_ref": old.fence_ref})
+    saved = _stopped_stage_checkpoint(connection, historical)
+    if saved is None:
+        return None
+    # The original formal resume must have created precisely this unused
+    # successor, and must still be the latest control on its Run.
+    operations = connection.execute(text("SELECT * FROM ar_control_operations "
+        "WHERE action='resume' AND quest_ref=:quest AND cycle_ref=:cycle AND created_at=:created"),
+        {"quest": control.quest_ref, "cycle": control.cycle_ref, "created": replacement.created_at}).all()
+    matching = []
+    for operation in operations:
+        receipt = _runtime_control_receipt(operation)
+        reservation = connection.execute(text("SELECT * FROM ar_control_reservations "
+            "WHERE operation_ref=:ref"), {"ref": operation.operation_ref}).first()
+        if (reservation is None or reservation.status != "applied" or reservation.action != "resume"
+                or connection.execute(text("SELECT 1 FROM ar_control_compensations WHERE operation_ref=:ref"),
+                    {"ref": operation.operation_ref}).first() is not None):
+            continue
+        reserved = _runtime_control_reservation_document(reservation)
+        target = decoded_object(reservation.payload_json)["target"]
+        expected_hash = canonical_hash({"issuer": AR_OWNER, "kind": "runtime_control",
+            "subject_ref": operation.operation_ref, "action": "resume", "target": target,
+            "source_stage": operation.source_stage,
+            "affected_question_refs_hash": operation.affected_question_refs_hash,
+            "affected_runs_hash": operation.affected_runs_hash, "safe_points_hash": operation.safe_points_hash})
+        if (operation.receipt_hash != expected_hash
+                or any(target.get(key) != getattr(control, key) for key in ("quest_ref", "cycle_ref", "epoch"))
+                or operation.epoch != control.epoch
+                or operation.target_scope != target.get("target_scope")
+                or operation.run_ref != target.get("run_ref")
+                or not any(all(item.get(key) == getattr(historical, key) for key in (
+                    "run_ref", "run_kind", "quest_ref", "cycle_ref", "epoch", "attempt_ref", "root_session_ref", "fence_ref"))
+                    and item.get("control_revision") == saved["checkpoint"]["control_revision"] + 1
+                    and item.get("status") == "suspended_fenced" for item in reserved["affected_runs"])):
+            continue
+        if any(all(item.get(key) == getattr(control, key) for key in (
+                "run_ref", "run_kind", "attempt_ref", "root_session_ref", "fence_ref", "safe_point_ref"))
+                and item.get("status") == "running" for item in receipt["affected_runs"]):
+            matching.append(operation)
+    if (len(matching) != 1 or int(control.control_revision) != saved["checkpoint"]["control_revision"] + 2
+            or primary.operation_ref == saved["checkpoint"]["provider_operation_ref"]):
+        return None
+    # Each technical ancestor must carry the same accepted primary. Native
+    # identity is recovered only from those ancestors' validated Owner decisions.
+    ancestors = {}
+    ancestor = old
+    while True:
+        if (ancestor.attempt_ref in ancestors or ancestor.run_ref != run.run_ref
+                or ancestor.root_session_ref != session.session_ref or ancestor.status != "executed"
+                or ancestor.primary_draft_json != old.primary_draft_json
+                or ancestor.primary_draft_hash != old.primary_draft_hash):
+            return None
+        ancestors[ancestor.attempt_ref] = ancestor
+        link = connection.execute(text("SELECT * FROM ar_stage_attempt_replacements "
+            "WHERE replacement_attempt_ref=:ref AND run_ref=:run"),
+            {"ref": ancestor.attempt_ref, "run": run.run_ref}).first()
+        if link is None:
+            break
+        if link.reason_code != "runtime_fence_replaced":
+            return None
+        previous = connection.execute(text("SELECT * FROM ar_stage_attempts WHERE attempt_ref=:ref"),
+            {"ref": link.retired_attempt_ref}).one()
+        if int(previous.generation) + 1 != int(ancestor.generation):
+            return None
+        ancestor = previous
+    decisions = []
+    for row in connection.execute(text("SELECT * FROM ar_bundle_dispatch_decisions WHERE run_ref=:run"),
+            {"run": run.run_ref}).all():
+        source = ancestors.get(row.attempt_ref)
+        if source is not None:
+            if row.fence_ref != source.fence_ref:
+                return None
+            decisions.append(_bundle_dispatch_decision(row))
+    natives = {decision.native_session_ref for decision in decisions}
+    if len(natives) != 1 or not next(iter(natives)):
+        return None
+    native = next(iter(natives))
+    retained_session = SimpleNamespace(**{**dict(session._mapping), "native_session_ref": native})
+    for source in ancestors.values():
+        execution = _attempt_execution(run, source, retained_session)
+        merged = SimpleNamespace(**{**dict(run._mapping), **dict(source._mapping),
+            "native_session_ref": native})
+        _verify_provider_execution_chain(connection, merged, execution)
+    old_fence = connection.execute(text("SELECT * FROM ar_execution_fences WHERE fence_ref=:ref"),
+        {"ref": old.fence_ref}).one()
+    old_primary, _ = _provider_invocations(connection, run, old, old_fence)
+    if primary.operation_ref == old_primary.operation_ref:
+        return None
+    return old, native, [decision.decision_ref for decision in decisions]
+
+
+def _stopped_stage_checkpoint(connection, control):
+    """Validate an accepted stopped-call boundary without authorizing its replay."""
+    if not _is_formal_stage_run_kind(control.run_kind):
+        return None
+    saved = _query_managed_safe_point(connection, control)
+    if saved is None:
+        return None
+    checkpoint = saved["checkpoint"]
+    if (checkpoint.get("action") != "provider_hard_ceiling"
+            or checkpoint.get("failure") != {"code": "codex_operation_stopped"}):
+        return None
+    expected = {"schema_ref": "meta-research/runtime-safe-point/v1",
+        "run_ref": control.run_ref, "run_kind": control.run_kind,
+        "quest_ref": control.quest_ref, "cycle_ref": control.cycle_ref,
+        "epoch": control.epoch, "attempt_ref": control.attempt_ref,
+        "root_session_ref": control.root_session_ref, "fence_ref": control.fence_ref,
+        "run_status": "running", "provider_operation_retry_permitted": False}
+    if (any(checkpoint.get(key) != value for key, value in expected.items())
+            or checkpoint.get("provider_operation_retry_permitted") is not False):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:ref"),
+        {"ref": checkpoint.get("provider_unit_ref")}).first()
+    fence = connection.execute(text("SELECT * FROM ar_execution_fences WHERE fence_ref=:ref"),
+        {"ref": control.fence_ref}).first()
+    revoked = connection.execute(text("SELECT * FROM ar_fence_revocations WHERE fence_ref=:ref"),
+        {"ref": control.fence_ref}).first()
+    if (unit is None or fence is None or revoked is None or unit.status != "revoked"
+            or (unit.run_ref, unit.attempt_ref, unit.fence_ref, unit.operation_ref,
+                _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind)) != (
+                control.run_ref, control.attempt_ref, control.fence_ref,
+                checkpoint.get("provider_operation_ref"), control.run_kind)
+            or (fence.run_ref, fence.attempt_ref, fence.status) != (
+                control.run_ref, control.attempt_ref, "rejected")
+            or (revoked.run_ref, revoked.attempt_ref, revoked.operation_ref, revoked.reason_code) != (
+                control.run_ref, control.attempt_ref, checkpoint.get("operation_ref"), "codex_operation_stopped")
+            or connection.execute(text("SELECT 1 FROM ar_provider_units WHERE run_ref=:run "
+                "AND status IN ('active','revocation_pending') LIMIT 1"), {"run": control.run_ref}).first()):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    _validated_stage_provider_hard_ceiling(unit_kind=unit.unit_kind,
+        failure_code="codex_operation_stopped", provider_exit=checkpoint.get("provider_exit"))
+    effect = _provider_runtime_effect(unit_ref=unit.unit_ref, operation_ref=unit.operation_ref,
+        run_ref=unit.run_ref, attempt_ref=unit.attempt_ref, fence_ref=unit.fence_ref,
+        claim_started_at=float(unit.started_at))
+    boundary = connection.execute(text("SELECT * FROM ar_runtime_boundary_receipts "
+        "WHERE responsibility_ref=:ref"), {"ref": effect.responsibility_ref}).first()
+    identity = {name: getattr(effect, name) for name in (
+        "responsibility_ref", "owner_scope", "root_run_ref", "attempt_ref", "fence_ref",
+        "operation_ref", "effect_kind")}
+    value = {"schema_ref": "meta-research/runtime-boundary-receipt/v1", **identity,
+        "boundary": "permanent_fence", "checkpoint_ref": None,
+        "owner_evidence_ref": "stage_provider_hard_ceiling_" + saved["checkpoint_hash"]}
+    if (boundary is None or any(boundary._mapping.get(key) != value
+            for key, value in value.items() if key not in {"schema_ref", "effect_kind"})
+            or boundary.evidence_hash != canonical_hash(value)):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    return saved
 
 
 def _stage_resume_reuses_checkpoint(connection, row) -> bool:
