@@ -9,6 +9,62 @@ const cycleNode = (timeline: Locator, cycleRef = CYCLE_REF) => timeline.locator(
 const stageSummary = (timeline: Locator, stage: string, cycleRef = CYCLE_REF) => cycleNode(timeline, cycleRef).locator(`.research-timeline-stage[data-stage="${stage}"] .research-timeline-stage-summary .timeline-summary-text`);
 const summaryNode = (timeline: Locator, key: string) => timeline.locator(`.timeline-summary[data-summary-key="${key}"]`);
 
+test("incomplete Target records preserve verified execution in the timeline without hiding uncertainty", async ({ page }) => {
+  const writes: string[] = [];
+  page.on("request", request => { if (request.method() !== "GET") writes.push(request.method()); });
+  const { timeline, catalog, errors } = await openTimeline(page, { runningBundle: true });
+  const session = catalog.sessions[0];
+  session.limited = true;
+  session.operations = [{ operation_ref: "target-turn-1", label: "执行 1", phase: "target-turn", status: "executing",
+    created_at: SOURCE_TIME, updated_at: SOURCE_TIME }];
+  catalog.limited = true;
+  catalog.reasons = [{ code: "root_session_operations_limited" }];
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const target = cycleNode(timeline).locator('.research-timeline-target[data-target-ref="target-143-a"]');
+  const status = target.locator(".research-timeline-target-state");
+  await expect(timeline).toContainText("部分工作会话暂不可确认");
+  await expect(status).toHaveText("正在执行");
+  await expect(target).toHaveAttribute("data-executing", "true");
+
+  catalog.reasons.push({ code: "root_session_index_part_unavailable" });
+  await expect(status).toHaveText("状态待确认");
+  await expect(target).toHaveAttribute("data-executing", "false");
+  catalog.reasons = [{ code: "root_session_operations_limited" }];
+  session.operations[0].status = "waiting";
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(status).toHaveText("状态待确认");
+  session.operations[0].status = "executing";
+  await expect(status).toHaveText("正在执行");
+  await expect(timeline).toContainText("部分工作会话暂不可确认");
+  expect(errors).toEqual([]); expect(writes).toEqual([]);
+});
+
+test("timeline execution remains unknown after failed session reads or stale runtime status", async ({ page }) => {
+  const { timeline, snapshot, runtime, errors } = await openTimeline(page, { runningBundle: true });
+  const target = cycleNode(timeline).locator('.research-timeline-target[data-target-ref="target-143-a"]');
+  const status = target.locator(".research-timeline-target-state");
+  await expect(status).toHaveText("正在执行");
+  const rootRoute = `**/api/v1/quests/${QUEST_REF}/root-sessions`;
+  await page.route(rootRoute, route => route.fulfill({ status: 503, contentType: "application/json", body: "{}" }));
+  await expect(status).toHaveText("状态待确认");
+  await expect(target).toHaveAttribute("data-executing", "false");
+  await page.unroute(rootRoute);
+  await expect(status).toHaveText("正在执行");
+
+  const observedAt = new Date().toISOString();
+  runtime.status = { schema_ref: "meta-research/runtime-status/v1", revision: snapshot.revision + 1,
+    observed_at: observedAt, updated_at: observedAt, state: "paused",
+    current_task: { kind: "target", title: "pilot_subject_level_eeg", run_ref: "target-run-143-a", target_ref: "target-143-a", status: "paused" },
+    waiting_reason: null, pending_requests: 0,
+    foreground: { ...snapshot.research_control.foreground, status: "paused", grant_status: "suspended" },
+    health: { status: "ready", checks: [] } };
+  await expect(status).toHaveText("已暂停");
+  await page.route("**/api/v1/status", route => route.fulfill({ status: 503, contentType: "application/json", body: "{}" }));
+  await expect(status).toHaveText("状态待确认");
+  await expect(target).toHaveAttribute("data-executing", "false");
+  expect(errors).toEqual([]);
+});
+
 test("timeline browsing includes formal Questions without Cycles and other Quests without changing foreground", async ({ page }) => {
   const { timeline, snapshot, history } = await openTimeline(page);
   const foreground = JSON.stringify(snapshot.research_control.foreground);

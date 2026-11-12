@@ -562,7 +562,8 @@ type TimelineProps = {
   onOpenOutput: (historical: boolean) => void;
 };
 
-function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, sessions: RootSession[], recordedNodes: TimelineSummaryNode[], unavailable: boolean, paused: boolean) {
+function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, roots: RootConversationsModel | undefined, recordedNodes: TimelineSummaryNode[], paused: boolean) {
+  const sessions = roots?.sessions ?? [];
   const unique = new Map<string, RootSession>();
   const prefer = (candidate: RootSession, previous: RootSession) =>
     Number(previous.activity_label === "已由新会话接续") - Number(candidate.activity_label === "已由新会话接续")
@@ -591,6 +592,8 @@ function timelineTargets(snapshot: PublicSnapshot, cycle: OverviewCycle, session
     const target = graph.find(item => item.target_ref === ref);
     const session = unique.get(ref);
     const currentSession = session && (!target?.target_run_ref || target.target_run_ref === session.run_ref) ? session : undefined;
+    const unavailable = Boolean(roots?.error || roots?.context.stale || (currentSession
+      ? rootSessionStatusUncertain(roots?.data, currentSession) : roots?.data?.limited));
     const label = session?.short_title || `Target ${index + 1}`;
     const commit = target && bundle?.target_commits.find(item => item.target_ref === ref && item.target_spec_hash === target.spec_hash
       && (!target.target_run_ref || item.target_run_ref === target.target_run_ref));
@@ -716,7 +719,7 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
           const artifacts = [...(cycle.stages[stage] ?? [])].sort((a, b) => a.epoch - b.epoch);
           return { stage, artifacts, latest: artifacts.at(-1) ?? null };
         });
-        const targets = timelineTargets(snapshot, cycle, sessions, Object.values(summaries.nodes), sessionsUnavailable, isCurrent && paused);
+        const targets = timelineTargets(snapshot, cycle, roots, Object.values(summaries.nodes), isCurrent && paused);
         return <li key={cycle.cycle_ref} className="research-timeline-cycle" data-cycle-ref={cycle.cycle_ref} data-current={isCurrent}>
           <BoundedDetails className="research-timeline-cycle-details" defaultOpen={isCurrent} summary={<>
             <span className="research-timeline-cycle-name">{isCurrent ? <MetaTrace variant="timeline" active={isLiveQuest && motion.active} /> : null}{cycle.ordinal ? `第 ${cycle.ordinal} 轮研究` : "研究轮次待确认"}<i className="research-timeline-chevron" aria-hidden="true">▸</i></span>
