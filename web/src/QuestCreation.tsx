@@ -1191,6 +1191,8 @@ export function QuestCreationWorkbench({
             ? confirmationIsCurrent(view)
             : true;
         },
+        // This is observation of the accepted turn, not a deadline for its work.
+        null,
       );
       if (!operationIsCurrent("intent", token)) return;
       applyView(next);
@@ -1840,9 +1842,10 @@ export function QuestCreationWorkbench({
                               field.required ? "core" : "",
                             ].filter(Boolean).join(" ")}
                             key={field.key}
+                            data-field={field.code}
                           >
                             <span className="seed-field-head">
-                              <code>{field.code}</code>
+                              <span>{field.label}</span>
                               <em className={field.required ? "required" : undefined}>
                                 {field.required ? "必填" : "可选"}
                               </em>
