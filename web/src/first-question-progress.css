@@ -16,6 +16,10 @@
 .first-question-stage-meter [data-state="current"] i::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, #ffffffb0, transparent); animation: first-question-scan 2s ease-in-out infinite; }
 .first-question-progress > p { margin: 16px 0 12px; color: #817b96; font-size: 11px; line-height: 1.8; }
 .first-question-progress.is-failed h3 { color: #a05d51; }
+.first-question-failure { margin: 12px 0; color: #a05d51; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.first-question-failure p { margin: 0 0 6px; }
+.first-question-failure details { color: #817b96; font-size: 11px; }
+.first-question-failure summary { cursor: pointer; }
 .first-question-activity { border: 1px solid #e7e4f0; border-radius: 11px; background: #fff; overflow: hidden; min-width: 0; }
 .first-question-activity > header { display: flex; align-items: center; justify-content: space-between; padding: 11px 14px; border-bottom: 1px solid #eeebf4; color: #615a7d; font-size: 11px; }
 .first-question-activity > header span { color: #948da7; font-size: 10px; }

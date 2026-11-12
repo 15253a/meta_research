@@ -5500,6 +5500,10 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             return self.query_quest_creation(initialization_id)
         assert preflight_draft is not None
         self._verify_material_bindings(preflight_draft)
+        _require_draft_cas(preflight_row, expected_draft_hash, expected_draft_revision)
+        cleanup = getattr(self._proposal_drafter, "close_failed_initialization_work", None)
+        if callable(cleanup):
+            cleanup(initialization_id, int(preflight_row.draft_revision), str(preflight_row.draft_hash))
         with self._database.write() as connection:
             replay = self._query_command(
                 connection, idempotency_key, "generate_proposal", request_hash

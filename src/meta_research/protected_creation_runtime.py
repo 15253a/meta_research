@@ -61,12 +61,15 @@ def boundary():
     os.setgid(65534)
     os.setuid(65534)
 
-def receipt(status, code, ended, error=None):
+def receipt(status, code, ended, error=None, mechanism=None):
     path = configuration["receipt"]
     temporary = path + ".new"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         json.dump({"status": status, "returncode": code, "descendants_ended": ended,
+            "process_tree": ({"schema_ref": "meta-research/provider-process-tree/v1",
+                "state": "closed", "mechanism": mechanism, **configuration["host_identity"]}
+                if ended and mechanism is not None else None),
             "error_type": type(error).__name__ if error else None,
             "error_errno": getattr(error, "errno", None)}, stream)
         stream.flush()
@@ -119,7 +122,7 @@ try:
         stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, close_fds=True,
         start_new_session=True, preexec_fn=boundary)
 except BaseException as error:
-    receipt("launch_failed", 125, True, error)
+    receipt("launch_failed", 125, True, error, mechanism="not-started")
     sys.exit(125)
 
 returncode = None
@@ -140,7 +143,8 @@ while True:
         if returncode is None or proof_failed:
             receipt("unknown_outcome", returncode, False)
             sys.exit(125)
-        receipt("stopped" if stopping else "completed", returncode, True)
+        receipt("stopped" if stopping else "completed", returncode, True,
+            mechanism="linux-subreaper-echild")
         sys.exit(0)
     if stopping or returncode is not None:
         try:
@@ -175,6 +179,14 @@ class ProtectedCreationError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class ProtectedCreationCompletedProcess(subprocess.CompletedProcess[str]):
+    """Native output accompanied by this call's verified helper closure."""
+
+    def __init__(self, args, returncode, stdout, stderr, *, process_tree):
+        super().__init__(args, returncode, stdout, stderr)
+        self.process_tree = process_tree
 
 
 class ProtectedCreationRuntime:
@@ -215,8 +227,10 @@ class ProtectedCreationRuntime:
                 arguments, environment, outputs, prompt = self._prepare_call(call)
                 launch = self._control / ("launch-" + secrets.token_hex(12) + ".json")
                 receipt = launch.with_suffix(".receipt.json")
+                from meta_research.provider_supervisor import supervisor_host_identity
                 _write_private(launch, json.dumps({"jail": str(self.jail_root),
-                    "argv": arguments, "environment": environment, "receipt": str(receipt)}).encode())
+                    "argv": arguments, "environment": environment, "receipt": str(receipt),
+                    "host_identity": supervisor_host_identity()}).encode())
                 with self._state:
                     if self._stop_before_launch:
                         return self._cancelled_call(call)
@@ -238,7 +252,7 @@ class ProtectedCreationRuntime:
                     raise ProtectedCreationError("protected_creation_launch_failed")
                 for source, destination in outputs:
                     self._publish_output(source, destination)
-                return subprocess.CompletedProcess(call.argv, int(outcome["returncode"]), stdout, stderr)
+                return self._completed_process(call, outcome, stdout, stderr)
         finally:
             with self._state:
                 self._starting = False
@@ -319,13 +333,33 @@ class ProtectedCreationRuntime:
         return stdout, stderr
 
     def _cancelled_call(self, call: NativeCreationCall) -> subprocess.CompletedProcess[str]:
+        from meta_research.provider_supervisor import supervisor_host_identity
+
         receipt = self._control / ("cancel-" + secrets.token_hex(12) + ".receipt.json")
-        _write_private(receipt, json.dumps({"status": "stopped", "returncode": -signal.SIGTERM,
-            "descendants_ended": True}).encode())
+        outcome = {"status": "stopped", "returncode": -signal.SIGTERM, "descendants_ended": True,
+            "process_tree": {"schema_ref": "meta-research/provider-process-tree/v1", "state": "closed",
+                "mechanism": "not-started", **supervisor_host_identity()}}
+        _write_private(receipt, json.dumps(outcome).encode())
         _replace_private(self._control / "active.json", json.dumps({"receipt": receipt.name}).encode(), 0o600)
         self._receipt = receipt
         self._process = None
-        return subprocess.CompletedProcess(call.argv, -signal.SIGTERM, "", "")
+        return self._completed_process(call, outcome, "", "")
+
+    @staticmethod
+    def _completed_process(call, outcome, stdout, stderr):
+        from meta_research.provider_supervisor import (
+            ProviderSupervisorError, supervisor_host_identity, verify_process_tree_closed,
+        )
+
+        proof = outcome.get("process_tree")
+        try:
+            verify_process_tree_closed(proof)
+            if any(proof[name] != value for name, value in supervisor_host_identity().items()):
+                raise ProviderSupervisorError("provider_process_tree_proof_invalid")
+        except ProviderSupervisorError as error:
+            raise ProtectedCreationError("protected_creation_unknown_outcome") from error
+        return ProtectedCreationCompletedProcess(call.argv, int(outcome["returncode"]), stdout, stderr,
+            process_tree=dict(proof))
 
     def request_stop(self) -> dict[str, object]:
         with self._state:

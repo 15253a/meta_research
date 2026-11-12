@@ -93,6 +93,10 @@ class CodexCompanionAdapter(
     def capability_profile(self) -> RootCapabilityProfile:
         return root_capability_profile("companion")
 
+    def close_failed_initialization_work(self, initialization_id, draft_revision, draft_hash):
+        from meta_research.creation_failure_cleanup import close_failed_initialization_work
+        close_failed_initialization_work(self, initialization_id, draft_revision, draft_hash)
+
     @resource_preparation
     def runtime_binding(self):
         binding = super().runtime_binding()
@@ -200,6 +204,15 @@ class CodexCompanionAdapter(
             if unknown:
                 raise IdeaSkillUnavailable("protected_creation_unknown_outcome") from error
             raise IdeaSkillUnavailable(error.code) from error
+        except Exception as error:
+            # A transport/programming error still owns the granted material
+            # channel. Close only after the exact runtime proves its tree ended.
+            outcome = work.request_stop()
+            unknown = not outcome["descendants_ended"]
+            work.fail(unknown_outcome=unknown)
+            if unknown:
+                raise IdeaSkillUnavailable("protected_creation_unknown_outcome") from error
+            raise
         finally:
             outcome = work.request_stop()
             with self._creation_call_lock:

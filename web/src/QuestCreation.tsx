@@ -1092,7 +1092,7 @@ export function QuestCreationWorkbench({
       const generationPoll = pollCreation(
         queued.initialization_id,
         proposalGenerationSettled,
-        draftRef.current.route === "deepfetch" ? null : 190_000,
+        null,
       );
       recoveryPollRef.current = {
         initializationId: queued.initialization_id,
@@ -1111,8 +1111,6 @@ export function QuestCreationWorkbench({
       const nextGeneration = currentProposalGeneration(next);
       const nextDeepFetch = currentDeepFetch(next);
       if (
-        nextGeneration?.status === "capability_unavailable" ||
-        nextGeneration?.status === "failed" ||
         nextDeepFetch?.status === "failed" ||
         nextDeepFetch?.status === "cancelled"
       ) {
@@ -1121,7 +1119,9 @@ export function QuestCreationWorkbench({
           nextGeneration?.failure?.code ??
           "proposal_drafter_unavailable",
         ));
-      } else {
+      } else if (nextGeneration?.status !== "capability_unavailable" && nextGeneration?.status !== "failed") {
+        // Generation failures are rendered from the durable projection, so they
+        // remain visible after closing/reopening without a second local alert.
         restoreTriggerFocus = true;
       }
     } catch (caught) {

@@ -230,3 +230,49 @@ def test_prelaunch_cancellation_is_applied_to_understanding_suboperation(tmp_pat
             assert source.read_text() == "original16"
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("tree_closed", [True, False])
+def test_unexpected_transport_error_revokes_material_scope_without_claiming_unknown_tree(tmp_path, monkeypatch, tree_closed):
+    from sqlalchemy import text
+
+    source = tmp_path / "original.txt"
+    source.write_text("original16")
+    runtime = _make(tmp_path / "runtime")
+    try:
+        with TestClient(create_app(runtime, base_url="http://testserver", control_key="control")) as client:
+            anchor, binding, _ = _open(client, runtime, source, "transport-error")
+            roots = runtime.root_workspaces
+            roots.configure_creation_runtime(executable="/bin/bash", credentials_home=tmp_path / "credentials")
+            adapter = CodexCompanionAdapter(tmp_path / "adapter", executable="/bin/bash")
+            adapter.bind_workspaces(roots)
+            captured = {}
+
+            def fail_transport(**arguments):
+                work = arguments["invocation_runner"].work
+                captured.update(work=work, token=arguments["mcp_token"])
+                if not tree_closed:
+                    monkeypatch.setattr(work, "request_stop", lambda: {
+                        "status": "unknown_outcome", "descendants_ended": False})
+                raise ValueError("controlled unexpected transport failure")
+
+            monkeypatch.setattr(adapter, "_invoke", fail_transport)
+            inputs = runtime.owners.human_collaboration.creation_material_snapshot(anchor)
+            request = InitializationUnderstandingRequest(anchor.ref, anchor.draft_revision, anchor.draft_hash,
+                {}, empty_manifest(), "transport-error:understanding", binding.location.root_session_ref, None, inputs=inputs)
+            expected = ValueError if tree_closed else DraftingUnavailable
+            detail = "controlled unexpected transport failure" if tree_closed else "protected_creation_unknown_outcome"
+            with pytest.raises(expected, match=detail):
+                adapter.understand_initialization(request)
+            with runtime.owners.human_collaboration._database.read() as connection:
+                state = connection.execute(text("SELECT state FROM hc_creation_material_operations WHERE operation_ref=:ref"),
+                    {"ref": request.job_ref}).scalar_one()
+            assert state == ("failed" if tree_closed else "unknown_outcome")
+            assert captured["work"]._token is None
+            assert not roots._creation_channels
+            status, _ = roots._creation_gateway.dispatch(captured["token"],
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            assert status == 401
+            assert (request.job_ref in adapter._creation_calls) is not tree_closed
+    finally:
+        runtime.close()

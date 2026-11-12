@@ -25,6 +25,18 @@ export function preparationReconciliationCopy(deepfetch: QuestCreationView["deep
     : "运行是否结束尚未确认，请等待核对后再重试。";
 }
 
+function generationFailureCopy(code: string) {
+  const messages: Record<string, string> = {
+    proposal_output_invalid: "系统未能完成本次准备结果的接纳，尚未形成可确认的问题草稿。",
+    protected_creation_input_linked: "资料读取保护检查未通过，请先检查运行环境后再重试。",
+    protected_creation_launch_failed: "资料准备环境未能启动，请检查运行环境后再重试。",
+    codex_cli_unavailable: "起草服务暂时不可用，请在服务恢复后重试。",
+    proposal_drafter_unavailable: "起草服务暂时不可用，请在服务恢复后重试。",
+    codex_cli_failed: "本次起草调用未完成，请查看运行记录后再重试。",
+  };
+  return messages[code] ?? "本次准备未能完成，请根据运行记录和原因代码检查后再重试。";
+}
+
 export function FirstQuestionProgress({ creation, pending, enabled, children }: {
   creation: QuestCreationView; pending: boolean; enabled: boolean; children: ReactNode;
 }) {
@@ -40,6 +52,7 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
   const currentBasis = basis?.freshness === "current";
   const ready = Boolean(creation.proposal?.status === "current" && generation?.status === "succeeded");
   const failed = generation?.status === "failed" || generation?.status === "capability_unavailable" || deepfetch?.status === "failed";
+  const generationFailure = generation?.status === "failed" || generation?.status === "capability_unavailable" ? generation.failure : null;
   const preparationBlocked = preparationRetryBlocked(deepfetch);
   const cancelled = deepfetch?.status === "cancelled" || creation.status === "cancelled";
   const stale = creation.status === "proposal_stale" || creation.proposal?.status === "stale" || basis?.freshness === "stale" || deepfetch?.freshness === "stale";
@@ -82,6 +95,10 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
         aria-current={active && index === firstGap ? "step" : undefined}><i aria-hidden="true" /><b>{step.label}</b><small>{step.skipped ? "已跳过" : step.done ? "已就绪" : index === firstGap && active ? "进行中" : "待完成"}</small></div>)}
     </div>
     <p>{preparationBlocked ? preparationReconciliationCopy(deepfetch) : failed ? "本次运行已结束，目标、材料和已有草稿仍保留。可以重新生成第一问。" : stale ? "保留此前的活动记录；更新依据后重新生成第一问。" : ready ? "检查下面的问题草稿，确认前仍可修改。" : "下面持续显示实际运行活动；没有新事件时会等待下一次输出。"}</p>
+    {generationFailure ? <div className="first-question-failure" role="alert">
+      <p>{generationFailureCopy(generationFailure.code)}</p>
+      <details key={`${generation?.ref}:${generationFailure.code}`}><summary>查看原因代码</summary><code>{generationFailure.code}</code></details>
+    </div> : null}
     {children}
     {generation ? <ProposalOutput key={generation.ref} initializationId={creation.initialization_id} generationRef={generation.ref}
       status={generation.status} enabled={enabled} onPhase={observePhase} /> : null}

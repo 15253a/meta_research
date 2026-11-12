@@ -2772,6 +2772,7 @@ class CodexIdeaSkillAdapter:
                         invocation_hash=invocation_hash,
                         returncode=completed.returncode,
                         input_bytes=len(prompt.encode("utf-8")),
+                        process_tree=getattr(completed, "process_tree", None),
                     )
                 exit_marker = _write_exit_marker(
                     directory,
