@@ -360,7 +360,7 @@ def test_extension_handoff_preserves_requested_time_and_original_budget_observat
             sections = {section["key"]: section["paragraphs"] for section in result.json()["sections"]}
             text = "\n".join(sections["research_time"])
             assert "申请额外 1 小时" in text
-            assert "已批准总时长：168 小时" in text
+            assert "建议总时长：168 小时" in text
             assert "已用：1 分钟" in text
             assert "等待回复仍计时" in text
             assert runtime.owners.agent_runtime.query_human_request(request["request_ref"]) == request

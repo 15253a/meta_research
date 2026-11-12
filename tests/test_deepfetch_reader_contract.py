@@ -78,3 +78,16 @@ def test_discovery_cutoff_drains_frozen_inflight_targets_without_promoting_backu
         "--freeze-paper-id", ids[3], ok=False)
     intake.write_text(json.dumps({"title": "Late candidate", "doi": "10.1000/late"}))
     assert "cannot add new candidates" in run(out, "upsert", "--input", str(intake), ok=False)
+
+
+def test_search_budget_overrun_is_recorded_without_freezing_discovery(tmp_path):
+    out = tmp_path / "output"
+    run(out, "init", "--topic", "Continue valuable discovery", "--intensity", "low")
+    for elapsed in (480, 600):
+        observed = run(out, "update-run", "--elapsed", str(elapsed))
+        assert observed["active_search_elapsed_seconds"] == elapsed
+        intake = tmp_path / f"intake-{elapsed}.json"
+        intake.write_text(json.dumps({"title": f"New evidence {elapsed}", "doi": f"10.1000/value{elapsed}"}))
+        assert len(run(out, "upsert", "--input", str(intake))["upserted"]) == 1
+    assert run(out, "validate")["valid"] is True
+    assert "cannot decrease" in run(out, "update-run", "--elapsed", "599", ok=False)

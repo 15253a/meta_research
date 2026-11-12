@@ -103,7 +103,7 @@ const requestCopy: Record<HumanRequestItem["kind"], {
     draftPlaceholder: "询问错误背景或确认将重试哪个操作……",
   },
   research_time_extension: {
-    list: "研究延时", draftLabel: "就延长研究时间发消息",
+    list: "预算调整", draftLabel: "就研究预算调整发消息",
     draftPlaceholder: "了解尚缺工作、预计耗时和不延长时可交付的内容……",
   },
 };
@@ -2476,7 +2476,7 @@ function HumanRequestView({
         )}
       </header>
       <nav className="hc-kind-navigation" aria-label="求助类别">
-        {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助", "研究延时"] as const).map((label, index) => {
+        {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助", "预算调整"] as const).map((label, index) => {
           const kind = (Object.keys(requestCopy) as HumanRequestItem["kind"][])[index];
           const sameKind = requests.filter(item => item.kind === kind);
           const next = sameKind.find(item => item.status === "open") ?? sameKind[0];
@@ -3314,7 +3314,7 @@ function RequestIntro({ children }: { children: ReactNode }) {
 
 function TimeExtensionReceipt({ request }: { request: HumanRequestItem }) {
   const latest = request.responses?.at(-1);
-  if (!latest) return <p>延时申请中，当前仍使用原已批准额度。</p>;
+  if (!latest) return <p>预算调整请求待处理，当前规划参考保持不变；预算本身不限制继续研究。</p>;
   const approval = isRecord(latest.time_budget_approval) ? latest.time_budget_approval : null;
   const resumed = request.direct_waiters?.some(waiter => waiter.resume_validation?.consumption != null);
   return <section aria-label="延时处理结果">
@@ -3344,8 +3344,8 @@ function TimeExtensionForm({ request, note, setNote, submit, disabled }: {
     && (!correct || mode !== "unlimited" && /^\d+(?:\.\d{1,2})?$/.test(remaining)
       && Number.isSafeInteger(remainingSeconds) && remainingSeconds >= 0 && reason.trim().length > 0);
   return <section aria-label="正式决定研究延时">
-    <p>请选择你同意增加的研究时间。助手建议、普通说明和暂缓决定均不增加额度。</p>
-    <label>批准额度方式<select value={mode} disabled={disabled}
+    <p>选择新的规划参考并保留已用时间；达到、超出或暂不能准确核定预算本身不要求停止研究或申请延期。</p>
+    <label>调整预算方式<select value={mode} disabled={disabled}
       onChange={event => setMode(event.currentTarget.value as typeof mode)}>
       <option value="additional">增加时长</option><option value="total">设置新的总时长</option><option value="unlimited">不设固定截止</option>
     </select></label>

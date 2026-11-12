@@ -25,9 +25,17 @@ def test_target_unknown_outcome_before_transport_keeps_first_budget_observation(
         "meta_research.harness.render_runtime_conditions", lambda *_args, **_scope: observations[0],
     )
     invoke = CodexHarnessAdapter.invoke
+    invoke_terminal = CodexHarnessAdapter.invoke_terminal
+    original_invocations = []
+    reconciliations = []
 
     def lost_before_transport(_adapter, _invocation):
+        original_invocations.append(_invocation)
         raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
+
+    def read_original_terminal(adapter, invocation):
+        reconciliations.append(invocation)
+        return invoke_terminal(adapter, invocation)
 
     monkeypatch.setattr(CodexHarnessAdapter, "invoke", lost_before_transport)
     _database, owner, target, runner, runtime = request.getfixturevalue("interrupted_root")
@@ -35,6 +43,7 @@ def test_target_unknown_outcome_before_transport_keeps_first_budget_observation(
     assert runner.calls == 0
     observations[0] = "Quest shared budget: used=35; remaining=25; observed_at=1025; revision=initial"
     monkeypatch.setattr(CodexHarnessAdapter, "invoke", invoke)
+    monkeypatch.setattr(CodexHarnessAdapter, "invoke_terminal", read_original_terminal)
 
     with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
         runtime().run_or_resume_target_root(
@@ -46,8 +55,19 @@ def test_target_unknown_outcome_before_transport_keeps_first_budget_observation(
     assert recovered.operation_ref == original.operation_ref
     assert recovered.invocation_hash == original.invocation_hash
     assert recovered.generation == 1
-    assert runner.calls == 1
-    conditions, business = split_runtime_prompt(runner.request_path.with_name("prompt.txt").read_text())
+    assert recovered.status == "unknown_outcome"
+    assert recovered.reconciliation_generation == 1
+    assert len(reconciliations) == 1
+    retained = reconciliations[0]
+    assert retained.entry_path == "recovery"
+    assert retained.provider_operation_ref == original.operation_ref
+    assert retained.owner_invocation_hash == original.invocation_hash
+    assert retained.prompt == original_invocations[0].prompt
+    # An unknown outcome without its signed receipt cannot authorize another
+    # physical call just to reconstruct the spool or refresh the observation.
+    assert runner.calls == 0
+    assert runner.request_path is None
+    conditions, business = split_runtime_prompt(retained.prompt)
     assert conditions == "Quest shared budget: used=10; remaining=50; observed_at=1000; revision=initial"
     assert business == "Original frozen Target work."
 
@@ -85,6 +105,7 @@ def test_research_provider_observes_shared_clock_at_new_operation_only(tmp_path,
         assert first_snapshot == ae.query_research_time(accepted["quest_ref"])
         assert first_snapshot["used_seconds"] == 60.0
         assert first_snapshot["remaining_seconds"] == 2591940.0
+        assert first_snapshot["budget_policy"] == "advisory"
 
         now[0] = 1120.0
         assert invoke("clock:first") == first
@@ -96,7 +117,58 @@ def test_research_provider_observes_shared_clock_at_new_operation_only(tmp_path,
         assert next_snapshot["remaining_seconds"] == 2591880.0
         assert next_snapshot["budget_revision"] == first_snapshot["budget_revision"]
         assert next_snapshot["observed_at"] == 1120.0
+        assert next_snapshot["budget_policy"] == "advisory"
+        assert "1200 秒" in next_conditions
+        assert "不强制停止、收口或先申请延期" in next_conditions
         assert next_business == business
+    finally:
+        runtime.close()
+
+
+def test_bundle_old_budget_prompt_reconciles_unchanged_then_new_resume_gets_advisory_policy(tmp_path, monkeypatch):
+    from meta_research.owners.common import canonical_hash
+
+    monkeypatch.setattr("time.time", lambda: 1000.0)
+    data = prepare_data_root(tmp_path / "policy-refresh")
+    runtime = _runtime(data, _IdeaProvider())
+    try:
+        runtime.owners.advancement_engine.start_research_time_service()
+        _confirm_question_with_prefix(runtime, "old-policy")
+        runtime.idea_stage.start("old-policy-start")
+        run = runtime.idea_stage.query_current()["run"]
+        runner = _SignedRunner()
+        workspace = data.root / "bundle-policy-provider"
+        adapter = CodexBundleSkillAdapter(workspace, executable=sys.executable, process_runner=runner)
+
+        def invoke(job, native=None):
+            return adapter._invoke_root_operation(
+                operation_name="primary", prompt="Keep original work and evidence.",
+                schema={"type": "object", "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"], "additionalProperties": False},
+                native_session_ref=native, job_ref=job, run_ref=run["run_ref"],
+                attempt_ref=None, root_session_ref=run["root_session_ref"], fence_ref=None,
+            )
+
+        old_conditions = 'Historical budget policy: extension first.\n{"research_time":{"approved_seconds":14400}}'
+        with monkeypatch.context() as old_release:
+            old_release.setattr("meta_research.idea_skill.render_runtime_conditions", lambda *_args, **_kwargs: old_conditions)
+            first = invoke("old-budget-operation")
+        directory = workspace / "provider-operations" / canonical_hash({"job_ref": "old-budget-operation"}) / "primary"
+        original_files = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+        assert invoke("old-budget-operation") == first
+        assert len(runner.calls) == 1
+        assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == original_files
+        assert split_runtime_prompt(runner.calls[0][1])[0] == old_conditions
+        invoke("new-budget-decision", first[1])
+        assert len(runner.calls) == 2
+        current, business = split_runtime_prompt(runner.calls[1][1])
+        assert json.loads(current.splitlines()[-1])["research_time"]["budget_policy"] == "advisory"
+        assert "新决策使用当前建议预算语义" in current
+        assert "1200 秒" in current
+        assert "extension first" not in current
+        assert business == "Keep original work and evidence."
+        invocation = json.loads((directory.parent.parent / canonical_hash({"job_ref": "new-budget-decision"}) / "primary" / "invocation.json").read_text())
+        assert invocation["payload"]["native_session_ref"] == first[1]
     finally:
         runtime.close()
 
@@ -125,6 +197,7 @@ def test_budget_reader_uses_authenticated_root_scope_and_live_owner_clock(tmp_pa
                                 arguments={}, request_id=2)
             assert result["isError"] is False
             assert result["structuredContent"] == ae.query_research_time(quest)
+            assert result["structuredContent"]["budget_policy"] == "advisory"
             contract = _tool_call(client, headers, operation_id="tools.contracts.read",
                 arguments={"operation_id": "advancement_engine.research_time.read"}, request_id=20)
             schema = contract["structuredContent"]["outputSchema"]

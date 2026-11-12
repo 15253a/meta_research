@@ -2920,12 +2920,9 @@ function resourceEnvelopeCopy(creation: QuestCreationView): string {
   const devices = envelope.selected_device_uuids
     .map((uuid) => devicesByUuid.get(uuid) ?? uuid)
     .join("、");
-  const ceiling = envelope.hard_ceiling.seconds === null
-    ? "未设时限"
-    : `${envelope.hard_ceiling.seconds.toLocaleString("zh-CN")} 秒上限`;
   return `已绑定 ${envelope.selected_device_uuids.length} 张实际检测设备。` +
-    `时间预算 ${timeBudgetLabel(envelope.time_budget)} · ${ceiling} · ${devices || "未选设备"}；` +
-    `实际使用情况将在作业运行后记录。`;
+    `建议时间预算 ${timeBudgetLabel(envelope.time_budget)} · ${devices || "未选设备"}；` +
+    `实际用时和偏差将在工作中记录，预算不作为自动截止时间。`;
 }
 
 function formatMemory(memoryTotalMib: number): string {

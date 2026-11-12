@@ -364,6 +364,21 @@ class BundleStageWorker:
             if managed["status"] == "suspended" and managed.get("terminal_reason") == "human_request_wait":
                 self._observation = BundleObservation("waiting", "human_request_wait")
             return False
+        if managed is not None and managed["status"] == "running" and managed.get("cleanup_status") == "completed":
+            provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+            current_binding = self._current_runtime_binding(provider)
+            if current_binding is not None and not bundle_bindings_compatible(run.runtime_binding, current_binding):
+                from meta_research.bundle_runtime_refresh import refresh_bundle_runtime
+                try:
+                    refreshed = refresh_bundle_runtime(self._agent_runtime, run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, runtime_binding=current_binding,
+                        harness_authority=self._harnesses)
+                except OwnerConflict as error:
+                    self._observation = BundleObservation("failure", error.code)
+                    return False
+                if refreshed:
+                    self._observation = BundleObservation("ready")
+                    return True
         if run.status in {"running", "awaiting_acceptance"}:
             self._drain_bundle_inbox(run)
         if _bundle_primary_output_kind(run) == "exhaustion_assessment":
@@ -924,14 +939,6 @@ class BundleStageWorker:
                             return False
                         if selected in input_errors:
                             raise BundleSkillContractError(input_errors[selected])
-                        # This completed turn is a safe decision boundary. Keep
-                        # its original input/result, but return an unusable
-                        # dispatch through the existing same-root correction
-                        # path instead of persisting an endlessly retried launch.
-                        constraint = research_time_work_constraint(
-                            self._advancement_engine.query_research_time(graph.quest_ref))
-                        if constraint["status"] != "available":
-                            raise BundleSkillContractError("quest_time_budget_" + constraint["status"])
                 except BundleSkillUnavailable as error:
                     error = self._recover_stopped_error(error, run.run_ref)
                     if error.code == "codex_operation_reconciliation_pending":

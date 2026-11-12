@@ -411,10 +411,12 @@ def _research_time_operation(advancement_engine, agent_runtime):
             "Read the authenticated root's current shared Quest research time before a new work decision, "
             "after a long call or a human reply. Seconds are Quest elapsed effective time, shared by parallel "
             "agents and cumulative across Cycles. Human pause and service downtime are excluded; HumanRequest "
-            "waiting counts. Returns approved, used, remaining/overrun, accuracy, observation time and budget "
+            "waiting counts. Returns the planning budget, used, remaining/overrun, accuracy, observation time and budget "
             "revision. Unlimited or unknown amounts are null, never a false zero. An observation is not a new "
-            "scientific input or permission to replay effects. If time is insufficient, use human_request.open "
-            "with request_kind=research_time_extension and the current revision; ordinary replies do not approve time."
+            "scientific input or permission to replay effects. Budgets and Agent-planned stage times are advisory: "
+            "reaching, exceeding or being unable to measure them does not block scheduling, acceptance, handoff or "
+            "successor work and does not require an extension first. Record deviations and adjust work by research value "
+            "within actual resource and permission boundaries. research_time_extension is optional planning collaboration."
         ),
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         output_schema=_research_time_schema(),
@@ -457,6 +459,7 @@ def _research_time_schema():
         "status": {"type": "string", "enum": ["not_started", "running", "paused", "stopped", "completed"]},
         "unknown_intervals": {"type": "array", "items": interval},
         "budget_kind": {"type": "string", "enum": ["finite", "unlimited"]},
+        "budget_policy": {"type": "string", "const": "advisory"},
         "shared": {"type": "boolean", "const": True}, "clock_policy": _string(),
         "measurement_basis": {"type": "string", "enum": ["recorded_intervals", "human_confirmation"]},
         "accounting_corrections": {"type": "array", "items": correction},
@@ -1216,9 +1219,9 @@ def _root_agent_human_request_operations(
                 "problem 说明困难或缺少条件，requested_delivery 说明应交付内容；impact 与 safe_response 说明后续影响和本请求页面回传方式。"
                 "这些发起时事实与当前请求修订一起保存，页面与 Markdown/HTML/PDF 共用；导出不补造尝试，不自动提交答复，也不启动助手。"
                 "acceptance_conditions 提供 1–32 条非空、去除首尾空格后互不重复的条件。"
-                "research_time_extension 仅供五个研究根申请研究延时：先读取 advancement_engine.research_time.read，"
+                "research_time_extension 供五个研究根按需协商调整规划预算：先读取 advancement_engine.research_time.read，"
                 "在 condition.time_extension 提供 budget_revision 与 requested_additional_seconds；"
-                "说明已做工作、缺口、估计不确定性与不延长时的收口影响。等待仍计时，普通答复不等于额度获批。"
+                "说明已做工作、缺口、后续价值与估计不确定性。等待仍计时，普通答复不改变预算记录；预算不是继续研究的授权前提。"
             ),
             input_schema=_root_human_request_open_input_schema(),
             output_schema=_root_human_request_output_schema(),
@@ -3116,7 +3119,7 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
                     "expert advice, fieldwork or physical/offline action; "
                     "capability_authorization for formal permission; "
                     "system_operation_help for a Meta Research runtime failure."
-                    " research_time_extension for explicit human approval of more Quest research time."
+                    " research_time_extension for optional human input on changing the advisory Quest planning budget."
                 ),
             },
             "obligation": {

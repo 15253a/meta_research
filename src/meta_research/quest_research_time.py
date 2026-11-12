@@ -1,4 +1,4 @@
-"""AE's shared Quest clock; HC applies explicit budget approvals in its transaction.
+"""AE's shared Quest clock; HC records explicit planning-budget adjustments.
 
 Service lifecycle facts are distinct from model/run status. A suspended model
 waiting for a human still uses time. Only explicit human pause stops a Quest.
@@ -21,7 +21,7 @@ from meta_research.time_budget import time_budget_seconds
 _LIVE_SERVICES: dict[str, str] = {}
 _SERVICE_LOCK = threading.RLock()
 _MISSING = object()
-_POLICY = "Quest 共用有效经过时间；并行只计一次，跨 Cycle 累计；人工暂停和服务停机不计，等待 HumanRequest 计时。"
+_POLICY = "Quest 共用有效经过时间；并行只计一次，跨 Cycle 累计；人工暂停和服务停机不计，等待 HumanRequest 计时。预算与阶段时间安排仅作建议；超出或计时未知不限制已授权研究，按实际用时与研究价值调整安排。"
 
 
 def _key(database: Database) -> str:
@@ -70,7 +70,7 @@ def _unmeasured_quest(connection, quest_ref, now):
             "overrun_seconds": 0.0 if started is None and seconds is not None else None,
             "observed_at": now, "accuracy": "exact" if started is None else "unknown",
             "status": "not_started" if started is None else "stopped", "unknown_intervals": unknown,
-            "budget_kind": "unlimited" if seconds is None else "finite", "shared": True, "clock_policy": _POLICY,
+            "budget_kind": "unlimited" if seconds is None else "finite", "budget_policy": "advisory", "shared": True, "clock_policy": _POLICY,
             "measurement_basis": "recorded_intervals", "accounting_corrections": []}
 
 
@@ -231,7 +231,7 @@ def query_quest_research_time_in_transaction(connection, quest_ref, *, database_
             "overrun_seconds": None if unknown or approved is None else max(0.0, elapsed-approved),
             "observed_at": now, "last_accounted_at": now if live else row["checkpoint_at"], "accuracy": "unknown" if unknown else "exact",
             "status": status, "unknown_intervals": unknown, "budget_kind": "unlimited" if approved is None else "finite",
-            "shared": True, "clock_policy": _POLICY,
+            "budget_policy": "advisory", "shared": True, "clock_policy": _POLICY,
             "measurement_basis": "human_confirmation" if corrections else "recorded_intervals",
             "accounting_corrections": corrections}
 
@@ -355,22 +355,10 @@ def read_quest_research_time(workspace: Path, quest_ref: str):
 
 
 def research_time_work_constraint(snapshot):
-    """Stable decision input: time passage changes it only at exhaustion."""
-    status = "available"
-    if snapshot["budget_kind"] == "finite":
-        if snapshot["accuracy"] == "unknown":
-            status = "unconfirmed"
-        elif snapshot["remaining_seconds"] <= 0:
-            status = "exhausted"
-    return {"budget_revision": snapshot["budget_revision"], "status": status}
+    """Legacy dispatch field: planning revisions, never permission to work.
 
-
-def require_time_for_new_work(connection, quest_ref):
-    snapshot = read_quest_research_time_in_transaction(connection, quest_ref)
-    constraint = research_time_work_constraint(snapshot)
-    if constraint["status"] != "available":
-        raise OwnerConflict("quest_time_budget_" + constraint["status"], {
-            "effect_status": "not_applied", "research_time": snapshot,
-            "message": "当前研究时间不足或尚未确认，新的 Target 尚未接纳。",
-            "correction": "读取当前研究时间；沿 human_request.open 申请明确额度或校正缺证余额，并在原根继续。可先对账、保管和收口已有工作。",
-        })
+    Live elapsed/unknown observations remain in the research-time snapshot.
+    Crossing a planning threshold must not invalidate an accepted dispatch or
+    force another model decision before its Target can be admitted.
+    """
+    return {"budget_revision": snapshot["budget_revision"], "policy": "advisory"}

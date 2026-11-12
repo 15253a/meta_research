@@ -50,7 +50,8 @@ async function workspace(page: Page) {
 test("human reviews an exact extension and reads applied budget separately from research resumption", async ({ page }, testInfo) => {
   const state = await workspace(page);
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项", exact: true });
-  await expect(dialog).toContainText("剩余 1 小时");
+  await expect(dialog).toContainText("预算余量 1 小时");
+  await expect(dialog).toContainText("不自动停止或要求延期");
   await expect(dialog).toContainText("等待回应期间继续计时");
   await dialog.getByLabel("增加研究时间（小时）").fill("2");
   await dialog.getByRole("button", { name: "同意增加时间", exact: true }).click();
@@ -72,8 +73,8 @@ test("human can set a new total and explicitly correct an uncertain remaining al
   state.budget.accuracy = "unknown";
   await page.reload();
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项", exact: true });
-  await expect(dialog).toContainText("剩余时间暂不能准确确定");
-  await dialog.getByLabel("批准额度方式").selectOption("total");
+  await expect(dialog).toContainText("预算余量暂不能准确确定");
+  await dialog.getByLabel("调整预算方式").selectOption("total");
   await dialog.getByLabel("新的总时长（小时）").fill("6");
   await dialog.getByText("缺少历史计时依据时，明确校正余额", { exact: true }).click();
   await dialog.getByLabel("同时确认缺证后的当前剩余额度").check();
@@ -87,4 +88,17 @@ test("human can set a new total and explicitly correct an uncertain remaining al
   await expect.poll(() => state.writes.length).toBe(1);
   expect(state.writes[0].facts.time_budget_decision).toEqual({ decision: "approve", expected_revision: "budget-1",
     total_seconds: 21600, confirmed_remaining_seconds: 9000, correction_reason: "依据已核对的运行记录，确认从当前时点还可用2.5小时。" });
+});
+
+test("overrun stays visible as a planning deviation", async ({ page }) => {
+  const state = await workspace(page);
+  Object.assign(state.budget, { used_seconds: 18000, confirmed_used_seconds: 18000,
+    remaining_seconds: 0, overrun_seconds: 3600 });
+  await page.reload();
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项", exact: true });
+  await expect(dialog).toContainText("建议总时长 4 小时");
+  await expect(dialog).toContainText("超出建议 1 小时");
+  await expect(dialog).toContainText("已用 5 小时");
+  await expect(dialog).toContainText("不自动停止或要求延期");
+  expect(state.writes).toHaveLength(0);
 });

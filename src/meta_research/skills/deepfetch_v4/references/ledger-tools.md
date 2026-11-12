@@ -49,4 +49,4 @@ python3 "$DEEPFETCH_ROOT/scripts/papers.py" finalize --out-dir "$OUTPUT_DIR" \
 
 `LITERATURE_ACCESS_MODE` 使用本请求宿主确认的有效模式。`provided_only` 校验要求 `dimensions_used=[]`、`active_search_elapsed_seconds=0`，不要求不存在的外部检索概念或发现维度；外部发现模式仍保持三维检索要求。宿主导入独立使用已核验模式，不信任模型自行选择校验模式。
 
-主动检索截止或有据提前停止时，调用 `update-run --stopping-reason "实际理由"`，用重复的 `--freeze-paper-id` 指明仍在获取的目标；工具同时冻结已登记全文及已分配 Reader 的论文。到达所选预算的 `--elapsed` 也触发冻结。此后只允许冻结目标完成获取／阅读或同文重试，不允许扩展冻结集合、晋升候补或新增发现条目。纯等人不增加 `--elapsed`。
+根据覆盖与研究价值决定完成发现时，调用 `update-run --stopping-reason "实际理由"`，用重复的 `--freeze-paper-id` 指明仍在获取的目标；工具同时冻结已登记全文及已分配 Reader 的论文。`--elapsed` 如实记录累计用时，允许超出建议预算，经过时间本身不冻结目标。记录停止理由后只允许冻结目标完成获取／阅读或同文重试，不允许扩展冻结集合、晋升候补或新增发现条目。纯等人不增加 `--elapsed`。

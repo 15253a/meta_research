@@ -6211,9 +6211,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                         "host_snapshot_ref": snapshot_ref,
                         "host_snapshot_hash": capabilities_hash,
                         "time_budget": draft["time_budget"],
-                        "hard_ceiling": _resource_hard_ceiling(
-                            cast(str, draft["time_budget"])
-                        ),
+                        "time_budget_policy": "advisory",
+                        "hard_ceiling": {"kind": "open_ended", "seconds": None},
                         "selected_device_uuids": selected_device_uuids,
                         "selected_devices": selected_devices,
                     }
@@ -9481,6 +9480,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     "status": "current" if envelope_current else "stale",
                     "host_snapshot_ref": envelope.host_snapshot_ref,
                     "time_budget": envelope_value.get("time_budget"),
+                    "time_budget_policy": "advisory",
                     "hard_ceiling": envelope_value.get("hard_ceiling"),
                     "selected_device_uuids": envelope_value.get(
                         "selected_device_uuids", []
@@ -10430,7 +10430,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         rebound = {
             **envelope,
             "time_budget": time_budget,
-            "hard_ceiling": _resource_hard_ceiling(time_budget),
+            "time_budget_policy": "advisory",
+            "hard_ceiling": {"kind": "open_ended", "seconds": None},
         }
         return {
             "envelope_ref": new_ref("resource_envelope"),
@@ -12008,9 +12009,16 @@ def _authorization_basis_resource_envelope(
     return envelope_value
 
 
-def _resource_hard_ceiling(time_budget: str) -> dict[str, object]:
+def _resource_time_binding_is_valid(envelope: dict[str, object], time_budget: str) -> bool:
+    if "time_budget_policy" in envelope:
+        return (
+            envelope["time_budget_policy"] == "advisory"
+            and envelope.get("hard_ceiling") == {"kind": "open_ended", "seconds": None}
+        )
+    # Historical envelopes retain their exact signed fields; validation does not
+    # promote the old budget-derived label into current scheduling authority.
     seconds = time_budget_seconds(time_budget)
-    return {
+    return envelope.get("hard_ceiling") == {
         "kind": "open_ended" if seconds is None else "wall_clock",
         "seconds": seconds,
     }
@@ -12039,7 +12047,7 @@ def _resource_envelope_matches_draft(
         isinstance(time_budget, str)
         and valid_time_budget(time_budget)
         and envelope.get("time_budget") == time_budget
-        and envelope.get("hard_ceiling") == _resource_hard_ceiling(time_budget)
+        and _resource_time_binding_is_valid(envelope, time_budget)
     )
 
 
@@ -12057,7 +12065,7 @@ def _resource_envelope_integrity_is_valid(
         envelope.get("schema_ref") != RESOURCE_ENVELOPE_SCHEMA
         or not isinstance(time_budget, str)
         or not valid_time_budget(time_budget)
-        or envelope.get("hard_ceiling") != _resource_hard_ceiling(time_budget)
+        or not _resource_time_binding_is_valid(envelope, time_budget)
         or not isinstance(selected_device_uuids, list)
         or not selected_device_uuids
         or any(not isinstance(uuid, str) or not uuid for uuid in selected_device_uuids)

@@ -2385,8 +2385,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
 
             # All request/currentness/dispatch checks above are read-only.  The
             # first persistent admission identity is allocated only here.
-            from meta_research.quest_research_time import require_time_for_new_work
-            require_time_for_new_work(connection, verification.quest_ref)
             launch_ref = new_ref("target_launch")
             if has_human_authorization:
                 assertion = target_execution_assertion(
@@ -9332,8 +9330,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "SELECT * FROM ar_stage_attempt_replacements WHERE run_ref=:run "
                     "AND replacement_attempt_ref=:attempt"),
                     {"run": run_ref, "attempt": feedback_attempt_ref}).first()
-                if replacement is None or replacement.reason_code != "human_request_resume_after_restart":
+                if replacement is None or replacement.reason_code not in {"human_request_resume_after_restart", "bundle_runtime_refreshed"}:
                     break
+                if replacement.reason_code == "bundle_runtime_refreshed":
+                    from meta_research.bundle_runtime_refresh import verify_runtime_refresh_replacement
+                    verify_runtime_refresh_replacement(connection, run_ref, feedback_attempt_ref)
                 run, current, session, current_fence = _load_stage_fence(
                     connection, run_ref, feedback_attempt_ref, cursor_fence_ref)
                 previous = connection.execute(text(
@@ -9409,8 +9410,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
                     "bundle_operation_inputs_changed": "旧输出针对旧 frontier/state/commit 快照；根据当前快照重新判断并保留已接纳事实。这表示决策输入已变化，不表示科学证据无效或输出格式错误。",
-                    "quest_time_budget_exhausted": "已批准研究时间已用尽，所选 Target 尚未接纳。用 advancement_engine.research_time.read 读取当前额度，沿 human_request.open 明确申请 research_time_extension，或选择 wait/replan_required 有序收口；保留在途结果，不重复已发出工作。",
-                    "quest_time_budget_unconfirmed": "研究计时缺证，无法确认可用余额，所选 Target 尚未接纳。用 advancement_engine.research_time.read 查看依据，沿 human_request.open 申请 research_time_extension 并请人明确确认剩余额度和校正依据，或选择 wait/replan_required 收口；不把未知余额当作充足授权。",
+                    "quest_time_budget_exhausted": "这是旧版把建议预算当作门槛的历史拒绝，保留原记录。当前预算仅供规划；读取 advancement_engine.research_time.read 如实记录用时与偏差，按研究价值在既有资源和权限内继续，不需先申请延期，也不因此强制等待或收口。原操作先对账，避免重复已发工作。",
+                    "quest_time_budget_unconfirmed": "这是旧版因计时缺证而拒绝研究的历史记录。保留未知区间，不猜测余额；读取 advancement_engine.research_time.read 并在既有资源和权限内继续。计时未知本身不要求延期批准、等待或收口；原操作先对账，避免重复已发工作。",
                     "reuse_receipt_invalid": "candidate.route.reuse_receipt: use the verified reuse-eligibility receipt for this candidate; TargetCommit acceptance is a different receipt.",
                     "candidate_measurement_cell_not_required": "candidate.measurement_contract: select a measurement cell present in the frozen NormalizedCompletionContract.",
                     "candidate_held_fixed_binding_incomplete": "candidate.held_fixed: provide the bindings for every declared controlled variable.",
@@ -18927,7 +18928,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 payload_hash=attempt.payload_hash,
                 receipt=execution.receipt,
             )
-        primary_draft = _primary_draft(run, attempt, session)
+        with self._database.read() as connection:
+            from meta_research.bundle_runtime_refresh import inherited_primary_binding_hash
+            source_hash = inherited_primary_binding_hash(connection, run, attempt)
+        primary_run = SimpleNamespace(**{**(dict(run._mapping) if hasattr(run, "_mapping") else vars(run)),
+                                         "primary_source_runtime_binding_hash": source_hash})
+        primary_draft = _primary_draft(primary_run, attempt, session)
         if primary_draft is not None and primary_draft.primary_provider_unit_ref is not None:
             with self._database.read() as connection:
                 source = connection.execute(text(
@@ -23610,7 +23616,7 @@ def _primary_draft(run, attempt, session) -> IdeaPrimaryDraft | None:
         attempt_ref=attempt.attempt_ref,
         fence_ref=attempt.fence_ref,
         native_session_ref=session.native_session_ref,
-        runtime_binding_hash=run.runtime_binding_hash,
+        runtime_binding_hash=getattr(run, "primary_source_runtime_binding_hash", run.runtime_binding_hash),
         draft=draft,
         draft_hash=attempt.primary_draft_hash,
         adapter_kind=attempt.primary_adapter_kind,
@@ -23790,6 +23796,8 @@ def _insert_provider_invocations(
 def _provider_invocations(
     connection, run, attempt, fence
 ) -> tuple[IdeaProviderInvocation, IdeaProviderInvocation | None]:
+    from meta_research.bundle_runtime_refresh import historical_bundle_runtime
+    run = historical_bundle_runtime(connection, run, generation=attempt.generation)
     rows = connection.execute(
         text(
             "SELECT * FROM ar_stage_provider_invocations WHERE "
@@ -24359,6 +24367,8 @@ def _load_stage_fence(connection, run_ref: str, attempt_ref: str, fence_ref: str
     ).first()
     if run is None or attempt is None or fence is None:
         raise OwnerConflict("attempt_fence_invalid")
+    from meta_research.bundle_runtime_refresh import historical_bundle_runtime
+    run = historical_bundle_runtime(connection, run, generation=attempt.generation)
     _runtime_binding_from_row(run)
     session = connection.execute(
         text("SELECT * FROM ar_stage_sessions WHERE session_ref = :session_ref"),
@@ -24420,6 +24430,8 @@ def _stage_native_replacement_row(connection, run_ref, attempt_ref, fence_ref):
 def _historical_stage_execution_row(connection, row):
     if row is None:
         return row
+    from meta_research.bundle_runtime_refresh import historical_bundle_runtime
+    row = historical_bundle_runtime(connection, row)
     missing = connection.execute(text(
         "SELECT s.checkpoint_json,s.checkpoint_hash,a.run_ref,a.root_session_ref,a.attempt_ref,a.fence_ref "
         "FROM ar_stage_attempt_replacements x "
@@ -25373,6 +25385,7 @@ _TARGET_FRONTIER_STAGE_REPLACEMENT_REASONS = frozenset(
     {
         "native_session_unavailable",
         "human_request_resume_after_restart",
+        "bundle_runtime_refreshed",
         "provider_result_correction",
         "root_completion_rejected",
         "runtime_fence_replaced",
@@ -25476,6 +25489,9 @@ def _target_frontier_dispatch_lineage_is_current(
             not in _TARGET_FRONTIER_STAGE_REPLACEMENT_REASONS
         ):
             return False
+        if replacement.reason_code == "bundle_runtime_refreshed":
+            from meta_research.bundle_runtime_refresh import verify_runtime_refresh_replacement
+            verify_runtime_refresh_replacement(connection, stage_run.run_ref, cursor_attempt_ref)
         retired = connection.execute(
             text(
                 "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "

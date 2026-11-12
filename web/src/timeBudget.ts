@@ -12,6 +12,6 @@ export function validTimeBudget(value: string): boolean {
 }
 
 export function timeBudgetLabel(value: string): string {
-  if (value === "open") return "不设硬截止";
+  if (value === "open") return "不设总时长建议";
   return validTimeBudget(value) ? `${timeBudgetHours(value)} 小时` : "请输入有效小时数";
 }

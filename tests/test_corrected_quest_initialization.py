@@ -2644,7 +2644,8 @@ def test_custom_hour_budget_round_trips_and_rebinds_the_gpu_envelope(tmp_path: P
             assert saved["resource_envelope"]["ref"] != basis["resource_envelope"]["ref"]
             assert saved["resource_envelope"]["status"] == "current"
             assert saved["resource_envelope"]["time_budget"] == budget
-            assert saved["resource_envelope"]["hard_ceiling"] == {"kind": "wall_clock", "seconds": seconds}
+            assert saved["resource_envelope"]["hard_ceiling"] == {"kind": "open_ended", "seconds": None}
+            assert saved["resource_envelope"]["time_budget_policy"] == "advisory"
             assert client.get(path).json()["quest_draft"]["value"]["time_budget"] == budget
             basis = saved
         for invalid in ["0h", "-1h", "NaNh", "0.001h"]:
@@ -2655,6 +2656,21 @@ def test_custom_hour_budget_round_trips_and_rebinds_the_gpu_envelope(tmp_path: P
             }, headers={**write_headers, "Idempotency-Key": f"invalid-{invalid}"})
             assert response.status_code == 422, response.text
         assert client.get(path).json()["quest_draft"]["hash"] == basis["quest_draft"]["hash"]
+
+
+def test_historical_resource_time_binding_stays_verifiable_without_rewriting():
+    from copy import deepcopy
+    from meta_research.owners.human_collaboration import _resource_envelope_matches_draft
+
+    draft = {"time_budget": "4h"}
+    historical = {"time_budget": "4h", "hard_ceiling": {"kind": "wall_clock", "seconds": 14400}}
+    original = deepcopy(historical)
+    assert _resource_envelope_matches_draft(draft, historical)
+    assert historical == original
+    assert not _resource_envelope_matches_draft(draft, {**historical, "hard_ceiling": {"kind": "wall_clock", "seconds": 1}})
+    current = {"time_budget": "4h", "time_budget_policy": "advisory", "hard_ceiling": {"kind": "open_ended", "seconds": None}}
+    assert _resource_envelope_matches_draft(draft, current)
+    assert not _resource_envelope_matches_draft(draft, {**current, "time_budget_policy": "mandatory"})
 
 
 def test_corrected_blank_draft_gpu_envelope_async_proposal_and_intent_are_durable(
@@ -2740,9 +2756,10 @@ def test_corrected_blank_draft_gpu_envelope_async_proposal_and_intent_are_durabl
         assert saved["resource_envelope"]["status"] == "current"
         assert saved["resource_envelope"]["time_budget"] == "30d"
         assert saved["resource_envelope"]["hard_ceiling"] == {
-            "kind": "wall_clock",
-            "seconds": 2_592_000,
+            "kind": "open_ended",
+            "seconds": None,
         }
+        assert saved["resource_envelope"]["time_budget_policy"] == "advisory"
         with runtime._database.read() as connection:
             immutable_budgets = [
                 value
