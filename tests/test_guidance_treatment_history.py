@@ -65,7 +65,21 @@ def _multi_root_history(tmp_path):
 
     runtime = _current_bundle_runtime(tmp_path / 'multi-root', bundle_skill=_ParallelBundle())
     runtime.configure_resident_mcp_endpoint('http://127.0.0.1:8999')
-    quest, admissions, _ = _two_admitted_roots(runtime)
+    quest, admissions, target_refs = _two_admitted_roots(runtime)
+    # The fixture admits Harness roots; native workspace history also needs
+    # the Owner activation performed by the production Target worker.
+    for target_ref in sorted(target_refs):
+        launch = runtime.owners.agent_runtime.query_admitted_target_launch(target_ref)
+        handle = runtime.target_run_authorities.agent_runtime.query_current_target_work_handle(target_ref)
+        assert handle.target_run_ref in {item.run.run_ref for item in admissions}
+        graph = runtime.owners.research_graph
+        candidate = graph.query_target_candidate_projection(target_ref=target_ref).candidate
+        formal_plan = graph.query_target_formal_plan_projection(graph_ref=launch.graph_ref).formal_plan
+        runtime.target_root_lifecycle.activate(
+            launch_ref=launch.launch_ref, handle=handle, candidate=candidate,
+            formal_plan=formal_plan, idempotency_key='activate-guidance-history:' + target_ref,
+        )
+        assert runtime.owners.agent_runtime.query_target_root_handle_history(target_ref).handle_history == (handle,)
     guide = _confirm_guidance(runtime, quest, {'kind': 'quest', 'quest_ref': quest},
         strength=2, text='Consider calibration and preserve negative evidence.')
     observed = []

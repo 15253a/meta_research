@@ -165,6 +165,7 @@ class NativeCreationCall:
     output_paths: tuple[Path, ...]
     stdout_sink: Callable[[bytes], None] | None = None
     stream_max_bytes: int = 64 * 1024 * 1024
+    input_layout_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -659,12 +660,11 @@ class ProtectedCreationRuntime:
 
     def _prepare_call(self, call: NativeCreationCall) -> tuple[list[str], dict[str, str], list[tuple[Path, Path]], str]:
         mappings = {str(self.executable): self._entry_command, str(self.work_directory): "/workspace"}
+        layout_root = None if call.input_layout_root is None else _absolute(call.input_layout_root)
+        if layout_root is not None:
+            mappings[str(layout_root)] = "/inputs/resources"
         with _parent_descriptor(self.jail_root / "inputs" / "slot") as directory:
-            for name in os.listdir(directory):
-                details = os.stat(name, dir_fd=directory, follow_symlinks=False)
-                if not stat.S_ISREG(details.st_mode) or details.st_uid != 0:
-                    raise ProtectedCreationError("protected_creation_jail_unrecognized")
-                os.unlink(name, dir_fd=directory)
+            _clear_input_projection(directory)
         total = 0
         for index, supplied in enumerate(call.read_only_inputs):
             source = _absolute(supplied)
@@ -677,7 +677,12 @@ class ProtectedCreationRuntime:
             if total > _INPUT_LIMIT:
                 raise ProtectedCreationError("protected_creation_input_too_large")
             name = f"{index:04d}-" + source.name
+            # Preserve links only within the explicitly declared resource root.
+            # This never enumerates or grants access to additional source files.
+            if layout_root is not None and source.is_relative_to(layout_root):
+                name = "resources/" + source.relative_to(layout_root).as_posix()
             target = self.jail_root / "inputs" / name
+            _directory(target.parent, 0o755)
             _replace_private(target, content, 0o444)
             mappings[str(source)] = "/inputs/" + name
         outputs = []
@@ -694,11 +699,11 @@ class ProtectedCreationRuntime:
                 mapped = "/outputs/" + name
             outputs.append((source, destination))
             mappings[str(destination)] = mapped
-        arguments = [_mapped(value, mappings, self.work_directory) for value in call.argv]
+        arguments = [_mapped(value, mappings, self.work_directory, layout_root) for value in call.argv]
         if arguments[0] not in {self._entry_command, self.executable.name, "codex"}:
             raise ProtectedCreationError("protected_creation_executable_mismatch")
         arguments[0] = self._entry_command
-        environment = {key: _mapped(value, mappings, self.work_directory) for key, value in call.environment.items()}
+        environment = {key: _mapped(value, mappings, self.work_directory, layout_root) for key, value in call.environment.items()}
         environment.update({"HOME": "/home/creation", "USERPROFILE": "/home/creation",
             "CODEX_HOME": "/home/creation/.codex", "CODEX_SQLITE_HOME": "/home/creation/.codex",
             "PATH": "/bin:/python/bin", "SHELL": "/bin/bash", "PYTHONHOME": "/python",
@@ -710,7 +715,7 @@ class ProtectedCreationRuntime:
         if len(arguments) > 1 and arguments[1] == "exec":
             from meta_research.quest_drafting import protected_codex_shell_arguments
             arguments = protected_codex_shell_arguments(arguments, environment=environment)
-        return arguments, environment, outputs, _mapped(call.prompt, mappings, self.work_directory)
+        return arguments, environment, outputs, _mapped(call.prompt, mappings, self.work_directory, layout_root)
 
     def _publish_output(self, source: Path, destination: Path) -> None:
         try:
@@ -947,10 +952,31 @@ def _runtime_entry(executable: Path) -> _RuntimeEntry:
     raise ProtectedCreationError("protected_creation_executable_unsupported")
 
 
-def _mapped(value: str, mappings: dict[str, str], work_directory: Path) -> str:
+def _clear_input_projection(directory: int) -> None:
+    for name in os.listdir(directory):
+        details = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if details.st_uid != 0 or details.st_mode & 0o022:
+            raise ProtectedCreationError("protected_creation_jail_unrecognized")
+        if stat.S_ISDIR(details.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                _clear_input_projection(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=directory)
+        elif stat.S_ISREG(details.st_mode) and details.st_nlink == 1:
+            os.unlink(name, dir_fd=directory)
+        else:
+            raise ProtectedCreationError("protected_creation_jail_unrecognized")
+
+
+def _mapped(value: str, mappings: dict[str, str], work_directory: Path,
+            input_layout_root: Path | None = None) -> str:
     for source, target in sorted(mappings.items(), key=lambda item: len(item[0]), reverse=True):
-        ending = r"(?=$|[\s\"',\]\)}])"
-        if source == str(work_directory):
-            ending = r"(?=$|/|[\s\"',\]\)}])"
+        # Developer instructions are JSON encoded CLI arguments: a root at the
+        # end of a line is followed by a literal \\n, not whitespace.
+        ending = r"(?=$|[\s\"'`,\]\)}]|\\[nrt\"])"
+        if source in {str(work_directory), str(input_layout_root)}:
+            ending = r"(?=$|/|[\s\"'`,\]\)}]|\\[nrt\"])"
         value = re.sub(r"(?<![\w./-])" + re.escape(source) + ending, lambda match: target, value)
     return value

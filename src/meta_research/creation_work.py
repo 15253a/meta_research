@@ -395,9 +395,10 @@ class ProtectedCreationRunner:
         "Keep edits and output in this operation's declared work directory."
     )
 
-    def __init__(self, work, *, read_only_inputs=(), environment=None):
+    def __init__(self, work, *, read_only_inputs=(), environment=None, input_layout_root=None):
         self.work = work
         self.read_only_inputs = tuple(read_only_inputs)
+        self.input_layout_root = input_layout_root
         self.environment = dict(environment or {})
         self._stop_requested = False
 
@@ -440,7 +441,8 @@ class ProtectedCreationRunner:
                 completed = self.work.run(NativeCreationCall(tuple(argv), prompt, timeout_seconds,
                     {**self.environment, **(environment or {})},
                     (*self.read_only_inputs, slots["--output-schema"]), (slots["--output-last-message"],),
-                    None if stream is None else write_stdout, stdout_max_bytes))
+                    None if stream is None else write_stdout, stdout_max_bytes,
+                    input_layout_root=self.input_layout_root))
                 if stream is not None:
                     os.fsync(stream.fileno())
             if self._stop_requested and completed.returncode != 0:
