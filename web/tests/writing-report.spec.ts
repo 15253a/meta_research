@@ -46,6 +46,65 @@ async function workspace(page: Page, fail = false, failCredential = false) {
   return { snapshot, writes, credentials };
 }
 
+for (const width of [1440, 390]) test(`accepted Target material labels preserve full paths and exact selections at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const state = await workspace(page);
+  const errors: string[] = [];
+  page.on("pageerror", error => errors.push(error.message));
+  const artifact = (version_ref: string, ordinal: number, path: string, content_hash: string, version_number: number) => ({
+    version_ref, content_hash, version_number, source_kind: "file",
+    display_name: `target-root-artifact-${String(ordinal).padStart(4, "0")}`,
+    provenance: { schema_ref: "meta-research/target-root-artifact-provenance/v1", ordinal,
+      artifact_kind: "file", declared_relative_path: path, content_hash },
+    receipt: { issuer: "research_memory", kind: "asset_acceptance", subject_ref: version_ref,
+      receipt_ref: `accepted-${version_ref}`, payload_hash: "e".repeat(64) },
+  });
+  const path = "outputs/analysis/independent_measurement_conditions_and_limitations/research-note.md";
+  const other = "handoff/independent_measurement_conditions_and_limitations/research-note.md";
+  const note = artifact("note-v2", 7, path, "7".repeat(64), 2);
+  const result = artifact("result-v1", 1, "outputs/result.json", "1".repeat(64), 1);
+  const otherNote = artifact("handoff-v3", 8, other, "8".repeat(64), 3);
+  const custom = { ...artifact("custom-v1", 9, "outputs/custom.md", "9".repeat(64), 1), display_name: "人工命名研究说明" };
+  const legacy = { version_ref: "legacy-v1", content_hash: "a".repeat(64), version_number: 1, display_name: "target-root-artifact-0010" };
+  state.snapshot.research_assets.items = [note, result, otherNote, custom, legacy];
+  await page.goto("http://127.0.0.1:18768/?workspace=1&panel=writing");
+  const dialog = page.getByRole("dialog", { name: "交给研究助手写作" });
+  const picker = dialog.getByLabel("选择材料版本");
+  await expect(picker.locator('option[value="note-v2"]')).toHaveText(`${path} · 版本 2`);
+  await expect(picker.locator('option[value="handoff-v3"]')).toHaveText(`${other} · 版本 3`);
+  await expect(picker.locator('option[value="custom-v1"]')).toHaveText("人工命名研究说明 · 版本 1");
+  await expect(picker.locator('option[value="legacy-v1"]')).toHaveText("target-root-artifact-0010 · 版本 1");
+  for (const [version, role] of [["note-v2", "draft"], ["result-v1", "source"], ["handoff-v3", "source"]]) {
+    await dialog.getByLabel("材料用途").selectOption(role);
+    await picker.selectOption(version);
+    await dialog.getByRole("button", { name: "加入本次写作" }).click();
+  }
+  const selected = dialog.locator(".writing-request-materials");
+  await expect(selected).toContainText(`前稿 · ${path} · 版本 2`);
+  await expect(selected).toContainText("研究材料 · outputs/result.json · 版本 1");
+  await expect(selected).toContainText(`研究材料 · ${other} · 版本 3`);
+  expect(state.snapshot.research_assets.items[0].display_name).toBe("target-root-artifact-0007");
+  await dialog.getByRole("button", { name: "关闭写作" }).click();
+  await page.getByRole("button", { name: "写作", exact: true }).click();
+  await expect(selected).toContainText(path);
+  state.snapshot.research_assets.items = [artifact("note-v3", 7, "outputs/analysis/new-revision.md", "b".repeat(64), 3)];
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(picker.locator('option[value="note-v3"]')).toHaveCount(1);
+  await expect(selected).toContainText(`前稿 · ${path} · 版本 2`);
+  expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await dialog.getByRole("region", { name: "本次写作材料" }).screenshot({ path: test.info().outputPath(`writing-path-labels-${width}.png`) });
+  await dialog.getByLabel("写作要求").fill("依据这三个精确版本写报告，保留限制。");
+  await dialog.getByRole("button", { name: "开始写作" }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(state.writes).toHaveLength(1);
+  expect(state.writes[0].body.writing_request.materials).toEqual([
+    { version_ref: "note-v2", content_hash: "7".repeat(64), role: "draft" },
+    { version_ref: "result-v1", content_hash: "1".repeat(64), role: "source" },
+    { version_ref: "handoff-v3", content_hash: "8".repeat(64), role: "source" },
+  ]);
+  expect(errors).toEqual([]);
+});
+
 for (const kind of ["report", "paper"]) test(`${kind} with PPT submits exact versions to ordinary companion`, async ({ page }) => {
   const state = await workspace(page);
   await page.goto("http://127.0.0.1:18768/?workspace=1&panel=writing");

@@ -3,6 +3,7 @@ import { fetchResearchAssets, ProductError, provisionCompanionContentCredential,
   type CompanionWritingMaterial, type CompanionWritingRequest,
   type ResearchAssetItem, type ResearchAssetsView } from "./api";
 import { usePageDraft } from "./pageDraft";
+import { writingMaterialLabel } from "./writingMaterialLabel";
 import "./writing-request.css";
 
 type SelectedMaterial = CompanionWritingMaterial & { name: string; version_number: number };
@@ -85,7 +86,7 @@ export function WritingRequestForm({ assets, scopeRef, workspacePath, onClose, o
     if (draft.materials.some(item => item.version_ref === material.version_ref && item.role === materialRole)) return;
     change({ materials: [...draft.materials, {
       version_ref: material.version_ref, content_hash: material.content_hash, role: materialRole,
-      name: material.display_name, version_number: material.version_number,
+      name: writingMaterialLabel(material), version_number: material.version_number,
     }] });
   };
 
@@ -137,7 +138,7 @@ export function WritingRequestForm({ assets, scopeRef, workspacePath, onClose, o
           <p>需要指定前稿、模板或重点材料时，可在这里选入具体版本。已选版本会保留；模板需要的图表、字体和书目可一起加入。</p>
           <div className="writing-request-row">
             <label>材料用途<select value={materialRole} onChange={event => setMaterialRole(event.target.value as CompanionWritingMaterial["role"])}>{Object.entries(materialRoles).map(([role, label]) => <option key={role} value={role}>{label}</option>)}</select></label>
-            <label>选择材料版本<select value={materialRef} onChange={event => setMaterialRef(event.target.value)}><option value="">请选择</option>{inventory.items.map(item => <option key={item.version_ref} value={item.version_ref}>{item.display_name} · 版本 {item.version_number}</option>)}</select></label>
+            <label>选择材料版本<select value={materialRef} onChange={event => setMaterialRef(event.target.value)}><option value="">请选择</option>{inventory.items.map(item => <option key={item.version_ref} value={item.version_ref}>{writingMaterialLabel(item)} · 版本 {item.version_number}</option>)}</select></label>
             <button type="button" disabled={!materialRef} onClick={addMaterial}>加入本次写作</button>
           </div>
           {inventory.has_more && <button type="button" disabled={loading} onClick={() => void moreMaterials()}>{loading ? "正在读取…" : "更多材料"}</button>}
