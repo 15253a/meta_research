@@ -20370,13 +20370,53 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 verifier = self._target_graph_verifier
                 if verifier is None:
                     raise OwnerConflict("target_graph_verifier_unavailable")
+                batch_replan = state.get("batch_replan")
+                replan_refs = None
+                if batch_replan is not None:
+                    from meta_research.bundle_batch_replan import validate_replan_basis
+
+                    expected_fields = {"schema_ref", "basis", "provider_operation_ref", "provider_unit_ref",
+                                       "operation_name", "base_generation", "base_head_receipt", "result_hash"}
+                    if (action != "replan_required" or frontier
+                            or not isinstance(batch_replan, dict) or set(batch_replan) != expected_fields
+                            or batch_replan["schema_ref"] != "meta-research/bundle-batch-replan-source/v1"
+                            or type(batch_replan["base_generation"]) is not int or batch_replan["base_generation"] < 0
+                            or batch_replan["operation_name"] != f"target-batch-{batch_replan['base_generation'] + 1}"
+                            or not isinstance(batch_replan["result_hash"], str)
+                            or not re.fullmatch(r"[0-9a-f]{64}", batch_replan["result_hash"])):
+                        raise OwnerConflict("bundle_batch_replan_source_invalid")
+                    try:
+                        basis = validate_replan_basis(batch_replan["basis"], tuple(state.get("target_commit_refs", ())))
+                    except (TypeError, ValueError) as error:
+                        raise OwnerConflict(str(error)) from error
+                    replan_refs = tuple(basis["source_target_commit_refs"])
+                    head = batch_replan["base_head_receipt"]
+                    if not isinstance(head, dict) or not all(isinstance(head.get(key), str) for key in ("receipt_ref", "payload_hash")):
+                        raise OwnerConflict("bundle_batch_replan_source_invalid")
+                    expected_unit = _bundle_rolling_provider_unit_ref(
+                        operation_ref=batch_replan["provider_operation_ref"],
+                        operation_name=batch_replan["operation_name"], attempt_ref=attempt_ref)
+                    source_unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:ref"),
+                        {"ref": batch_replan["provider_unit_ref"]}).first()
+                    if (source_unit is None or source_unit.unit_ref != expected_unit
+                            or source_unit.run_ref != run_ref or source_unit.attempt_ref != attempt_ref
+                            or source_unit.fence_ref != fence_ref or source_unit.status != "completed"
+                            or source_unit.operation_ref != batch_replan["provider_operation_ref"]
+                            or source_unit.unit_kind != "bundle_review"):
+                        raise OwnerConflict("bundle_batch_replan_source_not_settled")
+                    if connection.execute(text("SELECT unit_ref FROM ar_provider_units WHERE run_ref=:run "
+                            "AND status NOT IN ('completed','revoked') LIMIT 1"), {"run": run_ref}).first() is not None:
+                        raise OwnerConflict("bundle_batch_replan_source_not_settled")
                 verifier.verify_bundle_dispatch_frontier(
                     request_ref=run.request_ref,
                     run_ref=run_ref,
                     graph_ref=graph_ref,
                     frontier=frontier,
                     allow_legacy_high_risk=False,
-                    strategy_revision=action == "revise_strategy",
+                    strategy_revision=action == "revise_strategy" or batch_replan is not None,
+                    **({"replan_source_commit_refs": replan_refs,
+                        "replan_head": (batch_replan["base_generation"], head["receipt_ref"], head["payload_hash"])}
+                       if replan_refs is not None else {}),
                 )
                 expected_root = {
                     "run_kind": "bundle_stage",
@@ -26899,8 +26939,22 @@ def _prepare_bundle_report_material_in_snapshot(
                 )
             elif replan_decision is not None and not blockers:
                 additional_receipt_refs.add(replan_decision.receipt.receipt_ref)
+                semantic_changes = (replan_decision.rationale,)
+                batch_source = replan_decision.state.get("batch_replan")
+                if batch_source is not None:
+                    from meta_research.bundle_batch_replan import validate_replan_basis
+
+                    try:
+                        basis = validate_replan_basis(batch_source["basis"], tuple(
+                            closure.target_commit_ref for closure in accepted.values()))
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise OwnerConflict("bundle_batch_replan_source_commits_invalid") from error
+                    # Retain the precise root synthesis, not a mechanically
+                    # generated success claim. Actual remaining cells below
+                    # still come from verified domain facts and frozen Briefs.
+                    semantic_changes += (canonical_json(basis),)
                 report_kwargs.update({
-                    "semantic_change_required": (replan_decision.rationale,),
+                    "semantic_change_required": semantic_changes,
                     "evidence_refs": (replan_decision.decision_ref,),
                 })
             else:

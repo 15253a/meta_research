@@ -28,6 +28,9 @@ _POLICY_PREFIXES = (
     "package:meta_research.skills.bundle_stage/references/owner-operations.md@sha256:",
     "adapter-source:meta_research.bundle_skill@sha256:",
     "output-schema:target-dispatch@sha256:",
+    "output-schema:target-batch@sha256:",
+    "output-schema:target-batch-full@sha256:",
+    "adapter-source:meta_research.bundle_batch_replan@sha256:",
 )
 
 

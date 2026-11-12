@@ -692,6 +692,38 @@ class BundleStageWorker:
                         return False
                     self._bind_rolling_replacement(run, graph, batch_unit_ref,
                         result.native_session_ref, replacement_context)
+                    if result.action == "replan_required":
+                        # A genuine root decision, not an empty/invalid strategy
+                        # and not a Target. Settle the exact batch before AR
+                        # accepts its synthesis under the current root fence.
+                        self._agent_runtime.acknowledge_provider_safe_point(
+                            unit_ref=batch_unit_ref, run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+                        )
+                        decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+                        state = self._dispatch_state(graph, commits, run=run)
+                        state["batch_replan"] = {
+                            "schema_ref": "meta-research/bundle-batch-replan-source/v1",
+                            "basis": result.replan_basis,
+                            "provider_operation_ref": batch_operation_ref,
+                            "provider_unit_ref": batch_unit_ref,
+                            "operation_name": f"target-batch-{graph.head_generation + 1}",
+                            "base_generation": graph.head_generation,
+                            "base_head_receipt": batch_request.base_head_receipt,
+                            "result_hash": validate_bundle_target_batch_result(batch_request, result),
+                        }
+                        self._agent_runtime.record_bundle_dispatch_decision(
+                            run_ref=run.run_ref, attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref, native_session_ref=result.native_session_ref,
+                            graph_ref=graph.graph_ref, generation=len(decisions) + 1,
+                            frontier=(), state=state, action="replan_required",
+                            selected_target_ref=None, rationale=result.rationale,
+                            inbox_checkpoint=inbox_checkpoint,
+                            idempotency_key=_operation_key("bundle-batch-replan", run.run_ref,
+                                batch_operation_ref, batch_unit_ref),
+                        )
+                        self._observation = BundleObservation("ready")
+                        return True
                     self._agent_runtime.record_bundle_target_proposal(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,

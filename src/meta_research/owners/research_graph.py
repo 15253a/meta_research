@@ -6098,6 +6098,8 @@ class SQLiteResearchGraphReceiptVerifier:
         frontier: tuple[dict[str, object], ...],
         allow_legacy_high_risk: bool = True,
         strategy_revision: bool = False,
+        replan_source_commit_refs: tuple[str, ...] | None = None,
+        replan_head: tuple[int, str, str] | None = None,
     ) -> None:
         if not isinstance(allow_legacy_high_risk, bool) or not isinstance(strategy_revision, bool):
             raise OwnerConflict("bundle_dispatch_frontier_invalid")
@@ -6133,17 +6135,13 @@ class SQLiteResearchGraphReceiptVerifier:
                     {"content_ref": graph_row.plan_content_ref},
                 ).first()
             )
-            committed = {
-                row.target_ref
-                for row in connection.execute(
-                    text(
-                        "SELECT c.target_ref FROM rg_target_commits c JOIN "
-                        "rg_targets t ON t.target_ref = c.target_ref WHERE "
-                        "t.graph_ref = :graph_ref"
-                    ),
-                    {"graph_ref": graph_ref},
-                ).all()
-            }
+            commit_columns = "c.*" if replan_source_commit_refs is not None else "c.target_ref"
+            commit_rows = connection.execute(
+                text(f"SELECT {commit_columns} FROM rg_target_commits c JOIN rg_targets t "
+                     "ON t.target_ref = c.target_ref WHERE t.graph_ref = :graph_ref"),
+                {"graph_ref": graph_ref},
+            ).all()
+            committed = {row.target_ref for row in commit_rows}
             # Admission is an AR-owned, durable boundary.  Its presence only
             # permits omission from a NEW launch candidate list; it never
             # authorizes execution or weakens verification of passed entries.
@@ -6181,6 +6179,13 @@ class SQLiteResearchGraphReceiptVerifier:
         if strategy_revision and (frontier or graph.strategy_complete
                 or committed != {target.target_ref for target in graph.targets}):
             raise OwnerConflict("bundle_strategy_revision_not_ready")
+        if replan_source_commit_refs is not None:
+            verified_commits = tuple(_target_commit(row) for row in commit_rows)
+            if replan_head != (graph.head_generation, graph.head_receipt.receipt_ref, graph.head_receipt.payload_hash):
+                raise OwnerConflict("bundle_batch_replan_head_stale")
+            if (len(replan_source_commit_refs) != len(set(replan_source_commit_refs))
+                    or set(replan_source_commit_refs) != {item.commit_ref for item in verified_commits}):
+                raise OwnerConflict("bundle_batch_replan_source_commits_invalid")
         authoritative = tuple(
             target
             for target in (_accepted_target(row) for row in target_rows)

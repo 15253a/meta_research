@@ -1243,9 +1243,11 @@ def _root_agent_human_request_operations(
             semantic_operation_id=reconcile_id,
             owning_module="agent_runtime",
             description=(
-                "Read the immutable receipt for an earlier HumanRequest open effect."
+                "Read the receipt for an earlier HumanRequest open effect. For a "
+                "system_operation_help successor, supply its exact predecessor_request_ref "
+                "to read that revision. Without it, retain the original effect lineage lookup."
             ),
-            input_schema=_effect_input_schema(),
+            input_schema=_root_human_request_reconcile_input_schema(),
             output_schema=_root_human_request_output_schema(),
             access_mode="reconcile",
             handler=lambda context, arguments: _reconcile_root_agent_human_request(
@@ -1553,11 +1555,8 @@ def _open_root_agent_human_request(
     ):
         # Keep the Agent-visible effect identity stable while giving each
         # repeat-failure revision its own replay key and immutable open receipt.
-        effect_key = "mcp-effect:" + canonical_hash(
-            {
-                "logical_effect_key": effect_key,
-                "predecessor_request_ref": command.predecessor_request_ref,
-            }
+        effect_key = _human_request_successor_effect_key(
+            effect_key, command.predecessor_request_ref
         )
     guidance_asset_ref = command.condition.get("guidance_asset_ref")
     if isinstance(guidance_asset_ref, str):
@@ -1573,11 +1572,25 @@ def _open_root_agent_human_request(
             ) from error
         if guidance is None:
             raise SemanticMcpError("root_agent_human_request_guidance_invalid")
-    generation = _root_human_request_generation(
-        owner,
-        scope=scope,
-        predecessor_request_ref=command.predecessor_request_ref,
-    )
+    try:
+        generation = _root_human_request_generation(
+            owner,
+            scope=scope,
+            context=context,
+            predecessor_request_ref=command.predecessor_request_ref,
+            request_kind=command.request_kind,
+            effect_id=effect_id,
+        )
+    except SemanticMcpError as error:
+        # This validation precedes the effect Owner call. Do not turn a known
+        # argument rejection into an unresolved business effect.
+        raise SemanticMcpError(error.code, {
+            **(error.details or {}),
+            "execution_stage": "precondition_validation",
+            "call_execution": "not_started",
+            "effect_status": "not_applied",
+            "correction": "Correct the predecessor/effect identity using the original request. This submission was rejected before opening an effect; preserve any earlier uncertain submission unchanged.",
+        }) from error
     operation_binding = _root_human_request_operation_binding(
         scope,
         context,
@@ -1663,8 +1676,13 @@ def _reconcile_root_agent_human_request(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     effect_id, effect_key = _semantic_effect_key(context, arguments)
+    predecessor = arguments.get("predecessor_request_ref")
+    if isinstance(predecessor, str):
+        effect_key = _human_request_successor_effect_key(effect_key, predecessor)
     try:
-        request = owner.reconcile_human_request_effect(effect_key)
+        request = owner.reconcile_human_request_effect(
+            effect_key, follow_current_revision=predecessor is None
+        )
     except OwnerConflict as error:
         raise SemanticMcpError(error.code, error.details) from error
     open_effect = request.get("open_effect")
@@ -1675,6 +1693,15 @@ def _reconcile_root_agent_human_request(
         context=context,
         reconcile=True,
     )
+
+
+def _human_request_successor_effect_key(
+    logical_effect_key: str, predecessor_request_ref: str
+) -> str:
+    return "mcp-effect:" + canonical_hash({
+        "logical_effect_key": logical_effect_key,
+        "predecessor_request_ref": predecessor_request_ref.strip(),
+    })
 
 
 def _root_agent_human_request_scope(
@@ -1992,7 +2019,10 @@ def _root_human_request_generation(
     owner: AgentRuntimeInterface,
     *,
     scope: dict[str, object],
+    context: SemanticCallContext,
     predecessor_request_ref: str | None,
+    request_kind: str,
+    effect_id: str,
 ) -> int:
     generation = scope.get("waiter_generation")
     if not isinstance(generation, int) or isinstance(generation, bool):
@@ -2000,6 +2030,32 @@ def _root_human_request_generation(
     if predecessor_request_ref is None:
         return generation
     predecessor = owner.query_human_request(predecessor_request_ref)
+    if predecessor is not None:
+        prior_effect = predecessor.get("open_effect")
+        prior_binding = (
+            prior_effect.get("operation_binding")
+            if isinstance(prior_effect, dict) else None
+        )
+        if (
+            not isinstance(prior_binding, dict)
+            or prior_binding.get("quest_ref") != scope.get("quest_ref")
+            or prior_binding.get("task_ref") != context.run_ref
+            or prior_binding.get("root_session_ref") != context.root_session_ref
+        ):
+            raise SemanticMcpError("human_request_predecessor_invalid")
+    if predecessor is not None and request_kind == "system_operation_help":
+        prior_effect = predecessor.get("open_effect")
+        if (
+            predecessor.get("kind") == "system_operation_help"
+            and isinstance(prior_effect, dict)
+            and prior_effect.get("effect_id") != effect_id
+        ):
+            raise SemanticMcpError("human_request_predecessor_invalid", {
+                "field": "effect_id",
+                "expected_effect_id": prior_effect.get("effect_id"),
+                "predecessor_request_ref": predecessor_request_ref,
+                "message": "A repeat system failure continues the predecessor's effect_id. An unrelated new request does not name that predecessor.",
+            })
     waiters = None if predecessor is None else predecessor.get("direct_waiters")
     if (
         not isinstance(waiters, list)
@@ -3106,6 +3162,19 @@ def _root_acquisition_output_schema() -> dict[str, object]:
     )
 
 
+def _root_human_request_reconcile_input_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "effect_id": _string(max_length=128),
+            "predecessor_request_ref": {
+                **_string(max_length=96),
+                "description": "Exact predecessor supplied to the original system_operation_help successor open; omit for the original effect lineage.",
+            },
+        },
+        required=("effect_id",),
+    )
+
+
 def _root_human_request_open_input_schema() -> dict[str, object]:
     return _closed_object(
         {
@@ -3187,7 +3256,10 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
                     "exclusions",
                 ),
             ),
-            "predecessor_request_ref": _string(max_length=96),
+            "predecessor_request_ref": {
+                **_string(max_length=96),
+                "description": "Continue a terminal request lineage only. A repeated system_operation_help must retain that predecessor's effect_id; an unrelated new request omits this field. Reconcile a system-help successor with the same effect_id and predecessor_request_ref.",
+            },
         },
         required=(
             "effect_id",

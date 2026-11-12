@@ -210,7 +210,7 @@ class HumanRequestOwnerInterface(Protocol):
     ) -> dict[str, object] | None: ...
 
     def reconcile_human_request_effect(
-        self, effect_key: str
+        self, effect_key: str, *, follow_current_revision: bool = True
     ) -> dict[str, object]: ...
 
 
@@ -291,9 +291,11 @@ class HumanRequestOwnerMixin:
         )
 
     def reconcile_human_request_effect(
-        self, effect_key: str
+        self, effect_key: str, *, follow_current_revision: bool = True
     ) -> dict[str, object]:
-        return self._human_request_owner.reconcile_human_request_effect(effect_key)
+        return self._human_request_owner.reconcile_human_request_effect(
+            effect_key, follow_current_revision=follow_current_revision
+        )
 
 
 
@@ -1474,9 +1476,9 @@ class SQLiteHumanRequestOwner:
         return request
 
     def reconcile_human_request_effect(
-        self, effect_key: str
+        self, effect_key: str, *, follow_current_revision: bool = True
     ) -> dict[str, object]:
-        """Read the current revision of an immutable matching effect lineage."""
+        """Read a matching effect, optionally following its current revision."""
 
         _validate_idempotency_key(effect_key)
         with self._database.read() as connection:
@@ -1490,7 +1492,7 @@ class SQLiteHumanRequestOwner:
         request = self.query_human_request(cast(str, row.request_ref))
         if request is None or request.get("open_effect") is None:
             raise OwnerConflict("human_request_open_effect_invalid")
-        if request.get("kind") == "system_operation_help" and not request.get(
+        if follow_current_revision and request.get("kind") == "system_operation_help" and not request.get(
             "current"
         ):
             with self._database.read() as connection:
