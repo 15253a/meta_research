@@ -6426,6 +6426,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._host_compute_probe = host_compute_probe
         self._runtime_protection = runtime_protection
         self._operator_stop_reader: Callable[[str, str], dict[str, object] | None] | None = None
+        self._operator_stop_settlement_reader: Callable[[str, str], dict[str, object] | None] | None = None
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
         self._formal_plan_verifier = formal_plan_verifier
@@ -6484,9 +6485,82 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
 
 
     def bind_operator_stop_reader(
-        self, reader: Callable[[str, str], dict[str, object] | None]
+        self, reader: Callable[[str, str], dict[str, object] | None], *,
+        settlement_reader: Callable[[str, str], dict[str, object] | None] | None = None,
     ) -> None:
         self._operator_stop_reader = reader
+        self._operator_stop_settlement_reader = settlement_reader
+
+    def _settle_operator_stopped_provider(self, *, unit_ref, run_ref, attempt_ref, fence_ref, provider_exit) -> bool:
+        """ACK a verified pause stop once; never reinterpret it as a new ceiling."""
+        reader = self._operator_stop_settlement_reader
+        if reader is None:
+            return False
+        with self._database.read() as connection:
+            control = connection.execute(text("SELECT * FROM ar_run_controls WHERE run_ref=:run"),
+                {"run": run_ref}).first()
+            unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:unit"),
+                {"unit": unit_ref}).first()
+            if (control is None or unit is None or control.status not in {"running", "suspended"}
+                    or control.run_kind not in {"bundle_stage", "plan_stage", "reasoning_stage"}
+                    or (control.attempt_ref, control.fence_ref) != (attempt_ref, fence_ref)
+                    or (unit.run_ref, unit.attempt_ref, unit.fence_ref) != (run_ref, attempt_ref, fence_ref)
+                    or unit.unit_kind != control.run_kind.removesuffix("_stage") + "_primary"
+                    or unit.status not in {"active", "completed"}):
+                return False
+            saved = None
+            if control.status == "suspended":
+                saved = _query_managed_safe_point(connection, control)
+                if saved is None or saved["checkpoint"].get("action") != "pause":
+                    return False
+                reservations = connection.execute(text("SELECT * FROM ar_control_reservations "
+                    "WHERE operation_ref=:ref AND action='pause' AND status='applied'"),
+                    {"ref": saved["checkpoint"].get("operation_ref")}).all()
+            else:
+                reservations = connection.execute(text("SELECT * FROM ar_control_reservations "
+                    "WHERE action='pause' AND status='prepared'")).all()
+            authorized = False
+            for reservation in reservations:
+                document = _runtime_control_reservation_document(reservation)
+                if not any(all(item.get(key) == getattr(control, key) for key in (
+                        "run_ref", "run_kind", "quest_ref", "cycle_ref", "epoch", "attempt_ref",
+                        "root_session_ref", "fence_ref")) and item.get("status") == "running"
+                        and item.get("control_revision") == int(control.control_revision) - (control.status == "suspended")
+                        for item in document["affected_runs"]):
+                    continue
+                if control.status == "running" and reservation.status == "prepared":
+                    authorized = True
+                    break
+                if control.status == "suspended" and reservation.status == "applied":
+                    if (saved is None or saved["checkpoint"].get("action") != "pause"
+                            or saved["checkpoint"].get("operation_ref") != reservation.operation_ref
+                            or any(saved["checkpoint"].get(key) != getattr(control, key) for key in (
+                                "run_ref", "attempt_ref", "root_session_ref", "fence_ref"))):
+                        continue
+                    operation = connection.execute(text("SELECT * FROM ar_control_operations WHERE operation_ref=:ref"),
+                        {"ref": reservation.operation_ref}).first()
+                    if operation is None:
+                        continue
+                    self.verify_runtime_control_receipt(operation_ref=operation.operation_ref, action="pause",
+                        target=decoded_object(reservation.payload_json)["target"], receipt=_runtime_control_receipt(operation))
+                    authorized = True
+                    break
+            if not authorized:
+                return False
+        proof = reader(run_ref, "primary")
+        scope = {} if proof is None else proof.get("scope", {})
+        if (proof is None or proof.get("schema_ref") != "meta-research/operator-stopped-primary/v1"
+                or any(scope.get(key) != value for key, value in {
+                    "run_ref": run_ref, "run_kind": control.run_kind, "attempt_ref": attempt_ref,
+                    "root_session_ref": control.root_session_ref, "fence_ref": fence_ref,
+                    "unit_ref": unit_ref, "unit_kind": unit.unit_kind, "operation_ref": unit.operation_ref,
+                }.items()) or proof.get("hard_ceiling_checkpoint") != provider_exit):
+            raise OwnerConflict("operator_stop_checkpoint_invalid")
+        # The existing ACK closes this exact physical unit and is idempotent if
+        # the control driver won the race. It does not resume or replace a Run.
+        self.acknowledge_provider_safe_point(unit_ref=unit_ref, run_ref=run_ref,
+            attempt_ref=attempt_ref, fence_ref=fence_ref)
+        return True
 
     def _operator_stop_resume_checkpoints(self, affected_runs):
         checkpoints: dict[str, dict[str, object]] = {}
@@ -8250,6 +8324,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         provider_exit: dict[str, object],
     ) -> None:
         """Fence physical ceilings; route completed contract drift to correction."""
+
+        if failure_code == "codex_operation_stopped" and self._settle_operator_stopped_provider(
+                unit_ref=unit_ref, run_ref=run_ref, attempt_ref=attempt_ref, fence_ref=fence_ref,
+                provider_exit=provider_exit):
+            return
 
         if (isinstance(provider_exit, dict)
                 and provider_exit.get("schema_ref") == "meta-research/provider-native-session-unavailable/v1"):
