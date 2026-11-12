@@ -24380,6 +24380,7 @@ def _validated_runtime_binding(
     *,
     stage: str | None = None,
     allow_legacy_full_conformance: bool = False,
+    accepted_profile_hash: str | None = None,
 ) -> tuple[
     IdeaRuntimeBinding
     | PlanRuntimeBinding
@@ -24570,6 +24571,12 @@ def _validated_runtime_binding(
     profile = root_capability_profile(cast(RootAgentKind, stage),
         binding.model_ref if binding.model_ref in SUPPORTED_CODEX_MODEL_REFS else CODEX_MODEL_REF)
     allowed_root_bindings = set(profile.runtime_bindings())
+    if accepted_profile_hash is not None:
+        if not _is_sha256(accepted_profile_hash):
+            raise OwnerConflict("idea_runtime_binding_invalid")
+        allowed_root_bindings.add(
+            f"root-capability-profile:sha256:{accepted_profile_hash}"
+        )
     if (
         (stage == "bundle" and not bundle_binding_valid)
         or (stage == "reasoning" and not reasoning_binding_valid)
@@ -24742,11 +24749,8 @@ def _runtime_binding_from_row(
             resource_bindings=tuple(value["resource_bindings"]),
             schema_ref=value["schema_ref"],
         )
-        binding, binding_json, binding_hash = _validated_runtime_binding(
-            binding,
-            stage=row.stage,
-            allow_legacy_full_conformance=True,
-        )
+        binding_json = canonical_json(binding.as_dict())
+        binding_hash = canonical_hash(binding.as_dict())
     except (KeyError, TypeError, ValueError) as error:
         raise OwnerConflict("idea_runtime_binding_invalid") from error
     expected_admission_hash = canonical_hash(
@@ -24775,6 +24779,24 @@ def _runtime_binding_from_row(
         or expected_admission_hash != row.admission_hash
     ):
         raise OwnerConflict("idea_runtime_binding_invalid")
+    # An accepted binding describes its original installation, including paths
+    # in the profile's instructions. Check its persisted identity before allowing
+    # that exact historical fingerprint on readback. New admissions and writes
+    # still validate against the current profile; no capability is upgraded.
+    profile_prefix = "root-capability-profile:sha256:"
+    profiles = tuple(
+        item[len(profile_prefix):]
+        for item in binding.capability_bindings
+        if isinstance(item, str) and item.startswith(profile_prefix)
+    )
+    if len(profiles) > 1:
+        raise OwnerConflict("idea_runtime_binding_invalid")
+    binding, _binding_json, _binding_hash = _validated_runtime_binding(
+        binding,
+        stage=row.stage,
+        allow_legacy_full_conformance=True,
+        accepted_profile_hash=profiles[0] if profiles else None,
+    )
     return binding
 
 
