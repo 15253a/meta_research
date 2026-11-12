@@ -24,6 +24,9 @@ export const rootSessionStatus = (session: RootSession, language: "zh" | "en" = 
   ? language === "en" ? "Historical session" : "历史会话"
   : session.activity_label || statusLabels[session.status];
 const timeText = (value: number | null) => value ? new Date(value * 1_000).toLocaleString("zh-CN", { hour12: false }) : "时间待确认";
+const signedOutputIdentity = (page: RootOutput | null): string | null =>
+  page?.transport_invocation_hash && /^[a-f0-9]{64}$/.test(page.transport_invocation_hash) && typeof page.phase === "string" && page.phase
+    ? `${page.phase}:${page.transport_invocation_hash}` : null;
 
 function RootOutputTimestamp({ sourceUpdatedAt }: { sourceUpdatedAt: number | null | undefined }) {
   return typeof sourceUpdatedAt === "number" && Number.isFinite(sourceUpdatedAt) && sourceUpdatedAt > 0
@@ -325,6 +328,18 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   const [historyEnd, setHistoryEnd] = useState<number | null>(reading.historyEnd);
   const [follow, setFollow] = useState(reading.follow);
   const [detailsOpen, setDetailsOpen] = useState(reading.detailsOpen);
+  const [outputSources, setOutputSources] = useState(() => new Map([...reading.operations].flatMap(([ref, state]) => {
+    const identity = signedOutputIdentity(state.page);
+    return identity ? [[ref, identity] as const] : [];
+  })));
+  const recordOutputSource = useCallback((ref: string, identity: string | null) => {
+    setOutputSources(previous => {
+      if ((previous.get(ref) ?? null) === identity) return previous;
+      const next = new Map(previous);
+      if (identity) next.set(ref, identity); else next.delete(ref);
+      return next;
+    });
+  }, []);
   const [detailsHost, setDetailsHost] = useState<HTMLDivElement | null>(null);
   const [clockHost, setClockHost] = useState<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -374,6 +389,10 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
     const visibleOperations = new Set(operations.slice(start, end).map(operation => operation.operation_ref));
     // Keep each remembered session bounded to the four calls in its reading window.
     for (const ref of reading.operations.keys()) if (!visibleOperations.has(ref)) reading.operations.delete(ref);
+    setOutputSources(previous => {
+      const retained = new Map([...previous].filter(([ref]) => operations.some(operation => operation.operation_ref === ref)));
+      return retained.size === previous.size ? previous : retained;
+    });
   }, [reading, historyEnd, follow, start, end, session.operations]);
   useLayoutEffect(() => {
     const node = scrollRef.current;
@@ -438,6 +457,8 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
     }}>
       {start > 0 ? <button className="root-load-earlier" onClick={() => pauseReading(start)}>读取更早工作 · 还有 {start} 次</button> : null}
       {operations.slice(start, end).map((operation, index) => <RootOperationOutput key={operation.operation_ref} questRef={questRef} sessionRef={session.session_ref}
+        repeatedSource={outputSources.has(operation.operation_ref) && operations.slice(0, start + index).some(earlier => outputSources.get(earlier.operation_ref) === outputSources.get(operation.operation_ref))}
+        onOutputSource={recordOutputSource}
         operation={operation} sessionState={stale ? "unknown" : session.status} ordinal={start + index + 1} active={active} followLive={follow} onOutput={onOutput} readingCache={reading.operations} onReadHistory={() => pauseReading()}
         detailsHost={detailsHost} clockHost={index === end - start - 1 ? clockHost : null}
         onShowHistory={() => { reading.detailsOpen = true; setDetailsOpen(true); pauseReading(); }} />)}
@@ -453,7 +474,7 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   </section>;
 }
 
-function RootOperationOutput({ questRef, sessionRef, operation, sessionState, ordinal, active, followLive = true, onOutput, readingCache, onReadHistory, detailsHost, clockHost, onShowHistory }: { questRef: string; sessionRef: string; operation: RootOperation; sessionState?: RootSession["status"] | "unknown"; ordinal: number; active: boolean; followLive?: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void; detailsHost: HTMLDivElement | null; clockHost: HTMLDivElement | null; onShowHistory: () => void }) {
+function RootOperationOutput({ questRef, sessionRef, operation, sessionState, ordinal, active, followLive = true, onOutput, readingCache, onReadHistory, detailsHost, clockHost, onShowHistory, repeatedSource, onOutputSource }: { questRef: string; sessionRef: string; operation: RootOperation; sessionState?: RootSession["status"] | "unknown"; ordinal: number; active: boolean; followLive?: boolean; onOutput: () => void; readingCache: Map<string, OperationReadingState>; onReadHistory?: () => void; detailsHost: HTMLDivElement | null; clockHost: HTMLDivElement | null; onShowHistory: () => void; repeatedSource: boolean; onOutputSource: (ref: string, identity: string | null) => void }) {
   const [reading] = useState(() => {
     const state = readingCache.get(operation.operation_ref) ?? { page: null, chunks: [], browseOffset: null, tailOffset: 0, clock: null, visibleCount: 80 };
     readingCache.set(operation.operation_ref, state);
@@ -470,6 +491,9 @@ function RootOperationOutput({ questRef, sessionRef, operation, sessionState, or
   const tailOffset = useRef(reading.tailOffset);
   const chunksRef = useRef<{ offset: number; text: string }[]>(reading.chunks);
   const retryRequested = useRef(false);
+  useEffect(() => {
+    onOutputSource(operation.operation_ref, signedOutputIdentity(page));
+  }, [onOutputSource, operation.operation_ref, page?.transport_invocation_hash, page?.phase]);
   useEffect(() => {
     reading.page = page; reading.chunks = chunks; reading.browseOffset = browseOffset;
     reading.tailOffset = tailOffset.current; reading.clock = clock; reading.visibleCount = visibleCount;
@@ -550,6 +574,9 @@ function RootOperationOutput({ questRef, sessionRef, operation, sessionState, or
   }, [questRef, sessionRef, operation.operation_ref, operation.status, active, followLive, retry, browseOffset]);
   useEffect(onOutput, [page?.next_offset, page?.stream_ref, onOutput]);
   return <article className="root-operation" data-operation-ref={operation.operation_ref}>
+    {repeatedSource ? <div className="root-worker-notice" role="note">
+      <div><b>恢复时读回的原调用记录</b><span>这是已有调用的记录，并非新发起的调用。</span></div>
+    </div> : null}
     {operation.reason === "provider_terminal_proof_missing" ? <div className="root-session-warning" role="status">
       {operation.terminal_proof_diagnostic?.provider_operation_ref === operation.operation_ref
         && operation.terminal_proof_diagnostic.reasons.includes("provider_local_tree_closed_after_host_reboot")

@@ -34,6 +34,7 @@ export type RootOutput = {
   stream_ref: string; text: string; offset: number; next_offset: number; source_bytes: number;
   has_more: boolean; source_caught_up: boolean; source_updated_at: number | null; observed_at: number;
   native_session_ref: string | null; status: "live" | "terminal" | "waiting";
+  transport_invocation_hash?: string | null; phase?: string | null;
 };
 
 export class RootSessionError extends Error {
