@@ -687,6 +687,17 @@ def canonical_projection_bytes(value: object, name: str = "Bundle projection") -
         raise BundleProtocolError(name + " is not canonical UTF-8 JSON") from error
 
 
+def _is_canonical_root_synthesis(value: str, accepted_commit_refs: tuple[str, ...]) -> bool:
+    """Recognize the exact already-validated root document, never generic prose."""
+    from meta_research.bundle_batch_replan import validate_replan_basis
+
+    try:
+        basis = validate_replan_basis(json.loads(value), accepted_commit_refs)
+        return canonical_projection_bytes(basis).decode("utf-8") == value
+    except (ValueError, TypeError, UnicodeError, BundleProtocolError):
+        return False
+
+
 def validate_closed_bundle_projection(
     value: object,
     name: str = "Bundle projection",
@@ -710,7 +721,8 @@ def validate_closed_bundle_projection(
         if state["scalar_bytes"] > max_serialized_bytes:
             raise BundleProtocolError(name + " exceeds the root projection byte budget")
 
-    def visit(item_value: object, *, metric: bool = False, plan_text: bool = False) -> None:
+    def visit(item_value: object, *, metric: bool = False, plan_text: bool = False,
+              synthesis_commit_refs: tuple[str, ...] | None = None) -> None:
         state["nodes"] += 1
         if state["nodes"] > BUNDLE_ROOT_MAX_NODES:
             raise BundleProtocolError(name + " exceeds the root projection node budget")
@@ -736,14 +748,27 @@ def validate_closed_bundle_projection(
                 ) or (
                     type(item_value) is CodeReviewScope and item.name == "semantic_deltas"
                 )
-                visit(field_value, plan_text=inherited_plan_text)
+                # A typed batch root has already supplied a bounded, closed
+                # synthesis document. Retain that complete document in the
+                # report under its own field contract and the root envelope;
+                # it is not a 4 KiB reference or arbitrary long prose.
+                synthesis_refs = (
+                    item_value.accepted_target_commit_refs
+                    if type(item_value) is BundleReport
+                    and item_value.disposition == "replan_required"
+                    and item.name == "semantic_change_required"
+                    else None
+                )
+                visit(field_value, plan_text=inherited_plan_text,
+                      synthesis_commit_refs=synthesis_refs)
             return
         if type(item_value) is tuple:
             if len(item_value) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
                 raise BundleProtocolError(name + " contains an oversized tuple")
             seen: set[object] = set()
             for nested in item_value:
-                visit(nested, metric=metric, plan_text=plan_text)
+                visit(nested, metric=metric, plan_text=plan_text,
+                      synthesis_commit_refs=synthesis_commit_refs)
                 if type(nested) in _DUPLICATE_SENSITIVE_TYPES:
                     if nested in seen:
                         raise BundleProtocolError(name + " contains an exact duplicate proof")
@@ -763,9 +788,14 @@ def validate_closed_bundle_projection(
                 encoded = item_value.encode("utf-8")
             except UnicodeError as error:
                 raise BundleProtocolError(name + " is not valid UTF-8 text") from error
-            if (
+            oversized = (
                 len(item_value) > PLAN_TEXT_MAX_CHARS if plan_text
                 else len(encoded) > BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES
+            )
+            if oversized and not (
+                synthesis_commit_refs is not None
+                and len(encoded) <= max_serialized_bytes
+                and _is_canonical_root_synthesis(item_value, synthesis_commit_refs)
             ):
                 raise BundleProtocolError(name + " contains oversized text")
             add_scalar_bytes(len(canonical_projection_bytes(item_value, name + " text")))
