@@ -900,6 +900,7 @@ class TargetGraphReceiptVerifier(Protocol):
         graph_ref: str,
         frontier: tuple[dict[str, object], ...],
         allow_legacy_high_risk: bool = True,
+        strategy_revision: bool = False,
     ) -> None: ...
 
 

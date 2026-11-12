@@ -410,7 +410,7 @@ def validate_bundle_dispatch_result(
         if item.get("target_ref") == result.selected_target_ref
     ]
     if (
-        result.action not in {"dispatch", "wait", "replan_required"}
+        result.action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
         or (
             result.action == "dispatch"
             and (
@@ -422,6 +422,9 @@ def validate_bundle_dispatch_result(
         or (result.action != "dispatch" and result.selected_target_ref is not None)
     ):
         raise BundleSkillContractError("bundle_dispatch_target_not_in_frontier")
+    if result.action == "revise_strategy" and (request.frontier
+            or request.state.get("strategy_revision_available") is not True):
+        raise BundleSkillContractError("bundle_strategy_revision_not_ready")
     return canonical_hash(
         {
             "schema_ref": "meta-research/bundle-dispatch-decision/v1",
@@ -1485,7 +1488,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "由 Owner 评估 response、重验 authorization 并释放 waiter。绝对不得把 "
             "dispatch_allowed=false 的 Target 返回为 dispatch，也不得因 provider、"
             "validator 或 readiness 错误自行伪造 HumanRequest。"
-            "返回 wait 或 replan_required 时，selected_target_ref 必须为 null。\n"
+            "需要同根编制下一批策略而非等待外部条件时，只有 state.strategy_revision_available=true "
+            "才可返回 revise_strategy；下一次正式 target-batch 会接收此请求，仍须提出真实工作或有证据的策略收口。"
+            "此动作不创建或接纳任何 Target。wait 会持久等待，不会自动安排下一批。"
+            "返回 wait、replan_required 或 revise_strategy 时，selected_target_ref 必须为 null。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"graph_ref={request.graph_ref}\n"
             f"generation={request.generation}\n"
@@ -2050,7 +2056,7 @@ def _dispatch_schema(target_refs: tuple[str, ...]) -> dict[str, object]:
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["dispatch", "wait", "replan_required"],
+                "enum": ["dispatch", "wait", "replan_required", "revise_strategy"],
             },
             "selected_target_ref": {
                 "anyOf": [

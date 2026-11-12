@@ -364,7 +364,7 @@ class BundleStageWorker:
             if managed["status"] == "suspended" and managed.get("terminal_reason") == "human_request_wait":
                 self._observation = BundleObservation("waiting", "human_request_wait")
             return False
-        if managed is not None and managed["status"] == "running" and managed.get("cleanup_status") == "completed":
+        if managed is not None and managed["status"] == "running" and managed.get("cleanup_status") in {"completed", "none"}:
             provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
             current_binding = self._current_runtime_binding(provider)
             if current_binding is not None and not bundle_bindings_compatible(run.runtime_binding, current_binding):
@@ -545,7 +545,13 @@ class BundleStageWorker:
             if coordination_after_no_action:
                 decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
                 latest = decisions[-1] if decisions else None
-                if (latest is not None and latest.action == "wait" and not latest.frontier
+                if (latest is not None and latest.action == "revise_strategy"
+                        and latest.attempt_ref == run.attempt_ref
+                        and latest.fence_ref == run.fence_ref and latest.graph_ref == graph.graph_ref):
+                    # The accepted typed decision requests a new strategy proposal.
+                    # It is not a Target, a dispatch, or a synthetic inbox fact.
+                    coordination_after_no_action = False
+                elif (latest is not None and latest.action == "wait" and not latest.frontier
                         and latest.attempt_ref == run.attempt_ref
                         and latest.fence_ref == run.fence_ref and latest.graph_ref == graph.graph_ref):
                     # A wait consumes this exact research input, not the right to
@@ -1000,7 +1006,7 @@ class BundleStageWorker:
                         "bundle-dispatch", run.run_ref, str(len(decisions) + 1)
                     ),
                 )
-                self._observation = (BundleObservation("ready") if result.action == "dispatch" else BundleObservation("waiting", "bundle_replan_required" if result.action == "replan_required" else "bundle_root_waiting"))
+                self._observation = (BundleObservation("ready") if result.action in {"dispatch", "revise_strategy"} else BundleObservation("waiting", "bundle_replan_required" if result.action == "replan_required" else "bundle_root_waiting"))
                 return True
             finally:
                 if provider_safe:
@@ -1841,6 +1847,8 @@ class BundleStageWorker:
             "target_commit_refs": [commit.commit_ref for commit in commits],
             "running_targets": running,
             "blocked_targets": blocked,
+            "strategy_revision_available": (not graph.strategy_complete
+                and len(commits) == len(graph.targets) and not running and not blocked),
         }
 
     def _dispatch_target(

@@ -9415,7 +9415,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "reuse_receipt_invalid": "candidate.route.reuse_receipt: use the verified reuse-eligibility receipt for this candidate; TargetCommit acceptance is a different receipt.",
                     "candidate_measurement_cell_not_required": "candidate.measurement_contract: select a measurement cell present in the frozen NormalizedCompletionContract.",
                     "candidate_held_fixed_binding_incomplete": "candidate.held_fixed: provide the bindings for every declared controlled variable.",
-                    "bundle_dispatch_target_not_in_frontier": "dispatch: select a currently authorized frontier target; use null selected_target_ref for wait/replan_required.",
+                    "bundle_dispatch_target_not_in_frontier": "dispatch: select a currently authorized frontier target; use null selected_target_ref for wait/replan_required/revise_strategy; revise_strategy requires an open strategy with every existing Target committed.",
+                    "bundle_strategy_revision_not_ready": "revise_strategy: wait for actual outstanding work or evidence; only an open strategy with no frontier and every existing Target committed can return to the next target batch.",
                 }.get(code, "Correct the reported contract failure in the retained previous output; preserve accepted facts and current source bindings.")),
             }
 
@@ -20293,7 +20294,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             item for item in frontier if item.get("target_ref") == selected_target_ref
         ]
         if (
-            action not in {"dispatch", "wait", "replan_required"}
+            action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
             or (
                 action == "dispatch"
                 and (
@@ -20305,6 +20306,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or (action != "dispatch" and selected_target_ref is not None)
         ):
             raise OwnerConflict("bundle_dispatch_target_not_in_frontier")
+        if action == "revise_strategy" and (frontier
+                or state.get("strategy_revision_available") is not True):
+            raise OwnerConflict("bundle_strategy_revision_not_ready")
         validate_bundle_inbox_checkpoint(inbox_checkpoint)
         if (
             inbox_checkpoint.run_ref != run_ref
@@ -20372,6 +20376,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     graph_ref=graph_ref,
                     frontier=frontier,
                     allow_legacy_high_risk=False,
+                    strategy_revision=action == "revise_strategy",
                 )
                 expected_root = {
                     "run_kind": "bundle_stage",
@@ -25190,7 +25195,9 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
         or canonical_json(state) != row.state_json
         or canonical_hash(state) != row.state_hash
         or canonical_hash(decision) != row.decision_hash
-        or row.action not in {"dispatch", "wait", "replan_required"}
+        or row.action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
+        or (row.action == "revise_strategy" and (frontier
+            or state.get("strategy_revision_available") is not True))
         or (
             row.action == "dispatch"
             and (

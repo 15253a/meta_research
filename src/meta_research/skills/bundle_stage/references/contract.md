@@ -90,6 +90,19 @@ daemon 仅 claim、wake、single-flight、cancel、reconcile 和事件转发。c
 
 AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据冻结合同和 `formal_runs` 登记真实方法、Run、评价／待评价事实及产物角色，再接纳 TargetCommit。可有多个实际测量，也可没有评价；不要求每个 Target 都产生唯一 MetricResult。Bundle 重读接纳事实后更新 coverage。结果已接纳但 Dataset／Environment／Literature 的必要登记或关联尚未完成时，按主 Skill 的整理步骤处理并读回，不重复实施。
 
+## 调度与继续策略
+
+调度输出使用本次 schema 的 `action`、`selected_target_ref` 和 `rationale`。依据当前执行事实选择：
+
+| action | 本次决定 |
+| --- | --- |
+| `dispatch` | 从当前可派发 frontier 选择真实 Target，填写其准确 `selected_target_ref`。 |
+| `revise_strategy` | 策略尚未封口、frontier 为空、没有在途或阻塞 Target，且已有 Target 均已正式接纳 TargetCommit 时，请求原 Bundle 根形成下一次滚动策略提案。 |
+| `wait` | 等待具体外部条件、在途工作，或作出有依据的研究暂缓；在 rationale 中说明等待什么以及接续依据。 |
+| `replan_required` | 继续需要改变冻结科学承诺，说明必须修订的语义与剩余义务。 |
+
+后三项的 `selected_target_ref` 为 `null`。`revise_strategy` 只进入同根下一次正式 `target-batch` 提案，候选仍需正常接纳与调度；原 Plan、已接纳 Target 和 Commit 保持原样。需要编制下一批或汇总策略时明确选择这一动作，`wait` 不会要求系统代根生成下一批。当前决策采用最新运行条件，历史 operation 仍沿原精确输入对账。
+
 ## Bundle 收口
 
 普通 Literature 沿共享研究导航的 register／reference／read 及准确原件 reader 整理。BundleReport 如实保留未完成步骤、已有来源和阅读判断及具体阻塞，接口错误、部分失败不算无候选，不以阶段交接冒充整理完成。

@@ -2,8 +2,8 @@
 
 This is a new Owner transition after a human system-help retry, not equality or
 compatibility between runtime hashes. Shared guidance and the current tool
-contract are admitted anew, including schema changes. Model, adapter code,
-explicit capabilities and transport stay exact; Harness revalidates current
+contract and Bundle decision adapter are admitted anew, including schema changes.
+Model, explicit capabilities and transport stay exact; Harness revalidates current
 operations and HC revalidates existing research authorization.
 """
 import json
@@ -23,6 +23,11 @@ _POLICY_PREFIXES = (
     "package:meta_research.skills/references/human-guidance.md@sha256:",
     "harness-artifact:operation-binding-set:",
     "harness-artifact:operation-binding-contract:",
+    "package:meta_research.skills.bundle_stage/SKILL.md@sha256:",
+    "package:meta_research.skills.bundle_stage/references/contract.md@sha256:",
+    "package:meta_research.skills.bundle_stage/references/owner-operations.md@sha256:",
+    "adapter-source:meta_research.bundle_skill@sha256:",
+    "output-schema:target-dispatch@sha256:",
 )
 
 
@@ -182,8 +187,56 @@ def _same_execution_scope(prior, current):
             and execution_resources(prior.resource_bindings) == execution_resources(current.resource_bindings))
 
 
+def _formal_pause_resume(owner, connection, control):
+    """Prove an accepted quiet pause/resume on this exact current Attempt."""
+    from meta_research.owners.agent_runtime import (
+        _query_managed_safe_point, _runtime_control_reservation_document, _runtime_control_receipt,
+    )
+    saved = _query_managed_safe_point(connection, control)
+    if saved is None:
+        return None
+    checkpoint = saved["checkpoint"]
+    identity = {key: getattr(control, key) for key in (
+        "run_ref", "run_kind", "quest_ref", "cycle_ref", "epoch", "attempt_ref", "root_session_ref", "fence_ref")}
+    revision = checkpoint.get("control_revision")
+    if (checkpoint.get("action") != "pause" or checkpoint.get("run_status") != "running"
+            or any(checkpoint.get(key) != value for key, value in identity.items())
+            or type(revision) is not int or control.control_revision != revision + 2):
+        return None
+    proofs = {}
+    for action, old_status, new_status, reserved_revision in (
+            ("pause", "running", "suspended", revision), ("resume", "suspended", "running", revision + 1)):
+        matches = []
+        for operation in connection.execute(text("SELECT * FROM ar_control_operations WHERE action=:action "
+                "AND quest_ref=:quest AND cycle_ref=:cycle AND epoch=:epoch"),
+                {"action":action,"quest":control.quest_ref,"cycle":control.cycle_ref,"epoch":control.epoch}):
+            if action == "pause" and operation.operation_ref != checkpoint.get("operation_ref"):
+                continue
+            reservation = connection.execute(text("SELECT * FROM ar_control_reservations WHERE operation_ref=:ref"),
+                                             {"ref":operation.operation_ref}).first()
+            if reservation is None or reservation.status != "applied" or reservation.action != action:
+                continue
+            reserved = _runtime_control_reservation_document(reservation)
+            expected = {**identity,"status":old_status,"control_revision":reserved_revision}
+            if expected not in reserved["affected_runs"]:
+                continue
+            receipt = _runtime_control_receipt(operation)
+            expected_result = {key: identity[key] for key in (
+                "run_ref","run_kind","attempt_ref","root_session_ref","fence_ref")}
+            expected_result.update(status=new_status,safe_point_ref=saved["safe_point_ref"],cleanup_status="none")
+            if expected_result not in receipt["affected_runs"]:
+                continue
+            owner.verify_runtime_control_receipt(operation_ref=operation.operation_ref, action=action,
+                target=json.loads(reservation.payload_json)["target"], receipt=receipt)
+            matches.append(operation.operation_ref)
+        if len(matches) != 1:
+            return None
+        proofs[action + "_operation_ref"] = matches[0]
+    return {**proofs,"safe_point_ref":saved["safe_point_ref"],"checkpoint_hash":saved["checkpoint_hash"]}
+
+
 def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_binding, harness_authority):
-    """Adopt the installed provider only after the original retry is reconciled."""
+    """Admit the installed provider at a proven retry or quiet operator resume."""
     from meta_research.owners.agent_runtime import (
         _load_stage_fence, _runtime_binding_from_row, _validated_runtime_binding,
         _assert_runtime_control_allows, _require_current_fence, _prepared_control_affects_run,
@@ -201,18 +254,25 @@ def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_bi
         prior = _runtime_binding_from_row(run)
         if run.runtime_binding_hash == binding_hash:
             return False
+        if attempt.status not in {"running", "executed"}:
+            raise OwnerConflict("bundle_runtime_refresh_not_ready")
         control = connection.execute(text("SELECT * FROM ar_run_controls WHERE run_ref=:run"), {"run": run_ref}).one()
         _assert_runtime_control_allows(connection, run_ref, fence_ref)
-        _require_current_fence(run, attempt, fence, "running", "current")
+        _require_current_fence(run, attempt, fence, attempt.status,
+                               "submitted" if attempt.status == "executed" else "current")
         replacement = connection.execute(text("SELECT reason_code FROM ar_stage_attempt_replacements WHERE replacement_attempt_ref=:attempt"),
                                          {"attempt": attempt_ref}).first()
         units = connection.execute(text("SELECT * FROM ar_provider_units WHERE run_ref=:run"), {"run": run_ref}).all()
-        if (run.stage != "bundle" or control.status != "running" or control.cleanup_status != "completed"
-                or replacement is None or replacement.reason_code != "human_request_resume_after_restart"
+        human_retry = (control.cleanup_status == "completed" and replacement is not None
+                       and replacement.reason_code == "human_request_resume_after_restart"
+                       and attempt.submission_ref is None)
+        operator_resume = (_formal_pause_resume(owner, connection, control)
+                           if control.cleanup_status == "none" else None)
+        if (run.stage != "bundle" or control.status != "running" or not (human_retry or operator_resume)
                 or _prepared_control_affects_run(connection, run_ref)
                 or any(unit.status not in {"completed", "revoked"} for unit in units)
                 or not units or not session.native_session_ref or attempt.primary_draft_json is None
-                or attempt.submission_ref is not None or not _same_execution_scope(prior, current)):
+                or not _same_execution_scope(prior, current)):
             raise OwnerConflict("bundle_runtime_refresh_not_ready")
         # A broad research grant remains necessary. A refreshed clock or guidance
         # cannot itself grant access, resources, or high-risk Target execution.
@@ -250,6 +310,7 @@ def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_bi
                  "copied_primary": {name: getattr(attempt, name) for name in (
                      "primary_draft_hash", "primary_recorded_at", "primary_adapter_kind", "primary_provider_unit_ref")},
                  "primary_source_runtime_binding_hash": primary_source,
+                 "operator_resume": operator_resume,
                  "terminal_units": [{"unit_ref": u.unit_ref,"status": u.status,"operation_ref": u.operation_ref} for u in units]}
         connection.execute(text("INSERT INTO ar_bundle_runtime_refreshes VALUES (:ref,:run,:retired,:replacement,:generation,:payload,:hash,:now)"),
                            {"ref": refresh_ref, "run": run_ref, "retired": attempt_ref,

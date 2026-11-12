@@ -6097,8 +6097,9 @@ class SQLiteResearchGraphReceiptVerifier:
         graph_ref: str,
         frontier: tuple[dict[str, object], ...],
         allow_legacy_high_risk: bool = True,
+        strategy_revision: bool = False,
     ) -> None:
-        if not isinstance(allow_legacy_high_risk, bool):
+        if not isinstance(allow_legacy_high_risk, bool) or not isinstance(strategy_revision, bool):
             raise OwnerConflict("bundle_dispatch_frontier_invalid")
         with self._database.read() as connection:
             graph_row = connection.execute(
@@ -6177,6 +6178,9 @@ class SQLiteResearchGraphReceiptVerifier:
         graph = _accepted_target_graph(
             graph_row, target_rows, append_rows, plan_document
         )
+        if strategy_revision and (frontier or graph.strategy_complete
+                or committed != {target.target_ref for target in graph.targets}):
+            raise OwnerConflict("bundle_strategy_revision_not_ready")
         authoritative = tuple(
             target
             for target in (_accepted_target(row) for row in target_rows)
