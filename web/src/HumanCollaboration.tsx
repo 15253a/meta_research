@@ -326,6 +326,8 @@ function CompanionReplyContent({ message, scopeRef, onChanged }: {
     : null, onChanged);
   const content = pending && preview?.text ? preview.text : messageText(message);
   const replying = pending && (!preview || ["queued", "processing", "running"].includes(preview.status));
+  const failed = message.status === "failed" || pending && preview?.status === "failed";
+  const [showFailureReason, setShowFailureReason] = useState(false);
   const contentRef = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     scrollToConversationMessage(contentRef.current);
@@ -333,6 +335,16 @@ function CompanionReplyContent({ message, scopeRef, onChanged }: {
   return <span ref={contentRef} style={{ whiteSpace: "pre-wrap" }}>{content}{replying ? (
     <span className="lumen-message-state" role="status">
       {content ? "正在回复…" : "Codex 正在思考…"}
+    </span>
+  ) : null}{failed ? (
+    <span className="lumen-message-state">
+      <span role="alert">本次回复未完成，消息和已有记录已保留。</span>
+      {message.reason?.code ? <>
+        <button type="button" aria-expanded={showFailureReason} onClick={() => setShowFailureReason(value => !value)}>
+          查看原因代码
+        </button>
+        {showFailureReason ? <code>{message.reason.code}</code> : null}
+      </> : null}
     </span>
   ) : null}</span>;
 }

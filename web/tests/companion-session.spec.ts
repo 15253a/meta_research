@@ -68,6 +68,30 @@ async function workspace(page: Page, busy = false) {
   return { snapshot, companion, writes };
 }
 
+test("a failed Companion turn remains visible with its reason and original message", async ({ page }) => {
+  const state = await workspace(page);
+  state.companion.messages.push(
+    { message_ref: "failed:user", scope_ref: state.companion.scope_ref, role: "user", content: "只读解释首轮结果和后继工作。", status: "completed", native_session_generation: 1, native_session_ref: "native-original" },
+    { message_ref: "failed:assistant", scope_ref: state.companion.scope_ref, role: "assistant", content: "", status: "failed", reason: { code: "codex_operation_failed" }, native_session_generation: 1, native_session_ref: "native-original" },
+  );
+  await page.goto("http://127.0.0.1:18768/?workspace=1&companion=1", { waitUntil: "domcontentloaded" });
+  const assistant = page.getByRole("complementary", { name: "研究助手", exact: true });
+  await expect(assistant).toContainText("只读解释首轮结果和后继工作。");
+  await expect(assistant).toContainText("旧会话核验结果及限制仍可回看。");
+  await expect(assistant.getByRole("alert")).toHaveText("本次回复未完成，消息和已有记录已保留。");
+  const reason = assistant.getByRole("button", { name: "查看原因代码", exact: true });
+  await expect(reason).toHaveAttribute("aria-expanded", "false");
+  await expect(assistant.getByText("codex_operation_failed", { exact: true })).toHaveCount(0);
+  await reason.focus();
+  await page.keyboard.press("Enter");
+  await expect(reason).toHaveAttribute("aria-expanded", "true");
+  await expect(assistant.getByText("codex_operation_failed", { exact: true })).toBeVisible();
+  await page.keyboard.press("Space");
+  await expect(reason).toHaveAttribute("aria-expanded", "false");
+  await expect(assistant.getByText("Codex 正在思考…", { exact: true })).toHaveCount(0);
+  expect(state.writes).toEqual([]);
+});
+
 test("/new rotates the public session while preserving workspace and visible old work", async ({ page }) => {
   const state = await workspace(page);
   await page.goto("http://127.0.0.1:18768/?workspace=1&companion=1", { waitUntil: "domcontentloaded" });
