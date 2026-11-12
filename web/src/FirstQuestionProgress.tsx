@@ -55,8 +55,10 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
   const generationFailure = generation?.status === "failed" || generation?.status === "capability_unavailable" ? generation.failure : null;
   const preparationBlocked = preparationRetryBlocked(deepfetch);
   const cancelled = deepfetch?.status === "cancelled" || creation.status === "cancelled";
-  const stale = creation.status === "proposal_stale" || creation.proposal?.status === "stale" || basis?.freshness === "stale" || deepfetch?.freshness === "stale";
-  const active = !failed && !cancelled && !ready && !stale && (pending || creation.status === "proposal_generating" || ["queued", "running"].includes(generation?.status ?? "") || ["queued", "running", "accepting"].includes(deepfetch?.status ?? ""));
+  const currentAttempt = ["queued", "running"].includes(generation?.status ?? "")
+    || deepfetch?.freshness === "current" && ["queued", "running", "accepting"].includes(deepfetch.status);
+  const stale = !currentAttempt && !failed && (creation.status === "proposal_stale" || creation.proposal?.status === "stale" || basis?.freshness === "stale" || deepfetch?.freshness === "stale");
+  const active = !failed && !cancelled && !ready && !stale && (pending || creation.status === "proposal_generating" || currentAttempt);
   const hasMaterials = Boolean(creation.work_materials?.length || ("material_manifest" in creation.quest_draft.value && creation.quest_draft.value.material_manifest?.entries.length) || ("literature" in creation.quest_draft.value && creation.quest_draft.value.literature.accepted_material_bindings.length));
   const direct = creation.route === "direct";
   const searchDone = deepfetch?.status === "succeeded" && Boolean(deepfetch.literature_snapshot);
