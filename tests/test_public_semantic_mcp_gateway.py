@@ -559,8 +559,14 @@ def test_web_composition_binds_all_root_resident_mcp_channels(tmp_path) -> None:
         reasoning_provider = runtime.reasoning_stage._provider
         assert bundle_provider._full_conformance_authority is runtime.harnesses
         assert reasoning_provider._full_conformance_authority is runtime.harnesses
-        assert bundle_provider._resident_mcp_base_url == "http://127.0.0.1:8766"
-        assert reasoning_provider._resident_mcp_base_url == "http://127.0.0.1:8766"
+        for root_kind, provider in (
+            ("bundle", bundle_provider), ("reasoning", reasoning_provider)
+        ):
+            channels = provider._root_resident_mcp
+            assert channels._root_kind == root_kind
+            assert channels._authority is runtime.harnesses
+            assert channels.enabled
+            assert channels.endpoint_url == "http://127.0.0.1:8766/mcp"
         assert runtime.target_run_runtime._harnesses is runtime.harnesses
         assert runtime.target_run_runtime._mcp_base_url == "http://127.0.0.1:8766"
     finally:

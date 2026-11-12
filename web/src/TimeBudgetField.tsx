@@ -15,7 +15,8 @@ export function TimeBudgetField({ value, onChange, onBlur, disabled = false, cla
       placeholder="输入小时数，例如 2.5" value={timeBudgetHours(value)} disabled={disabled || value === "open"}
       aria-invalid={invalid || undefined} onChange={event => onChange(`${event.currentTarget.value}h`)} onBlur={onBlur} /></label>
     <button type="button" className="time-budget-open" aria-pressed={value === "open"} disabled={disabled}
-      onClick={() => onChange(value === "open" ? previousHours.current : "open")}>不设硬截止</button>
+      onClick={() => onChange(value === "open" ? previousHours.current : "open")}>不设总时长建议</button>
+    <small>规划参考，可按研究进展调整；超出预算不会自动停止研究。</small>
     {invalid ? <small role="alert">请输入大于 0 的小时数，最多两位小数。</small> : null}
   </div>;
 }

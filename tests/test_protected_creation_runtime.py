@@ -384,6 +384,43 @@ print("native complete")
     assert (runtime.work_directory / "unselected.txt").read_text() == "trial only"
 
 
+def test_declared_resource_layout_preserves_links_and_clears_prior_allowlist(runtime, tmp_path):
+    resources = tmp_path / "resources"
+    (resources / "references").mkdir(parents=True)
+    guide = resources / "SKILL.md"
+    reference = resources / "references" / "guide.md"
+    guide.write_text("Read [guide](references/guide.md)")
+    reference.write_text("exact allowed bytes")
+    (resources / "undeclared.md").write_text("must remain unreadable")
+    external = tmp_path / "original.txt"
+    external.write_text("external original")
+    developer = "developer_instructions=" + json.dumps(f"Shared reference root: {resources}\n")
+    script = '''import json, pathlib, sys
+root = pathlib.Path(json.loads(sys.argv[1].split("=", 1)[1]).split(": ", 1)[1].strip())
+guide = root / "SKILL.md"
+linked = guide.parent / guide.read_text().split("(", 1)[1].rstrip(")")
+assert linked.read_text() == "exact allowed bytes"
+assert not (root / "undeclared.md").exists()
+assert not pathlib.Path(sys.argv[2]).exists()
+try:
+    linked.write_text("change")
+except PermissionError:
+    pass
+else:
+    raise AssertionError("Projected resources must be read-only")
+print(str(root))
+'''
+    call = replace(_call(script, arguments=(developer, external), inputs=(guide, reference)),
+                   input_layout_root=resources)
+    completed = runtime.run(call)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "/inputs/resources\n"
+    assert reference.read_text() == "exact allowed bytes"
+    following = runtime.run(replace(_call("import pathlib; assert not pathlib.Path('/inputs/resources/references/guide.md').exists()",
+        inputs=(guide,)), input_layout_root=resources))
+    assert following.returncode == 0, following.stderr
+
+
 def test_private_native_state_survives_resume_and_auth_stays_private(runtime):
     first = runtime.run(_call('''
 from pathlib import Path

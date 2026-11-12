@@ -90,6 +90,31 @@ daemon 仅 claim、wake、single-flight、cancel、reconcile 和事件转发。c
 
 AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据冻结合同和 `formal_runs` 登记真实方法、Run、评价／待评价事实及产物角色，再接纳 TargetCommit。可有多个实际测量，也可没有评价；不要求每个 Target 都产生唯一 MetricResult。Bundle 重读接纳事实后更新 coverage。结果已接纳但 Dataset／Environment／Literature 的必要登记或关联尚未完成时，按主 Skill 的整理步骤处理并读回，不重复实施。
 
+## 调度与继续策略
+
+调度输出使用本次 schema 的 `action`、`selected_target_ref` 和 `rationale`。依据当前执行事实选择：
+
+| action | 本次决定 |
+| --- | --- |
+| `dispatch` | 从当前可派发 frontier 选择真实 Target，填写其准确 `selected_target_ref`。 |
+| `revise_strategy` | 策略尚未封口、frontier 为空、没有在途或阻塞 Target，且已有 Target 均已正式接纳 TargetCommit 时，请求原 Bundle 根形成下一次滚动策略提案。 |
+| `wait` | 等待具体外部条件、在途工作，或作出有依据的研究暂缓；在 rationale 中说明等待什么以及接续依据。 |
+| `replan_required` | 根据真实结果与未完成责任，判断冻结研究承诺或工作安排需由后继修订，并说明依据。 |
+
+后三项的 `selected_target_ref` 为 `null`。`revise_strategy` 只进入同根下一次正式 `target-batch` 提案，候选仍需正常接纳与调度；原 Plan、已接纳 Target 和 Commit 保持原样。需要编制下一批或汇总策略时明确选择这一动作，`wait` 不会要求系统代根生成下一批。当前决策采用最新运行条件，历史 operation 仍沿原精确输入对账。
+
+## 批次重规划交接
+
+`target-batch` 输出按本次 schema 明确选择 `action=propose_targets | replan_required`，并提供非空、至多 512 字符的 `rationale`。`propose_targets` 携带正常 `strategy_update`，`replan_basis=null`；根判断当前冻结安排需要修订、适宜由后继 Cycle 承接时，使用 `replan_required`，`strategy_update=null`，将真实综合写入 `replan_basis`：
+
+- `work_summary`：已经实际开展及取得的工作，包括失败和局部产物。
+- `source_target_commit_refs`：本轮已正式接纳、实际支持本次判断的准确 TargetCommit 引用。
+- `limitations`：结论适用范围、证据缺口和技术限制；环境未就绪只支持环境事实。
+- `unfinished_work`：仍未完成的研究义务。
+- `next_focus`：后续应优先处理什么，以及该安排如何消费已有结果和限制。
+
+这是一项由原根作出的正式判断。先完成必要独立审阅并保留准确来源；Owner 验证当前根、工作终态和来源 Commit 后，将该判断交给 BundleReport 综合及 Reasoning。原 Plan、cell 身份、TargetCommit 与失败记录保持原样。新候选不能承担已占用 cell、或缺少真实前提时，按事实判断继续的可行性与交接价值；不以空且未封口的策略输出代替此分支。建议时间预算及偏差本身不要求重规划或结束。
+
 ## Bundle 收口
 
 普通 Literature 沿共享研究导航的 register／reference／read 及准确原件 reader 整理。BundleReport 如实保留未完成步骤、已有来源和阅读判断及具体阻塞，接口错误、部分失败不算无候选，不以阶段交接冒充整理完成。
@@ -98,7 +123,7 @@ AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据�
 | --- | --- |
 | `realized` | 已安排 Brief 的所需 cells 有 current accepted TargetCommit，结果方向不限；不据此宣布 Plan 中未安排的 gap 已履行。 |
 | `blocked` | 技术、权限、资源、currentness 或未知结果阻止可信继续。 |
-| `replan_required` | 剩余有效路线必须改变冻结科学承诺。 |
+| `replan_required` | 根据真实结果与未完成责任，冻结研究承诺或工作安排需由后继修订。 |
 | `ExhaustionProposal` | 冻结范围内已无实质不同路线，全部执行、交接、取消、人类待办和未知效果已对账。 |
 
 负、零、不显著或不确定结果可以实现承诺；真实未完成工作不能靠耗尽或修订标签隐藏。BundleReport 候选包含当前 request／Plan、逐 Brief 覆盖、已接纳 Commit 与交接来源、剩余工作及真实阻塞。它不把 live workspace、未冻结指标或子会话全文作为正式结果。AE 在当前范围与接纳链验证后形成 StageCommit。完整 Plan 中未安排的责任与理由继续供 Reasoning 综合，不另建覆盖台账；新完成的文稿或其他产物据实际 TargetCommit 报告，不回写旧 Plan 的覆盖和来源快照。

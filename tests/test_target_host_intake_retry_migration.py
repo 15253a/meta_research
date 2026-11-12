@@ -28,10 +28,6 @@ def test_host_intake_retry_migration_preserves_populated_owner_records(
             lambda *_args, **_kwargs: None,
         )
         previous_schema.setattr(
-            "meta_research.quest_research_time.require_time_for_new_work",
-            lambda *_args, **_kwargs: None,
-        )
-        previous_schema.setattr(
             "meta_research.quest_research_time.QuestResearchTimeMixin.query_research_time",
             # Pre-0081 dispatch did not have an elapsed-time admission gate.
             # This seed-only observation creates no budget or clock records.

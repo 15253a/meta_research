@@ -1092,7 +1092,7 @@ export function QuestCreationWorkbench({
       const generationPoll = pollCreation(
         queued.initialization_id,
         proposalGenerationSettled,
-        draftRef.current.route === "deepfetch" ? null : 190_000,
+        null,
       );
       recoveryPollRef.current = {
         initializationId: queued.initialization_id,
@@ -1111,8 +1111,6 @@ export function QuestCreationWorkbench({
       const nextGeneration = currentProposalGeneration(next);
       const nextDeepFetch = currentDeepFetch(next);
       if (
-        nextGeneration?.status === "capability_unavailable" ||
-        nextGeneration?.status === "failed" ||
         nextDeepFetch?.status === "failed" ||
         nextDeepFetch?.status === "cancelled"
       ) {
@@ -1121,7 +1119,9 @@ export function QuestCreationWorkbench({
           nextGeneration?.failure?.code ??
           "proposal_drafter_unavailable",
         ));
-      } else {
+      } else if (nextGeneration?.status !== "capability_unavailable" && nextGeneration?.status !== "failed") {
+        // Generation failures are rendered from the durable projection, so they
+        // remain visible after closing/reopening without a second local alert.
         restoreTriggerFocus = true;
       }
     } catch (caught) {
@@ -2920,12 +2920,9 @@ function resourceEnvelopeCopy(creation: QuestCreationView): string {
   const devices = envelope.selected_device_uuids
     .map((uuid) => devicesByUuid.get(uuid) ?? uuid)
     .join("、");
-  const ceiling = envelope.hard_ceiling.seconds === null
-    ? "未设时限"
-    : `${envelope.hard_ceiling.seconds.toLocaleString("zh-CN")} 秒上限`;
   return `已绑定 ${envelope.selected_device_uuids.length} 张实际检测设备。` +
-    `时间预算 ${timeBudgetLabel(envelope.time_budget)} · ${ceiling} · ${devices || "未选设备"}；` +
-    `实际使用情况将在作业运行后记录。`;
+    `建议时间预算 ${timeBudgetLabel(envelope.time_budget)} · ${devices || "未选设备"}；` +
+    `实际用时和偏差将在工作中记录，预算不作为自动截止时间。`;
 }
 
 function formatMemory(memoryTotalMib: number): string {

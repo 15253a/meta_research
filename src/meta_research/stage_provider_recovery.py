@@ -49,6 +49,13 @@ class StoppedStageProviderRecovery:
 
     def read_for_operator_resume(self, run_ref: str, pending_phase: str) -> dict[str, object] | None:
         """Verify the exact stopped transport before replacing a paused call."""
+        return self._read_operator_stop(run_ref, pending_phase, statuses={"completed"})
+
+    def read_for_operator_settlement(self, run_ref: str, pending_phase: str) -> dict[str, object] | None:
+        """Verify the same stopped call before or after the control driver's ACK."""
+        return self._read_operator_stop(run_ref, pending_phase, statuses={"running", "completed"})
+
+    def _read_operator_stop(self, run_ref: str, pending_phase: str, *, statuses: set[str]) -> dict[str, object] | None:
         try:
             scope = self._reader._validated_scope(
                 self._reader._scope_lookup(run_ref), run_ref=run_ref
@@ -58,7 +65,7 @@ class StoppedStageProviderRecovery:
                 ("bundle_stage", "bundle_primary"): "primary",
                 ("plan_stage", "plan_primary"): "primary",
             }.get((scope["run_kind"], scope["unit_kind"]))
-            if scope["status"] != "completed" or expected_phase is None or expected_phase != pending_phase:
+            if scope["status"] not in statuses or expected_phase is None or expected_phase != pending_phase:
                 return None
             operation = self._reader._resolve_operation(scope)
             if operation is None:
@@ -69,7 +76,7 @@ class StoppedStageProviderRecovery:
             receipt_path = directory / "supervisor-exit.json"
             if not receipt_path.exists():
                 raise OwnerConflict("operator_stop_checkpoint_unavailable")
-            _, _, limits = _verified_operation_inputs(directory, invocation_hash=invocation_hash)
+            prompt_hash, schema_hash, limits = _verified_operation_inputs(directory, invocation_hash=invocation_hash)
             _, key = read_transport_key_for_operation(directory)
             receipt, envelope = read_verified_exit_receipt(
                 receipt_path, key=key, invocation_hash=invocation_hash,
@@ -91,6 +98,12 @@ class StoppedStageProviderRecovery:
                 "invocation_hash": invocation_hash,
                 "supervisor_receipt_hash": canonical_hash(envelope),
                 "provider_exit": receipt,
+                "hard_ceiling_checkpoint": _provider_hard_ceiling_checkpoint({
+                    "invocation_hash": invocation_hash, "termination_reason": "stopped",
+                    "prompt_hash": prompt_hash, "output_schema_hash": schema_hash,
+                    "stdout_hash": canonical_hash(stdout), "result_file_hash": receipt["result_file_hash"],
+                    "supervisor_receipt_hash": canonical_hash(envelope),
+                }),
             }
         except (StageRootObservationError, ProviderOperationUnavailable, ProviderSupervisorError,
                 OSError, UnicodeError, ValueError) as error:

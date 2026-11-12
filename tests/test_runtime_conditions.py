@@ -126,6 +126,9 @@ def test_selected_four_gpus_budget_literature_and_target_directory(root):
     rendered = render_runtime_conditions(workspace, quest_ref="quest-one", run_ref="run-one",
                                          target_ref="target-one", initialization_id="init-one")
     assert "GPU-one-3" in rendered
+    assert "规划建议" in rendered
+    assert "1200 秒" in rendered
+    assert "先申请 research_time_extension" not in rendered
 
 
 @pytest.mark.parametrize('style,description', [

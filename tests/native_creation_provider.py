@@ -26,7 +26,7 @@ class ObservedCompanion(CodexCompanionAdapter):
         return result
 
 
-def native_creation_executable(path):
+def native_creation_executable(path, *, program_transform=None):
     compiler = shutil.which("cc")
     assert compiler is not None, "Native integration requires a C compiler"
     code = r"""import json, os, sys
@@ -55,6 +55,8 @@ Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(json.dumps(
 print(json.dumps({'type': 'thread.started', 'thread_id': 'local-native-root'}))
 print(json.dumps({'type': 'turn.completed'}))
 """.replace('VERSION', CODEX_LOCKED_VERSION).replace('QUESTION', repr(QUESTION))
+    if program_transform is not None:
+        code = program_transform(code)
     source = path.with_suffix('.c')
     source.write_text('#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) {\n'
         + 'const char *code=' + json.dumps(code) + ';\n'

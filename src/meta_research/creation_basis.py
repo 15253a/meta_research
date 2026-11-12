@@ -794,7 +794,12 @@ class CreationBasisMemory:
                 reference = source["reference"]
                 with self.workspaces.server_files._open_reference(reference["source"], "") as (_, details):
                     if details["kind"] != "file":
-                        raise OwnerConflict("creation_source_file_required")
+                        raise OwnerConflict("creation_source_file_required", {
+                            "basis_ref": basis["basis_ref"], "basis_hash": basis["basis_hash"],
+                            "material_key": material_key,
+                            "correction": "This reference describes a directory, not file content. Use a retained file's exact reader. entry_path does not select creation source files.",
+                            "retained_files": self._retained_original_files(basis, reference["reference_ref"]),
+                        })
                 page = self.workspaces.server_files.read(reference["source"], path="",
                     observation_ref=details["observation_ref"], offset=offset, max_bytes=limit)
                 return {**page, "content": material_bytes(page)}
@@ -811,6 +816,15 @@ class CreationBasisMemory:
                 content = content.encode("utf-8")
         return {**page, "content": content}
 
+    @staticmethod
+    def _retained_original_files(basis, reference_ref):
+        return [{"material_key": item["material_key"], "relative_path": item["relative_path"],
+            "binding": item["binding"], "reader": {"operation": "research_memory.content.read",
+                "source_ref": item["binding"]["version_ref"], "version_ref": item["binding"]["version_ref"]}}
+            for item in basis["sources"] if item["binding"] is not None
+            and item.get("source", {}).get("kind") == "original_file"
+            and item["source"]["reference_ref"] == reference_ref]
+
     def source_views(self, basis):
         views = []
         for source in basis["sources"]:
@@ -819,6 +833,10 @@ class CreationBasisMemory:
                 if binding is not None else {"operation": "research_memory.creation_basis.read", "basis_ref": basis["basis_ref"],
                     "expected_basis_hash": basis["basis_hash"], "view": "source", "material_key": source["material_key"]})
             view = {**source, "reader": reader}
+            reference = source.get("reference", {})
+            if binding is None and reference.get("source", {}).get("kind") == "directory":
+                view.update(reader=None, read_status="directory_reference",
+                    retained_files=self._retained_original_files(basis, reference["reference_ref"]))
             if basis.get("input_identity") is not None:
                 view["coverage"] = {**source["coverage"], "read_ranges": [
                     self.citation_view(basis, item) for item in source["coverage"]["read_ranges"]]}

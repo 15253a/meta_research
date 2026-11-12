@@ -3,6 +3,105 @@ import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import type { QuestCreationView } from "../src/api";
 
+for (const routeKind of ["direct", "deepfetch"] as const) {
+  test(`${routeKind} current preparation takes precedence over retained stale basis and proposal`, async ({ page }) => {
+    const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
+    snapshot.human_collaboration.human_requests.items = [];
+    const hash = "b".repeat(64);
+    const previousHash = "a".repeat(64);
+    const startedAt = 1_791_705_600;
+    await page.clock.setFixedTime(new Date((startedAt + 65) * 1000));
+    const creation: QuestCreationView = {
+      initialization_id: "init-current-reassessment", creation_context: "quest_initialization", route: routeKind, status: "proposal_generating",
+      quest_draft: { revision: 3, hash, schema_ref: "meta-research/quest-initialization-draft/v2", value: {
+        goal: "根据当前研究重心重新准备第一问", completion_criteria: "保留实际来源与未完成工作", time_budget: "4h", research_style: "balanced", route: routeKind,
+        resource_envelope_ref: null, resource_envelope_hash: null, background_and_initial_direction: "",
+        literature: { mode: "oa_only", library_entry_url: "", scope_exclusions: "", accepted_material_bindings: [] },
+        material_manifest: { entries: [{ material_key: "notes", relative_path: "notes.md", sha256: hash, bytes: 120 }], submissions: [] },
+      } },
+      compute: null, resource_envelope: null,
+      creation_basis: { basis_ref: "previous-basis", basis_hash: previousHash, kind: "prepared", freshness: "stale",
+        understanding: { material_composition: [], work_already_done: [], claims_and_conditions: [], conflicts: [], gaps: [], unfinished_questions: [] },
+        sources: [], corrections: [], search_assessment: null },
+      proposal: { ref: "previous-proposal", revision: 1, hash: previousHash, basis_revision: 2, basis_hash: previousHash, status: "stale",
+        content: { title: "此前的问题草稿", unknown_statement: "哪些结果可复用？", answer_shape: "有条件的判断", applicability_scope: "已有材料",
+          background_context: "", requirements_constraints: "" }, literature_snapshot_ref: null },
+      proposal_generation: routeKind === "direct" ? { ref: "current-generation", basis_revision: 3, basis_hash: hash, status: "running",
+        adapter_kind: "production", attempt_count: 1, started_at: startedAt, completed_at: null, failure: null, literature_snapshot_ref: null } : null,
+      deepfetch: routeKind === "deepfetch" ? { request_ref: "current-deepfetch", correlation_ref: "current-correlation", basis_revision: 3, basis_hash: hash,
+        scope_hash: hash, freshness: "current", status: "queued", activity: "waiting_for_runtime", progress: { completed: 0, total: 5 }, recent_events: [],
+        authorization_receipt: { status: "accepted", issuer: "fixture", kind: "deepfetch-authorization", receipt_ref: "current-receipt", subject_ref: "current-deepfetch", payload_hash: hash },
+        preparation: { ref: "current-preparation", started_at: startedAt, completed_at: null, operation_state: "active", retry_permitted: false },
+        run: null, literature_snapshot: null, failure: null } : null,
+      confirmation_preview: null, intent_session: null, acquisition_session: null, recovery: null, canonical_empty_advancement: false,
+      capabilities: { direct: { status: "ready" }, first_question_deepfetch: { status: "ready" }, accepted_material_basis: { status: "ready" } },
+      receipts: { human_confirmation: { status: "not_attempted" }, quest_goal: { status: "not_attempted" }, broad_research_authorization: { status: "not_attempted" },
+        question_content: { status: "not_attempted" }, question_identity: { status: "not_attempted" }, cycle_activation: { status: "not_attempted" } },
+    };
+    const webRoot = process.env.META_RESEARCH_WEB_DIST ?? resolve(import.meta.dirname, "../../src/meta_research/web_dist");
+    let posts = 0;
+    await page.route("**/*", async route => {
+      const url = new URL(route.request().url());
+      if (url.origin !== "http://127.0.0.1:18768") return route.abort();
+      const json = (body: unknown) => route.fulfill({ contentType: "application/json", body: JSON.stringify(body) });
+      if (route.request().method() === "POST") { posts += 1; return route.abort(); }
+      if (url.pathname === "/api/v1/snapshot") return json({ ...snapshot, quest_creation: { ...snapshot.quest_creation, current: creation } });
+      if (url.pathname === `/api/v1/quest-initializations/${creation.initialization_id}`) return json(creation);
+      if (url.pathname.endsWith("/proposal-output") || url.pathname.endsWith("/preparation-output")) return json({
+        generation_ref: creation.proposal_generation?.ref ?? creation.deepfetch?.preparation?.ref,
+        status: creation.proposal_generation?.status ?? creation.deepfetch?.status, availability: "ready", phase: "understanding",
+        text: "", next_offset: 0, source_bytes: 0, has_more: false,
+      });
+      if (url.pathname === "/api/v1/preferences") return json({ output_language: "zh" });
+      if (url.pathname === "/api/v1/events") return route.fulfill({ contentType: "text/event-stream", body: "event: snapshot.required\ndata: {}\n\n" });
+      if (url.pathname.startsWith("/api/")) return route.abort();
+      if (url.pathname !== "/" && !/^\/assets\/[\w.-]+$/.test(url.pathname)) return route.abort();
+      const file = resolve(webRoot, url.pathname === "/" ? "index.html" : `.${url.pathname}`);
+      return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
+    });
+    await page.goto("http://127.0.0.1:18768/?panel=create-quest", { waitUntil: "domcontentloaded" });
+    const progress = page.getByTestId("first-question-progress");
+    const elapsed = progress.locator(":scope > header > span");
+    const confirm = page.getByRole("button", { name: "确认创建 Quest 与第一个问题", exact: true });
+    await expect(progress.locator("h3")).toHaveText("正在理解已有资料");
+    await expect(progress).toHaveClass(/is-active/);
+    await expect(progress.locator("[aria-current=step]")).toContainText("理解已有资料");
+    await expect(elapsed).toHaveText("已用时 01:05");
+    await page.clock.setFixedTime(new Date((startedAt + 70) * 1000));
+    await expect(elapsed).toHaveText("已用时 01:10");
+    await expect(page.getByText("研究依据已变化，请重新生成或复核问题草稿后再确认。", { exact: true })).toBeVisible();
+    await expect(confirm).toBeDisabled();
+
+    if (creation.proposal_generation) {
+      creation.proposal_generation.status = "failed";
+      creation.proposal_generation.completed_at = startedAt + 72;
+      creation.proposal_generation.failure = { code: "proposal_output_invalid" };
+    } else if (creation.deepfetch?.preparation) {
+      creation.deepfetch.status = "failed";
+      creation.deepfetch.failure = { code: "creation_input_stale" };
+      creation.deepfetch.preparation.completed_at = startedAt + 72;
+      creation.deepfetch.preparation.operation_state = "failed";
+      creation.deepfetch.preparation.retry_permitted = true;
+    }
+    await page.reload();
+    await expect(progress.locator("h3")).toHaveText("本次准备未完成");
+    await expect(progress).not.toHaveClass(/is-active/);
+    await expect(elapsed).toHaveText("本轮耗时 01:12");
+    if (routeKind === "direct") await expect(progress).toContainText("系统未能完成本次准备结果的接纳，尚未形成可确认的问题草稿。");
+    await expect(confirm).toBeDisabled();
+    await expect(page.getByText("研究依据已变化，请重新生成或复核问题草稿后再确认。", { exact: true })).toBeVisible();
+
+    // An operation for another draft never becomes current just because history is stale.
+    creation.quest_draft.revision = 4;
+    creation.quest_draft.hash = "c".repeat(64);
+    creation.status = "proposal_stale";
+    await page.reload();
+    await expect(progress).toHaveCount(0);
+    await expect(confirm).toBeDisabled();
+    expect(posts).toBe(0);
+  });
+}
+
 test("DeepFetch streams material understanding before generation, then changes producers without stale activity or premature completion", async ({ page }, testInfo) => {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];

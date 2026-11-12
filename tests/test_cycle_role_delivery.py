@@ -13,8 +13,9 @@ from io import StringIO
 import pytest
 
 from meta_research.plan_skill import CodexPlanSkillAdapter
-from test_plan_skill_adapter import _fake_codex, _plan, _request, _SequenceRunner
+from test_plan_skill_adapter import _plan, _request, _SequenceRunner
 from test_public_guidance_delivery import _ReadingRunner
+from role_delivery_process_support import controlled_codex as _fake_codex, run_observed_durable_result
 
 
 class _RoleReadingRunner(_ReadingRunner):
@@ -24,9 +25,15 @@ class _RoleReadingRunner(_ReadingRunner):
         self.role_observations = []
 
     def run_job(self, job_ref, argv, prompt, timeout, environment=None):
-        # The deterministic delegate has no subprocess lifetime to manage.
+        # Required adapter interface; frozen jobs use run_durable_job below.
         del job_ref
         return self(argv, prompt, timeout, environment)
+
+    def run_durable_job(self, job_ref, argv, prompt, timeout, stdout_path,
+                        pid_path, request_path, environment=None):
+        return run_observed_durable_result(
+            self, job_ref, argv, prompt, timeout, stdout_path,
+            pid_path, request_path, environment)
 
     def __call__(self, argv, prompt, timeout, environment=None):
         # The shared observer reads through the same package root exposed to the
@@ -105,6 +112,10 @@ def test_idea_continuation_keeps_methods_and_original_session(tmp_path):
     assert "accepted_question=" in runner.calls[0][1]
     assert "accepted_question=" in runner.calls[1][1]
     assert runner.calls[0][2] == runner.calls[1][2]
+    receipts = list((tmp_path / "provider" / "provider-operations").rglob("supervisor-exit.json"))
+    assert len(receipts) == 2
+    for path in receipts:
+        assert json.loads(path.read_text())["payload"]["process_tree"]["mechanism"] == "linux-subreaper-echild"
 
 
 def test_bundle_rolling_dispatch_keeps_methods_and_delivers_current_frontier(tmp_path):

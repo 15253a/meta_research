@@ -115,7 +115,7 @@ test("an explicit total can match unchanged conditions after another HR budget r
   await expect(dialog(page).getByRole("button", { name: "保存运行条件" })).toBeEnabled();
   await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
   await open.click();
-  await expect(dialog(page)).toContainText("保存将把已批准总时长设为 4 小时");
+  await expect(dialog(page)).toContainText("保存将把建议总时长设为 4 小时");
   await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
   await expect(dialog(page).getByRole("status")).toContainText("已保存");
   expect(state.writes[0]).toMatchObject({ time_budget_change: { expected_revision: "budget-1", total_seconds: 14400 } });
@@ -344,12 +344,12 @@ test("custom hour budgets validate and survive saving and reopening", async ({ p
   await dialog(page).getByRole("button", { name: "关闭", exact: true }).click();
   await opener.click();
   await expect(budget).toHaveValue("2.5");
-  await dialog(page).getByRole("button", { name: "不设硬截止", exact: true }).click();
+  await dialog(page).getByRole("button", { name: "不设总时长建议", exact: true }).click();
   await expect(budget).toBeDisabled();
-  await dialog(page).getByRole("button", { name: "不设硬截止", exact: true }).click();
+  await dialog(page).getByRole("button", { name: "不设总时长建议", exact: true }).click();
   await expect(budget).toHaveValue("2.5");
   await expect(budget).toBeEnabled();
-  await dialog(page).getByRole("button", { name: "不设硬截止", exact: true }).click();
+  await dialog(page).getByRole("button", { name: "不设总时长建议", exact: true }).click();
   await save.click();
   await expect(dialog(page).getByRole("status")).toContainText("已保存");
   expect(savedJson(state.writes[1].text).time_budget).toBe("open");

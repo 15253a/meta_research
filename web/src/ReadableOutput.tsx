@@ -83,6 +83,7 @@ function SourceSpans({ spans, label = "查看原始记录" }: { spans: readonly 
 
 const actionLabels: Record<string, string> = {
   wait: "等待", dispatch: "安排执行", complete: "提交结果", stop: "停止", continue: "继续",
+  revise_strategy: "修订工作安排", replan_required: "交接后续安排",
 };
 
 function CommandContents({ command }: { command: ReadableCommand }) {

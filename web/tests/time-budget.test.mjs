@@ -9,7 +9,7 @@ test("custom hour budgets retain their unit and display legacy budgets in hours"
     assert.equal(timeBudgetLabel(budget), `${hours} 小时`);
   }
   assert.equal(validTimeBudget("open"), true);
-  assert.equal(timeBudgetLabel("open"), "不设硬截止");
+  assert.equal(timeBudgetLabel("open"), "不设总时长建议");
 });
 
 test("hour budgets reject empty, nonpositive, excessive precision and unsafe values", () => {

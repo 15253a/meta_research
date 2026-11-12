@@ -240,8 +240,8 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
               total_seconds: time_budget === "open" ? null : Math.round(Number(timeBudgetHours(time_budget)) * 3600),
             });
           }} />
-        {timeBasis && <p>在此修改额度并保存，是你对新总时长的明确确认；已用时间保留。高级原文中的时长描述不单独改变已批准额度。</p>}
-        {timeBudgetChange && <p>保存将把已批准总时长设为 {timeBudgetChange.total_seconds == null ? "不设固定截止" : `${timeBudgetChange.total_seconds / 3600} 小时`}。</p>}
+        {timeBasis && <p>在此保存新的建议总时长，已用时间和偏差仍保留。高级原文中的时长描述不单独改变计时记录。</p>}
+        {timeBudgetChange && <p>保存将把建议总时长设为 {timeBudgetChange.total_seconds == null ? "未设建议总时长" : `${timeBudgetChange.total_seconds / 3600} 小时`}。</p>}
       </div>
       <section className="runtime-stage-models" aria-label="研究阶段模型">
         <h3>研究阶段模型</h3>

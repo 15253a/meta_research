@@ -33,6 +33,7 @@ class _CorrectingWireRunner(_GuidanceRunner):
 
 def test_production_wire_receives_durable_parent_feedback_then_delivers_after_restart(tmp_path):
     runner = _CorrectingWireRunner()
+    originating_session = runner.native_session_ref
     executable = _fake_codex(tmp_path / "codex")
 
     def open_runtime():
@@ -68,7 +69,7 @@ def test_production_wire_receives_durable_parent_feedback_then_delivers_after_re
         )
         assert len(diagnostic) > 128
         assert diagnostic in "\n".join(rejection.feedback)
-        assert rejection.native_session_ref == run.native_session_ref == "runtime-native"
+        assert rejection.native_session_ref == run.native_session_ref == originating_session
         assert run.attempt_ref == rejection.successor_attempt_ref
         assert run.fence_ref != rejection.fence_ref
         assert len(runner.calls) == 1
@@ -84,7 +85,7 @@ def test_production_wire_receives_durable_parent_feedback_then_delivers_after_re
         assert commit is not None, runtime.reasoning_stage.transient_error
         assert len(runner.calls) == 2
         argv, correction_prompt = runner.calls[1]
-        assert argv[-3:] == ["resume", "runtime-native", "-"]
+        assert argv[-3:] == ["resume", originating_session, "-"]
         delivered = json.loads(next(
             line.removeprefix("owner_feedback=") for line in correction_prompt.splitlines()
             if line.startswith("owner_feedback=")
@@ -98,7 +99,7 @@ def test_production_wire_receives_durable_parent_feedback_then_delivers_after_re
         accepted = runtime.owners.agent_runtime.query_reasoning_stage_run(request.request_ref)
         assert accepted.run_ref == rejection.run_ref
         assert accepted.root_session_ref == rejection.root_session_ref
-        assert accepted.native_session_ref == "runtime-native"
+        assert accepted.native_session_ref == originating_session
         assert accepted.attempt_ref == rejection.successor_attempt_ref
         assert [item["question_ref"] for item in accepted.execution.outcome["scientific_outcome"]["research_synthesis"]["parent_questions"]] == parents
         assert runtime.owners.agent_runtime.query_stage_completion_rejection(rejection.attempt_ref) == rejection

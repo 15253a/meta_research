@@ -449,6 +449,7 @@ export type QuestResourceEnvelope = {
   status: "current" | "stale";
   host_snapshot_ref: string;
   time_budget: QuestDraft["time_budget"];
+  time_budget_policy?: "advisory";
   hard_ceiling: {
     kind: "wall_clock" | "open_ended";
     seconds: number | null;

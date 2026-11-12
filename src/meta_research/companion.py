@@ -93,12 +93,17 @@ class CodexCompanionAdapter(
     def capability_profile(self) -> RootCapabilityProfile:
         return root_capability_profile("companion")
 
+    def close_failed_initialization_work(self, initialization_id, draft_revision, draft_hash):
+        from meta_research.creation_failure_cleanup import close_failed_initialization_work
+        close_failed_initialization_work(self, initialization_id, draft_revision, draft_hash)
+
     @resource_preparation
     def runtime_binding(self):
         binding = super().runtime_binding()
         creation = first_creation_instructions()
         guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
         source_hash = _file_sha256(Path(__file__).resolve())
+        handoff_hash = _file_sha256(Path(__file__).with_name("companion_native_handoff.py"))
         return replace(binding,
             packaged_skill_bundle_hash=canonical_hash({
                 "inherited": binding.packaged_skill_bundle_hash, "companion-work.md": guidance,
@@ -107,13 +112,36 @@ class CodexCompanionAdapter(
             instruction_set_hash=canonical_hash({
                 "inherited": binding.instruction_set_hash,
                 "companion-work.md": guidance, "companion_source": source_hash,
+                "native_handoff_source": handoff_hash,
                 "first_creation": creation["bundle_hash"],
             }),
             resource_bindings=(*binding.resource_bindings,
                 "package:meta_research.skills/companion-work.md@sha256:" + canonical_hash(guidance),
                 "package:meta_research.skills/first_creation@sha256:" + creation["bundle_hash"],
-                "adapter-source:meta_research.companion@sha256:" + source_hash),
+                "adapter-source:meta_research.companion@sha256:" + source_hash,
+                "adapter-source:meta_research.companion_native_handoff@sha256:" + handoff_hash),
         )
+
+    def _invoke(self, **kwargs):
+        binding = kwargs.get("workspace_binding")
+        native = kwargs.get("native_session_ref")
+        job = kwargs.get("job_ref")
+        # Existing operations keep their frozen input and terminal failure.
+        # Custody is prepared only for a new formally scoped native call.
+        if binding is not None and native and job and kwargs.get("invocation_runner") is None:
+            invocation = (self._workspace / "provider-operations" / canonical_hash({"job_ref": job})
+                          / kwargs["operation_name"] / "invocation.json")
+            if not invocation.exists():
+                from meta_research.companion_native_handoff import ensure_companion_native_handoff
+                from meta_research.protected_creation_runtime import ProtectedCreationError
+                from meta_research.semantic_mcp import SemanticMcpError
+                try:
+                    ensure_companion_native_handoff(self, binding, native)
+                except (OwnerConflict, ProtectedCreationError, SemanticMcpError) as error:
+                    raise IdeaSkillUnavailable(error.code) from error
+                except (OSError, ValueError, TypeError, KeyError) as error:
+                    raise IdeaSkillUnavailable("companion_native_handoff_invalid") from error
+        return super()._invoke(**kwargs)
 
     def cancel_job(self, job_ref: str) -> bool:
         with self._creation_call_lock:
@@ -158,19 +186,26 @@ class CodexCompanionAdapter(
         elif getattr(request, "reassessment", None) is not None:
             work.bind_reassessment_readers(request.reassessment)
             extra = ("research_memory.creation_basis.read", "research_memory.content.read")
-        from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_root
+        from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_root, shared_writing_resources
+        resource_root = shared_reference_root()
         guidance = first_creation_instructions()["paths"]
         files = [Path(value) for value in guidance.values()]
-        files.extend(shared_reference_root() / name for name in SHARED_REFERENCE_PATHS)
+        files.extend(resource_root / name for name in sorted(SHARED_REFERENCE_PATHS))
+        files.append(resource_root / "companion-work.md")
+        files.extend(resource_root / "writing-report" / name for name in shared_writing_resources())
         context = getattr(request, "context", None)
+        context_files = {}
         if context is not None:
             original_binding = self._creation_workspace(request)
-            files.extend(original_binding.directory / item["path"] for item in context["manifest"])
+            context_files = {item["path"]: str(original_binding.directory / item["path"])
+                             for item in context["manifest"]}
+            files.extend(Path(path) for path in context_files.values())
         proxy_environment = {key: os.environ[key] for key in
             ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy") if key in os.environ}
         for key in ("NO_PROXY", "no_proxy"):
             proxy_environment[key] = ",".join(filter(None, (os.environ.get(key), "127.0.0.1", "localhost")))
-        runner = ProtectedCreationRunner(work, read_only_inputs=files, environment=proxy_environment)
+        runner = ProtectedCreationRunner(work, read_only_inputs=files, environment=proxy_environment,
+                                        input_layout_root=resource_root)
         runner.runtime_conditions = render_runtime_conditions(self._workspace,
             initialization_id=request.initialization_id) + "\n" + runner.runtime_conditions
         with self._creation_call_lock:
@@ -182,8 +217,12 @@ class CodexCompanionAdapter(
         try:
             access = work.channel(extra)
             prompt += "\n\nProtected creation binding and explicit guidance file locations:\n" + _canonical_json({
-                "execution": work.execution_binding, "material_references": inputs.as_dict(), "guidance_files": guidance})
+                "execution": work.execution_binding, "material_references": inputs.as_dict(),
+                "guidance_files": guidance, "context_files": context_files})
             prompt += "\nRead guidance through these exact declared locations, including its reference files. "
+            prompt += "Read sealed context through context_files; its keys preserve the canonical manifest paths, "
+            prompt += "and its values are the readable locations. The canonical manifest and context_hash remain unchanged; "
+            prompt += "its logical relative_root is not a mounted directory. "
             prompt += "Create the operation work directory before writing a program or result. The reference descriptors name unreadable external originals."
             raw, native_ref, stdout = self._invoke(operation_name=operation_name, prompt=prompt, schema=schema,
                 native_session_ref=native_session_ref, job_ref=request.job_ref,
@@ -200,6 +239,15 @@ class CodexCompanionAdapter(
             if unknown:
                 raise IdeaSkillUnavailable("protected_creation_unknown_outcome") from error
             raise IdeaSkillUnavailable(error.code) from error
+        except Exception as error:
+            # A transport/programming error still owns the granted material
+            # channel. Close only after the exact runtime proves its tree ended.
+            outcome = work.request_stop()
+            unknown = not outcome["descendants_ended"]
+            work.fail(unknown_outcome=unknown)
+            if unknown:
+                raise IdeaSkillUnavailable("protected_creation_unknown_outcome") from error
+            raise
         finally:
             outcome = work.request_stop()
             with self._creation_call_lock:

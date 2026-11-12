@@ -817,13 +817,11 @@ def command_update_run(args: argparse.Namespace) -> None:
         if args.elapsed is not None:
             if args.elapsed < run["active_search_elapsed_seconds"]:
                 raise PapersError("active search elapsed time cannot decrease")
-            if args.elapsed > run["active_search_budget_minutes"] * 60:
-                raise PapersError("active search elapsed time exceeds the selected budget")
             run["active_search_elapsed_seconds"] = args.elapsed
         run["dimensions_used"] = merge_unique(run["dimensions_used"], args.dimensions)
         if args.stopping_reason is not None:
             run["stopping_reason"] = nonempty_string(args.stopping_reason, "run.stopping_reason")
-        freezing = run["stopping_reason"] is not None or run["active_search_elapsed_seconds"] >= run["active_search_budget_minutes"] * 60
+        freezing = run["stopping_reason"] is not None
         if args.freeze_paper_ids and not freezing:
             raise PapersError("freeze targets only when stopping discovery")
         if freezing:
@@ -1376,8 +1374,6 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
             errors.append("run: budget does not match intensity")
         elapsed = run["active_search_elapsed_seconds"]
         check(lambda: nonnegative_integer(elapsed, "run.active_search_elapsed_seconds"), "run")
-        if isinstance(elapsed, int) and not isinstance(elapsed, bool) and intensity in INTENSITY_BUDGETS and elapsed > INTENSITY_BUDGETS[intensity] * 60:
-            errors.append("run: active search elapsed time exceeds budget")
         dimensions = run["dimensions_used"]
         check(lambda: string_list(dimensions, "run.dimensions_used"), "run")
         if isinstance(dimensions, list):

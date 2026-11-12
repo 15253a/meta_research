@@ -814,9 +814,12 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
                 "rationale": "This frontier item closes the frozen gap.",
             },
             {
+                "action": "propose_targets",
+                "replan_basis": None,
                 "strategy_update": {
                     "schema_ref": FORMAL_STRATEGY_UPDATE_SCHEMA_REF,
                     "revision": 2,
+                    "notes": "",
                     "candidates": [
                         {
                             **deepcopy(
@@ -1093,12 +1096,10 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     assert contract not in batch_prompt
     assert "installed_experiment_provider_catalog" not in batch_prompt
     assert "targets" not in batch_schema["properties"]
-    assert batch_schema["properties"]["strategy_update"]["properties"][
-        "candidates"
-    ]["minItems"] == 0
-    batch_candidate_schema = batch_schema["properties"]["strategy_update"][
-        "properties"
-    ]["candidates"]["items"]
+    strategy_branches = batch_schema["properties"]["strategy_update"]["anyOf"]
+    assert strategy_branches[1] == {"type": "null"}
+    assert strategy_branches[0]["properties"]["candidates"]["minItems"] == 0
+    batch_candidate_schema = strategy_branches[0]["properties"]["candidates"]["items"]
     assert "measurement_contract" in batch_candidate_schema["required"]
     oversized_target = {
         **batch_request.current_targets[0],
@@ -1804,6 +1805,8 @@ def test_bundle_large_rolling_prompt_reaches_the_public_batch_operation(
     runner = _SequenceRunner(
         [
             {
+                "action": "propose_targets",
+                "replan_basis": None,
                 "strategy_update": {
                     "schema_ref": FORMAL_STRATEGY_UPDATE_SCHEMA_REF,
                     "revision": 2,

@@ -411,10 +411,12 @@ def _research_time_operation(advancement_engine, agent_runtime):
             "Read the authenticated root's current shared Quest research time before a new work decision, "
             "after a long call or a human reply. Seconds are Quest elapsed effective time, shared by parallel "
             "agents and cumulative across Cycles. Human pause and service downtime are excluded; HumanRequest "
-            "waiting counts. Returns approved, used, remaining/overrun, accuracy, observation time and budget "
+            "waiting counts. Returns the planning budget, used, remaining/overrun, accuracy, observation time and budget "
             "revision. Unlimited or unknown amounts are null, never a false zero. An observation is not a new "
-            "scientific input or permission to replay effects. If time is insufficient, use human_request.open "
-            "with request_kind=research_time_extension and the current revision; ordinary replies do not approve time."
+            "scientific input or permission to replay effects. Budgets and Agent-planned stage times are advisory: "
+            "reaching, exceeding or being unable to measure them does not block scheduling, acceptance, handoff or "
+            "successor work and does not require an extension first. Record deviations and adjust work by research value "
+            "within actual resource and permission boundaries. research_time_extension is optional planning collaboration."
         ),
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         output_schema=_research_time_schema(),
@@ -457,6 +459,7 @@ def _research_time_schema():
         "status": {"type": "string", "enum": ["not_started", "running", "paused", "stopped", "completed"]},
         "unknown_intervals": {"type": "array", "items": interval},
         "budget_kind": {"type": "string", "enum": ["finite", "unlimited"]},
+        "budget_policy": {"type": "string", "const": "advisory"},
         "shared": {"type": "boolean", "const": True}, "clock_policy": _string(),
         "measurement_basis": {"type": "string", "enum": ["recorded_intervals", "human_confirmation"]},
         "accounting_corrections": {"type": "array", "items": correction},
@@ -1216,9 +1219,9 @@ def _root_agent_human_request_operations(
                 "problem 说明困难或缺少条件，requested_delivery 说明应交付内容；impact 与 safe_response 说明后续影响和本请求页面回传方式。"
                 "这些发起时事实与当前请求修订一起保存，页面与 Markdown/HTML/PDF 共用；导出不补造尝试，不自动提交答复，也不启动助手。"
                 "acceptance_conditions 提供 1–32 条非空、去除首尾空格后互不重复的条件。"
-                "research_time_extension 仅供五个研究根申请研究延时：先读取 advancement_engine.research_time.read，"
+                "research_time_extension 供五个研究根按需协商调整规划预算：先读取 advancement_engine.research_time.read，"
                 "在 condition.time_extension 提供 budget_revision 与 requested_additional_seconds；"
-                "说明已做工作、缺口、估计不确定性与不延长时的收口影响。等待仍计时，普通答复不等于额度获批。"
+                "说明已做工作、缺口、后续价值与估计不确定性。等待仍计时，普通答复不改变预算记录；预算不是继续研究的授权前提。"
             ),
             input_schema=_root_human_request_open_input_schema(),
             output_schema=_root_human_request_output_schema(),
@@ -1240,9 +1243,11 @@ def _root_agent_human_request_operations(
             semantic_operation_id=reconcile_id,
             owning_module="agent_runtime",
             description=(
-                "Read the immutable receipt for an earlier HumanRequest open effect."
+                "Read the receipt for an earlier HumanRequest open effect. For a "
+                "system_operation_help successor, supply its exact predecessor_request_ref "
+                "to read that revision. Without it, retain the original effect lineage lookup."
             ),
-            input_schema=_effect_input_schema(),
+            input_schema=_root_human_request_reconcile_input_schema(),
             output_schema=_root_human_request_output_schema(),
             access_mode="reconcile",
             handler=lambda context, arguments: _reconcile_root_agent_human_request(
@@ -1550,11 +1555,8 @@ def _open_root_agent_human_request(
     ):
         # Keep the Agent-visible effect identity stable while giving each
         # repeat-failure revision its own replay key and immutable open receipt.
-        effect_key = "mcp-effect:" + canonical_hash(
-            {
-                "logical_effect_key": effect_key,
-                "predecessor_request_ref": command.predecessor_request_ref,
-            }
+        effect_key = _human_request_successor_effect_key(
+            effect_key, command.predecessor_request_ref
         )
     guidance_asset_ref = command.condition.get("guidance_asset_ref")
     if isinstance(guidance_asset_ref, str):
@@ -1570,11 +1572,25 @@ def _open_root_agent_human_request(
             ) from error
         if guidance is None:
             raise SemanticMcpError("root_agent_human_request_guidance_invalid")
-    generation = _root_human_request_generation(
-        owner,
-        scope=scope,
-        predecessor_request_ref=command.predecessor_request_ref,
-    )
+    try:
+        generation = _root_human_request_generation(
+            owner,
+            scope=scope,
+            context=context,
+            predecessor_request_ref=command.predecessor_request_ref,
+            request_kind=command.request_kind,
+            effect_id=effect_id,
+        )
+    except SemanticMcpError as error:
+        # This validation precedes the effect Owner call. Do not turn a known
+        # argument rejection into an unresolved business effect.
+        raise SemanticMcpError(error.code, {
+            **(error.details or {}),
+            "execution_stage": "precondition_validation",
+            "call_execution": "not_started",
+            "effect_status": "not_applied",
+            "correction": "Correct the predecessor/effect identity using the original request. This submission was rejected before opening an effect; preserve any earlier uncertain submission unchanged.",
+        }) from error
     operation_binding = _root_human_request_operation_binding(
         scope,
         context,
@@ -1660,8 +1676,13 @@ def _reconcile_root_agent_human_request(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     effect_id, effect_key = _semantic_effect_key(context, arguments)
+    predecessor = arguments.get("predecessor_request_ref")
+    if isinstance(predecessor, str):
+        effect_key = _human_request_successor_effect_key(effect_key, predecessor)
     try:
-        request = owner.reconcile_human_request_effect(effect_key)
+        request = owner.reconcile_human_request_effect(
+            effect_key, follow_current_revision=predecessor is None
+        )
     except OwnerConflict as error:
         raise SemanticMcpError(error.code, error.details) from error
     open_effect = request.get("open_effect")
@@ -1672,6 +1693,15 @@ def _reconcile_root_agent_human_request(
         context=context,
         reconcile=True,
     )
+
+
+def _human_request_successor_effect_key(
+    logical_effect_key: str, predecessor_request_ref: str
+) -> str:
+    return "mcp-effect:" + canonical_hash({
+        "logical_effect_key": logical_effect_key,
+        "predecessor_request_ref": predecessor_request_ref.strip(),
+    })
 
 
 def _root_agent_human_request_scope(
@@ -1989,7 +2019,10 @@ def _root_human_request_generation(
     owner: AgentRuntimeInterface,
     *,
     scope: dict[str, object],
+    context: SemanticCallContext,
     predecessor_request_ref: str | None,
+    request_kind: str,
+    effect_id: str,
 ) -> int:
     generation = scope.get("waiter_generation")
     if not isinstance(generation, int) or isinstance(generation, bool):
@@ -1997,6 +2030,32 @@ def _root_human_request_generation(
     if predecessor_request_ref is None:
         return generation
     predecessor = owner.query_human_request(predecessor_request_ref)
+    if predecessor is not None:
+        prior_effect = predecessor.get("open_effect")
+        prior_binding = (
+            prior_effect.get("operation_binding")
+            if isinstance(prior_effect, dict) else None
+        )
+        if (
+            not isinstance(prior_binding, dict)
+            or prior_binding.get("quest_ref") != scope.get("quest_ref")
+            or prior_binding.get("task_ref") != context.run_ref
+            or prior_binding.get("root_session_ref") != context.root_session_ref
+        ):
+            raise SemanticMcpError("human_request_predecessor_invalid")
+    if predecessor is not None and request_kind == "system_operation_help":
+        prior_effect = predecessor.get("open_effect")
+        if (
+            predecessor.get("kind") == "system_operation_help"
+            and isinstance(prior_effect, dict)
+            and prior_effect.get("effect_id") != effect_id
+        ):
+            raise SemanticMcpError("human_request_predecessor_invalid", {
+                "field": "effect_id",
+                "expected_effect_id": prior_effect.get("effect_id"),
+                "predecessor_request_ref": predecessor_request_ref,
+                "message": "A repeat system failure continues the predecessor's effect_id. An unrelated new request does not name that predecessor.",
+            })
     waiters = None if predecessor is None else predecessor.get("direct_waiters")
     if (
         not isinstance(waiters, list)
@@ -3103,6 +3162,19 @@ def _root_acquisition_output_schema() -> dict[str, object]:
     )
 
 
+def _root_human_request_reconcile_input_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "effect_id": _string(max_length=128),
+            "predecessor_request_ref": {
+                **_string(max_length=96),
+                "description": "Exact predecessor supplied to the original system_operation_help successor open; omit for the original effect lineage.",
+            },
+        },
+        required=("effect_id",),
+    )
+
+
 def _root_human_request_open_input_schema() -> dict[str, object]:
     return _closed_object(
         {
@@ -3116,7 +3188,7 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
                     "expert advice, fieldwork or physical/offline action; "
                     "capability_authorization for formal permission; "
                     "system_operation_help for a Meta Research runtime failure."
-                    " research_time_extension for explicit human approval of more Quest research time."
+                    " research_time_extension for optional human input on changing the advisory Quest planning budget."
                 ),
             },
             "obligation": {
@@ -3184,7 +3256,10 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
                     "exclusions",
                 ),
             ),
-            "predecessor_request_ref": _string(max_length=96),
+            "predecessor_request_ref": {
+                **_string(max_length=96),
+                "description": "Continue a terminal request lineage only. A repeated system_operation_help must retain that predecessor's effect_id; an unrelated new request omits this field. Reconcile a system-help successor with the same effect_id and predecessor_request_ref.",
+            },
         },
         required=(
             "effect_id",

@@ -37,7 +37,7 @@ cells 表达应实施及报告的责任，允许负结果、失败原因和未�
 
 ## 2. 据结果调整
 
-首次 admission 仅处理未启动工作；已 claimed、running、recovering、finalizing 的工作沿既有 TargetRun 观察、wake 或 reconcile；已接纳 TargetCommit 用于收口。按证据、价值、资源与依赖选择 dispatch、wait 或 replan_required，说明理由。
+首次 admission 仅处理未启动工作；已 claimed、running、recovering、finalizing 的工作沿既有 TargetRun 观察、wake 或 reconcile；已接纳 TargetCommit 用于收口。按[调度与继续策略](references/contract.md#调度与继续策略)选择调度动作；target-batch 中提出真实策略，或按[批次重规划交接](references/contract.md#批次重规划交接)综合已做工作、限制及后续重心。
 
 给 Target 留出方法复用／新建、实际归属（含跨 Baseline）、实现和补充检查空间。保持 FormalPlan 的科学目的、支持要求、相对已有工作的增量和明确固定的边界，包括适用的 required Metric 与 held-fixed 比较条件；Characteristics 中的普通实现建议可有理由调整并在既有 notes 说明，不能借调整建议偷换科学比较。必须改变已承诺核心科学语义时交给 Reasoning 与后继 Cycle，同一 Cycle 不回 Plan。
 

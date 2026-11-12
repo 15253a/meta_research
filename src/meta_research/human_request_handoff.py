@@ -49,8 +49,8 @@ def build_human_request_handoff(request: dict[str, Any]) -> dict[str, Any]:
     elif request["kind"] == "research_time_extension":
         return_instructions = [
             f"本材料绑定请求 {request['request_ref']}（修订 {request['revision']}）。",
-            "请回到本求助页面核对当前时长，明确批准增加时长或新的总时长，或选择拒绝、稍后处理。",
-            "普通说明、助手建议和下载材料都不批准时长；预算生效与研究实际继续分别查看页面回执。",
+            "请回到本求助页面核对当前时长，选择调整建议总时长，或选择拒绝、稍后处理。",
+            "预算调整不构成继续研究的授权；预算记录与原请求的实际恢复分别查看页面回执。",
         ]
     else:
         return_instructions = [
@@ -92,11 +92,12 @@ def build_human_request_handoff(request: dict[str, Any]) -> dict[str, Any]:
                          if isinstance(observed, (int, float)) else "未记录")
         sections.insert(4, ("research_time", "研究时长申请", [
             "申请额外 " + duration(extension.get("requested_additional_seconds")) + "，由整个研究项目共用。",
-            "已批准总时长：" + ("无固定截止" if unlimited else duration(approved)) + "。",
+            "建议总时长：" + ("未设建议总时长" if unlimited else duration(approved)) + "。",
             "已用：" + duration(snapshot.get("used_seconds")) + "；已确认累计：" + duration(snapshot.get("confirmed_used_seconds")) + "。",
             "剩余：" + ("无固定截止" if unlimited else duration(snapshot.get("remaining_seconds"))) + "。",
             "申请时的观察时间：" + observed_text + "。",
             "这是申请时记录的时长；等待回复仍计时，人工暂停和服务停机不计时。确认前请在当前页面核对最新余额。",
+            "时长仅为规划建议，达到、超出或暂不能准确核定预算本身不要求停止研究或申请延期。",
         ]))
     return {
         "schema_ref": "meta-research/human-request-handoff/v1",

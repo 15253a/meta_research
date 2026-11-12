@@ -885,8 +885,10 @@ def build_production_runtime(
     if (isinstance(plan_skill_provider, CodexPlanSkillAdapter)
             or isinstance(reasoning_skill_provider, CodexReasoningSkillAdapter)
             or isinstance(bundle_skill_provider, CodexBundleSkillAdapter)):
+        stopped_recovery = StoppedStageProviderRecovery(stage_root_observations)
         agent_runtime.bind_operator_stop_reader(
-            StoppedStageProviderRecovery(stage_root_observations).read_for_operator_resume
+            stopped_recovery.read_for_operator_resume,
+            settlement_reader=stopped_recovery.read_for_operator_settlement,
         )
     autonomous_creation = AutonomousCreationService(
         human_collaboration,

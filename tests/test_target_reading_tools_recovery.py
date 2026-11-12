@@ -63,6 +63,7 @@ def test_reading_tools_only_enter_new_snapshot_and_unknown_operation_keeps_origi
         assert sealed.status == "unknown_outcome" and runner.calls == 0
         assert runner.request_path is None
         frozen = captured[0].prompt
+        assert sealed.frozen_prompt == frozen
         assert ("Execution reading tools:\n" in frozen) is not old_operation
         if not old_operation:
             tools = json.loads(frozen.split("Execution reading tools:\n", 1)[1].splitlines()[0])
@@ -77,11 +78,21 @@ def test_reading_tools_only_enter_new_snapshot_and_unknown_operation_keeps_origi
         assert recovered.operation_ref == sealed.operation_ref
         assert recovered.invocation_hash == sealed.invocation_hash
         assert recovered.generation == sealed.generation == 1
-        assert runner.calls == 1
-        assert runner.request_path.with_name("prompt.txt").read_text() == frozen
-        with pytest.raises(HarnessAdmissionError, match="provider_stopped"):
+        assert recovered.frozen_prompt == frozen
+        assert recovered.status == "unknown_outcome"
+        # The injected failure happened before transport. There is no sealed
+        # terminal receipt to reconcile, so restoring the adapter must neither
+        # launch the old operation nor invent a stopped process outcome.
+        assert runner.calls == 0
+        assert runner.request_path is None
+        with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
             runtime().run_or_resume_target_root(request.request_ref, prompt=prompt, mcp_base_url="http://127.0.0.1:8999")
-        assert runner.calls == 1
-        assert owner.latest_operation(run.run_ref).operation_ref == sealed.operation_ref
+        retained = owner.latest_operation(run.run_ref)
+        assert runner.calls == 0
+        assert runner.request_path is None
+        assert retained.operation_ref == sealed.operation_ref
+        assert retained.invocation_hash == sealed.invocation_hash
+        assert retained.frozen_prompt == frozen
+        assert retained.generation == 1 and retained.status == "unknown_outcome"
     finally:
         database.close()

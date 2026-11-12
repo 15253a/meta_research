@@ -169,6 +169,62 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
         return {"proposal_fork_native_session_ref": "native-child", "result": {"content": QUESTION, "revision": revision}}, "native-parent", ""
 
 
+class ReadableGuidanceFixture(ProtectedCreationFixture):
+    def _invoke(self, **arguments):
+        runner = arguments["invocation_runner"]
+        developer = next(value for value in self.capability_profile().codex_arguments()
+                         if value.startswith("developer_instructions="))
+        # Execute the advertised paths, including links inside the actual copied
+        # documents, with the same filesystem boundary as the native reader.
+        script = '''import hashlib, json, pathlib, re, sys
+developer = json.loads(sys.argv[1].split("=", 1)[1])
+allowed = {pathlib.Path(path).resolve() for path in json.loads(sys.argv[3])}
+root = pathlib.Path(re.search(r"^Shared reference root: (.+)$", developer, re.M)[1])
+pending = [root / path for path in re.findall(r"`(references/[^`]+)`", developer)]
+pending += [pathlib.Path(path) for path in re.findall(r"^(?:Shared writing skill|Companion role|Creation role) source: (.+)$", developer, re.M)]
+seen = set()
+while pending:
+    path = pending.pop(0).resolve()
+    if path in seen:
+        continue
+    seen.add(path)
+    content = path.read_text()
+    for link in re.findall(r"\\]\\(([^)]+)\\)", content):
+        if "://" not in link and not link.startswith("#"):
+            linked = (path.parent / link.split("#", 1)[0]).resolve()
+            if linked in allowed:
+                pending.append(linked)
+            else:
+                assert not linked.exists(), str(linked)
+assert len(seen) >= 14
+prompt = sys.argv[2]
+binding = json.loads(prompt.split("Protected creation binding and explicit guidance file locations:\\n", 1)[1].split("\\nRead guidance", 1)[0])
+task = json.JSONDecoder().raw_decode(prompt[prompt.index("\\n{") + 1:])[0]
+context = task.get("sealed_context")
+if context is not None:
+    assert set(binding["context_files"]) == {item["path"] for item in context["manifest"]}
+    for item in context["manifest"]:
+        content = pathlib.Path(binding["context_files"][item["path"]]).read_bytes()
+        assert hashlib.sha256(content).hexdigest() == item["sha256"]
+        json.loads(content)
+print(json.dumps({"context": context, "guidance_files_read": len(seen)}))
+'''
+        call = NativeCreationCall(("/bin/bash", "-c", 'exec /bin/python - "$@"',
+            "read-guidance", developer, arguments["prompt"], json.dumps(list(map(str, runner.read_only_inputs)))),
+            script, 30.0, {}, runner.read_only_inputs, ())
+        # The baseline lacks this projection field; still execute its real
+        # preparation so the regression fails on unreadable advertised paths.
+        if hasattr(runner, "input_layout_root"):
+            from dataclasses import replace
+            call = replace(call, input_layout_root=runner.input_layout_root)
+        completed = runner.work.run(call)
+        assert completed.returncode == 0, completed.stderr
+        proof = json.loads(completed.stdout)
+        task = json.JSONDecoder().raw_decode(arguments["prompt"][arguments["prompt"].index("\n{") + 1:])[0]
+        assert proof["context"] == task.get("sealed_context")
+        return super()._invoke(**arguments)
+
+
 def test_actual_adapter_methods_share_current_protected_gateway_and_readers(tmp_path):
     source = tmp_path / "original"
     source.mkdir()
@@ -181,7 +237,7 @@ def test_actual_adapter_methods_share_current_protected_gateway_and_readers(tmp_
             anchor, binding, _ = _open(client, runtime, source, "adapter")
             roots = runtime.root_workspaces
             roots.configure_creation_runtime(executable="/bin/bash", credentials_home=tmp_path / "credentials")
-            adapter = ProtectedCreationFixture(tmp_path / "adapter", selection="both")
+            adapter = ReadableGuidanceFixture(tmp_path / "adapter", selection="both")
             adapter.bind_workspaces(roots)
             inputs = runtime.owners.human_collaboration.creation_material_snapshot(anchor)
             request = InitializationUnderstandingRequest(anchor.ref, anchor.draft_revision, anchor.draft_hash, {}, empty_manifest(),
@@ -228,5 +284,51 @@ def test_prelaunch_cancellation_is_applied_to_understanding_suboperation(tmp_pat
                 adapter.understand_initialization(request)
             assert adapter.cancel_job("cancelled-parent") is True
             assert source.read_text() == "original16"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("tree_closed", [True, False])
+def test_unexpected_transport_error_revokes_material_scope_without_claiming_unknown_tree(tmp_path, monkeypatch, tree_closed):
+    from sqlalchemy import text
+
+    source = tmp_path / "original.txt"
+    source.write_text("original16")
+    runtime = _make(tmp_path / "runtime")
+    try:
+        with TestClient(create_app(runtime, base_url="http://testserver", control_key="control")) as client:
+            anchor, binding, _ = _open(client, runtime, source, "transport-error")
+            roots = runtime.root_workspaces
+            roots.configure_creation_runtime(executable="/bin/bash", credentials_home=tmp_path / "credentials")
+            adapter = CodexCompanionAdapter(tmp_path / "adapter", executable="/bin/bash")
+            adapter.bind_workspaces(roots)
+            captured = {}
+
+            def fail_transport(**arguments):
+                work = arguments["invocation_runner"].work
+                captured.update(work=work, token=arguments["mcp_token"])
+                if not tree_closed:
+                    monkeypatch.setattr(work, "request_stop", lambda: {
+                        "status": "unknown_outcome", "descendants_ended": False})
+                raise ValueError("controlled unexpected transport failure")
+
+            monkeypatch.setattr(adapter, "_invoke", fail_transport)
+            inputs = runtime.owners.human_collaboration.creation_material_snapshot(anchor)
+            request = InitializationUnderstandingRequest(anchor.ref, anchor.draft_revision, anchor.draft_hash,
+                {}, empty_manifest(), "transport-error:understanding", binding.location.root_session_ref, None, inputs=inputs)
+            expected = ValueError if tree_closed else DraftingUnavailable
+            detail = "controlled unexpected transport failure" if tree_closed else "protected_creation_unknown_outcome"
+            with pytest.raises(expected, match=detail):
+                adapter.understand_initialization(request)
+            with runtime.owners.human_collaboration._database.read() as connection:
+                state = connection.execute(text("SELECT state FROM hc_creation_material_operations WHERE operation_ref=:ref"),
+                    {"ref": request.job_ref}).scalar_one()
+            assert state == ("failed" if tree_closed else "unknown_outcome")
+            assert captured["work"]._token is None
+            assert not roots._creation_channels
+            status, _ = roots._creation_gateway.dispatch(captured["token"],
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            assert status == 401
+            assert (request.job_ref in adapter._creation_calls) is not tree_closed
     finally:
         runtime.close()

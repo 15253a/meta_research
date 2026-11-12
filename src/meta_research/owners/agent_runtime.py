@@ -2385,8 +2385,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
 
             # All request/currentness/dispatch checks above are read-only.  The
             # first persistent admission identity is allocated only here.
-            from meta_research.quest_research_time import require_time_for_new_work
-            require_time_for_new_work(connection, verification.quest_ref)
             launch_ref = new_ref("target_launch")
             if has_human_authorization:
                 assertion = target_execution_assertion(
@@ -6426,6 +6424,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._host_compute_probe = host_compute_probe
         self._runtime_protection = runtime_protection
         self._operator_stop_reader: Callable[[str, str], dict[str, object] | None] | None = None
+        self._operator_stop_settlement_reader: Callable[[str, str], dict[str, object] | None] | None = None
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
         self._formal_plan_verifier = formal_plan_verifier
@@ -6474,6 +6473,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._recover_completed_bundle_rolling_provider_units()
         self._recover_interrupted_provider_units()
         self._recover_daemon_stopped_stage_runs()
+        self._recover_resumed_bundle_checkpoints()
         self._recover_interrupted_acquisition()
         self._recover_interrupted_deepfetch()
 
@@ -6483,9 +6483,82 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
 
 
     def bind_operator_stop_reader(
-        self, reader: Callable[[str, str], dict[str, object] | None]
+        self, reader: Callable[[str, str], dict[str, object] | None], *,
+        settlement_reader: Callable[[str, str], dict[str, object] | None] | None = None,
     ) -> None:
         self._operator_stop_reader = reader
+        self._operator_stop_settlement_reader = settlement_reader
+
+    def _settle_operator_stopped_provider(self, *, unit_ref, run_ref, attempt_ref, fence_ref, provider_exit) -> bool:
+        """ACK a verified pause stop once; never reinterpret it as a new ceiling."""
+        reader = self._operator_stop_settlement_reader
+        if reader is None:
+            return False
+        with self._database.read() as connection:
+            control = connection.execute(text("SELECT * FROM ar_run_controls WHERE run_ref=:run"),
+                {"run": run_ref}).first()
+            unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:unit"),
+                {"unit": unit_ref}).first()
+            if (control is None or unit is None or control.status not in {"running", "suspended"}
+                    or control.run_kind not in {"bundle_stage", "plan_stage", "reasoning_stage"}
+                    or (control.attempt_ref, control.fence_ref) != (attempt_ref, fence_ref)
+                    or (unit.run_ref, unit.attempt_ref, unit.fence_ref) != (run_ref, attempt_ref, fence_ref)
+                    or unit.unit_kind != control.run_kind.removesuffix("_stage") + "_primary"
+                    or unit.status not in {"active", "completed"}):
+                return False
+            saved = None
+            if control.status == "suspended":
+                saved = _query_managed_safe_point(connection, control)
+                if saved is None or saved["checkpoint"].get("action") != "pause":
+                    return False
+                reservations = connection.execute(text("SELECT * FROM ar_control_reservations "
+                    "WHERE operation_ref=:ref AND action='pause' AND status='applied'"),
+                    {"ref": saved["checkpoint"].get("operation_ref")}).all()
+            else:
+                reservations = connection.execute(text("SELECT * FROM ar_control_reservations "
+                    "WHERE action='pause' AND status='prepared'")).all()
+            authorized = False
+            for reservation in reservations:
+                document = _runtime_control_reservation_document(reservation)
+                if not any(all(item.get(key) == getattr(control, key) for key in (
+                        "run_ref", "run_kind", "quest_ref", "cycle_ref", "epoch", "attempt_ref",
+                        "root_session_ref", "fence_ref")) and item.get("status") == "running"
+                        and item.get("control_revision") == int(control.control_revision) - (control.status == "suspended")
+                        for item in document["affected_runs"]):
+                    continue
+                if control.status == "running" and reservation.status == "prepared":
+                    authorized = True
+                    break
+                if control.status == "suspended" and reservation.status == "applied":
+                    if (saved is None or saved["checkpoint"].get("action") != "pause"
+                            or saved["checkpoint"].get("operation_ref") != reservation.operation_ref
+                            or any(saved["checkpoint"].get(key) != getattr(control, key) for key in (
+                                "run_ref", "attempt_ref", "root_session_ref", "fence_ref"))):
+                        continue
+                    operation = connection.execute(text("SELECT * FROM ar_control_operations WHERE operation_ref=:ref"),
+                        {"ref": reservation.operation_ref}).first()
+                    if operation is None:
+                        continue
+                    self.verify_runtime_control_receipt(operation_ref=operation.operation_ref, action="pause",
+                        target=decoded_object(reservation.payload_json)["target"], receipt=_runtime_control_receipt(operation))
+                    authorized = True
+                    break
+            if not authorized:
+                return False
+        proof = reader(run_ref, "primary")
+        scope = {} if proof is None else proof.get("scope", {})
+        if (proof is None or proof.get("schema_ref") != "meta-research/operator-stopped-primary/v1"
+                or any(scope.get(key) != value for key, value in {
+                    "run_ref": run_ref, "run_kind": control.run_kind, "attempt_ref": attempt_ref,
+                    "root_session_ref": control.root_session_ref, "fence_ref": fence_ref,
+                    "unit_ref": unit_ref, "unit_kind": unit.unit_kind, "operation_ref": unit.operation_ref,
+                }.items()) or proof.get("hard_ceiling_checkpoint") != provider_exit):
+            raise OwnerConflict("operator_stop_checkpoint_invalid")
+        # The existing ACK closes this exact physical unit and is idempotent if
+        # the control driver won the race. It does not resume or replace a Run.
+        self.acknowledge_provider_safe_point(unit_ref=unit_ref, run_ref=run_ref,
+            attempt_ref=attempt_ref, fence_ref=fence_ref)
+        return True
 
     def _operator_stop_resume_checkpoints(self, affected_runs):
         checkpoints: dict[str, dict[str, object]] = {}
@@ -6661,6 +6734,54 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 attempt_ref=attempt_ref,
                 fence_ref=fence_ref,
             )
+
+    def _recover_resumed_bundle_checkpoints(self) -> None:
+        """Repair only an unused successor of the former stopped-resume bug."""
+        with self._database.write() as connection:
+            controls = connection.execute(text(
+                "SELECT c.* FROM ar_run_controls c JOIN ar_stage_sessions s ON "
+                "s.session_ref=c.root_session_ref AND s.run_ref=c.run_ref "
+                "WHERE c.run_kind='bundle_stage' AND c.status='running' "
+                "AND c.safe_point_ref IS NOT NULL AND s.native_session_ref IS NULL"
+            )).all()
+            for control in controls:
+                if _prepared_control_affects_run(connection, control.run_ref):
+                    continue
+                try:
+                    recovered = _resumed_bundle_checkpoint(connection, control)
+                except (OwnerConflict, TypeError, ValueError):
+                    # Unproven or changed work remains fenced by the normal
+                    # worker checks; startup must never guess a native identity.
+                    continue
+                if recovered is None:
+                    continue
+                old, native, decisions = recovered
+                connection.execute(text(
+                    "UPDATE ar_stage_attempts SET primary_draft_json=:draft, primary_draft_hash=:hash, "
+                    "primary_adapter_kind=:adapter, primary_recorded_at=:recorded, "
+                    "primary_provider_unit_ref=:unit WHERE attempt_ref=:attempt"
+                ), {"draft": old.primary_draft_json, "hash": old.primary_draft_hash,
+                    "adapter": old.primary_adapter_kind, "recorded": old.primary_recorded_at,
+                    "unit": old.primary_provider_unit_ref, "attempt": control.attempt_ref})
+                primary = connection.execute(text("SELECT * FROM ar_stage_provider_invocations "
+                    "WHERE attempt_ref=:ref AND phase='primary'"), {"ref": old.attempt_ref}).one()
+                connection.execute(text("UPDATE ar_stage_provider_invocations SET status='completed', "
+                    "response_hash=:hash, completed_at=:completed WHERE attempt_ref=:ref AND phase='primary'"),
+                    {"hash": primary.response_hash, "completed": primary.completed_at, "ref": control.attempt_ref})
+                now = time.time()
+                connection.execute(text("UPDATE ar_stage_sessions SET native_session_ref=:native, "
+                    "updated_at=:now WHERE session_ref=:ref"),
+                    {"native": native, "now": now, "ref": control.root_session_ref})
+                connection.execute(text("UPDATE ar_run_controls SET control_revision=control_revision+1, "
+                    "updated_at=:now WHERE run_ref=:run"), {"now": now, "run": control.run_ref})
+                connection.execute(text("UPDATE agent_runtime_state SET revision=revision+1 WHERE singleton='owner'"))
+                self._feed.record(connection, "agent_runtime.stopped_bundle_checkpoint_recovered", {
+                    "run_ref": control.run_ref, "attempt_ref": control.attempt_ref,
+                    "fence_ref": control.fence_ref, "root_session_ref": control.root_session_ref,
+                    "source_attempt_ref": old.attempt_ref, "safe_point_ref": control.safe_point_ref,
+                    "native_session_ref": native, "dispatch_decision_refs": decisions,
+                    "primary_draft_hash": old.primary_draft_hash,
+                })
 
     def _recover_daemon_stopped_stage_runs(self) -> None:
         """Resume only a physically stopped Stage proven to be daemon shutdown.
@@ -7903,7 +8024,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if control is not None and root_kind in FORMAL_STAGES:
             interrupted_unit = connection.execute(
                 text(
-                    "SELECT units.unit_ref FROM ar_provider_units AS units JOIN "
+                    "SELECT units.unit_ref, units.unit_kind FROM ar_provider_units AS units JOIN "
                     "ar_fence_revocations AS revocations ON revocations.fence_ref = "
                     "units.fence_ref AND revocations.run_ref = units.run_ref WHERE "
                     "units.run_ref = :run_ref AND units.attempt_ref = :attempt_ref "
@@ -7925,12 +8046,22 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     ),
                     {"now": now, "fence_ref": operation_binding["fence_ref"]},
                 )
+                retained_primary = connection.execute(text(
+                    "SELECT primary_draft_hash FROM ar_stage_attempts WHERE attempt_ref=:attempt "
+                    "AND run_ref=:run"), {"attempt": control.attempt_ref, "run": task_ref}).first()
+                replace_bundle_review_operation = (
+                    root_kind == "bundle" and interrupted_unit.unit_kind == "bundle_review"
+                    and retained_primary is not None and retained_primary.primary_draft_hash is not None
+                )
                 replacement = self._replace_fenced_managed_attempt(
                     connection,
                     control,
                     now,
                     reuse_checkpoint=True,
-                    reuse_operation_refs=True,
+                    # Retain accepted primary work and its native root. A new
+                    # review phase needs a new job so its new Attempt cannot
+                    # collide with the sealed pre-restart batch identity.
+                    reuse_operation_refs=not replace_bundle_review_operation,
                     preserve_native_session=True,
                     replacement_reason_code="human_request_resume_after_restart",
                 )
@@ -7938,7 +8069,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     text(
                         "UPDATE ar_run_controls SET attempt_ref = :attempt_ref, "
                         "fence_ref = :fence_ref, control_revision = "
-                        "control_revision + 1, updated_at = :now WHERE run_ref = "
+                        "control_revision + 1, cleanup_status = CASE WHEN run_kind = "
+                        "'bundle_stage' THEN 'pending' ELSE cleanup_status END, "
+                        "updated_at = :now WHERE run_ref = "
                         ":run_ref AND status = 'running' AND attempt_ref = "
                         ":old_attempt_ref AND fence_ref = :old_fence_ref"
                     ),
@@ -8201,6 +8334,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         provider_exit: dict[str, object],
     ) -> None:
         """Fence physical ceilings; route completed contract drift to correction."""
+
+        if failure_code == "codex_operation_stopped" and self._settle_operator_stopped_provider(
+                unit_ref=unit_ref, run_ref=run_ref, attempt_ref=attempt_ref, fence_ref=fence_ref,
+                provider_exit=provider_exit):
+            return
 
         if (isinstance(provider_exit, dict)
                 and provider_exit.get("schema_ref") == "meta-research/provider-native-session-unavailable/v1"):
@@ -9179,17 +9317,64 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         """Project the predecessor's retained correction into its current Attempt."""
         from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
         with self._database.read() as connection:
+            control = connection.execute(text(
+                "SELECT * FROM ar_run_controls WHERE run_ref=:run AND attempt_ref=:attempt "
+                "AND fence_ref=:fence"),
+                {"run": run_ref, "attempt": attempt_ref, "fence": fence_ref}).first()
+            if control is None:
+                return None
+            feedback_attempt_ref = attempt_ref
+            cursor_fence_ref = fence_ref
+            while True:
+                replacement = connection.execute(text(
+                    "SELECT * FROM ar_stage_attempt_replacements WHERE run_ref=:run "
+                    "AND replacement_attempt_ref=:attempt"),
+                    {"run": run_ref, "attempt": feedback_attempt_ref}).first()
+                if replacement is None or replacement.reason_code not in {"human_request_resume_after_restart", "bundle_runtime_refreshed"}:
+                    break
+                if replacement.reason_code == "bundle_runtime_refreshed":
+                    from meta_research.bundle_runtime_refresh import verify_runtime_refresh_replacement
+                    verify_runtime_refresh_replacement(connection, run_ref, feedback_attempt_ref)
+                run, current, session, current_fence = _load_stage_fence(
+                    connection, run_ref, feedback_attempt_ref, cursor_fence_ref)
+                previous = connection.execute(text(
+                    "SELECT * FROM ar_stage_attempts WHERE attempt_ref=:attempt AND run_ref=:run"),
+                    {"attempt": replacement.retired_attempt_ref, "run": run_ref}).first()
+                if previous is None:
+                    raise OwnerConflict("stage_provider_feedback_invalid")
+                _, retired, _, retired_fence = _load_stage_fence(
+                    connection, run_ref, previous.attempt_ref, previous.fence_ref)
+                current_primary, _ = _provider_invocations(connection, run, current, current_fence)
+                retired_primary, _ = _provider_invocations(connection, run, retired, retired_fence)
+                if (run.root_session_ref != control.root_session_ref
+                        or session.session_ref != control.root_session_ref
+                        or current.root_session_ref != retired.root_session_ref
+                        or int(current.generation) != int(retired.generation) + 1
+                        or retired_fence.status != "rejected"
+                        or (current_primary.operation_ref != retired_primary.operation_ref and not (
+                            run.stage == "bundle" and current.primary_draft_hash is not None
+                            and current.primary_draft_hash == retired.primary_draft_hash
+                            and current_primary.status == retired_primary.status == "completed"
+                            and current_primary.response_hash == retired_primary.response_hash
+                        ))):
+                    raise OwnerConflict("stage_provider_feedback_invalid")
+                # HR restart retains the exact invocation or accepted primary
+                # under a new review job. No other replacement reason inherits
+                # a correction diagnostic through this reader.
+                feedback_attempt_ref = retired.attempt_ref
+                cursor_fence_ref = retired.fence_ref
             row = connection.execute(text(
                 "SELECT s.* FROM ar_stage_attempt_replacements r "
                 "JOIN ar_run_controls c ON c.run_ref=r.run_ref "
                 "JOIN ar_safe_points s ON s.run_ref=r.run_ref "
                 "AND s.attempt_ref=r.retired_attempt_ref "
                 "AND s.root_session_ref=c.root_session_ref "
-                "WHERE r.run_ref=:run_ref AND r.replacement_attempt_ref=:attempt_ref "
+                "WHERE r.run_ref=:run_ref AND r.replacement_attempt_ref=:feedback_attempt_ref "
                 "AND r.reason_code='provider_result_correction' "
                 "AND c.attempt_ref=:attempt_ref AND c.fence_ref=:fence_ref "
                 "ORDER BY s.created_at DESC LIMIT 1"
-            ), {"run_ref": run_ref, "attempt_ref": attempt_ref, "fence_ref": fence_ref}).first()
+            ), {"run_ref": run_ref, "attempt_ref": attempt_ref, "fence_ref": fence_ref,
+                "feedback_attempt_ref": feedback_attempt_ref}).first()
             if row is None:
                 return None
             try:
@@ -9225,12 +9410,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
                     "bundle_operation_inputs_changed": "旧输出针对旧 frontier/state/commit 快照；根据当前快照重新判断并保留已接纳事实。这表示决策输入已变化，不表示科学证据无效或输出格式错误。",
-                    "quest_time_budget_exhausted": "已批准研究时间已用尽，所选 Target 尚未接纳。用 advancement_engine.research_time.read 读取当前额度，沿 human_request.open 明确申请 research_time_extension，或选择 wait/replan_required 有序收口；保留在途结果，不重复已发出工作。",
-                    "quest_time_budget_unconfirmed": "研究计时缺证，无法确认可用余额，所选 Target 尚未接纳。用 advancement_engine.research_time.read 查看依据，沿 human_request.open 申请 research_time_extension 并请人明确确认剩余额度和校正依据，或选择 wait/replan_required 收口；不把未知余额当作充足授权。",
+                    "quest_time_budget_exhausted": "这是旧版把建议预算当作门槛的历史拒绝，保留原记录。当前预算仅供规划；读取 advancement_engine.research_time.read 如实记录用时与偏差，按研究价值在既有资源和权限内继续，不需先申请延期，也不因此强制等待或收口。原操作先对账，避免重复已发工作。",
+                    "quest_time_budget_unconfirmed": "这是旧版因计时缺证而拒绝研究的历史记录。保留未知区间，不猜测余额；读取 advancement_engine.research_time.read 并在既有资源和权限内继续。计时未知本身不要求延期批准、等待或收口；原操作先对账，避免重复已发工作。",
                     "reuse_receipt_invalid": "candidate.route.reuse_receipt: use the verified reuse-eligibility receipt for this candidate; TargetCommit acceptance is a different receipt.",
                     "candidate_measurement_cell_not_required": "candidate.measurement_contract: select a measurement cell present in the frozen NormalizedCompletionContract.",
                     "candidate_held_fixed_binding_incomplete": "candidate.held_fixed: provide the bindings for every declared controlled variable.",
-                    "bundle_dispatch_target_not_in_frontier": "dispatch: select a currently authorized frontier target; use null selected_target_ref for wait/replan_required.",
+                    "bundle_dispatch_target_not_in_frontier": "dispatch: select a currently authorized frontier target; use null selected_target_ref for wait/replan_required/revise_strategy; revise_strategy requires an open strategy with every existing Target committed.",
+                    "bundle_strategy_revision_not_ready": "revise_strategy: wait for actual outstanding work or evidence; only an open strategy with no frontier and every existing Target committed can return to the next target batch.",
                 }.get(code, "Correct the reported contract failure in the retained previous output; preserve accepted facts and current source bindings.")),
             }
 
@@ -9857,6 +10043,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 continue
             if reconcile(str(row.operation_ref)) is not True:
                 continue
+            finish = getattr(provider, "finish_job", None)
+            if callable(finish):
+                # A verified terminal job may retain an in-memory cancellation
+                # latch. Release it before clearing pending cleanup, so a
+                # failed release remains retryable and cannot unblock new work.
+                finish(str(row.operation_ref))
             self.acknowledge_provider_safe_point(
                 unit_ref=row.unit_ref,
                 run_ref=row.run_ref,
@@ -10595,17 +10787,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         usage_wait = (saved is not None
                             and saved["checkpoint"].get("action") == "provider_hard_ceiling"
                             and saved["checkpoint"].get("failure", {}).get("code") == "codex_usage_limit")
+                        stopped = _stopped_stage_checkpoint(connection, row) is not None
                         row = self._replace_fenced_managed_attempt(
                             connection,
                             row,
                             now,
                             reuse_checkpoint=(
-                                usage_wait or _stage_resume_reuses_checkpoint(connection, row)
+                                usage_wait or stopped or _stage_resume_reuses_checkpoint(connection, row)
                                 if _is_formal_stage_run_kind(row.run_kind)
                                 else True
                             ),
-                            reuse_operation_refs=False if usage_wait else None,
-                            preserve_native_session=True if usage_wait else None,
+                            reuse_operation_refs=False if usage_wait or stopped else None,
+                            preserve_native_session=True if usage_wait or stopped else None,
                         )
                     next_status = "suspended" if human_wait_pending else "running"
                     cleanup_status = "none"
@@ -18736,7 +18929,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 payload_hash=attempt.payload_hash,
                 receipt=execution.receipt,
             )
-        primary_draft = _primary_draft(run, attempt, session)
+        with self._database.read() as connection:
+            from meta_research.bundle_runtime_refresh import inherited_primary_binding_hash
+            source_hash = inherited_primary_binding_hash(connection, run, attempt)
+        primary_run = SimpleNamespace(**{**(dict(run._mapping) if hasattr(run, "_mapping") else vars(run)),
+                                         "primary_source_runtime_binding_hash": source_hash})
+        primary_draft = _primary_draft(primary_run, attempt, session)
         if primary_draft is not None and primary_draft.primary_provider_unit_ref is not None:
             with self._database.read() as connection:
                 source = connection.execute(text(
@@ -20096,7 +20294,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             item for item in frontier if item.get("target_ref") == selected_target_ref
         ]
         if (
-            action not in {"dispatch", "wait", "replan_required"}
+            action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
             or (
                 action == "dispatch"
                 and (
@@ -20108,6 +20306,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or (action != "dispatch" and selected_target_ref is not None)
         ):
             raise OwnerConflict("bundle_dispatch_target_not_in_frontier")
+        if action == "revise_strategy" and (frontier
+                or state.get("strategy_revision_available") is not True):
+            raise OwnerConflict("bundle_strategy_revision_not_ready")
         validate_bundle_inbox_checkpoint(inbox_checkpoint)
         if (
             inbox_checkpoint.run_ref != run_ref
@@ -20169,12 +20370,53 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 verifier = self._target_graph_verifier
                 if verifier is None:
                     raise OwnerConflict("target_graph_verifier_unavailable")
+                batch_replan = state.get("batch_replan")
+                replan_refs = None
+                if batch_replan is not None:
+                    from meta_research.bundle_batch_replan import validate_replan_basis
+
+                    expected_fields = {"schema_ref", "basis", "provider_operation_ref", "provider_unit_ref",
+                                       "operation_name", "base_generation", "base_head_receipt", "result_hash"}
+                    if (action != "replan_required" or frontier
+                            or not isinstance(batch_replan, dict) or set(batch_replan) != expected_fields
+                            or batch_replan["schema_ref"] != "meta-research/bundle-batch-replan-source/v1"
+                            or type(batch_replan["base_generation"]) is not int or batch_replan["base_generation"] < 0
+                            or batch_replan["operation_name"] != f"target-batch-{batch_replan['base_generation'] + 1}"
+                            or not isinstance(batch_replan["result_hash"], str)
+                            or not re.fullmatch(r"[0-9a-f]{64}", batch_replan["result_hash"])):
+                        raise OwnerConflict("bundle_batch_replan_source_invalid")
+                    try:
+                        basis = validate_replan_basis(batch_replan["basis"], tuple(state.get("target_commit_refs", ())))
+                    except (TypeError, ValueError) as error:
+                        raise OwnerConflict(str(error)) from error
+                    replan_refs = tuple(basis["source_target_commit_refs"])
+                    head = batch_replan["base_head_receipt"]
+                    if not isinstance(head, dict) or not all(isinstance(head.get(key), str) for key in ("receipt_ref", "payload_hash")):
+                        raise OwnerConflict("bundle_batch_replan_source_invalid")
+                    expected_unit = _bundle_rolling_provider_unit_ref(
+                        operation_ref=batch_replan["provider_operation_ref"],
+                        operation_name=batch_replan["operation_name"], attempt_ref=attempt_ref)
+                    source_unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:ref"),
+                        {"ref": batch_replan["provider_unit_ref"]}).first()
+                    if (source_unit is None or source_unit.unit_ref != expected_unit
+                            or source_unit.run_ref != run_ref or source_unit.attempt_ref != attempt_ref
+                            or source_unit.fence_ref != fence_ref or source_unit.status != "completed"
+                            or source_unit.operation_ref != batch_replan["provider_operation_ref"]
+                            or source_unit.unit_kind != "bundle_review"):
+                        raise OwnerConflict("bundle_batch_replan_source_not_settled")
+                    if connection.execute(text("SELECT unit_ref FROM ar_provider_units WHERE run_ref=:run "
+                            "AND status NOT IN ('completed','revoked') LIMIT 1"), {"run": run_ref}).first() is not None:
+                        raise OwnerConflict("bundle_batch_replan_source_not_settled")
                 verifier.verify_bundle_dispatch_frontier(
                     request_ref=run.request_ref,
                     run_ref=run_ref,
                     graph_ref=graph_ref,
                     frontier=frontier,
                     allow_legacy_high_risk=False,
+                    strategy_revision=action == "revise_strategy" or batch_replan is not None,
+                    **({"replan_source_commit_refs": replan_refs,
+                        "replan_head": (batch_replan["base_generation"], head["receipt_ref"], head["payload_hash"])}
+                       if replan_refs is not None else {}),
                 )
                 expected_root = {
                     "run_kind": "bundle_stage",
@@ -23419,7 +23661,7 @@ def _primary_draft(run, attempt, session) -> IdeaPrimaryDraft | None:
         attempt_ref=attempt.attempt_ref,
         fence_ref=attempt.fence_ref,
         native_session_ref=session.native_session_ref,
-        runtime_binding_hash=run.runtime_binding_hash,
+        runtime_binding_hash=getattr(run, "primary_source_runtime_binding_hash", run.runtime_binding_hash),
         draft=draft,
         draft_hash=attempt.primary_draft_hash,
         adapter_kind=attempt.primary_adapter_kind,
@@ -23599,6 +23841,8 @@ def _insert_provider_invocations(
 def _provider_invocations(
     connection, run, attempt, fence
 ) -> tuple[IdeaProviderInvocation, IdeaProviderInvocation | None]:
+    from meta_research.bundle_runtime_refresh import historical_bundle_runtime
+    run = historical_bundle_runtime(connection, run, generation=attempt.generation)
     rows = connection.execute(
         text(
             "SELECT * FROM ar_stage_provider_invocations WHERE "
@@ -24168,6 +24412,8 @@ def _load_stage_fence(connection, run_ref: str, attempt_ref: str, fence_ref: str
     ).first()
     if run is None or attempt is None or fence is None:
         raise OwnerConflict("attempt_fence_invalid")
+    from meta_research.bundle_runtime_refresh import historical_bundle_runtime
+    run = historical_bundle_runtime(connection, run, generation=attempt.generation)
     _runtime_binding_from_row(run)
     session = connection.execute(
         text("SELECT * FROM ar_stage_sessions WHERE session_ref = :session_ref"),
@@ -24229,6 +24475,8 @@ def _stage_native_replacement_row(connection, run_ref, attempt_ref, fence_ref):
 def _historical_stage_execution_row(connection, row):
     if row is None:
         return row
+    from meta_research.bundle_runtime_refresh import historical_bundle_runtime
+    row = historical_bundle_runtime(connection, row)
     missing = connection.execute(text(
         "SELECT s.checkpoint_json,s.checkpoint_hash,a.run_ref,a.root_session_ref,a.attempt_ref,a.fence_ref "
         "FROM ar_stage_attempt_replacements x "
@@ -24380,6 +24628,7 @@ def _validated_runtime_binding(
     *,
     stage: str | None = None,
     allow_legacy_full_conformance: bool = False,
+    accepted_profile_hash: str | None = None,
 ) -> tuple[
     IdeaRuntimeBinding
     | PlanRuntimeBinding
@@ -24570,6 +24819,12 @@ def _validated_runtime_binding(
     profile = root_capability_profile(cast(RootAgentKind, stage),
         binding.model_ref if binding.model_ref in SUPPORTED_CODEX_MODEL_REFS else CODEX_MODEL_REF)
     allowed_root_bindings = set(profile.runtime_bindings())
+    if accepted_profile_hash is not None:
+        if not _is_sha256(accepted_profile_hash):
+            raise OwnerConflict("idea_runtime_binding_invalid")
+        allowed_root_bindings.add(
+            f"root-capability-profile:sha256:{accepted_profile_hash}"
+        )
     if (
         (stage == "bundle" and not bundle_binding_valid)
         or (stage == "reasoning" and not reasoning_binding_valid)
@@ -24742,11 +24997,8 @@ def _runtime_binding_from_row(
             resource_bindings=tuple(value["resource_bindings"]),
             schema_ref=value["schema_ref"],
         )
-        binding, binding_json, binding_hash = _validated_runtime_binding(
-            binding,
-            stage=row.stage,
-            allow_legacy_full_conformance=True,
-        )
+        binding_json = canonical_json(binding.as_dict())
+        binding_hash = canonical_hash(binding.as_dict())
     except (KeyError, TypeError, ValueError) as error:
         raise OwnerConflict("idea_runtime_binding_invalid") from error
     expected_admission_hash = canonical_hash(
@@ -24775,6 +25027,24 @@ def _runtime_binding_from_row(
         or expected_admission_hash != row.admission_hash
     ):
         raise OwnerConflict("idea_runtime_binding_invalid")
+    # An accepted binding describes its original installation, including paths
+    # in the profile's instructions. Check its persisted identity before allowing
+    # that exact historical fingerprint on readback. New admissions and writes
+    # still validate against the current profile; no capability is upgraded.
+    profile_prefix = "root-capability-profile:sha256:"
+    profiles = tuple(
+        item[len(profile_prefix):]
+        for item in binding.capability_bindings
+        if isinstance(item, str) and item.startswith(profile_prefix)
+    )
+    if len(profiles) > 1:
+        raise OwnerConflict("idea_runtime_binding_invalid")
+    binding, _binding_json, _binding_hash = _validated_runtime_binding(
+        binding,
+        stage=row.stage,
+        allow_legacy_full_conformance=True,
+        accepted_profile_hash=profiles[0] if profiles else None,
+    )
     return binding
 
 
@@ -24965,7 +25235,9 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
         or canonical_json(state) != row.state_json
         or canonical_hash(state) != row.state_hash
         or canonical_hash(decision) != row.decision_hash
-        or row.action not in {"dispatch", "wait", "replan_required"}
+        or row.action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
+        or (row.action == "revise_strategy" and (frontier
+            or state.get("strategy_revision_available") is not True))
         or (
             row.action == "dispatch"
             and (
@@ -25160,6 +25432,7 @@ _TARGET_FRONTIER_STAGE_REPLACEMENT_REASONS = frozenset(
     {
         "native_session_unavailable",
         "human_request_resume_after_restart",
+        "bundle_runtime_refreshed",
         "provider_result_correction",
         "root_completion_rejected",
         "runtime_fence_replaced",
@@ -25263,6 +25536,9 @@ def _target_frontier_dispatch_lineage_is_current(
             not in _TARGET_FRONTIER_STAGE_REPLACEMENT_REASONS
         ):
             return False
+        if replacement.reason_code == "bundle_runtime_refreshed":
+            from meta_research.bundle_runtime_refresh import verify_runtime_refresh_replacement
+            verify_runtime_refresh_replacement(connection, stage_run.run_ref, cursor_attempt_ref)
         retired = connection.execute(
             text(
                 "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
@@ -26663,8 +26939,22 @@ def _prepare_bundle_report_material_in_snapshot(
                 )
             elif replan_decision is not None and not blockers:
                 additional_receipt_refs.add(replan_decision.receipt.receipt_ref)
+                semantic_changes = (replan_decision.rationale,)
+                batch_source = replan_decision.state.get("batch_replan")
+                if batch_source is not None:
+                    from meta_research.bundle_batch_replan import validate_replan_basis
+
+                    try:
+                        basis = validate_replan_basis(batch_source["basis"], tuple(
+                            closure.target_commit_ref for closure in accepted.values()))
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise OwnerConflict("bundle_batch_replan_source_commits_invalid") from error
+                    # Retain the precise root synthesis, not a mechanically
+                    # generated success claim. Actual remaining cells below
+                    # still come from verified domain facts and frozen Briefs.
+                    semantic_changes += (canonical_json(basis),)
                 report_kwargs.update({
-                    "semantic_change_required": (replan_decision.rationale,),
+                    "semantic_change_required": semantic_changes,
                     "evidence_refs": (replan_decision.decision_ref,),
                 })
             else:
@@ -29286,6 +29576,189 @@ def _daemon_stopped_stage_evidence(connection, control) -> str | None:
                 + canonical_hash(proof)):
             return str(interruption.interruption_ref)
     return None
+
+
+def _resumed_bundle_checkpoint(connection, control):
+    run, current, session, fence = _load_stage_fence(connection,
+        control.run_ref, control.attempt_ref, control.fence_ref)
+    if (run.stage != "bundle" or run.status != "running" or current.status != "running"
+            or session.status != "active" or session.native_session_ref is not None
+            or fence.status != "current" or run.current_attempt_ref != current.attempt_ref
+            or run.current_fence_ref != fence.fence_ref
+            or current.root_session_ref != control.root_session_ref
+            or any(getattr(current, key) is not None for key in (
+                "primary_draft_json", "primary_draft_hash", "primary_adapter_kind", "primary_recorded_at",
+                "primary_provider_unit_ref", "submission_ref", "payload_json", "payload_hash",
+                "execution_receipt_ref", "execution_receipt_hash"))):
+        return None
+    if (connection.execute(text("SELECT 1 FROM ar_provider_units WHERE attempt_ref=:ref LIMIT 1"),
+            {"ref": current.attempt_ref}).first() is not None
+            or connection.execute(text("SELECT 1 FROM ar_execution_responsibilities WHERE attempt_ref=:ref LIMIT 1"),
+                {"ref": current.attempt_ref}).first() is not None):
+        return None
+    primary, review = _provider_invocations(connection, run, current, fence)
+    if any(item is not None and (item.status != "prepared" or item.response_hash is not None)
+           for item in (primary, review)):
+        return None
+    replacement = connection.execute(text("SELECT * FROM ar_stage_attempt_replacements "
+        "WHERE replacement_attempt_ref=:ref AND run_ref=:run"),
+        {"ref": current.attempt_ref, "run": run.run_ref}).first()
+    if replacement is None or replacement.reason_code != "runtime_fence_replaced":
+        return None
+    old = connection.execute(text("SELECT * FROM ar_stage_attempts WHERE attempt_ref=:ref"),
+        {"ref": replacement.retired_attempt_ref}).one()
+    if (old.run_ref != run.run_ref or old.root_session_ref != session.session_ref
+            or old.status != "executed" or int(old.generation) + 1 != int(current.generation)
+            or old.primary_draft_json is None or old.submission_ref is None):
+        return None
+    historical = SimpleNamespace(**{**dict(control._mapping),
+        "attempt_ref": old.attempt_ref, "fence_ref": old.fence_ref})
+    saved = _stopped_stage_checkpoint(connection, historical)
+    if saved is None:
+        return None
+    # The original formal resume must have created precisely this unused
+    # successor, and must still be the latest control on its Run.
+    operations = connection.execute(text("SELECT * FROM ar_control_operations "
+        "WHERE action='resume' AND quest_ref=:quest AND cycle_ref=:cycle AND created_at=:created"),
+        {"quest": control.quest_ref, "cycle": control.cycle_ref, "created": replacement.created_at}).all()
+    matching = []
+    for operation in operations:
+        receipt = _runtime_control_receipt(operation)
+        reservation = connection.execute(text("SELECT * FROM ar_control_reservations "
+            "WHERE operation_ref=:ref"), {"ref": operation.operation_ref}).first()
+        if (reservation is None or reservation.status != "applied" or reservation.action != "resume"
+                or connection.execute(text("SELECT 1 FROM ar_control_compensations WHERE operation_ref=:ref"),
+                    {"ref": operation.operation_ref}).first() is not None):
+            continue
+        reserved = _runtime_control_reservation_document(reservation)
+        target = decoded_object(reservation.payload_json)["target"]
+        expected_hash = canonical_hash({"issuer": AR_OWNER, "kind": "runtime_control",
+            "subject_ref": operation.operation_ref, "action": "resume", "target": target,
+            "source_stage": operation.source_stage,
+            "affected_question_refs_hash": operation.affected_question_refs_hash,
+            "affected_runs_hash": operation.affected_runs_hash, "safe_points_hash": operation.safe_points_hash})
+        if (operation.receipt_hash != expected_hash
+                or any(target.get(key) != getattr(control, key) for key in ("quest_ref", "cycle_ref", "epoch"))
+                or operation.epoch != control.epoch
+                or operation.target_scope != target.get("target_scope")
+                or operation.run_ref != target.get("run_ref")
+                or not any(all(item.get(key) == getattr(historical, key) for key in (
+                    "run_ref", "run_kind", "quest_ref", "cycle_ref", "epoch", "attempt_ref", "root_session_ref", "fence_ref"))
+                    and item.get("control_revision") == saved["checkpoint"]["control_revision"] + 1
+                    and item.get("status") == "suspended_fenced" for item in reserved["affected_runs"])):
+            continue
+        if any(all(item.get(key) == getattr(control, key) for key in (
+                "run_ref", "run_kind", "attempt_ref", "root_session_ref", "fence_ref", "safe_point_ref"))
+                and item.get("status") == "running" for item in receipt["affected_runs"]):
+            matching.append(operation)
+    if (len(matching) != 1 or int(control.control_revision) != saved["checkpoint"]["control_revision"] + 2
+            or primary.operation_ref == saved["checkpoint"]["provider_operation_ref"]):
+        return None
+    # Each technical ancestor must carry the same accepted primary. Native
+    # identity is recovered only from those ancestors' validated Owner decisions.
+    ancestors = {}
+    ancestor = old
+    while True:
+        if (ancestor.attempt_ref in ancestors or ancestor.run_ref != run.run_ref
+                or ancestor.root_session_ref != session.session_ref or ancestor.status != "executed"
+                or ancestor.primary_draft_json != old.primary_draft_json
+                or ancestor.primary_draft_hash != old.primary_draft_hash):
+            return None
+        ancestors[ancestor.attempt_ref] = ancestor
+        link = connection.execute(text("SELECT * FROM ar_stage_attempt_replacements "
+            "WHERE replacement_attempt_ref=:ref AND run_ref=:run"),
+            {"ref": ancestor.attempt_ref, "run": run.run_ref}).first()
+        if link is None:
+            break
+        if link.reason_code != "runtime_fence_replaced":
+            return None
+        previous = connection.execute(text("SELECT * FROM ar_stage_attempts WHERE attempt_ref=:ref"),
+            {"ref": link.retired_attempt_ref}).one()
+        if int(previous.generation) + 1 != int(ancestor.generation):
+            return None
+        ancestor = previous
+    decisions = []
+    for row in connection.execute(text("SELECT * FROM ar_bundle_dispatch_decisions WHERE run_ref=:run"),
+            {"run": run.run_ref}).all():
+        source = ancestors.get(row.attempt_ref)
+        if source is not None:
+            if row.fence_ref != source.fence_ref:
+                return None
+            decisions.append(_bundle_dispatch_decision(row))
+    natives = {decision.native_session_ref for decision in decisions}
+    if len(natives) != 1 or not next(iter(natives)):
+        return None
+    native = next(iter(natives))
+    retained_session = SimpleNamespace(**{**dict(session._mapping), "native_session_ref": native})
+    for source in ancestors.values():
+        execution = _attempt_execution(run, source, retained_session)
+        merged = SimpleNamespace(**{**dict(run._mapping), **dict(source._mapping),
+            "native_session_ref": native})
+        _verify_provider_execution_chain(connection, merged, execution)
+    old_fence = connection.execute(text("SELECT * FROM ar_execution_fences WHERE fence_ref=:ref"),
+        {"ref": old.fence_ref}).one()
+    old_primary, _ = _provider_invocations(connection, run, old, old_fence)
+    if primary.operation_ref == old_primary.operation_ref:
+        return None
+    return old, native, [decision.decision_ref for decision in decisions]
+
+
+def _stopped_stage_checkpoint(connection, control):
+    """Validate an accepted stopped-call boundary without authorizing its replay."""
+    if not _is_formal_stage_run_kind(control.run_kind):
+        return None
+    saved = _query_managed_safe_point(connection, control)
+    if saved is None:
+        return None
+    checkpoint = saved["checkpoint"]
+    if (checkpoint.get("action") != "provider_hard_ceiling"
+            or checkpoint.get("failure") != {"code": "codex_operation_stopped"}):
+        return None
+    expected = {"schema_ref": "meta-research/runtime-safe-point/v1",
+        "run_ref": control.run_ref, "run_kind": control.run_kind,
+        "quest_ref": control.quest_ref, "cycle_ref": control.cycle_ref,
+        "epoch": control.epoch, "attempt_ref": control.attempt_ref,
+        "root_session_ref": control.root_session_ref, "fence_ref": control.fence_ref,
+        "run_status": "running", "provider_operation_retry_permitted": False}
+    if (any(checkpoint.get(key) != value for key, value in expected.items())
+            or checkpoint.get("provider_operation_retry_permitted") is not False):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:ref"),
+        {"ref": checkpoint.get("provider_unit_ref")}).first()
+    fence = connection.execute(text("SELECT * FROM ar_execution_fences WHERE fence_ref=:ref"),
+        {"ref": control.fence_ref}).first()
+    revoked = connection.execute(text("SELECT * FROM ar_fence_revocations WHERE fence_ref=:ref"),
+        {"ref": control.fence_ref}).first()
+    if (unit is None or fence is None or revoked is None or unit.status != "revoked"
+            or (unit.run_ref, unit.attempt_ref, unit.fence_ref, unit.operation_ref,
+                _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind)) != (
+                control.run_ref, control.attempt_ref, control.fence_ref,
+                checkpoint.get("provider_operation_ref"), control.run_kind)
+            or (fence.run_ref, fence.attempt_ref, fence.status) != (
+                control.run_ref, control.attempt_ref, "rejected")
+            or (revoked.run_ref, revoked.attempt_ref, revoked.operation_ref, revoked.reason_code) != (
+                control.run_ref, control.attempt_ref, checkpoint.get("operation_ref"), "codex_operation_stopped")
+            or connection.execute(text("SELECT 1 FROM ar_provider_units WHERE run_ref=:run "
+                "AND status IN ('active','revocation_pending') LIMIT 1"), {"run": control.run_ref}).first()):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    _validated_stage_provider_hard_ceiling(unit_kind=unit.unit_kind,
+        failure_code="codex_operation_stopped", provider_exit=checkpoint.get("provider_exit"))
+    effect = _provider_runtime_effect(unit_ref=unit.unit_ref, operation_ref=unit.operation_ref,
+        run_ref=unit.run_ref, attempt_ref=unit.attempt_ref, fence_ref=unit.fence_ref,
+        claim_started_at=float(unit.started_at))
+    boundary = connection.execute(text("SELECT * FROM ar_runtime_boundary_receipts "
+        "WHERE responsibility_ref=:ref"), {"ref": effect.responsibility_ref}).first()
+    identity = {name: getattr(effect, name) for name in (
+        "responsibility_ref", "owner_scope", "root_run_ref", "attempt_ref", "fence_ref",
+        "operation_ref", "effect_kind")}
+    value = {"schema_ref": "meta-research/runtime-boundary-receipt/v1", **identity,
+        "boundary": "permanent_fence", "checkpoint_ref": None,
+        "owner_evidence_ref": "stage_provider_hard_ceiling_" + saved["checkpoint_hash"]}
+    if (boundary is None or any(boundary._mapping.get(key) != value
+            for key, value in value.items() if key not in {"schema_ref", "effect_kind"})
+            or boundary.evidence_hash != canonical_hash(value)):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    return saved
 
 
 def _stage_resume_reuses_checkpoint(connection, row) -> bool:

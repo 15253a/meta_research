@@ -61,12 +61,15 @@ def boundary():
     os.setgid(65534)
     os.setuid(65534)
 
-def receipt(status, code, ended, error=None):
+def receipt(status, code, ended, error=None, mechanism=None):
     path = configuration["receipt"]
     temporary = path + ".new"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         json.dump({"status": status, "returncode": code, "descendants_ended": ended,
+            "process_tree": ({"schema_ref": "meta-research/provider-process-tree/v1",
+                "state": "closed", "mechanism": mechanism, **configuration["host_identity"]}
+                if ended and mechanism is not None else None),
             "error_type": type(error).__name__ if error else None,
             "error_errno": getattr(error, "errno", None)}, stream)
         stream.flush()
@@ -119,7 +122,7 @@ try:
         stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, close_fds=True,
         start_new_session=True, preexec_fn=boundary)
 except BaseException as error:
-    receipt("launch_failed", 125, True, error)
+    receipt("launch_failed", 125, True, error, mechanism="not-started")
     sys.exit(125)
 
 returncode = None
@@ -140,7 +143,8 @@ while True:
         if returncode is None or proof_failed:
             receipt("unknown_outcome", returncode, False)
             sys.exit(125)
-        receipt("stopped" if stopping else "completed", returncode, True)
+        receipt("stopped" if stopping else "completed", returncode, True,
+            mechanism="linux-subreaper-echild")
         sys.exit(0)
     if stopping or returncode is not None:
         try:
@@ -161,6 +165,7 @@ class NativeCreationCall:
     output_paths: tuple[Path, ...]
     stdout_sink: Callable[[bytes], None] | None = None
     stream_max_bytes: int = 64 * 1024 * 1024
+    input_layout_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +180,14 @@ class ProtectedCreationError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class ProtectedCreationCompletedProcess(subprocess.CompletedProcess[str]):
+    """Native output accompanied by this call's verified helper closure."""
+
+    def __init__(self, args, returncode, stdout, stderr, *, process_tree):
+        super().__init__(args, returncode, stdout, stderr)
+        self.process_tree = process_tree
 
 
 class ProtectedCreationRuntime:
@@ -215,8 +228,10 @@ class ProtectedCreationRuntime:
                 arguments, environment, outputs, prompt = self._prepare_call(call)
                 launch = self._control / ("launch-" + secrets.token_hex(12) + ".json")
                 receipt = launch.with_suffix(".receipt.json")
+                from meta_research.provider_supervisor import supervisor_host_identity
                 _write_private(launch, json.dumps({"jail": str(self.jail_root),
-                    "argv": arguments, "environment": environment, "receipt": str(receipt)}).encode())
+                    "argv": arguments, "environment": environment, "receipt": str(receipt),
+                    "host_identity": supervisor_host_identity()}).encode())
                 with self._state:
                     if self._stop_before_launch:
                         return self._cancelled_call(call)
@@ -238,7 +253,7 @@ class ProtectedCreationRuntime:
                     raise ProtectedCreationError("protected_creation_launch_failed")
                 for source, destination in outputs:
                     self._publish_output(source, destination)
-                return subprocess.CompletedProcess(call.argv, int(outcome["returncode"]), stdout, stderr)
+                return self._completed_process(call, outcome, stdout, stderr)
         finally:
             with self._state:
                 self._starting = False
@@ -319,13 +334,33 @@ class ProtectedCreationRuntime:
         return stdout, stderr
 
     def _cancelled_call(self, call: NativeCreationCall) -> subprocess.CompletedProcess[str]:
+        from meta_research.provider_supervisor import supervisor_host_identity
+
         receipt = self._control / ("cancel-" + secrets.token_hex(12) + ".receipt.json")
-        _write_private(receipt, json.dumps({"status": "stopped", "returncode": -signal.SIGTERM,
-            "descendants_ended": True}).encode())
+        outcome = {"status": "stopped", "returncode": -signal.SIGTERM, "descendants_ended": True,
+            "process_tree": {"schema_ref": "meta-research/provider-process-tree/v1", "state": "closed",
+                "mechanism": "not-started", **supervisor_host_identity()}}
+        _write_private(receipt, json.dumps(outcome).encode())
         _replace_private(self._control / "active.json", json.dumps({"receipt": receipt.name}).encode(), 0o600)
         self._receipt = receipt
         self._process = None
-        return subprocess.CompletedProcess(call.argv, -signal.SIGTERM, "", "")
+        return self._completed_process(call, outcome, "", "")
+
+    @staticmethod
+    def _completed_process(call, outcome, stdout, stderr):
+        from meta_research.provider_supervisor import (
+            ProviderSupervisorError, supervisor_host_identity, verify_process_tree_closed,
+        )
+
+        proof = outcome.get("process_tree")
+        try:
+            verify_process_tree_closed(proof)
+            if any(proof[name] != value for name, value in supervisor_host_identity().items()):
+                raise ProviderSupervisorError("provider_process_tree_proof_invalid")
+        except ProviderSupervisorError as error:
+            raise ProtectedCreationError("protected_creation_unknown_outcome") from error
+        return ProtectedCreationCompletedProcess(call.argv, int(outcome["returncode"]), stdout, stderr,
+            process_tree=dict(proof))
 
     def request_stop(self) -> dict[str, object]:
         with self._state:
@@ -625,12 +660,11 @@ class ProtectedCreationRuntime:
 
     def _prepare_call(self, call: NativeCreationCall) -> tuple[list[str], dict[str, str], list[tuple[Path, Path]], str]:
         mappings = {str(self.executable): self._entry_command, str(self.work_directory): "/workspace"}
+        layout_root = None if call.input_layout_root is None else _absolute(call.input_layout_root)
+        if layout_root is not None:
+            mappings[str(layout_root)] = "/inputs/resources"
         with _parent_descriptor(self.jail_root / "inputs" / "slot") as directory:
-            for name in os.listdir(directory):
-                details = os.stat(name, dir_fd=directory, follow_symlinks=False)
-                if not stat.S_ISREG(details.st_mode) or details.st_uid != 0:
-                    raise ProtectedCreationError("protected_creation_jail_unrecognized")
-                os.unlink(name, dir_fd=directory)
+            _clear_input_projection(directory)
         total = 0
         for index, supplied in enumerate(call.read_only_inputs):
             source = _absolute(supplied)
@@ -643,7 +677,12 @@ class ProtectedCreationRuntime:
             if total > _INPUT_LIMIT:
                 raise ProtectedCreationError("protected_creation_input_too_large")
             name = f"{index:04d}-" + source.name
+            # Preserve links only within the explicitly declared resource root.
+            # This never enumerates or grants access to additional source files.
+            if layout_root is not None and source.is_relative_to(layout_root):
+                name = "resources/" + source.relative_to(layout_root).as_posix()
             target = self.jail_root / "inputs" / name
+            _directory(target.parent, 0o755)
             _replace_private(target, content, 0o444)
             mappings[str(source)] = "/inputs/" + name
         outputs = []
@@ -660,11 +699,11 @@ class ProtectedCreationRuntime:
                 mapped = "/outputs/" + name
             outputs.append((source, destination))
             mappings[str(destination)] = mapped
-        arguments = [_mapped(value, mappings, self.work_directory) for value in call.argv]
+        arguments = [_mapped(value, mappings, self.work_directory, layout_root) for value in call.argv]
         if arguments[0] not in {self._entry_command, self.executable.name, "codex"}:
             raise ProtectedCreationError("protected_creation_executable_mismatch")
         arguments[0] = self._entry_command
-        environment = {key: _mapped(value, mappings, self.work_directory) for key, value in call.environment.items()}
+        environment = {key: _mapped(value, mappings, self.work_directory, layout_root) for key, value in call.environment.items()}
         environment.update({"HOME": "/home/creation", "USERPROFILE": "/home/creation",
             "CODEX_HOME": "/home/creation/.codex", "CODEX_SQLITE_HOME": "/home/creation/.codex",
             "PATH": "/bin:/python/bin", "SHELL": "/bin/bash", "PYTHONHOME": "/python",
@@ -676,7 +715,7 @@ class ProtectedCreationRuntime:
         if len(arguments) > 1 and arguments[1] == "exec":
             from meta_research.quest_drafting import protected_codex_shell_arguments
             arguments = protected_codex_shell_arguments(arguments, environment=environment)
-        return arguments, environment, outputs, _mapped(call.prompt, mappings, self.work_directory)
+        return arguments, environment, outputs, _mapped(call.prompt, mappings, self.work_directory, layout_root)
 
     def _publish_output(self, source: Path, destination: Path) -> None:
         try:
@@ -913,10 +952,31 @@ def _runtime_entry(executable: Path) -> _RuntimeEntry:
     raise ProtectedCreationError("protected_creation_executable_unsupported")
 
 
-def _mapped(value: str, mappings: dict[str, str], work_directory: Path) -> str:
+def _clear_input_projection(directory: int) -> None:
+    for name in os.listdir(directory):
+        details = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if details.st_uid != 0 or details.st_mode & 0o022:
+            raise ProtectedCreationError("protected_creation_jail_unrecognized")
+        if stat.S_ISDIR(details.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                _clear_input_projection(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=directory)
+        elif stat.S_ISREG(details.st_mode) and details.st_nlink == 1:
+            os.unlink(name, dir_fd=directory)
+        else:
+            raise ProtectedCreationError("protected_creation_jail_unrecognized")
+
+
+def _mapped(value: str, mappings: dict[str, str], work_directory: Path,
+            input_layout_root: Path | None = None) -> str:
     for source, target in sorted(mappings.items(), key=lambda item: len(item[0]), reverse=True):
-        ending = r"(?=$|[\s\"',\]\)}])"
-        if source == str(work_directory):
-            ending = r"(?=$|/|[\s\"',\]\)}])"
+        # Developer instructions are JSON encoded CLI arguments: a root at the
+        # end of a line is followed by a literal \\n, not whitespace.
+        ending = r"(?=$|[\s\"'`,\]\)}]|\\[nrt\"])"
+        if source in {str(work_directory), str(input_layout_root)}:
+            ending = r"(?=$|/|[\s\"'`,\]\)}]|\\[nrt\"])"
         value = re.sub(r"(?<![\w./-])" + re.escape(source) + ending, lambda match: target, value)
     return value

@@ -10,7 +10,7 @@
 
 交接全文沿同一冻结前序来源取得；真正缺失、截断未补齐或不可访问时，如实说明缺什么及其影响，不能将预览或新摘要称为完整交接。其他历史按当前判断的相关性追溯。无直接前序时，保留这一事实，并按需要查当前 Question 和同 Quest 既有研究。
 
-有 `creation_basis` 时，它指向正式 Question 关联的已有课题理解。用 `research_memory.stage_context.read` 的 `creation_understanding`、`creation_corrections` 和 `creation_sources` 分页读取。选中原件沿返回的 `research_memory.content.read` 精确版本入口继续读；未选中或未读原材料保留 `research_memory.creation_basis.read` 入口。无该绑定时不补造创建交接，材料缺失或 hash 变化如实呈现。外部旧成果保留其来源，不能当成本 Quest 新 Run。
+有 `creation_basis` 时，它指向正式 Question 关联的已有课题理解。用 `research_memory.stage_context.read` 的 `creation_understanding`、`creation_corrections` 和 `creation_sources` 分页读取。选中原件沿返回的 `research_memory.content.read` 精确版本入口继续读；未选中单文件沿其返回的 `research_memory.creation_basis.read` 入口读取。目录引用保留材料描述与覆盖情况，`reader` 为 null；其 `retained_files` 只列本 basis 已保管的原文件，沿各自精确 reader 读取，不能用目录 material_key 加 entry_path 代替。其他原材料入口仍遵循各自 reference 的授权与生命周期。无该绑定时不补造创建交接，材料缺失或 hash 变化如实呈现。外部旧成果保留其来源，不能当成本 Quest 新 Run。
 
 ## 判断当前工作所需的条件
 

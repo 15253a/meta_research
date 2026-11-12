@@ -35,12 +35,13 @@ export function QuestResearchTime({ questRef, refreshKey = "", onObserved }: {
   return <section className="quest-research-time" aria-label="研究时间">
     <h3>研究时间</h3>
     {snapshot ? <>
-      <p><b>{snapshot.budget_kind === "unlimited" ? "不设固定截止" : snapshot.accuracy === "unknown" ? "剩余时间暂不能准确确定"
-        : `剩余 ${durationLabel(snapshot.remaining_seconds ?? 0)}`}</b>
-        {snapshot.overrun_seconds != null && snapshot.overrun_seconds > 0 ? ` · 已超时 ${durationLabel(snapshot.overrun_seconds)}` : ""}</p>
-      <p>{snapshot.approved_seconds == null ? "当前额度：不设固定截止" : `已批准总时长 ${durationLabel(snapshot.approved_seconds)}`}；
+      <p><b>{snapshot.budget_kind === "unlimited" ? "未设建议总时长" : snapshot.accuracy === "unknown" ? "预算余量暂不能准确确定"
+        : `预算余量 ${durationLabel(snapshot.remaining_seconds ?? 0)}`}</b>
+        {snapshot.overrun_seconds != null && snapshot.overrun_seconds > 0 ? ` · 超出建议 ${durationLabel(snapshot.overrun_seconds)}` : ""}</p>
+      <p>{snapshot.approved_seconds == null ? "规划预算：未设建议总时长" : `建议总时长 ${durationLabel(snapshot.approved_seconds)}`}；
         {snapshot.accuracy === "exact" ? `已用 ${durationLabel(snapshot.used_seconds ?? 0)}` : `已确认用量 ${durationLabel(snapshot.confirmed_used_seconds)}`}
       </p>
+      <p>时间预算用于规划。超出或暂不能准确核定时，按研究价值调整安排，不自动停止或要求延期。</p>
       <p>{snapshot.status === "paused" ? "人工暂停中，暂停期间不计时。" : snapshot.status === "stopped" ? "服务已停止，停机期间不计时。"
         : snapshot.status === "not_started" ? "正式研究尚未开始。" : snapshot.status === "completed" ? "本项研究已结束计时。" : "等待回应期间继续计时；人工暂停和服务停机不计时。"}</p>
       {snapshot.accuracy === "unknown" && <p>有缺少计时依据的区间，已确认用量仍保留；需明确校正依据后才能给出准确余额。</p>}

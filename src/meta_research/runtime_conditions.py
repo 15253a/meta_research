@@ -158,7 +158,7 @@ def _initial_conditions(db, *, quest_ref=None, run_ref=None,
         values["gpu_configuration"] = "未配置已选 GPU；不得将机器探测到的其他显卡当作用户已选择的资源。"
     initial_text = (
         "按以下条件安排研究与委派；显卡是用户选定的可用资源，按工作需要使用，无需为了使用显卡而改变方法。"
-        "时间预算是整个 Quest 的预算，开始新一轮研究时不会重置。\n"
+        "时间预算是整个 Quest 跨轮累计的规划建议，按研究价值与实际进展调整安排。\n"
         + json.dumps(values, ensure_ascii=False, indent=2)
     )
     scope = quest_ref or _INIT_PREFIX + initialization_id
@@ -420,9 +420,12 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
     public = {key: value for key, value in current.items() if key not in {"literature_configuration", "stage_models"}}
     clock_guidance = (
         "research_time 是 Quest 共用的当前计时观察，优先于正文中的初始总预算。安排新工作、长调用后及人类答复后，"
-        "按需用 advancement_engine.research_time.read 刷新；据余额、耗时估计、依赖与资源调整实际工作和委派，"
-        "计入核对、交接和求助耗时，首次预计不足时先申请 research_time_extension，再安排获批后的研究工作。"
-        "已发出操作先沿原输入对账。\n"
+        "按需用 advancement_engine.research_time.read 刷新，如实记录用时、偏差与计量不确定性。"
+        "Quest 时长、1200 秒环境准备窗口及 Agent 提出的阶段时限均为规划建议，写入或接纳 Plan 不使其成为硬要求。"
+        "达到、预计超出或暂不能准确核定建议预算时，根据研究价值调整安排并在已授权范围内继续；"
+        "不能仅因此拒绝调度、Target 接纳、成果交接或后继推进，也不强制停止、收口或先申请延期。"
+        "用户明确的停止指令、资源与权限边界、工具超时和进程控制仍按其本身含义执行。"
+        "已发出操作先沿原输入对账，历史 Plan、失败和已接纳成果保持原记录；新决策使用当前建议预算语义。\n"
         if "research_time" in public else ""
     )
     return (

@@ -364,6 +364,21 @@ class BundleStageWorker:
             if managed["status"] == "suspended" and managed.get("terminal_reason") == "human_request_wait":
                 self._observation = BundleObservation("waiting", "human_request_wait")
             return False
+        if managed is not None and managed["status"] == "running" and managed.get("cleanup_status") in {"completed", "none"}:
+            provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
+            current_binding = self._current_runtime_binding(provider)
+            if current_binding is not None and not bundle_bindings_compatible(run.runtime_binding, current_binding):
+                from meta_research.bundle_runtime_refresh import refresh_bundle_runtime
+                try:
+                    refreshed = refresh_bundle_runtime(self._agent_runtime, run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, runtime_binding=current_binding,
+                        harness_authority=self._harnesses)
+                except OwnerConflict as error:
+                    self._observation = BundleObservation("failure", error.code)
+                    return False
+                if refreshed:
+                    self._observation = BundleObservation("ready")
+                    return True
         if run.status in {"running", "awaiting_acceptance"}:
             self._drain_bundle_inbox(run)
         if _bundle_primary_output_kind(run) == "exhaustion_assessment":
@@ -506,7 +521,48 @@ class BundleStageWorker:
         # Stage completion is exclusively authorized by the durable report
         # path above, after AR has reread every current terminal handoff and
         # exact FormalPlan measurement cell.
-        if len(commits) == len(graph.targets) and not graph.strategy_complete:
+        all_targets_committed = len(commits) == len(graph.targets)
+        coordination_after_no_action = False
+        if all_targets_committed and not graph.strategy_complete:
+            feedback = self._agent_runtime.query_stage_provider_correction_feedback(
+                run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+            )
+            # A rejected empty batch is not an accepted strategy or a research
+            # conclusion. Give its exact current successor the existing root
+            # decision channel instead of demanding another impossible batch.
+            # The physical unit also binds the rejected graph generation: old
+            # feedback must not divert later, legitimately appended work.
+            coordination_after_no_action = bool(
+                feedback is not None
+                and feedback.get("failure_code") == "bundle_review_result_contract_invalid"
+                and feedback.get("detail_code") == "strategy_update_has_no_actionable_work"
+                and feedback.get("provider_unit_ref") == _rolling_provider_unit_ref(
+                    operation_ref=feedback["provider_operation_ref"],
+                    operation_name=f"target-batch-{graph.head_generation + 1}",
+                    attempt_ref=feedback["rejected_attempt_ref"],
+                )
+            )
+            if coordination_after_no_action:
+                decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+                latest = decisions[-1] if decisions else None
+                if (latest is not None and latest.action == "revise_strategy"
+                        and latest.attempt_ref == run.attempt_ref
+                        and latest.fence_ref == run.fence_ref and latest.graph_ref == graph.graph_ref):
+                    # The accepted typed decision requests a new strategy proposal.
+                    # It is not a Target, a dispatch, or a synthetic inbox fact.
+                    coordination_after_no_action = False
+                elif (latest is not None and latest.action == "wait" and not latest.frontier
+                        and latest.attempt_ref == run.attempt_ref
+                        and latest.fence_ref == run.fence_ref and latest.graph_ref == graph.graph_ref):
+                    # A wait consumes this exact research input, not the right to
+                    # propose later work. Fresh inbox facts reopen the normal
+                    # batch path; unchanged inputs retain the durable wait.
+                    checkpoint = self._drain_bundle_inbox(run)
+                    coordination_after_no_action = self._operation_uses_inbox_checkpoint(
+                        operation_kind="dispatch", operation_ref=latest.decision_ref,
+                        checkpoint=checkpoint,
+                    )
+        if all_targets_committed and not graph.strategy_complete and not coordination_after_no_action:
             inbox_checkpoint = self._drain_bundle_inbox(run)
             proposals = self._agent_runtime.query_bundle_target_proposals(
                 run.run_ref
@@ -636,6 +692,38 @@ class BundleStageWorker:
                         return False
                     self._bind_rolling_replacement(run, graph, batch_unit_ref,
                         result.native_session_ref, replacement_context)
+                    if result.action == "replan_required":
+                        # A genuine root decision, not an empty/invalid strategy
+                        # and not a Target. Settle the exact batch before AR
+                        # accepts its synthesis under the current root fence.
+                        self._agent_runtime.acknowledge_provider_safe_point(
+                            unit_ref=batch_unit_ref, run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+                        )
+                        decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+                        state = self._dispatch_state(graph, commits, run=run)
+                        state["batch_replan"] = {
+                            "schema_ref": "meta-research/bundle-batch-replan-source/v1",
+                            "basis": result.replan_basis,
+                            "provider_operation_ref": batch_operation_ref,
+                            "provider_unit_ref": batch_unit_ref,
+                            "operation_name": f"target-batch-{graph.head_generation + 1}",
+                            "base_generation": graph.head_generation,
+                            "base_head_receipt": batch_request.base_head_receipt,
+                            "result_hash": validate_bundle_target_batch_result(batch_request, result),
+                        }
+                        self._agent_runtime.record_bundle_dispatch_decision(
+                            run_ref=run.run_ref, attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref, native_session_ref=result.native_session_ref,
+                            graph_ref=graph.graph_ref, generation=len(decisions) + 1,
+                            frontier=(), state=state, action="replan_required",
+                            selected_target_ref=None, rationale=result.rationale,
+                            inbox_checkpoint=inbox_checkpoint,
+                            idempotency_key=_operation_key("bundle-batch-replan", run.run_ref,
+                                batch_operation_ref, batch_unit_ref),
+                        )
+                        self._observation = BundleObservation("ready")
+                        return True
                     self._agent_runtime.record_bundle_target_proposal(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
@@ -793,7 +881,7 @@ class BundleStageWorker:
             in {target.target_ref for target in launchable}
             else None
         )
-        coordination_needed = bool(frontier)
+        coordination_needed = bool(frontier) or coordination_after_no_action
         dispatch_generation = (
             pending_dispatch.generation
             if pending_dispatch is not None
@@ -889,14 +977,6 @@ class BundleStageWorker:
                             return False
                         if selected in input_errors:
                             raise BundleSkillContractError(input_errors[selected])
-                        # This completed turn is a safe decision boundary. Keep
-                        # its original input/result, but return an unusable
-                        # dispatch through the existing same-root correction
-                        # path instead of persisting an endlessly retried launch.
-                        constraint = research_time_work_constraint(
-                            self._advancement_engine.query_research_time(graph.quest_ref))
-                        if constraint["status"] != "available":
-                            raise BundleSkillContractError("quest_time_budget_" + constraint["status"])
                 except BundleSkillUnavailable as error:
                     error = self._recover_stopped_error(error, run.run_ref)
                     if error.code == "codex_operation_reconciliation_pending":
@@ -958,7 +1038,7 @@ class BundleStageWorker:
                         "bundle-dispatch", run.run_ref, str(len(decisions) + 1)
                     ),
                 )
-                self._observation = (BundleObservation("ready") if result.action == "dispatch" else BundleObservation("waiting", "bundle_replan_required" if result.action == "replan_required" else "bundle_root_waiting"))
+                self._observation = (BundleObservation("ready") if result.action in {"dispatch", "revise_strategy"} else BundleObservation("waiting", "bundle_replan_required" if result.action == "replan_required" else "bundle_root_waiting"))
                 return True
             finally:
                 if provider_safe:
@@ -1799,6 +1879,8 @@ class BundleStageWorker:
             "target_commit_refs": [commit.commit_ref for commit in commits],
             "running_targets": running,
             "blocked_targets": blocked,
+            "strategy_revision_available": (not graph.strategy_complete
+                and len(commits) == len(graph.targets) and not running and not blocked),
         }
 
     def _dispatch_target(

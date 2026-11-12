@@ -348,10 +348,12 @@ class BundleTargetBatchRequest:
 
 @dataclass(frozen=True)
 class BundleTargetBatchResult:
-    strategy_update: dict[str, object]
+    strategy_update: dict[str, object] | None
     rationale: str
     native_session_ref: str
     adapter_kind: str
+    action: str = "propose_targets"
+    replan_basis: dict[str, object] | None = None
 
 
 class BundleSkillProvider(Protocol):
@@ -410,7 +412,7 @@ def validate_bundle_dispatch_result(
         if item.get("target_ref") == result.selected_target_ref
     ]
     if (
-        result.action not in {"dispatch", "wait", "replan_required"}
+        result.action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
         or (
             result.action == "dispatch"
             and (
@@ -422,6 +424,9 @@ def validate_bundle_dispatch_result(
         or (result.action != "dispatch" and result.selected_target_ref is not None)
     ):
         raise BundleSkillContractError("bundle_dispatch_target_not_in_frontier")
+    if result.action == "revise_strategy" and (request.frontier
+            or request.state.get("strategy_revision_available") is not True):
+        raise BundleSkillContractError("bundle_strategy_revision_not_ready")
     return canonical_hash(
         {
             "schema_ref": "meta-research/bundle-dispatch-decision/v1",
@@ -468,7 +473,7 @@ def validate_bundle_target_batch_result(
         or request.base_generation < 0
         or not _rolling_native_result_matches(request, result.native_session_ref)
         or not result.adapter_kind
-        or not isinstance(result.strategy_update, dict)
+        or result.action not in {"propose_targets", "replan_required"}
         or not isinstance(result.rationale, str)
         or not result.rationale.strip()
         or len(result.rationale) > 1000
@@ -524,6 +529,29 @@ def validate_bundle_target_batch_result(
         or current_specs[: len(initial_candidates)] != initial_candidates
     ):
         raise BundleSkillContractError("bundle_target_batch_history_drift")
+    if result.action == "replan_required":
+        from meta_research.bundle_batch_replan import validate_replan_basis
+
+        if result.strategy_update is not None or len(result.rationale) > 512:
+            raise BundleSkillContractError("bundle_batch_replan_invalid")
+        try:
+            validate_replan_basis(result.replan_basis, tuple(
+                commit["commit_ref"] for commit in request.target_commits))
+        except (KeyError, TypeError, ValueError) as error:
+            raise BundleSkillContractError(str(error)) from error
+        return canonical_hash({
+            "schema_ref": "meta-research/bundle-target-batch-replan/v1",
+            "graph_ref": request.graph_ref, "base_generation": request.base_generation,
+            "base_head_receipt": request.base_head_receipt,
+            "root_session_ref": request.root_session_ref,
+            "inbox_checkpoint_ref": request.inbox_checkpoint["checkpoint_ref"],
+            "inbox_checkpoint_hash": checkpoint_hash,
+            "action": result.action, "replan_basis": result.replan_basis,
+            "rationale": result.rationale, "native_session_ref": result.native_session_ref,
+            "adapter_kind": result.adapter_kind,
+        })
+    if not isinstance(result.strategy_update, dict) or result.replan_basis is not None:
+        raise BundleSkillContractError("bundle_target_batch_invalid")
     current_state_document = {
         "schema_ref": ROLLING_STRATEGY_STATE_SCHEMA_REF,
         "completion_contract_hash": completion_contract_hash(completion),
@@ -1165,6 +1193,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                         Path(__file__).with_name("bundle_dispatch_recovery.py")
                     ),
                     "batch_view_source_hash": _file_sha256(Path(__file__).with_name("bundle_batch_view.py")),
+                    "batch_replan_source_hash": _file_sha256(Path(__file__).with_name("bundle_batch_replan.py")),
                     "batch_access_source_hash": _file_sha256(Path(__file__).with_name("bundle_batch_access.py")),
                     "output_assembly_source_hash": _file_sha256(Path(__file__).with_name("bundle_output_assembly.py")),
                 }
@@ -1200,6 +1229,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 + _file_sha256(Path(__file__).with_name("bundle_dispatch_recovery.py")),
                 "adapter-source:meta_research.bundle_skill@sha256:"
                 f"{adapter_source_hash}",
+                "adapter-source:meta_research.bundle_batch_replan@sha256:"
+                + _file_sha256(Path(__file__).with_name("bundle_batch_replan.py")),
                 "adapter-source:meta_research.bundle_batch_view@sha256:"
                 + _file_sha256(Path(__file__).with_name("bundle_batch_view.py")),
                 "adapter-source:meta_research.bundle_batch_access@sha256:"
@@ -1485,7 +1516,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "由 Owner 评估 response、重验 authorization 并释放 waiter。绝对不得把 "
             "dispatch_allowed=false 的 Target 返回为 dispatch，也不得因 provider、"
             "validator 或 readiness 错误自行伪造 HumanRequest。"
-            "返回 wait 或 replan_required 时，selected_target_ref 必须为 null。\n"
+            "需要同根编制下一批策略而非等待外部条件时，只有 state.strategy_revision_available=true "
+            "才可返回 revise_strategy；下一次正式 target-batch 会接收此请求，仍须提出真实工作或有证据的策略收口。"
+            "此动作不创建或接纳任何 Target。wait 会持久等待，不会自动安排下一批。"
+            "返回 wait、replan_required 或 revise_strategy 时，selected_target_ref 必须为 null。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"graph_ref={request.graph_ref}\n"
             f"generation={request.generation}\n"
@@ -1636,6 +1670,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "全部所需 cells 已由 current accepted TargetCommit 覆盖时，先读最后结果、整理可复用资源、"
             "完成独立审阅，再以空 candidates、strategy_complete=true 和完整 notes 封口。"
             "保留后续研究线索与零或一个建题推荐，修订事实不改写冻结输入。\n"
+            "Use action=propose_targets with a real strategy_update and replan_basis=null for ordinary work. "
+            "If continuing requires revising frozen responsibilities, explicitly choose action=replan_required, "
+            "strategy_update=null, and a complete replan_basis: actual work and retained artifacts, exact current "
+            "source_target_commit_refs, limitations, unfinished work, and next research focus. "
+            "Keep rationale within 512 characters. This submits your real synthesis to the normal BundleReport "
+            "and Reasoning boundary; it does not assert success or exhaustion. Do not invent a candidate, "
+            "duplicate an accepted cell, or deliberately emit an invalid empty batch to exit.\n"
             f"batch_context={canonical_json(reading_context)}"
         )
         if len(prompt.encode("utf-8")) > BUNDLE_TARGET_BATCH_PROMPT_MAX_BYTES:
@@ -1667,10 +1708,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 recover_rejected_target_batch(self, request, operation_name)
             raise
         strategy_update = output.get("strategy_update")
+        action = output.get("action", "propose_targets")
+        replan_basis = output.get("replan_basis")
         rationale = output.get("rationale")
         if (
             session_ref is None
-            or not isinstance(strategy_update, dict)
+            or action not in {"propose_targets", "replan_required"}
+            or (action == "propose_targets" and not isinstance(strategy_update, dict))
             or not isinstance(rationale, str)
         ):
             checkpoint_session = session_ref or request.native_session_ref
@@ -1686,7 +1730,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         from meta_research.bundle_output_assembly import assemble_strategy_update
         from meta_research.bundle_target_contract import BundleTargetContractError
         try:
-            strategy_update = assemble_strategy_update(strategy_update, request.plan_document)
+            if action == "propose_targets":
+                strategy_update = assemble_strategy_update(strategy_update, request.plan_document)
         except BundleTargetContractError as error:
             raise self._sealed_result_failure(job_ref=request.job_ref, operation_name=operation_name,
                 native_session_ref=session_ref, failure_code="bundle_review_result_contract_invalid",
@@ -1696,6 +1741,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             rationale=rationale,
             native_session_ref=session_ref,
             adapter_kind="codex_cli",
+            action=action,
+            replan_basis=replan_basis,
         )
         try:
             validate_bundle_target_batch_result(request, result)
@@ -2050,7 +2097,7 @@ def _dispatch_schema(target_refs: tuple[str, ...]) -> dict[str, object]:
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["dispatch", "wait", "replan_required"],
+                "enum": ["dispatch", "wait", "replan_required", "revise_strategy"],
             },
             "selected_target_ref": {
                 "anyOf": [
@@ -2067,21 +2114,25 @@ def _dispatch_schema(target_refs: tuple[str, ...]) -> dict[str, object]:
 def _target_batch_schema(
     request: BundleSkillRequest | BundleTargetBatchRequest,
 ) -> dict[str, object]:
+    from meta_research.bundle_batch_replan import replan_basis_schema
+
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "strategy_update": _formal_strategy_update_schema(
+            "action": {"type": "string", "enum": ["propose_targets", "replan_required"]},
+            "replan_basis": {"anyOf": [replan_basis_schema(), {"type": "null"}]},
+            "strategy_update": {"anyOf": [_formal_strategy_update_schema(
                 request,
                 initial=False,
-            ),
+            ), {"type": "null"}]},
             "rationale": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 1000,
             },
         },
-        "required": ["strategy_update", "rationale"],
+        "required": ["action", "strategy_update", "replan_basis", "rationale"],
     }
 
 

@@ -62,6 +62,7 @@ async function fixture(page: Page) {
     ["review", message("同一 Bundle 会话已完成复核。")], ["dispatch-1", message("现在等待两个 Target 的证据。")],
     ["target-turn-1", message("T1 正在执行基线实验。")], ["target-turn-2", message("T2 正在执行对照实验。")], ["idea-primary", message("上一轮 Idea 已完成。")],
   ]);
+  const sourceIdentities = new Map<string, { transport_invocation_hash: string; phase: string }>();
   const state = { runtimeStatus: null as RuntimeStatus | null, statusFailed: false, listFailed: false, outputFailed: false, staleOnce: false, listReads: 0, outputReads: 0, outputSessionRefs: [] as string[], offsets: [] as { ref: string; after: number }[] };
   const errors: string[] = [], writes: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
@@ -89,6 +90,7 @@ async function fixture(page: Page) {
       let end = Math.min(bytes.length, start + 65536);
       while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
       return json({ schema_ref: "meta-research/root-session-output/v1", quest_ref: catalog.quest_ref, session_ref: item.session_ref, operation_ref: ref,
+        ...sourceIdentities.get(ref),
         stream_ref: `root-output:${item.session_ref}:${ref}`, status: ["completed", "failed"].includes(op.status) ? "terminal" : op.status === "executing" ? "live" : "waiting",
         native_session_ref: "native-root", text: bytes.subarray(start, end).toString(), offset: start, next_offset: end, source_bytes: bytes.length,
         has_more: end < bytes.length, source_caught_up: end >= bytes.length, source_updated_at: sourceTime, observed_at: sourceTime + 1_547 });
@@ -98,7 +100,40 @@ async function fixture(page: Page) {
     const file = resolve(webRoot, url.pathname === "/" ? "index.html" : `.${url.pathname}`);
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
   });
-  return { snapshot, catalog, bundle, target1, target2, acquisition, history, output, state, errors, writes, operation };
+  return { snapshot, catalog, bundle, target1, target2, acquisition, history, output, sourceIdentities, state, errors, writes, operation };
+}
+
+for (const identity of ["same", "different-hash", "different-phase", "missing"] as const) {
+  test(`recovery records distinguish ${identity} signed invocation identities`, async ({ page }, testInfo) => {
+    const f = await fixture(page);
+    f.bundle.operations = [f.operation("original-unit", "接续调用", 10), f.operation("replayed-unit", "接续调用", 20)];
+    const original = { transport_invocation_hash: "a".repeat(64), phase: "target-batch-1" };
+    f.sourceIdentities.set("original-unit", original);
+    if (identity !== "missing") f.sourceIdentities.set("replayed-unit", identity === "same" ? original
+      : identity === "different-phase" ? { ...original, phase: "target-batch-2" }
+      : { ...original, transport_invocation_hash: "b".repeat(64) });
+    for (const ref of ["original-unit", "replayed-unit"]) f.output.set(ref, message("准备结果仍是技术阻塞，不能启动训练。"));
+    await openWorkspace(page);
+    const trace = page.locator("#research-activity");
+    await trace.getByLabel("选择查看的会话").selectOption(f.bundle.session_ref);
+    const originalOutput = trace.locator('[data-operation-ref="original-unit"]');
+    const replayedOutput = trace.locator('[data-operation-ref="replayed-unit"]');
+    await expect(originalOutput).toContainText("准备结果仍是技术阻塞");
+    await expect(replayedOutput).toContainText("准备结果仍是技术阻塞");
+    const label = "恢复时读回的原调用记录";
+    await expect(originalOutput.getByText(label, { exact: true })).toHaveCount(0);
+    if (identity === "same") {
+      await expect(replayedOutput.getByText(label, { exact: true })).toBeVisible();
+      await expect(replayedOutput).toContainText("这是已有调用的记录，并非新发起的调用。");
+      await replayedOutput.screenshot({ path: testInfo.outputPath("original-call-record-label.png") });
+    } else {
+      await expect(replayedOutput.getByText(label, { exact: true })).toHaveCount(0);
+    }
+    await trace.getByText("执行详情与历史分页", { exact: true }).click();
+    await expect(trace.locator(".root-operation-details")).toHaveCount(2);
+    await expect(trace.getByRole("navigation", { name: /执行 [12] 历史分页/ })).toHaveCount(2);
+    expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+  });
 }
 
 test("waiting output shows a stable last record and resumes its elapsed clock only when executing", async ({ page }) => {

@@ -3,7 +3,16 @@ from dataclasses import replace
 import pytest
 from meta_research.acquisition import AcquisitionBatchRequest, AcquisitionPaper, AcquisitionPreflightRequest, AcquisitionUnavailable
 from meta_research.acquisition_root import CodexAcquisitionRootAdapter
-from test_external_root_resident_mcp import _AcquisitionDelegate, _SequenceRunner, _fake_codex
+from test_external_root_resident_mcp import _AcquisitionDelegate, _SequenceRunner as _ObservedSequenceRunner
+from role_delivery_process_support import controlled_codex as _fake_codex, run_observed_durable_result
+
+
+class _SequenceRunner(_ObservedSequenceRunner):
+    def run_durable_job(self, job_ref, argv, prompt, timeout, stdout_path,
+                        pid_path, request_path, environment=None):
+        return run_observed_durable_result(
+            self, job_ref, argv, prompt, timeout, stdout_path,
+            pid_path, request_path, environment)
 
 
 def batch(tmp_path, **changes):
@@ -190,20 +199,60 @@ def test_provided_only_native_policy_does_not_leak_to_next_request(tmp_path):
 
 
 def test_unknown_native_effect_is_reconciled_without_repeating_download(tmp_path):
+    import json
     import subprocess
+    import sys
+    import threading
+    import time
+    from meta_research.quest_drafting import _CancellableProcessRunner
+    started = tmp_path / 'actual-provider-started'
+    executable_path = tmp_path / 'codex'
+    executable_path.write_text(
+        f'#!{sys.executable}\nimport sys,time\nfrom pathlib import Path\n'
+        "if '--version' in sys.argv:\n print('codex-acquisition-test 1');raise SystemExit(0)\n"
+        'prompt=sys.stdin.read()\nassert prompt\n'
+        f'Path({str(started)!r}).write_text("started")\n'
+        'while True:time.sleep(0.02)\n', encoding='utf-8')
+    executable_path.chmod(0o700)
     class InterruptedRunner(_SequenceRunner):
         attempts = 0
-        def __call__(self, argv, prompt, timeout, environment=None):
+        def run_durable_job(self, job_ref, argv, prompt, timeout, stdout_path,
+                            pid_path, request_path, environment=None):
             self.attempts += 1
+            self.job_ref, self.request_path = job_ref, request_path
+            self.actual = _CancellableProcessRunner()
+            self.worker_errors = []
+            def run():
+                try:
+                    self.actual.run_durable_job(job_ref, argv, prompt, timeout,
+                        stdout_path, pid_path, request_path, environment)
+                except BaseException as error:
+                    self.worker_errors.append(error)
+            self.thread = threading.Thread(target=run)
+            self.thread.start()
+            deadline = time.monotonic() + 8
+            while not started.exists() and self.thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert started.exists(), self.worker_errors
+            # Lose only the caller's response after the real provider started.
+            # The supervisor retains the original operation and process tree.
             raise subprocess.TimeoutExpired(argv, 1)
     runner = InterruptedRunner([])
     workspace = tmp_path / "provider"
-    executable = str(_fake_codex(tmp_path / "codex"))
+    executable = str(executable_path)
     adapter = CodexAcquisitionRootAdapter(workspace, _AcquisitionDelegate(), executable=executable, process_runner=runner)
     request = batch(tmp_path)
-    with pytest.raises(AcquisitionUnavailable):
-        adapter.acquire(request)
-    resumed = CodexAcquisitionRootAdapter(workspace, _AcquisitionDelegate(), executable=executable, process_runner=runner)
-    with pytest.raises(AcquisitionUnavailable, match="reconciliation_pending"):
-        resumed.reconcile(request)
-    assert runner.attempts == 1
+    try:
+        with pytest.raises(AcquisitionUnavailable, match='codex_cli_timeout'):
+            adapter.acquire(request)
+        resumed = CodexAcquisitionRootAdapter(workspace, _AcquisitionDelegate(), executable=executable, process_runner=runner)
+        with pytest.raises(AcquisitionUnavailable, match="reconciliation_pending"):
+            resumed.reconcile(request)
+        assert runner.attempts == 1
+        assert runner.thread.is_alive()
+    finally:
+        runner.actual.cancel_job(runner.job_ref)
+        runner.thread.join(timeout=10)
+        assert not runner.thread.is_alive()
+        receipt = json.loads((runner.request_path.parent / 'supervisor-exit.json').read_text())['payload']
+        assert receipt['process_tree']['state'] == 'closed'
