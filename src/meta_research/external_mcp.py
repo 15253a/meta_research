@@ -406,7 +406,10 @@ class ExternalMcpRuntime:
                 snapshot = self._read_snapshot(path)
                 if snapshot.root_kind != root_kind or snapshot.operation_key != operation_key or binding is not None and snapshot.binding() != binding:
                     raise ExternalMcpError("external_mcp_snapshot_conflict")
-                if not recovery and snapshot.task_prompt != task_prompt:
+                # An exact frozen binding restores this snapshot, not a newly
+                # rendered task. The caller still verifies its sealed operation
+                # and business inputs before replaying or invoking a provider.
+                if not recovery and binding is None and snapshot.task_prompt != task_prompt:
                     raise ExternalMcpError("external_mcp_snapshot_conflict")
                 return snapshot
             if recovery or binding is not None:
