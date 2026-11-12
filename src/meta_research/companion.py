@@ -103,6 +103,7 @@ class CodexCompanionAdapter(
         creation = first_creation_instructions()
         guidance = (Path(__file__).parent / "skills" / "companion-work.md").read_text(encoding="utf-8")
         source_hash = _file_sha256(Path(__file__).resolve())
+        handoff_hash = _file_sha256(Path(__file__).with_name("companion_native_handoff.py"))
         return replace(binding,
             packaged_skill_bundle_hash=canonical_hash({
                 "inherited": binding.packaged_skill_bundle_hash, "companion-work.md": guidance,
@@ -111,13 +112,36 @@ class CodexCompanionAdapter(
             instruction_set_hash=canonical_hash({
                 "inherited": binding.instruction_set_hash,
                 "companion-work.md": guidance, "companion_source": source_hash,
+                "native_handoff_source": handoff_hash,
                 "first_creation": creation["bundle_hash"],
             }),
             resource_bindings=(*binding.resource_bindings,
                 "package:meta_research.skills/companion-work.md@sha256:" + canonical_hash(guidance),
                 "package:meta_research.skills/first_creation@sha256:" + creation["bundle_hash"],
-                "adapter-source:meta_research.companion@sha256:" + source_hash),
+                "adapter-source:meta_research.companion@sha256:" + source_hash,
+                "adapter-source:meta_research.companion_native_handoff@sha256:" + handoff_hash),
         )
+
+    def _invoke(self, **kwargs):
+        binding = kwargs.get("workspace_binding")
+        native = kwargs.get("native_session_ref")
+        job = kwargs.get("job_ref")
+        # Existing operations keep their frozen input and terminal failure.
+        # Custody is prepared only for a new formally scoped native call.
+        if binding is not None and native and job and kwargs.get("invocation_runner") is None:
+            invocation = (self._workspace / "provider-operations" / canonical_hash({"job_ref": job})
+                          / kwargs["operation_name"] / "invocation.json")
+            if not invocation.exists():
+                from meta_research.companion_native_handoff import ensure_companion_native_handoff
+                from meta_research.protected_creation_runtime import ProtectedCreationError
+                from meta_research.semantic_mcp import SemanticMcpError
+                try:
+                    ensure_companion_native_handoff(self, binding, native)
+                except (OwnerConflict, ProtectedCreationError, SemanticMcpError) as error:
+                    raise IdeaSkillUnavailable(error.code) from error
+                except (OSError, ValueError, TypeError, KeyError) as error:
+                    raise IdeaSkillUnavailable("companion_native_handoff_invalid") from error
+        return super()._invoke(**kwargs)
 
     def cancel_job(self, job_ref: str) -> bool:
         with self._creation_call_lock:
