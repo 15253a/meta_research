@@ -417,7 +417,15 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
         if initial is None:
             return ""
         current = _with_research_time(connection, _read(connection, *initial))
-    public = {key: value for key, value in current.items() if key not in {"literature_configuration", "stage_models"}}
+    # Stored literature configuration has already passed the credential-free URL
+    # validator. Roots need its current access requirements as well as Acquisition.
+    public = {key: value for key, value in current.items() if key != "stage_models"}
+    literature_guidance = (
+        "literature_configuration 是当前文献全文获取模式、图书馆入口与机构访问要求；"
+        "与 text 中同类字段冲突时以 literature_configuration 为准，文献排除范围等其他持续条件仍然有效。"
+        "入口已配置不代表已登录、连接可用或全文已取得，应通过文献获取流程核实实际访问状态。\n"
+        if "literature_configuration" in public else ""
+    )
     clock_guidance = (
         "research_time 是 Quest 共用的当前计时观察，优先于正文中的初始总预算。安排新工作、长调用后及人类答复后，"
         "按需用 advancement_engine.research_time.read 刷新，如实记录用时、偏差与计量不确定性。"
@@ -431,7 +439,7 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
     return (
         "本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。"
         "同类旧运行条件以本段为准；已经接纳的研究成果、精确输入与正式授权仍按原记录核验。\n"
-        + clock_guidance
+        + clock_guidance + literature_guidance
         + render_research_style(current['research_style']) + '\n'
         + json.dumps(public, ensure_ascii=False, separators=(",", ":"))
     )

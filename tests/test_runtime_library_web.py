@@ -1,5 +1,7 @@
 """Quest library settings use the authenticated versioned configuration boundary."""
 
+import json
+
 import pytest
 
 from meta_research.runtime_conditions import render_runtime_conditions
@@ -12,7 +14,7 @@ from test_public_manual_question_lifecycle import (
 )
 
 
-def test_library_configuration_round_trip_drives_new_deepfetch_without_prompt_leak(tmp_path):
+def test_library_configuration_round_trip_informs_roots_and_drives_new_deepfetch(tmp_path):
     provider = RecordingAcquisitionProvider()
     runtime = _build_runtime(tmp_path / "library", acquisition_provider=provider)
     try:
@@ -27,7 +29,8 @@ def test_library_configuration_round_trip_drives_new_deepfetch_without_prompt_le
         assert saved.status_code == 200, saved.text
         assert client.get(url).json() == saved.json()
         assert saved.json()["literature_configuration"] == config
-        assert "library.example.org" not in render_runtime_conditions(runtime.data_root.root, quest_ref=quest_ref)
+        conditions = render_runtime_conditions(runtime.data_root.root, quest_ref=quest_ref)
+        assert json.loads(conditions.splitlines()[-1])["literature_configuration"] == config
         assert client.put(url, headers=headers, json=payload).status_code == 409
         write = lambda key: {**headers, "Idempotency-Key": key}
         opened = client.post("/api/v1/manual-question-creations", headers=write("library-manual"), json={"quest_ref": quest_ref, "parent_question_ref": question_ref}).json()
@@ -40,6 +43,8 @@ def test_library_configuration_round_trip_drives_new_deepfetch_without_prompt_le
         assert provider.preflights[-1].mode == "oa_then_institution"
         changed = client.put(url, headers=headers, json={**payload, "expected_revision": saved.json()["revision"], "literature_configuration": {**config, "library_entry_url": "https://other-library.example.org/"}})
         assert changed.status_code == 200, changed.text
+        conditions = render_runtime_conditions(runtime.data_root.root, quest_ref=quest_ref)
+        assert json.loads(conditions.splitlines()[-1])["literature_configuration"] == changed.json()["literature_configuration"]
         count = len(provider.preflights)
         replay = client.post(f"/api/v1/manual-question-creations/{context_ref}/deepfetch", headers=write("library-start"), json=request)
         assert replay.status_code == 202, replay.text

@@ -62,14 +62,48 @@ class _SignedRunner:
         return result
 
 
-def _idea_call(adapter, *, job="job:initial", prompt="Research the actual question.", native=None):
+def _idea_call(adapter, *, job="job:initial", prompt="Research the actual question.", native=None,
+               run="stage-run:current"):
     return adapter._invoke_root_operation(
         operation_name="primary", prompt=prompt,
         schema={"type":"object", "properties":{"ok":{"type":"boolean"}},
                 "required":["ok"], "additionalProperties":False},
-        native_session_ref=native, job_ref=job, run_ref="stage-run:current",
+        native_session_ref=native, job_ref=job, run_ref=run,
         attempt_ref=None, root_session_ref="session:current", fence_ref=None,
     )
+
+
+@pytest.mark.parametrize("adapter_type", (
+    CodexIdeaSkillAdapter, CodexPlanSkillAdapter,
+    CodexBundleSkillAdapter, CodexReasoningSkillAdapter,
+))
+def test_stage_receives_library_configuration_and_refreshes_it_on_next_call(root, adapter_type):
+    from meta_research.runtime_conditions import split_runtime_prompt
+
+    original = read_runtime_conditions(root, "quest-one")
+    library = {"mode": "oa_then_institution",
+               "library_entry_url": "https://library.example.edu/entry",
+               "institution_required": True}
+    saved = save_runtime_conditions(root, "quest-one", text=original["text"],
+        literature_configuration=library, expected_revision=original["revision"])
+    runner = _SignedRunner()
+    adapter = adapter_type(root / "stage-provider", executable=sys.executable, process_runner=runner)
+    first = _idea_call(adapter, run="run-one")
+    conditions, _ = split_runtime_prompt(runner.calls[0][1])
+    public = json.loads(conditions.splitlines()[-1])
+    assert public["literature_configuration"] == library
+    assert "GPU-one-3" in conditions and "30d" in conditions
+    assert "secret-auth" not in conditions
+
+    changed = {"mode": "provided_only", "library_entry_url": "", "institution_required": False}
+    save_runtime_conditions(root, "quest-one", text=saved["text"],
+        literature_configuration=changed, expected_revision=saved["revision"])
+    assert _idea_call(adapter, run="run-one") == first
+    assert len(runner.calls) == 1
+    _idea_call(adapter, run="run-one", job="job:next", native="runtime-native")
+    conditions, _ = split_runtime_prompt(runner.calls[1][1])
+    assert json.loads(conditions.splitlines()[-1])["literature_configuration"] == changed
+    assert library["library_entry_url"] not in conditions
 
 
 def test_public_idea_provider_receives_saved_style_and_restores_original_operation_snapshot(root):

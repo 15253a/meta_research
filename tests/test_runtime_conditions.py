@@ -173,6 +173,27 @@ def test_edits_persist_refresh_and_leave_other_quest_and_database_unchanged(root
         }
 
 
+@pytest.mark.parametrize("scope,identity", [
+    ("initialization:init-draft", {"initialization_id": "init-draft"}),
+    ("quest-one", {"run_ref": "deepfetch-manual", "initialization_id": "init-one"}),
+    ("quest-one", {"run_ref": "harness-one", "target_ref": "target-one"}),
+])
+def test_library_configuration_is_visible_with_free_text_in_each_scope(root, scope, identity):
+    initial = read_runtime_conditions(root, scope)
+    library = {"mode": "oa_then_institution", "library_entry_url": "https://library.example.edu/",
+               "institution_required": True}
+    saved = save_runtime_conditions(root, scope, text="Use only peer-reviewed literature.",
+        literature_configuration=library, expected_revision=initial["revision"])
+    rendered = render_runtime_conditions(root, **identity)
+    public = json.loads(rendered.splitlines()[-1])
+    assert public["literature_configuration"] == library
+    assert public["text"] == saved["text"]
+    assert public["revision"] == saved["revision"]
+    assert "stage_models" not in public
+    assert "secret-auth" not in rendered
+    assert "library.example.edu" not in render_runtime_conditions(root, run_ref="run-two")
+
+
 @pytest.mark.parametrize("scope", [
     {"quest_ref": "quest-one", "run_ref": "run-two"},
     {"quest_ref": "quest-one", "target_ref": "target-two"},
