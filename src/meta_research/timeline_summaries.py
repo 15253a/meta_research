@@ -26,7 +26,7 @@ MAX_SCAN_SECONDS = 7200
 # Version the prose policy independently from scheduling instructions. Preserve
 # the original policy hash so a cadence-only update does not regenerate history.
 # Change this value when the factual summarization policy itself changes.
-SUMMARY_CONTENT_VERSION = 'research-recorder-readable-summary-20261109'
+SUMMARY_CONTENT_VERSION = 'research-recorder-plain-node-explanation-20261113'
 
 
 def _scan_interval(value):
@@ -424,7 +424,7 @@ class TimelineSummaryService:
 
 def create_timeline_summary_service(runtime, executable: str, *, provider=None) -> TimelineSummaryService:
     from meta_research.timeline_summary_sources import TimelineSummarySourceReader
-    from meta_research.system_prompt import read_output_language
+    from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, read_output_language
 
     root = runtime.data_root.root / 'research-recorder'
     reader = TimelineSummarySourceReader(runtime)
@@ -439,7 +439,7 @@ def create_timeline_summary_service(runtime, executable: str, *, provider=None) 
             process_runner=_CancellableProcessRunner(protected_environment=runtime.data_root.codex_environment))
 
     def prompt_version():
-        return SUMMARY_CONTENT_VERSION
+        return canonical_hash({'policy': SUMMARY_CONTENT_VERSION, 'research_principles': RESEARCH_SYSTEM_PROMPT})
 
     return TimelineSummaryService(TimelineSummaryStore(root / 'summaries.sqlite3'),
         reader, create_provider,

@@ -104,6 +104,8 @@ def companion_reference_instructions(root_kind: str) -> str:
             + "\nCreation role source: " + str(root / "first_creation" / "SKILL.md")
             + "\n按本次业务分支读取并遵循相应主指导：日常交流及独立写作使用 Companion；"
             "创建理解、重评、首题父子任务及 manual_question_creation 使用 first_creation 与相应上下文合同。"
+            "解释系统运行、阶段成果或时间线摘要时，先从 Companion role source 读取当前主指导，"
+            "再按其中入口核对相关流程规则和研究事实。"
             "续轮或压缩后缺少适用规则时从这些准确入口恢复；始终使用本次实际提供的响应 schema，"
             "manual 窗口仅起草六字段 Proposal，用户正式确认由原入口处理。\n")
 
@@ -128,6 +130,8 @@ def shared_reference_instructions(root_kind: str) -> str:
             "- 需要人协助访问或收到回应时，读取 references/human-guidance.md 的正式求助、回执与回应部分。\n"
             "- 接收全文、核实文件、交付或整理持久工作区时，读取 references/materials-and-custody.md 的材料保管部分。"
         )
+    elif root_kind == "companion":
+        purposes["cycle-work.md"] = ("解释阶段职责、跳过、轮次接续或目标变化", "理解研究流程，实际执行仍由对应研究角色承担")
     elif root_kind not in cycle_roles:
         names = tuple(name for name in names if name != "cycle-work.md")
     return (

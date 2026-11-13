@@ -14,14 +14,15 @@ from meta_research.quest_drafting import (
     _read_durable_job,
 )
 from meta_research.recorder_sources import READ_SOURCE, RecorderChannels
+from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT
 
 _SKILL_PATH = Path(__file__).with_name("skills") / "research-recorder" / "SKILL.md"
-_SUMMARY_LIMITS = {"zh": 180, "en": 360}
+_SUMMARY_LIMITS = {"zh": 600, "en": 1800}
 _SUMMARY_KINDS = ("process", "tentative_finding", "accepted_conclusion", "insufficient_evidence")
 _OUTPUT_KEYS = {"node_key", "source_hash", "summary", "summary_kind", "source_refs", "milestone"}
 _EMPTY_SENTENCE = {
-    "zh": "该阶段尚无可读的工作或判断记录，无法确认具体进展。",
-    "en": "No readable work or judgment records are available for this stage, so its progress is unknown.",
+    "zh": "暂时没有这个阶段的工作记录。",
+    "en": "No work has been recorded for this stage yet.",
 }
 
 
@@ -35,6 +36,12 @@ class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
         configs = (
             # Override the drafting catalog's base instructions for the recorder role.
             "model_instructions_file=" + json.dumps(str(_SKILL_PATH.resolve())),
+            "developer_instructions=" + json.dumps(
+                RESEARCH_SYSTEM_PROMPT + "\n\n当前角色是独立的只读研究记录员，按已加载的 research-recorder 合同总结。"
+                "公共研究原则用于理解研究对象、阶段职责与证据含义；其中的执行、委派和交接由相应研究根承担。"
+                "本角色只通过获授的 timeline.sources.read 阅读本次观察资料，按 output_language 输出摘要。",
+                ensure_ascii=False,
+            ),
             "mcp_servers.meta_research.url=" + json.dumps(self.channels.url),
             'mcp_servers.meta_research.bearer_token_env_var="META_RESEARCH_MCP_TOKEN"',
             "mcp_servers.meta_research.required=true",
@@ -59,10 +66,10 @@ class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
             }
             for n in nodes
         ]
-        intro = "你是本 Quest 的独立研究记录员，按所附记录员角色和输出合同维护本批每节点一句话。" if native_session_ref is None else "按原记录员合同更新本批变化。"
+        intro = "你是本 Quest 的研究记录员，为本批每个节点说明它做了什么。" if native_session_ref is None else "按当前记录员说明，更新本批节点的工作介绍。"
         prompt = (
             intro + f" 调用 {READ_SOURCE}，用 node_key、source_ref 阅读本次观察的必要正文；"
-            "非空 next_offset 表示仍有后文，可继续读取。按 output_language 为每节点写一句让非专业读者读懂的实际工作或发现，保留关键事实与限制。\n"
+            "非空 next_offset 表示仍有后文，可继续读取。按 output_language 用易懂的一小段话讲清每个节点做了什么、得到什么结果，可以用几句话解释。\n"
             + json.dumps({**basis, "nodes": visible}, ensure_ascii=False, separators=(",", ":"))
         )
         with self.channels.grant(job_ref, basis, native_session_ref) as grant:

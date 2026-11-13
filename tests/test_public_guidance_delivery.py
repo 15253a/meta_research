@@ -154,6 +154,46 @@ def test_bundle_provider_reads_shared_references_with_complete_formal_plan(tmp_p
     assert len(authority.issued) == len(authority.revoked) == 1
 
 
+@pytest.mark.parametrize("initial_native", (None, "inherited-creation-root"))
+def test_companion_explanation_guidance_is_readable_on_entry_and_continuation(tmp_path, initial_native):
+    """Observe delivery and source access, not the model's interpretation."""
+    from meta_research.companion import CodexCompanionAdapter
+    from meta_research.quest_drafting import IntentTurnRequest
+    from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT
+    from test_quest_drafting_adapters import RecordingRunner
+
+    class ExplanationRunner(RecordingRunner):
+        def __call__(self, argv, prompt, timeout, environment=None):
+            return super().__call__(argv, prompt, timeout)
+
+    native = initial_native or "new-companion-root"
+    reading = _ReadingRunner(ExplanationRunner({"reply": "The recorded judgment remains uncertain.", "agent_proposal": None}, thread_id=native))
+    role_reads = []
+
+    def runner(argv, prompt, timeout, environment=None):
+        developer = _developer(argv)
+        assert RESEARCH_SYSTEM_PROMPT in developer
+        role_source = Path(re.search(r"^Companion role source: (.+)$", developer, re.MULTILINE).group(1))
+        role_reads.append(role_source.read_text(encoding="utf-8"))
+        return reading(argv, prompt, timeout, environment)
+
+    adapter = CodexCompanionAdapter(tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
+    request = IntentTurnRequest(initialization_id="quest:explanation", draft_revision=1,
+        draft_hash="a" * 64, draft={"interaction_kind": "conversation"},
+        message="Explain why a completed Cycle still has an uncertain finding.", native_session_ref=initial_native)
+    first = adapter.reply(request)
+    second = adapter.reply(replace(request, native_session_ref=first.native_session_ref,
+        message="What happened after the earlier Idea said there were no experiments yet?"))
+
+    assert first.native_session_ref == second.native_session_ref == native
+    assert len(role_reads) == 2 and role_reads[0] == role_reads[1]
+    assert role_reads[0].strip()
+    assert reading.calls[1][0][-3:] == ["resume", native, "-"]
+    for _, developer, documents in reading.observed:
+        assert "references/cycle-work.md" in developer
+        assert set(documents) == set(SHARED_NAMES)
+
+
 @pytest.mark.parametrize("root_kind", ("idea", "plan", "bundle", "reasoning", "target", "deepfetch", "acquisition", "companion"))
 @pytest.mark.parametrize("entry_path", ("initial", "resume"))
 def test_harness_maintains_role_scoped_reference_access(tmp_path, root_kind, entry_path):
@@ -162,7 +202,7 @@ def test_harness_maintains_role_scoped_reference_access(tmp_path, root_kind, ent
     from meta_research.root_resident_mcp import RootResidentMcpChannels
     from test_root_capability_floor import _NoActivityCodexRunner
     names = ("human-guidance.md", "materials-and-custody.md") if root_kind == "acquisition" else tuple(
-        name for name in SHARED_NAMES if name != "cycle-work.md" or root_kind in {"idea", "plan", "bundle", "target", "reasoning"})
+        name for name in SHARED_NAMES if name != "cycle-work.md" or root_kind in {"idea", "plan", "bundle", "target", "reasoning", "companion"})
     session = f"session:{root_kind}"
     reading = _ReadingRunner(_NoActivityCodexRunner(session), names)
 

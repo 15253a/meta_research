@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import subprocess
+import tomllib
 
 import pytest
 
@@ -190,13 +191,71 @@ def test_native_resume_receives_only_changes_and_restart_uses_original_job(tmp_p
         restarted.recover_summaries(altered)
 
 
+def test_new_and_existing_recorder_receive_shared_principles_with_read_only_role(tmp_path):
+    from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT
+
+    runner = RecorderRunner()
+    provider = adapter(tmp_path, runner)
+    request = job()
+    _, native, _ = provider.summarize(**request)
+    provider.summarize(**dict(request, job_ref="next-observation", native_session_ref=native))
+
+    for argv, prompt in runner.calls:
+        configs = {}
+        for i, arg in enumerate(argv[:-1]):
+            if arg == "--config":
+                configs.update(tomllib.loads(argv[i + 1]))
+        developer = configs["developer_instructions"]
+        assert RESEARCH_SYSTEM_PROMPT in developer
+        assert "只读研究记录员" in developer and READ_SOURCE in developer
+        role = Path(configs["model_instructions_file"]).read_text(encoding="utf-8")
+        assert "上层说明下层工作合起来做了什么" in role
+        assert "正式收下的结果也可能是否定或不确定" in role
+        assert RESEARCH_SYSTEM_PROMPT not in prompt  # Turn data remains the source delta.
+        assert configs["agents"]["enabled"] is False
+        assert set(configs["mcp_servers"]) == {"meta_research"}
+    assert runner.calls[1][0][-3:] == ["resume", native, "-"]
+    assert "当前记录员说明" in runner.calls[1][1]
+
+
+@pytest.mark.parametrize("language,limit,explanation", [
+    ("zh", 600,
+     "这一轮先检查了脑电数据，逐个核对文件能否打开、每个人的记录是否完整，以及电极名称能否对应起来。"
+     "随后把参与者分成开发组和确认组，开发组用于选择分析方法，确认组留到方法确定后再测试。"
+     "研究人员比较了两种计算脑电参考信号的方式，观察它们是否影响模型对新参与者的预测。"
+     "为了看清差别，还分别检查了完整电极和减少电极后的结果，并把各次运行的设置、预测和图表整理到一起。"
+     "最后结合这些结果讨论了下一轮应该继续检查的问题，让后续工作能够接着这批数据和分析开展。"),
+    ("en", 1800,
+     "The team first checked whether the EEG files opened correctly and whether each participant had complete recordings. "
+     "They separated participants into a development group for choosing the analysis method and a confirmation group for testing it afterward. "
+     "They then compared two ways of calculating the reference signal and checked how each affected predictions for new participants. "
+     "The saved settings, predictions and charts show what was done and provide a starting point for the next round of work."),
+])
+def test_readable_multi_sentence_explanation_can_exceed_old_length_limit(tmp_path, language, limit, explanation):
+    value = output()
+    value["summaries"][0]["summary"] = explanation
+    runner = RecorderRunner(value)
+    runner.sources.data["question-1"] = {"work_record": explanation}
+    request = dict(job(), output_language=language)
+    assert len(explanation) > {"zh": 180, "en": 360}[language]
+    rows, _, _ = adapter(tmp_path, runner).summarize(**request)
+    assert rows[0]["summary"] == explanation
+    argv, _ = runner.calls[0]
+    schema = json.loads(Path(argv[argv.index("--output-schema") + 1]).read_text())
+    assert schema["properties"]["summaries"]["items"]["properties"]["summary"]["maxLength"] == limit
+
+    runner.value["summaries"][0]["summary"] = "x" * (limit + 1)
+    with pytest.raises(DraftingUnavailable, match="output_invalid"):
+        adapter(tmp_path / "too-long", runner).summarize(**request)
+
+
 def test_empty_stage_sentence_needs_actual_read_of_stage_itself(tmp_path):
     runner = RecorderRunner()
     runner.sources.data[STAGE] = {"stage": "reasoning", "artifacts": [], "current": None}
     runner.value["summaries"][1].update(summary_kind="process", summary="可能正在执行。", source_refs=[STAGE])
     runner.reads = [(Q, "question-1"), (STAGE, STAGE)]
     rows, _, _ = adapter(tmp_path, runner).summarize(**job())
-    assert rows[1]["summary"] == "该阶段尚无可读的工作或判断记录，无法确认具体进展。"
+    assert rows[1]["summary"] == "暂时没有这个阶段的工作记录。"
     assert rows[1]["summary_kind"] == "insufficient_evidence" and rows[1]["source_refs"] == ["cycle-1"]
     runner.sources.data[STAGE] = None
     with pytest.raises(DraftingUnavailable, match="source_unavailable"):
