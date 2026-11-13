@@ -756,7 +756,12 @@ def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
     elif not isinstance(page,dict) or set(page)!={"schema_ref","total_count","shown_count","offset","limit","next_offset","selection","complete","references_hash"} or page["schema_ref"]!="meta-research/evidence-reference-page/v1" or type(page["total_count"])is not int or page["total_count"]<len(refs) or page["shown_count"]!=len(refs) or page["total_count"]!=pack["evidence_reference_revision"] or page["offset"]!=0 or page["limit"]!=32 or len(refs)>32 or page["references_hash"]!=_canonical_hash(sorted(refs)) or page["complete"]!=(len(refs)==page["total_count"]) or page["next_offset"]!=(len(refs) if len(refs)<page["total_count"] else None):
         raise IdeaContractError("idea_context_pack_invalid")
     _validate_literature_reference(pack["literature_binding"],accepted_question_binding.get("question_ref"))
-    prior=pack["prior_accepted_bindings"]
+    validate_reasoning_handoff_references(pack["prior_accepted_bindings"])
+    return refs
+
+
+def validate_reasoning_handoff_references(prior: object) -> None:
+    """Validate the shared frozen predecessor reference used by research stages."""
     if not isinstance(prior,list) or len(prior)>1:
         raise IdeaContractError("idea_context_pack_invalid")
     for item in prior:
@@ -774,4 +779,3 @@ def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
                 raise IdeaContractError("idea_context_pack_invalid")
         _validate_public_receipt(item["receipt"],issuer="advancement_engine",subject_ref=item["commit_ref"])
         _validate_public_receipt(item["outcome_receipt"],issuer="research_graph",subject_ref=item["outcome_ref"])
-    return refs

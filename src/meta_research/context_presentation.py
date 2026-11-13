@@ -26,9 +26,9 @@ STAGE_CONTEXT_DELIVERY_GUIDANCE = (
 )
 _STAGE_SCIENTIFIC_INPUTS = {
     "idea": frozenset({"prior_accepted_bindings"}),
-    "plan": frozenset(),  # The adapter supplies the exact IdeaSet once.
+    "plan": frozenset({"prior_accepted_bindings"}),  # The adapter supplies the exact IdeaSet once.
     "bundle": frozenset({"accepted_formal_plan_binding"}),
-    "reasoning": frozenset({"plan_evidence_input", "upstream_stage_closure",
+    "reasoning": frozenset({"prior_accepted_bindings", "plan_evidence_input", "upstream_stage_closure",
                             "accepted_target_commit_closures", "current_target_evidence_closure"}),
 }
 _REQUIRED_CURRENT_MATERIAL = frozenset({

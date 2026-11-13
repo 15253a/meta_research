@@ -53,6 +53,7 @@ from meta_research.idea_contract import (
     evidence_reference_revision,
     literature_binding,
     validate_idea_context_pack,
+    validate_reasoning_handoff_references,
 )
 from meta_research.plan_contract import (
     PlanContractError,
@@ -2460,6 +2461,14 @@ class SQLiteAdvancementEngine(
         with self._database.read_snapshot():
             return self._query_reasoning_successor_context(cycle_ref)
 
+    def _reasoning_prior_accepted_bindings(self, cycle_ref: str) -> list[dict[str, object]]:
+        """Use the accepted predecessor for every stage of its successor Cycle."""
+        successor = self.query_reasoning_successor_context(cycle_ref)
+        return [] if successor is None else [
+            reasoning_handoff_reference(binding)
+            for binding in successor["prior_accepted_bindings"]
+        ]
+
     def _query_reasoning_successor_context(
         self, cycle_ref: str
     ) -> dict[str, object] | None:
@@ -4409,13 +4418,17 @@ class SQLiteAdvancementEngine(
         context_pack: dict[str, object],
         idempotency_key: str,
     ) -> StageRunRequest:
-        """Freeze the accepted Question, IdeaSet closure, and Evidence snapshot."""
+        """Freeze the Question, IdeaSet, Evidence and prior Reasoning handoff."""
 
         _validate_idempotency_key(idempotency_key)
         position = self.query_cycle_position(cycle_ref)
         if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
             raise OwnerConflict("cycle_position_binding_invalid")
         context_pack = {**context_pack, "cycle_position": position}
+        prior = self._reasoning_prior_accepted_bindings(cycle_ref)
+        if "prior_accepted_bindings" in context_pack and context_pack["prior_accepted_bindings"] != prior:
+            raise OwnerConflict("plan_reasoning_handoff_invalid")
+        context_pack = {**context_pack, "prior_accepted_bindings": prior}
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
         epoch = self._current_stage_epoch(
@@ -4939,6 +4952,7 @@ class SQLiteAdvancementEngine(
         self._reasoning_outcome_verifier.verify_reasoning_research_context(
             reasoning_graph_context
         )
+        prior = self._reasoning_prior_accepted_bindings(cycle_ref)
         command_kind = "ensure_reasoning_stage_request"
 
         # Reject a globally reused key before AE creates the route-derived
@@ -4999,6 +5013,7 @@ class SQLiteAdvancementEngine(
                 question_literature_revision=question_literature_revision,
                 quest_goal_revision=quest_goal_revision,
                 reasoning_graph_context=reasoning_graph_context,
+                prior_accepted_bindings=prior,
                 evidence_reuse_closure=evidence_reuse_closure,
                 current_target_evidence_closure=(
                     current_target_evidence_closure
@@ -5683,6 +5698,10 @@ class SQLiteAdvancementEngine(
                 requested.cycle_ref, requested.context_pack
             )
         elif requested.stage == PLAN_STAGE and requested.accepted_idea_set is not None:
+            if ("prior_accepted_bindings" in requested.context_pack
+                    and requested.context_pack["prior_accepted_bindings"]
+                    != self._reasoning_prior_accepted_bindings(requested.cycle_ref)):
+                raise OwnerConflict("plan_reasoning_handoff_invalid")
             self._verify_plan_idea_set(
                 requested.cycle_ref,
                 requested.accepted_idea_set,
@@ -5796,6 +5815,11 @@ class SQLiteAdvancementEngine(
                     dict[str, object] | None, frozen_revision
                 ),
                 reference_literature=isinstance(frozen_revision, dict) and frozen_revision.get("kind") == "QuestionLiteratureReference",
+                # Previously frozen requests keep their original shape and hash.
+                prior_accepted_bindings=(
+                    self._reasoning_prior_accepted_bindings(requested.cycle_ref)
+                    if "prior_accepted_bindings" in requested.context_pack else None
+                ),
                 quest_goal_revision=cast(
                     dict[str, object],
                     requested.context_pack["research_context"],
@@ -10912,6 +10936,7 @@ def _reasoning_context_pack_from_rows(
     accepted_question: AcceptedQuestionBinding,
     question_literature_revision: dict[str, object] | None = None,
     reference_literature: bool = True,
+    prior_accepted_bindings: list[dict[str, object]] | None = None,
     quest_goal_revision: dict[str, object] | None = None,
     reasoning_graph_context: dict[str, object] | None = None,
     evidence_reuse_closure: tuple[EvidenceReuseLeaf, ...] = (),
@@ -11078,6 +11103,8 @@ def _reasoning_context_pack_from_rows(
             "upstream_stage_commit_refs": [commit.commit_ref for commit in commits],
         },
     }
+    if prior_accepted_bindings is not None:
+        context_pack["prior_accepted_bindings"] = prior_accepted_bindings
     _validate_reasoning_context_pack(
         context_pack,
         cycle_ref=cycle_ref,
@@ -11141,7 +11168,7 @@ def _validate_reasoning_context_pack(
     epoch: int,
     accepted_question_binding: dict[str, object],
 ) -> None:
-    if set(context_pack) != {
+    if set(context_pack) - {"prior_accepted_bindings"} != {
         "schema_ref",
         "cycle_position",
         "cycle_ref",
@@ -11162,6 +11189,11 @@ def _validate_reasoning_context_pack(
         != accepted_question_binding
     ):
         raise OwnerConflict("reasoning_context_pack_invalid")
+    if "prior_accepted_bindings" in context_pack:
+        try:
+            validate_reasoning_handoff_references(context_pack["prior_accepted_bindings"])
+        except IdeaContractError as error:
+            raise OwnerConflict("reasoning_context_pack_invalid") from error
     literature = context_pack.get("question_literature_input")
     if not isinstance(literature, dict) or literature.get("kind") not in {
         "none",

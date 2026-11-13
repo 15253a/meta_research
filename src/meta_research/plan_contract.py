@@ -7,6 +7,7 @@ from meta_research.idea_contract import (
     REVIEW_CATEGORIES,
     IdeaContractError,
     validate_idea_outcome,
+    validate_reasoning_handoff_references,
 )
 from meta_research.owners.common import canonical_hash, canonical_json
 
@@ -56,7 +57,8 @@ def validate_plan_context_pack(
             "evidence_catalog",
             "evidence_reference_revision",
         } | ({"evidence_catalog_page"} if "evidence_catalog_page" in context_pack else set())
-          | ({"cycle_position"} if "cycle_position" in context_pack else set()),
+          | ({"cycle_position"} if "cycle_position" in context_pack else set())
+          | ({"prior_accepted_bindings"} if "prior_accepted_bindings" in context_pack else set()),
         "plan_context_pack_invalid",
     )
     if (
@@ -72,6 +74,11 @@ def validate_plan_context_pack(
         try:
             validate_cycle_position(context_pack["cycle_position"], cycle_ref=cycle_ref)
         except ValueError as error:
+            raise PlanContractError("plan_context_pack_invalid") from error
+    if "prior_accepted_bindings" in context_pack:
+        try:
+            validate_reasoning_handoff_references(context_pack["prior_accepted_bindings"])
+        except IdeaContractError as error:
             raise PlanContractError("plan_context_pack_invalid") from error
     question_ref = accepted_question_binding.get("question_ref")
     if not _text(question_ref):
