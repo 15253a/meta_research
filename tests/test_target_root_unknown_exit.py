@@ -13,7 +13,7 @@ from meta_research.owners.common import OwnerConflict
 from meta_research.owners.common import canonical_hash
 from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError
 from meta_research.quest_goal import ResearchRoot
-from meta_research.target_workspace_cleanup import _cycle_dependencies
+from meta_research.native_session_cleanup import _cycle_dependencies
 from test_target_root_cancel import _running_root
 
 

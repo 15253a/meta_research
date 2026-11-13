@@ -13,7 +13,10 @@ from uuid import UUID
 
 from sqlalchemy import bindparam, text
 
-from meta_research.owners.common import canonical_hash
+from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.advancement_engine import recent_workspace_cycles
+from meta_research.owners.agent_runtime import _bundle_inbox_checkpoint_from_row
+from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError
 from meta_research.stage_session_retirement import retired_stage_ids
 from meta_research.target_session_retirement import replaced_target_sessions
 from meta_research.provider_supervisor import (ProviderSupervisorError, read_transport_envelope,
@@ -27,9 +30,8 @@ def _uuid(value):
         return False
 
 
-# A single sweep holds the research Owner writer while it revalidates and
-# deletes. Share the CLI wait allowance across the whole fenced batch; a
-# slow Harness must yield to research instead of blocking once per thread.
+# Bound CLI latency for a sweep, independently of research database access.
+# Native deletion and filesystem work never hold the research Owner writer.
 _NATIVE_DELETE_BATCH_SECONDS = 2.0
 
 
@@ -179,25 +181,348 @@ def _query_runs(connection, sql, work):
                               {"runs": tuple(work)})
 
 
-def cleanup_cycle_sessions(runtime, connection, candidates, *, dry_run, protected_paths=()):
-    """Called under the Owner fence after the same window and dependencies as file cleanup."""
+def _cycle_dependencies(connection, cycle_refs):
+    """Read current Owner dependencies once per database snapshot, across every run of each Cycle."""
+    rows = connection.execute(text("""
+        WITH runs AS (
+            SELECT cycle_ref, run_ref, NULL AS target_ref FROM ar_stage_runs WHERE cycle_ref IN :cycles
+            UNION
+            SELECT r.cycle_ref, a.target_run_ref, a.target_ref FROM ar_target_launches a
+              JOIN ae_stage_run_requests r ON r.request_ref=a.stage_request_ref WHERE r.cycle_ref IN :cycles
+        ), pending AS (
+            SELECT cycle_ref, 'cycle_incomplete' AS reason FROM ae_cycles
+              WHERE cycle_ref IN :cycles AND status!='completed'
+            UNION ALL
+            SELECT c.cycle_ref, 'workspace_cycle_lineage_unavailable' FROM ae_cycles c
+              WHERE c.cycle_ref IN :cycles AND NOT EXISTS (
+                SELECT 1 FROM ae_foreground_grants g JOIN ae_foreground_heads h USING (quest_ref)
+                WHERE g.quest_ref=c.quest_ref AND g.cycle_ref=c.cycle_ref AND g.epoch<=h.epoch)
+            UNION ALL
+            SELECT cycle_ref, 'cycle_handoff_incomplete' AS reason FROM ae_stage_run_requests r
+              WHERE cycle_ref IN :cycles AND NOT EXISTS (
+                SELECT 1 FROM ae_stage_commits c WHERE c.request_ref=r.request_ref)
+              -- A revoked attempt has no commit of its own. Its responsibility
+              -- is settled only by a later commit of this same Cycle and Stage.
+              AND NOT EXISTS (
+                SELECT 1 FROM ae_foreground_grants g
+                JOIN ae_stage_run_requests newer ON newer.cycle_ref=r.cycle_ref
+                  AND newer.stage=r.stage AND newer.epoch>r.epoch
+                JOIN ae_stage_commits accepted ON accepted.request_ref=newer.request_ref
+                WHERE g.quest_ref=r.quest_ref AND g.cycle_ref=r.cycle_ref
+                  AND g.epoch=r.epoch AND g.status='revoked'
+                  AND NOT EXISTS (SELECT 1 FROM ar_stage_runs s LEFT JOIN ar_run_controls ctl USING(run_ref)
+                    WHERE s.request_ref=r.request_ref AND
+                      (ctl.status IS NOT 'terminated' OR ctl.cleanup_status IS NOT 'completed')))
+            UNION ALL
+            SELECT r.cycle_ref, 'handoff_incomplete' FROM ar_target_launches a
+              JOIN ae_stage_run_requests r ON r.request_ref=a.stage_request_ref
+              LEFT JOIN ar_target_root_lifecycles l ON l.target_ref=a.target_ref
+              WHERE r.cycle_ref IN :cycles AND (l.status IS NULL OR l.status NOT IN ('completed','cancelled','failed'))
+            UNION ALL
+            SELECT cycle_ref, 'unfinished_runtime_responsibility' FROM runs r
+              JOIN ar_execution_responsibilities effects ON effects.root_run_ref=r.run_ref
+              WHERE effects.status!='finished'
+            UNION ALL
+            SELECT cycle_ref, 'pending_human_request' FROM runs JOIN owner_human_request_waiters w
+              ON (w.waiter_ref='root_run:'||run_ref OR w.waiter_ref=runs.target_ref)
+              WHERE w.status IN ('blocked','released')
+            UNION ALL
+            SELECT cycle_ref, 'active_or_recoverable_session' FROM runs r WHERE
+              EXISTS (SELECT 1 FROM ar_harness_provider_operations p WHERE p.run_ref=r.run_ref
+                      AND status IN ('running','unknown_outcome'))
+              OR EXISTS (SELECT 1 FROM ar_target_harness_child_sessions s WHERE s.target_run_ref=r.run_ref
+                         AND s.completion_evidence_ref IS NULL)
+              OR EXISTS (SELECT 1 FROM ar_provider_units u WHERE u.run_ref=r.run_ref
+                         AND u.status IN ('active','revocation_pending'))
+              OR EXISTS (SELECT 1 FROM ar_run_controls c WHERE c.run_ref=r.run_ref AND
+                         (c.status IN ('running','suspended','suspended_fenced','reconciliation_required')
+                          OR c.cleanup_status='pending'))
+              OR EXISTS (SELECT 1 FROM ar_execution_fences f WHERE f.run_ref=r.run_ref
+                         AND f.status IN ('current','submitted'))
+              OR EXISTS (SELECT 1 FROM ar_stage_sessions s WHERE s.run_ref=r.run_ref AND s.status='active')
+              OR EXISTS (SELECT 1 FROM ar_harness_runs h WHERE h.run_ref=r.run_ref AND h.status='suspended')
+        )
+        SELECT cycle_ref, reason FROM pending GROUP BY cycle_ref, reason ORDER BY cycle_ref, reason
+        """).bindparams(bindparam("cycles", expanding=True)), {"cycles": sorted(cycle_refs)})
+    pending = {cycle: reason for cycle, reason in rows}
+    failed = connection.execute(text("SELECT requests.cycle_ref, launches.target_ref "
+        "FROM ar_target_launches launches JOIN ae_stage_run_requests requests "
+        "ON requests.request_ref=launches.stage_request_ref JOIN ar_target_root_lifecycles lifecycle "
+        "ON lifecycle.target_ref=launches.target_ref WHERE requests.cycle_ref IN :cycles "
+        "AND lifecycle.status='failed'").bindparams(bindparam("cycles", expanding=True)),
+        {"cycles": sorted(cycle_refs)})
+    for cycle, target in failed:
+        try:
+            _verify_failed_notice_ack(connection, target)
+        except OwnerConflict as error:
+            pending[cycle] = error.code
+    return pending
+
+
+def _verify_failed_notice_ack(connection, target_ref):
+    # A closed historical Bundle cannot use the current-execution checkpoint API.
+    # Its immutable checkpoint still authenticates the exact published prefix.
+    row = connection.execute(text("SELECT checkpoints.* FROM ar_target_work_notices notice "
+        "JOIN ar_bundle_inbox_entries entries ON entries.notice_ref=notice.notice_ref "
+        "JOIN ar_target_launches launches ON launches.target_ref=notice.target_ref "
+        "JOIN ar_bundle_dispatch_decisions dispatch ON dispatch.decision_ref=launches.dispatch_decision_ref "
+        "AND dispatch.run_ref=entries.run_ref "
+        "JOIN ar_bundle_inbox_checkpoints checkpoints ON checkpoints.run_ref=entries.run_ref "
+        "AND checkpoints.cursor>=entries.sequence AND checkpoints.generation>=entries.published_generation "
+        "WHERE notice.target_ref=:target ORDER BY checkpoints.checkpoint_revision LIMIT 1"),
+        {"target": target_ref}).first()
+    if row is None:
+        raise OwnerConflict('bundle_notice_unacknowledged')
+    _bundle_inbox_checkpoint_from_row(row)
+
+
+def _path_dependency(workspace, path, pending_uploads, pending_intakes):
+    if workspace in pending_uploads:
+        return 'pending_human_upload'
+    if (path / '.target-completion-intakes').exists():
+        return 'pending_finalizer_intake'
+    if any(_paths_overlap(source, path) for source in pending_intakes):
+        return 'pending_asset_intake'
+    return None
+
+
+def _blocked_session_runs(leases, target_root, pending_uploads, pending_intakes):
+    """Check every recorded lease outside the database access."""
+    blocked = {}
+    for run, workspace, name in leases:
+        try:
+            path = target_root / name
+            if name != canonical_hash({'workspace_ref': workspace}) or path.resolve(strict=False) != path:
+                blocked[run] = 'workspace_cleanup_unsafe_boundary'
+            elif reason := _path_dependency(workspace, path, pending_uploads, pending_intakes):
+                blocked[run] = reason
+        except (OSError, RuntimeError, TypeError):
+            blocked[run] = 'workspace_cleanup_unsafe_boundary'
+    return blocked
+
+
+def _window_reason(connection, candidate, windows):
+    quest = candidate['quest_ref']
+    if quest not in windows:
+        try:
+            windows[quest] = recent_workspace_cycles(connection, quest)
+        except OwnerConflict:
+            windows[quest] = ()
+    if not windows[quest]:
+        return 'workspace_cycle_window_unavailable'
+    if candidate['cycle_ref'] in windows[quest]:
+        return 'recent_cycle_window'
+    return None
+
+
+def _pending_intake_paths(connection):
+    paths = []
+    for row in connection.execute(text("SELECT request_json,request_hash FROM rm_asset_intakes "
+                                       "WHERE status IN ('queued','processing')")):
+        try:
+            request = json.loads(row.request_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict('workspace_cleanup_pending_intake_invalid') from error
+        if not isinstance(request, dict) or canonical_hash(request) != row.request_hash:
+            raise OwnerConflict('workspace_cleanup_pending_intake_invalid')
+        if isinstance(request.get('source_locator'), str):
+            paths.append(Path(request['source_locator']))
+    return tuple(paths)
+
+
+def _original_locators(connection):
+    """Stored custody and human selections protect physical originals, even retired ones."""
+    paths = set()
+    for row in connection.execute(text("SELECT source_locator FROM rm_asset_custodies "
+                                       "WHERE custody_mode='linked_local'")):
+        if not row.source_locator:
+            raise OwnerConflict('linked_local_locator_unavailable')
+        original = Path(row.source_locator)
+        if not original.is_absolute():
+            raise OwnerConflict('linked_local_locator_unavailable')
+        paths.add(original)
+    for row in connection.execute(text(
+            "SELECT r.selection_json,r.selection_hash FROM hc_work_material_references r "
+            "JOIN hc_work_material_submissions s USING(submission_ref) "
+            "WHERE s.state IN ('ready','pending') AND "
+            "s.anchor_kind IN ('creation','manual','guidance','input','request')")):
+        try:
+            selection = json.loads(row.selection_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid') from error
+        if (not isinstance(selection, dict) or canonical_hash(selection) != row.selection_hash
+                or not isinstance(selection.get('absolute_path'), str)
+                or not Path(selection['absolute_path']).is_absolute()):
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid')
+        original = Path(selection['absolute_path'])
+        paths.add(original)
+    return tuple(paths)
+
+
+def _pending_human_uploads(connection):
+    workspaces = set()
+    for row in connection.execute(text(
+            "SELECT s.command_json,s.command_hash,s.receiver_json,w.workspace_ref "
+            "FROM hc_work_material_submissions s JOIN hc_work_material_roots w USING(submission_ref) "
+            "WHERE s.state='pending'")):
+        try:
+            command = json.loads(row.command_json)
+            receiver = json.loads(row.receiver_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid') from error
+        if (not isinstance(command, dict) or not isinstance(receiver, dict) or canonical_hash(command) != row.command_hash
+                or command.get('receiver') != receiver
+                or not any(root.get('workspace_ref') == row.workspace_ref for root in receiver.get('roots', []))):
+            raise OwnerConflict('workspace_cleanup_material_reference_invalid')
+        if command.get('uploads'):
+            workspaces.add(row.workspace_ref)
+    return workspaces
+
+
+def _resolve_protected_paths(paths):
+    # Preserve both the registered locator and its actual original (parent aliases).
+    try:
+        return tuple(set(paths) | {path.resolve(strict=False) for path in paths})
+    except (OSError, RuntimeError, ValueError) as error:
+        raise OwnerConflict('workspace_cleanup_material_reference_invalid') from error
+
+
+def _paths_overlap(left, right):
+    left, right = left.resolve(strict=False), right.resolve(strict=False)
+    return left == right or left in right.parents or right in left.parents
+
+
+def _verified_candidate_path(runtime, candidate):
+    """Keep native retirement's published handoff requirements separate from scratch GC."""
+    if candidate['cycle_status'] != 'completed':
+        return None
+    failed = candidate['root_kind'] == 'target' and candidate['lifecycle_status'] == 'failed'
+    if not failed and (candidate['lifecycle_status'] != 'completed' or not candidate['commit_ref']):
+        return None
+    if candidate['root_kind'] == 'target':
+        root = Path(runtime._target_agent._workspace_root)
+        path = root / candidate['root_name']
+        expected = canonical_hash({'workspace_ref': candidate['workspace_ref']})
+    else:
+        if runtime._root_workspaces is None:
+            return None
+        location = runtime._root_workspaces.read_stage_workspace_location(
+            candidate['work_ref'], candidate['cycle_ref'], candidate['root_kind'])
+        path = location.directory
+        root = path.parent
+        candidate['workspace_ref'] = location.workspace_ref
+        expected = canonical_hash({'work_ref': candidate['work_ref']})
+    if (path.name != expected or root.is_symlink() or root.resolve() != root
+            or path.is_symlink() or path.resolve(strict=False) != path):
+        return None
+    if failed:
+        owner = runtime._agent_runtime
+        notice = owner.query_target_work_notice(candidate['target_ref'])
+        if notice is None:
+            return None
+        handoff = owner.read_target_run_handoff(notice.handoff_manifest_ref)
+        if handoff.handle_history[-1].target_run_ref != candidate['work_ref']:
+            return None
+        operation = owner.harness_runs.latest_operation(candidate['work_ref'])
+        if operation is None:
+            return None
+        owner.harness_runs.verify_operation_terminal(operation.operation_ref)
+    elif candidate['root_kind'] == 'target':
+        graph = runtime._research_graph
+        manifest = graph._target_root_manifest_reader.query(candidate['manifest_ref'])
+        transition = graph.query_target_root_commit_transition(candidate['target_ref'])
+        handoff = runtime._agent_runtime.query_target_root_completion_handoff(
+            target_ref=candidate['target_ref'], completion_ref=candidate['completion_ref'],
+            target_commit_ref=candidate['commit_ref'])
+        if manifest is None or transition is None or handoff is None or transition.target_commit_ref != candidate['commit_ref']:
+            return None
+    else:
+        request = runtime._agent_runtime.query_stage_run_by_ref(candidate['work_ref'])
+        ae = runtime._advancement_engine
+        if (ae is None or request is None
+                or getattr(ae, 'query_' + candidate['root_kind'] + '_stage_commit')(request.request_ref) is None):
+            return None
+    return path
+
+
+def cleanup_cycle_sessions(runtime, candidates, *, dry_run):
+    """Snapshot retirement guards, then inspect/delete native files without a writer lock.
+
+    Called before workspace deletion so pending finalizer markers are still visible.
+    Native terminal, handoff, active-session and pending-intake guards remain in force.
+    """
     cleanup = runtime._native_cleanup
-    work = {item["work_ref"]: item["root_kind"] for item in candidates}
-    if cleanup is None or not work:
+    candidates = [c for c in candidates if c.get('lineage_valid', True) and c.get('cycle_ref') and c.get('quest_ref')]
+    if cleanup is None or not candidates:
         return []
-    native = _query_runs(connection, """
-        SELECT native_session_ref FROM ar_stage_sessions
-        WHERE run_ref IN :runs AND status='completed'
-        UNION SELECT native_session_ref FROM ar_harness_runs
-        WHERE run_ref IN :runs AND harness_family='codex'
-        UNION SELECT c.native_child_session_ref FROM ar_target_harness_child_sessions c
-        JOIN ar_harness_runs h ON h.run_ref=c.target_run_ref AND h.harness_family='codex'
-        WHERE c.target_run_ref IN :runs AND c.completion_evidence_ref IS NOT NULL
-    """, work).scalars().all()
-    retired = (set(native) | retired_stage_ids(connection, work)
-               | replaced_target_sessions(connection, work, runtime._target_agent))
-    reports = cleanup.delete(retired, dry_run, protected_paths)
-    reports.extend(_clean_spools(cleanup.root, connection, work, dry_run, protected_paths))
+    database = runtime._database
+    eligible = []
+    try:
+        with database.read_snapshot() as connection:
+            windows = {}
+            reasons = {c['work_ref']: _window_reason(connection, c, windows) for c in candidates}
+            deps = _cycle_dependencies(connection, {c['cycle_ref'] for c in candidates})
+            locators = _original_locators(connection)
+            pending_intakes = _pending_intake_paths(connection)
+            pending_uploads = _pending_human_uploads(connection)
+            runs = {c['work_ref'] for c in candidates if c['root_kind'] == 'target'}
+            leases = _query_runs(connection, """SELECT target_run_ref,workspace_ref,root_name
+                FROM ar_target_run_workspaces WHERE target_run_ref IN :runs""", runs).all() if runs else []
+        protected = _resolve_protected_paths((*locators, *pending_intakes))
+        blocked = _blocked_session_runs(leases, Path(runtime._target_agent._workspace_root),
+                                        pending_uploads, pending_intakes)
+        for item in candidates:
+            if item['work_ref'] in blocked:
+                item['native_cleanup_reason'] = blocked[item['work_ref']]
+            candidate = dict(item)
+            if reasons[candidate['work_ref']] or deps.get(candidate['cycle_ref']) or candidate['work_ref'] in blocked:
+                continue
+            try:
+                path = _verified_candidate_path(runtime, candidate)
+                if path is not None and not _path_dependency(candidate['workspace_ref'], path, pending_uploads, pending_intakes):
+                    eligible.append(candidate)
+            except (OwnerConflict, AgentRuntimeHarnessError, OSError, RuntimeError, ValueError, TypeError):
+                continue
+    except (OwnerConflict, OSError, RuntimeError, ValueError):
+        return []
+    work = {item['work_ref']: item['root_kind'] for item in eligible}
+    if not work:
+        return []
+    try:
+        with database.read_snapshot() as connection:
+            # File/handoff verification may be slow. Reject changed mutable guards
+            # using a fresh, short database snapshot before any native deletion.
+            windows = {}
+            current_deps = _cycle_dependencies(connection, {c['cycle_ref'] for c in eligible})
+            work = {c['work_ref']: c['root_kind'] for c in eligible
+                    if not current_deps.get(c['cycle_ref']) and not _window_reason(connection, c, windows)}
+            if (not work or set(locators) != set(_original_locators(connection))
+                    or set(pending_intakes) != set(_pending_intake_paths(connection))
+                    or pending_uploads != _pending_human_uploads(connection)):
+                return []
+            native = _query_runs(connection, """
+                SELECT native_session_ref FROM ar_stage_sessions
+                WHERE run_ref IN :runs AND status='completed'
+                UNION SELECT native_session_ref FROM ar_harness_runs
+                WHERE run_ref IN :runs AND harness_family='codex'
+                UNION SELECT c.native_child_session_ref FROM ar_target_harness_child_sessions c
+                JOIN ar_harness_runs h ON h.run_ref=c.target_run_ref AND h.harness_family='codex'
+                WHERE c.target_run_ref IN :runs AND c.completion_evidence_ref IS NOT NULL
+            """, work).scalars().all()
+            retired = (set(native) | retired_stage_ids(connection, work)
+                       | replaced_target_sessions(connection, work, runtime._target_agent))
+            stage_spools = _query_runs(connection, """
+                SELECT DISTINCT run_ref,operation_ref FROM ar_provider_units WHERE run_ref IN :runs
+                  AND status IN ('completed','revoked') AND operation_ref IS NOT NULL
+            """, work).all()
+            target_spools = _query_runs(connection, """
+                SELECT operation_ref,invocation_hash FROM ar_harness_provider_operations
+                WHERE run_ref IN :runs AND status IN ('executed','failed')
+            """, work).all()
+    except (OwnerConflict, OSError, ValueError, TypeError):
+        return []
+    reports = cleanup.delete(retired, dry_run, protected)
+    reports.extend(_clean_spools(cleanup.root, work, stage_spools, target_spools, dry_run, protected))
     return reports
 
 
@@ -231,12 +556,9 @@ def _prune_spool(directory, digest, dry_run, protected_paths):
              "action": "candidate" if dry_run else "pruned", "reason": "terminal_launch_scratch"}] if size else []
 
 
-def _clean_spools(root, connection, work, dry_run, protected_paths):
+def _clean_spools(root, work, stage_spools, target_spools, dry_run, protected_paths):
     records = []
-    for run, operation in _query_runs(connection, """
-            SELECT DISTINCT run_ref,operation_ref FROM ar_provider_units WHERE run_ref IN :runs
-              AND status IN ('completed','revoked') AND operation_ref IS NOT NULL
-        """, work):
+    for run, operation in stage_spools:
         kind = work[run]
         if kind not in {"idea", "plan", "bundle", "reasoning"}:
             continue
@@ -254,10 +576,7 @@ def _clean_spools(root, connection, work, dry_run, protected_paths):
             except (OSError, ProviderSupervisorError, ValueError):
                 continue
     base = root.run / "harness-supervisor"
-    for operation, owner_hash in _query_runs(connection, """
-            SELECT operation_ref,invocation_hash FROM ar_harness_provider_operations
-            WHERE run_ref IN :runs AND status IN ('executed','failed')
-        """, work):
+    for operation, owner_hash in target_spools:
         try:
             if not re.fullmatch("[0-9a-f]{64}", owner_hash):
                 continue
@@ -299,8 +618,7 @@ class NativeSessionCleanup:
         return rows
 
     def long_lived(self, database, *, dry_run, limit):
-        from meta_research.target_workspace_cleanup import _protected_originals, _pending_intake_paths
-        with database.fenced_write() as connection:
+        with database.read_snapshot() as connection:
             ids = set(self.page("companion", connection, """
                 SELECT n.native_session_ref FROM hc_companion_native_sessions n
                  JOIN hc_companion_sessions s USING (session_ref)
@@ -312,19 +630,33 @@ class NativeSessionCleanup:
                   AND n.native_session_ref IS NOT NULL
                 ORDER BY 1
             """, limit))
-            if self.acquisition:
-                from meta_research.acquisition import AcquisitionUnavailable
-                for session in self.page("acquisition", connection, """
+            sessions = self.page("acquisition", connection, """
                     SELECT s.session_ref FROM ar_acquisition_sessions s
                     WHERE s.status IN ('ready','cancelled') AND s.current_request_id IS NULL
                       AND NOT EXISTS (SELECT 1 FROM ar_acquisition_requests r WHERE r.session_ref=s.session_ref
                         AND r.status IN ('running','waiting_user'))
                     ORDER BY s.session_ref
-                """, limit):
-                    try:
-                        ids.update(self.acquisition(session))
-                    except (OSError, AcquisitionUnavailable):
-                        continue
+                """, limit) if self.acquisition else []
+        acquisition_ids = {}
+        if self.acquisition:
+            from meta_research.acquisition import AcquisitionUnavailable
+            for session in sessions:
+                try:
+                    acquisition_ids[session] = self.acquisition(session)
+                except (OSError, AcquisitionUnavailable):
+                    continue
+        with database.read_snapshot() as connection:
+            # Revalidate the Owner state after reading acquisition receipt files.
+            if acquisition_ids:
+                eligible_sessions = _query_runs(connection, """
+                    SELECT s.session_ref FROM ar_acquisition_sessions s
+                    WHERE s.session_ref IN :runs AND s.status IN ('ready','cancelled')
+                      AND s.current_request_id IS NULL
+                      AND NOT EXISTS (SELECT 1 FROM ar_acquisition_requests r WHERE r.session_ref=s.session_ref
+                        AND r.status IN ('running','waiting_user'))
+                """, acquisition_ids).scalars().all()
+                for session in eligible_sessions:
+                    ids.update(acquisition_ids[session])
             # Intent and Companion can hand the same live native thread across scopes.
             if ids:
                 ids -= set(_query_runs(connection, r"""
@@ -358,38 +690,44 @@ class NativeSessionCleanup:
                       LEFT JOIN unfinished f ON f.root_run_ref=i.initialization_id AND f.operation_ref=a.generation_ref||'\:proposal'
                      WHERE a.status IN ('queued','running') OR f.operation_ref IS NOT NULL
                 """, ids).scalars())
-            recorder = self.root.root / "research-recorder" / "summaries.sqlite3"
-            if not ids and not recorder.exists():
+        recorder = self.root.root / "research-recorder" / "summaries.sqlite3"
+        if not ids and not recorder.exists():
+            return []
+        # Load source protection once, and only if a bound retired UUID exists.
+        def reclaim(refs):
+            if not any(_uuid(ref) for ref in refs):
                 return []
-            # Load source protection once, and only if a bound retired UUID exists.
-            def reclaim(refs):
-                if not any(_uuid(ref) for ref in refs):
-                    return []
-                protected = (*_protected_originals(connection), *_pending_intake_paths(connection))
-                return self.delete(refs, dry_run, protected)
+            try:
+                with database.read_snapshot() as connection:
+                    locators = _original_locators(connection)
+                    pending_intakes = _pending_intake_paths(connection)
+                protected = _resolve_protected_paths((*locators, *pending_intakes))
+            except (OwnerConflict, OSError, ValueError):
+                return []
+            return self.delete(refs, dry_run, protected)
 
-            if recorder.exists() and recorder.resolve() == recorder:
-                with sqlite3.connect(recorder.as_uri() + "?mode=rw", uri=True, timeout=2) as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    tables = {row[0] for row in db.execute(
-                        "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('jobs','quests')"
-                    )}
-                    # The recorder creates its file before committing its schema.
-                    if tables != {"jobs", "quests"}:
-                        return [*reclaim(ids), {"root_kind": "native_session", "session_ref": None,
-                            "path": str(recorder), "bytes": 0, "action": "skipped",
-                            "reason": "native_recorder_schema_unavailable"}]
-                    offset = self.offsets.get("recorder", 0)
-                    retired = [r[0] for r in db.execute("""
-                        SELECT DISTINCT j.native_session_ref FROM jobs j WHERE j.native_session_ref IS NOT NULL
-                          AND j.status IN ('completed','failed')
-                          AND j.native_session_ref NOT IN (
-                            SELECT native_session_ref FROM quests WHERE native_session_ref IS NOT NULL
-                            UNION ALL
-                            SELECT json_extract(request_json,'$.native_session_ref') FROM jobs
-                             WHERE status IN ('active','failed') AND json_type(request_json,'$.native_session_ref')='text'
-                          )
-                        ORDER BY 1 LIMIT ? OFFSET ?""", (limit, offset))]
-                    self.offsets["recorder"] = offset + len(retired) if len(retired) == limit else 0
-                    return reclaim(ids | set(retired))
-            return reclaim(ids)
+        if recorder.exists() and recorder.resolve() == recorder:
+            with sqlite3.connect(recorder.as_uri() + "?mode=rw", uri=True, timeout=2) as db:
+                db.execute("BEGIN IMMEDIATE")
+                tables = {row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('jobs','quests')"
+                )}
+                # The recorder creates its file before committing its schema.
+                if tables != {"jobs", "quests"}:
+                    return [*reclaim(ids), {"root_kind": "native_session", "session_ref": None,
+                        "path": str(recorder), "bytes": 0, "action": "skipped",
+                        "reason": "native_recorder_schema_unavailable"}]
+                offset = self.offsets.get("recorder", 0)
+                retired = [r[0] for r in db.execute("""
+                    SELECT DISTINCT j.native_session_ref FROM jobs j WHERE j.native_session_ref IS NOT NULL
+                      AND j.status IN ('completed','failed')
+                      AND j.native_session_ref NOT IN (
+                        SELECT native_session_ref FROM quests WHERE native_session_ref IS NOT NULL
+                        UNION ALL
+                        SELECT json_extract(request_json,'$.native_session_ref') FROM jobs
+                         WHERE status IN ('active','failed') AND json_type(request_json,'$.native_session_ref')='text'
+                      )
+                    ORDER BY 1 LIMIT ? OFFSET ?""", (limit, offset))]
+                self.offsets["recorder"] = offset + len(retired) if len(retired) == limit else 0
+                return reclaim(ids | set(retired))
+        return reclaim(ids)

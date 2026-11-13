@@ -1,5 +1,7 @@
-"""Only published, readable completion scratch is reclaimable."""
+"""Expired Cycle workspaces are reclaimed unless they contain linked originals."""
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 import time
 import os
 import subprocess
@@ -163,18 +165,23 @@ def test_missing_foreground_history_does_not_expire_a_completed_workspace(tmp_pa
         runtime.close()
 
 
-def test_target_completion_preserves_workspace_until_cycle_business_completion(tmp_path):
+def test_current_cycle_is_retained_and_stale_cycle_status_does_not_extend_window(tmp_path):
     runtime, handle, _, workspace, _, _, _ = _complete(tmp_path, finish_cycle=False)
     try:
         result = _target_cleanup(runtime,
             dry_run=False)
-        assert result[0]['action'] == 'skipped' and result[0]['reason'] == 'cycle_incomplete', result
+        assert result[0]['action'] == 'skipped' and result[0]['reason'] == 'recent_cycle_window', result
         assert workspace.is_dir()
+        for _ in range(3):
+            _next_foreground(runtime)
+        released = _target_cleanup(runtime, dry_run=False)
+        assert released[0]['action'] == 'removed', released
+        assert not workspace.exists()
     finally:
         runtime.close()
 
 
-def test_actual_provider_instructions_preserve_cycle_dependencies_before_cleanup(tmp_path):
+def test_actual_provider_instructions_describe_cycle_workspace_lifetime(tmp_path):
     from test_root_capability_floor import _invoke_root_without_tool_activity
     from meta_research.target_execution_contract import target_execution_skill_text
     from meta_research.reasoning_skill import _reasoning_skill_instructions
@@ -187,11 +194,11 @@ def test_actual_provider_instructions_preserve_cycle_dependencies_before_cleanup
                      for line in visible.splitlines() if line.startswith('Shared reference root: ')))
     custody = (root / 'references/materials-and-custody.md').read_text(encoding='utf-8')
     assert custody not in visible
-    assert '单个 Target 结束不能证明整个 Cycle 或目录已可回收' in custody
-    assert '实际执行、恢复、待接纳及后继读取依赖继续保护' in custody
-    assert '精确保管原件不作为临时材料删除' in custody
-    assert '已由 RM 正式以 `linked_local` 保管的原件留在原位置' in custody
-    assert '出窗且工作已结束、没有续接、恢复、未决对账或必要读取依赖时才释放' in custody
+    assert '近期窗口保留当前 Cycle 与前两轮' in custody
+    assert '只在原位保留 RM 正式以 `linked_local` 保管的资产原件' in custody
+    assert '其余文件与目录删除；没有这类原件时整目录删除' in custody
+    assert '活动、恢复、读取、待接纳或完成状态不增加窗口外 Workspace 的保留条件' in custody
+    assert '原生 Session 的退役与回收沿其既有运行生命周期处理' in custody
     target = target_execution_skill_text()
     source = Path(target.split('Skill source: ', 1)[1].splitlines()[0])
     assert source.read_text(encoding='utf-8').strip() in visible
@@ -212,8 +219,8 @@ def test_actual_provider_instructions_preserve_cycle_dependencies_before_cleanup
     assert '(../references/materials-and-custody.md#交接与工作区收尾)' in reasoning_skill
     assert (reasoning_source.parent / '../references/materials-and-custody.md').resolve() == (root / 'references/materials-and-custody.md').resolve()
     assert custody not in reasoning_visible
-    assert 'ScientificOutcome 草稿或单个 Target 完成不代表本轮已可清理' in reasoning_skill
-    assert '后继读取' in reasoning_skill and '执行、恢复、待接纳等依赖' in reasoning_skill
+    assert '按共享生命周期安排后继读取与正式保管' in reasoning_skill
+    assert '工作区清理由系统执行' in reasoning_skill
 
 
 def test_completed_cycle_reclaims_stage_working_copies_and_keeps_public_assets_readable(tmp_path, monkeypatch):
@@ -304,7 +311,7 @@ def test_cycle_cleanup_and_native_rotation_keep_the_companion_workspace(tmp_path
         runtime.close()
 
 
-def test_pending_stage_asset_intake_survives_cleanup_and_releases_after_public_readback(tmp_path):
+def test_queued_managed_intake_does_not_extend_workspace_retention(tmp_path):
     runtime, _, _, _, _, _, _ = _complete(tmp_path)
     try:
         location = runtime.cleanup_test_skills['plan'].locations[runtime.cleanup_test_cycle_ref]
@@ -315,23 +322,25 @@ def test_pending_stage_asset_intake_survives_cleanup_and_releases_after_public_r
             asynchronous=True), idempotency_key='cycle-pending-intake')
         assert job.status == 'queued'
         report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
-        protected = next(item for item in report if item['workspace_ref'] == location.workspace_ref)
-        assert protected['action'] == 'skipped' and protected['reason'] == 'pending_asset_intake', report
-        assert source.read_text() == 'Temporary plan working notes.'
+        released = next(item for item in report if item['workspace_ref'] == location.workspace_ref)
+        assert released['action'] == 'removed', report
+        assert not location.directory.exists()
         assert memory.process_asset_intake_once()
-        accepted = memory.query_asset_intake(job.job_ref)
-        assert accepted.status == 'accepted'
-        report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
-        assert next(item for item in report if item['workspace_ref'] == location.workspace_ref)['action'] == 'removed'
-        assert memory.materialize_asset(accepted.asset.version_ref).content == b'Temporary plan working notes.'
+        retried = memory.query_asset_intake(job.job_ref)
+        assert retried.status == 'queued' and retried.attempt_count == 1 and retried.asset is None
+        with runtime._database.read() as connection:
+            retry = connection.exec_driver_sql(
+                'SELECT started_at,next_attempt_at,updated_at FROM rm_asset_intakes WHERE job_ref=?',
+                (job.job_ref,)).one()
+        assert retry.started_at is None and retry.next_attempt_at > retry.updated_at
         print('CYCLE_PENDING_INTAKE ' + json.dumps({'job_ref': job.job_ref, 'report': report,
-            'public_rm_readback': 'Temporary plan working notes.'}, sort_keys=True))
+            'intake_status': retried.status}, sort_keys=True))
     finally:
         runtime.close()
 
 
 @pytest.mark.parametrize('first_attempt', ['removed', 'interrupted'])
-def test_cleanup_retry_after_restart_never_reclaims_new_work_at_an_old_location(tmp_path, monkeypatch, first_attempt):
+def test_cleanup_retry_reclaims_recreated_expired_scratch(tmp_path, monkeypatch, first_attempt):
     runtime, _, manifest, workspace, _, _, _ = _complete(tmp_path)
     data_root = runtime.data_root.root
     try:
@@ -351,23 +360,21 @@ def test_cleanup_retry_after_restart_never_reclaims_new_work_at_an_old_location(
         runtime.close()
         workspace.mkdir(exist_ok=True)
         source = workspace / 'newly-needed.txt'
-        source.write_text('New work must survive an old Cycle cleanup retry.')
+        source.write_text('Recreated scratch at an expired Cycle workspace.')
         runtime = _cleanup_runtime(data_root)
         report = _target_cleanup(runtime, dry_run=False)
-        assert report[0]['action'] == 'skipped' and report[0]['reason'] == {
-            'removed': 'workspace_cleanup_scope_closed',
-            'interrupted': 'workspace_cleanup_scope_changed'}[first_attempt], report
-        assert source.read_text() == 'New work must survive an old Cycle cleanup retry.'
+        assert report[0]['action'] == 'removed', report
+        assert not workspace.exists()
         asset = next(entry for entry in manifest.entries if entry.declared_relative_path == 'outputs/data/run1.txt')
         assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b'36\n'
         print('CYCLE_RETRY_SCOPE ' + json.dumps({'first_attempt': first_attempt, 'report': report,
-            'new_work_retained': True, 'rm_readback': '36\n'}, sort_keys=True))
+            'expired_scratch_removed': True, 'rm_readback': '36\n'}, sort_keys=True))
     finally:
         runtime.close()
 
 
 @pytest.mark.parametrize('change', ['recreated_old_name', 'overwritten_surviving_file'])
-def test_interrupted_cleanup_retry_preserves_changed_work_at_a_previously_recorded_name(tmp_path, monkeypatch, change):
+def test_interrupted_cleanup_retry_reclaims_changed_expired_scratch(tmp_path, monkeypatch, change):
     runtime, _, manifest, workspace, _, _, _ = _complete(tmp_path)
     data_root = runtime.data_root.root
     try:
@@ -387,12 +394,12 @@ def test_interrupted_cleanup_retry_preserves_changed_work_at_a_previously_record
         source.write_text('New research content at an old relative name.')
         runtime = _cleanup_runtime(data_root)
         report = _target_cleanup(runtime, dry_run=False)
-        assert report[0]['action'] == 'skipped' and report[0]['reason'] == 'workspace_cleanup_scope_changed', report
-        assert source.read_text() == 'New research content at an old relative name.'
+        assert report[0]['action'] == 'removed', report
+        assert not workspace.exists()
         asset = next(entry for entry in manifest.entries if entry.declared_relative_path == 'outputs/data/run1.txt')
         assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b'36\n'
         print('CYCLE_CHANGED_ENTRY ' + json.dumps({'change': change, 'report': report,
-            'changed_work_retained': True, 'exact_rm_readback': '36\n'}, sort_keys=True))
+            'expired_scratch_removed': True, 'exact_rm_readback': '36\n'}, sort_keys=True))
     finally:
         runtime.close()
 
@@ -428,6 +435,9 @@ def test_cleanup_preserves_external_originals_and_unsafe_or_recent_workspace(tmp
         if protection in {'linked_local', 'linked_local_stage'}:
             source = workspace / 'retained-original.csv'
             source.write_text('subject,value\na,36\n')
+            sibling = workspace / 'ordinary-scratch.txt'
+            sibling.write_text('Scratch alongside a linked original expires with its Cycle.')
+            original_inode = source.stat().st_ino
             asset = runtime.owners.research_memory.submit_asset_intake(AssetIntakeRequest(
                 source_kind='local_path', custody_mode='linked_local', display_name=source.name,
                 source_locator=str(source)), idempotency_key='linked-original').asset
@@ -446,13 +456,15 @@ def test_cleanup_preserves_external_originals_and_unsafe_or_recent_workspace(tmp
                 lambda candidate: candidate == source or actual_is_mount(candidate))
         report = tuple(item for item in runtime.target_run_runtime.cleanup_completed_workspaces(
             dry_run=False) if item['path'] == str(workspace))
-        assert report[0]['action'] == ('pruned' if protection in {'linked_local', 'linked_local_stage'} else 'skipped'), report
+        assert report[0]['action'] == ('pruned' if protection.startswith('linked_local') else 'skipped'), report
         assert report[0]['reason'] == {'linked_local':'originals_preserved_in_place', 'linked_local_stage':'originals_preserved_in_place',
             'symlink':'workspace_cleanup_unsafe_boundary',
             'mount_detection':'workspace_cleanup_unsafe_boundary'}[protection]
         assert workspace.exists()
         assert source.exists()
         if protection in {'linked_local', 'linked_local_stage'}:
+            assert not sibling.exists()
+            assert source.stat().st_ino == original_inode
             assert runtime.owners.research_memory.materialize_asset(asset.version_ref).content == b'subject,value\na,36\n'
         if protection == 'mount_detection':
             assert (source / 'external-sentinel.txt').read_text() == 'retain at mount boundary'
@@ -462,9 +474,8 @@ def test_cleanup_preserves_external_originals_and_unsafe_or_recent_workspace(tmp
 
 
 @pytest.mark.parametrize("state", ["running", "unknown_outcome", "reserved_child", "human_wait"])
-def test_cleanup_preserves_owner_recorded_active_and_recoverable_sessions(tmp_path, state):
+def test_expired_workspace_retention_is_independent_of_old_runtime_state(tmp_path, state):
     runtime, handle, manifest, workspace, _, _, _ = _complete(tmp_path)
-    process = None
     try:
         harness = runtime.owners.agent_runtime.harness_runs
         if state == "human_wait":
@@ -487,88 +498,41 @@ def test_cleanup_preserves_owner_recorded_active_and_recoverable_sessions(tmp_pa
                 generation=generation, invocation_hash=canonical_hash({"cleanup-test": state}), resume=False)
             if state == "unknown_outcome":
                 harness.record_operation_failure(operation_ref, "provider_outcome_unknown", durable_outcome="unknown")
-            else:
-                # A real local process uses this scratch path while AR records a
-                # running operation; no model or transport receipt is fabricated.
-                process = subprocess.Popen([sys.executable, "-c",
-                    "from pathlib import Path; import sys; marker = Path('active.marker'); "
-                    "marker.touch(); print('ready', flush=True); sys.stdin.readline(); "
-                    "marker.write_bytes(b'in use'); print('written', flush=True); sys.stdin.readline()"],
-                    cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-                assert process.stdout.readline().strip() == "ready"
-                assert process.poll() is None and (workspace / "active.marker").is_file()
             assert harness.latest_operation(handle.target_run_ref).status == state
-        def files():
-            return {p.relative_to(workspace): p.read_bytes() for p in workspace.rglob('*') if p.is_file()}
-
-        before_files, before_bytes = files(), _workspace_bytes(workspace)
-        if process is not None:
-            process.stdin.write("append\n")
-            process.stdin.flush()
+        # These real Owner records deliberately remain unsettled. The workspace
+        # policy depends on its distinct-Cycle window, not those old states.
         result = _target_cleanup(runtime, dry_run=False)
-        assert result[0]["action"] == "skipped", result
-        reason = "pending_human_request" if state == "human_wait" else "active_or_recoverable_session"
-        assert result[0]["reason"] == reason, result
-        if process is not None:
-            assert process.stdout.readline().strip() == "written"
-            assert before_files[Path('active.marker')] == b''
-            before_files[Path('active.marker')] = b'in use'
-        assert workspace.is_dir() and files() == before_files
-        assert all(skill.locations[runtime.cleanup_test_cycle_ref].directory.is_dir()
+        assert result[0]["action"] == "removed", result
+        assert not workspace.exists()
+        assert all(not skill.locations[runtime.cleanup_test_cycle_ref].directory.exists()
             for skill in runtime.cleanup_test_skills.values())
-        if process is not None: assert process.poll() is None
-        print("T16_PROTECTED " + json.dumps({"state": state, "report": result,
-            "allocated_before": before_bytes, "allocated_after": _workspace_bytes(workspace)}))
+        if state in {'running', 'unknown_outcome'}:
+            assert harness.latest_operation(handle.target_run_ref).status == state
+        print("EXPIRED_WORKSPACE_STATE " + json.dumps({"state": state, "report": result}))
     finally:
-        if process is not None:
-            process.terminate(); process.wait(timeout=5)
         runtime.close()
 
 
 @pytest.mark.parametrize("dependency", ["unpublished", "pending_intake"])
-def test_cleanup_waits_for_actual_handoff_and_pending_finalizer_files(tmp_path, dependency):
+def test_expired_workspace_does_not_wait_for_publication_or_finalizer_files(tmp_path, dependency):
     runtime, handle, manifest, workspace, _, _, completed = _complete(tmp_path, publish=dependency!="unpublished")
     try:
         if dependency == "pending_intake":
             pending = workspace / ".target-completion-intakes"
             pending.mkdir(); (pending / "unconsumed.json").write_text('{"state":"awaiting-finalizer"}')
-        before = _workspace_bytes(workspace)
-        def workspace_contents():
-            return {str(path.relative_to(workspace)): (
-                path.is_symlink(), path.is_dir(),
-                None if path.is_dir() else path.read_bytes())
-                for path in workspace.rglob("*")}
-        before_contents = workspace_contents()
-        result = _target_cleanup(runtime, dry_run=False)
         if dependency == "unpublished":
-            # Completion and RM/RG receipts exist, but publication has not yet
-            # advanced the AR lifecycle from finalizing to completed. It is
-            # therefore excluded before the candidate-deletion loop.
-            assert result == ()
+            for _ in range(3):
+                _next_foreground(runtime)
             with runtime._database.read() as connection:
                 assert connection.exec_driver_sql("SELECT status FROM ar_target_root_lifecycles").scalar_one() == "finalizing"
-        else:
-            assert result[0]["action"] == "skipped", result
-            assert result[0]["reason"] == "pending_finalizer_intake"
-        assert workspace.exists() and workspace_contents() == before_contents
+        result = _target_cleanup(runtime, dry_run=False)
+        assert result[0]['action'] == 'removed', result
+        assert not workspace.exists()
         asset = next(entry for entry in manifest.entries
             if entry.declared_relative_path == "outputs/data/run1.txt")
         assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b"36\n"
-        print("T16_PROTECTED " + json.dumps({"state":dependency,"report":result,
-            "allocated_bytes_before":before,"allocated_bytes_after":_workspace_bytes(workspace),
-            "workspace_contents_unchanged":True}))
-        if dependency == "unpublished":
-            runtime.owners.agent_runtime.publish_target_root_completion(target_ref=handle.target_ref,
-                completion_ref=completed.completion_ref, target_commit_ref=completed.target_commit_ref)
-            _finish_stage(runtime, 'bundle')
-            _finish_stage(runtime, 'reasoning')
-            _next_foreground(runtime)
-            _next_foreground(runtime)
-            published = _target_cleanup(runtime, dry_run=False)
-            assert published[0]["action"] == "removed" and not workspace.exists()
-            asset = next(entry for entry in manifest.entries if entry.declared_relative_path == "outputs/data/run1.txt")
-            assert runtime.owners.research_memory.materialize_asset(asset.binding.version_ref).content == b"36\n"
-            print("T16_PUBLICATION_RELEASE " + json.dumps({"after_publish":published,"rm_readback":"36\n"}))
+        print("EXPIRED_UNPUBLISHED_WORKSPACE " + json.dumps({"state":dependency,"report":result,
+            "exact_rm_readback":"36\n"}))
     finally: runtime.close()
 
 
@@ -619,3 +583,62 @@ def test_interrupted_real_removal_recovers_after_runtime_reconstruction(tmp_path
         print("T16_RECOVERY " + json.dumps({"before_bytes":before,"partial_bytes":partial,"after_bytes":0,
             "interruption":result,"recovered":report,"repeated":repeated,"rm_readback":"36\n"}))
     finally: runtime.close()
+
+
+@pytest.mark.parametrize('io_boundary', ['scan', 'delete'])
+def test_blocked_cleanup_io_does_not_hold_the_database_writer(tmp_path, monkeypatch, io_boundary):
+    runtime, _, _, workspace, _, _, _ = _complete(tmp_path)
+    entered = Event()
+    release = Event()
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        with runtime._database.fenced_write() as connection:
+            connection.exec_driver_sql('CREATE TABLE cleanup_unrelated_writer (value INTEGER NOT NULL)')
+            connection.exec_driver_sql('INSERT INTO cleanup_unrelated_writer VALUES (0)')
+
+        def pause_once():
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(20), 'test did not release cleanup I/O'
+
+        if io_boundary == 'scan':
+            real_scan = cleanup_module._workspace_bytes
+
+            def paused_scan(path, *args, **kwargs):
+                if Path(path) == workspace:
+                    pause_once()
+                return real_scan(path, *args, **kwargs)
+
+            monkeypatch.setattr(cleanup_module, '_workspace_bytes', paused_scan)
+        else:
+            real_delete = cleanup_module.shutil.rmtree
+
+            def paused_delete(path, *args, **kwargs):
+                if path == workspace.name:
+                    pause_once()
+                return real_delete(path, *args, **kwargs)
+
+            monkeypatch.setattr(cleanup_module.shutil, 'rmtree', paused_delete)
+
+        cleanup = pool.submit(_target_cleanup, runtime, dry_run=False)
+        assert entered.wait(15), 'cleanup never reached the selected I/O boundary'
+
+        def independent_write():
+            with runtime._database.fenced_write() as connection:
+                connection.exec_driver_sql('UPDATE cleanup_unrelated_writer SET value=value+1')
+
+        # A completed UPDATE+COMMIT proves both the process-local RLock and
+        # SQLite writer are available while the cleanup I/O remains paused.
+        writer = pool.submit(independent_write)
+        writer.result(timeout=3)
+        assert not cleanup.done()
+        with runtime._database.read() as connection:
+            assert connection.exec_driver_sql('SELECT value FROM cleanup_unrelated_writer').scalar_one() == 1
+        release.set()
+        report = cleanup.result(timeout=20)
+        assert report[0]['action'] == 'removed', report
+        assert not workspace.exists()
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+        runtime.close()

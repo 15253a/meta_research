@@ -102,4 +102,4 @@ Target 过程中发现、取得或阅读的 Literature 同样需要交接。记�
 
 文献线索与阅读说明沿现有研究说明交接，选中保存的数字材料沿实际保管路径处理；本次判断写入实际 research_notes。接纳后 Bundle／Reasoning 沿共享研究导航的 Literature register／reference／read 关联该 Target／TargetCommit 和准确 note binding，读回原文与分析。现行结果 schema 没有 `literature_candidates`，无需新增候选字段；未选中或无价值的线索不强制登记。
 
-把需保留的科学产物完整选入交接，后续使用正式精确版本。工作区引用期限、`linked_local` 与外部原件的保管条件按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理；系统仅在正式发布已核实、保留期已过且执行、恢复、待接纳等真实依赖解除后回收完成的临时工作区。
+把需保留的科学产物完整选入交接，后续使用正式精确版本。工作区引用期限、窗口外清理、`linked_local` 与外部原件的保管条件按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理。

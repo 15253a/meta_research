@@ -1,4 +1,4 @@
-"""An actual RM read holds expired scratch until managed custody is accepted."""
+"""An in-flight managed intake does not extend the three-Cycle workspace window."""
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -9,11 +9,11 @@ from threading import Event
 
 import meta_research.owners.research_memory as memory_module
 from meta_research.owners.research_memory import AssetIntakeRequest
-from test_completed_workspace_cleanup import _complete, _target_cleanup
+from test_completed_workspace_cleanup import _complete, _next_foreground, _target_cleanup
 
 
-def test_processing_rm_read_holds_workspace_until_exact_managed_readback(tmp_path, monkeypatch):
-    runtime, _, _, workspace, _, _, _ = _complete(tmp_path)
+def test_processing_rm_read_does_not_extend_the_workspace_window(tmp_path, monkeypatch):
+    runtime, _, manifest, workspace, _, _, _ = _complete(tmp_path, out_of_window=False)
     read_started = Event()
     resume_read = Event()
     executor = ThreadPoolExecutor(max_workers=1)
@@ -64,30 +64,43 @@ def test_processing_rm_read_holds_workspace_until_exact_managed_readback(tmp_pat
         assert memory.query_asset_intake(job.job_ref).status == "processing"
 
         retained, = _target_cleanup(runtime, dry_run=False)
-        assert (retained["action"], retained["reason"]) == ("skipped", "pending_asset_intake"), retained
+        assert (retained["action"], retained["reason"]) == ("skipped", "recent_cycle_window"), retained
         assert source_path.read_bytes() == content
+        assert not worker.done()
+
+        _next_foreground(runtime)
+        _next_foreground(runtime)
+        released, = _target_cleanup(runtime, dry_run=False)
+        assert released['action'] == 'removed', released
+        assert not workspace.exists()
         assert not worker.done()
 
         resume_read.set()
         assert worker.result(timeout=30)
-        accepted = memory.query_asset_intake(job.job_ref)
-        assert accepted.status == "accepted"
-        version_ref = accepted.asset.version_ref
-        assert accepted.asset.custody_modes == ("managed",)
-        assert memory.materialize_asset(version_ref).content == content
-
-        released, = _target_cleanup(runtime, dry_run=False)
-        assert released["action"] == "removed", released
-        assert not workspace.exists()
-        assert memory.materialize_asset(version_ref).content == content
+        completed_read = memory.query_asset_intake(job.job_ref)
+        # The worker may finish through its open descriptor or schedule the
+        # existing retry after the source disappears. Neither pins scratch.
+        assert completed_read.status in {'accepted', 'failed', 'queued'}
+        if completed_read.status == 'queued':
+            with runtime._database.read() as connection:
+                retry = connection.exec_driver_sql(
+                    'SELECT attempt_count,started_at,next_attempt_at,updated_at FROM rm_asset_intakes WHERE job_ref=?',
+                    (job.job_ref,)).one()
+            assert retry.attempt_count == 1 and retry.started_at is None
+            assert retry.next_attempt_at > retry.updated_at
+        if completed_read.status == 'accepted':
+            assert memory.materialize_asset(completed_read.asset.version_ref).content == content
+        retained_asset = next(entry for entry in manifest.entries
+                              if entry.declared_relative_path == 'outputs/data/run1.txt')
+        assert memory.materialize_asset(retained_asset.binding.version_ref).content == b'36\n'
         repeated, = _target_cleanup(runtime, dry_run=False)
         assert repeated["reason"] == "already_removed", repeated
         print("GC_READING_DEPENDENCY " + json.dumps({
-            "job_ref": job.job_ref, "version_ref": version_ref,
+            "job_ref": job.job_ref, "intake_status": completed_read.status,
             "source_sha256": hashlib.sha256(content).hexdigest(),
             "source_bytes": len(content), "observed_read": observed,
             "retained": retained, "released": released, "repeated": repeated,
-            "exact_rm_readback_before_and_after_cleanup": True,
+            "previously_accepted_asset_survives_cleanup": True,
         }, sort_keys=True))
     finally:
         resume_read.set()

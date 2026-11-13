@@ -146,7 +146,7 @@ def test_failed_workspace_reclaimed_after_receipt_and_bundle_ack(tmp_path):
 
 @pytest.mark.parametrize("dependency", ["unknown", "unacknowledged", "damaged_ack",
     "provider_hold", "external_hold", "lost_receipt"])
-def test_failed_workspace_preserves_unsettled_dependencies(tmp_path, dependency):
+def test_expired_failed_workspace_does_not_wait_for_old_dependency_records(tmp_path, dependency):
     runtime, handle, workspace, notice, scope, transport, binding_path, binding, quest = _failed_workspace(tmp_path)
     try:
         checkpoint = None
@@ -175,24 +175,8 @@ def test_failed_workspace_preserves_unsettled_dependencies(tmp_path, dependency)
         for _ in range(3):
             _next_foreground(runtime)
         report = _target_cleanup(runtime, dry_run=False)
-        expected = {
-            "unknown": "provider_terminal_proof_missing",
-            "unacknowledged": "bundle_notice_unacknowledged",
-            "damaged_ack": "bundle_inbox_checkpoint_integrity_invalid",
-            "provider_hold": "unfinished_runtime_responsibility",
-            "external_hold": "unfinished_runtime_responsibility",
-            "lost_receipt": "provider_terminal_proof_missing",
-        }[dependency]
-        assert len(report) == 1 and (report[0]["action"], report[0]["reason"]) == ("skipped", expected), report
-        assert (workspace / "scratch.txt").read_text() == "Unfinished local experiment notes."
-        if dependency == "external_hold":
-            with runtime._database.fenced_write() as connection:
-                record_runtime_boundary(connection, identity=external, boundary="terminal",
-                    owner_evidence_ref="issue296-external-fixture-reconciled")
-            runtime.harnesses._runtime_protection.finish(external.responsibility_ref, boundary="terminal")
-            released = _target_cleanup(runtime, dry_run=False)
-            assert released[0]["action"] == "removed", released
-            assert not workspace.exists()
+        assert len(report) == 1 and report[0]['action'] == 'removed', report
+        assert not workspace.exists()
     finally:
         runtime.close()
 
@@ -248,7 +232,7 @@ def test_reconciled_failed_target_remains_a_technical_bundle_blocker(tmp_path):
         runtime.close()
 
 
-def test_completed_workspace_waits_for_unfinished_external_responsibility(tmp_path):
+def test_expired_completed_workspace_does_not_wait_for_external_responsibility(tmp_path):
     runtime, handle, _, workspace, _, _, _ = _complete(tmp_path)
     try:
         external = RuntimeEffectIdentity("issue296-completed-cleanup-external", "agent_runtime",
@@ -256,9 +240,8 @@ def test_completed_workspace_waits_for_unfinished_external_responsibility(tmp_pa
             handle.execution_attempt_ref, handle.execution_fence_ref)
         runtime.harnesses._runtime_protection.acquire(external)
         report = _target_cleanup(runtime, dry_run=False)
-        assert (report[0]["action"], report[0]["reason"]) == (
-            "skipped", "unfinished_runtime_responsibility"), report
-        assert workspace.is_dir()
+        assert report[0]['action'] == 'removed', report
+        assert not workspace.exists()
     finally:
         runtime.close()
 

@@ -16,7 +16,7 @@ from meta_research.provider_supervisor import (
 from meta_research.runtime_protection import RuntimeEffectIdentity
 from meta_research.streaming_provider_supervisor import reconcile_rebooted_supervisor
 from meta_research.target_raw_output import TargetRawOutputStore, TargetRawOutputUnavailable
-from meta_research.target_workspace_cleanup import _cycle_dependencies
+from meta_research.native_session_cleanup import _cycle_dependencies
 from test_target_root_cancel import _running_root
 
 

@@ -12,6 +12,6 @@ Target 的候选交接见[正式工作交接](formal-work.md)；接纳后由 Bun
 
 编辑 `linked_local` 等已保管材料时，按[阅读、工作副本与保管选择](../../references/materials-and-custody.md#阅读工作副本与保管选择)保留原件并另建工作文件；保留与清理按[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)处理。
 
-Target 交接只结束当前工作，后续 Bundle／Reasoning 仍可按授权使用本轮资料。跨 Cycle 接续、正式内容保留及物理清理统一按上述共享生命周期处理，核对执行、恢复和待接纳等真实依赖。
+Target 交接只结束当前工作，后续 Bundle／Reasoning 仍可按授权使用本轮资料。跨 Cycle 接续、正式内容保留及物理清理统一按上述共享生命周期处理。
 
 获取、保存或相关研究判断需要人的专业知识、判断、权限、资源或行动时，按[主动发起与接续 HumanRequest](../../references/human-guidance.md#主动发起与接续-humanrequest)及时请求协作，并沿其等待与恢复规则安排独立工作。真实获取或保存失败应说明当前已保存位置、缺少步骤和继续条件。

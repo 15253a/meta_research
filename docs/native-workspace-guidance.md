@@ -1,5 +1,7 @@
 # #268：原生工作目录说明与实际投递
 
+当前 Workspace 清理规则见[资产生命周期](asset-lifecycle.md#cycle-workspace-cleanup)，Agent 统一读取[交接与工作区收尾](../src/meta_research/skills/references/materials-and-custody.md#交接与工作区收尾)。下文保留 #268 当时实现及验证记录，其中旧依赖保护场景的测试结果不作为当前清理政策的验收。
+
 本次对应 [#268 当前重开范围](https://github.com/15253a/meta_research/issues/268)，按 [#262](https://github.com/15253a/meta_research/issues/262) 的职责边界实施。2026-11-09 读取远端时，#268 为 open、负责人为 `15253a`、原生 blocked-by 为空；开放 PR 中没有本轮对应改动。已核对相邻 #267／#271 的代码交付与本地在途状态，两者聊天均为空闲；#267 的票状态仍为 open。保留已有负责人、标签和依赖。
 
 从最新 `origin/v1-test@03f875a087362c42b69f8e8d717c302a53884604` 创建独立分支 `codex/issue-268-role-paths`。原源码 checkout 仍在原分支，未提交修改留在原目录。[#267 已交付的历史发现、正文和处理回执能力](human-interact-history.md)直接复用。
@@ -11,7 +13,7 @@
 | 角色方法与三轮目录一致 | Idea `io-contract.md`、Plan `contract.md`／`owner-operations.md` 指向共享 `materials-and-custody.md`；修正剩余 #268 待接通语句 | 扫描当前安装资源，核对原定位的13处；已正确的主 Skill、Bundle、工具合同与历史参考保持 |
 | 实际路径、工作归属、权限 | `RootWorkspaces.native_directory_prompt` 随实际调用提供目录；只解释窗口和未列出路径，不改路径筛选 | 正式 Plan 接纳→adapter→受控 provider 读取 Idea 原文件，仅向自己的 Plan 工作目录写副本；运行条件与科学正文分区 |
 | 当前及前两轮、缺失或不可见路径 | 采用 AE 的 Quest 研究序列，按角色和原根范围筛选；非 Cycle 根沿自身范围 | 构造三轮窗口、真实临时文件、缺失目录、窗口外目录和只有本根标为 `read_write`；不实跑四轮科研 |
-| 保管与生命周期 | 沿现有回收和正式 reader；共享收尾合同集中说明原位原件、活动／恢复依赖、长期根与外部只读材料 | 复用现有目录、保管和原生会话专项；失败保留在下表，不宣称回收系统全绿 |
+| 保管与生命周期 | 共享收尾合同统一说明 Workspace 清理、原件保管、Session 与非 Cycle 根的生命周期 | 下表为当时目录、保管和原生会话专项结果；不宣称当前回收系统已通过验收 |
 | 正式安装与资源身份 | 原角色／共享资源参与现有 runtime binding，代码参与实现身份；原根漂移拒绝及当前身份恢复合同保持 | 精确快照构建 wheel、全部包字节核验、隔离安装后从 provider 边界读正式资源，复用身份及恢复正反测试 |
 
 普通目录查找仍使用已获授的原生文件／shell 能力。没有新增 RW 工具、MCP 包装、必经索引层、目录系统、回收账本或旧任务迁移。路径提示不是 OS 沙箱，也不扩大 Harness 权限；缺失路径不能推导没有研究历史。材料递交、正式保管和准确 reader 的职责保持。

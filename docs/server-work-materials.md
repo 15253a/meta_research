@@ -46,4 +46,4 @@ Agent 自行取得资料可调用 `research_workspace.materials.acquire`，传 `
 
 引用 GET 返回 `treatments`，保留原 receiver、processed_by 实际根／run、真实用途、声明的影响与局限；成功 read_ranges 的 reader_kind／actor 区分根与浏览器，旧记录无类型时不推定根已读。`.feedback.reconcile` 只传 effect_id 查询原接受结果。反馈 replay 先按原命令核验，不因来源、页面或前台后来变化重新投递。
 
-后继同 Quest 根通过 `materials.discover.retained_treatments` 及 next_offset 检索真正选中的内容和原采用关系，再将 selection.reader 交给 `research_memory.content.read`。它不获得原投递工作区的额外可见性；linked_local 漂移如实从精确 reader 返回。未选副本、输出与原件不因反馈自动入库；引用位置沿现有 Cycle 清理的 pending intake／linked custody 依赖保护。
+后继同 Quest 根通过 `materials.discover.retained_treatments` 及 next_offset 检索真正选中的内容和原采用关系，再将 selection.reader 交给 `research_memory.content.read`。它不获得原投递工作区的额外可见性；linked_local 漂移如实从精确 reader 返回。未选副本、输出与原件不因反馈自动入库；工作区引用位置按[工作区清理](asset-lifecycle.md#cycle-workspace-cleanup)处理。

@@ -35,7 +35,7 @@ Plan 接受 TargetCommit、HumanInput、ScientificOutcome、AssetVersion 和 Lit
 
 ## 原生工作文件
 
-普通文件沿宿主提供的当前及前两轮实际目录、工作归属与读写范围，用原生文件／shell 按需查找。自己的工作空间与 RM 正式版本分别使用；HumanRequest 材料递交与 inbox 保留原归属。目录与 Session 回收由宿主按实际窗口和恢复依赖处理，Agent 不代系统清理历史。准确版本和回复材料的用法见[当前工作目录与回复材料](../../references/materials-and-custody.md#当前工作目录与回复材料)。
+普通文件沿宿主提供的当前及前两轮实际目录、工作归属与读写范围，用原生文件／shell 按需查找。自己的工作空间与 RM 正式版本分别使用；HumanRequest 材料递交与 inbox 保留原归属。目录与 Session 的生命周期见[交接与工作区收尾](../../references/materials-and-custody.md#交接与工作区收尾)。准确版本和回复材料的用法见[当前工作目录与回复材料](../../references/materials-and-custody.md#当前工作目录与回复材料)。
 
 ## 求助、回复与有效指导
 
