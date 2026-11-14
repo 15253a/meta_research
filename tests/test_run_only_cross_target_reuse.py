@@ -61,6 +61,7 @@ def test_unassessed_cross_target_reuse_is_queryable_without_duplicating_executio
             _, second_lifecycle, second_memory, _, second_handle, second_workspace, second_evidence = root_fixtures._root_finalizer_fixture(tmp_path / 'second')
         second_evidence = replace(second_evidence, operation_ref='second-target-final-turn',
                                   evidence_ref='second-target-final-evidence')
+        (second_workspace / 'implementation/train.py').write_text("print('second target')\n")
         result_path = second_workspace / 'outputs/result.json'
         document = json.loads(result_path.read_text())
         old = original[0]
@@ -82,6 +83,12 @@ def test_unassessed_cross_target_reuse_is_queryable_without_duplicating_executio
         assert len(facts) == 1 and facts[0]['variant_run_ref'] == old['variant_run_ref']
         assert facts[0]['manifest_ref'] == reused.manifest_ref
         assert facts[0]['variant_run']['inputs']['target_ref'] == handle.target_ref
+        original_code = [entry.binding.version_ref for entry in memory.query(pending.manifest_ref).entries
+                         if entry.role == 'implementation']
+        current_code = {entry.binding.version_ref for entry in second_memory.query(reused.manifest_ref).entries
+                        if entry.role == 'implementation'}
+        assert original_code and set(original_code).isdisjoint(current_code)
+        assert [entry['version_ref'] for entry in facts[0]['implementation_artifacts']] == original_code
         assert (facts[0]['evaluation_attempt'] is not None) == evaluate
         assert facts[0]['target_commit_ref'] == reused.target_commit_ref
         assert finalizer.finalize(handle=second_handle, evidence=second_evidence) == reused

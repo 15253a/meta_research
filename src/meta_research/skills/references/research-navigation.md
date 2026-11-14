@@ -35,6 +35,8 @@ RG 通过 Question、Baseline、Literature、Environment、Dataset、Human Inter
 
 检索按当前已提供的范围发现相关研究描述，再回溯归属或展开关联。Baseline 检索覆盖方法合同、Variant recipe、Evaluation protocol、VariantRun／EvaluationAttempt 的正式输入描述与结果 manifest，以及 Artifact 的角色和 RM 描述。命中只提供候选；使用 baselines.read 的 relation 分别展开 variants、runs、evaluations、attempts、metrics、artifacts，并用返回 reader 读取准确记录。各关系独立续页，真实 Run 可以没有评价。已有准确引用时直接读取。复用前理解方法的目的与条件，沿实际输入、处理过程、产物和评价判断适用性；相近的方法或相同的内容不能代替执行依据。Target 的声明、修订与正式接纳见 [正式工作交接](../target-execution/references/formal-work.md)。
 
+查找已保管的实现代码时，展开 runs 并沿其 `research_graph.formal_results.read` reader 读取详情；`implementation_artifacts` 返回该 Run 实际选择的实现路径、精确内容版本与 `research_memory.content.read` reader。一个 Run 可对应多个代码包，复用 Run 保留原实施的代码版本；`implementation_revision_ref` 是实现指纹，读取内容使用条目给出的 reader。Target 详情的每个 Run 也提供这些条目。代码目录以 ZIP 保管时，沿 `next_offset` 读完内容页，按 `encoding` 解码后在可写工作区解包查看；`entry_path` 选择 RM 条目，不选择 ZIP 内部文件。后续实施仍通过正式执行输入绑定采用这些精确内容。
+
 ## Literature：理解外部研究及已有阅读
 
 需要理解研究现状、查证论述、形成构想或接续阅读时，发现文献、准确原文及已有阅读判断。沿同一文献在不同问题中的采用背景，理解它支持什么主张、存在什么限制、曾引发什么分歧。
@@ -68,6 +70,8 @@ Target 执行中也可能发现、取得并阅读文献；值得保留的文献�
 处理目录只给定位摘要，判断采纳／不采纳及研究变化时展开相应反馈原文。后续反馈保留先前记录及其准确入口，反馈中的变化与目标影响是当时的声明；实际履行和目标演化须核对对应工作与正式结果。处理变化使相关续页失效时，按 `research_query_changed` 从首项重查。缺少原件、版本不符或不可读按实际错误处理，不能当作无记录或目标未变。
 
 历史发现与准确读取均按当前授权纯读，不领取指导、不产生已读或处理回执，也不解除 HumanRequest 等待。当前求助、适用指导、正式反馈及答复续接仍沿 HC 的原合同。可见历史要求只在其确认范围内适用。
+
+正式指导和 HumanRequest 回复的上传附件，沿准确详情中的 `upload_readers` 读取；将每项 reader 的 `source_ref`、`version_ref`、`entry_path` 及授权范围原样交给 `research_memory.content.read`，按字节偏移续页。这条路径读取原已接纳上传命令保留的字节，后继读者无需取得原接收工作区权限；原工作区位置仍表达交付出处。
 
 HC 保存协作原记录与流程，RG 组织研究关联。HC、系统工作和 Agent 登记均可提供关系来源，按实际来路保留。当前协作的发起、回应和指导处理见 [人类协作](human-guidance.md)。
 

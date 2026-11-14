@@ -7059,7 +7059,51 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             committed = query_target_formal_results(connection, target_ref) if transition else ()
         committed_runs = {item['variant_run_ref'] for item in committed}
         unassessed = query_unassessed_runs(self, target_ref)
-        return (*committed, *(item for item in unassessed if item['variant_run_ref'] not in committed_runs))
+        facts = (*committed, *(item for item in unassessed if item['variant_run_ref'] not in committed_runs))
+        implementations = {}
+        for fact in facts:
+            run_ref = fact['variant_run_ref']
+            if run_ref not in implementations:
+                implementations[run_ref] = self._run_implementation_artifacts(fact['variant_run'])
+        return tuple({**fact, 'implementation_artifacts': implementations[fact['variant_run_ref']]}
+                     for fact in facts)
+
+    def _run_implementation_artifacts(self, run):
+        """Resolve code from this execution's original frozen source, including reused runs."""
+        from meta_research.formal_run_bindings import implementation_binding
+
+        source = run['inputs']
+        manifest_ref = source.get('manifest_ref')
+        if manifest_ref is None:
+            return []
+        reader = self._target_root_manifest_reader
+        manifest = None if reader is None else reader.query(manifest_ref)
+        if (manifest is None or source.get('manifest_payload_hash') != manifest.payload_hash
+                or source.get('completion_ref') != manifest.completion_ref
+                or source.get('target_ref') != manifest.target_ref
+                or source.get('target_run_ref') != manifest.target_run_ref):
+            raise OwnerConflict('target_formal_entity_integrity_invalid')
+        declarations = manifest.result_document.as_dict().get('formal_runs')
+        if declarations is None:
+            declarations = [{'run_key': 'primary'}]
+        selected = [item for item in declarations if item.get('run_key') == source.get('run_key')]
+        if len(selected) != 1 or selected[0].get('variant_run_ref'):
+            raise OwnerConflict('target_formal_entity_integrity_invalid')
+        paths = selected[0].get('implementation_paths')
+        revision, tree_hash = implementation_binding(
+            [entry.as_dict() for entry in manifest.entries], paths,
+            selected[0].get('implementation_revision_ref'))
+        if (source.get('implementation_revision_ref') != revision
+                or source.get('implementation_tree_hash') != tree_hash
+                or run['implementation_revision_ref'] != revision):
+            raise OwnerConflict('target_formal_entity_integrity_invalid')
+        return [{**entry.binding.as_dict(), 'role': 'implementation',
+                 'declared_relative_path': entry.declared_relative_path,
+                 'artifact_kind': entry.artifact_kind, 'media_type': entry.media_type,
+                 'byte_count': entry.byte_count, 'tree_hash': entry.tree_hash,
+                 'implementation_revision_ref': revision}
+                for entry in manifest.entries if entry.role == 'implementation'
+                and (paths is None or entry.declared_relative_path in paths)]
 
     def _target_resource_candidates(
         self, target_ref: str, *, facts: tuple[dict[str, object], ...]
@@ -7228,6 +7272,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                         "variant_run": value.get("variant_run"),
                         "evaluation_attempt": value.get("evaluation_attempt"),
                         "metric_result": value.get("metric_result"),
+                        "implementation_artifacts": value.get("implementation_artifacts", []),
                         "run_artifacts": value.get("run_artifacts", []),
                         "evaluation_artifacts": value.get("evaluation_artifacts", []),
                     }

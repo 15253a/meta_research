@@ -247,6 +247,11 @@ def test_companion_reads_another_authorized_quests_accepted_formal_lineage(tmp_p
             ref=first["variant_run_ref"], source_quest_ref=source_quest))
         assert exact["result"]["target_ref"] == handle.target_ref
         assert exact["result"]["variant_run"] == first["variant_run"]
+        implementation, = exact["result"]["implementation_artifacts"]
+        reader = implementation["reader"]
+        assert reader["args"]["source_quest_ref"] == source_quest
+        code = _accepted(_call(runtime, channel, reader["operation"], **reader["args"]))
+        assert code["content_hash"] == implementation["content_hash"]
         assert _call(runtime, channel, "research_graph.target_formal_results.read",
             target_ref=handle.target_ref).get("isError")
     finally:

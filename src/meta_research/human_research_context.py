@@ -149,6 +149,16 @@ def read_human_research_context(agent_runtime, human_collaboration, context, arg
                 value["used_by_owner_evaluation"] = response_ref in evaluation.get("response_refs", [])
                 value["owner_disposition"] = (response_context.get("disposition") or {}).get("decision")
             source_ref = response_ref or request_ref
+        if quest_ref and ((constraint_ref is not None and treatment_ref is None
+                and arguments.get("entry_kind") != "treatments") or response_ref is not None):
+            from meta_research.human_upload_content import human_upload_readers
+            upload_version = (value["guidance_hash"] if constraint_ref is not None
+                              else value["response_content_hash"])
+            uploads = human_upload_readers(human_collaboration,
+                quest_ref=quest_ref, source_ref=source_ref, version_ref=upload_version,
+                source_quest_ref=arguments.get("source_quest_ref"))
+            if uploads:
+                value["upload_readers"] = uploads
         if arguments.get("source_quest_ref") is not None:
             # Only generated navigation descriptors gain the selector. Exact
             # human text, response facts and delivery workspace bindings stay intact.
@@ -229,7 +239,8 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
                      "精确回复同时提供 request_ref 和 response_ref，携带 reader 的 version_ref 并省略 cursor。offset／limit 按 UTF-8 字节重建原文与 hash。"
                      "请求目录只附最新回复；沿 responses_reader 的 entry_kind=responses 及 request_ref 查询全部历史回复，"
                      "以 response_offset 和 query_revision 独立续页。每条回复提供准确 reader，目录不准备请求的完整执行生命周期。"
-                     "正式回复的 delivery.reply_file／uploaded_files 给出原工作区的相对路径与 SHA-256，用原生文件工具从获授目录读取；外部原目录沿当前获授的工作材料引用读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
+                     "正式指导和回复的详情在 upload_readers 提供上传附件的精确内容入口，沿 reader 的 source_ref/version_ref/entry_path 读取原已接纳上传字节，无需原接收工作区权限。"
+                     "delivery.reply_file／uploaded_files 也保留原工作区的相对路径与 SHA-256，原接收根可从获授目录读取；外部原目录沿当前获授的工作材料引用读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
         input_schema={"type": "object", "properties": {"source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
             "entry_kind": {"type": "string", "enum": ["guidance", "responses", "treatments"]},
             "guidance_offset": {"type": "integer", "minimum": 0},

@@ -115,12 +115,20 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
         if source_ref.startswith("soft_constraint_"):
             value = human_collaboration.read_research_guidance(source_ref,
                 quest_ref=quest_ref, version_ref=version_ref)
+            from meta_research.human_upload_content import human_upload_readers, read_human_upload
+            if entry_path is not None:
+                return read_human_upload(human_collaboration, quest_ref=quest_ref,
+                    source_ref=source_ref, version_ref=version_ref, entry_path=entry_path,
+                    offset=offset, limit=limit)
             if reader_source_quest_ref is not None:
                 value["treatments_reader"] = {**value["treatments_reader"], "source_quest_ref": reader_source_quest_ref}
             # Current status and treatment count can change without changing the
             # immutable guidance version. Do not cache that live projection by it.
             page = context_read_page(value, path=[], offset=offset, limit=min(limit, 16384))
-            return {**page, "source_ref": source_ref, "version_ref": version_ref}
+            return {**page, "source_ref": source_ref, "version_ref": version_ref,
+                    "upload_readers": human_upload_readers(human_collaboration, quest_ref=quest_ref,
+                        source_ref=source_ref, version_ref=version_ref,
+                        source_quest_ref=reader_source_quest_ref)}
         if source_ref.startswith("guidance_effect_"):
             value = human_collaboration.read_research_guidance_treatment(source_ref,
                 quest_ref=quest_ref, version_ref=version_ref)
@@ -132,7 +140,15 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
                 response.request_ref,source_ref,quest_ref=quest_ref)
             value = selected["response"]
             if canonical_hash(value)!=version_ref:raise OwnerConflict("content_version_unbound")
-            return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
+            from meta_research.human_upload_content import human_upload_readers, read_human_upload
+            if entry_path is not None:
+                return read_human_upload(human_collaboration, quest_ref=quest_ref,
+                    source_ref=source_ref, version_ref=version_ref, entry_path=entry_path,
+                    offset=offset, limit=limit)
+            return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref,
+                    "upload_readers": human_upload_readers(human_collaboration, quest_ref=quest_ref,
+                        source_ref=source_ref, version_ref=version_ref,
+                        source_quest_ref=reader_source_quest_ref)}
         if source_ref.startswith("human_request_"):
             from meta_research.human_research_context import _request_content_hash
             value = human_collaboration.query_research_help_request(source_ref, quest_ref=quest_ref)
@@ -438,7 +454,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
             raise SemanticMcpError(error.code, error.details) from error
     operations=[SemanticOperation(semantic_operation_id="research_memory.content.read",owning_module="research_memory",
         description="Read an exact authorized source using its returned source_ref/version_ref. Before Quest creation, DeepFetch may read only its current HC request's accepted input versions using the supplied version/version reader. Companion may explicitly select source_quest_ref outside the page selection when current HC authority grants it; other roots retain their current Quest scope. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
-        return_description="Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Asset file pages use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. A hash names complete digital content, not a physical resource or its verified condition. Preserve returned exact source bindings and readers.",
+        return_description="Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Exact guidance and human response pages also expose upload_readers for their retained attachments; follow each reader's source_ref/version_ref/entry_path. Uploaded attachments and asset files use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. A hash names complete digital content, not a physical resource or its verified condition. Preserve returned exact source bindings and readers.",
         error_descriptions={
             "content_version_unbound": "This source/version is not bound here. Reopen research_graph.questions.page, research_memory.literature.page or research_memory.assets.page; copy its exact reader arguments, including source_quest_ref. Other content may exist.",
             "content_source_unbound": "The source_ref has no readable binding here. For an AssetVersion original, copy its exact reader or use asset_binding.version_ref as both source_ref and version_ref; asset_ref identifies the logical asset, not its readable content. For other source kinds rediscover the exact reader. Changing arguments cannot grant access.",
