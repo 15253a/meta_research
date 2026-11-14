@@ -2819,7 +2819,7 @@ class CodexDeepFetchAdapter:
                      "不得虚构机构访问失败或由此被迫降级到 OA。\n")
         elif mode == "provided_only":
             route = ("仅核实和阅读 accepted_material_bindings 内提供的材料；不进行外部发现或 Web Gate，"
-                     "不调用 OpenAlex、Web 或补充来源，不伪造 Web 成功、发现维度或主动检索耗时。\n")
+                     "不调用 OpenReview、OpenAlex、Web 或补充来源，不伪造 Web 成功、发现维度或主动检索耗时。\n")
         return (
             "你是 DeepFetch v4 main agent。以下内联的是本次正式安装的完整 Skill；无需重复读取正文，"
             "长参考按 Skill 指定时机从 deepfetch_skill_root 读取。\n"

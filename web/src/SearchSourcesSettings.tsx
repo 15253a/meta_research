@@ -236,6 +236,7 @@ function SearchSourcesEditor({ scope, onEnsureInitialization, onSelectionSaved, 
   return <section className="search-sources-settings" aria-label="DeepFetch 搜索源">
     <div className="search-sources-heading"><h3>检索来源</h3><span>与全文下载分开配置</span></div>
     <div className="search-sources-defaults" aria-label="始终启用的默认搜索源">
+      <span className="search-sources-default-chip"><i aria-hidden="true">✓</i> OpenReview</span>
       <span className="search-sources-default-chip"><i aria-hidden="true">✓</i> OpenAlex</span>
       <span className="search-sources-default-chip"><i aria-hidden="true">✓</i> Web</span>
       <small>默认始终启用</small>

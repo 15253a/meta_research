@@ -17,7 +17,7 @@ description: 当任务明确调用 DeepFetch、系统性多论文文献梳理或
 
 有效模式或其绑定缺失时，如实说明运行条件缺失，沿现有运行错误与协作路径处理；模型不自行补成默认模式或宣称路线已就绪。Gate 首次查询需要的关键原文应在当轮准确可读，不能以实质轮稍后会收到代替当前可读。
 
-需要外部发现的请求先进行短 Web Evidence Gate：按完整 scope 做真实 Search 并 Open/Fetch 一个结果，成功只证明本轮 Web 路线可用。Gate 不作全文阅读或研究交付；无法完成时保留真实故障和需要人的事项。`provided_only` 直接进入提供材料核实和阅读，Web Gate 不适用，不生成 Web 成功记录，也不开展 OpenAlex、Web 或补充来源发现。
+需要外部发现的请求先进行短 Web Evidence Gate：按完整 scope 做真实 Search 并 Open/Fetch 一个结果，成功只证明本轮 Web 路线可用。Gate 不作全文阅读或研究交付；无法完成时保留真实故障和需要人的事项。`provided_only` 直接进入提供材料核实和阅读，Web Gate 不适用，不生成 Web 成功记录，也不开展 OpenReview、OpenAlex、Web 或补充来源发现。
 
 首次进入实质工作完整接收或读取本 Skill；正文已经内联时不重复加载同一份。各参考使用本次固定 bundle 的准确入口，按以下时机全文读取：
 
@@ -45,13 +45,13 @@ Gate 与实质工作沿同一 native 根连续推进时，实质轮只增当前�
 
 ## 2. 发现
 
-首次外部查询前完整读取[发现入口](references/openalex.md)；所有模式首次台账工作前完整读取[台账契约](references/papers-json.md)，初始化台账。外部发现时把研究输入转成检索概念，从文本查询、文献角色与引文结构三个维度发现。OpenAlex 是结构化主入口；Web Search 用于术语、综述、基准、命名方法、近期工作和索引缺口。宿主注入本次 Run 已冻结的补充来源清单时，读取[补充来源](references/search-sources.md)，按需要调用 `deepfetch_source_action`；允许集合不要求每次全部调用。`provided_only` 仅处理提供材料，不发现或调用补充来源。查询、锚点、方向、深度与停止由主智能体判断。
+首次外部查询前完整读取[发现入口](references/openalex.md)；所有模式首次台账工作前完整读取[台账契约](references/papers-json.md)，初始化台账。外部发现默认使用 OpenReview、OpenAlex 和 Web，无需在补充来源中勾选。把研究输入转成检索概念，从文本查询、文献角色与引文结构三个维度发现。OpenReview 通过原生 Web 定向检索公开投稿及评审讨论；OpenAlex 提供结构化元数据与引文邻域；Web Search 用于术语、综述、基准、命名方法、近期工作和索引缺口。宿主注入本次 Run 已冻结的补充来源清单时，读取[补充来源](references/search-sources.md)，按需要调用 `deepfetch_source_action`；允许集合不要求每次全部调用。`provided_only` 仅处理提供材料，不发现或调用补充来源。查询、锚点、方向、深度与停止由主智能体判断。
 
 每批宽检索先筛选、核实身份并登记重要条目，再扩展下一批。标题级占位也可以保留相关已核实论文；合并明确重复、移除无关线索。访问容易、引用量、机构或期刊名不直接证明研究价值。
 
 冻结精读集合前，对现有台账和已见候选做一次有界覆盖检查：重要任务设置、方法族、经典到近期脉络、综述或基准，以及反证和边界是否有代表性条目；重看相关却尚未登记的候选，针对关键缺口使用 Web Search。Web 结果先核实学术身份；摘要片段不是全文证据，OpenAlex 无记录也不是丢弃理由。
 
-外部发现的完成条件：三个发现维度均有实际工作，使用 OpenAlex 和 Web 完成覆盖检查，并已有真实 Web Search 与 Open/Fetch 成功证据；根据已获证据、覆盖缺口与继续投入的价值说明停止理由。Web 不可用时保留具体故障及其所属服务，按共享人类协作指导选择求助路径。本次原生 Web Evidence Gate 的 Meta Research 运行或操作故障需要人介入时用 `system_operation_help`；机构访问和外部服务问题分别沿角色契约的相应路径处理。不能仅记录 Web 不可用便宣称完成，也不能伪造 Gate 的 ready 状态。
+外部发现的完成条件：三个发现维度均有实际工作，结合 OpenReview、OpenAlex 和 Web 完成覆盖检查，如实记录各来源的使用、无相关结果或访问限制，并已有真实 Web Search 与 Open/Fetch 成功证据；根据已获证据、覆盖缺口与继续投入的价值说明停止理由。Web 不可用时保留具体故障及其所属服务，按共享人类协作指导选择求助路径。本次原生 Web Evidence Gate 的 Meta Research 运行或操作故障需要人介入时用 `system_operation_help`；机构访问和外部服务问题分别沿角色契约的相应路径处理。不能仅记录 Web 不可用便宣称完成，也不能伪造 Gate 的 ready 状态。
 
 `provided_only` 的对应完成条件是已在授权提供集合内核实材料、选择有价值的阅读对象并说明未覆盖范围；不填写未发生的发现维度、渠道或主动检索耗时，不把有限材料综述写成系统性外部检索完成。
 

@@ -1,6 +1,12 @@
 # 文献发现入口
 
-OpenAlex 提供可复核的元数据查询、精确身份解析和引文邻域；Web Search 补充术语、近期或弱索引工作、综述、基准、命名方法及台账中显现的缺口。两者都不直接判定质量。主智能体负责查询、锚点、方向、深度、相关性与停止判断。
+默认发现来源为 OpenReview、OpenAlex 和 Web。OpenReview 用于公开投稿及评审讨论；OpenAlex 提供可复核的元数据查询、精确身份解析和引文邻域；Web Search 补充术语、近期或弱索引工作、综述、基准、命名方法及台账中显现的缺口。来源本身不直接判定质量。主智能体负责查询、锚点、方向、深度、相关性与停止判断。
+
+## OpenReview
+
+使用原生 Web Search 以 `site:openreview.net` 加研究概念、精确论文标题或会议名称定向查询，再 Open/Fetch 结果中的公开论文页面。核实标题、作者、会议、投稿或接收状态及页面所示版本；保存准确 forum URL 至 `metadata.source_urls`。按实际可读范围区分论文摘要、评审意见、作者回应与决定，评审分数或接收状态不代替独立科学阅读。
+
+沿下文的身份核验与台账规则，使用已核实 DOI、arXiv 或 OpenAlex 标识登记同一确认版本；只有 OpenReview forum ID 时保留为带原始链接的研究笔记，继续核验，不把 forum ID 填入其它标识字段或仅凭相似标题合并。无相关结果、页面不可读或需要登录时记录实际限制，继续其它可用来源；入选正文仍交 Acquisition 和 Reader。
 
 ## OpenAlex
 
@@ -34,7 +40,7 @@ python3 "$DEEPFETCH_ROOT/scripts/openalex.py" citations \
 
 ## 接纳一条 Web 线索
 
-1. 核实精确学术标题及至少一项身份来源，例如 DOI、arXiv、OpenAlex、PubMed、会议录、仓储或出版商论文页。
+1. 核实精确学术标题及至少一项身份来源，例如 DOI、arXiv、OpenAlex、OpenReview、PubMed、会议录、仓储或出版商论文页。
 2. 可行时用 OpenAlex 规范元数据；没有记录仍可保留已核实 DOI 或 arXiv 身份的论文。只有标题的线索先留在研究笔记。
 3. 按 DOI、arXiv 或 OpenAlex 的已核实身份及同一确认版本去重；相似标题不合并，预印本与正式版、arXiv 不同版本分开。
 4. 仅填写标题、摘要、引文上下文或元数据实际支持的预理解。

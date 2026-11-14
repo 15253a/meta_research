@@ -277,7 +277,7 @@ test("failed shared save retains its draft through folding and explicit cancel d
   const state = await workspace(page, false, false, false);
   await expect(management(page)).not.toHaveAttribute("open");
   await expect(shared(page)).toBeHidden();
-  await expect(settings(page)).toContainText("OpenAlex");
+  await expect(settings(page).locator(".search-sources-default-chip")).toHaveText(["✓ OpenReview", "✓ OpenAlex", "✓ Web"]);
   await expect(settings(page)).toContainText("Web");
   await add(page, "website", "待保存的网站");
   await shared(page).getByRole("textbox", { name: "网站地址", exact: true }).fill("https://example.org/pending");

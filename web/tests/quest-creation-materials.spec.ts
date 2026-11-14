@@ -166,7 +166,7 @@ test("empty supplementary sources open an editor only on request and keep its dr
   const sources = page.getByRole("region", { name: "DeepFetch 搜索源", exact: true });
   const shared = sources.getByRole("region", { name: "共享搜索源管理", exact: true });
   const management = sources.locator("details").filter({ has: page.getByRole("region", { name: "共享搜索源管理", exact: true, includeHidden: true }) });
-  await expect(sources).toContainText("OpenAlex");
+  await expect(sources.locator(".search-sources-default-chip")).toHaveText(["✓ OpenReview", "✓ OpenAlex", "✓ Web"]);
   await expect(sources).toContainText("Web");
   await expect(shared).toBeHidden();
   await expect(sources.getByRole("button", { name: "保存创建草稿允许来源", exact: true })).toHaveCount(0);

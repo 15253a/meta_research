@@ -29,7 +29,7 @@
 }
 ```
 
-`paper_order` 恰好包含 `papers` 的每个 key 一次。`missing_fulltexts` 按此顺序列出全部 `fulltext_path=null` 的论文。外部发现完成时 `dimensions_used` 包含实际开展的 `text_queries`、`literature_roles`、`citation_graph`；它们是语义维度，OpenAlex 和 Web 均可参与，引文方向和深度由 Agent 选择。`provided_only` 没有外部发现，`dimensions_used=[]`，主动检索耗时为 0，停止理由和限制说明只处理提供材料；故障或部分工作不补造未完成维度。`limitations` 记录简短运行级证据／覆盖限制。未知标量为 `null`，未知、空或不适用集合为 `[]`。
+`paper_order` 恰好包含 `papers` 的每个 key 一次。`missing_fulltexts` 按此顺序列出全部 `fulltext_path=null` 的论文。外部发现完成时 `dimensions_used` 包含实际开展的 `text_queries`、`literature_roles`、`citation_graph`；它们是语义维度，OpenReview、OpenAlex 和 Web 均可参与，引文方向和深度由 Agent 选择。`provided_only` 没有外部发现，`dimensions_used=[]`，主动检索耗时为 0，停止理由和限制说明只处理提供材料；故障或部分工作不补造未完成维度。`limitations` 记录简短运行级证据／覆盖限制。未知标量为 `null`，未知、空或不适用集合为 `[]`。
 
 ## 论文身份与元数据
 
