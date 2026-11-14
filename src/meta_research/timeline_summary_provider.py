@@ -69,7 +69,10 @@ class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
         intro = "你是本 Quest 的研究记录员，为本批每个节点说明它做了什么。" if native_session_ref is None else "按当前记录员说明，更新本批节点的工作介绍。"
         prompt = (
             intro + f" 调用 {READ_SOURCE}，用 node_key、source_ref 阅读本次观察的必要正文；"
-            "非空 next_offset 表示仍有后文，可继续读取。按 output_language 用易懂的一小段话讲清每个节点做了什么、得到什么结果，可以用几句话解释。\n"
+            "非空 next_offset 表示仍有后文，可继续读取。按已加载 Skill 的“每轮先讲本轮重点”要求，"
+            "每个 Cycle 的第一句先说明当前 cycle_focus，再讲工作和结果。"
+            "按 output_language 用自然连贯的人话讲清楚，让非专业读者一遍读懂；"
+            "篇幅随内容需要调整，不固定句数，保留必要解释，避免重复和无关展开。\n"
             + json.dumps({**basis, "nodes": visible}, ensure_ascii=False, separators=(",", ":"))
         )
         with self.channels.grant(job_ref, basis, native_session_ref) as grant:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import text
 
+from meta_research.cycle_position import validate_cycle_position
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.research_notes import manifest_research_notes, read_note_body
 from meta_research.research_overview import ResearchOverviewReader, STAGES
@@ -137,7 +138,8 @@ class TimelineSummarySourceReader:
                 raise OwnerConflict("timeline_summary_quest_not_found")
             cycles = _rows(
                 db,
-                "SELECT cycle_ref,question_ref FROM ae_cycles " "WHERE quest_ref=:quest ORDER BY created_at,cycle_ref",
+                "SELECT cycle_ref,question_ref,cycle_position_json FROM ae_cycles "
+                "WHERE quest_ref=:quest ORDER BY created_at,cycle_ref",
                 quest_ref,
             )
             foreground = self.owners.advancement_engine.query_foreground(quest_ref)
@@ -156,7 +158,15 @@ class TimelineSummarySourceReader:
             grouped = defaultdict(list)
             for ordinal, cycle in enumerate(cycles, 1):
                 c, q = cycle["cycle_ref"], cycle["question_ref"]
-                identity = _source(c, "Cycle identity", "cycle", cycle_ref=c, question_ref=q, ordinal=ordinal)
+                position = None
+                if cycle["cycle_position_json"] is not None:
+                    try:
+                        position = json.loads(cycle["cycle_position_json"])
+                        validate_cycle_position(position, cycle_ref=c)
+                    except (ValueError, TypeError) as error:
+                        raise OwnerConflict("timeline_summary_cycle_position_invalid") from error
+                identity = _source(c, "Cycle identity and focus", "cycle", cycle_ref=c,
+                                   question_ref=q, ordinal=ordinal, cycle_position=position)
                 target_nodes = []
                 for target, sources in targets[c]:
                     target_nodes.append(

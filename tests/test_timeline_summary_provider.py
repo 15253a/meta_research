@@ -211,6 +211,11 @@ def test_new_and_existing_recorder_receive_shared_principles_with_read_only_role
         role = Path(configs["model_instructions_file"]).read_text(encoding="utf-8")
         assert "上层说明下层工作合起来做了什么" in role
         assert "正式收下的结果也可能是否定或不确定" in role
+        assert "cycle_position.cycle_focus" in role
+        assert "每个 Cycle 节点的 `summary` 都必须以本轮重点开头" in role
+        assert "可读性必须高，说人话" in role
+        assert "每个 Cycle 的第一句先说明当前 cycle_focus" in prompt
+        assert "非专业读者一遍读懂" in prompt
         assert RESEARCH_SYSTEM_PROMPT not in prompt  # Turn data remains the source delta.
         assert configs["agents"]["enabled"] is False
         assert set(configs["mcp_servers"]) == {"meta_research"}
