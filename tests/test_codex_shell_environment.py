@@ -1,20 +1,11 @@
-"""Observe the Adapter policy through the locked CLI's actual command runner."""
+"""Provider processes inherit the parent environment without adapter filtering."""
 import json
 import os
 from pathlib import Path
-import queue
-import shutil
 import subprocess
 import sys
-import threading
 
 import pytest
-
-from meta_research.acquisition import AcquisitionBatchRequest, AcquisitionPaper
-from meta_research.acquisition_root import CodexAcquisitionRootAdapter
-from test_external_root_resident_mcp import (
-    _SequenceRunner, _WaitingAcquisitionDelegate, _authority, _scope,
-)
 
 
 def _vendor():
@@ -26,75 +17,49 @@ def _vendor():
     return executable
 
 
-def _command_environment(executable, arguments, environment, cwd):
-    # No model call or MCP credential is needed for Codex's real shell runner.
-    policy = [part for pair in zip(arguments, arguments[1:])
-              if pair[0] == '--config' and pair[1].startswith('shell_environment_policy')
-              for part in pair]
-    process = subprocess.Popen([str(executable), 'app-server', '--strict-config', *policy],
-        env=environment, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, text=True)
-    records = queue.Queue()
-    threading.Thread(target=lambda: [records.put(json.loads(line)) for line in process.stdout], daemon=True).start()
+@pytest.mark.parametrize('with_overrides', [False, True])
+def test_process_runner_inherits_parent_environment(monkeypatch, with_overrides):
+    from meta_research.quest_drafting import _CancellableProcessRunner
 
-    def call(identifier, method, params):
-        process.stdin.write(json.dumps({'id': identifier, 'method': method, 'params': params}) + '\n')
-        process.stdin.flush()
-        while True:
-            record = records.get(timeout=20)
-            if record.get('id') == identifier:
-                assert 'error' not in record, record
-                return record['result']
+    monkeypatch.setenv('RESEARCH_PARENT_SETTING', 'inherited')
+    monkeypatch.setenv('RESEARCH_INVOCATION_SETTING', 'parent')
+    monkeypatch.setenv('RESEARCH_STORAGE_SETTING', 'parent')
+    runner = _CancellableProcessRunner(protected_environment=(
+        {'RESEARCH_STORAGE_SETTING': 'managed'} if with_overrides else None
+    ))
+    environment = ({'RESEARCH_INVOCATION_SETTING': 'invocation',
+                    'RESEARCH_STORAGE_SETTING': 'requested'} if with_overrides else None)
+    names = ['RESEARCH_PARENT_SETTING', 'RESEARCH_INVOCATION_SETTING', 'RESEARCH_STORAGE_SETTING']
+    code = 'import json,os,sys; print(json.dumps({name: os.environ.get(name) for name in sys.argv[1:]}))'
 
-    try:
-        call(1, 'initialize', {'clientInfo': {'name': 'shell-policy-test', 'version': '1'},
-                              'capabilities': {'experimentalApi': True}})
-        process.stdin.write('{"method":"initialized"}\n')
-        process.stdin.flush()
-        code = ('import json,os,shutil,subprocess; print(json.dumps({'
-                '"tools":{n:shutil.which(n) for n in ("node","python","cat")},'
-                '"node_ran":subprocess.check_output(["node","-p","2+2"],text=True).strip()=="4",'
-                '"python_ran":subprocess.check_output(["python","-c","print(3+3)"],text=True).strip()=="6",'
-                '"home":os.environ.get("HOME"),"tmp":os.environ.get("TMPDIR"),'
-                '"proxy_present":os.environ.get("HTTP_PROXY")=="http://probe:private@127.0.0.1:9",'
-                '"forbidden":[n for n in ("META_RESEARCH_MCP_TOKEN","EXTERNAL_MCP_AUTH",'
-                '"ARBITRARY_SECRET","CONFIG_SECRET","CONFIG_OTHER") if n in os.environ]}))')
-        result = call(2, 'command/exec', {'command': [sys.executable, '-c', code],
-            'cwd': str(cwd), 'sandboxPolicy': {'type': 'dangerFullAccess'}, 'timeoutMs': 10000})
-        assert result['exitCode'] == 0, result
-        return json.loads(result['stdout'])
-    finally:
-        process.stdin.close()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            process.wait(timeout=5)
+    completed = runner([sys.executable, '-c', code, *names], '', 10, environment)
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {
+        'RESEARCH_PARENT_SETTING': 'inherited',
+        'RESEARCH_INVOCATION_SETTING': 'invocation' if with_overrides else 'parent',
+        'RESEARCH_STORAGE_SETTING': 'managed' if with_overrides else 'parent',
+    }
 
 
-def test_resident_acquisition_shell_has_tools_and_proxy_without_bearer_or_host_secrets(tmp_path, monkeypatch):
-    executable = _vendor()
-    home = tmp_path / 'managed-home'
-    home.mkdir()
-    temporary = tmp_path / 'managed-tmp'
-    temporary.mkdir()
-    codex_home = tmp_path / 'codex'
-    codex_home.mkdir()
-    # An empty override map is insufficient: Codex deeply merges config.set.
-    (codex_home / 'config.toml').write_text('[shell_environment_policy]\ninherit="all"\n'
-        'include_only=["*"]\n[shell_environment_policy.set]\nPATH="/wrong/config/path"\n'
-        'HOME="/wrong/config/home"\nCONFIG_SECRET="private"\nCONFIG_OTHER="private"\n'
-        'META_RESEARCH_MCP_TOKEN="config-bearer"\n')
-    expected_tools = {name: shutil.which(name) for name in ('node', 'python', 'cat')}
-    assert all(expected_tools.values())
-    for name, value in {'CODEX_HOME': str(codex_home), 'HOME': str(home), 'TMPDIR': str(temporary),
-        'HTTP_PROXY': 'http://probe:private@127.0.0.1:9', 'EXTERNAL_MCP_AUTH': 'external-private',
-        'ARBITRARY_SECRET': 'host-private'}.items():
-        monkeypatch.setenv(name, value)
-    runner = _SequenceRunner([{'results': [{'paper_id': 'paper:1', 'status': 'waiting_user',
+def test_resident_acquisition_does_not_override_shell_environment_policy(tmp_path):
+    from meta_research.acquisition import AcquisitionBatchRequest, AcquisitionPaper
+    from meta_research.acquisition_root import CodexAcquisitionRootAdapter
+    from test_external_root_resident_mcp import (
+        _SequenceRunner, _WaitingAcquisitionDelegate, _authority, _scope,
+    )
+    from provider_supervisor_support import closed_tree_fixture
+
+    class CompletedSequenceRunner(_SequenceRunner):
+        def __call__(self, *args, **kwargs):
+            completed = super().__call__(*args, **kwargs)
+            completed.process_tree = closed_tree_fixture()
+            return completed
+
+    runner = CompletedSequenceRunner([{'results': [{'paper_id': 'paper:1', 'status': 'waiting_user',
         'path': None, 'format': None, 'failure': {'code': 'institutional_login_required', 'detail': 'Login required.'}}]}])
     adapter = CodexAcquisitionRootAdapter(tmp_path / 'provider', _WaitingAcquisitionDelegate(),
-        executable=str(executable), process_runner=runner)
+        process_runner=runner)
     adapter.bind_resident_mcp_authority(_authority('acquisition', 'acquisition-root-turn'))
     adapter.configure_resident_mcp_endpoint('http://127.0.0.1:8766')
     request = AcquisitionBatchRequest('shell-env', 'oa_first_then_institution',
@@ -103,42 +68,29 @@ def test_resident_acquisition_shell_has_tools_and_proxy_without_bearer_or_host_s
         root_runtime_scope=_scope('acquisition'))
     assert adapter.acquire(request)[0].status == 'waiting_user'
     argv = runner.argvs[0]
-    assert 'probe:private' not in json.dumps(argv)
-    environment = dict(os.environ, **runner.environments[0])
-    observed = _command_environment(executable, argv, environment, tmp_path)
-    assert observed == {'tools': expected_tools, 'node_ran': True, 'python_ran': True,
-                        'home': str(home), 'tmp': str(temporary),
-                        'proxy_present': True, 'forbidden': []}
-    before = len(runner.argvs)
-    assert adapter.reconcile(request)[0].status == 'waiting_user'
-    assert len(runner.argvs) == before
+    assert not any(value.startswith('shell_environment_policy') for value in argv)
 
 
-def test_managed_paths_win_and_provided_only_keeps_strict_exec_isolation(tmp_path, monkeypatch):
-    from meta_research.paths import prepare_data_root
-    from meta_research.quest_drafting import _CancellableProcessRunner, protected_codex_shell_arguments
-    from meta_research.root_capabilities import provided_only_cli_arguments
+def test_provided_only_keeps_strict_exec_isolation_without_environment_filter(tmp_path):
     executable = _vendor()
+    from meta_research.paths import prepare_data_root
+    from meta_research.root_capabilities import provided_only_cli_arguments
+
     root = prepare_data_root(tmp_path / 'data')
     # This missing-native check must remain offline even on credentialed hosts.
     (root.codex_home / 'auth.json').unlink(missing_ok=True)
-    monkeypatch.setenv('HOME', '/wrong/host/home')
-    monkeypatch.setenv('TMPDIR', '/wrong/host/tmp')
-    monkeypatch.setenv('HTTP_PROXY', 'http://probe:private@127.0.0.1:9')
-    runner = _CancellableProcessRunner(protected_environment=root.codex_environment)
     schema = tmp_path / 'schema.json'
     schema.write_text('{"type":"object","properties":{},"required":[],"additionalProperties":false}')
     argv = provided_only_cli_arguments([str(executable), 'exec', '--strict-config',
         '--skip-git-repo-check', '--sandbox', 'danger-full-access', '--json',
         '--cd', str(tmp_path), '--output-schema', str(schema), '--output-last-message', str(tmp_path / 'result'),
         'resume', '00000000-0000-4000-8000-000000000099', '-'], writable_root=tmp_path, resident_mcp=False)
-    argv = protected_codex_shell_arguments(argv, runner)
     assert argv[argv.index('--sandbox') + 1] == 'workspace-write'
     assert '--ignore-user-config' in argv and '--ignore-rules' in argv
     assert 'sandbox_workspace_write.network_access=false' in argv
     assert 'web_search="disabled"' in argv
     assert 'mcp_servers={}' in argv
-    assert 'probe:private' not in json.dumps(argv)
+    assert not any(value.startswith('shell_environment_policy') for value in argv)
     # The real exec must ignore even an invalid base configuration, without
     # starting a model turn or relaxing the provided-only sandbox.
     (root.codex_home / 'config.toml').write_text('unknown_config_must_be_ignored=true\n')
@@ -147,37 +99,3 @@ def test_managed_paths_win_and_provided_only_keeps_strict_exec_isolation(tmp_pat
     assert completed.returncode == 1
     assert not completed.stdout
     assert 'no rollout found for thread id 00000000-0000-4000-8000-000000000099' in completed.stderr
-    (root.codex_home / 'config.toml').unlink()
-    # Exercise the same allowlist with the OA command runner. This check does
-    # not claim that the unavailable host bwrap sandbox executed successfully.
-    observed = _command_environment(executable, argv, {**os.environ, **root.codex_environment}, tmp_path)
-    assert observed['home'] == root.codex_environment['HOME']
-    assert observed['tmp'] == root.codex_environment['TMPDIR']
-    assert observed['forbidden'] == []
-    assert observed['proxy_present'] and observed['node_ran'] and observed['python_ran']
-
-
-def test_final_creation_environment_replaces_host_policy_without_secret_or_empty_fallback(monkeypatch):
-    import tomllib
-    from meta_research.quest_drafting import protected_codex_shell_arguments
-    monkeypatch.setenv('HOME', '/host/managed-home')
-    monkeypatch.setenv('PATH', '/host/node:/host/python')
-    first = protected_codex_shell_arguments(['codex', 'exec', '-'], object())
-    jail = {'HOME': '/home/creation', 'TMPDIR': '/tmp', 'PATH': '/bin:/python/bin',
-        'PYTHONHOME': '/python', 'PYTHONPATH': '', 'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
-        'META_RESEARCH_MCP_TOKEN': 'private-bearer', 'WRITING_API_KEY': 'private-writing',
-        'HTTP_PROXY': 'http://private:credential@proxy.invalid:9'}
-    final = protected_codex_shell_arguments(first, environment=jail)
-    policy = {}
-    for previous, value in zip(final, final[1:]):
-        if previous == '--config' and value.startswith('shell_environment_policy.'):
-            item = tomllib.loads(value)['shell_environment_policy']
-            assert not policy.keys() & item.keys(), 'Previous host policy must not survive as a second override'
-            policy.update(item)
-    assert policy['set'] == {name: value for name, value in jail.items()
-                             if name not in {'META_RESEARCH_MCP_TOKEN', 'WRITING_API_KEY', 'HTTP_PROXY'}}
-    assert all(name in policy['include_only'] for name in ('PYTHONHOME', 'PYTHONNOUSERSITE', 'PYTHONDONTWRITEBYTECODE'))
-    assert not {'META_RESEARCH_MCP_TOKEN', 'WRITING_API_KEY'} & set(policy['include_only'])
-    assert '/host/' not in json.dumps(final) and 'private:' not in json.dumps(final)
-    empty = protected_codex_shell_arguments(first, environment={})
-    assert '/host/' not in json.dumps(empty)

@@ -200,10 +200,8 @@ class CodexCompanionAdapter(
             context_files = {item["path"]: str(original_binding.directory / item["path"])
                              for item in context["manifest"]}
             files.extend(Path(path) for path in context_files.values())
-        proxy_environment = {key: os.environ[key] for key in
-            ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy") if key in os.environ}
-        for key in ("NO_PROXY", "no_proxy"):
-            proxy_environment[key] = ",".join(filter(None, (os.environ.get(key), "127.0.0.1", "localhost")))
+        proxy_environment = {key: ",".join(filter(None, (os.environ.get(key), "127.0.0.1", "localhost")))
+                             for key in ("NO_PROXY", "no_proxy")}
         runner = ProtectedCreationRunner(work, read_only_inputs=files, environment=proxy_environment,
                                         input_layout_root=resource_root)
         runner.runtime_conditions = render_runtime_conditions(self._workspace,
@@ -228,7 +226,7 @@ class CodexCompanionAdapter(
                 native_session_ref=native_session_ref, job_ref=request.job_ref,
                 workspace_binding=work.binding, invocation_runner=runner, provider_execution_binding=work.execution_binding,
                 mcp_url=access.url, mcp_token=access.token, mcp_scope_binding_hash=access.scope_binding_hash,
-                semantic_mcp_protected_environment=True, authorized_operation_ids=access.operation_ids)
+                authorized_operation_ids=access.operation_ids)
             work.completed_handoff()
             identity = work.seal()
             return raw, native_ref, stdout, identity, work

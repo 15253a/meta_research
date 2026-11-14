@@ -188,10 +188,7 @@ def test_provided_only_production_runner_keeps_strict_exec_boundary(native_sessi
     assert '--ignore-user-config' in argv and '--ignore-rules' in argv
     assert 'sandbox_workspace_write.network_access=false' in argv
     assert 'web_search="disabled"' in argv
-    assert 'shell_environment_policy.inherit="all"' in argv
-    allowlist = next(value.split('=', 1)[1] for value in argv
-                     if value.startswith('shell_environment_policy.include_only='))
-    assert 'PATH' in json.loads(allowlist) and 'META_RESEARCH_MCP_TOKEN' not in json.loads(allowlist)
+    assert not any(value.startswith('shell_environment_policy') for value in argv)
     assert argv[argv.index('--sandbox') + 1] == 'workspace-write'
     assert argv[argv.index('--add-dir') + 1] == request.target_dir
     assert argv[argv.index('--cd') + 1] == str(workspace)

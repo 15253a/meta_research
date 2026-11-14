@@ -962,7 +962,6 @@ def provided_only_cli_arguments(
     argv: list[str], *, writable_root: Path, resident_mcp: bool,
 ) -> list[str]:
     # Never fall back to unrestricted execution on hosts lacking sandbox support.
-    # Auth belongs to the CLI; model-generated commands inherit no user secrets.
     result = list(argv)
     result[result.index("--sandbox") + 1] = "workspace-write"
     denied_features = {"hooks", "plugins", "remote_plugin", "apps", "browser_use",
@@ -974,8 +973,7 @@ def provided_only_cli_arguments(
                 result[index] = "--disable"
     overlay = ["--ignore-user-config", "--ignore-rules", "--add-dir", str(writable_root),
                "--config", 'web_search="disabled"',
-               "--config", "sandbox_workspace_write.network_access=false",
-               "--config", 'shell_environment_policy.inherit="none"']
+               "--config", "sandbox_workspace_write.network_access=false"]
     for feature in sorted(denied_features):
         if ["--disable", feature] not in [result[index:index + 2] for index in range(len(result) - 1)]:
             overlay.extend(["--disable", feature])

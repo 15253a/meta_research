@@ -70,7 +70,6 @@ from meta_research.reasoning_contract import (
 from .research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 from meta_research.semantic_mcp import (
     ROOT_AGENT_COMMON_OPERATION_IDS,
-    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
 )
 
 
@@ -970,9 +969,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         if authority is None or self._root_resident_mcp.endpoint_url is None:
             raise ReasoningSkillUnavailable("reasoning_semantic_mcp_unavailable")
         operation_ids = self._reasoning_semantic_operation_ids()
-        human_request_enabled = bool(
-            set(operation_ids) & set(ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS)
-        )
         try:
             conformance = authority.require_operation_binding(
                 harness_family="codex",
@@ -1007,7 +1003,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 mcp_url=access.url,
                 mcp_token=access.token,
                 mcp_scope_binding_hash=access.scope_binding_hash,
-                semantic_mcp_protected_environment=human_request_enabled,
                 authorized_operation_ids=operation_ids,
                 run_ref=request.run_ref,
                 **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
@@ -1096,8 +1091,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
                 "codex-config:reasoning-primary.features.multi_agent=true",
-                "codex-config:reasoning-primary."
-                "shell_environment_policy.inherit=none",
                 "codex-config:reasoning-review.features.multi_agent=true",
                 "codex-config:reasoning-autonomous-resume."
                 "features.multi_agent=true",

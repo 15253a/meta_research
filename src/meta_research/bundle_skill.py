@@ -1103,7 +1103,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 mcp_url=access.url,
                 mcp_token=access.token,
                 mcp_scope_binding_hash=access.scope_binding_hash,
-                semantic_mcp_protected_environment=True,
                 authorized_operation_ids=operation_ids,
                 run_ref=run_ref,
                 **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),

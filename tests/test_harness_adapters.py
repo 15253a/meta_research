@@ -2281,6 +2281,7 @@ def test_target_codex_invocation_is_workspace_write_and_profiles_it(
         if value == "--config"
     }
     assert "mcp_servers.meta_research.required=true" in target_config
+    assert not any(value.startswith("shell_environment_policy") for value in target_config)
     assert (
         'mcp_servers.meta_research.default_tools_approval_mode="approve"'
         in target_config
