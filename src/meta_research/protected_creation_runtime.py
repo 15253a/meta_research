@@ -240,7 +240,7 @@ class ProtectedCreationRuntime:
                     _replace_private(self._control / "active.json", json.dumps({"receipt": receipt.name}).encode(), 0o600)
                     self._process = subprocess.Popen(
                         [sys.executable, "-I", "-S", "-c", _HELPER, str(launch)],
-                        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                        env={**os.environ, "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
                         cwd="/", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         close_fds=True, start_new_session=True)
@@ -489,7 +489,7 @@ class ProtectedCreationRuntime:
             file_modes[relative] = mode
             if dependencies:
                 completed = subprocess.run(["/usr/bin/ldd", str(resolved)],
-                    env={"PATH": "/usr/bin:/bin", "LANG": "C"}, capture_output=True,
+                    env={**os.environ, "PATH": "/usr/bin:/bin", "LANG": "C"}, capture_output=True,
                     text=True, timeout=30, check=False)
                 if "not found" in completed.stdout:
                     raise ProtectedCreationError("protected_creation_dependency_unavailable")
@@ -703,7 +703,9 @@ class ProtectedCreationRuntime:
         if arguments[0] not in {self._entry_command, self.executable.name, "codex"}:
             raise ProtectedCreationError("protected_creation_executable_mismatch")
         arguments[0] = self._entry_command
-        environment = {key: _mapped(value, mappings, self.work_directory, layout_root) for key, value in call.environment.items()}
+        environment = dict(os.environ)
+        environment.update({key: _mapped(value, mappings, self.work_directory, layout_root)
+                            for key, value in call.environment.items()})
         environment.update({"HOME": "/home/creation", "USERPROFILE": "/home/creation",
             "CODEX_HOME": "/home/creation/.codex", "CODEX_SQLITE_HOME": "/home/creation/.codex",
             "PATH": "/bin:/python/bin", "SHELL": "/bin/bash", "PYTHONHOME": "/python",
@@ -712,9 +714,6 @@ class ProtectedCreationRuntime:
             "XDG_STATE_HOME": "/home/creation/.local/state", "XDG_CACHE_HOME": "/cache",
             "PIP_CACHE_DIR": "/cache/pip", "npm_config_cache": "/cache/npm", "UV_CACHE_DIR": "/cache/uv",
             "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp", "SQLITE_TMPDIR": "/tmp"})
-        if len(arguments) > 1 and arguments[1] == "exec":
-            from meta_research.quest_drafting import protected_codex_shell_arguments
-            arguments = protected_codex_shell_arguments(arguments, environment=environment)
         return arguments, environment, outputs, _mapped(call.prompt, mappings, self.work_directory, layout_root)
 
     def _publish_output(self, source: Path, destination: Path) -> None:

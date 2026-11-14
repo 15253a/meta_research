@@ -49,7 +49,7 @@ class LegacyFailureAdapter(CodexCompanionAdapter):
             native_session_ref=None, job_ref=request.job_ref, workspace_binding=work.binding,
             provider_execution_binding=work.execution_binding, invocation_runner=runner,
             mcp_url=access.url, mcp_token=access.token, mcp_scope_binding_hash=access.scope_binding_hash,
-            semantic_mcp_protected_environment=True, authorized_operation_ids=access.operation_ids)
+            authorized_operation_ids=access.operation_ids)
 
 
 @pytest.fixture

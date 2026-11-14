@@ -3100,14 +3100,6 @@ class CodexDeepFetchAdapter:
                     'approval_policy="never"',
                     "--config",
                     CODEX_ROOT_REASONING_PRESET_CONFIG,
-                    *(
-                        (
-                            "--config",
-                            'shell_environment_policy.inherit="none"',
-                        )
-                        if access is not None or external_mcp_access is not None
-                        else ()
-                    ),
                     *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
                     "--sandbox",
                     self._sandbox_mode,
@@ -3123,9 +3115,6 @@ class CodexDeepFetchAdapter:
                 ]
                 if request.literature_access_mode == "provided_only":
                     argv = provided_only_cli_arguments(argv, writable_root=self._workspace, resident_mcp=access is not None)
-                if access is not None or external_mcp_access is not None or request.literature_access_mode == "provided_only":
-                    from meta_research.quest_drafting import protected_codex_shell_arguments
-                    argv = protected_codex_shell_arguments(argv, self._runner)
                 if request.native_session_ref is None:
                     argv.append("-")
                 else:
@@ -3418,9 +3407,6 @@ class CodexDeepFetchAdapter:
             )
             if request.literature_access_mode == "provided_only":
                 argv = provided_only_cli_arguments(argv, writable_root=self._workspace, resident_mcp=access is not None)
-            if access is not None or external_mcp_access is not None or request.literature_access_mode == "provided_only":
-                from meta_research.quest_drafting import protected_codex_shell_arguments
-                argv = protected_codex_shell_arguments(argv, self._runner)
             supervisor_request_path = directory / "supervisor-request.json"
             try:
                 write_supervisor_request(
@@ -3549,14 +3535,6 @@ class CodexDeepFetchAdapter:
             'approval_policy="never"',
             "--config",
             CODEX_ROOT_REASONING_PRESET_CONFIG,
-            *(
-                (
-                    "--config",
-                    'shell_environment_policy.inherit="none"',
-                )
-                if mcp_url is not None or external_mcp_access is not None
-                else ()
-            ),
             *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
             "--sandbox",
             self._sandbox_mode,

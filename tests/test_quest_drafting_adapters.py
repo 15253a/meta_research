@@ -477,7 +477,6 @@ def test_codex_drafting_does_not_require_user_namespaces_on_the_deployed_host(
         "mcp_servers={}",
         'approval_policy="never"',
         'web_search="disabled"',
-        'shell_environment_policy.inherit="none"',
         "tools.update_plan.enabled=false",
         "tools.experimental_request_user_input.enabled=false",
         "agents.enabled=false",
@@ -485,6 +484,7 @@ def test_codex_drafting_does_not_require_user_namespaces_on_the_deployed_host(
         "skills.bundled.enabled=false",
         'model_reasoning_effort="max"',
     } <= set(config_values)
+    assert not any(value.startswith("shell_environment_policy") for value in config_values)
     disabled = {
         argv[index + 1] for index, value in enumerate(argv) if value == "--disable"
     }

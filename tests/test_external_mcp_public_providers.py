@@ -79,7 +79,7 @@ def test_unbound_standalone_deepfetch_preserves_native_mcp_configuration(tmp_pat
     assert "--strict-config" in argv
     assert "mcp_servers={}" not in argv
     assert not any("meta_research_external" in argument for argument in argv)
-    assert 'shell_environment_policy.inherit="none"' not in argv
+    assert not any(value.startswith('shell_environment_policy') for value in argv)
 
 
 def test_cancelled_job_reconciliation_accepts_and_verifies_frozen_external_binding(tmp_path):

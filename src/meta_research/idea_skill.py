@@ -994,7 +994,6 @@ class CodexIdeaSkillAdapter:
 
     _sandbox_mode = "danger-full-access"
     _root_agent_kind: RootAgentKind = "idea"
-    _shell_environment_inherit: str | None = None
     _web_search_mode = "live"
     _reconciliation_operation_names = ("primary",)
     _provider_transport_limits = DEFAULT_PROVIDER_TRANSPORT_LIMITS
@@ -1978,7 +1977,6 @@ class CodexIdeaSkillAdapter:
                 mcp_url=access.url,
                 mcp_token=access.token,
                 mcp_scope_binding_hash=access.scope_binding_hash,
-                semantic_mcp_protected_environment=True,
                 authorized_operation_ids=access.operation_ids,
                 sandbox_read_root=sandbox_read_root,
                 run_ref=run_ref,
@@ -2093,7 +2091,6 @@ class CodexIdeaSkillAdapter:
         mcp_url: str | None = None,
         mcp_token: str | None = None,
         mcp_scope_binding_hash: str | None = None,
-        semantic_mcp_protected_environment: bool = False,
         authorized_operation_ids: tuple[str, ...] = (),
         sandbox_read_root: Path | None = None,
         run_ref: str | None = None,
@@ -2178,9 +2175,6 @@ class CodexIdeaSkillAdapter:
                     mcp_url=mcp_url,
                     mcp_token=mcp_token,
                     mcp_scope_binding_hash=mcp_scope_binding_hash,
-                    semantic_mcp_protected_environment=(
-                        semantic_mcp_protected_environment
-                    ),
                     authorized_operation_ids=authorized_operation_ids,
                     sandbox_read_root=sandbox_read_root,
                     transport_limits=transport_limits,
@@ -2221,9 +2215,6 @@ class CodexIdeaSkillAdapter:
                         mcp_url=mcp_url,
                         mcp_token=mcp_token,
                         mcp_scope_binding_hash=mcp_scope_binding_hash,
-                        semantic_mcp_protected_environment=(
-                            semantic_mcp_protected_environment
-                        ),
                         sandbox_read_root=sandbox_read_root,
                         transport_limits=transport_limits,
                         workspace_binding=workspace_binding,
@@ -2269,7 +2260,6 @@ class CodexIdeaSkillAdapter:
         mcp_url: str | None,
         mcp_token: str | None,
         mcp_scope_binding_hash: str | None,
-        semantic_mcp_protected_environment: bool,
         authorized_operation_ids: tuple[str, ...],
         sandbox_read_root: Path | None,
         transport_limits: ProviderTransportLimits,
@@ -2454,9 +2444,6 @@ class CodexIdeaSkillAdapter:
                 mcp_url=mcp_url,
                 mcp_token=mcp_token,
                 mcp_scope_binding_hash=mcp_scope_binding_hash,
-                semantic_mcp_protected_environment=(
-                    semantic_mcp_protected_environment
-                ),
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
                 workspace_binding=workspace_binding,
@@ -2501,7 +2488,6 @@ class CodexIdeaSkillAdapter:
         mcp_url: str | None = None,
         mcp_token: str | None = None,
         mcp_scope_binding_hash: str | None = None,
-        semantic_mcp_protected_environment: bool = False,
         sandbox_read_root: Path | None = None,
         workspace_binding: WorkspaceBinding | None = None,
         external_mcp_access: ExternalMcpAccess | None = None,
@@ -2518,12 +2504,6 @@ class CodexIdeaSkillAdapter:
         ):
             raise IdeaSkillUnavailable("semantic_mcp_invocation_invalid")
         semantic_mcp_enabled = all(value is not None for value in mcp_values)
-        if (
-            type(semantic_mcp_protected_environment) is not bool
-            or semantic_mcp_protected_environment
-            and not semantic_mcp_enabled
-        ):
-            raise IdeaSkillUnavailable("semantic_mcp_invocation_invalid")
         directory.mkdir(parents=True, exist_ok=True)
         schema_path = directory / "output-schema.json"
         result_path = directory / "last-message.json"
@@ -2534,8 +2514,7 @@ class CodexIdeaSkillAdapter:
         else:
             _write_durable(schema_path, schema_json)
         # The authenticated effect channel is owned by the current operation
-        # tree. Root reconnects and native children share it, while shell
-        # subprocesses do not inherit the bearer environment.
+        # tree. Root reconnects and native children share it.
         capability_profile = root_capability_profile(self._root_agent_kind, model_ref)
         argv = [
             self._executable,
@@ -2571,16 +2550,6 @@ class CodexIdeaSkillAdapter:
             "--config",
             CODEX_ROOT_REASONING_PRESET_CONFIG,
             *(
-                (
-                    "--config",
-                    "shell_environment_policy.inherit=\"none\"",
-                )
-                if semantic_mcp_protected_environment
-                or external_mcp_access is not None
-                or self._shell_environment_inherit == "none"
-                else ()
-            ),
-            *(
                 value
                 for feature in _DISABLED_CODEX_FEATURES
                 for value in ("--disable", feature)
@@ -2600,10 +2569,6 @@ class CodexIdeaSkillAdapter:
             from meta_research.root_capabilities import provided_only_cli_arguments
             argv = provided_only_cli_arguments(argv, writable_root=execution_write_root or working_directory,
                                                resident_mcp=semantic_mcp_enabled)
-        if (semantic_mcp_protected_environment or external_mcp_access is not None
-                or self._shell_environment_inherit == "none" or execution_access_mode == "provided_only"):
-            from meta_research.quest_drafting import protected_codex_shell_arguments
-            argv = protected_codex_shell_arguments(argv, runner)
         if native_session_ref is None:
             argv.append("-")
         else:

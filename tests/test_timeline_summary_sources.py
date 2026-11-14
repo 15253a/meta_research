@@ -33,7 +33,7 @@ class Fixture:
         with self.db.write() as db:
             for table, columns in {
                 "rg_quests": "quest_ref, accepted_at",
-                "ae_cycles": "cycle_ref, question_ref, quest_ref, created_at",
+                "ae_cycles": "cycle_ref, question_ref, quest_ref, created_at, cycle_position_json",
                 "ae_stage_commits": "cycle_ref, stage, epoch, commit_ref, receipt_hash, request_ref, outcome_ref, disposition",
                 "ae_stage_run_requests": "cycle_ref, question_ref, stage, request_ref, quest_ref, epoch",
                 "ar_stage_runs": "cycle_ref, stage, epoch, run_ref",
@@ -57,7 +57,8 @@ class Fixture:
                     "INSERT INTO rg_questions VALUES ('q','quest','question-content','hash-q'),('past-q','quest','past-content','old')"
                 )
             )
-            db.execute(text("INSERT INTO ae_cycles VALUES ('past','past-q','quest',1),('active','q','quest',2)"))
+            db.execute(text("INSERT INTO ae_cycles (cycle_ref,question_ref,quest_ref,created_at) "
+                            "VALUES ('past','past-q','quest',1),('active','q','quest',2)"))
             db.execute(
                 text(
                     "INSERT INTO rg_target_graphs VALUES ('graph','quest','active','plan-hash','request','notes-source','notes-hash')"
@@ -166,6 +167,57 @@ class Fixture:
                     "INSERT INTO rm_target_root_completion_manifests VALUES ('t0','run','manifest','result-hash','completion')"
                 )
             )
+
+
+def test_each_cycle_reads_its_own_frozen_focus_and_new_cut_tracks_changes(tmp_path):
+    f = Fixture(tmp_path / "focus.sqlite")
+    positions = {
+        "past": {"cycle_ref": "past", "round": 1, "cycle_focus": "先核对数据是否齐全。",
+                 "focus_source": {"kind": "confirmed_creation", "initialization_id": "creation"}},
+        "active": {"cycle_ref": "active", "round": 2, "cycle_focus": "本轮比较两种去噪方法。",
+                   "focus_source": {"kind": "accepted_reasoning", "cycle_ref": "past"}},
+    }
+    with f.db.write() as db:
+        for cycle, position in positions.items():
+            db.execute(text("UPDATE ae_cycles SET cycle_position_json=:position WHERE cycle_ref=:cycle"),
+                       {"position": json.dumps(position), "cycle": cycle})
+    before = f.nodes()
+    for cycle, position in positions.items():
+        body = f.reader.read_source("quest", before["cycle:" + cycle], cycle)
+        assert body["cycle_position"] == position
+    assert f.body_reads == []
+    updated = {**positions["active"], "cycle_focus": "本轮复核去噪后是否丢失细节。"}
+    with f.db.write() as db:
+        db.execute(text("UPDATE ae_cycles SET cycle_position_json=:position WHERE cycle_ref='active'"),
+                   {"position": json.dumps(updated)})
+    after = f.nodes()
+    assert f.reader.read_source("quest", before["cycle:active"], "active")["cycle_position"] == positions["active"]
+    assert f.reader.read_source("quest", after["cycle:active"], "active")["cycle_position"] == updated
+    changed = {key for key in before if before[key]["source_hash"] != after[key]["source_hash"]}
+    assert changed == {"cycle:active", "question:q", *("stage:active:" + stage for stage in ("idea", "plan", "bundle", "reasoning"))}
+    assert f.body_reads == []
+
+
+def test_historical_cycle_without_focus_exposes_missing_position(tmp_path):
+    f = Fixture(tmp_path / "missing-focus.sqlite")
+    node = f.nodes()["cycle:past"]
+    assert f.reader.read_source("quest", node, "past")["cycle_position"] is None
+
+
+@pytest.mark.parametrize("position", [
+    "not-json",
+    json.dumps({"cycle_ref": "past", "round": 2, "cycle_focus": "Another cycle's focus",
+                "focus_source": {"kind": "accepted_reasoning"}}),
+    json.dumps({"cycle_ref": "active", "round": 2, "cycle_focus": "",
+                "focus_source": {"kind": "accepted_reasoning"}}),
+])
+def test_invalid_cycle_focus_is_not_guessed_or_borrowed(tmp_path, position):
+    f = Fixture(tmp_path / "invalid-focus.sqlite")
+    with f.db.write() as db:
+        db.execute(text("UPDATE ae_cycles SET cycle_position_json=:position WHERE cycle_ref='active'"),
+                   {"position": position})
+    with pytest.raises(OwnerConflict, match="timeline_summary_cycle_position_invalid"):
+        f.nodes()
 
 
 def test_one_changed_target_updates_only_its_ancestors_without_reading_any_history_body(tmp_path):

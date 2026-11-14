@@ -1031,15 +1031,6 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
         )
 
     def _argv(self, invocation: HarnessInvocation) -> list[str]:
-        target_environment_arguments: tuple[str, ...] = ()
-        if invocation.target_workspace_ref is not None:
-            # HumanRequest effects remain attributed to this authenticated
-            # Target operation. Native child Sessions intentionally share the
-            # operation bearer, while shell subprocesses do not inherit it.
-            target_environment_arguments = (
-                "--config",
-                'shell_environment_policy.inherit="none"',
-            )
         capability_profile = root_capability_profile(
             invocation.root_kind or "target", invocation.model_ref
         )
@@ -1061,7 +1052,6 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             CODEX_ROOT_REASONING_PRESET_CONFIG,
             "--config",
             "mcp_servers={}",
-            *target_environment_arguments,
             "--sandbox",
             self._sandbox_mode(invocation),
             "--cd",

@@ -63,7 +63,6 @@ def adapter_arguments(source, executable, directory, role, mcp_url):
     from meta_research.recorder_sources import RecorderChannels
     from meta_research.timeline_summary_provider import CodexTimelineSummaryAdapter
     from meta_research.root_capabilities import provided_only_cli_arguments
-    from meta_research.quest_drafting import protected_codex_shell_arguments
     schema = directory / "output-schema.json"
     schema.write_text(json.dumps(SCHEMA))
     result = directory / "last-message.json"
@@ -96,7 +95,6 @@ def adapter_arguments(source, executable, directory, role, mcp_url):
             schema_path=schema, result_path=result, native_session_ref=None, mcp_url=mcp_url)
         if provided_only:
             argv = provided_only_cli_arguments(argv, writable_root=directory, resident_mcp=True)
-        argv = protected_codex_shell_arguments(argv)
         return argv, "CodexDeepFetchAdapter._durable_argv + production access overlays", argv[argv.index("--sandbox") + 1]
 
     class Captured(BaseException):
@@ -116,7 +114,6 @@ def adapter_arguments(source, executable, directory, role, mcp_url):
             prompt="Inventory", schema=SCHEMA, native_session_ref=None, job_ref=None,
             stdout_path=None, invocation_hash=None, transport_limits=DEFAULT_PROVIDER_TRANSPORT_LIMITS,
             mcp_url=mcp_url, mcp_token="fixture", mcp_scope_binding_hash="0" * 64,
-            semantic_mcp_protected_environment=True,
             execution_access_mode="provided_only" if provided_only else None,
             execution_write_root=directory)
     except Captured as captured:

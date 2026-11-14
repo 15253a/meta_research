@@ -333,6 +333,34 @@ def test_runtime_permission_repair_rejects_writable_runtime_directories(runtime,
         protected.run(_call("raise AssertionError('must not launch')"))
 
 
+def test_native_environment_inherits_parent_with_call_and_managed_path_overrides(runtime, monkeypatch):
+    monkeypatch.setenv("CREATION_PARENT_SETTING", "parent-value")
+    monkeypatch.setenv("CREATION_API_KEY", "parent-key")
+    monkeypatch.setenv("CREATION_OVERRIDE", "parent-value")
+    monkeypatch.setenv("HOME", "/host/home")
+    monkeypatch.setenv("PATH", "/host/bin")
+    monkeypatch.setenv("TMPDIR", "/host/tmp")
+    call = _call('''import json, os
+print(json.dumps({name: os.environ[name] for name in (
+    "CREATION_PARENT_SETTING", "CREATION_API_KEY", "CREATION_OVERRIDE",
+    "HOME", "PATH", "TMPDIR", "CODEX_HOME")}))
+''', environment={"CREATION_OVERRIDE": "call-value", "HOME": "/caller/home"})
+    _, environment, _, _ = runtime._prepare_call(call)
+    expected = {
+        "CREATION_PARENT_SETTING": "parent-value",
+        "CREATION_API_KEY": "parent-key",
+        "CREATION_OVERRIDE": "call-value",
+        "HOME": "/home/creation",
+        "PATH": "/bin:/python/bin",
+        "TMPDIR": "/tmp",
+        "CODEX_HOME": "/home/creation/.codex",
+    }
+    assert {name: environment[name] for name in expected} == expected
+    completed = runtime.run(call)
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == expected
+
+
 def test_native_boundary_inputs_and_exact_outputs(runtime, tmp_path):
     schema = tmp_path / "schema.json"
     schema.write_text('{"trusted":"schema"}', encoding="utf-8")
