@@ -65,8 +65,8 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
         try:
             quest = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
                 human_collaboration=human_collaboration)
-            def status(asset_ref):
-                value = memory.query_asset_status(asset_ref)
+            def status(asset_ref, version_ref=None):
+                value = memory.query_asset_status(asset_ref, version_ref=version_ref)
                 history = value["history_reader"]
                 return {**value, "history_reader": {**history,
                     "args": _reader(history["args"], arguments.get("source_quest_ref"))}}
@@ -76,7 +76,33 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     refs = (
                         connection.execute(
                             text(
-                                "SELECT a.asset_ref FROM rm_assets a WHERE (EXISTS (SELECT 1 FROM rg_asset_roles r WHERE r.asset_ref=a.asset_ref AND r.quest_ref=:quest) OR EXISTS (SELECT 1 FROM rm_asset_changes c WHERE c.asset_ref=a.asset_ref AND c.kind='initial' AND json_extract(c.payload_json,'$.origin_quest_ref')=:quest)) AND EXISTS (SELECT 1 FROM rm_asset_versions v WHERE v.asset_ref=a.asset_ref AND instr(lower(v.display_name),lower(:query))>0) ORDER BY a.created_at DESC,a.asset_ref LIMIT :limit OFFSET :offset"
+                                "WITH family_scope AS ("
+                                "SELECT a.asset_ref FROM rm_assets a WHERE "
+                                "EXISTS (SELECT 1 FROM rg_asset_roles r WHERE r.asset_ref=a.asset_ref AND r.quest_ref=:quest) "
+                                "OR EXISTS (SELECT 1 FROM rm_asset_changes c WHERE c.asset_ref=a.asset_ref "
+                                "AND c.kind='initial' AND json_extract(c.payload_json,'$.origin_quest_ref')=:quest)), "
+                                "manifest_versions AS ("
+                                "SELECT DISTINCT v.asset_ref,v.version_ref,v.version_number "
+                                "FROM rm_target_root_completion_manifests m "
+                                "JOIN rg_targets t ON t.target_ref=m.target_ref "
+                                "JOIN rg_target_graphs g ON g.graph_ref=t.graph_ref "
+                                "JOIN rg_target_commits c ON c.target_ref=t.target_ref "
+                                "JOIN rg_target_root_measurements accepted ON accepted.target_ref=t.target_ref "
+                                "AND accepted.manifest_ref=m.manifest_ref "
+                                "JOIN json_each(m.entries_json) e "
+                                "JOIN rm_asset_versions v ON v.version_ref=json_extract(e.value,'$.binding.version_ref') "
+                                "WHERE g.quest_ref=:quest AND instr(lower(v.display_name),lower(:query))>0), "
+                                "candidates AS ("
+                                "SELECT f.asset_ref,NULL AS exact_version_ref FROM family_scope f "
+                                "WHERE EXISTS (SELECT 1 FROM rm_asset_versions v WHERE v.asset_ref=f.asset_ref "
+                                "AND instr(lower(v.display_name),lower(:query))>0) "
+                                "UNION ALL SELECT asset_ref,version_ref FROM ("
+                                "SELECT m.*,ROW_NUMBER() OVER (PARTITION BY m.asset_ref ORDER BY m.version_number DESC) AS selected "
+                                "FROM manifest_versions m WHERE NOT EXISTS "
+                                "(SELECT 1 FROM family_scope f WHERE f.asset_ref=m.asset_ref)) WHERE selected=1) "
+                                "SELECT c.asset_ref,c.exact_version_ref FROM candidates c "
+                                "JOIN rm_assets a ON a.asset_ref=c.asset_ref "
+                                "ORDER BY a.created_at DESC,a.asset_ref LIMIT :limit OFFSET :offset"
                             ),
                             {
                                 "quest": quest,
@@ -85,12 +111,13 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                                 "offset": offset,
                             },
                         )
-                        .scalars()
                         .all()
                     )
                 items = []
-                for asset_ref in refs[:limit]:
-                    lifecycle = status(asset_ref)
+                for asset_ref, exact_version_ref in refs[:limit]:
+                    # A Target manifest grants its exact version, not every
+                    # later version in the same asset family.
+                    lifecycle = status(asset_ref, exact_version_ref)
                     version_ref = lifecycle['version_ref']
                     graph.verify_asset_quest_scope(version_ref, quest_ref=quest)
                     asset = memory.query_asset_version(version_ref)
@@ -102,6 +129,9 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                                 "lifecycle_state": lifecycle_state,
                             },
                             "lifecycle": lifecycle,
+                            "reader": {"operation": "research_memory.content.read",
+                                "args": _reader({"source_ref": version_ref, "version_ref": version_ref},
+                                                arguments.get("source_quest_ref"))},
                         }
                     )
                 return {
@@ -281,7 +311,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
             SemanticOperation(
                 semantic_operation_id="research_memory.assets." + action,
                 owning_module="research_memory",
-                description="Discover and read accepted asset lifecycle. Companion may select source_quest_ref for another currently HC-authorized Quest; this does not authorize writes. Current selection is explicit. Exact historical content.read keeps original bytes and shows correction or retirement explanations.",
+                description="Discover and read accepted asset lifecycle. The directory returns one item per asset family and an exact content reader. Family-authorized assets use the lifecycle selection; assets visible only through an accepted Target manifest use the newest matching accepted exact version, which may be historical. query matches visible version display names. Companion may select source_quest_ref for another currently HC-authorized Quest; carry that selector in returned readers. This does not authorize writes. Current selection is explicit. Exact historical content.read keeps original bytes and shows correction or retirement explanations.",
                 input_schema={
                     "type": "object",
                     "properties": {**properties, "source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256}},

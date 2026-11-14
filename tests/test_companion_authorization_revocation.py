@@ -40,6 +40,10 @@ def test_cross_quest_readers_and_discovery_recheck_confirmed_human_revocation(tm
             source_ref=asset.version_ref, version_ref=asset.version_ref))["selected_evidence_binding"]["reader"]
         assert _accepted(_call(runtime, channel, exact["operation"], **exact["args"]))["text"] == "Other Quest exact original."
         asset_page = _accepted(_call(runtime, channel, "research_memory.assets.page", source_quest_ref=other))
+        asset_reader = asset_page["items"][0]["reader"]
+        assert asset_reader["args"]["source_quest_ref"] == other
+        assert _accepted(_call(runtime, channel, asset_reader["operation"],
+            **asset_reader["args"]))["text"] == "Other Quest exact original."
         asset_current = _accepted(_call(runtime, channel, "research_memory.assets.current", source_quest_ref=other,
             version_ref=asset.version_ref))
         content = _accepted(_call(runtime, channel, exact["operation"], **exact["args"]))
@@ -52,6 +56,8 @@ def test_cross_quest_readers_and_discovery_recheck_confirmed_human_revocation(tm
 
         revoke_quest_authority(runtime.owners.human_collaboration, other)
 
+        denied = _call(runtime, channel, asset_reader["operation"], **asset_reader["args"])
+        assert denied["isError"] and denied["structuredContent"]["code"] == "content_quest_not_authorized"
         for operation, args in readers:
             denied = _call(runtime, channel, operation, source_quest_ref=other, **args)
             assert denied["isError"] and denied["structuredContent"]["code"] == "content_quest_not_authorized"

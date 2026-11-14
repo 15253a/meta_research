@@ -529,7 +529,7 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
             handler=lambda context, arguments: read(context, arguments, page=False)),
         SemanticOperation(
             semantic_operation_id="research_graph.target_formal_results.read", owning_module="research_graph",
-            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding 和当前 RG 生产归属；候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。implementation_artifacts 给出每个 Run 实际选择的已保管实现条目、精确版本和 content.read reader；可有多个代码包，复用 Run 保留原实施的代码。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding 和当前 RG 生产归属；候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
             input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "target_ref": _string(max_length=1024)},
                 "required": ["target_ref"], "additionalProperties": False},
             output_schema={"type": "object"},
@@ -560,7 +560,7 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
                 research_graph, agent_runtime, context, arguments)),
         SemanticOperation(
             semantic_operation_id="research_graph.formal_results.read", owning_module="research_graph",
-            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. Read one exact formal result by its bare ref (variant_run_, evaluation_attempt_ or metric_result_ prefix, including target-root refs) with its verified lineage: a metric result resolves to its evaluation attempt and variant run, a variant run to its Target context. Uses the same receipt-verified reads as target_formal_results.read.",
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. Read one exact formal result by its bare ref (variant_run_, evaluation_attempt_ or metric_result_ prefix, including target-root refs) with its verified lineage: a metric result resolves to its evaluation attempt and variant run, a variant run to its Target context. implementation_artifacts exposes the retained code entries actually selected by that run, with exact versions and content.read readers; a run may select multiple archives, and a reused run retains its original code. Uses the same receipt-verified reads as target_formal_results.read.",
             input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "ref": _string(max_length=1024)},
                 "required": ["ref"], "additionalProperties": False},
             output_schema={"type": "object"},
@@ -630,7 +630,7 @@ def _target_fact_readers(fact, source_quest_ref):
     return {**fact, **{key: [{**entry, "reader": _asset_reader(entry,
                 source_quest_ref=source_quest_ref)}
             for entry in fact[key]]
-        for key in ("run_artifacts", "evaluation_artifacts") if key in fact}}
+        for key in ("implementation_artifacts", "run_artifacts", "evaluation_artifacts") if key in fact}}
 
 
 def _target_content_readers(result, source_quest_ref):

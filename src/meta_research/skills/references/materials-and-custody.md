@@ -110,7 +110,7 @@ selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保
 
 准确 reader 每次核对当前授权、范围和接纳身份。相同不可变来源、所选路径及表示可复用已编码字节及该表示自己的摘要；current history/index 没有准确修订身份时每次重新读取。可变文件每次打开都核对实际字节，校验与取页共用同一次读取；stat 未变化不能证明内容相等，也不能以 context_pack_hash 代替正文 content_hash。原件缺失或漂移分别按 reader 的准确错误处理；本次已验证的值直接交给消费者，另一次打开仍重新核验。
 
-常规资产页只附所选版本的当前／被替换／退役状态、适用说明及 history_reader；详细变更沿该入口按需读取。资产语义状态不代替实际原件可用性，历史精确引用保留原义。
+`research_memory.assets.page` 按可见版本的 display_name 检索，每个资产身份返回一项及准确内容 reader。具有资产家族授权时沿生命周期选择版本；仅由已接纳 Target manifest 可见时，返回匹配查询的最新已接纳精确版本，可能是历史版本。沿条目 reader 读取，不把它替换成同一资产的其他版本。常规资产页只附所选版本的当前／被替换／退役状态、适用说明及 history_reader；详细变更沿该入口按需读取。资产语义状态不代替实际原件可用性，历史精确引用保留原义。
 
 reader 指针只把 operation 以外的参数交给指定工具；summary_only 是外层展示标志，不是 research_notes_reader 的调用参数。序列化 JSON 的 offset/limit 按 UTF-8 字节计，以 next_offset=null 结束；complete 仅说明单页是否包含全部来源，尾页仍可能为 false。资产文件页按字节计，以 complete=true 结束；目录页按 entries 计，以 next_offset=null 结束。不要混用这三种结束条件。
 
