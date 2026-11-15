@@ -508,7 +508,12 @@ class BundleStageWorker:
         # authenticated native attachment and cannot run ahead of it.
         initialize_batch = (run.native_session_ref is None
             and len(commits) == len(graph.targets) and not graph.strategy_complete)
-        report_progress = None if initialize_batch else self._advance_bundle_report_closure(
+        synthesis_pending = self._replan_completion_synthesis_pending(
+            run=run, graph=graph,
+            formal_plan_content_receipt=formal_plan_content.receipt,
+            formal_plan_projection_receipt=formal_plan_projection.receipt,
+        )
+        report_progress = None if initialize_batch or synthesis_pending else self._advance_bundle_report_closure(
             request=request,
             run=run,
             graph=graph,
@@ -562,7 +567,7 @@ class BundleStageWorker:
                         operation_kind="dispatch", operation_ref=latest.decision_ref,
                         checkpoint=checkpoint,
                     )
-        if all_targets_committed and not graph.strategy_complete and not coordination_after_no_action:
+        if all_targets_committed and (not graph.strategy_complete or synthesis_pending) and not coordination_after_no_action:
             inbox_checkpoint = self._drain_bundle_inbox(run)
             proposals = self._agent_runtime.query_bundle_target_proposals(
                 run.run_ref
@@ -646,6 +651,14 @@ class BundleStageWorker:
                         provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
                         result = provider.propose_target_batch(batch_request)
                         validate_bundle_target_batch_result(batch_request, result)
+                        self._validate_replan_remaining_work(graph, result.action)
+                        if result.action == "propose_targets" and (
+                            synthesis_pending or (batch_request.provider_feedback or {}).get("detail_code")
+                            == "bundle_replan_work_already_complete"
+                        ):
+                            notes = result.strategy_update.get("notes")
+                            if not isinstance(notes, str) or not notes.strip():
+                                raise BundleSkillContractError("bundle_completion_synthesis_missing")
                     except BundleSkillUnavailable as error:
                         error = self._recover_stopped_error(error, run.run_ref)
                         if error.code == "codex_operation_reconciliation_pending":
@@ -769,7 +782,7 @@ class BundleStageWorker:
                     self._observation = BundleObservation("waiting", "bundle_strategy_incomplete")
                     return False
                 if error.code in BASELINE_METHOD_REJECTION_FEEDBACK:
-                    return self._correct_target_batch_identity(
+                    return self._correct_rolling_result(
                         run=run, unit_ref=batch_unit_ref, job_ref=batch_operation_ref,
                         operation_name=f"target-batch-{graph.head_generation + 1}",
                         native_session_ref=pending.native_session_ref, detail_code=error.code,
@@ -970,6 +983,7 @@ class BundleStageWorker:
                     provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
                     result = provider.schedule_target(dispatch_request)
                     validate_bundle_dispatch_result(dispatch_request, result)
+                    self._validate_replan_remaining_work(graph, result.action)
                     if result.action == "dispatch":
                         selected = cast(str, result.selected_target_ref)
                         if selected not in {target.target_ref for target in launchable}:
@@ -1132,6 +1146,38 @@ class BundleStageWorker:
                 else "target_launch_pending")
         return False
 
+    def _validate_replan_remaining_work(self, graph: AcceptedTargetGraph, action: str) -> None:
+        # Empty launch frontiers and completed proposed Targets do not prove
+        # completion of the frozen Plan. Use the report's accepted-cell facts.
+        if action == "replan_required" and not self._research_graph.query_bundle_remaining_work(graph.graph_ref):
+            raise BundleSkillContractError("bundle_replan_work_already_complete")
+
+    def _replan_completion_synthesis_pending(
+        self, *, run: BundleStageRun, graph: AcceptedTargetGraph,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+    ) -> bool:
+        # Historical strategies could be sealed before their last Target
+        # completed. A correction must reach the Root even in that case; the
+        # old seal cannot stand in for the requested updated synthesis.
+        if not graph.strategy_complete or run.completion is not None or run.status == "cancelled":
+            return False
+        if not self._agent_runtime.bundle_replan_synthesis_pending(
+            run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+            notes_source_ref=None,
+        ):
+            return False
+        contract = self._research_graph.query_bundle_report_contract(
+            request_ref=run.request_ref, run_ref=run.run_ref, graph_ref=graph.graph_ref,
+            head_receipt=graph.head_receipt,
+            formal_plan_content_receipt=formal_plan_content_receipt,
+            formal_plan_projection_receipt=formal_plan_projection_receipt,
+        )
+        return self._agent_runtime.bundle_replan_synthesis_pending(
+            run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+            notes_source_ref=contract.get("notes_source_ref"),
+        )
+
     def _prepare_launch_inputs(self, target: AcceptedTarget) -> bool:
         graph = self._research_graph
         if graph.query_target_candidate_projection(target_ref=target.target_ref) is None:
@@ -1167,38 +1213,51 @@ class BundleStageWorker:
         decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
         replan = decisions[-1] if decisions else None
         if (replan is not None and replan.action == "replan_required"
-            and replan.attempt_ref == run.attempt_ref
-            and replan.fence_ref == run.fence_ref
             and replan.graph_ref == graph.graph_ref):
-            # Stop expanding research while admitted work reaches its real
-            # terminal handoff.  Unlaunched Targets remain pending in the report.
-            for target in graph.targets:
-                frontier = self._agent_runtime.query_target_frontier_entry(target.target_ref)
-                if frontier is not None:
-                    if (frontier.state != "terminal"
-                        or frontier.currentness_known is not True
-                        or frontier.current is not True):
+            # A legacy decision, or a Target accepted after the decision, can
+            # now cover the entire Plan. Return to the exact originating turn;
+            # retain that decision and let the Root submit its normal synthesis.
+            if not self._research_graph.query_bundle_remaining_work(graph.graph_ref):
+                source = self._agent_runtime.verify_bundle_replan_correction_source(
+                    run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+                    graph_ref=graph.graph_ref, decision_ref=replan.decision_ref,
+                )
+                if source is not None:
+                    return self._correct_rolling_result(
+                        run=run, unit_ref=source["unit_ref"], job_ref=source["operation_ref"],
+                        operation_name=source["operation_name"], native_session_ref=source["native_session_ref"],
+                        detail_code="bundle_replan_work_already_complete",
+                    )
+            elif replan.attempt_ref == run.attempt_ref and replan.fence_ref == run.fence_ref:
+                # Stop expanding research while admitted work reaches its real
+                # terminal handoff.  Unlaunched Targets remain pending in the report.
+                for target in graph.targets:
+                    frontier = self._agent_runtime.query_target_frontier_entry(target.target_ref)
+                    if frontier is not None:
+                        if (frontier.state != "terminal"
+                            or frontier.currentness_known is not True
+                            or frontier.current is not True):
+                            self._observation = BundleObservation("waiting", "bundle_replan_waiting_for_target_terminal")
+                            return False
+                        continue
+                    notice = self._agent_runtime.query_target_work_notice(
+                        target.target_ref
+                    )
+                    if notice is not None:
+                        handoff = self._agent_runtime.read_target_run_handoff(
+                            notice.handoff_manifest_ref
+                        )
+                        if (
+                            type(handoff.terminal) is GoalWorkDisposition
+                            and handoff.terminal.disposition == "not_started"
+                        ):
+                            continue
+                        raise OwnerConflict("bundle_report_handoff_invalid")
+                    if self._agent_runtime.query_target_launch_ack(target.target_ref) is not None:
                         self._observation = BundleObservation("waiting", "bundle_replan_waiting_for_target_terminal")
                         return False
-                    continue
-                notice = self._agent_runtime.query_target_work_notice(
-                    target.target_ref
-                )
-                if notice is not None:
-                    handoff = self._agent_runtime.read_target_run_handoff(
-                        notice.handoff_manifest_ref
-                    )
-                    if (
-                        type(handoff.terminal) is GoalWorkDisposition
-                        and handoff.terminal.disposition == "not_started"
-                    ):
-                        continue
-                    raise OwnerConflict("bundle_report_handoff_invalid")
-                if self._agent_runtime.query_target_launch_ack(target.target_ref) is not None:
-                    self._observation = BundleObservation("waiting", "bundle_replan_waiting_for_target_terminal")
-                    return False
-            if disposition != "blocked":
-                disposition = "replan_required"
+                if disposition != "blocked":
+                    disposition = "replan_required"
         if disposition is None:
             return None
         try:
@@ -3231,10 +3290,10 @@ class BundleStageWorker:
             ),
         )
 
-    def _correct_target_batch_identity(
+    def _correct_rolling_result(
         self, *, run, unit_ref, job_ref, operation_name, native_session_ref, detail_code,
     ) -> bool:
-        """Reuse the retained rolling-output correction after exact RG rejection."""
+        """Correct a retained rolling output through its original Root Session."""
         self._agent_runtime.begin_provider_unit(
             unit_ref=unit_ref, operation_ref=job_ref, run_ref=run.run_ref,
             attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, unit_kind="bundle_review",
