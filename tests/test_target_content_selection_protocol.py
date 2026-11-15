@@ -93,7 +93,7 @@ def test_parent_and_file_scopes_share_one_capture_even_when_live_child_changes(t
         runtime.close()
 
 
-@pytest.mark.parametrize('bad', ['json', 'path'])
+@pytest.mark.parametrize('bad', ['json', 'path', 'retained'])
 def test_invalid_declaration_is_persisted_before_any_freeze_or_intake(tmp_path, monkeypatch, bad):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
@@ -103,7 +103,11 @@ def test_invalid_declaration_is_persisted_before_any_freeze_or_intake(tmp_path, 
             path.write_text('{"metrics":{},"metrics":{}}')
         else:
             document = json.loads(original)
-            document['formal_runs'][0]['implementation_paths'] = ['implementation/../outside']
+            if bad == 'path':
+                document['formal_runs'][0]['implementation_paths'] = ['implementation/../outside']
+            else:
+                document['retained_artifacts'].append({
+                    'relative_path': 'implementation/train.py', 'role': 'analysis'})
             path.write_text(canonical_json(document))
         finalizer = _finalizer(runtime, lifecycle, memory, evidence,
                                graph_authority=runtime.owners.research_graph)
@@ -155,22 +159,25 @@ def test_inline_snapshot_survives_restart_after_ar_receipt_before_rm(tmp_path, m
         reopened.close()
 
 
-def test_two_local_children_keep_distinct_scopes_in_run_contract():
-    from meta_research.formal_run_bindings import resolve_local_inputs, local_input_selections
+def test_local_inputs_keep_child_and_whole_asset_scopes_in_run_contract():
+    from meta_research.formal_run_bindings import resolve_local_inputs
     binding = {'asset_ref': 'parent', 'version_ref': 'version', 'content_hash': 'a' * 64,
                'manifest_hash': 'b' * 64, 'receipt': {'status': 'accepted', 'issuer': 'research_memory',
                    'kind': 'asset_accepted', 'receipt_ref': 'r', 'subject_ref': 'version', 'payload_hash': 'c' * 64}}
     entries = [{'declared_relative_path': 'outputs/data/' + child, 'role': 'data',
         'binding': binding, 'path': child, 'selection_protocol': SELECTION_MANIFEST_SCHEMA}
         for child in ('a', 'b')]
+    entries.append({'declared_relative_path': 'outputs/data', 'role': 'data',
+        'binding': binding, 'path': None, 'selection_protocol': SELECTION_MANIFEST_SCHEMA})
     consumer = {'run_key': 'use', 'local_inputs': [
-        {'producer_run_key': 'produce', 'artifact_path': 'outputs/data/' + child}
-        for child in ('a', 'b')]}
+        {'producer_run_key': 'produce', 'artifact_path': entry['declared_relative_path']}
+        for entry in entries]}
     document = {'formal_runs': [
-        {'run_key': 'produce', 'artifact_paths': ['outputs/data/a', 'outputs/data/b']}, consumer]}
-    refs = resolve_local_inputs(document, entries, consumer)
-    assert len(set(refs)) == 2 and all(ref.startswith('content_selection_') for ref in refs)
-    selections = local_input_selections(document, entries, consumer)
-    assert [value['path'] for value in selections] == ['a', 'b']
-    assert [value['selection_ref'] for value in selections] == refs
+        {'run_key': 'produce', 'artifact_paths': [entry['declared_relative_path'] for entry in entries]}, consumer]}
+    refs, selections = resolve_local_inputs(document, entries, consumer)
+    assert len(set(refs)) == 3 and all(ref.startswith('content_selection_') for ref in refs[:2])
+    assert refs[2] == binding['version_ref']
+    assert [value['path'] for value in selections] == ['a', 'b', None]
+    assert [value['selection_ref'] for value in selections[:2]] == refs[:2]
+    assert selections[2]['selection_ref'].startswith('content_selection_')
 

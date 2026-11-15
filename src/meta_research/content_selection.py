@@ -158,10 +158,10 @@ class ContentSelectionReader:
     def __init__(self, verifier):
         self._verifier = verifier
 
-    def _source(self, binding, path):
+    def _source(self, binding, path, *, source=None):
         selection = ContentSelection(binding, path)
-        verifier = self._verifier
-        source = verifier._asset_export_source(binding.version_ref)
+        if source is None:
+            source = self._verifier._asset_export_source(binding.version_ref)
         description, row, _custodies, _manifest = source
         # The source resolver already verifies the persisted receipt and manifest.
         # Compare the caller's complete identity without repeating that verification.
@@ -175,6 +175,20 @@ class ContentSelectionReader:
 
     def describe(self, binding, path=None):
         return self._source(binding, path)[0]
+
+    def describe_many(self, selections, *, current=False):
+        """Verify each parent once in this operation, then each selected scope."""
+        parents, descriptions = {}, []
+        for selection in selections:
+            binding = selection.asset_binding
+            if binding.version_ref not in parents:
+                source = self._verifier._asset_export_source(binding.version_ref)
+                if current:
+                    self._verifier._verify_selection_parent_current(source)
+                parents[binding.version_ref] = source
+            descriptions.append(self._source(binding, selection.path,
+                source=parents[binding.version_ref])[0])
+        return tuple(descriptions)
 
     def read_page(self, binding, path=None, *, entry_path=None, offset=0, limit=8192):
         from meta_research.owners.research_asset_content import AssetContentPageReader

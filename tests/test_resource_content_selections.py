@@ -111,6 +111,7 @@ def test_invalid_selection_creates_no_resource_or_dependency(runtime, tmp_path):
     with runtime._database.read() as connection:
         assert connection.execute(text("SELECT count(*) FROM rg_environments")).scalar_one() == 0
         assert connection.execute(text("SELECT count(*) FROM rg_environment_assets")).scalar_one() == 0
+        assert connection.execute(text("SELECT count(*) FROM rg_resource_selections")).scalar_one() == 0
 
 
 def test_dataset_and_environment_use_the_same_selected_content(runtime, tmp_path):
@@ -137,7 +138,92 @@ def test_whole_asset_registration_uses_the_same_selection_contract(runtime):
     from test_research_datasets import _asset
     graph = runtime.owners.research_graph
     binding = _asset(runtime)
-    environment = _environment(graph, asset_bindings=[binding])
+    environment = _environment(graph, selections=[_selection(binding, None)])
     assert environment["selections"] == [_selection(binding, None)]
     assert environment["selection_readers"][0]["reader"]["selection_path"] is None
     assert graph.query_environment(environment["environment_ref"]) == environment
+
+
+def test_selection_lookup_does_not_read_unrelated_corrupt_resources(runtime, tmp_path):
+    graph = runtime.owners.research_graph
+    quest = _quest(runtime, "indexed-selections")
+    _, binding = _parent(runtime, tmp_path)
+    graph.accept_asset_role(binding=binding, role="evidence", quest_ref=quest.quest_ref, idempotency_key="origin")
+    selected = _selection(binding, "one")
+    environment = _environment(graph, key="selected", quest_ref=quest.quest_ref, selections=[selected])
+    unrelated = _environment(graph, key="unrelated", quest_ref=quest.quest_ref,
+        selections=[_selection(binding, "two")])
+    version = graph.register_dataset_version(dataset_ref=_dataset(graph)["dataset_ref"],
+        version_label="unrelated", meaning="Other selected data", selections=[_selection(binding, "empty")],
+        idempotency_key="unrelated-dataset")
+    graph.reference_dataset(dataset_version_ref=version["dataset_version_ref"],
+        question_ref=quest.question_ref, idempotency_key="adopt-unrelated")
+    with runtime._database.write() as connection:
+        connection.execute(text("UPDATE rg_environments SET payload_json='{}' WHERE environment_ref=:ref"),
+            {"ref": unrelated["environment_ref"]})
+        connection.execute(text("UPDATE rg_dataset_versions SET payload_json='{}' WHERE dataset_version_ref=:ref"),
+            {"ref": version["dataset_version_ref"]})
+    assert graph.resolve_resource_selection(content_selection_ref(selected),
+        quest_ref=quest.quest_ref).as_dict() == selected
+    assert graph.resolve_resource_selection(content_selection_ref(_selection(binding, None)),
+        quest_ref=quest.quest_ref) is None
+    # The index is only a lookup hint; it cannot add a scope to the signed record.
+    whole_ref = content_selection_ref(_selection(binding, None))
+    with runtime._database.write() as connection:
+        connection.execute(text("INSERT INTO rg_resource_selections "
+            "(selection_ref,resource_kind,resource_ref) VALUES (:selection,'environment',:resource)"),
+            {"selection": whole_ref, "resource": environment["environment_ref"]})
+    with pytest.raises(OwnerConflict, match="resource_selection_index_invalid"):
+        graph.resolve_resource_selection(whole_ref, quest_ref=quest.quest_ref)
+
+
+@pytest.mark.parametrize("resource_kind", ["environment", "dataset"])
+def test_sibling_selections_authenticate_parent_once_per_resource_operation(runtime, tmp_path, monkeypatch, resource_kind):
+    import meta_research.owners.research_memory as rm
+    graph = runtime.owners.research_graph
+    _, binding = _parent(runtime, tmp_path)
+    selections = [_selection(binding, "one"), _selection(binding, "two/source.py")]
+    verify_metadata = rm._verify_asset_metadata
+    checks = []
+
+    def count_parent_metadata(row, custodies, **kwargs):
+        if row.version_ref == binding.version_ref:
+            checks.append(row.version_ref)
+        return verify_metadata(row, custodies, **kwargs)
+
+    monkeypatch.setattr(rm, "_verify_asset_metadata", count_parent_metadata)
+    if resource_kind == "environment":
+        record = _environment(graph, selections=selections)
+        reader, ref = graph.query_environment, record["environment_ref"]
+    else:
+        record = graph.register_dataset_version(dataset_ref=_dataset(graph)["dataset_ref"],
+            version_label="siblings", meaning="Two scopes in one parent", selections=selections,
+            idempotency_key="siblings")
+        reader, ref = graph.query_dataset_version, record["dataset_version_ref"]
+    assert checks == [binding.version_ref]
+    checks.clear()
+    assert reader(ref) == record
+    assert checks == [binding.version_ref]
+
+    # The second scope is still checked when its parent was already verified.
+    with pytest.raises(OwnerConflict, match="content_selection_not_found"):
+        _environment(graph, key="invalid-second-scope",
+            selections=[_selection(binding, "one"), _selection(binding, "zz-missing")])
+
+
+def test_new_resource_registration_still_checks_current_parent_bytes(runtime, tmp_path):
+    from meta_research.owners.research_memory import _managed_object_candidate
+    graph, memory = runtime.owners.research_graph, runtime.owners.research_memory
+    _, binding = _parent(runtime, tmp_path)
+    selections = [_selection(binding, "one")]
+    _, _, _, manifest = memory._receipt_verifier._asset_export_source(binding.version_ref)
+    sibling = next(entry for entry in manifest["entries"] if entry["path"] == "two/source.py")
+    _managed_object_candidate(memory._object_store, sibling["object_path"]).write_bytes(b"corrupt sibling")
+    with pytest.raises(OwnerConflict, match="asset_custody_unavailable"):
+        _environment(graph, selections=selections)
+    with pytest.raises(OwnerConflict, match="asset_custody_unavailable"):
+        graph.register_dataset_version(dataset_ref=_dataset(graph)["dataset_ref"],
+            version_label="corrupt-parent", meaning="Must retain a complete usable parent",
+            selections=selections, idempotency_key="corrupt-dataset")
+    with runtime._database.read() as connection:
+        assert connection.execute(text("SELECT count(*) FROM rg_resource_selections")).scalar_one() == 0

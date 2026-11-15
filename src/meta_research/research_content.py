@@ -32,8 +32,8 @@ def _read_resource_selection(memory, record, *, source_ref, version_ref, selecti
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 65536:
             raise OwnerConflict("research_content_page_invalid")
         items = []
-        for selection in selections[offset:offset + limit]:
-            description = memory.describe_selection(selection.asset_binding, selection.path)
+        page_selections = selections[offset:offset + limit]
+        for selection, description in zip(page_selections, memory.describe_selections(page_selections)):
             items.append({"selection_ref": content_selection_ref(selection),
                 "selection": selection.as_dict(), "kind": description.kind,
                 "reader": _reader({"source_ref": source_ref, "version_ref": version_ref,

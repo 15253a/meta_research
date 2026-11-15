@@ -20,7 +20,7 @@ def referenced_version(runtime, dataset, question, key, **fields):
               "notes": "", "metadata": {}}
     values.update(fields)
     version = graph.register_dataset_version(dataset_ref=dataset["dataset_ref"],
-        asset_bindings=[binding], idempotency_key=key + "-version", **values)
+        selections=[{"asset_binding": binding.as_dict(), "path": None}], idempotency_key=key + "-version", **values)
     graph.reference_dataset(dataset_version_ref=version["dataset_version_ref"],
         question_ref=question.question_ref, idempotency_key=key + "-reference")
     return version

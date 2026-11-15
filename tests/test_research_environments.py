@@ -104,7 +104,7 @@ def test_new_snapshot_and_machine_adaptation_preserve_original_content_and_usage
     graph.accept_asset_role(binding=original_asset, role="evidence", quest_ref=question.quest_ref,
         idempotency_key="original-origin")
     original = _environment(graph, key="original", semantic_key="simulator:traffic",
-        source="/mnt/simulator on machine A", asset_bindings=[original_asset], quest_ref=question.quest_ref)
+        source="/mnt/simulator on machine A", selections=[{"asset_binding": original_asset.as_dict(), "path": None}], quest_ref=question.quest_ref)
     usage = graph.reference_environment(environment_ref=original["environment_ref"],
         question_ref=question.question_ref, purpose="Original experiment on machine A", idempotency_key="original-use")
     adapted_asset = _asset(runtime, content=b"Simulator adapted for machine B.", key="adapted",
@@ -112,7 +112,7 @@ def test_new_snapshot_and_machine_adaptation_preserve_original_content_and_usage
     graph.accept_asset_role(binding=adapted_asset, role="evidence", quest_ref=question.quest_ref,
         idempotency_key="adapted-origin")
     adapted = _environment(graph, key="adapted", semantic_key=original["semantic_key"],
-        source="/mnt/simulator on machine B", asset_bindings=[adapted_asset],
+        source="/mnt/simulator on machine B", selections=[{"asset_binding": adapted_asset.as_dict(), "path": None}],
         source_environment_ref=original["environment_ref"], quest_ref=question.quest_ref)
     assert adapted["environment_ref"] != original["environment_ref"]
     assert adapted["source_environment_ref"] == original["environment_ref"]
@@ -140,15 +140,15 @@ def test_environment_rejects_forged_exact_content_binding(runtime, field):
             "receipt_subject": ("subject_ref", "asset_version_other"),
             "receipt_issuer": ("issuer", "agent_runtime")}[field]
         binding = replace(binding, receipt=replace(binding.receipt, **{key: value}))
-    with pytest.raises(OwnerConflict, match="asset_receipt"):
-        _environment(graph, asset_bindings=[binding])
+    with pytest.raises(OwnerConflict, match="content_selection_binding_invalid"):
+        _environment(graph, selections=[{"asset_binding": binding.as_dict(), "path": None}])
     assert graph.query_environments()["total"] == 0
 
 
 def test_environment_binding_itself_retains_shared_rm_content(runtime):
     graph = runtime.owners.research_graph
     binding = _asset(runtime)
-    environment = _environment(graph, asset_bindings=[binding])
+    environment = _environment(graph, selections=[{"asset_binding": binding.as_dict(), "path": None}])
     assert graph.query_environment_asset_references(binding.version_ref) == (
         "environment:" + environment["environment_ref"],)
     release = runtime.owners.research_memory.assess_release_eligibility(binding.version_ref,
@@ -192,7 +192,7 @@ def test_real_root_mcp_blocks_foreign_resources_content_and_question_writes(runt
     own = _environment(graph, key="own", quest_ref=one.quest_ref)
     foreign_asset = _asset(runtime)
     graph.accept_asset_role(binding=foreign_asset, role="evidence", quest_ref=two.quest_ref, idempotency_key="foreign-origin")
-    foreign = _environment(graph, key="foreign", quest_ref=two.quest_ref, asset_bindings=[foreign_asset])
+    foreign = _environment(graph, key="foreign", quest_ref=two.quest_ref, selections=[{"asset_binding": foreign_asset.as_dict(), "path": None}])
     gateway = SemanticMcpGateway(environment_operations(graph, agent))
     channel = _channel(gateway, _scope(runtime, quest_ref=one.quest_ref))
     assert _accepted(_call(gateway, channel, "read", environment_ref=own["environment_ref"])) == own
@@ -202,7 +202,7 @@ def test_real_root_mcp_blocks_foreign_resources_content_and_question_writes(runt
         ("reference", dict(environment_ref=foreign["environment_ref"], question_ref=one.question_ref), "asset_quest_scope_invalid"),
         ("reference", dict(environment_ref=own["environment_ref"], question_ref=two.question_ref), "environment_question_scope_invalid"),
         ("register", dict(source_environment_ref=foreign["environment_ref"]), "environment_source_not_found"),
-        ("register", dict(asset_bindings=[foreign_asset.as_dict()]), "asset_quest_scope_invalid"),
+        ("register", dict(selections=[{"asset_binding": foreign_asset.as_dict(), "path": None}]), "asset_quest_scope_invalid"),
     )
     for index, (action, arguments, code) in enumerate(cases):
         if action == "register":
@@ -247,7 +247,7 @@ def test_cross_quest_digital_adoption_needs_every_binding_and_keeps_exact_shared
     for index, binding in enumerate(bindings):
         graph.accept_asset_role(binding=binding, role="evidence", quest_ref=origin.quest_ref,
             idempotency_key=f"digital-origin-{index}")
-    environment = _environment(graph, quest_ref=origin.quest_ref, asset_bindings=bindings)
+    environment = _environment(graph, quest_ref=origin.quest_ref, selections=[{"asset_binding": item.as_dict(), "path": None} for item in bindings])
     assets_before = {item.version_ref for item in memory.query_asset_inventory()}
     gateway = SemanticMcpGateway(environment_operations(graph, agent))
     channel = _channel(gateway, _scope(runtime, quest_ref=destination.quest_ref))
@@ -341,7 +341,7 @@ def test_accepted_target_environment_and_dataset_share_content_and_actual_run(ac
     version = _version(graph, _dataset(graph, "environment-fixtures"), binding, key="environment-fixtures-version")
     environment = _environment(graph, key="completed-environment", quest_ref=own.quest_ref,
         semantic_key="simulator:retained-fixtures", source=refs["target"],
-        asset_bindings=[binding], meaning="Retained simulation fixtures from the actual completed work.")
+        selections=[{"asset_binding": binding.as_dict(), "path": None}], meaning="Retained simulation fixtures from the actual completed work.")
     usage = graph.reference_environment(environment_ref=environment["environment_ref"],
         question_ref=own.question_ref, research_ref=refs["run"], purpose="Reuse the existing simulator fixtures",
         idempotency_key="completed-environment-usage")

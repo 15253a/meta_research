@@ -69,7 +69,7 @@ def _dataset(graph, key="observations"):
 def _version(graph, dataset, binding, *, label="collection-2026", key="version"):
     return graph.register_dataset_version(dataset_ref=dataset["dataset_ref"], version_label=label,
         meaning="First observed collection; qualitative interpretation remains open.",
-        asset_bindings=[binding], notes="One observer did not finish the final visit.", idempotency_key=key)
+        selections=[{"asset_binding": binding.as_dict(), "path": None}], notes="One observer did not finish the final visit.", idempotency_key=key)
 
 
 def test_dataset_is_discoverable_only_after_same_quest_origin_and_reference(runtime):
@@ -103,7 +103,7 @@ def test_dataset_versions_pin_rm_content_and_reject_forged_receipt(runtime):
     assert first.version_ref != second.version_ref
     with pytest.raises(OwnerConflict, match="dataset_semantic_identity_conflict"):
         _version(graph, dataset, second, key="conflict")
-    with pytest.raises(OwnerConflict, match="asset_receipt"):
+    with pytest.raises(OwnerConflict, match="content_selection_binding_invalid"):
         _version(graph, dataset, replace(second, content_hash="0" * 64), label="forged", key="forged")
     assert graph.query_datasets(dataset_ref=dataset["dataset_ref"])["total"] == 2
 
@@ -119,7 +119,7 @@ def test_dataset_version_rejects_inexact_rm_binding(runtime, field):
                       "receipt_subject": ("subject_ref", "asset_version_other"),
                       "receipt_issuer": ("issuer", "agent_runtime")}[field]
         binding = replace(binding, receipt=replace(binding.receipt, **{key: value}))
-    with pytest.raises(OwnerConflict, match="asset_receipt"):
+    with pytest.raises(OwnerConflict, match="content_selection_binding_invalid"):
         _version(graph, dataset, binding)
     assert graph.query_datasets(dataset_ref=dataset["dataset_ref"])["total"] == 0
 
@@ -248,7 +248,7 @@ def test_dataset_mcp_effect_read_reconcile_and_stale_scope(runtime):
     graph.accept_asset_role(binding=binding, role="evidence", quest_ref=question.quest_ref, idempotency_key="mcp-origin")
     version = call("register_version", {"effect_id": "version", "dataset_ref": accepted["dataset_ref"],
         "version_label": "2026-observation", "meaning": "Collected by field observers",
-        "asset_bindings": [binding.as_dict()], "notes": "Uncertain observations retained"})["structuredContent"]["result"]
+        "selections": [{"asset_binding": binding.as_dict(), "path": None}], "notes": "Uncertain observations retained"})["structuredContent"]["result"]
     assert call("register_version.reconcile", {"effect_id": "version"})["structuredContent"]["result"] == version
     usage = call("reference", {"effect_id": "use", "dataset_version_ref": version["dataset_version_ref"],
         "question_ref": question.question_ref, "purpose": "Compare interpretations", "notes": "Do not treat absence as certainty"})["structuredContent"]["result"]

@@ -665,14 +665,13 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
                      ["semantic_key", "name", "meaning"]),
         "register_version": ({"dataset_ref": _string(max_length=1024), "version_label": _string(max_length=1024),
                               "meaning": _string(max_length=65536),
-                              "asset_bindings": {"type": "array", "items": {"type": "object"}},
                               "selections": {"type": "array", "minItems": 1, "maxItems": 256,
                                   "items": {"type": "object", "properties": {
                                       "asset_binding": {"type": "object"},
                                       "path": {"type": ["string", "null"], "minLength": 1, "maxLength": 4096}},
                                       "required": ["asset_binding", "path"], "additionalProperties": False}},
                               "metadata": {"type": "object"}},
-                             ["dataset_ref", "version_label", "meaning"]),
+                              ["dataset_ref", "version_label", "meaning", "selections"]),
         "reference": ({"dataset_version_ref": _string(max_length=1024), "question_ref": _string(max_length=1024),
                        "research_ref": _string(max_length=1024), "purpose": {"type": "string"}},
                       ["dataset_version_ref", "question_ref"]),
@@ -684,7 +683,7 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
     }
     descriptions = {
         "register": "登记可复用的 Dataset 语义身份；semantic_key 由系统统一识别，当前调用的发现与采用范围仍是本 Quest。先检索并复用已有 semantic_key；name、meaning、metadata 和 notes 描述研究含义，实际内容沿 RM 资产绑定保存。",
-        "register_version": "登记不可变 DatasetVersion，绑定当前 Quest 已正式接纳的精确 RM AssetVersion。整个资产使用 asset_bindings，保留 asset_ref、version_ref、content_hash、manifest_hash、receipt 五字段。子范围使用 selections，每项含原 asset_binding 和规范相对 path（null 为整个父资产），asset_bindings 自动推导，无须重复填写。可选择同父的多个文件或目录，父 receipt/hash 不变。返回的 selection_readers 给出准确 content.read 参数和 selection_ref；Target 的 direct_accepted_input_asset_refs 可使用 selection_ref。使用 1–256 个资产或选择；meaning 描述采集、解释和版本含义，随后用 datasets.reference 关联当前 Question。",
+        "register_version": "登记不可变 DatasetVersion，绑定当前 Quest 已正式接纳的精确 RM AssetVersion。统一使用 selections，每项含原 asset_binding（asset_ref、version_ref、content_hash、manifest_hash、receipt 五字段）和规范相对 path；null 表示整个父资产。返回的 asset_bindings 自动推导，不作为登记参数。可选择同父的多个文件或目录，父 receipt/hash 不变。返回的 selection_readers 给出准确 content.read 参数和 selection_ref；Target 的 direct_accepted_input_asset_refs 可使用 selection_ref。使用 1–256 个选择；meaning 描述采集、解释和版本含义，随后用 datasets.reference 关联当前 Question。",
         "reference": "记录本 Quest 的 Question 对精确 DatasetVersion 的使用；该版本的资产须在当前 Quest 的已接纳范围内，可复用身份本身不授予跨 Quest 访问或采用权限。可用 research_ref 关联当前 Quest 已有的 Baseline／Variant／VariantRun／Evaluation／EvaluationAttempt／Target／TargetCommit，以 purpose 和 notes 说明用途。关联表示研究关系，归属、生产、结果与执行授权各按对应 Owner 事实核验。",
         "derive": "Record one exact source DatasetVersion -> retained derived DatasetVersion, for example collection -> cleaned, annotated, combined or split data. Both versions must already bind accepted RM assets; this copies no data. Use multiple edges for multiple sources. Describe processing and provenance under the current Quest's Question. Optional research_ref identifies existing related research, within the current Quest; it is not proof of production or independent verification. Choose useful lineage granularity yourself; registering every file, transient intermediate or processing step is not required. Self-links and provenance cycles are invalid.",
     }
@@ -762,13 +761,10 @@ def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *
         # RG calls this trusted closure inside its fenced writer transaction.
         scope = _dataset_scope(agent_runtime, context)
         if action == "register_version":
-            bindings = payload.get("asset_bindings")
-            if payload.get("selections") is not None:
-                from meta_research.resource_selections import resource_selections
-                _, parents = resource_selections(payload["selections"], asset_bindings=bindings)
-                bindings = [item.as_dict() for item in parents]
-            for binding in bindings or []:
-                research_graph.verify_asset_quest_scope(binding["version_ref"], quest_ref=scope["quest_ref"])
+            from meta_research.resource_selections import resource_selections
+            _, parents = resource_selections(payload["selections"])
+            for binding in parents:
+                research_graph.verify_asset_quest_scope(binding.version_ref, quest_ref=scope["quest_ref"])
         if action in {"reference", "derive"}:
             question = research_graph.query_question_history_by_ref(payload["question_ref"])
             if question is None or question.quest_ref != scope.get("quest_ref"):

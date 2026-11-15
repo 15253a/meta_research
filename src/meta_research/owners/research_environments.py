@@ -10,7 +10,6 @@ import time
 from typing import Protocol
 
 from sqlalchemy import text
-from meta_research.owners.asset_lifecycle import assert_asset_usable
 
 from meta_research.dataset_contract import dataset_asset_binding, dataset_metadata, dataset_text
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash, canonical_json, new_ref
@@ -49,14 +48,14 @@ class ResearchEnvironmentOwnerInterface(Protocol):
 
 
 class ResearchEnvironmentOwnerMixin:
-    def register_environment(self, *, semantic_key, name, meaning, source, asset_bindings=None, selections=None,
+    def register_environment(self, *, semantic_key, name, meaning, source, selections=(),
                              metadata=None, notes="", source_environment_ref=None, quest_ref=None,
                              idempotency_key, effect_scope=None):
         payload = {field: _validate(dataset_text, value, field, optional=field == "notes")
             for field, value in (("semantic_key", semantic_key), ("name", name),
                                  ("meaning", meaning), ("source", source), ("notes", notes))}
         from meta_research.resource_selections import resource_selections
-        selected, bindings = resource_selections(selections, asset_bindings=asset_bindings)
+        selected, bindings = resource_selections(selections)
         payload["selections"] = [item.as_dict() for item in selected]
         payload.update(asset_bindings=[item.as_dict() for item in sorted(bindings, key=lambda item: item.version_ref)],
                        metadata=_validate(dataset_metadata, metadata), origin_quest_ref=quest_ref,
@@ -65,21 +64,10 @@ class ResearchEnvironmentOwnerMixin:
             _validate(dataset_text, quest_ref, "quest_ref")
         if source_environment_ref is not None:
             _validate(dataset_text, source_environment_ref, "source_environment_ref")
-        with self._database.read() as connection:
-            existing = connection.execute(text("SELECT 1 FROM rg_environments WHERE payload_hash=:hash"),
-                {"hash": canonical_hash(payload)}).first()
-        if existing is None:
-            for binding in bindings:
-                self._verify_environment_asset(binding, current=True)
-
         def verify_new():
-            for binding in bindings:
-                self._verify_environment_asset(binding, current=False)
-                with self._database.read() as connection:
-                    assert_asset_usable(connection, binding.version_ref)
             from meta_research.resource_selections import verify_resource_selections
             verify_resource_selections(self._asset_verifier, payload["selections"],
-                                       asset_bindings=payload["asset_bindings"])
+                                       asset_bindings=payload["asset_bindings"], current=True)
 
         return self._accept_environment_fact("register", payload, idempotency_key,
                                              effect_scope=effect_scope, verify_new=verify_new)
@@ -120,11 +108,6 @@ class ResearchEnvironmentOwnerMixin:
                 self.verify_asset_quest_scope(binding["version_ref"], quest_ref=question.quest_ref)
             if payload["research_ref"] is not None:
                 self.verify_dataset_research_ref_scope(payload["research_ref"], quest_ref=question.quest_ref)
-
-    def _verify_environment_asset(self, binding, *, current):
-        verify = self._asset_verifier.verify_asset_binding if current else self._asset_verifier.verify_asset_receipt
-        verify(asset_ref=binding.asset_ref, version_ref=binding.version_ref,
-               content_hash=binding.content_hash, manifest_hash=binding.manifest_hash, receipt=binding.receipt)
 
     def verify_environment_quest_scope(self, environment_ref, *, quest_ref):
         record = self.query_environment(environment_ref)
@@ -168,6 +151,8 @@ class ResearchEnvironmentOwnerMixin:
                     for binding in payload["asset_bindings"]:
                         connection.execute(text("INSERT INTO rg_environment_assets (environment_ref,asset_version_ref) VALUES (:ref,:asset)"),
                                            {"ref": ref, "asset": binding["version_ref"]})
+                    from meta_research.resource_selections import index_resource_selections
+                    index_resource_selections(connection, "environment", ref, payload["selections"])
                 connection.execute(text("UPDATE research_graph_state SET revision=revision+1 WHERE singleton='owner'"))
                 self._feed.record(connection, f"research_graph.environment_{operation}_accepted", {key: ref, "payload_hash": digest})
                 result = {key: ref, **payload, "schema_ref": f"meta-research/environment-{operation}/v2",
@@ -240,8 +225,6 @@ class ResearchEnvironmentOwnerMixin:
                                             {"ref": ref}).scalars().all()
             if sorted(assets) != sorted(item.version_ref for item in bindings):
                 raise OwnerConflict("environment_asset_reference_invalid")
-            for binding in bindings:
-                self._verify_environment_asset(binding, current=False)
             from meta_research.resource_selections import verify_resource_selections
             verify_resource_selections(self._asset_verifier, payload["selections"],
                                        asset_bindings=payload["asset_bindings"])
@@ -261,18 +244,19 @@ class ResearchEnvironmentOwnerMixin:
         if not isinstance(selection_ref, str) or not selection_ref.startswith("content_selection_"):
             return None
         with self._database.read_snapshot() as connection:
-            environments = connection.execute(text("SELECT environment_ref FROM rg_environments")).scalars().all()
-            datasets = connection.execute(text("SELECT dataset_version_ref FROM rg_dataset_versions")).scalars().all()
-            for reader, refs in ((self.query_environment, environments), (self.query_dataset_version, datasets)):
-                for ref in refs:
-                    record = reader(ref, quest_ref=quest_ref)
-                    if record is None:
-                        continue
-                    for value in record["selections"]:
-                        if content_selection_ref(value) == selection_ref:
-                            selection = ContentSelection.from_dict(value)
-                            self.verify_asset_quest_scope(selection.asset_binding.version_ref, quest_ref=quest_ref)
-                            return selection
+            matches = connection.execute(text("SELECT resource_kind, resource_ref FROM rg_resource_selections "
+                "WHERE selection_ref=:ref ORDER BY resource_kind, resource_ref"), {"ref": selection_ref}).all()
+            readers = {"environment": self.query_environment, "dataset_version": self.query_dataset_version}
+            for match in matches:
+                record = readers[match.resource_kind](match.resource_ref, quest_ref=quest_ref)
+                if record is None:
+                    continue
+                for value in record["selections"]:
+                    if content_selection_ref(value) == selection_ref:
+                        selection = ContentSelection.from_dict(value)
+                        self.verify_asset_quest_scope(selection.asset_binding.version_ref, quest_ref=quest_ref)
+                        return selection
+                raise OwnerConflict("resource_selection_index_invalid")
         return None
 
     def query_environment(self, environment_ref, *, quest_ref=None):

@@ -1,4 +1,5 @@
 """Shared immutable selection contracts for Dataset and Environment indexes."""
+from sqlalchemy import text
 from meta_research.content_selection import ContentSelection
 from meta_research.dataset_contract import dataset_asset_binding
 from meta_research.owners.common import OwnerConflict, canonical_hash
@@ -18,10 +19,6 @@ def selection_readers(record, source_ref):
 
 def resource_selections(values, *, asset_bindings=None):
     """Normalize logical selections and derive their retained parent dependencies."""
-    if values is None:
-        if asset_bindings is not None and not isinstance(asset_bindings, (list, tuple)):
-            raise OwnerConflict("resource_selections_invalid")
-        values = [ContentSelection(dataset_asset_binding(value), None) for value in asset_bindings or []]
     if not isinstance(values, (list, tuple)) or len(values) > 256:
         raise OwnerConflict("resource_selections_invalid")
     selections, parents = {}, {}
@@ -44,8 +41,15 @@ def resource_selections(values, *, asset_bindings=None):
     return ordered, bindings
 
 
-def verify_resource_selections(verifier, values, *, asset_bindings):
+def verify_resource_selections(verifier, values, *, asset_bindings, current=False):
     selections, _ = resource_selections(values, asset_bindings=asset_bindings)
-    for selection in selections:
-        verifier.describe_selection(selection.asset_binding, selection.path)
+    verifier.describe_selections(selections, current=current)
     return selections
+
+
+def index_resource_selections(connection, resource_kind, resource_ref, values):
+    """Store lookup hints atomically with the receipt-bound resource record."""
+    for value in values:
+        connection.execute(text("INSERT INTO rg_resource_selections "
+            "(selection_ref, resource_kind, resource_ref) VALUES (:selection, :kind, :resource)"),
+            {"selection": content_selection_ref(value), "kind": resource_kind, "resource": resource_ref})

@@ -72,7 +72,9 @@ def implementation_set_hash(entries):
 
 
 def resolve_local_inputs(document, entries, run):
-    """Resolve only earlier producers in the original declared execution order."""
+    """Resolve earlier producers once into input refs and signed selection scopes."""
+    from meta_research.resource_selections import content_selection_ref
+
     selections = run.get('local_inputs', [])
     if not isinstance(selections, list) or len(selections) > 100:
         raise TargetContentIssue('target_formal_local_input_invalid')
@@ -80,7 +82,7 @@ def resolve_local_inputs(document, entries, run):
     indexes = {item['run_key']: index for index, item in enumerate(declared)
                if isinstance(item, dict) and isinstance(item.get('run_key'), str)}
     current = indexes.get(run.get('run_key'))
-    result = []
+    refs, scopes = [], []
     for choice in selections:
         if (not isinstance(choice, dict) or set(choice) != {'producer_run_key', 'artifact_path'}
                 or not all(isinstance(value, str) and value for value in choice.values())):
@@ -99,26 +101,10 @@ def resolve_local_inputs(document, entries, run):
         if len(matches) != 1:
             raise TargetContentIssue('target_formal_local_input_path_not_bound')
         match = matches[0]
-        if match.get('selection_protocol') == SELECTION_MANIFEST_SCHEMA and match.get('path') is not None:
-            from meta_research.resource_selections import content_selection_ref
-            result.append(content_selection_ref({'asset_binding': match['binding'], 'path': match['path']}))
-        else:
-            result.append(match['binding']['version_ref'])
-    if len(result) != len(set(result)):
+        selection = {'asset_binding': match['binding'], 'path': match['path']}
+        selection_ref = content_selection_ref(selection)
+        refs.append(selection_ref if match['path'] is not None else match['binding']['version_ref'])
+        scopes.append({**choice, **selection, 'selection_ref': selection_ref})
+    if len(refs) != len(set(refs)):
         raise TargetContentIssue('target_formal_local_input_invalid')
-    return result
-
-
-def local_input_selections(document, entries, run):
-    """Record v2 local scopes in the signed Run input contract, alongside refs."""
-    resolve_local_inputs(document, entries, run)
-    from meta_research.resource_selections import content_selection_ref
-    result = []
-    for choice in run.get('local_inputs', []):
-        matches = [entry for entry in entries if entry['declared_relative_path'] == choice['artifact_path']]
-        if len(matches) != 1 or matches[0].get('selection_protocol') != SELECTION_MANIFEST_SCHEMA:
-            continue
-        entry = matches[0]
-        selection = {'asset_binding': entry['binding'], 'path': entry.get('path')}
-        result.append({**choice, **selection, 'selection_ref': content_selection_ref(selection)})
-    return result
+    return refs, scopes

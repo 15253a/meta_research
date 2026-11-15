@@ -147,7 +147,7 @@ def test_bundle_registers_one_original_for_dataset_and_environment_and_successor
         version = _accepted(_call(runtime, channel, "research_graph.datasets.register_version",
             effect_id="observation-version", dataset_ref=dataset["dataset_ref"],
             version_label="first-retained", meaning=candidate["purpose"],
-            asset_bindings=[candidate["asset_binding"]]))["result"]
+            selections=[candidate["selection"]]))["result"]
         reference = _accepted(_call(runtime, channel, "research_graph.datasets.reference",
             effect_id="observation-use", dataset_version_ref=version["dataset_version_ref"],
             question_ref=question_ref, research_ref=handle.target_ref, purpose=candidate["purpose"]))["result"]
@@ -155,7 +155,7 @@ def test_bundle_registers_one_original_for_dataset_and_environment_and_successor
             effect_id="fixture-environment", semantic_key="squared:fixtures",
             name=environment_candidate["name"], meaning=environment_candidate["purpose"],
             source="Retained first simulator run in " + handle.target_ref,
-            asset_bindings=[environment_candidate["asset_binding"]]))["result"]
+            selections=[environment_candidate["selection"]]))["result"]
         environment_reference = _accepted(_call(runtime, channel, "research_graph.environments.reference",
             effect_id="fixture-use", environment_ref=environment["environment_ref"],
             question_ref=question_ref, research_ref=candidate["producers"][0]["subject_ref"],

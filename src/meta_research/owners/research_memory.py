@@ -1442,6 +1442,19 @@ class SQLiteResearchMemoryReceiptVerifier:
         from meta_research.content_selection import ContentSelectionReader
         return ContentSelectionReader(self).describe(binding, path)
 
+    def describe_selections(self, selections, *, current=False):
+        from meta_research.content_selection import ContentSelectionReader
+        return ContentSelectionReader(self).describe_many(selections, current=current)
+
+    def _verify_selection_parent_current(self, source):
+        _description, row, custodies, manifest = source
+        with self._database.read() as connection:
+            assert_asset_usable(connection, row.version_ref)
+        integrity, availability = _asset_current_content_state(
+            self._object_store, row, custodies, manifest, allow_large_linked=True)
+        if integrity != "verified" or availability != "available":
+            raise OwnerConflict("asset_custody_unavailable")
+
     def read_selection_page(self, binding, path=None, *, entry_path=None, offset=0, limit=8192):
         from meta_research.content_selection import ContentSelectionReader
         return ContentSelectionReader(self).read_page(
@@ -1466,16 +1479,20 @@ class SQLiteResearchMemoryReceiptVerifier:
             ).all()
         if row is None:
             raise OwnerConflict("asset_not_found")
-        accepted = _accepted_asset(row, custodies)
-        if row.acceptance_kind != ASSET_RECEIPT_KIND:
-            self.verify_asset_receipt(
-                asset_ref=accepted.asset_ref,
-                version_ref=accepted.version_ref,
-                content_hash=accepted.content_hash,
-                manifest_hash=accepted.manifest_hash,
-                receipt=accepted.receipt,
-            )
         manifest, _ = _verify_asset_metadata(row, custodies)
+        _verify_asset_custody_rows(row, custodies)
+        if row.acceptance_kind == ASSET_RECEIPT_KIND:
+            if row.receipt_hash != _asset_receipt_hash(row, custodies):
+                raise OwnerConflict("asset_receipt_invalid")
+        else:
+            self.verify_asset_receipt(
+                asset_ref=row.asset_ref,
+                version_ref=row.version_ref,
+                content_hash=row.content_hash,
+                manifest_hash=row.manifest_hash,
+                receipt=AcceptanceReceipt(RM_OWNER, row.acceptance_kind, row.receipt_ref,
+                    row.version_ref, row.receipt_hash),
+            )
         if manifest["kind"] == "file" and len(manifest["entries"]) != 1:
             raise OwnerConflict("asset_manifest_invalid")
         description = AssetExportDescription(
@@ -4770,6 +4787,9 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
 
     def describe_selection(self, binding, path=None):
         return self._receipt_verifier.describe_selection(binding, path)
+
+    def describe_selections(self, selections, *, current=False):
+        return self._receipt_verifier.describe_selections(selections, current=current)
 
     def read_selection_page(self, binding, path=None, *, entry_path=None, offset=0, limit=8192):
         page = self._receipt_verifier.read_selection_page(
@@ -11982,6 +12002,12 @@ def _asset_current_state(
         _verify_asset_custody_rows(row, custodies)
     except OwnerConflict:
         return "failed", "unavailable"
+    return _asset_current_content_state(object_store, row, custodies, manifest,
+                                        allow_large_linked=allow_large_linked)
+
+
+def _asset_current_content_state(object_store, row, custodies, manifest, *, allow_large_linked=False):
+    """Check current custody bytes after the caller authenticated parent metadata."""
     entry_count = len(manifest["entries"]) + len(manifest.get("directories", []))
     oversized = int(row.byte_count) > MAX_ASSET_BYTES or entry_count > MAX_ASSET_FILES
     if oversized and not (

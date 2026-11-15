@@ -682,8 +682,8 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         run_ref, attempt_ref = item['variant_run_ref'], item['evaluation_attempt_ref']
         vb = variant_proof['binding_ref'] if item['ordinal'] == 0 else _ref('variant_input', run_ref)
         eb = None if attempt_ref is None else (evaluation_proof['binding_ref'] if item['ordinal'] == 0 else _ref('evaluation_input', attempt_ref))
-        from meta_research.formal_run_bindings import implementation_binding, resolve_local_inputs, local_input_selections
-        local_inputs = resolve_local_inputs(result, entries, item)
+        from meta_research.formal_run_bindings import implementation_binding, resolve_local_inputs
+        local_inputs, selected_local = resolve_local_inputs(result, entries, item)
         input_selection_recorded = item['input_refs'] is not None
         legacy_input_selection = False
         if verify_only and not item['reuse_variant_run']:
@@ -722,7 +722,6 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         }
         inputs['produced_selections'] = produced_selections(entries,
             [*(item.get('artifact_paths') or []), *(item.get('checkpoint_paths') or [])])
-        selected_local = local_input_selections(result, entries, item)
         if selected_local:
             inputs['local_input_selections'] = selected_local
         if not legacy_input_selection:

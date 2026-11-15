@@ -101,7 +101,7 @@ def test_bundle_completed_large_dataset_and_report_feed_dependent_target(tmp_pat
             idempotency_key="workflow-dataset")
         dataset_version = graph_owner.register_dataset_version(dataset_ref=dataset["dataset_ref"],
             version_label="collection-v1", meaning="Exact retained collection including its empty partition.",
-            asset_bindings=[data.binding], idempotency_key="workflow-dataset-version")
+            selections=[{"asset_binding": data.binding.as_dict(), "path": None}], idempotency_key="workflow-dataset-version")
         question, = graph_owner.query_question_tree(quest_ref=graph.quest_ref)
         reference = graph_owner.reference_dataset(dataset_version_ref=dataset_version["dataset_version_ref"],
             question_ref=question.question_ref, purpose="Data produced by the collection execution",

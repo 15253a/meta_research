@@ -49,7 +49,7 @@ def test_retired_root_cannot_commit_any_dataset_effect(runtime, monkeypatch, act
     arguments = {
         "register": dict(semantic_key="scope:late", name="late", meaning="Must reject retired writer"),
         "register_version": dict(dataset_ref=dataset["dataset_ref"], version_label="new",
-            meaning="Must reject retired writer", asset_bindings=[asset.as_dict()]),
+            meaning="Must reject retired writer", selections=[{"asset_binding": asset.as_dict(), "path": None}]),
         "reference": dict(dataset_version_ref=version["dataset_version_ref"], question_ref=question.question_ref),
         "derive": dict(source_dataset_version_ref=version["dataset_version_ref"],
             derived_dataset_version_ref=None if derived is None else derived["dataset_version_ref"],
@@ -106,7 +106,7 @@ def test_dataset_effect_ids_remain_separate_between_operation_families(runtime):
     dataset = _call(gateway, channel, "register", effect_id="same-id", semantic_key="family:dataset",
         name="dataset", meaning="Shared id string is local to an operation family")["structuredContent"]["result"]
     version = _call(gateway, channel, "register_version", effect_id="same-id", dataset_ref=dataset["dataset_ref"],
-        version_label="first", meaning="Exact collection", asset_bindings=[asset.as_dict()])
+        version_label="first", meaning="Exact collection", selections=[{"asset_binding": asset.as_dict(), "path": None}])
     assert not version.get("isError"), version
     assert _call(gateway, channel, "register.reconcile", effect_id="same-id")["structuredContent"]["result"] == dataset
     assert _call(gateway, channel, "register_version.reconcile", effect_id="same-id")["structuredContent"] == version["structuredContent"]

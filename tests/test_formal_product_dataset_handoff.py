@@ -63,12 +63,12 @@ def test_native_formal_product_read_register_reference_and_reconcile(accepted_re
     forged["receipt"]["receipt_ref"] = "rm_receipt_forged"
     invalid = _call(gateway, channel, "research_graph.datasets.register_version", effect_id="forged",
         dataset_ref=dataset["dataset_ref"], version_label="forged", meaning="Must reject altered receipt",
-        asset_bindings=[forged])
-    assert invalid.get("isError") and "receipt" in str(invalid)
+        selections=[{"asset_binding": forged, "path": None}])
+    assert invalid.get("isError") and "content_selection_binding_invalid" in str(invalid)
     assert _counts(runtime) == before
     registered = _accepted(_call(gateway, channel, "research_graph.datasets.register_version",
         effect_id="exact-version", dataset_ref=dataset["dataset_ref"], version_label="retained-v1",
-        meaning="Unchanged real Target output", asset_bindings=[binding]))
+        meaning="Unchanged real Target output", selections=[{"asset_binding": binding, "path": None}]))
     version = registered["result"]
     assert version["asset_bindings"] == [binding]
     reference = _accepted(_call(gateway, channel, "research_graph.datasets.reference",
@@ -87,7 +87,7 @@ def test_native_formal_product_read_register_reference_and_reconcile(accepted_re
     assert denied.get("isError") and "scope" in str(denied)
     denied = _call(gateway, foreign_channel, "research_graph.datasets.register_version", effect_id="foreign-version",
         dataset_ref=dataset["dataset_ref"], version_label="foreign", meaning="Foreign Quest cannot adopt origin",
-        asset_bindings=[binding])
+        selections=[{"asset_binding": binding, "path": None}])
     assert denied.get("isError") and "scope" in str(denied)
     assert _counts(runtime) == before
     next_scope = _scope(runtime, quest_ref=own.quest_ref, run_ref="product-handoff",

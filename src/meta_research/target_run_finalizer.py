@@ -1643,9 +1643,9 @@ class TargetRunFinalizer:
         if len(result_matches) != 1 or result_matches[0].artifact_kind != "file":
             raise OwnerConflict("target_root_result_document_invalid")
         result = _decode_result_document_bytes(result_matches[0].content)
-        retained = _retained_artifact_declarations(result.as_dict())
+        retained = result.domain_fields.get("retained_artifacts", ())
         frozen_roles = {item['declared_relative_path']: item['role'] for item in selections}
-        if any(frozen_roles.get(item.relative_path) != item.role for item in retained):
+        if any(frozen_roles.get(item["relative_path"]) != item["role"] for item in retained):
             raise OwnerConflict("target_root_retained_artifact_unbound")
         return _FrozenWorkspace(
             workspace_ref=workspace_ref,
@@ -1742,7 +1742,8 @@ def _declared_target_completion_candidate(*, handle, evidence, root_descriptor):
         finally:
             os.close(descriptor)
         try:
-            document = _decode_result_document_bytes(raw).as_dict()
+            result = _decode_result_document_bytes(raw)
+            document = result.as_dict()
         except OwnerConflict as error:
             raise DeclaredCandidateIssue(error.code, '$', 'outputs/result.json',
                 getattr(error, 'feedback', 'invalid result declaration (' + error.code + ')')) from error
@@ -1780,7 +1781,7 @@ def _declared_target_completion_candidate(*, handle, evidence, root_descriptor):
                 else:
                     os.close(candidate_fd)
         handoff = _system_target_completion_handoff(handle=handle, evidence=evidence,
-                                                    root_descriptor=root_descriptor, document=document)
+                                                    root_descriptor=root_descriptor, document=result)
         for index, declaration in enumerate(handoff.artifacts):
             try:
                 validate_bundle_relative_path(declaration.relative_path)
@@ -1806,7 +1807,7 @@ def _system_target_completion_handoff(
     handle: TargetWorkHandle,
     evidence: TargetRootCompletionEvidence,
     root_descriptor: int,
-    document: dict | None = None,
+    document: TargetRootResultDocument | None = None,
 ) -> TargetCompletionHandoff:
     """Derive the handoff from declared and conventional descriptor-safe paths."""
 
@@ -1819,10 +1820,11 @@ def _system_target_completion_handoff(
     if document is None:
         descriptor, info = _open_workspace_artifact(root_descriptor, "outputs/result.json")
         try:
-            document = _decode_result_document_bytes(_read_stable_regular_file(descriptor, info)).as_dict()
+            document = _decode_result_document_bytes(_read_stable_regular_file(descriptor, info))
         finally:
             os.close(descriptor)
-    retained = _retained_artifact_declarations(document)
+    retained = document.domain_fields.get("retained_artifacts", ())
+    document = document.as_dict()
     selected_paths = []
     runs = document.get('formal_runs', [])
     for run in runs if isinstance(runs, list) else ():
@@ -1844,7 +1846,7 @@ def _system_target_completion_handoff(
         artifacts[0:0] = [TargetCompletionArtifact(role='implementation', relative_path=path) for path in selected_paths]
     for role, relative_path in _SYSTEM_TARGET_COMPLETION_OPTIONAL_ARTIFACTS:
         if _workspace_artifact_exists(root_descriptor, relative_path):
-            boundaries = _declared_artifact_boundaries(document, relative_path, role)
+            boundaries = _declared_artifact_boundaries(document, retained, relative_path, role)
             paths = (
                 _declared_boundary_artifact_paths(root_descriptor, relative_path, boundaries)
                 if boundaries else _subject_artifact_paths(root_descriptor, relative_path, role)
@@ -1859,7 +1861,11 @@ def _system_target_completion_handoff(
     # Retention purpose is declared independently of the directory convention.
     # One exact path is frozen once; its producing work is resolved by RG from
     # formal_runs, never by these storage-role selections.
-    retained_by_path = {item.relative_path: item for item in retained}
+    retained_by_path = {
+        item["relative_path"]: TargetCompletionArtifact(
+            role=item["role"], relative_path=item["relative_path"])
+        for item in retained
+    }
     artifacts = [retained_by_path.pop(item.relative_path, item) for item in artifacts]
     artifacts.extend(retained_by_path.values())
     by_path = {item.relative_path: item for item in artifacts}
@@ -1890,13 +1896,12 @@ def _system_target_completion_handoff(
     )
 
 
-def _declared_artifact_boundaries(document, relative_path, role):
+def _declared_artifact_boundaries(document, retained, relative_path, role):
     """Honor exact retention and production selections; RG owns attribution."""
     if role not in {'data', 'analysis', 'log', 'checkpoint'}:
         return ()
     selected = []
-    selected.extend(item.relative_path
-                    for item in _retained_artifact_declarations(document))
+    selected.extend(item["relative_path"] for item in retained)
     runs = document.get('formal_runs', [])
     for run in runs if isinstance(runs, list) else ():
         if not isinstance(run, dict) or run.get('status', 'executed') not in ('executed', 'failed'):
@@ -1927,12 +1932,12 @@ def _declared_artifact_boundaries(document, relative_path, role):
     return tuple(sorted(paths))
 
 
-def _retained_artifact_declarations(document):
-    """Validate exact retention selections without dropping invalid declarations."""
+def _validate_retained_artifacts(document):
+    """Validate retention once when decoding this result document's bytes."""
     selected = document.get("retained_artifacts", [])
     if not isinstance(selected, list) or len(selected) > 100:
         raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
-    artifacts, paths = [], set()
+    paths = set()
     for item in selected:
         if (not isinstance(item, dict) or set(item) != {"relative_path", "role"}
                 or not isinstance(item["role"], str)
@@ -1947,8 +1952,6 @@ def _retained_artifact_declarations(document):
                 or path.startswith("outputs/result.json/")):
             raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
         paths.add(path)
-        artifacts.append(TargetCompletionArtifact(role=item["role"], relative_path=path))
-    return tuple(artifacts)
 
 
 def _declared_boundary_artifact_paths(root_descriptor, relative_path, boundaries):
@@ -2305,12 +2308,6 @@ def _publish_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTarget
     return replace(frozen, artifacts=tuple(artifacts))
 
 
-def _remove_frozen_sources(frozen: _FrozenWorkspace) -> None:
-    roots = {artifact.source_path.parent for artifact in frozen.artifacts if artifact.source_path}
-    for root in roots:
-        _remove_frozen_source_root(root)
-
-
 def _remove_frozen_source_root(root: Path) -> None:
     if root.parent.name != ".target-completion-intakes" or root.is_symlink():
         raise OwnerConflict("target_root_artifact_storage_unavailable")
@@ -2642,7 +2639,7 @@ def _target_root_utf8_size(value: str, *, invalid_code: str) -> int:
 def _decode_result_document_value(value: object) -> TargetRootResultDocument:
     if type(value) is not dict or not TARGET_ROOT_REQUIRED_RESULT_DOCUMENT_FIELDS <= set(value):
         raise DeclaredCandidateIssue("target_root_result_document_invalid")
-    _retained_artifact_declarations(value)
+    _validate_retained_artifacts(value)
     schema_ref = value.get("schema_ref")
     metrics = value.get("metrics")
     disposition = value.get("result_disposition")

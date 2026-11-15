@@ -29,7 +29,7 @@ def test_environment_entry_reads_multiple_exact_bindings_and_rejects_foreign_que
             semantic_key="simulator:installed", name="Installed field simulator",
             meaning="A reusable simulator installation with configuration and operating notes.",
             source="/mnt/research/simulator", metadata={"conditions": "Requires a GPU"},
-            asset_bindings=[material, instructions], quest_ref=quest.quest_ref,
+            selections=[{"asset_binding": item.as_dict(), "path": None} for item in (material, instructions)], quest_ref=quest.quest_ref,
             idempotency_key="environment")
         # A newer RM version must not replace the configuration this entry names.
         newer = _asset(runtime, content=b"Different simulator configuration.", key="new-configuration",

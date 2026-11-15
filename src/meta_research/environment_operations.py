@@ -26,15 +26,14 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
                       "selections": {"type": "array", "maxItems": 256, "items": {
                           "type": "object", "properties": {"asset_binding": {"type": "object"},
                               "path": {"type": ["string", "null"], "minLength": 1, "maxLength": 4096}},
-                          "required": ["asset_binding", "path"], "additionalProperties": False}},
-                      "asset_bindings": {"type": "array", "maxItems": 256, "items": {"type": "object"}}},
+                          "required": ["asset_binding", "path"], "additionalProperties": False}}},
                      ["semantic_key", "name", "meaning", "source"]),
         "reference": ({"environment_ref": string, "question_ref": string, "research_ref": string,
                        "purpose": {"type": "string", "maxLength": 65536}},
                       ["environment_ref", "question_ref"]),
     }
     descriptions = {
-        "register": "登记当前 Quest 可复用的 Environment 含义快照。source 写真实来源、持久路径、安装/服务位置或设备设施身份与位置；metadata 保留能力和已知条件。现成资源可直接登记，无需构建 Target、打包或重建配方，asset_bindings 可空。选择已有资产的文件或子目录时用 selections，每项为原 asset_binding 五字段和规范相对 path；path=null 表示整个资产。asset_bindings 由 selections 推导，无须重复填写；同一父版本可有多个子范围，保留父版本原 receipt/hash。成功返回的 selection_readers 给出准确阅读参数和 selection_ref；Target 可把 selection_ref 填入 direct_accepted_input_asset_refs，实际输入采用该范围。本 Target 新建或改动的成果先完成正式交接后登记。数字材料使用当前 Quest 已正式接纳的 RM 精确 binding；说明 hash 不代表实体或服务被冻结或核验。semantic_key 由 Agent 决定；相同内容复用，不同内容形成新的不可变 environment_ref，旧引用不漂移。适配工作用 source_environment_ref 关联原环境，沿既有 Baseline 工作保存。",
+        "register": "登记当前 Quest 可复用的 Environment 含义快照。source 写真实来源、持久路径、安装/服务位置或设备设施身份与位置；metadata 保留能力和已知条件。现成资源可直接登记，无需构建 Target、打包或重建配方，selections 可空。数字材料统一用 selections，每项为原 asset_binding 五字段和规范相对 path；path=null 表示整个资产。返回的 asset_bindings 由 selections 推导，不作为登记参数；同一父版本可有多个子范围，保留父版本原 receipt/hash。成功返回的 selection_readers 给出准确阅读参数和 selection_ref；Target 可把 selection_ref 填入 direct_accepted_input_asset_refs，实际输入采用该范围。本 Target 新建或改动的成果先完成正式交接后登记。数字材料使用当前 Quest 已正式接纳的 RM 精确 binding；说明 hash 不代表实体或服务被冻结或核验。semantic_key 由 Agent 决定；相同内容复用，不同内容形成新的不可变 environment_ref，旧引用不漂移。适配工作用 source_environment_ref 关联原环境，沿既有 Baseline 工作保存。",
         "reference": "关联当前 Quest 的 Question 对已知精确 Environment 索引的用途，research_ref 可关联本 Quest 已有 Baseline/Variant/VariantRun 等实际工作。可引用其他 Quest 的环境；其每个数字 binding 须已在当前 Quest 正式接纳，无数字 binding 的设备设施可直接引用。成功引用后本 Quest 可发现和读取该索引。Target 新产物在正式接纳后与 Dataset 同一整理环节登记。用途记录不表示资源已可用、权限已授予或运行条件已更改；索引不替代实际执行输入绑定或本次选卡与预算配置。",
     }
 

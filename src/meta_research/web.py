@@ -4067,9 +4067,8 @@ async def _process_target_runs(
             if target_ref in cancel_flights:
                 continue
             if asyncio.get_running_loop().time() < next_due.get(target_ref, 0):
-                cancel_reader = getattr(runtime.target_run_runtime, "has_pending_cancel", None)
                 try:
-                    pending_cancel = callable(cancel_reader) and await asyncio.to_thread(cancel_reader, target_ref)
+                    pending_cancel = await asyncio.to_thread(runtime.target_run_runtime.has_pending_cancel, target_ref)
                 except Exception as error:
                     discovery_error = error.code if isinstance(error, OwnerConflict) else type(error).__name__
                     continue

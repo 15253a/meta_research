@@ -73,14 +73,14 @@ def test_index_keeps_two_directory_versions_readable_entry_by_entry(tmp_path, re
             if resource == "datasets":
                 indexed = _read(call, prefix + ".register_version", effect_id=f"version-{ordinal}",
                     dataset_ref=dataset["dataset_ref"], version_label=str(ordinal), meaning=f"Collection {ordinal}",
-                    asset_bindings=[binding.as_dict()])["result"]
+                    selections=[{"asset_binding": binding.as_dict(), "path": None}])["result"]
                 _read(call, prefix + ".reference", effect_id=f"use-{ordinal}", question_ref=question,
                     dataset_version_ref=indexed["dataset_version_ref"])
                 ref = indexed["dataset_version_ref"]
             else:
                 indexed = _read(call, prefix + ".register", effect_id=f"snapshot-{ordinal}",
                     semantic_key="navigation:directory", name="Nested simulator resources", meaning=f"Snapshot {ordinal}",
-                    source="Managed original directory", asset_bindings=[binding.as_dict()])["result"]
+                    source="Managed original directory", selections=[{"asset_binding": binding.as_dict(), "path": None}])["result"]
                 ref = indexed["environment_ref"]
             expected[ref] = (asset.version_ref, note)
 

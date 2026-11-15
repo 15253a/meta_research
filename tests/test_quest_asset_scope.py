@@ -24,7 +24,7 @@ def test_quest_dataset_discovery_and_effects_require_existing_asset_origin(tmp_p
         assert _call(gateway, foreign, "read", dataset_version_ref=version["dataset_version_ref"])["structuredContent"]["status"] == "not_found"
         bad = _call(gateway, foreign, "reference", effect_id="launder", dataset_version_ref=version["dataset_version_ref"], question_ref=two.question_ref)
         assert bad.get("isError"), bad
-        bad = _call(gateway, foreign, "register_version", effect_id="launder-version", dataset_ref=dataset["dataset_ref"], version_label="foreign", meaning="cannot import another Quest", asset_bindings=[asset.as_dict()])
+        bad = _call(gateway, foreign, "register_version", effect_id="launder-version", dataset_ref=dataset["dataset_ref"], version_label="foreign", meaning="cannot import another Quest", selections=[{"asset_binding": asset.as_dict(), "path": None}])
         assert bad.get("isError"), bad
         other_asset = _asset(runtime, content=b"Different Quest material", key="other")
         graph.accept_asset_role(binding=other_asset, role="evidence", quest_ref=two.quest_ref, idempotency_key="other-origin")

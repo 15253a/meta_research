@@ -58,11 +58,11 @@ def _unassessed_inventory(document):
 def _source_inputs(completion, manifest, target, authority, run, *, source_owner,
                    legacy_input_selection=False):
     proofs = projection_plain_value(completion.handle.accepted_input_asset_proofs)
-    from meta_research.formal_run_bindings import manifest_selection_entries, implementation_binding, resolve_local_inputs, local_input_selections
+    from meta_research.formal_run_bindings import manifest_selection_entries, implementation_binding, resolve_local_inputs
     entries = manifest_selection_entries(manifest)
     revision_ref, tree_hash = implementation_binding(entries, run.get('implementation_paths'),
                                                     run.get('implementation_revision_ref'))
-    local_inputs = resolve_local_inputs(manifest.result_document.as_dict(), entries, run)
+    local_inputs, selected_local = resolve_local_inputs(manifest.result_document.as_dict(), entries, run)
     defaults = list(dict.fromkeys([
         *completion.handle.accepted_input_target_commit_refs,
         *(proof["selection_ref"] or proof["asset_ref"] for proof in proofs), manifest.implementation_revision_ref,
@@ -95,7 +95,6 @@ def _source_inputs(completion, manifest, target, authority, run, *, source_owner
     from meta_research.formal_entities import produced_selections
     inputs['produced_selections'] = produced_selections(entries,
         [*(run.get('artifact_paths') or []), *(run.get('checkpoint_paths') or [])])
-    selected_local = local_input_selections(manifest.result_document.as_dict(), entries, run)
     if selected_local:
         inputs["local_input_selections"] = selected_local
     if not legacy_input_selection:

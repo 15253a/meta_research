@@ -10,7 +10,7 @@ import time
 from typing import Protocol
 
 from sqlalchemy import text
-from meta_research.owners.asset_lifecycle import assert_asset_usable, _verified_lifecycle
+from meta_research.owners.asset_lifecycle import _verified_lifecycle
 
 from meta_research.dataset_contract import (
     DATASET_SCHEMA, DATASET_VERSION_SCHEMA, DATASET_REFERENCE_SCHEMA, DATASET_DERIVATION_SCHEMA,
@@ -96,12 +96,12 @@ class ResearchDatasetOwnerMixin:
             {"semantic_key": payload["semantic_key"]}, effect_scope=effect_scope)
 
     def register_dataset_version(self, *, dataset_ref, version_label, meaning,
-                                 asset_bindings=None, selections=None, metadata=None, notes="", idempotency_key, effect_scope=None):
+                                 selections, metadata=None, notes="", idempotency_key, effect_scope=None):
         dataset_text(dataset_ref, "ref")
         if self.query_dataset(dataset_ref) is None:
             raise OwnerConflict("dataset_not_found")
         from meta_research.resource_selections import resource_selections
-        selected, bindings = resource_selections(selections, asset_bindings=asset_bindings)
+        selected, bindings = resource_selections(selections)
         if not selected:
             raise OwnerConflict("dataset_asset_bindings_invalid")
         payload = {
@@ -113,20 +113,10 @@ class ResearchDatasetOwnerMixin:
             "metadata": dataset_metadata(metadata),
             "notes": dataset_text(notes, "notes", optional=True),
         }
-        with self._database.read() as connection:
-            existing = connection.execute(text("SELECT 1 FROM rg_dataset_versions WHERE dataset_ref=:ref AND version_label=:label"),
-                {"ref": dataset_ref, "label": payload["version_label"]}).first()
-        if existing is None:
-            for binding in bindings:
-                self._verify_dataset_asset(binding, current=True)
         def verify_current():
-            for binding in bindings:
-                self._verify_dataset_asset(binding, current=False)
-                with self._database.read() as connection:
-                    assert_asset_usable(connection, binding.version_ref)
             from meta_research.resource_selections import verify_resource_selections
             verify_resource_selections(self._asset_verifier, payload["selections"],
-                                       asset_bindings=payload["asset_bindings"])
+                                       asset_bindings=payload["asset_bindings"], current=True)
         return self._accept_dataset_fact("register_version", payload, idempotency_key,
             {"dataset_ref": dataset_ref, "version_label": payload["version_label"]},
             verify_new=verify_current, effect_scope=effect_scope)
@@ -403,6 +393,8 @@ class ResearchDatasetOwnerMixin:
                     for binding in payload["asset_bindings"]:
                         connection.execute(text("INSERT INTO rg_dataset_version_assets (dataset_version_ref, asset_version_ref) VALUES (:dataset, :asset)"),
                                            {"dataset": ref, "asset": binding["version_ref"]})
+                    from meta_research.resource_selections import index_resource_selections
+                    index_resource_selections(connection, "dataset_version", ref, payload["selections"])
                 connection.execute(text("UPDATE research_graph_state SET revision = revision + 1 WHERE singleton = 'owner'"))
                 self._feed.record(connection, f"research_graph.dataset_{operation}_accepted", {key: ref, "payload_hash": payload_hash})
                 result = {"schema_ref": schema, key: ref, **payload, "payload_hash": payload_hash,
@@ -446,8 +438,6 @@ class ResearchDatasetOwnerMixin:
                 assets = connection.execute(text("SELECT asset_version_ref FROM rg_dataset_version_assets WHERE dataset_version_ref = :ref"), {"ref": mapping[key]}).scalars().all()
             if sorted(assets) != sorted(binding.version_ref for binding in bindings):
                 raise OwnerConflict("dataset_asset_reference_invalid")
-            for binding in bindings:
-                self._verify_dataset_asset(binding, current=False)
             from meta_research.resource_selections import verify_resource_selections
             verify_resource_selections(self._asset_verifier, payload["selections"],
                                        asset_bindings=payload["asset_bindings"])

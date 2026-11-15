@@ -39,6 +39,9 @@ def test_failed_target_stays_unavailable_while_retry_is_pending(
                 return tuple(sorted(active))
 
     class TargetRuntime:
+        def has_pending_cancel(self, target_ref: str) -> bool:
+            return False
+
         def process_once(self, target_ref: str) -> bool:
             with lock:
                 calls[target_ref] = calls.get(target_ref, 0) + 1
@@ -114,6 +117,9 @@ def test_retired_target_no_longer_keeps_worker_unavailable() -> None:
             return () if retired.is_set() else ("target-retired",)
 
     class TargetRuntime:
+        def has_pending_cancel(self, target_ref: str) -> bool:
+            return False
+
         def process_once(self, target_ref: str) -> bool:
             assert target_ref == "target-retired"
             retired.set()

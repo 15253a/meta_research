@@ -9773,39 +9773,12 @@ class SQLiteTargetExecutionAdmissionVerifier:
             raise OwnerConflict("target_execution_upstream_input_unavailable")
         resolved: list[AcceptedTargetExecutionInputFile] = []
         for ordinal, proof in enumerate(handle.accepted_input_asset_proofs, 1):
-            selection_ref = getattr(proof, "selection_ref", None)
-            if selection_ref is None:
-                asset, _proof_receipt, _file_name, content = self._research_memory.materialize_input_asset(
-                    target_ref=handle.target_ref,
-                    asset_ref=proof.asset_ref,
-                )
-            else:
-                import io
-                import zipfile
-                from meta_research.content_selection import ContentSelection
-                from meta_research.resource_selections import content_selection_ref
-                asset, _receipt, _description = self._research_memory.describe_input_asset(
-                    target_ref=handle.target_ref, asset_ref=proof.asset_ref)
-                selection = ContentSelection(asset, proof.selection_path)
-                if (asset.version_ref != proof.asset_version_ref
-                        or content_selection_ref(selection) != selection_ref):
-                    raise OwnerConflict("target_execution_input_manifest_invalid")
-                with TemporaryDirectory(prefix="target-selected-input-") as temporary:
-                    exported = self._research_memory.export_selection(
-                        asset, proof.selection_path, Path(temporary) / "content")
-                    if exported.description.kind == "file":
-                        content = exported.path.read_bytes()
-                    else:
-                        # This execution port accepts files. Encode only the chosen
-                        # tree, preserving empty directories, as its payload.
-                        buffer = io.BytesIO()
-                        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
-                            for directory in exported.description.directories:
-                                archive.writestr(zipfile.ZipInfo(directory + "/"), b"")
-                            for entry in exported.description.entries:
-                                archive.writestr(zipfile.ZipInfo(entry.path),
-                                                 (exported.path / entry.path).read_bytes())
-                        content = buffer.getvalue()
+            if proof.selection_ref is not None:
+                raise OwnerConflict("target_execution_selection_unsupported")
+            asset, _proof_receipt, _file_name, content = self._research_memory.materialize_input_asset(
+                target_ref=handle.target_ref,
+                asset_ref=proof.asset_ref,
+            )
             relative_path = (
                 "direct/"
                 f"{ordinal:04d}-"
