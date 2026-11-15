@@ -767,6 +767,12 @@ def start_rolling_strategy(
     )
 
 
+def is_strategy_synthesis_update(update: FormalStrategyUpdate) -> bool:
+    """Closing prose may advance a sealed head without changing its work."""
+    return (not update.candidates and update.update.strategy_complete
+            and isinstance(update.notes, str) and bool(update.notes.strip()))
+
+
 def apply_strategy_update(
     state: RollingStrategyState,
     update: FormalStrategyUpdate,
@@ -778,7 +784,7 @@ def apply_strategy_update(
 
     _validate_state(state, completion_contract)
     _validate_update_pair(update, completion_contract)
-    if state.strategy.strategy_complete:
+    if state.strategy.strategy_complete and not is_strategy_synthesis_update(update):
         raise BundleTargetContractError("completed_strategy_is_immutable")
     if update.update.revision <= state.strategy.revision:
         raise BundleTargetContractError("strategy_revision_not_monotonic")
@@ -884,7 +890,9 @@ def rolling_strategy_state_from_dict(
     _validate_state(result, completion_contract)
     if previous_state is not None:
         _validate_state(previous_state, completion_contract)
-        if previous_state.strategy.strategy_complete:
+        if previous_state.strategy.strategy_complete and (
+            not result.strategy.strategy_complete or result.candidates != previous_state.candidates
+        ):
             raise BundleTargetContractError("completed_strategy_is_immutable")
         if result.strategy.revision <= previous_state.strategy.revision:
             raise BundleTargetContractError("strategy_revision_not_monotonic")

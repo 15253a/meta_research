@@ -1546,6 +1546,16 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, run_ref: str
     ) -> tuple[BundleDispatchDecision, ...]: ...
 
+    def verify_bundle_replan_correction_source(
+        self, *, run_ref: str, attempt_ref: str, fence_ref: str,
+        graph_ref: str, decision_ref: str,
+    ) -> dict[str, str] | None: ...
+
+    def bundle_replan_synthesis_pending(
+        self, *, run_ref: str, attempt_ref: str, fence_ref: str,
+        notes_source_ref: str | None,
+    ) -> bool: ...
+
     def record_bundle_target_proposal(
         self,
         *,
@@ -9409,6 +9419,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     + ". Reconcile original external effects before repeating them."
                     if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
+                    "bundle_replan_work_already_complete": "当前 Plan 的工作已全部完成。研究问题尚未解决，不代表本轮工作未完成。请整理结果、局限和后续建议，正常结束 Bundle，交给 Reasoning 综合。",
+                    "bundle_completion_synthesis_missing": "本轮工作已全部完成，但仍缺少完整收尾说明。请在正常收尾的 notes 中说明结果、局限和后续建议，再交给 Reasoning 综合；保留已接纳的结果，不重复 Target。",
                     "bundle_operation_inputs_changed": "旧输出针对旧 frontier/state/commit 快照；根据当前快照重新判断并保留已接纳事实。这表示决策输入已变化，不表示科学证据无效或输出格式错误。",
                     "quest_time_budget_exhausted": "这是旧版把建议预算当作门槛的历史拒绝，保留原记录。当前预算仅供规划；读取 advancement_engine.research_time.read 如实记录用时与偏差，按研究价值在既有资源和权限内继续，不需先申请延期，也不因此强制等待或收口。原操作先对账，避免重复已发工作。",
                     "quest_time_budget_unconfirmed": "这是旧版因计时缺证而拒绝研究的历史记录。保留未知区间，不猜测余额；读取 advancement_engine.research_time.read 并在既有资源和权限内继续。计时未知本身不要求延期批准、等待或收口；原操作先对账，避免重复已发工作。",
@@ -20553,6 +20565,110 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             ).all()
         return tuple(_bundle_dispatch_decision(row) for row in rows)
 
+    def verify_bundle_replan_correction_source(
+        self, *, run_ref: str, attempt_ref: str, fence_ref: str,
+        graph_ref: str, decision_ref: str,
+    ) -> dict[str, str] | None:
+        """Authenticate an uncorrected original decision across Root recovery."""
+        with self._database.read() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref)
+            _require_bundle_rolling_fence(connection, run, attempt, fence)
+            row = connection.execute(text(
+                "SELECT * FROM ar_bundle_dispatch_decisions WHERE run_ref=:run "
+                "ORDER BY generation DESC LIMIT 1"), {"run": run_ref}).first()
+            if row is None:
+                raise OwnerConflict("bundle_replan_correction_source_invalid")
+            decision = _bundle_dispatch_decision(row)
+            if (run.stage != "bundle" or decision.decision_ref != decision_ref
+                    or decision.action != "replan_required"
+                    or decision.graph_ref != graph_ref
+                    or not _target_frontier_dispatch_lineage_is_current(
+                        connection, stage_run=run, dispatch=decision)):
+                raise OwnerConflict("bundle_replan_correction_source_invalid")
+            source_run, source_attempt, _source_session, source_fence = _load_stage_fence(
+                connection, run_ref, decision.attempt_ref, decision.fence_ref)
+            primary, _ = _provider_invocations(connection, source_run, source_attempt, source_fence)
+            operation_ref = primary.operation_ref
+            batch = decision.state.get("batch_replan")
+            if batch is None:
+                operation_name = f"dispatch-{decision.generation}"
+            else:
+                if (not isinstance(batch, dict)
+                        or type(batch.get("base_generation")) is not int
+                        or batch["base_generation"] < 0
+                        or batch.get("schema_ref") != "meta-research/bundle-batch-replan-source/v1"
+                        or batch.get("provider_operation_ref") != operation_ref
+                        or batch.get("operation_name") != f"target-batch-{batch['base_generation'] + 1}"):
+                    raise OwnerConflict("bundle_replan_correction_source_invalid")
+                operation_name = batch["operation_name"]
+            unit_ref = _bundle_rolling_provider_unit_ref(
+                operation_ref=operation_ref, operation_name=operation_name, attempt_ref=decision.attempt_ref)
+            unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:ref"),
+                {"ref": unit_ref}).first()
+            if (unit is None or unit.run_ref != run_ref or unit.attempt_ref != decision.attempt_ref
+                    or unit.fence_ref != decision.fence_ref or unit.operation_ref != operation_ref
+                    or unit.unit_kind != "bundle_review" or unit.status != "completed"
+                    or (batch is not None and batch.get("provider_unit_ref") != unit_ref)):
+                raise OwnerConflict("bundle_replan_correction_source_invalid")
+            for correction, point in _bundle_replan_correction_points(connection, run, attempt, session):
+                if (correction.rejected_generation >= source_attempt.generation
+                        and point.get("provider_operation_ref") == operation_ref
+                        and point.get("provider_unit_ref") == _bundle_rolling_provider_unit_ref(
+                            operation_ref=operation_ref, operation_name=operation_name,
+                            attempt_ref=correction.attempt_ref)):
+                    return None
+            if decision.native_session_ref != session.native_session_ref:
+                raise OwnerConflict("bundle_replan_correction_source_invalid")
+            # Reprove the old signed output under the current fence. Never
+            # reopen its retired unit or substitute the current provider job.
+            correction_unit = _bundle_rolling_provider_unit_ref(
+                operation_ref=operation_ref, operation_name=operation_name, attempt_ref=attempt_ref)
+            return {"unit_ref": correction_unit, "operation_ref": operation_ref,
+                "operation_name": operation_name, "native_session_ref": decision.native_session_ref}
+
+    def bundle_replan_synthesis_pending(
+        self, *, run_ref: str, attempt_ref: str, fence_ref: str,
+        notes_source_ref: str | None,
+    ) -> bool:
+        """Derive an outstanding synthesis from retained correction history.
+
+        Later transport/format corrections or a native replacement must not
+        erase this obligation. The caller supplies the notes source already
+        authenticated by RG's current report contract; AR verifies its issuer
+        and that the synthesis follows the most recent full-coverage rejection.
+        """
+        with self._database.read_snapshot() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref)
+            if (run.stage != "bundle" or run.current_attempt_ref != attempt_ref
+                    or run.current_fence_ref != fence_ref):
+                raise OwnerConflict("bundle_replan_synthesis_source_invalid")
+            points = _bundle_replan_correction_points(connection, run, attempt, session)
+            if not points:
+                return False
+            rejected_generation = points[-1][0].rejected_generation
+            row = connection.execute(text("SELECT * FROM ar_bundle_target_proposals WHERE proposal_ref=:ref"),
+                {"ref": notes_source_ref}).first()
+            if row is None:
+                return True
+            proposal = _bundle_target_proposal(row)
+            _source_run, source_attempt, source_session, _source_fence = _load_stage_fence(
+                connection, proposal.run_ref, proposal.attempt_ref, proposal.fence_ref)
+            if proposal.run_ref != run_ref or source_session.session_ref != session.session_ref:
+                raise OwnerConflict("bundle_replan_synthesis_source_invalid")
+            self.verify_bundle_target_proposal_receipt(
+                proposal_ref=proposal.proposal_ref, run_ref=run_ref,
+                attempt_ref=proposal.attempt_ref, fence_ref=proposal.fence_ref,
+                graph_ref=proposal.graph_ref, base_generation=proposal.base_generation,
+                base_head_receipt=proposal.base_head_receipt, proposal_hash=proposal.proposal_hash,
+                receipt=proposal.receipt, require_checkpoint_current=False,
+            )
+            notes = proposal.proposal["strategy_update"].get("notes")
+            return not (rejected_generation < source_attempt.generation <= attempt.generation
+                and proposal.strategy_complete and not proposal.targets
+                and isinstance(notes, str) and bool(notes.strip()))
+
     def record_bundle_target_proposal(
         self,
         *,
@@ -24427,6 +24543,60 @@ def _load_stage_fence(connection, run_ref: str, attempt_ref: str, fence_ref: str
     ):
         raise OwnerConflict("attempt_fence_invalid")
     return run, attempt, session, fence
+
+
+def _bundle_replan_correction_points(connection, run, attempt, session):
+    """Authenticate retained full-coverage corrections for this logical Root."""
+    run_ref = run.run_ref
+    corrections = connection.execute(text(
+        "SELECT s.*, x.retired_attempt_ref, a.generation AS rejected_generation, "
+        "a.fence_ref AS retired_fence_ref, a.root_session_ref AS retired_root_ref, "
+        "n.generation AS successor_generation, n.root_session_ref AS successor_root_ref "
+        "FROM ar_stage_attempt_replacements x "
+        "JOIN ar_stage_attempts a ON a.attempt_ref=x.retired_attempt_ref AND a.run_ref=x.run_ref "
+        "JOIN ar_stage_attempts n ON n.attempt_ref=x.replacement_attempt_ref AND n.run_ref=x.run_ref "
+        "LEFT JOIN ar_safe_points s ON s.safe_point_ref=(SELECT p.safe_point_ref "
+        "FROM ar_safe_points p WHERE p.run_ref=x.run_ref AND p.attempt_ref=x.retired_attempt_ref "
+        "ORDER BY p.created_at DESC LIMIT 1) "
+        "WHERE x.run_ref=:run AND x.reason_code='provider_result_correction' "
+        "AND a.generation<:generation ORDER BY a.generation"
+    ), {"run": run_ref, "generation": attempt.generation}).all()
+    verified = []
+    for row in corrections:
+        try:
+            point = decoded_object(row.checkpoint_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("bundle_replan_synthesis_source_invalid") from error
+        if (canonical_hash(point) != row.checkpoint_hash
+                or point.get("schema_ref") != "meta-research/runtime-safe-point/v1"
+                or point.get("action") != "provider_result_correction"
+                or point.get("operation_ref") != row.operation_ref
+                or point.get("run_kind") != "bundle_stage"
+                or point.get("run_ref") != run_ref or row.run_ref != run_ref
+                or point.get("root_session_ref") != session.session_ref
+                or row.root_session_ref != session.session_ref
+                or row.retired_root_ref != session.session_ref
+                or row.successor_root_ref != session.session_ref
+                or point.get("attempt_ref") != row.retired_attempt_ref
+                or row.attempt_ref != row.retired_attempt_ref
+                or point.get("fence_ref") != row.retired_fence_ref
+                or row.fence_ref != row.retired_fence_ref
+                or row.successor_generation != row.rejected_generation + 1
+                or not isinstance(point.get("provider_exit"), dict)):
+            raise OwnerConflict("bundle_replan_synthesis_source_invalid")
+        if point["provider_exit"].get("contract_failure_detail_code") != "bundle_replan_work_already_complete":
+            continue
+        unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:ref"),
+            {"ref": point.get("provider_unit_ref")}).first()
+        if (unit is None or unit.run_ref != run_ref or unit.attempt_ref != row.attempt_ref
+                or unit.fence_ref != row.fence_ref or unit.unit_kind != "bundle_review"
+                or unit.operation_ref != point.get("provider_operation_ref")
+                or point.get("failure") != {"code": "bundle_review_result_contract_invalid"}):
+            raise OwnerConflict("bundle_replan_synthesis_source_invalid")
+        _validated_stage_provider_hard_ceiling(unit_kind=unit.unit_kind,
+            failure_code="bundle_review_result_contract_invalid", provider_exit=point["provider_exit"])
+        verified.append((row, point))
+    return verified
 
 
 _CORRECTION_ANCESTRY_SQL = (

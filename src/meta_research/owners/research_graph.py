@@ -47,6 +47,7 @@ from meta_research.bundle_target_contract import (
     RollingStrategyState,
     TargetMeasurementContractCandidate,
     apply_strategy_update,
+    is_strategy_synthesis_update,
     completion_contract_hash,
     formal_target_candidate_from_dict,
     measurement_contract_from_dict,
@@ -1843,6 +1844,8 @@ class ResearchGraphInterface(ResearchLiteratureOwnerInterface, ResearchEnvironme
     def verify_formal_plan_content_acceptance(self, **values) -> None: ...
 
     def query_bundle_report_contract(self, **values) -> dict[str, object]: ...
+
+    def query_bundle_remaining_work(self, graph_ref: str) -> tuple[str, ...]: ...
 
     def query_target_formal_plan_projection_source(
         self, **values: object
@@ -12425,6 +12428,54 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         with self._database.read_snapshot():
             return self._receipt_verifier.query_bundle_report_contract(**values)
 
+    def query_bundle_remaining_work(self, graph_ref: str) -> tuple[str, ...]:
+        """Read unfinished frozen Plan work from verified accepted Target results.
+
+        A launch frontier only describes work that can start now. The report's
+        own cell aggregation determines completion even before the root seals
+        its strategy, including required cells that have no Target yet.
+        """
+        from meta_research.bundle_completion import result_sets
+
+        with self._database.read_snapshot() as connection:
+            row = connection.execute(text(
+                "SELECT request_ref FROM rg_target_graphs WHERE graph_ref=:ref"
+            ), {"ref": graph_ref}).first()
+            if row is None:
+                raise OwnerConflict("target_graph_missing")
+            graph = self.query_target_graph(row.request_ref)
+            if graph is None or graph.graph_ref != graph_ref:
+                raise OwnerConflict("bundle_report_contract_invalid")
+            source = self.query_formal_plan_content_acceptance(graph.formal_plan_ref)
+            projection = self.query_target_formal_plan_projection(graph_ref=graph_ref)
+            if source is None or projection is None:
+                raise OwnerConflict("target_formal_plan_projection_invalid")
+            contract = self.query_bundle_report_contract(
+                request_ref=graph.request_ref,
+                run_ref=graph.run_ref,
+                graph_ref=graph_ref,
+                head_receipt=graph.head_receipt,
+                formal_plan_content_receipt=source.receipt,
+                formal_plan_projection_receipt=projection.receipt,
+            )
+            accepted: dict[str, AcceptedMeasurementClosure] = {}
+            for commit in self.query_target_commits(graph_ref):
+                transition = self.query_target_frontier_commit_transition(commit.target_ref)
+                if transition is None:
+                    raise OwnerConflict("bundle_report_target_commit_invalid")
+                accepted[commit.target_ref] = transition.canonical_terminal
+            self.verify_bundle_report_target_commits(
+                graph_ref=graph_ref,
+                closures=tuple(accepted.values()),
+                receipts=None,
+                head_receipt=graph.head_receipt,
+            )
+            try:
+                _realized, remaining = result_sets(contract["plan"], accepted)
+            except BundleProtocolError as error:
+                raise OwnerConflict("bundle_report_contract_invalid") from error
+            return remaining
+
     def query_target_formal_plan_projection_source(
         self, **values: object
     ) -> dict[str, object]:
@@ -15164,8 +15215,6 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             or base_generation != graph.head_generation
         ):
             raise OwnerConflict("target_graph_append_base_stale")
-        if graph.strategy_complete:
-            raise OwnerConflict("target_graph_strategy_complete")
         verified = self._stage_request_verifier.query_verified_bundle_stage_request(
             request_ref=graph.request_ref,
             context_pack_ref=graph.context_pack_ref,
@@ -15202,6 +15251,8 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 update_value,
                 completion_contract=completion,
             )
+            if graph.strategy_complete and not is_strategy_synthesis_update(update):
+                raise OwnerConflict("target_graph_strategy_complete")
             if update.update.revision != state.strategy.revision + 1:
                 raise BundleTargetContractError("strategy_revision_not_monotonic")
             target_values = (
@@ -15348,7 +15399,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     or current_receipt_hash != graph.head_receipt.payload_hash
                 ):
                     raise OwnerConflict("target_graph_append_base_stale")
-                if current_complete:
+                if current_complete and not is_strategy_synthesis_update(update):
                     raise OwnerConflict("target_graph_strategy_complete")
                 existing_rows = connection.execute(
                     text(
@@ -19811,7 +19862,7 @@ def _target_graph_head(
             != head.receipt.receipt_ref
             or append_row.predecessor_head_receipt_hash
             != head.receipt.payload_hash
-            or head.strategy_complete
+            or (head.strategy_complete and not is_strategy_synthesis_update(update))
             or validated_proposal_hash != append_row.proposal_hash
             or proposal.get("graph_ref") != graph_row.graph_ref
             or proposal.get("base_generation") != expected_generation - 1

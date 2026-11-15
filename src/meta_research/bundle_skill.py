@@ -1765,6 +1765,13 @@ def _bundle_output_assembly_prompt() -> str:
 def _provider_correction_prompt(feedback: dict[str, object] | None) -> str:
     if not feedback:
         return ""
+    if feedback.get("detail_code") in {"bundle_replan_work_already_complete", "bundle_completion_synthesis_missing"}:
+        return (
+            "继续原 Bundle Root 的 native Session，根据当前冻结 Plan 和正式接纳的 Target 结果重新判断。"
+            "原决定和实验结果保持原样；不要重复已完成的 Target。按照 Owner 反馈，"
+            "通过现有最终综合、资源整理和原生独立审阅流程，提交完整 notes 与正常收尾。\n"
+            f"provider_correction_feedback={canonical_json(feedback)}"
+        )
     return (
         "上一份输出未被接纳。继续当前 native Session，结合保留的上一份输出和下列 "
         "Owner 反馈作局部修正，保留已接纳的 Target/Commit 与冻结研究合同。"
