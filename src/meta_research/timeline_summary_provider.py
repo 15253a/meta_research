@@ -6,10 +6,8 @@ from pathlib import Path
 
 from meta_research.owners.common import canonical_hash
 from meta_research.quest_drafting import (
-    PROVIDER_STREAM_MAX_BYTES,
     CodexDraftingAdapter,
     DraftingUnavailable,
-    _read_bounded_text,
     _read_drafting_invocation,
     _read_durable_job,
 )
@@ -24,6 +22,22 @@ _EMPTY_SENTENCE = {
     "zh": "暂时没有这个阶段的工作记录。",
     "en": "No work has been recorded for this stage yet.",
 }
+
+
+class TimelineSummaryBatchError(DraftingUnavailable):
+    """Verified rows and actionable failures from one recorder observation."""
+
+    def __init__(self, *, summaries, failures, native_session_ref, next_scan_seconds=300,
+                 code="timeline_summary_output_invalid"):
+        super().__init__(code, native_session_ref=native_session_ref)
+        self.summaries = summaries
+        self.failures = failures
+        self.next_scan_seconds = next_scan_seconds
+
+
+class _NodeValidationError(Exception):
+    def __init__(self, code, message, source_refs=()):
+        self.feedback = {"code": code, "source_refs": list(source_refs), "message": message}
 
 
 class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
@@ -68,7 +82,8 @@ class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
         ]
         intro = "你是本 Quest 的研究记录员，为本批每个节点说明它做了什么。" if native_session_ref is None else "按当前记录员说明，更新本批节点的工作介绍。"
         prompt = (
-            intro + f" 调用 {READ_SOURCE}，用 node_key、source_ref 阅读本次观察的必要正文；"
+            intro + f" 可按需要调用 {READ_SOURCE}，用 node_key、source_ref 阅读资料正文；"
+            "若节点有 retry_feedback，按其中的原因修正结构或引用；只返回本次请求的节点。"
             "非空 next_offset 表示仍有后文，可继续读取。按已加载 Skill 的“每轮先讲本轮重点”要求，"
             "每个 Cycle 的第一句先说明当前 cycle_focus，再讲工作和结果。"
             "按 output_language 用自然连贯的人话讲清楚，让非专业读者一遍读懂；"
@@ -85,7 +100,7 @@ class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
                 request_hash=canonical_hash(basis),
                 environment={"META_RESEARCH_MCP_TOKEN": grant.token},
             )
-        return self._result(job_ref, raw, native, basis, native_session_ref)
+        return self._result(raw, native, basis, native_session_ref)
 
     def recover_summaries(self, job):
         basis = _basis(job["quest_ref"], job["nodes"], job["observed_at"], job["output_language"])
@@ -98,9 +113,9 @@ class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
         ):
             raise DraftingUnavailable("codex_job_spool_conflict")
         raw, native = _read_durable_job(directory, invocation)
-        return self._result(job["job_ref"], raw, native, basis, job["native_session_ref"])
+        return self._result(raw, native, basis, job["native_session_ref"])
 
-    def _result(self, job_ref, raw, native, basis, expected_native):
+    def _result(self, raw, native, basis, expected_native):
         if (
             not isinstance(native, str)
             or not native.strip()
@@ -108,11 +123,7 @@ class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
             and native != expected_native
         ):
             raise DraftingUnavailable("timeline_summary_session_invalid")
-        stdout = _read_bounded_text(
-            self._durable_job_directory(job_ref) / "stdout.jsonl", PROVIDER_STREAM_MAX_BYTES
-        )
-        bodies = _read_bodies(stdout, basis, native)
-        rows = _validate(raw, basis, bodies, native)
+        rows = _validate(raw, basis, native)
         interval = raw["next_scan_seconds"]
         return rows, native, interval if type(interval) is int and 300 <= interval <= 7200 else 300
 
@@ -179,179 +190,88 @@ def _output_schema(count, maximum_length):
     }
 
 
-def _read_bodies(stdout, basis, native):
-    # Use the original provider output, including on recovery. Only successful pages
-    # of this root's reader count. The temporary spool already records those calls.
-    nodes = {n["node_key"]: n for n in basis["nodes"]}
-    pages, failed = {}, set()
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if (
-            not isinstance(item, dict)
-            or item.get("type") != "mcp_tool_call"
-            or item.get("server") != "meta_research"
-            or item.get("tool") != READ_SOURCE
-        ):
-            continue
-        args = item.get("arguments")
-        if not isinstance(args, dict):
-            continue
-        key, ref = args.get("node_key"), args.get("source_ref")
-        if not isinstance(key, str) or not isinstance(ref, str):
-            continue
-        node = nodes.get(key)
-        if not node or not any(s["ref"] == ref for s in node["sources"]):
-            continue
-        origin = (key, ref)
-        result = item.get("result") or {}
-        if (
-            item.get("status") != "completed"
-            or result.get("isError")
-            or result.get("is_error")
-            or item.get("error")
-        ):
-            failed.add(origin)
-            continue
-        # Codex retains MCP text content even when the native event omits structuredContent.
-        try:
-            page = json.loads(result["content"][0]["text"])
-            if (
-                page["source_hash"] != node["source_hash"]
-                or page["node_key"] != key
-                or page["source_ref"] != ref
-                or page["offset"] != args.get("offset", 0)
-                or not isinstance(page["text"], str)
-            ):
-                continue
-            pages.setdefault(origin, {})[page["offset"]] = page
-        except (ValueError, KeyError, TypeError, IndexError):
-            failed.add(origin)
-    bodies = {}
-    for origin, chunks in pages.items():
-        # A segment may be sufficient for ordinary progress. Only a full body
-        # can establish the empty-stage or accepted-claim qualifications.
-        bodies[origin] = None
-        offset, parts = 0, []
-        while offset in chunks:
-            page = chunks[offset]
-            parts.append(page["text"])
-            if page["next_offset"] is None:
-                body = json.loads("".join(parts))
-                if isinstance(body, dict):
-                    bodies[origin] = body
-                    failed.discard(origin)
-                break
-            if not page["text"] or page["next_offset"] != offset + len(page["text"]):
-                break
-            offset = page["next_offset"]
-    if failed:
-        raise DraftingUnavailable("timeline_summary_source_unavailable", native_session_ref=native)
-    return bodies
-
-
-def _validate(raw, basis, bodies, native):
-    def invalid():
-        return DraftingUnavailable("timeline_summary_output_invalid", native_session_ref=native)
-
-    if not isinstance(raw, dict) or set(raw) != {"summaries", "next_scan_seconds"}:
-        raise invalid()
+def _validate(raw, basis, native):
     nodes = {node["node_key"]: node for node in basis["nodes"]}
-    rows = raw["summaries"]
-    if not isinstance(rows, list) or len(rows) != len(nodes):
-        raise invalid()
-    results = {}
-    language = basis["output_language"]
-    # The same source may legitimately support multiple levels of this batch.
-    read = {}
-    for (key, ref), body in bodies.items():
-        source = next(s for s in nodes[key]["sources"] if s["ref"] == ref)
-        identity = (ref, canonical_hash(source["binding"]))
-        if identity not in read or body is not None:
-            read[identity] = body
-    read_refs = {ref for ref, _ in read}
-    for row in rows:
-        if not isinstance(row, dict) or set(row) != _OUTPUT_KEYS:
-            raise invalid()
-        key = row["node_key"]
-        if not isinstance(key, str) or key not in nodes or key in results:
-            raise invalid()
-        node = nodes[key]
-        kind, refs, sentence = row["summary_kind"], row["source_refs"], row["summary"]
-        allowed = {s["ref"]: s["binding"] for s in node["sources"]}
-        if (
-            not refs
-            and kind != "insufficient_evidence"
-            or row["source_hash"] != node["source_hash"]
-            or kind not in _SUMMARY_KINDS
-            or not isinstance(refs, list)
-            or any(not isinstance(ref, str) or ref not in allowed for ref in refs)
-            or len(refs) != len(set(refs))
-            or bool(allowed)
-            and not refs
-            or type(row["milestone"]) is not bool
-            or row["milestone"]
-            and kind not in {"tentative_finding", "accepted_conclusion"}
-            or not isinstance(sentence, str)
-            or not sentence.strip()
-            or len(sentence.strip()) > _SUMMARY_LIMITS[language]
-            or any(c in sentence for c in "\r\n\u2028\u2029")
-        ):
-            raise invalid()
-        available = {
-            ref: read[identity]
-            for ref, binding in allowed.items()
-            if ref in read_refs and (identity := (ref, canonical_hash(binding))) in read
-        }
-        stage = available.get(key)
-        if (
-            node["kind"] == "stage"
-            and stage
-            and allowed[key].get("kind") == "stage"
-            and stage.get("stage") == node["stage"]
-            and stage.get("artifacts") == []
-            and "current" in stage
-            and stage["current"] is None
-        ):
-            row = dict(
-                row,
-                summary=_EMPTY_SENTENCE[language],
-                summary_kind="insufficient_evidence",
-                milestone=False,
-                source_refs=[node["cycle_ref"]] if node["cycle_ref"] in allowed else [key],
-            )
-        else:
-            if not all(ref in available for ref in refs) or sentence.strip() in _EMPTY_SENTENCE.values():
-                raise invalid()
-            if kind == "accepted_conclusion":
-                eligible = node["kind"] == "cycle" or node["kind"] == "stage" and node["stage"] == "reasoning"
-                if not eligible or not any(
-                    allowed[ref].get("kind") == "artifact"
-                    and allowed[ref].get("stage") == "reasoning"
-                    and allowed[ref].get("cycle_ref") == node["cycle_ref"]
-                    and _supports_conclusion(available[ref] or {}, refs)
-                    for ref in refs
-                ):
-                    raise invalid()
-            row = dict(row, summary=sentence.strip())
-        results[key] = row
-    return [results[key] for key in nodes]
+    interval = raw.get("next_scan_seconds") if isinstance(raw, dict) else None
+    interval = interval if type(interval) is int and 300 <= interval <= 7200 else 300
+    if (not isinstance(raw, dict) or set(raw) != {"summaries", "next_scan_seconds"}
+            or not isinstance(raw["summaries"], list)):
+        raise TimelineSummaryBatchError(
+            summaries=[], failures={key: {"code": "invalid_output", "source_refs": [],
+                "message": "Return one summaries array and next_scan_seconds, with one row for each requested node."}
+                for key in nodes}, native_session_ref=native, next_scan_seconds=interval)
+
+    grouped = {key: [] for key in nodes}
+    for row in raw["summaries"]:
+        key = row.get("node_key") if isinstance(row, dict) else None
+        # Unrequested or unidentifiable rows cannot supply a requested node.
+        if isinstance(key, str) and key in grouped:
+            grouped[key].append(row)
+
+    summaries, failures = [], {}
+    for key, node in nodes.items():
+        rows = grouped[key]
+        try:
+            if not rows:
+                raise _NodeValidationError("missing_node", "Return this requested node exactly once.")
+            if len(rows) != 1:
+                raise _NodeValidationError("duplicate_node", "Return one unambiguous row for this node; do not repeat its node_key.")
+            summaries.append(_validate_node(rows[0], node, basis["output_language"]))
+        except _NodeValidationError as error:
+            failures[key] = error.feedback
+    if failures:
+        raise TimelineSummaryBatchError(summaries=summaries, failures=failures,
+            native_session_ref=native, next_scan_seconds=interval)
+    return summaries
 
 
-def _supports_conclusion(body, refs):
-    judgment, source = body.get("content"), body.get("source")
-    if not isinstance(judgment, dict) or not isinstance(source, dict):
-        return False
-    claim = judgment.get("claim")
-    return (
-        body.get("stage") == "reasoning"
-        and body.get("status") == "accepted"
-        and isinstance(claim, str)
-        and claim.strip()
-        and any(source.get(k) in refs for k in ("content_ref", "outcome_ref"))
-    )
+def _validate_node(row, node, language):
+    if set(row) != _OUTPUT_KEYS:
+        raise _NodeValidationError("invalid_node", "Return all required summary fields without extra fields.")
+    key = node["node_key"]
+    kind, refs, sentence = row["summary_kind"], row["source_refs"], row["summary"]
+    allowed = {s["ref"]: s["binding"] for s in node["sources"]}
+    if isinstance(refs, list) and all(isinstance(ref, str) for ref in refs):
+        foreign = [ref for ref in refs if ref not in allowed]
+        if foreign:
+            raise _NodeValidationError("unallowed_source_refs",
+                "Cite only source_refs listed for this requested node.", foreign)
+    if (
+        not refs and kind != "insufficient_evidence"
+        or row["source_hash"] != node["source_hash"]
+        or kind not in _SUMMARY_KINDS
+        or not isinstance(refs, list)
+        or any(not isinstance(ref, str) or ref not in allowed for ref in refs)
+        or len(refs) != len(set(refs))
+        or bool(allowed) and not refs
+        or type(row["milestone"]) is not bool
+        or row["milestone"] and kind not in {"tentative_finding", "accepted_conclusion"}
+        or not isinstance(sentence, str)
+        or not sentence.strip()
+        or len(sentence.strip()) > _SUMMARY_LIMITS[language]
+        or any(c in sentence for c in "\r\n\u2028\u2029")
+    ):
+        raise _NodeValidationError("invalid_node",
+            "Match the requested source_hash, allowed source_refs, summary_kind and output schema.")
+    # The source reader freezes these identities independently of model tool use.
+    stage = allowed.get(key)
+    if (node["kind"] == "stage" and stage and stage.get("kind") == "stage"
+            and stage.get("stage") == node["stage"] and stage.get("artifacts") == []
+            and "current" in stage and stage["current"] is None):
+        return dict(row, summary=_EMPTY_SENTENCE[language], summary_kind="insufficient_evidence",
+                    milestone=False, source_refs=[node["cycle_ref"]] if node["cycle_ref"] in allowed else [key])
+    if sentence.strip() in _EMPTY_SENTENCE.values():
+        raise _NodeValidationError("invalid_node", "The frozen stage metadata does not identify an empty stage.")
+    if kind == "accepted_conclusion":
+        eligible = node["kind"] == "cycle" or node["kind"] == "stage" and node["stage"] == "reasoning"
+        if not eligible or not any(
+            allowed[ref].get("kind") == "artifact" and allowed[ref].get("stage") == "reasoning"
+            and allowed[ref].get("cycle_ref") == node["cycle_ref"]
+            and allowed[ref].get("disposition") == "completed"
+            and isinstance(allowed[ref].get("commit_ref"), str) and allowed[ref]["commit_ref"].strip()
+            and isinstance(allowed[ref].get("outcome_ref"), str) and allowed[ref]["outcome_ref"] in refs
+            for ref in refs
+        ):
+            raise _NodeValidationError("unsupported_conclusion",
+                "Use accepted_conclusion only for this Cycle or Reasoning, citing its completed Reasoning outcome with a committed artifact identity.", refs)
+    return dict(row, summary=sentence.strip())
