@@ -310,7 +310,7 @@ class TargetMeasurementAuthorityReader(Protocol):
 
 class TargetRootGraphFinalizationAuthority(Protocol):
     def query_target_commits_for_quest(
-        self, quest_ref: str
+        self, quest_ref: str, *, target_commit_refs: tuple[str, ...] | None = None
     ) -> tuple[object, ...]: ...
 
     def query_target_frontier_commit_transition(
@@ -1453,7 +1453,14 @@ class TargetRunFinalizer:
             raise OwnerConflict("target_root_upstream_input_authority_unavailable")
         quest_ref = self._workspace_resolver.query_target_workspace_quest_ref(handle)
         try:
-            commits = graph.query_target_commits_for_quest(quest_ref)
+            lookup_refs = tuple(dict.fromkeys(required))
+            commits = tuple(
+                commit
+                for offset in range(0, len(lookup_refs), 256)
+                for commit in graph.query_target_commits_for_quest(
+                    quest_ref, target_commit_refs=lookup_refs[offset:offset + 256]
+                )
+            )
         except Exception as error:
             raise OwnerConflict(
                 "target_root_upstream_input_authority_invalid"

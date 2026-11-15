@@ -88,13 +88,14 @@ def test_formal_reads_use_fresh_nested_cuts_and_keep_integrity(pending_root, mon
         finally:
             plan_file.write_bytes(saved)
         assert query() == expected
-    verifier = owner._receipt_verifier
-    original = verifier.verify_formal_plan_decision
-    monkeypatch.setattr(verifier, 'verify_formal_plan_decision', Mock(side_effect=OwnerConflict('proof_unavailable')))
+    # Inject at the execution issuer, independently of internal Plan helper reuse.
+    verifier = owner._receipt_verifier._execution_verifier
+    original = verifier.verify_attempt_execution_receipt
+    monkeypatch.setattr(verifier, 'verify_attempt_execution_receipt', Mock(side_effect=OwnerConflict('proof_unavailable')))
     with pytest.raises(OwnerConflict, match='proof_unavailable'):
         query()
     assert database._read_cut.get() is None and database._read_cache.get() is None
-    monkeypatch.setattr(verifier, 'verify_formal_plan_decision', original)
+    monkeypatch.setattr(verifier, 'verify_attempt_execution_receipt', original)
     assert query() == expected
 
 

@@ -6741,13 +6741,47 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             or type(result_document) is not RootResult
         ):
             raise OwnerConflict("target_root_commit_issuer_invalid")
-        accepted_completion = completion_reader.query_completion(
-            completion.handle.target_ref
+        accepted_completion, accepted_manifest = self._read_target_root_issuers(
+            target_ref=completion.handle.target_ref,
+            manifest_ref=manifest.manifest_ref,
         )
-        accepted_manifest = manifest_reader.query(manifest.manifest_ref)
         if (
             accepted_completion != completion
             or accepted_manifest != manifest
+            or accepted_manifest.result_document != result_document
+        ):
+            raise OwnerConflict("target_root_commit_issuer_invalid")
+        return accepted_completion, accepted_manifest
+
+    def _read_target_root_issuers(
+        self, *, target_ref: str, manifest_ref: str,
+    ) -> tuple[AcceptedTargetRootCompletion, AcceptedTargetRootCompletionManifest]:
+        """Read and authenticate one AR/RM pair in the same short snapshot."""
+        from meta_research.owners.target_root_lifecycle import (
+            AcceptedTargetRootCompletion as RootCompletion,
+        )
+        from meta_research.target_run_finalizer import (
+            AcceptedTargetRootCompletionManifest as RootManifest,
+            TargetRootResultDocument as RootResult,
+        )
+
+        completion_reader = self._target_root_completion_reader
+        manifest_reader = self._target_root_manifest_reader
+        if completion_reader is None or manifest_reader is None:
+            raise OwnerConflict("target_root_commit_issuer_unavailable")
+        with self._database.read_snapshot():
+            completion = completion_reader.query_completion(target_ref)
+            manifest = manifest_reader.query(manifest_ref)
+        if (
+            type(completion) is not RootCompletion
+            or type(manifest) is not RootManifest
+            or type(manifest.result_document) is not RootResult
+        ):
+            raise OwnerConflict("target_root_commit_issuer_invalid")
+        result_document = manifest.result_document
+        if (
+            completion.handle.target_ref != target_ref
+            or manifest.manifest_ref != manifest_ref
             or manifest.completion_ref != completion.completion_ref
             or manifest.target_ref != completion.handle.target_ref
             or manifest.target_run_ref != completion.handle.target_run_ref
@@ -6759,7 +6793,6 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             or manifest.result_document_hash != completion.result_document_hash
             or manifest.artifact_snapshot_hash
             != completion.artifact_snapshot_hash
-            or manifest.result_document != result_document
             or result_document.content_hash != manifest.result_document_hash
             or canonical_hash(result_document.as_dict())
             != result_document.content_hash
@@ -6774,7 +6807,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             or manifest.receipt.subject_ref != manifest.manifest_ref
         ):
             raise OwnerConflict("target_root_commit_issuer_invalid")
-        return accepted_completion, accepted_manifest
+        return completion, manifest
 
     def _target_root_domain_context(
         self,
@@ -6849,14 +6882,14 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         candidate = candidate_projection.candidate
         protocol = authority.measurement_contract.protocol_version
         from meta_research.formal_entities import primary_work_metrics
-        actual_metrics = primary_work_metrics(result_document.as_dict())
+        result_content = result_document.as_dict()
+        actual_metrics = primary_work_metrics(result_content)
         metric_keys = set(actual_metrics)
         required_keys = set(protocol.required_metric_keys)
         allowed_keys = required_keys | set(protocol.optional_metric_keys)
         policy = authority.measurement_contract.checkpoint_policy
         from meta_research.formal_entities import explicit_run_only
-        run_only = explicit_run_only(result_document.as_dict())
-        result_content = result_document.as_dict()
+        run_only = explicit_run_only(result_content)
         authoritative_fields = {
             "target_ref": target.target_ref,
             "target_run_ref": completion.handle.target_run_ref,
@@ -6924,7 +6957,6 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         if (
             (result_document.schema_ref is not None and result_document.schema_ref
                 != authority.measurement_contract.result_schema_ref)
-            or (not run_only and not required_keys <= metric_keys <= allowed_keys)
             or any(
                 not valid_target_metric_value(value)
                 for value in actual_metrics.values()
@@ -6934,13 +6966,13 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             raise TargetContentIssue("target_root_commit_domain_invalid")
         _validate_target_result_schema(
             schema=authority.measurement_contract.result_schema.as_dict(),
-            result_content=result_document.as_dict(),
+            result_content=result_content,
         )
         from meta_research.formal_entities import verify_report_only_assessments
         from meta_research.formal_run_bindings import manifest_selection_entries
         selected_entries = manifest_selection_entries(manifest)
         try:
-            verify_report_only_assessments(result_document.as_dict(), selected_entries)
+            verify_report_only_assessments(result_content, selected_entries)
         except OwnerConflict as error:
             if error.code not in {'target_formal_evaluation_report_required', 'target_formal_artifact_path_not_bound'}:
                 raise
@@ -6954,7 +6986,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             raise correction from error
         from meta_research.formal_entities import verify_retained_products
-        verify_retained_products(result_document.as_dict(), selected_entries)
+        verify_retained_products(result_content, selected_entries)
         return target, authority, projection, candidate_projection
 
     def verify_target_execution_closure(
@@ -7660,14 +7692,8 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         manifest_reader = self._target_root_manifest_reader
         if completion_reader is None or manifest_reader is None:
             raise OwnerConflict("target_root_commit_issuer_unavailable")
-        completion = completion_reader.query_completion(target_ref)
-        manifest = manifest_reader.query(str(root_row.manifest_ref))
-        if completion is None or manifest is None:
-            raise OwnerConflict("target_root_commit_issuer_invalid")
-        completion, manifest = self._verify_target_root_issuers(
-            completion=completion,
-            manifest=manifest,
-            result_document=manifest.result_document,
+        completion, manifest = self._read_target_root_issuers(
+            target_ref=target_ref, manifest_ref=str(root_row.manifest_ref),
         )
         from meta_research.owners.agent_runtime import _stored_bundle_record
         terminal = _stored_bundle_record(

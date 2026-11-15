@@ -379,7 +379,12 @@ def root_work_items(*, payload, identities, result_document):
     A measured fact leads the handoff when present. Otherwise an actual failed
     attempt or an unassessed execution is sufficient to finish this work unit.
     """
-    work = _declared_work(result_document)
+    return _root_work_items_from_declared(
+        work=_declared_work(result_document), payload=payload, identities=identities,
+    )
+
+
+def _root_work_items_from_declared(*, work, payload, identities):
     primary_key = work[0][0]['run_key']
     items = []
     for ordinal, (run, attempt) in enumerate(work):
@@ -1459,9 +1464,10 @@ def verify_retained_products(document, entries):
         return
     work = _declared_work(document)
     primary = work[0][0]
-    items = root_work_items(payload={'measurement_ref': 'inventory', 'variant_run_ref': primary.get('variant_run_ref', 'primary'),
+    items = _root_work_items_from_declared(work=work,
+        payload={'measurement_ref': 'inventory', 'variant_run_ref': primary.get('variant_run_ref', 'primary'),
         'evaluation_attempt_ref': 'assessment', 'metric_result_ref': 'result'},
-        identities={'variant_ref': 'inventory', 'evaluation_ref': 'inventory'}, result_document=document)
+        identities={'variant_ref': 'inventory', 'evaluation_ref': 'inventory'})
     _verify_declared_subject_artifact_bindings(work, entries)
     assigned = set()
     for item in items:

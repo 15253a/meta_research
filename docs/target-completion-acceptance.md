@@ -5,6 +5,12 @@ the admission history of every already accepted upstream Commit. Accepted reads
 authenticate the persisted closure, exact identities, hashes and Owner receipts;
 the first acceptance of new research still validates its research context.
 
+Upstream input lookup reads only the selected Commit references within the
+current Quest. Accepted root reads load their initial AR/RM source pair once in
+a short read snapshot, then retain the separate freshness check after native
+entity verification. Reusing parsed request and work documents within a call
+does not replace validation of persisted intake requests or new source reads.
+
 Running-frontier discovery uses the accepted launch and dispatch receipts and
 retains current Stage, Bundle lineage and exact completion-transition checks.
 It does not repeat candidate admission on each background wake.

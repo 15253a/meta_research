@@ -127,9 +127,10 @@ class _Graph:
             canonical_terminal=SimpleNamespace(asset_manifest_ref=frozen.manifest_ref),
         )
 
-    def query_target_commits_for_quest(self, quest_ref: str):
+    def query_target_commits_for_quest(self, quest_ref: str, *, target_commit_refs=None):
         assert quest_ref == "quest-frozen-inputs"
-        return (self.commit,)
+        return ((self.commit,) if target_commit_refs is None
+                or self.commit.commit_ref in target_commit_refs else ())
 
     def query_target_frontier_commit_transition(self, target_ref: str):
         assert target_ref == self.commit.target_ref

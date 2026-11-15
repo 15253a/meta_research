@@ -51,6 +51,30 @@ def test_dataset_and_environment_can_reference_one_exact_asset():
     assert len(entries) == 1
 
 
+def test_retained_products_parse_work_once_and_recheck_changed_attribution(monkeypatch):
+    import meta_research.formal_entities as formal_entities
+
+    path = "outputs/data/simulator"
+    document = {"formal_runs": [{"run_key": "construct", "artifact_paths": [path],
+                                 "evaluations": []}]}
+    entries = [{"role": "data", "declared_relative_path": path}]
+    original = formal_entities._declared_work
+    calls = 0
+
+    def parse(value):
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(formal_entities, "_declared_work", parse)
+    verify_retained_products(document, entries)
+    assert calls == 1
+    document["formal_runs"][0]["artifact_paths"] = []
+    with pytest.raises(OwnerConflict, match="target_root_commit_domain_invalid"):
+        verify_retained_products(document, entries)
+    assert calls == 2
+
+
 def test_environment_implementation_keeps_its_actual_run_selection():
     entries = [{"role": "implementation", "declared_relative_path": "implementation/used"},
                {"role": "implementation", "declared_relative_path": "implementation/unused"}]
@@ -124,7 +148,9 @@ def test_environment_subpath_cannot_substitute_for_an_existing_implementation_sn
         verify_retained_products({"metrics": {"observed": 1},
             "environment_candidates": [_candidate("implementation/simulator.py")]},
             [{"role": "implementation", "declared_relative_path": "implementation"}])
-    assert "existing manifest entry" in failure.value.feedback
+    assert failure.value.code == "target_root_commit_domain_invalid"
+    assert "implementation/simulator.py" in failure.value.feedback
+    assert "producer declaration" in failure.value.feedback
     assert "keep environment_candidates unchanged" not in failure.value.feedback
 
 

@@ -3263,7 +3263,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         ):
             raise OwnerConflict("target_note_provenance_reserved")
         return self._submit_asset_intake(
-            request,
+            document,
             idempotency_key=idempotency_key,
             effect_scope=effect_scope,
             target_note_binding=None,
@@ -3279,7 +3279,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         document = _asset_request_document(request)
         binding = _target_note_intake_effect_binding(document)
         return self._submit_asset_intake(
-            request,
+            document,
             idempotency_key=idempotency_key,
             effect_scope=effect_scope,
             target_note_binding=binding,
@@ -3287,7 +3287,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
 
     def _submit_asset_intake(
         self,
-        request: AssetIntakeRequest,
+        request_document: dict[str, object],
         *,
         idempotency_key: str,
         effect_scope: Callable[[], None] | None = None,
@@ -3295,7 +3295,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
     ) -> AssetIntakeResult:
         if not idempotency_key or len(idempotency_key) > 128:
             raise OwnerConflict("asset_intake_idempotency_key_invalid")
-        request_document = _asset_request_document(request)
+        asynchronous = request_document["asynchronous"]
         if effect_scope is not None:
             request_document["effect_scope_required"] = True
         if request_document.get("effect_scope_required") and effect_scope is None:
@@ -3362,7 +3362,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     raise OwnerConflict("asset_intake_idempotency_conflict")
                 job_ref = existing.job_ref
                 if (
-                    not request.asynchronous
+                    not asynchronous
                     and existing.status == "queued"
                     and float(existing.next_attempt_at) <= time.time()
                 ):
@@ -3398,7 +3398,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 job_ref = new_ref("asset_intake")
                 now = time.time()
                 initial_status = (
-                    "queued" if request.asynchronous else "processing"
+                    "queued" if asynchronous else "processing"
                 )
                 connection.execute(
                     text(
@@ -3420,12 +3420,12 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                         "request_source_kind": request_document["source_kind"],
                         "request_custody_mode": request_document["custody_mode"],
                         "status": initial_status,
-                        "attempt_count": 0 if request.asynchronous else 1,
-                        "started_at": None if request.asynchronous else now,
+                        "attempt_count": 0 if asynchronous else 1,
+                        "started_at": None if asynchronous else now,
                         "now": now,
                     },
                 )
-                sync_claimed = not request.asynchronous
+                sync_claimed = not asynchronous
                 connection.execute(
                     text(
                         "UPDATE research_memory_state SET revision = revision + 1, "
