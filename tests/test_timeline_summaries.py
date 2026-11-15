@@ -152,6 +152,103 @@ def test_failure_keeps_previous_sentence_and_retries_with_recovered_session(reco
     assert service.query('quest-1')['nodes'][0]['summary'] == '两个外部队列可用。'
 
 
+def test_partial_publication_persists_good_node_and_retries_only_rejected_node(tmp_path):
+    store = TimelineSummaryStore(tmp_path / 'partial.sqlite3')
+    good = node('已核验的进展。')
+    bad = {**node('待补读的进展。'), 'node_key': 'stage:c2:plan', 'cycle_ref': 'c2'}
+    store.sync('quest-1', [good, bad], 100)
+    job = store.claim(100, 'zh')
+    accepted = {'node_key': good['node_key'], 'source_hash': good['source_hash'],
+                'summary': '已核验的进展。', 'source_refs': ['accepted-plan-1']}
+    feedback = {'code': 'unallowed_source_refs', 'source_refs': ['foreign-source'],
+                'message': 'Choose a source allowed for this node before resubmitting.'}
+    store.publish(job, [accepted], 'native-recorder', 101,
+                  failures={bad['node_key']: feedback})
+    rows = {n['node_key']: n for n in store.query('quest-1')['nodes']}
+    assert rows[good['node_key']]['status'] == 'ready'
+    assert rows[bad['node_key']]['status'] == 'failed'
+    assert rows[bad['node_key']]['summary'] is None
+    # Settlement is idempotent and the correction survives service restart.
+    store.publish(job, [accepted], 'native-recorder', 102,
+                  failures={bad['node_key']: feedback})
+    restarted = TimelineSummaryStore(store.path)
+    correction = restarted.claim(102, 'zh')
+    assert correction['native_session_ref'] == 'native-recorder'
+    assert len(correction['nodes']) == 1
+    retry_node = correction['nodes'][0]
+    assert retry_node['node_key'] == bad['node_key']
+    assert retry_node['source_hash'] == bad['source_hash']
+    assert retry_node['retry_feedback'] == feedback
+    assert correction['observed_at'] == job['observed_at']
+    with sqlite3.connect(store.path) as db:
+        assert db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 2
+
+
+def test_changed_source_retires_only_its_correction_and_keeps_published_sibling(tmp_path):
+    store = TimelineSummaryStore(tmp_path / 'changed-partial.sqlite3')
+    good = node()
+    bad = {**node('旧资料。'), 'node_key': 'stage:c2:plan', 'cycle_ref': 'c2'}
+    store.sync('quest-1', [good, bad], 100)
+    job = store.claim(100, 'zh')
+    accepted = {'node_key': good['node_key'], 'source_hash': good['source_hash'],
+                'summary': '已完成核验。', 'source_refs': ['accepted-plan-1']}
+    store.publish(job, [accepted], 'native-recorder', 101,
+                  failures={bad['node_key']: {'code': 'unallowed_source_refs', 'source_refs': ['foreign-source'], 'message': 'Choose an allowed source.'}})
+    changed = {**bad, 'source_hash': canonical_hash('new source')}
+    store.sync('quest-1', [good, changed], 102)
+    correction = store.claim(103, 'zh')
+    assert [n['node_key'] for n in correction['nodes']] == [bad['node_key']]
+    assert correction['nodes'][0]['source_hash'] == changed['source_hash']
+    assert 'retry_feedback' not in correction['nodes'][0]
+    assert store.query('quest-1')['nodes'][0]['status'] == 'ready'
+
+
+def test_repeated_bad_correction_backs_off_without_starving_its_sibling(tmp_path):
+    store = TimelineSummaryStore(tmp_path / 'isolated-retries.sqlite3')
+    first = node('第一项。')
+    second = {**node('第二项。'), 'node_key': 'stage:c2:plan', 'cycle_ref': 'c2'}
+    feedback = {'code': 'unallowed_source_refs', 'source_refs': ['foreign-source'], 'message': 'Choose an allowed source.'}
+    store.sync('quest-1', [first, second], 100)
+    job = store.claim(100, 'zh')
+    store.publish(job, [], 'native-recorder', 101,
+                  failures={n['node_key']: feedback for n in (first, second)})
+    correction = store.claim(102, 'zh')
+    assert [n['node_key'] for n in correction['nodes']] == [first['node_key']]
+    store.publish(correction, [], 'native-recorder', 103, failures={first['node_key']: feedback})
+    sibling = store.claim(104, 'zh')
+    assert [n['node_key'] for n in sibling['nodes']] == [second['node_key']]
+    store.publish(sibling, [{'node_key': second['node_key'], 'source_hash': second['source_hash'],
+                            'summary': '第二项已核验。', 'source_refs': ['accepted-plan-1']}], 'native-recorder', 105)
+    assert store.claim(402, 'zh') is None
+    retry = store.claim(403, 'zh')
+    assert [n['node_key'] for n in retry['nodes']] == [first['node_key']]
+    assert retry['nodes'][0]['retry_feedback'] == feedback
+
+
+def test_partial_settlement_does_not_retry_replaced_observation(tmp_path):
+    store = TimelineSummaryStore(tmp_path / 'replaced-partial.sqlite3')
+    before = node('旧资料。')
+    store.sync('quest-1', [before], 100)
+    job = store.claim(100, 'zh')
+    after = node('新资料。')
+    store.sync('quest-1', [after], 101)
+    store.publish(job, [], 'native-recorder', 102, failures={before['node_key']: {
+        'code': 'unallowed_source_refs', 'source_refs': ['foreign-source'], 'message': 'Choose an allowed source.'}})
+    new_job = store.claim(103, 'zh')
+    assert new_job['nodes'][0]['source_hash'] == after['source_hash']
+    assert 'retry_feedback' not in new_job['nodes'][0]
+
+
+def test_partial_settlement_requires_disjoint_complete_outcomes(tmp_path):
+    store = TimelineSummaryStore(tmp_path / 'invalid-partial.sqlite3')
+    store.sync('quest-1', [node()], 100)
+    job = store.claim(100, 'zh')
+    with pytest.raises(ValueError, match='settlement_invalid'):
+        store.publish(job, [], 'native-recorder', 101, failures={})
+    assert store.claim(102, 'zh')['job_ref'] == job['job_ref']
+    assert store.query('quest-1')['nodes'][0]['summary'] is None
+
+
 def test_saved_tentative_finding_keeps_its_kind_and_sources_when_refresh_fails(tmp_path):
     store = TimelineSummaryStore(tmp_path / 'summary-kinds.sqlite3')
     store.sync('quest-1', [node('初步发现改善，等待独立数据复核。')], 100)
@@ -486,3 +583,83 @@ def test_later_historical_batch_cannot_postpone_urgent_scan_after_restart(record
     assert result['scan_interval_seconds'] == 300
     assert result['next_scan_at'] == deadline
     assert reader.calls == 1 and len(provider.calls) == 2
+
+
+def test_terminal_provider_failure_rotates_without_reusing_uncleaned_spool(recorder, monkeypatch):
+    service, store, reader, provider, now = recorder
+    for i in range(2):
+        reader.nodes['quest-1'] = [node(f'Completed summary {i}')]
+        assert service.process_once()
+        now[0] += 301
+    reader.nodes['quest-1'] = [node('Third attempt fails after the model exits.')]
+    original_reconcile = provider.reconcile_job
+    original_summarize = provider.summarize
+    failed = set()
+
+    def failed_summarize(**request):
+        provider.calls.append(deepcopy(request))
+        failed.add(request['job_ref'])
+        raise DraftingUnavailable('codex_cli_failed', native_session_ref=request['native_session_ref'])
+
+    monkeypatch.setattr(provider, 'summarize', failed_summarize)
+    monkeypatch.setattr(provider, 'reconcile_job', lambda ref: 'terminal' if ref in failed else original_reconcile(ref))
+    monkeypatch.setattr(provider, 'finish_job', lambda ref: (_ for _ in ()).throw(OSError('cleanup unavailable')))
+    assert not service.process_once()
+    failed_request = provider.calls[-1]
+    monkeypatch.setattr(provider, 'summarize', original_summarize)
+    now[0] += 301
+    assert service.process_once()
+    assert provider.calls[-1]['job_ref'] != failed_request['job_ref']
+    assert provider.calls[-1]['nodes'] == failed_request['nodes']
+    assert provider.calls[-1]['native_session_ref'] is None
+
+
+def test_pending_and_terminal_replay_do_not_consume_extra_session_calls(recorder, monkeypatch):
+    service, store, reader, provider, now = recorder
+    assert service.process_once()
+    now[0] += 301
+    reader.nodes['quest-1'] = [node('Second operation loses its response.')]
+    original = provider.summarize
+
+    def response_lost(**request):
+        result = original(**request)
+        provider.pending = True
+        raise DraftingUnavailable('codex_job_outcome_unknown')
+
+    monkeypatch.setattr(provider, 'summarize', response_lost)
+    assert not service.process_once()
+    pending_request = provider.calls[-1]
+    for _ in range(3):
+        now[0] += 31
+        assert not service.process_once()
+        assert store.claim(now[0] + 31, 'zh')['native_session_ref'] == pending_request['native_session_ref']
+    provider.pending = False
+    monkeypatch.setattr(provider, 'summarize', original)
+    now[0] += 31
+    assert service.process_once()
+    assert len(provider.calls) == 2
+    now[0] += 301
+    reader.nodes['quest-1'] = [node('Third real operation stays in the current native root.')]
+    assert service.process_once()
+    assert provider.calls[-1]['native_session_ref'] == pending_request['native_session_ref']
+    now[0] += 301
+    reader.nodes['quest-1'] = [node('Fourth real operation uses a fresh native root.')]
+    assert service.process_once()
+    assert provider.calls[-1]['native_session_ref'] is None
+
+
+def test_cancellation_without_terminal_receipt_keeps_active_session(recorder, monkeypatch):
+    service, store, _, provider, now = recorder
+    service._observe('quest-1', now[0])
+    active = store.claim(now[0], 'zh')
+    provider.pending = True
+    monkeypatch.setattr(provider, 'cancel_job', lambda job_ref: True)
+    now[0] += 961
+    assert not service.process_once()
+    recovered = store.claim(now[0] + 31, 'zh')
+    assert recovered['job_ref'] == active['job_ref']
+    assert recovered['native_session_ref'] == active['native_session_ref']
+    assert recovered['status'] == 'active'
+    assert not provider.calls
+    assert not provider.finished
+    assert service.query('quest-1')['nodes'][0]['status'] == 'updating'

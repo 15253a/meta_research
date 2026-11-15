@@ -26,8 +26,10 @@ QUESTION = {"details": "长材料" * 1800, "limit": "尚未验证外部队列"}
 
 
 def node(key, kind, refs):
-    binding = {"judgment": {"kind": "artifact", "stage": "reasoning", "cycle_ref": "cycle-1"},
-               STAGE: {"kind": "stage", "stage": "reasoning", "cycle_ref": "cycle-1"}}
+    binding = {"judgment": {"kind": "artifact", "stage": "reasoning", "cycle_ref": "cycle-1",
+                            "disposition": "completed", "commit_ref": "reasoning-commit", "outcome_ref": "judgment"},
+                STAGE: {"kind": "stage", "stage": "reasoning", "cycle_ref": "cycle-1",
+                        "artifacts": ["judgment"], "current": None}}
     return {
         "quest_ref": "quest-1",
         "question_ref": "question-1",
@@ -151,6 +153,29 @@ def adapter(tmp_path, runner):
     return CodexTimelineSummaryAdapter(tmp_path / "provider", process_runner=runner, channels=runner.channels)
 
 
+class ObservedNodes:
+    def __init__(self):
+        self.nodes = job()["nodes"]
+
+    def quest_refs(self):
+        return ["quest-1"]
+
+    def read(self, _quest_ref):
+        return deepcopy(self.nodes)
+
+
+class CorrectingRunner(RecorderRunner):
+    def __call__(self, argv, prompt, timeout, environment):
+        request = json.loads(prompt.rsplit("\n", 1)[1])
+        templates = {row["node_key"]: row for row in output()["summaries"]}
+        self.value = {"next_scan_seconds": 900, "summaries": [
+            dict(templates[n["node_key"]], source_hash=n["source_hash"]) for n in request["nodes"]]}
+        if not self.calls:
+            self.value["summaries"][0]["source_refs"] = ["judgment"]
+        self.reads = []
+        return super().__call__(argv, prompt, timeout, environment)
+
+
 def test_grant_has_only_frozen_sources_and_long_native_reads_all_pages(tmp_path):
     runner = RecorderRunner()
     runner.reads += [(STAGE, "question-1"), (Q, "unknown"), ("another-quest", "question-1")]
@@ -189,6 +214,17 @@ def test_native_resume_receives_only_changes_and_restart_uses_original_job(tmp_p
     altered["nodes"][0]["sources"][0]["binding"]["version"] = 2
     with pytest.raises(DraftingUnavailable, match="conflict"):
         restarted.recover_summaries(altered)
+
+
+def test_new_native_sessions_keep_the_same_recorder_workspace(tmp_path):
+    runner = RecorderRunner()
+    runner.reads = []
+    for index in range(3):
+        adapter(tmp_path, runner).summarize(**dict(job(), job_ref=f"new-session-{index}", native_session_ref=None))
+    directories = [argv[argv.index("--cd") + 1] for argv, _ in runner.calls]
+    assert len(set(directories)) == 1
+    assert Path(directories[0]) == tmp_path / "provider" / "research-workspace"
+    assert all("resume" not in argv for argv, _ in runner.calls)
 
 
 def test_new_and_existing_recorder_receive_shared_principles_with_read_only_role(tmp_path):
@@ -254,17 +290,15 @@ def test_readable_multi_sentence_explanation_can_exceed_old_length_limit(tmp_pat
         adapter(tmp_path / "too-long", runner).summarize(**request)
 
 
-def test_empty_stage_sentence_needs_actual_read_of_stage_itself(tmp_path):
+def test_empty_stage_sentence_uses_frozen_stage_metadata_without_tool_reads(tmp_path):
     runner = RecorderRunner()
-    runner.sources.data[STAGE] = {"stage": "reasoning", "artifacts": [], "current": None}
+    request = job()
+    request["nodes"][1]["sources"][0]["binding"]["artifacts"] = []
     runner.value["summaries"][1].update(summary_kind="process", summary="可能正在执行。", source_refs=[STAGE])
-    runner.reads = [(Q, "question-1"), (STAGE, STAGE)]
-    rows, _, _ = adapter(tmp_path, runner).summarize(**job())
+    runner.reads = []
+    rows, _, _ = adapter(tmp_path, runner).summarize(**request)
     assert rows[1]["summary"] == "暂时没有这个阶段的工作记录。"
     assert rows[1]["summary_kind"] == "insufficient_evidence" and rows[1]["source_refs"] == ["cycle-1"]
-    runner.sources.data[STAGE] = None
-    with pytest.raises(DraftingUnavailable, match="source_unavailable"):
-        adapter(tmp_path / "missing", runner).summarize(**job())
 
 
 @pytest.mark.parametrize(
@@ -281,7 +315,7 @@ def test_empty_stage_sentence_needs_actual_read_of_stage_itself(tmp_path):
         lambda v: v["summaries"][1].update(source_refs=[STAGE]),
     ],
 )
-def test_output_must_match_requested_nodes_actual_scientific_evidence_and_schema(tmp_path, mutate):
+def test_output_must_match_requested_nodes_allowed_references_and_schema(tmp_path, mutate):
     value = output()
     mutate(value)
     with pytest.raises(DraftingUnavailable, match="output_invalid"):
@@ -313,11 +347,17 @@ def test_isolated_cycle_reads_child_judgment_and_its_limits(tmp_path):
     assert adapter(tmp_path, runner).summarize(**request)[0] == value["summaries"]
 
 
-def test_engineering_acceptance_cannot_upgrade_a_result_even_on_reasoning_stage(tmp_path):
+@pytest.mark.parametrize("change", [
+    {"disposition": "skipped"}, {"commit_ref": None}, {"outcome_ref": None},
+    {"cycle_ref": "another-cycle"}, {"stage": "bundle"},
+])
+def test_accepted_conclusion_requires_this_cycles_committed_reasoning_identity(tmp_path, change):
     runner = RecorderRunner()
-    runner.sources.data["judgment"] = dict(CLAIM, content={"status": "accepted", "exit_code": 0})
+    runner.reads = []
+    request = job()
+    request["nodes"][1]["sources"][-1]["binding"].update(change)
     with pytest.raises(DraftingUnavailable, match="output_invalid"):
-        adapter(tmp_path, runner).summarize(**job())
+        adapter(tmp_path, runner).summarize(**request)
 
 
 def test_model_order_does_not_reorder_requested_nodes(tmp_path):
@@ -331,6 +371,122 @@ def test_research_text_with_claim_shaped_fields_cannot_impersonate_owner_artifac
     request["nodes"][1]["sources"][-1]["binding"]["kind"] = "note"
     with pytest.raises(DraftingUnavailable, match="output_invalid"):
         adapter(tmp_path, RecorderRunner()).summarize(**request)
+
+
+def test_summary_can_use_allowed_sources_without_current_tool_reads(tmp_path):
+    runner = RecorderRunner()
+    runner.reads = []
+    assert adapter(tmp_path, runner).summarize(**job()) == (output()["summaries"], "native-recorder", 900)
+
+
+def test_optional_source_read_failure_does_not_gate_valid_summary_output(tmp_path):
+    runner = RecorderRunner()
+    runner.sources.data["question-1"] = None
+    assert adapter(tmp_path, runner).summarize(**job())[0] == output()["summaries"]
+
+
+@pytest.mark.parametrize("problem,code", [
+    ("missing", "missing_node"), ("duplicate", "duplicate_node"), ("unknown", "missing_node"),
+])
+def test_malformed_node_identity_does_not_discard_uniquely_identified_results(tmp_path, problem, code):
+    value = output()
+    if problem == "missing":
+        value["summaries"].pop(0)
+    elif problem == "duplicate":
+        value["summaries"].append(dict(value["summaries"][0]))
+    else:
+        value["summaries"][0]["node_key"] = "question:another-question"
+    runner = RecorderRunner(value)
+    runner.reads = []
+    with pytest.raises(DraftingUnavailable, match="output_invalid") as failed:
+        adapter(tmp_path, runner).summarize(**job())
+    assert failed.value.summaries == [output()["summaries"][1]]
+    assert set(failed.value.failures) == {Q}
+    assert failed.value.failures[Q]["code"] == code
+
+
+def test_restart_recovers_partial_results_without_another_model_call(tmp_path):
+    value = output()
+    value["summaries"][0]["source_refs"] = ["judgment"]
+    runner = RecorderRunner(value)
+    runner.reads = []
+    with pytest.raises(DraftingUnavailable, match="output_invalid") as original:
+        adapter(tmp_path, runner).summarize(**job())
+
+    restarted_runner = RecorderRunner()
+    restarted = adapter(tmp_path, restarted_runner)
+    with pytest.raises(DraftingUnavailable, match="output_invalid") as recovered:
+        restarted.recover_summaries(job())
+    assert recovered.value.summaries == original.value.summaries == [output()["summaries"][1]]
+    assert recovered.value.failures == original.value.failures
+    assert recovered.value.native_session_ref == "native-recorder"
+    assert recovered.value.next_scan_seconds == 900
+    assert not restarted_runner.calls
+
+
+def test_recorder_restart_corrects_only_invalid_node_with_feedback(tmp_path):
+    from meta_research.timeline_summaries import TimelineSummaryService, TimelineSummaryStore
+
+    runner = CorrectingRunner()
+    database = tmp_path / "summaries.sqlite3"
+    first = TimelineSummaryService(TimelineSummaryStore(database), ObservedNodes(),
+        lambda: adapter(tmp_path, runner), clock=lambda: 100)
+    assert first.process_once()
+    rows = {row["node_key"]: row for row in first.query("quest-1")["nodes"]}
+    assert rows[STAGE]["status"] == "ready" and rows[STAGE]["summary"] == output()["summaries"][1]["summary"]
+    assert rows[Q]["status"] == "failed" and rows[Q]["summary"] is None
+
+    restarted = TimelineSummaryService(TimelineSummaryStore(database), ObservedNodes(),
+        lambda: adapter(tmp_path, runner), clock=lambda: 101)
+    assert restarted.process_once()
+    assert all(row["status"] == "ready" for row in restarted.query("quest-1")["nodes"])
+    assert len(runner.calls) == 2
+    argv, prompt = runner.calls[1]
+    request = json.loads(prompt.rsplit("\n", 1)[1])
+    assert [n["node_key"] for n in request["nodes"]] == [Q]
+    assert request["nodes"][0]["retry_feedback"]["source_refs"] == ["judgment"]
+    assert request["nodes"][0]["retry_feedback"]["code"] == "unallowed_source_refs"
+    assert argv[-3:] == ["resume", "native-recorder", "-"]
+    assert "retry_feedback" in prompt
+
+
+def test_partial_publication_recovers_after_restart_without_counting_another_call(tmp_path):
+    from meta_research.timeline_summaries import TimelineSummaryService, TimelineSummaryStore
+
+    class UnavailableStore(TimelineSummaryStore):
+        def publish(self, *args, **kwargs):
+            raise OSError("temporary storage failure")
+
+    runner, reader, now = CorrectingRunner(), ObservedNodes(), [100]
+    database = tmp_path / "summaries.sqlite3"
+    first = TimelineSummaryService(UnavailableStore(database), reader,
+        lambda: adapter(tmp_path, runner), clock=lambda: now[0])
+    assert not first.process_once()
+    assert len(runner.calls) == 1
+    assert all(row["summary"] is None for row in first.query("quest-1")["nodes"])
+
+    now[0] = 131
+    restarted = TimelineSummaryService(TimelineSummaryStore(database), reader,
+        lambda: adapter(tmp_path, runner), clock=lambda: now[0])
+    assert restarted.process_once()
+    assert len(runner.calls) == 1  # Recover the terminal spool; no second CLI invocation.
+    rows = {row["node_key"]: row for row in restarted.query("quest-1")["nodes"]}
+    assert rows[STAGE]["status"] == "ready" and rows[Q]["status"] == "failed"
+
+    now[0] = 132
+    assert restarted.process_once()
+    assert len(runner.calls) == 2
+    correction = json.loads(runner.calls[1][1].rsplit("\n", 1)[1])
+    assert [n["node_key"] for n in correction["nodes"]] == [Q]
+    assert all(row["status"] == "ready" for row in restarted.query("quest-1")["nodes"])
+
+    # Publication recovery must not consume a model call: the next genuine
+    # observation is the third call and still resumes this native session.
+    reader.nodes[0]["source_hash"] = "next-observation"
+    now[0] = 1100
+    assert restarted.process_once()
+    assert len(runner.calls) == 3
+    assert runner.calls[2][0][-3:] == ["resume", "native-recorder", "-"]
 
 
 def test_unrelated_root_cannot_discover_or_call_the_recorders_operation(tmp_path):
@@ -397,7 +553,7 @@ def test_source_pages_pin_one_successful_read_for_this_binding_and_grant():
 
 def test_adapter_validates_shared_ref_against_each_nodes_exact_binding(tmp_path):
     cycle = node("cycle:cycle-1", "cycle", ["judgment"])
-    cycle["sources"][0]["binding"]["version"] = 2
+    cycle["sources"][0]["binding"].update(version=2, disposition="skipped")
     request = job()
     request["nodes"] = [node(STAGE, "stage", ["judgment"]), cycle]
     value = output()
@@ -405,10 +561,7 @@ def test_adapter_validates_shared_ref_against_each_nodes_exact_binding(tmp_path)
     progress = dict(judgment, node_key=cycle["node_key"], summary_kind="process", summary="正在核对新增队列的数据。")
     value["summaries"] = [judgment, progress]
     runner = RecorderRunner(value)
-    runner.reads = [(STAGE, "judgment"), (cycle["node_key"], "judgment")]
-    runner.sources.read_source = lambda quest, n, ref: (
-        CLAIM if n["sources"][0]["binding"]["version"] == 1 else {"stage": "reasoning", "status": "pending"}
-    )
+    runner.reads = []
 
     assert adapter(tmp_path, runner).summarize(**request)[0] == [judgment, progress]
     progress["summary_kind"] = "accepted_conclusion"
