@@ -7,7 +7,7 @@ import pytest
 import meta_research.target_run_finalizer as finalizer_module
 from meta_research.owners.common import OwnerConflict
 from meta_research.target_run_finalizer import TargetRunFinalizer
-from test_target_root_finalizer import _EvidenceReader, _root_finalizer_fixture
+from test_target_root_finalizer import _EvidenceReader, _GraphAcceptance, _root_finalizer_fixture
 
 
 @contextmanager
@@ -70,6 +70,51 @@ def test_ar_only_retry_reuses_private_frozen_bytes_without_copying(tmp_path, mon
         assert result.status == "rm_accepted"
         assert result.completion_ref == completion.completion_ref
         assert result.completion_generation == 1
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_accepted_replay_retries_failed_cleanup_before_delivery(tmp_path, monkeypatch, directory):
+    with _pending_completion(tmp_path, monkeypatch, directory=directory) as values:
+        lifecycle, memory, handle, workspace, evidence, completion, saved, finalizer = values
+        graph = _GraphAcceptance()
+        finalizer._graph_authority = graph
+        rmtree = finalizer_module.shutil.rmtree
+
+        def failed_cleanup(path, *args, **kwargs):
+            if Path(path) == saved[0].parent:
+                raise OSError("temporary frozen cleanup failed")
+            return rmtree(path, *args, **kwargs)
+
+        with monkeypatch.context() as first_cleanup:
+            first_cleanup.setattr(finalizer_module.shutil, "rmtree", failed_cleanup)
+            with pytest.raises(OSError, match="temporary frozen cleanup failed"):
+                finalizer.finalize(handle=handle, evidence=evidence)
+        manifest = memory.query_for_completion(completion.completion_ref)
+        assert manifest is not None
+        assert graph.calls == 0
+        assert all(path.exists() for path in saved)
+        pending = saved[0].parent.parent / "another-pending-completion"
+        pending.mkdir()
+        (pending / "artifact-0000").write_bytes(b"still pending")
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("accepted cleanup reopened or revalidated the live workspace")
+
+        monkeypatch.setattr(finalizer, "_freeze", forbidden)
+        monkeypatch.setattr(finalizer._workspace_resolver, "resolve_target_workspace", forbidden)
+        monkeypatch.setattr(finalizer._workspace_resolver, "query_target_workspace", forbidden)
+        accepted = finalizer.finalize(handle=handle, evidence=evidence)
+        assert accepted.status == "completed"
+        assert accepted.manifest_ref == manifest.manifest_ref
+        assert graph.calls == 1
+        assert not saved[0].parent.exists()
+        assert (pending / "artifact-0000").read_bytes() == b"still pending"
+        assert (workspace / "logs/train.log").is_file()
+        # Cleanup is idempotent, and the accepted copy remains readable.
+        assert finalizer.finalize(handle=handle, evidence=evidence) == accepted
+        manifest = memory.query(accepted.manifest_ref)
+        log = next(entry for entry in manifest.entries if entry.declared_relative_path == "logs/train.log")
+        assert memory._asset_memory.materialize_asset(log.binding.version_ref).content == b"epoch 1 complete\n"
 
 
 @pytest.mark.parametrize("changed", ["frozen_bytes", "frozen_directory", "inline_bytes", "frozen_symlink", "operation"])

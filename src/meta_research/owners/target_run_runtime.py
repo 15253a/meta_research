@@ -4279,6 +4279,12 @@ class SQLiteTargetRunAgentAuthority:
             payload_hash=payload_hash, receipt=receipt, status=row.status, created_at=float(row.created_at),
         )
 
+    def target_workspace_path(self, workspace_ref: str) -> Path:
+        """Locate a known workspace without reopening or revalidating it."""
+        if self._workspace_root is None:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        return self._workspace_root / canonical_hash({"workspace_ref": workspace_ref})
+
     def read_target_workspace_location(self, target_run_ref: str) -> tuple[TargetRunWorkspace, Path]:
         workspace = self.query_target_workspace(target_run_ref)
         if workspace is None or self._workspace_root is None:

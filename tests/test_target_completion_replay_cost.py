@@ -38,7 +38,7 @@ def _replay_fixture(tmp_path, monkeypatch):
         harness_operation_ref=evidence.operation_ref, evidence_ref=evidence.evidence_ref,
         evidence_content_hash=canonical_hash({"evidence": "provider-drained"}),
         handoff=handoff, workspace_ref=workspace._workspace.workspace_ref,
-        candidate_rejection_code=None,
+        candidate_rejection_code=None, artifact_snapshot_hash="a" * 64,
     )
     manifest = SimpleNamespace(manifest_ref="accepted-manifest",
         artifact_snapshot_hash="a" * 64, result_document=SimpleNamespace(metrics={"value": 1}))

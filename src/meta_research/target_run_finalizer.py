@@ -302,6 +302,8 @@ class TargetRootFinalizationResult:
 
 
 class TargetRootWorkspaceResolver(Protocol):
+    def target_workspace_path(self, workspace_ref: str) -> Path: ...
+
     def resolve_target_workspace(
         self,
         *,
@@ -1343,6 +1345,10 @@ class TargetRunFinalizer:
                 manifest = self._memory.query_for_completion(
                     completion.completion_ref
                 )
+                if manifest is not None:
+                    # Acceptance may have committed before cleanup was interrupted.
+                    workspace = self._workspace_resolver.target_workspace_path(completion.workspace_ref)
+                    _remove_frozen_source_root(_frozen_sources_root(workspace.parent, completion))
             elif rejection is None:
                 raise OwnerConflict("target_root_completion_conflict")
 
@@ -2365,17 +2371,21 @@ def _publish_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTarget
 def _remove_frozen_sources(frozen: _FrozenWorkspace) -> None:
     roots = {artifact.source_path.parent for artifact in frozen.artifacts if artifact.source_path}
     for root in roots:
-        if root.parent.name != ".target-completion-intakes" or root.is_symlink():
-            raise OwnerConflict("target_root_artifact_storage_unavailable")
-        try:
-            shutil.rmtree(root)
-        except FileNotFoundError:
-            pass
-        try:
-            root.parent.rmdir()
-        except OSError:
-            # Another completion may still own its pending intake snapshots.
-            pass
+        _remove_frozen_source_root(root)
+
+
+def _remove_frozen_source_root(root: Path) -> None:
+    if root.parent.name != ".target-completion-intakes" or root.is_symlink():
+        raise OwnerConflict("target_root_artifact_storage_unavailable")
+    try:
+        shutil.rmtree(root)
+    except FileNotFoundError:
+        pass
+    try:
+        root.parent.rmdir()
+    except OSError:
+        # Another completion may still own its pending intake snapshots.
+        pass
 
 
 def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: int,
