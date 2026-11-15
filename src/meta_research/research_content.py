@@ -12,6 +12,45 @@ from meta_research.research_pagination import bind_page, page_state
 from meta_research.accepted_materials import DeepFetchAcceptedMaterials
 
 
+_UNSELECTED = object()
+
+
+def _read_resource_selection(memory, record, *, source_ref, version_ref, selection_path,
+                             entry_path, offset, limit, source_quest_ref):
+    """Keep entry paths relative to a selected root, including multi-root resources."""
+    from meta_research.content_selection import ContentSelection
+    from meta_research.resource_selections import content_selection_ref
+    selections = [ContentSelection.from_dict(value) for value in record["selections"]
+                  if value["asset_binding"]["version_ref"] == version_ref]
+    if selection_path is not _UNSELECTED:
+        selections = [item for item in selections if item.path == selection_path]
+    if not selections:
+        raise OwnerConflict("content_selection_unbound")
+    if len(selections) > 1:
+        if entry_path is not None:
+            raise OwnerConflict("content_selection_required")
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 65536:
+            raise OwnerConflict("research_content_page_invalid")
+        items = []
+        for selection in selections[offset:offset + limit]:
+            description = memory.describe_selection(selection.asset_binding, selection.path)
+            items.append({"selection_ref": content_selection_ref(selection),
+                "selection": selection.as_dict(), "kind": description.kind,
+                "reader": _reader({"source_ref": source_ref, "version_ref": version_ref,
+                    "selection_path": selection.path}, source_quest_ref)})
+        next_offset = offset + len(items) if offset + len(items) < len(selections) else None
+        return {"kind": "selections", "source_ref": source_ref, "version_ref": version_ref,
+            "items": items, "offset": offset, "offset_unit": "selection", "limit": limit,
+            "total": len(selections), "next_offset": next_offset,
+            "complete": offset == 0 and next_offset is None}
+    selection = selections[0]
+    page = memory.read_selection_page(selection.asset_binding, selection.path,
+                                     entry_path=entry_path, offset=offset, limit=limit)
+    return {**page, "source_ref": source_ref, "version_ref": version_ref,
+        "selection": selection.as_dict(), "selection_ref": content_selection_ref(selection),
+        "selection_path": selection.path}
+
+
 def _quest(agent_runtime, context):
     scope = agent_runtime.verify_root_agent_runtime_scope(
         root_kind=context.root_kind, run_ref=context.run_ref, attempt_ref=context.attempt_ref,
@@ -44,6 +83,11 @@ def _reading_quest(agent_runtime, context, *, source_quest_ref=None, human_colla
 def read_content(graph, memory, *, quest_ref, source_ref, version_ref, **arguments):
     page = _read_content(graph, memory, quest_ref=quest_ref,
                          source_ref=source_ref, version_ref=version_ref, **arguments)
+    if "selection" in page:
+        # A selected view must not advertise the wider parent's evidence reader
+        # as though it described the content just read. Resource registration
+        # supplies the exact selection_ref used by execution inputs.
+        return page
     if source_ref.startswith("human_input_"):
         # Its adoption binding was projected from the same verified read.
         return page
@@ -72,7 +116,9 @@ def adopted_source_binding(graph, *, quest_ref, source_ref, leaf=None):
                        "args": {"source_ref": source_ref, "version_ref": version_ref}}}
 
 
-def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, offset=0, limit=8192, human_collaboration=None, page_cache=None, reader_source_quest_ref=None):
+def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_path=None, selection_path=_UNSELECTED, offset=0, limit=8192, human_collaboration=None, page_cache=None, reader_source_quest_ref=None):
+    if selection_path is not _UNSELECTED and not source_ref.startswith(("environment_", "dataset_version_", "asset_version_")):
+        raise OwnerConflict("content_selection_unbound")
     def exact_page(value):
         return context_read_page(value, path=[], offset=offset, limit=min(limit, 16384),
             cache=page_cache, identity=(quest_ref, source_ref, version_ref, 'canonical-json', reader_source_quest_ref))
@@ -162,19 +208,27 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
             return {**page, "source_ref": source_ref, "version_ref": version_ref}
     if source_ref == version_ref and memory.query_asset_version(version_ref) is not None:
         graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
+        if selection_path is not _UNSELECTED:
+            binding = memory.query_asset_version(version_ref).as_binding()
+            return memory.read_selection_page(binding, selection_path,
+                entry_path=entry_path, offset=offset, limit=limit)
         return memory.read_asset_content_page(version_ref, entry_path=entry_path, offset=offset, limit=limit)
     dataset = graph.query_dataset_version(source_ref, quest_ref=quest_ref)
     if dataset is not None:
         if version_ref not in {b["version_ref"] for b in dataset["asset_bindings"]}:
             raise OwnerConflict("content_version_unbound")
         graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
-        return {**memory.read_asset_content_page(version_ref,entry_path=entry_path,offset=offset,limit=limit),"source_ref":source_ref}
+        return _read_resource_selection(memory, dataset, source_ref=source_ref, version_ref=version_ref,
+            selection_path=selection_path, entry_path=entry_path, offset=offset, limit=limit,
+            source_quest_ref=reader_source_quest_ref)
     environment = graph.query_environment(source_ref, quest_ref=quest_ref)
     if environment is not None:
         if version_ref not in {binding["version_ref"] for binding in environment["asset_bindings"]}:
             raise OwnerConflict("content_version_unbound")
         graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
-        return {**memory.read_asset_content_page(version_ref,entry_path=entry_path,offset=offset,limit=limit),"source_ref":source_ref}
+        return _read_resource_selection(memory, environment, source_ref=source_ref, version_ref=version_ref,
+            selection_path=selection_path, entry_path=entry_path, offset=offset, limit=limit,
+            source_quest_ref=reader_source_quest_ref)
     question = graph.query_question_history_by_ref(source_ref)
     if question is not None:
         if question.quest_ref != quest_ref or version_ref != question.content_ref:
@@ -406,6 +460,8 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
     def invoke(context, arguments):
         try:
             if context.phase == "creation_materials":
+                if "selection_path" in arguments:
+                    raise OwnerConflict("content_selection_unbound")
                 if "source_quest_ref" in arguments:
                     raise OwnerConflict("content_quest_not_authorized")
                 operation = human_collaboration._creation_material_operation(context)
@@ -468,6 +524,8 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
             "version_ref":{"type":"string","minLength":1,"maxLength":1024,
                 "description":"Copy version_ref from the exact reader. For an AssetVersion original this is the same accurate version identity as source_ref; do not substitute the logical asset_ref or latest version."},
             "entry_path":{"type":"string","minLength":1,"maxLength":4096},
+            "selection_path":{"type":["string","null"],"minLength":1,"maxLength":4096,
+                "description":"Copy from a resource's selection reader. entry_path is relative to this selected root; null explicitly selects the whole parent."},
             "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":65536}},
             "required":["source_ref","version_ref"],"additionalProperties":False},
         output_schema={"type":"object"},handler=invoke)]

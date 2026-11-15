@@ -49,19 +49,15 @@ class ResearchEnvironmentOwnerInterface(Protocol):
 
 
 class ResearchEnvironmentOwnerMixin:
-    def register_environment(self, *, semantic_key, name, meaning, source, asset_bindings=None,
+    def register_environment(self, *, semantic_key, name, meaning, source, asset_bindings=None, selections=None,
                              metadata=None, notes="", source_environment_ref=None, quest_ref=None,
                              idempotency_key, effect_scope=None):
         payload = {field: _validate(dataset_text, value, field, optional=field == "notes")
             for field, value in (("semantic_key", semantic_key), ("name", name),
                                  ("meaning", meaning), ("source", source), ("notes", notes))}
-        if asset_bindings is None:
-            asset_bindings = []
-        if not isinstance(asset_bindings, (list, tuple)) or len(asset_bindings) > 256:
-            raise OwnerConflict("environment_asset_bindings_invalid")
-        bindings = [_validate(dataset_asset_binding, item) for item in asset_bindings]
-        if len({item.version_ref for item in bindings}) != len(bindings):
-            raise OwnerConflict("environment_asset_bindings_invalid")
+        from meta_research.resource_selections import resource_selections
+        selected, bindings = resource_selections(selections, asset_bindings=asset_bindings)
+        payload["selections"] = [item.as_dict() for item in selected]
         payload.update(asset_bindings=[item.as_dict() for item in sorted(bindings, key=lambda item: item.version_ref)],
                        metadata=_validate(dataset_metadata, metadata), origin_quest_ref=quest_ref,
                        source_environment_ref=source_environment_ref)
@@ -81,6 +77,9 @@ class ResearchEnvironmentOwnerMixin:
                 self._verify_environment_asset(binding, current=False)
                 with self._database.read() as connection:
                     assert_asset_usable(connection, binding.version_ref)
+            from meta_research.resource_selections import verify_resource_selections
+            verify_resource_selections(self._asset_verifier, payload["selections"],
+                                       asset_bindings=payload["asset_bindings"])
 
         return self._accept_environment_fact("register", payload, idempotency_key,
                                              effect_scope=effect_scope, verify_new=verify_new)
@@ -171,8 +170,11 @@ class ResearchEnvironmentOwnerMixin:
                                            {"ref": ref, "asset": binding["version_ref"]})
                 connection.execute(text("UPDATE research_graph_state SET revision=revision+1 WHERE singleton='owner'"))
                 self._feed.record(connection, f"research_graph.environment_{operation}_accepted", {key: ref, "payload_hash": digest})
-                result = {key: ref, **payload, "schema_ref": f"meta-research/environment-{operation}/v1",
+                result = {key: ref, **payload, "schema_ref": f"meta-research/environment-{operation}/v2",
                           "payload_hash": digest, "receipt": receipt, "accepted_at": now}
+                if operation == "register":
+                    from meta_research.resource_selections import selection_readers
+                    result.update(selection_readers(payload, ref))
             else:
                 result = self._environment_record(operation, row)
                 ref = result[key]
@@ -226,7 +228,8 @@ class ResearchEnvironmentOwnerMixin:
             payload = json.loads(row.payload_json)
             if (not isinstance(payload, dict) or canonical_hash(payload) != row.payload_hash
                     or receipt["payload_hash"] != row.receipt_hash
-                    or any(payload[field] != row._mapping[field] for field in indexed)):
+                    or any(payload[field] != row._mapping[field] for field in indexed)
+                    or (operation == "register" and not isinstance(payload["selections"], list))):
                 raise ValueError
         except (ValueError, TypeError, KeyError) as error:
             raise OwnerConflict("environment_receipt_invalid") from error
@@ -239,10 +242,38 @@ class ResearchEnvironmentOwnerMixin:
                 raise OwnerConflict("environment_asset_reference_invalid")
             for binding in bindings:
                 self._verify_environment_asset(binding, current=False)
+            from meta_research.resource_selections import verify_resource_selections
+            verify_resource_selections(self._asset_verifier, payload["selections"],
+                                       asset_bindings=payload["asset_bindings"])
         else:
             self._verify_environment_sources(operation, payload)
-        return {key: ref, **payload, "schema_ref": f"meta-research/environment-{operation}/v1",
-                "payload_hash": row.payload_hash, "receipt": receipt, "accepted_at": row.accepted_at}
+        result = {key: ref, **payload, "schema_ref": f"meta-research/environment-{operation}/v2",
+                  "payload_hash": row.payload_hash, "receipt": receipt, "accepted_at": row.accepted_at}
+        if operation == "register":
+            from meta_research.resource_selections import selection_readers
+            result.update(selection_readers(payload, ref))
+        return result
+
+    def resolve_resource_selection(self, selection_ref, *, quest_ref):
+        """Resolve a logical input only from a verified resource visible to this Quest."""
+        from meta_research.content_selection import ContentSelection
+        from meta_research.resource_selections import content_selection_ref
+        if not isinstance(selection_ref, str) or not selection_ref.startswith("content_selection_"):
+            return None
+        with self._database.read_snapshot() as connection:
+            environments = connection.execute(text("SELECT environment_ref FROM rg_environments")).scalars().all()
+            datasets = connection.execute(text("SELECT dataset_version_ref FROM rg_dataset_versions")).scalars().all()
+            for reader, refs in ((self.query_environment, environments), (self.query_dataset_version, datasets)):
+                for ref in refs:
+                    record = reader(ref, quest_ref=quest_ref)
+                    if record is None:
+                        continue
+                    for value in record["selections"]:
+                        if content_selection_ref(value) == selection_ref:
+                            selection = ContentSelection.from_dict(value)
+                            self.verify_asset_quest_scope(selection.asset_binding.version_ref, quest_ref=quest_ref)
+                            return selection
+        return None
 
     def query_environment(self, environment_ref, *, quest_ref=None):
         return self._query_environment_fact("register", environment_ref, quest_ref=quest_ref)

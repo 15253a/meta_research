@@ -2956,7 +2956,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     or handle.accepted_input_target_commit_refs
                     != request.accepted_input_target_commit_refs
                     or tuple(
-                        proof.asset_ref for proof in handle.accepted_input_asset_proofs
+                        proof.input_ref for proof in handle.accepted_input_asset_proofs
                     )
                     != request.accepted_input_asset_refs
                     or projection_plain_value(handle.accepted_input_asset_proofs)
@@ -26006,10 +26006,8 @@ def _target_work_handle_from_json(value: str) -> TargetWorkHandle:
         asset_proofs: list[AcceptedInputAssetProof] = []
         for asset_value in asset_values:
             if not isinstance(asset_value, dict) or set(asset_value) != {
-                "asset_ref",
-                "rm_acceptance_receipt",
-                "rg_role_receipt",
-            }:
+                "asset_ref", "rm_acceptance_receipt", "rg_role_receipt",
+                "selection_ref", "selection_path", "asset_version_ref"}:
                 raise TypeError("AcceptedInputAssetProof")
             asset_proofs.append(
                 AcceptedInputAssetProof(
@@ -26020,6 +26018,9 @@ def _target_work_handle_from_json(value: str) -> TargetWorkHandle:
                     rg_role_receipt=_receipt_proof_from_value(
                         asset_value["rg_role_receipt"]
                     ),
+                    selection_ref=asset_value["selection_ref"],
+                    selection_path=asset_value["selection_path"],
+                    asset_version_ref=asset_value["asset_version_ref"],
                 )
             )
         handle = TargetWorkHandle(

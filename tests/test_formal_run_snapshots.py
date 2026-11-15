@@ -62,11 +62,14 @@ def test_two_real_snapshots_and_local_input_are_frozen_and_readable(tmp_path):
         accepted = graph.accept_target_commit_from_root_completion(
             completion=lifecycle.query_completion(handle.target_ref), manifest=manifest,
             result_document=manifest.result_document, idempotency_key='two-real-runs')
+        assert getattr(accepted, 'issuer', None) != 'research_graph', getattr(accepted, 'feedback', '')
         rows = {row['run_key']: row for row in graph.query_target_formal_results(handle.target_ref)}
         entries = {entry.declared_relative_path: entry for entry in manifest.entries}
         first, second = [rows[key]['variant_run']['inputs'] for key in ('first','second')]
-        assert first['implementation_revision_ref'] == 'target_impl_' + entries['implementation/v1'].tree_hash
-        assert second['implementation_revision_ref'] == 'target_impl_' + entries['implementation/v2'].tree_hash
+        from meta_research.formal_run_bindings import implementation_binding, manifest_selection_entries
+        logical = manifest_selection_entries(manifest)
+        assert first['implementation_revision_ref'] == implementation_binding(logical, ['implementation/v1'])[0]
+        assert second['implementation_revision_ref'] == implementation_binding(logical, ['implementation/v2'])[0]
         assert first['implementation_revision_ref'] != second['implementation_revision_ref']
         assert entries['outputs/data/run1.txt'].binding.version_ref in second['input_refs']
         for path, expected in [('outputs/data/run1.txt', b'36\n'), ('outputs/data/run2.txt', b'169\n')]:
@@ -89,10 +92,11 @@ def test_false_run_bindings_are_rejected_after_real_freezing(tmp_path, case, cod
     try:
         frozen = finalizer.finalize(handle=handle, evidence=evidence)
         manifest = memory.query(frozen.manifest_ref)
-        with pytest.raises(OwnerConflict, match=code):
-            runtime.owners.research_graph.accept_target_commit_from_root_completion(
-                completion=lifecycle.query_completion(handle.target_ref), manifest=manifest,
-                result_document=manifest.result_document, idempotency_key='false-run-binding')
+        rejected = runtime.owners.research_graph.accept_target_commit_from_root_completion(
+            completion=lifecycle.query_completion(handle.target_ref), manifest=manifest,
+            result_document=manifest.result_document, idempotency_key='false-run-binding')
+        assert rejected.issuer == 'research_graph'
+        assert code in rejected.code
         with runtime._database.read() as connection:
             assert connection.execute(text('SELECT COUNT(*) FROM rg_variant_runs')).scalar_one() == 0
     finally:

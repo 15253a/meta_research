@@ -603,6 +603,12 @@ class SQLiteTargetRunMemoryAuthority:
     def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
         return self._verifier.describe_asset_export(memory_ref)
 
+    def describe_selection(self, binding, path=None):
+        return self._verifier.describe_selection(binding, path)
+
+    def export_selection(self, binding, path, destination):
+        return self._verifier.export_selection(binding, path, destination)
+
     def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str:
         return self._verifier.read_asset_entry_text(memory_ref, entry_path=entry_path)
 
@@ -2346,6 +2352,15 @@ class SQLiteTargetRunGraphAuthority:
                 "target_ref = :target_ref AND idempotency_key LIKE "
                 "'target-plan-companion-input-rg:%'"
             ), {"target_ref": target_ref}).scalars())
+        parent_versions = {item.asset.asset_ref: item.asset for item in resolved.values()}
+        for ref in refs:
+            selection = self._resource_input_selection(target_ref, ref)
+            if selection is not None:
+                prior = parent_versions.get(selection.asset_binding.asset_ref)
+                if prior is not None and prior != selection.asset_binding:
+                    raise OwnerConflict("target_input_evidence_version_conflict")
+                parent_versions[selection.asset_binding.asset_ref] = selection.asset_binding
+                resolved[ref] = _SelectedTargetInput(selection.asset_binding, _quest_ref)
         unresolved = tuple(ref for ref in refs if ref not in resolved and (ref.startswith("evidence_")
             or ref in companion_assets
             or self.query_input_asset_projection(target_ref=target_ref, asset_ref=ref) is None))
@@ -2684,7 +2699,7 @@ class SQLiteTargetRunGraphAuthority:
             selected = inputs.get(input_ref)
             if selected is not None:
                 self._verify_input_asset_version(target_ref=target_ref, selected=selected)
-                resolved.append(selected.asset.asset_ref)
+                resolved.append(input_ref if input_ref.startswith("content_selection_") else selected.asset.asset_ref)
             elif input_ref.startswith("evidence_"):
                 raise OwnerConflict("target_input_evidence_not_selected")
             elif input_ref.startswith("asset_version_"):
@@ -2747,9 +2762,16 @@ class SQLiteTargetRunGraphAuthority:
             role = selected.role
             companion = role is None
             if companion:
+                quest_ref = selected.quest_ref
+                if quest_ref is None:
+                    with self._database.read() as connection:
+                        quest_ref = connection.execute(text(
+                            "SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g "
+                            "ON g.graph_ref=t.graph_ref WHERE t.target_ref=:ref"
+                        ), {"ref": target_ref}).scalar_one()
                 identity = canonical_hash({"target_ref": target_ref, "asset": selected.asset.as_dict()})
                 role = self._domain_reader.accept_asset_role(
-                    binding=selected.asset, role="evidence", quest_ref=selected.quest_ref,
+                    binding=selected.asset, role="evidence", quest_ref=quest_ref,
                     idempotency_key="target-plan-companion-input-role:" + identity, verify_content=False,
                 )
             identity = canonical_hash({"target_ref": target_ref,
@@ -2779,7 +2801,7 @@ class SQLiteTargetRunGraphAuthority:
         grouped: dict[str, list[str]] = {}
         for ref in refs:
             selected = inputs.get(ref)
-            asset_ref = ref if selected is None else selected.asset.asset_ref
+            asset_ref = ref if selected is None or ref.startswith("content_selection_") else selected.asset.asset_ref
             grouped.setdefault(asset_ref, []).append(ref)
         return {asset_ref: tuple(sorted(values)) for asset_ref, values in grouped.items()
             if any(value != asset_ref for value in values)}
@@ -2964,11 +2986,33 @@ class SQLiteTargetRunGraphAuthority:
     def query_bundle_input_asset_proof(
         self, *, target_ref: str, asset_ref: str
     ) -> AcceptedInputAssetProof | None:
+        selection = self._resource_input_selection(target_ref, asset_ref)
         projection = self.query_input_asset_projection(
             target_ref=target_ref,
-            asset_ref=asset_ref,
+            asset_ref=asset_ref if selection is None else selection.asset_binding.asset_ref,
         )
-        return None if projection is None else projection.as_bundle_proof()
+        if projection is None:
+            return None
+        proof = projection.as_bundle_proof()
+        if selection is not None:
+            if projection.asset != selection.asset_binding:
+                raise OwnerConflict("target_input_evidence_version_conflict")
+            proof = replace(proof, selection_ref=asset_ref, selection_path=selection.path,
+                            asset_version_ref=selection.asset_binding.version_ref)
+        return proof
+
+    def _resource_input_selection(self, target_ref: str, input_ref: str):
+        if not input_ref.startswith("content_selection_"):
+            return None
+        with self._database.read() as connection:
+            quest_ref = connection.execute(text(
+                "SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g "
+                "ON g.graph_ref=t.graph_ref WHERE t.target_ref=:ref"
+            ), {"ref": target_ref}).scalar_one()
+        selection = self._domain_reader.resolve_resource_selection(input_ref, quest_ref=quest_ref)
+        if selection is None:
+            raise OwnerConflict("target_input_selection_not_selected")
+        return selection
 
     def accept_execution_input_binding(
         self,
@@ -3826,12 +3870,14 @@ class SQLiteTargetRunGraphAuthority:
                 target_ref=binding.target_ref,
                 asset_ref=proof.asset_ref,
             )
-            if projection is None or projection.as_bundle_proof() != proof:
+            if projection is None or self.query_bundle_input_asset_proof(
+                target_ref=binding.target_ref, asset_ref=proof.input_ref
+            ) != proof:
                 raise OwnerConflict("target_generic_execution_input_invalid")
-            if projection.asset.asset_ref not in target_input.proof.input_refs:
+            if proof.input_ref not in target_input.proof.input_refs:
                 raise OwnerConflict("target_generic_execution_input_invalid")
             accepted.append(projection.asset)
-        if len({asset.asset_ref for asset in accepted}) != len(accepted):
+        if len({proof.input_ref for proof in request.handle.accepted_input_asset_proofs}) != len(accepted):
             raise OwnerConflict("target_generic_execution_input_invalid")
         return tuple(accepted)
 
@@ -4534,21 +4580,20 @@ class SQLiteTargetRunAgentAuthority:
             if handle.accepted_input_asset_proofs else {}
         )
         for ordinal, proof in enumerate(handle.accepted_input_asset_proofs, start=1):
-            descriptor = getattr(self._memory, "describe_input_asset", None)
-            if callable(descriptor):
-                asset, _proof_receipt, description = descriptor(
-                    target_ref=handle.target_ref,
-                    asset_ref=proof.asset_ref,
-                )
+            asset, _proof_receipt, description = self._memory.describe_input_asset(
+                target_ref=handle.target_ref, asset_ref=proof.asset_ref)
+            file_name = description.file_name
+            selection_ref = getattr(proof, "selection_ref", None)
+            if selection_ref is not None:
+                from meta_research.content_selection import ContentSelection
+                from meta_research.resource_selections import content_selection_ref
+                selection = ContentSelection(asset, proof.selection_path)
+                if (proof.asset_version_ref != asset.version_ref
+                        or content_selection_ref(selection) != selection_ref):
+                    raise OwnerConflict("target_run_input_asset_proof_invalid")
+                description = self._memory.describe_selection(asset, proof.selection_path)
                 file_name = description.file_name
-                content = None
-            else:
-                # Historical in-memory adapters retain their existing seam.
-                asset, _proof_receipt, file_name, content = self._memory.materialize_input_asset(
-                    target_ref=handle.target_ref, asset_ref=proof.asset_ref,
-                )
-                description = None
-            suffix = ("" if description is not None and description.kind == "directory"
+            suffix = ("" if description.kind == "directory"
                       else _safe_input_suffix(file_name))
             relative_path = (
                 "direct/"
@@ -4556,25 +4601,23 @@ class SQLiteTargetRunAgentAuthority:
                 f"{hashlib.sha256(asset.asset_ref.encode('utf-8')).hexdigest()[:16]}"
                 f"{suffix}"
             )
-            if description is None:
-                expected[relative_path] = content
-                content_hash, byte_count = hashlib.sha256(content).hexdigest(), len(content)
-            else:
-                self._project_input_export(relative_path, description, expected, exports, directories)
-                content_hash, byte_count = description.content_hash, description.byte_count
+            self._project_input_export(relative_path, description, expected, exports, directories)
+            content_hash, byte_count = description.content_hash, description.byte_count
             entries.append(
                 {
                     "kind": "direct_asset",
-                    **({"source_refs": list(sources[asset.asset_ref])}
-                       if asset.asset_ref in sources else {}),
+                    **({"source_refs": list(sources[selection_ref or asset.asset_ref])}
+                       if (selection_ref or asset.asset_ref) in sources else {}),
+                    **({"selection_ref": selection_ref, "selection_path": proof.selection_path,
+                        "parent_content_sha256": asset.content_hash,
+                        "visibility": "selected_content_only"} if selection_ref is not None else {}),
                     "relative_path": relative_path,
                     "asset_ref": asset.asset_ref,
                     "version_ref": asset.version_ref,
                     "content_sha256": content_hash,
                     "byte_count": byte_count,
-                    **({"artifact_kind": description.kind,
-                        "media_type": description.media_type}
-                       if description is not None else {}),
+                    "artifact_kind": description.kind,
+                    "media_type": description.media_type,
                 }
             )
         commit_sources = self.target_input_commit_sources(handle)
@@ -4797,7 +4840,10 @@ class SQLiteTargetRunAgentAuthority:
         on process death, allowing the next wake to discard incomplete staging.
         """
         base = self._target_input_asset_cache_root()
-        identity = self._target_input_asset_identity(export.description)
+        from meta_research.content_selection import SelectionDescription
+        selected = export.description if isinstance(export.description, SelectionDescription) else None
+        cache_description = export.description if selected is None else selected.parent_description
+        identity = self._target_input_asset_identity(cache_description)
         key = canonical_hash(identity)
         metadata = canonical_json(identity).encode("utf-8")
         cached = base / key
@@ -4821,16 +4867,16 @@ class SQLiteTargetRunAgentAuthority:
                 staging.mkdir(mode=0o700)
                 try:
                     payload = staging / "content"
-                    delivered = self._memory.export_asset(export.description.memory_ref, payload)
-                    if delivered.description != export.description or delivered.path != payload:
+                    delivered = self._memory.export_asset(cache_description.memory_ref, payload)
+                    if delivered.description != cache_description or delivered.path != payload:
                         raise OwnerConflict("target_run_workspace_input_integrity_invalid")
-                    if export.description.kind == "file":
+                    if cache_description.kind == "file":
                         payload.chmod(0o400)
                     else:
-                        for entry in export.description.entries:
+                        for entry in cache_description.entries:
                             (payload / entry.path).chmod(0o400)
                         self._lock_input_directories(payload)
-                    self._check_shared_input_payload(payload, export.description)
+                    self._check_shared_input_payload(payload, cache_description)
                     with (staging / "description.json").open("wb") as output:
                         output.write(metadata)
                         output.flush()
@@ -4848,13 +4894,16 @@ class SQLiteTargetRunAgentAuthority:
             if ({item.name for item in cached.iterdir()} != {"description.json", "content"}
                     or not self._input_file_matches(cached / "description.json", metadata)):
                 raise OwnerConflict("target_run_workspace_input_integrity_invalid")
-            self._check_shared_input_payload(cached / "content", export.description)
+            self._check_shared_input_payload(cached / "content", cache_description)
+            selected_source = cached / "content"
+            if selected is not None and selected.path is not None:
+                selected_source = selected_source.joinpath(*selected.path.split("/"))
             # Directory links are assembled outside the frozen tree and published
             # together, so crashes cannot leave a partial accepted projection.
             with TemporaryDirectory(prefix=".input-projection-", dir=root.parent) as temporary:
                 projected = Path(temporary) / "content"
                 try:
-                    self._link_input_asset_payload(cached / "content", projected, export.description)
+                    self._link_input_asset_payload(selected_source, projected, export.description)
                     os.rename(projected, destination)
                 finally:
                     if projected.is_dir():
@@ -5162,7 +5211,7 @@ class SQLiteTargetRunAgentAuthority:
                 handle.accepted_input_target_commit_refs
             ),
             accepted_input_asset_refs=tuple(
-                proof.asset_ref for proof in handle.accepted_input_asset_proofs
+                proof.input_ref for proof in handle.accepted_input_asset_proofs
             ),
         )
         run = self._harness.query_target_run_by_ref(handle.target_run_ref)
@@ -5228,10 +5277,10 @@ class SQLiteTargetRunAgentAuthority:
         }:
             raise OwnerConflict("target_run_harness_identity_invalid")
         for proof in handle.accepted_input_asset_proofs:
-            projection = self._graph.query_input_asset_projection(
-                target_ref=handle.target_ref, asset_ref=proof.asset_ref
+            current = self._graph.query_bundle_input_asset_proof(
+                target_ref=handle.target_ref, asset_ref=proof.input_ref
             )
-            if projection is None or projection.as_bundle_proof() != proof:
+            if current != proof:
                 raise OwnerConflict("target_run_input_asset_proof_invalid")
         return handle
 
@@ -5310,7 +5359,7 @@ class SQLiteTargetRunAgentAuthority:
                 old_handle.accepted_input_target_commit_refs
             ),
             accepted_input_asset_refs=tuple(
-                proof.asset_ref for proof in old_handle.accepted_input_asset_proofs
+                proof.input_ref for proof in old_handle.accepted_input_asset_proofs
             ),
         )
         if (
@@ -5349,7 +5398,7 @@ class SQLiteTargetRunAgentAuthority:
             sorted(
                 (
                     *old_handle.accepted_input_target_commit_refs,
-                    *(proof.asset_ref for proof in old_handle.accepted_input_asset_proofs),
+                    *(proof.input_ref for proof in old_handle.accepted_input_asset_proofs),
                 )
             )
         )
@@ -5432,7 +5481,7 @@ class SQLiteTargetRunAgentAuthority:
                 old_handle.accepted_input_target_commit_refs
             ),
             accepted_input_asset_refs=tuple(
-                proof.asset_ref for proof in old_handle.accepted_input_asset_proofs
+                proof.input_ref for proof in old_handle.accepted_input_asset_proofs
             ),
         )
         try:
@@ -5512,7 +5561,7 @@ class SQLiteTargetRunAgentAuthority:
                 old_handle.accepted_input_target_commit_refs
             ),
             accepted_input_asset_refs=tuple(
-                proof.asset_ref for proof in old_handle.accepted_input_asset_proofs
+                proof.input_ref for proof in old_handle.accepted_input_asset_proofs
             ),
         )
         validate_target_work_handle(
@@ -5522,7 +5571,7 @@ class SQLiteTargetRunAgentAuthority:
                 old_handle.accepted_input_target_commit_refs
             ),
             accepted_input_asset_refs=tuple(
-                proof.asset_ref for proof in old_handle.accepted_input_asset_proofs
+                proof.input_ref for proof in old_handle.accepted_input_asset_proofs
             ),
         )
         old_binding = self._graph.query_execution_input_binding(
@@ -5545,7 +5594,7 @@ class SQLiteTargetRunAgentAuthority:
                 (
                     *old_handle.accepted_input_target_commit_refs,
                     *(
-                        proof.asset_ref
+                        proof.input_ref
                         for proof in old_handle.accepted_input_asset_proofs
                     ),
                 )
@@ -6291,13 +6340,13 @@ class SQLiteTargetRunAgentAuthority:
             raise OwnerConflict("target_run_handle_integrity_invalid") from error
         asset_proofs = []
         for asset_ref in asset_refs:
-            projection = self._graph.query_input_asset_projection(
+            proof = self._graph.query_bundle_input_asset_proof(
                 target_ref=target_ref,
                 asset_ref=asset_ref,
             )
-            if projection is None:
+            if proof is None:
                 raise OwnerConflict("target_run_input_asset_proof_invalid")
-            asset_proofs.append(projection.as_bundle_proof())
+            asset_proofs.append(proof)
         handle = TargetWorkHandle(
             target_ref=target_ref,
             target_run_ref=admission.target_run_ref,
@@ -9724,12 +9773,39 @@ class SQLiteTargetExecutionAdmissionVerifier:
             raise OwnerConflict("target_execution_upstream_input_unavailable")
         resolved: list[AcceptedTargetExecutionInputFile] = []
         for ordinal, proof in enumerate(handle.accepted_input_asset_proofs, 1):
-            asset, _proof_receipt, _file_name, content = (
-                self._research_memory.materialize_input_asset(
+            selection_ref = getattr(proof, "selection_ref", None)
+            if selection_ref is None:
+                asset, _proof_receipt, _file_name, content = self._research_memory.materialize_input_asset(
                     target_ref=handle.target_ref,
                     asset_ref=proof.asset_ref,
                 )
-            )
+            else:
+                import io
+                import zipfile
+                from meta_research.content_selection import ContentSelection
+                from meta_research.resource_selections import content_selection_ref
+                asset, _receipt, _description = self._research_memory.describe_input_asset(
+                    target_ref=handle.target_ref, asset_ref=proof.asset_ref)
+                selection = ContentSelection(asset, proof.selection_path)
+                if (asset.version_ref != proof.asset_version_ref
+                        or content_selection_ref(selection) != selection_ref):
+                    raise OwnerConflict("target_execution_input_manifest_invalid")
+                with TemporaryDirectory(prefix="target-selected-input-") as temporary:
+                    exported = self._research_memory.export_selection(
+                        asset, proof.selection_path, Path(temporary) / "content")
+                    if exported.description.kind == "file":
+                        content = exported.path.read_bytes()
+                    else:
+                        # This execution port accepts files. Encode only the chosen
+                        # tree, preserving empty directories, as its payload.
+                        buffer = io.BytesIO()
+                        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+                            for directory in exported.description.directories:
+                                archive.writestr(zipfile.ZipInfo(directory + "/"), b"")
+                            for entry in exported.description.entries:
+                                archive.writestr(zipfile.ZipInfo(entry.path),
+                                                 (exported.path / entry.path).read_bytes())
+                        content = buffer.getvalue()
             relative_path = (
                 "direct/"
                 f"{ordinal:04d}-"

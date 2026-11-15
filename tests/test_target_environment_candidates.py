@@ -96,15 +96,27 @@ def test_environment_candidate_requires_canonical_relative_path(path):
 
 
 @pytest.mark.parametrize("other_field", ["dataset_candidates", "environment_candidates"])
-def test_candidate_parent_child_overlap_is_rejected_across_both_indexes(other_field):
+def test_candidate_child_requires_a_verified_logical_selection(other_field):
     document = {"metrics": {"observed": 1}, "environment_candidates": [_candidate("outputs/data/environment")],
                 "formal_runs": [{"run_key": "construct", "artifact_paths": ["outputs/data/environment"],
                                  "checkpoint_paths": [], "evaluations": []}]}
     document.setdefault(other_field, []).append(_candidate("outputs/data/environment/fixtures"))
     with pytest.raises(OwnerConflict) as failure:
         verify_retained_products(document, [{"role": "data", "declared_relative_path": "outputs/data/environment"}])
-    assert "overlap" in failure.value.feedback
-    assert "unchanged" not in failure.value.feedback
+    assert "exact retained artifact" in failure.value.feedback
+
+
+def test_verified_logical_parent_and_child_can_be_reused_in_both_indexes():
+    from meta_research.formal_run_bindings import SELECTION_MANIFEST_SCHEMA
+    parent = "outputs/data/environment"
+    child = parent + "/fixtures"
+    entries = [{"role": "data", "declared_relative_path": path,
+                "selection_protocol": SELECTION_MANIFEST_SCHEMA} for path in (parent, child)]
+    document = {"formal_runs": [{"run_key": "construct", "artifact_paths": [parent, child],
+                                "evaluations": []}],
+                "environment_candidates": [_candidate(parent), _candidate(child)],
+                "dataset_candidates": [_candidate(child)]}
+    verify_retained_products(document, entries)
 
 
 def test_environment_subpath_cannot_substitute_for_an_existing_implementation_snapshot():

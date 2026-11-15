@@ -8,7 +8,7 @@ from meta_research.owners.common import AcceptedAssetBinding, AcceptanceReceipt,
 
 
 DATASET_SCHEMA = "meta-research/dataset/v1"
-DATASET_VERSION_SCHEMA = "meta-research/dataset-version/v1"
+DATASET_VERSION_SCHEMA = "meta-research/dataset-version/v2"
 DATASET_REFERENCE_SCHEMA = "meta-research/dataset-reference/v1"
 DATASET_DERIVATION_SCHEMA = "meta-research/dataset-derivation/v1"
 

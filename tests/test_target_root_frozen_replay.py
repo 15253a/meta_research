@@ -16,10 +16,6 @@ def _pending_completion(tmp_path, monkeypatch, *, directory=False):
         _root_finalizer_fixture(tmp_path)
     )
     monkeypatch.setattr(finalizer_module, "TARGET_ROOT_INLINE_ARTIFACT_BYTES", 1)
-    if directory:
-        def streamed_directory(_descriptor):
-            raise finalizer_module.TargetImplementationBundleError("target_implementation_bundle_too_large")
-        monkeypatch.setattr(finalizer_module, "build_target_implementation_bundle_from_open_directory", streamed_directory)
 
     class UnavailableMemory:
         def __getattr__(self, name):
@@ -134,7 +130,13 @@ def test_pending_frozen_replay_keeps_content_and_identity_checks(tmp_path, monke
         else:
             evidence = replace(evidence, operation_ref="different-operation")
             finalizer._evidence_reader = _EvidenceReader(evidence)
-        with pytest.raises(OwnerConflict):
-            finalizer.finalize(handle=handle, evidence=evidence)
+        if changed == "inline_bytes":
+            result = finalizer.finalize(handle=handle, evidence=evidence)
+            assert result.status == "rm_accepted"
+            assert result.completion_ref == completion.completion_ref
+            assert memory.query_for_completion(completion.completion_ref) is not None
+        else:
+            with pytest.raises(OwnerConflict):
+                finalizer.finalize(handle=handle, evidence=evidence)
+            assert memory.query_for_completion(completion.completion_ref) is None
         assert lifecycle.query_completion(handle.target_ref) == completion
-        assert memory.query_for_completion(completion.completion_ref) is None

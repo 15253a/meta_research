@@ -529,7 +529,7 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
             handler=lambda context, arguments: read(context, arguments, page=False)),
         SemanticOperation(
             semantic_operation_id="research_graph.target_formal_results.read", owning_module="research_graph",
-            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。implementation_artifacts 给出每个 Run 实际选择的已保管实现条目、精确版本和 content.read reader；可有多个代码包，复用 Run 保留原实施的代码。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding 和当前 RG 生产归属；候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。implementation_artifacts 给出每个 Run 实际选择的已保管实现范围、精确父版本和 content.read reader；reader.selection_path 固定子范围，entry_path 相对于该范围，复用 Run 保留原实施的代码。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding、selection 与实际来源。登记子范围时将 selection 放入 selections，保留其原父 binding/path；implementation_snapshot 表示采用过的快照，不是作者证明。候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空；正式执行采用登记后返回的 selection_ref。",
             input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "target_ref": _string(max_length=1024)},
                 "required": ["target_ref"], "additionalProperties": False},
             output_schema={"type": "object"},
@@ -621,6 +621,8 @@ def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments
 
 def _asset_reader(binding, *, source_ref=None, source_quest_ref=None):
     args = {"source_ref": source_ref or binding["version_ref"], "version_ref": binding["version_ref"]}
+    if "selection" in binding:
+        args["selection_path"] = binding["selection"]["path"]
     if source_quest_ref is not None:
         args["source_quest_ref"] = source_quest_ref
     return {"operation": "research_memory.content.read", "args": args}
@@ -637,7 +639,8 @@ def _target_content_readers(result, source_quest_ref):
     candidates = result["resource_candidates"]
     return {**result, "items": [_target_fact_readers(fact, source_quest_ref) for fact in result["items"]],
         "resource_candidates": {**candidates, **{key: [{**item,
-            "reader": _asset_reader(item["asset_binding"],
+            "reader": _asset_reader({**item["asset_binding"],
+                **({"selection": item["selection"]} if "selection" in item else {})},
                 source_quest_ref=source_quest_ref)} for item in candidates[key]]
             for key in ("dataset_candidates", "environment_candidates")}}}
 
@@ -645,9 +648,12 @@ def _target_content_readers(result, source_quest_ref):
 def _dataset_content_readers(result, source_quest_ref):
     if "asset_bindings" not in result:
         return result
-    return {**result, "asset_readers": [_asset_reader(binding,
-        source_ref=result["dataset_version_ref"], source_quest_ref=source_quest_ref)
-        for binding in result["asset_bindings"]]}
+    from meta_research.resource_selections import selection_readers
+    readers = selection_readers(result, result["dataset_version_ref"])
+    if source_quest_ref is not None:
+        for item in readers["selection_readers"]:
+            item["reader"]["source_quest_ref"] = source_quest_ref
+    return {**result, **readers}
 
 
 def _dataset_operations(research_graph, agent_runtime, human_collaboration=None):
@@ -660,8 +666,13 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
         "register_version": ({"dataset_ref": _string(max_length=1024), "version_label": _string(max_length=1024),
                               "meaning": _string(max_length=65536),
                               "asset_bindings": {"type": "array", "items": {"type": "object"}},
+                              "selections": {"type": "array", "minItems": 1, "maxItems": 256,
+                                  "items": {"type": "object", "properties": {
+                                      "asset_binding": {"type": "object"},
+                                      "path": {"type": ["string", "null"], "minLength": 1, "maxLength": 4096}},
+                                      "required": ["asset_binding", "path"], "additionalProperties": False}},
                               "metadata": {"type": "object"}},
-                             ["dataset_ref", "version_label", "meaning", "asset_bindings"]),
+                             ["dataset_ref", "version_label", "meaning"]),
         "reference": ({"dataset_version_ref": _string(max_length=1024), "question_ref": _string(max_length=1024),
                        "research_ref": _string(max_length=1024), "purpose": {"type": "string"}},
                       ["dataset_version_ref", "question_ref"]),
@@ -673,7 +684,7 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
     }
     descriptions = {
         "register": "登记可复用的 Dataset 语义身份；semantic_key 由系统统一识别，当前调用的发现与采用范围仍是本 Quest。先检索并复用已有 semantic_key；name、meaning、metadata 和 notes 描述研究含义，实际内容沿 RM 资产绑定保存。",
-        "register_version": "登记不可变 DatasetVersion，绑定当前 Quest 已正式接纳的精确 RM AssetVersion。asset_bindings 每项从原 binding 取 asset_ref、version_ref、content_hash、manifest_hash、receipt 五字段；receipt 保留 issuer、kind、receipt_ref、subject_ref、payload_hash，及原有 status=accepted。使用 1–256 个不重复的 version_ref。meaning 描述采集、解释和版本含义，材料可为数值、文本、观察或其他研究内容；随后用 datasets.reference 关联当前 Question。",
+        "register_version": "登记不可变 DatasetVersion，绑定当前 Quest 已正式接纳的精确 RM AssetVersion。整个资产使用 asset_bindings，保留 asset_ref、version_ref、content_hash、manifest_hash、receipt 五字段。子范围使用 selections，每项含原 asset_binding 和规范相对 path（null 为整个父资产），asset_bindings 自动推导，无须重复填写。可选择同父的多个文件或目录，父 receipt/hash 不变。返回的 selection_readers 给出准确 content.read 参数和 selection_ref；Target 的 direct_accepted_input_asset_refs 可使用 selection_ref。使用 1–256 个资产或选择；meaning 描述采集、解释和版本含义，随后用 datasets.reference 关联当前 Question。",
         "reference": "记录本 Quest 的 Question 对精确 DatasetVersion 的使用；该版本的资产须在当前 Quest 的已接纳范围内，可复用身份本身不授予跨 Quest 访问或采用权限。可用 research_ref 关联当前 Quest 已有的 Baseline／Variant／VariantRun／Evaluation／EvaluationAttempt／Target／TargetCommit，以 purpose 和 notes 说明用途。关联表示研究关系，归属、生产、结果与执行授权各按对应 Owner 事实核验。",
         "derive": "Record one exact source DatasetVersion -> retained derived DatasetVersion, for example collection -> cleaned, annotated, combined or split data. Both versions must already bind accepted RM assets; this copies no data. Use multiple edges for multiple sources. Describe processing and provenance under the current Quest's Question. Optional research_ref identifies existing related research, within the current Quest; it is not proof of production or independent verification. Choose useful lineage granularity yourself; registering every file, transient intermediate or processing step is not required. Self-links and provenance cycles are invalid.",
     }
@@ -751,7 +762,12 @@ def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *
         # RG calls this trusted closure inside its fenced writer transaction.
         scope = _dataset_scope(agent_runtime, context)
         if action == "register_version":
-            for binding in payload["asset_bindings"]:
+            bindings = payload.get("asset_bindings")
+            if payload.get("selections") is not None:
+                from meta_research.resource_selections import resource_selections
+                _, parents = resource_selections(payload["selections"], asset_bindings=bindings)
+                bindings = [item.as_dict() for item in parents]
+            for binding in bindings or []:
                 research_graph.verify_asset_quest_scope(binding["version_ref"], quest_ref=scope["quest_ref"])
         if action in {"reference", "derive"}:
             question = research_graph.query_question_history_by_ref(payload["question_ref"])
@@ -3999,8 +4015,12 @@ def _accepted_input_asset_schema() -> dict[str, object]:
             "asset_ref": _string(),
             "rm_acceptance_receipt": _receipt_proof_schema(),
             "rg_role_receipt": _receipt_proof_schema(),
+            "selection_ref": {"type": ["string", "null"]},
+            "selection_path": {"type": ["string", "null"]},
+            "asset_version_ref": {"type": ["string", "null"]},
         },
-        required=("asset_ref", "rm_acceptance_receipt", "rg_role_receipt"),
+        required=("asset_ref", "rm_acceptance_receipt", "rg_role_receipt",
+                  "selection_ref", "selection_path", "asset_version_ref"),
     )
 
 

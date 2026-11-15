@@ -278,6 +278,13 @@ class AcceptedInputAssetProof:
     asset_ref: str
     rm_acceptance_receipt: ReceiptProof
     rg_role_receipt: ReceiptProof
+    selection_ref: Optional[str] = None
+    selection_path: Optional[str] = None
+    asset_version_ref: Optional[str] = None
+
+    @property
+    def input_ref(self) -> str:
+        return self.selection_ref or self.asset_ref
 
 
 @dataclass(frozen=True, slots=True)

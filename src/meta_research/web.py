@@ -3981,7 +3981,8 @@ async def _process_target_runs(
     flights: dict[str, _TargetRunFlight] = {}
     cancel_flights: dict[str, _TargetRunFlight] = {}
     operation_errors: dict[str, str] = {}
-    idle_sweeps = 0
+    next_due: dict[str, float] = {}
+    no_progress_count: dict[str, int] = {}
 
     def set_health(status: Literal["ready", "unavailable"], code: str | None) -> None:
         changed = health.status != status or health.last_error != code
@@ -4018,6 +4019,9 @@ async def _process_target_runs(
         # returns a valid result or leaves the authoritative work inventory.
         for target_ref in operation_errors.keys() - set(target_refs):
             del operation_errors[target_ref]
+        for target_ref in next_due.keys() - set(target_refs):
+            next_due.pop(target_ref, None)
+            no_progress_count.pop(target_ref, None)
 
         discovery_error: str | None = None
         for target_ref in target_refs:
@@ -4062,6 +4066,15 @@ async def _process_target_runs(
                 continue
             if target_ref in cancel_flights:
                 continue
+            if asyncio.get_running_loop().time() < next_due.get(target_ref, 0):
+                cancel_reader = getattr(runtime.target_run_runtime, "has_pending_cancel", None)
+                try:
+                    pending_cancel = callable(cancel_reader) and await asyncio.to_thread(cancel_reader, target_ref)
+                except Exception as error:
+                    discovery_error = error.code if isinstance(error, OwnerConflict) else type(error).__name__
+                    continue
+                if not pending_cancel:
+                    continue
             operation = _daemon_thread_call(
                 lambda target_ref=target_ref: runtime.target_run_runtime.process_once(
                     target_ref
@@ -4100,6 +4113,11 @@ async def _process_target_runs(
                         )
                     advanced = advanced or result
                     operation_errors.pop(target_ref, None)
+                    count = 0 if result else min(no_progress_count.get(target_ref, 0) + 1, 9)
+                    no_progress_count[target_ref] = count
+                    next_due[target_ref] = asyncio.get_running_loop().time() + (
+                        0 if result else min(0.2 * (2 ** (count - 1)), 30.0)
+                    )
                 except Exception as error:
                     if not isinstance(
                         error, (OSError, OwnerConflict, SQLAlchemyError)
@@ -4110,6 +4128,11 @@ async def _process_target_runs(
                         if isinstance(error, OwnerConflict)
                         else type(error).__name__
                     )
+                    count = min(no_progress_count.get(target_ref, 0) + 1, 9)
+                    no_progress_count[target_ref] = count
+                    next_due[target_ref] = asyncio.get_running_loop().time() + min(
+                        0.2 * (2 ** (count - 1)), 30.0
+                    )
 
         operation_error = next(iter(operation_errors.values()), None)
         if discovery_error is not None or operation_error is not None:
@@ -4118,19 +4141,14 @@ async def _process_target_runs(
             set_health("ready", None)
 
         if advanced:
-            idle_sweeps = 0
             await asyncio.sleep(0)
         elif flights or cancel_flights:
             # A boundary is still executing; keep collecting promptly.
-            idle_sweeps = 0
             await asyncio.sleep(0.05)
         else:
-            # Every idle sweep re-runs each Target root's full read
-            # verification; polling that at the base rate pins a core
-            # without research progress. Back off while the inventory
-            # stays quiescent and snap back on the first advance.
-            idle_sweeps = min(idle_sweeps + 1, 7)
-            await asyncio.sleep(min(0.2 * (2 ** (idle_sweeps - 1)), 30.0))
+            # Keep inventory/cancellation responsive while expensive wakes
+            # follow each Target's own completion-based backoff.
+            await asyncio.sleep(0.2)
 
 
 async def _process_bundle_stage(

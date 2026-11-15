@@ -82,13 +82,17 @@ def _admit_independent_target_root(runtime, *, ready=None, key_prefix=""):
         ).scalar_one()
     candidate = candidate_projection.candidate
     formal_plan = formal_plan_projection.formal_plan
+    input_refs = tuple(sorted((*launch_request.accepted_input_target_commit_refs,
+                              *launch_request.accepted_input_asset_refs)))
+    input_proofs = tuple(runtime.target_run_authorities.research_graph.query_bundle_input_asset_proof(
+        target_ref=target.target_ref, asset_ref=ref) for ref in launch_request.accepted_input_asset_refs)
     scope = canonical_target_scope_binding(
         target_ref=target.target_ref,
         target_run_ref=target_run_ref,
         target_spec_hash=launch_request.target_spec_binding.content_hash_ref,
         candidate=candidate,
         formal_plan=formal_plan,
-        accepted_input_refs=(),
+        accepted_input_refs=input_refs,
     )
     admission = runtime.harnesses.admit_target_run(
         target_ref=target.target_ref,
@@ -114,7 +118,7 @@ def _admit_independent_target_root(runtime, *, ready=None, key_prefix=""):
             target_fence_ref=admission.run.fence_ref,
             target_spec_hash=launch_request.target_spec_binding.content_hash_ref,
             target_scope_binding_hash=canonical_hash(scope),
-            input_refs=(),
+            input_refs=input_refs,
             idempotency_key=key_prefix + "formal-target-input-binding",
         )
     )
@@ -126,8 +130,8 @@ def _admit_independent_target_root(runtime, *, ready=None, key_prefix=""):
         execution_fence_ref=admission.run.fence_ref,
         execution_input_binding_ref=accepted_input.proof.binding_ref,
         execution_input_binding_receipt=accepted_input.proof.acceptance_receipt,
-        accepted_input_target_commit_refs=(),
-        accepted_input_asset_proofs=(),
+        accepted_input_target_commit_refs=launch_request.accepted_input_target_commit_refs,
+        accepted_input_asset_proofs=input_proofs,
         recoverable=True,
     )
     runtime.target_run_authorities.agent_runtime.reserve_target_workspace(

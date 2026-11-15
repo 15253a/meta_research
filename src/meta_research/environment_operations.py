@@ -23,6 +23,10 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
         "register": ({"semantic_key": string, "name": string, "source": string,
                       "meaning": {"type": "string", "minLength": 1, "maxLength": 65536},
                       "metadata": {"type": "object"}, "source_environment_ref": string,
+                      "selections": {"type": "array", "maxItems": 256, "items": {
+                          "type": "object", "properties": {"asset_binding": {"type": "object"},
+                              "path": {"type": ["string", "null"], "minLength": 1, "maxLength": 4096}},
+                          "required": ["asset_binding", "path"], "additionalProperties": False}},
                       "asset_bindings": {"type": "array", "maxItems": 256, "items": {"type": "object"}}},
                      ["semantic_key", "name", "meaning", "source"]),
         "reference": ({"environment_ref": string, "question_ref": string, "research_ref": string,
@@ -30,7 +34,7 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
                       ["environment_ref", "question_ref"]),
     }
     descriptions = {
-        "register": "登记当前 Quest 可复用的 Environment 含义快照。source 写真实来源、持久路径、安装/服务位置或设备设施身份与位置；metadata 保留能力和已知条件。现成资源可直接登记，无需构建 Target、打包或重建配方，asset_bindings 可空。本 Target 新建或改动的成果先完成正式交接后登记。数字材料使用当前 Quest 已正式接纳的 RM 精确 binding；说明 hash 不代表实体或服务被冻结或核验。semantic_key 由 Agent 决定；相同内容复用，不同内容形成新的不可变 environment_ref，旧引用不漂移。适配工作用 source_environment_ref 关联原环境，沿既有 Baseline 工作保存。",
+        "register": "登记当前 Quest 可复用的 Environment 含义快照。source 写真实来源、持久路径、安装/服务位置或设备设施身份与位置；metadata 保留能力和已知条件。现成资源可直接登记，无需构建 Target、打包或重建配方，asset_bindings 可空。选择已有资产的文件或子目录时用 selections，每项为原 asset_binding 五字段和规范相对 path；path=null 表示整个资产。asset_bindings 由 selections 推导，无须重复填写；同一父版本可有多个子范围，保留父版本原 receipt/hash。成功返回的 selection_readers 给出准确阅读参数和 selection_ref；Target 可把 selection_ref 填入 direct_accepted_input_asset_refs，实际输入采用该范围。本 Target 新建或改动的成果先完成正式交接后登记。数字材料使用当前 Quest 已正式接纳的 RM 精确 binding；说明 hash 不代表实体或服务被冻结或核验。semantic_key 由 Agent 决定；相同内容复用，不同内容形成新的不可变 environment_ref，旧引用不漂移。适配工作用 source_environment_ref 关联原环境，沿既有 Baseline 工作保存。",
         "reference": "关联当前 Quest 的 Question 对已知精确 Environment 索引的用途，research_ref 可关联本 Quest 已有 Baseline/Variant/VariantRun 等实际工作。可引用其他 Quest 的环境；其每个数字 binding 须已在当前 Quest 正式接纳，无数字 binding 的设备设施可直接引用。成功引用后本 Quest 可发现和读取该索引。Target 新产物在正式接纳后与 Dataset 同一整理环节登记。用途记录不表示资源已可用、权限已授予或运行条件已更改；索引不替代实际执行输入绑定或本次选卡与预算配置。",
     }
 
@@ -65,10 +69,14 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
     def read(context, arguments, page):
         try:
             arguments = dict(arguments)
-            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.pop("source_quest_ref", None),
+            source_quest_ref = arguments.pop("source_quest_ref", None)
+            quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=source_quest_ref,
                 human_collaboration=human_collaboration)
             if page:
-                return graph.query_environments(**arguments, quest_ref=quest_ref)
+                result = graph.query_environments(**arguments, quest_ref=quest_ref)
+                for item in result["items"]:
+                    _carry_selection_quest(item, source_quest_ref)
+                return result
             if len(arguments) != 1:
                 raise OwnerConflict("environment_read_ref_invalid", {
                     "fields": ["environment_ref", "environment_reference_ref"],
@@ -78,6 +86,7 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
             field, ref = next(iter(arguments.items()))
             handler = graph.query_environment if field == "environment_ref" else graph.query_environment_reference
             result = handler(ref, quest_ref=quest_ref)
+            _carry_selection_quest(result, source_quest_ref)
             return {"status": "not_found" if result is None else "accepted", "result": result}
         except OwnerConflict as error:
             raise SemanticMcpError(error.code, error.details) from error
@@ -99,7 +108,7 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
             output_schema={"type": "object"},
             handler=lambda context, arguments, action=action: effect(context, arguments, action, True)))
     operations.append(SemanticOperation(semantic_operation_id="research_graph.environments.page", owning_module="research_graph",
-        description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 分页发现本 Quest 登记或使用的 Environment。query 搜索含义/来源，semantic_key 查看同资源不可变快照，environment_ref 或 question_ref 查看用途（过滤模式互斥）。数字原件用 content.read，source_ref=environment_ref，version_ref 取 asset_bindings。用 next_offset/query_revision 续页并保持过滤与limit；research_query_changed 后从0重开，research_query_revision_required 表示缺修订。result_state/scan_complete 区分空结果与扫描结束。物理设备、服务或现成目录可仅有资源说明，hash不证明实体状态。",
+        description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 分页发现本 Quest 登记或使用的 Environment。query 搜索含义/来源，semantic_key 查看同资源不可变快照，environment_ref 或 question_ref 查看用途（过滤模式互斥）。有 selections 时使用 selection_readers 的准确 content.read 参数；entry_path 相对于所选范围，selection_ref 可作为 Target 的 direct_accepted_input_asset_refs。整个资产的 reader.selection_path 为 null。用 next_offset/query_revision 续页并保持过滤与limit；research_query_changed 后从0重开，research_query_revision_required 表示缺修订。result_state/scan_complete 区分空结果与扫描结束。物理设备、服务或现成目录可仅有资源说明，hash不证明实体状态。",
         input_schema={"type": "object", "properties": {"source_quest_ref": string, "query": {"type": "string", "maxLength": 1024},
             "semantic_key": string, "environment_ref": string, "question_ref": string,
             "query_revision": {"type":"string","pattern":"^[0-9a-f]{64}$"},
@@ -112,3 +121,9 @@ def environment_operations(graph, agent_runtime, human_collaboration=None):
             "additionalProperties": False}, output_schema={"type": "object"},
         handler=lambda context, arguments: read(context, arguments, False)))
     return tuple(operations)
+
+
+def _carry_selection_quest(record, source_quest_ref):
+    if source_quest_ref is not None and record is not None:
+        for item in record.get("selection_readers", []):
+            item["reader"] = {**item["reader"], "source_quest_ref": source_quest_ref}

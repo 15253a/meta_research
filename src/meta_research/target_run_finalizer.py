@@ -39,6 +39,7 @@ from meta_research.research_notes import (
 )
 from meta_research.query_timing import measured_owner_operation
 from meta_research.feed import DurableFeed
+from meta_research.formal_run_bindings import SELECTION_MANIFEST_SCHEMA
 from meta_research.owners.common import (
     AcceptanceReceipt,
     AcceptedAssetBinding,
@@ -66,7 +67,6 @@ from meta_research.owners.target_run_runtime import (
 )
 from meta_research.target_implementation_bundle import (
     TargetImplementationBundleError,
-    build_target_implementation_bundle_from_open_directory,
     validate_bundle_relative_path,
 )
 from meta_research.target_run_runtime_contract import (
@@ -85,8 +85,7 @@ RM_TARGET_ROOT_COMPLETION_MANIFEST_RECEIPT_KIND = (
     "target_root_completion_manifest_accepted"
 )
 TARGET_ROOT_RG_PENDING_CODE = "target_root_graph_acceptance_unavailable"
-# Small historical bundles remain readable; file-backed artifacts have no
-# research-size ceiling. This threshold only selects a bounded inline encoding.
+# Small files use bounded inline custody; directories use native streamed capture.
 TARGET_ROOT_INLINE_ARTIFACT_BYTES = 64 * 1024
 TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES = 256 * 1024
 # The formal protocol admits at most 64 required plus 64 optional metric
@@ -104,101 +103,26 @@ _SYSTEM_TARGET_COMPLETION_OPTIONAL_ARTIFACTS = (
     ("log", "logs"),
 )
 
-# Retain old rejection text so historical signed rejections remain replayable.
-# New path-backed artifacts do not use the historical byte/directory ceilings.
-_RM_RECOVERABLE_CANDIDATE_FEEDBACK = {
-    "asset_change_required": (
-        "The Target host's revision intake request is missing change metadata "
-        "required by Research Memory. The host must supply change with the exact "
-        "predecessor and revision. Preserve the existing research outputs; do not "
-        "rewrite the research explanation to repair this host field. After the "
-        "host is corrected, finish another normal turn in this same root."
-    ),
-    "target_root_retained_artifacts_invalid": (
-        "retained_artifacts must contain at most 100 unique canonical workspace paths, "
-        "each with exactly relative_path and role (log, analysis, data or checkpoint). "
-        "Select exact files or directories outside inputs/, implementation/, handoff/ "
-        "and the result document. Keep the existing work, correct its retention "
-        "declaration and finish another normal root turn."
-    ),
-    "target_root_retained_artifact_unbound": (
-        "A retained_artifacts selection is not bound to its exact path and declared "
-        "role in this completion. Preserve the content and correct the handoff "
-        "selection before finishing another normal root turn."
-    ),
-    "target_root_artifact_intake_failed": (
-        "Research Memory could not retain a selected artifact after storage retries. "
-        "Inspect the failed intake and available storage, preserve the research "
-        "outputs, and resolve the actual storage problem before completing another turn."
-    ),
-    "target_root_artifact_missing": (
-        "A required conventional completion path is missing from the Target "
-        "workspace. Create implementation/ and outputs/result.json as needed, "
-        "then complete another root turn."
-    ),
-    "target_root_artifact_too_large": (
-        "A declared completion artifact exceeds the Research Memory intake "
-        "limit. Reduce or split it and complete another root turn."
-    ),
-    "target_root_artifact_set_too_large": (
-        "The declared completion artifact set exceeds the bounded finalization "
-        "budget. Reduce the conventional artifacts and complete another root turn."
-    ),
-    "target_root_artifact_type_unsupported": (
-        "A declared completion artifact has an unsupported filesystem type. "
-        "Replace it with a regular file or directory and complete another root "
-        "turn."
-    ),
-    "target_root_artifact_symlink_forbidden": (
-        "A conventional completion path is a symbolic link. Replace it with a "
-        "regular file or directory inside the Target workspace and complete "
-        "another root turn."
-    ),
-    "target_implementation_workspace_invalid": (
-        "The declared implementation artifact is not a valid directory. Correct "
-        "implementation/ and complete another root turn."
-    ),
-    "target_implementation_workspace_entry_unsupported": (
-        "The implementation artifact contains an unsupported entry or an "
-        "oversized file. Correct it and complete another root turn."
-    ),
-    "target_implementation_bundle_too_large": (
-        "The implementation artifact exceeds the accepted bundle limits. Reduce "
-        "it and complete another root turn."
-    ),
-    "target_root_result_document_invalid": (
-        "The declared result document is not valid unambiguous UTF-8 JSON for the Target "
-        "result schema. Rewrite outputs/result.json and complete another root turn."
-    ),
-    "target_root_result_document_too_large": (
-        "The declared result document exceeds the bounded Target result schema "
-        "limit. Reduce it and complete another root turn."
-    ),
-    "target_root_result_metrics_invalid": (
-        "The declared result document contains invalid metric names or values. "
-        "Correct the metrics and complete another root turn."
-    ),
-    "asset_content_too_large": (
-        "A completion artifact exceeds the Research Memory managed-content limit. "
-        "Reduce or split it and complete another root turn."
-    ),
-    "asset_provenance_too_large": (
-        "The completion artifact set produces provenance beyond the Research "
-        "Memory limit. Reduce the conventional artifacts and complete another root "
-        "turn."
-    ),
-}
 
-for _role, _path in (("checkpoint", "outputs/checkpoints"),
-                     ("analysis", "outputs/analysis"), ("log", "logs"),
-                     ("result", "outputs/result.json")):
-    _RM_RECOVERABLE_CANDIDATE_FEEDBACK["target_root_" + _role + "_directory_invalid"] = (
-        f"The {_role} artifact at {_path} exceeds a directory limit or contains an "
-        "unsupported entry. Limits: 16777216 bytes per file, 67108864 bytes "
-        "uncompressed total, 4096 entries; only regular files and directories "
-        "without links. Correct this artifact; retain valid research evidence."
-    )
+class DeclaredCandidateIssue(OwnerConflict):
+    """A correction of the candidate declaration, never a host failure."""
 
+    def __init__(self, code, field='$', value=None, detail=None):
+        super().__init__(code)
+        self.feedback = (f"{field}={repr(value)[:1024]}: {detail or code}. "
+                         "Preserve the completed research; correct this declaration and finish "
+                         "another normal turn in the same root.")[:4096]
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredCandidate:
+    handoff: TargetCompletionHandoff
+
+
+@dataclass(frozen=True, slots=True)
+class InvalidDeclaredCandidate:
+    handoff: TargetCompletionHandoff
+    issue: DeclaredCandidateIssue
 
 @dataclass(frozen=True, slots=True)
 class TargetRootResultDocument:
@@ -263,6 +187,8 @@ class AcceptedTargetRootCompletionManifest:
     payload_hash: str
     receipt: AcceptanceReceipt
     accepted_at: float
+    schema_ref: str = SELECTION_MANIFEST_SCHEMA
+    selections: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +339,8 @@ class _FrozenArtifact:
     tree_hash: str
     source_path: Path | None = None
     source_byte_count: int = 0
+    tree_entries: tuple[dict[str, object], ...] = ()
+    tree_directories: tuple[str, ...] = ()
 
     @property
     def byte_count(self) -> int:
@@ -440,6 +368,14 @@ class _FrozenWorkspace:
     result_document: TargetRootResultDocument
     result_document_hash: str
     artifact_snapshot_hash: str
+    selections: tuple[dict[str, object], ...] = ()
+    schema_ref: str = SELECTION_MANIFEST_SCHEMA
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletionCustody:
+    handle: TargetWorkHandle
+    evidence_content_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,103 +460,9 @@ class SQLiteTargetRootCompletionMemoryAuthority:
         return {**recovery, "completion_ref": completion.completion_ref,
                 "target_run_ref": completion.handle.target_run_ref}
 
-    def accept_historical_research_note(self, *, manifest_ref: str,
-                                       evidence: TargetRootCompletionEvidence,
-                                       evidence_reader: TargetRootCompletionEvidenceReader):
-        """Archive an original verified final statement without rewriting history."""
-        manifest = self.query(manifest_ref)
-        if manifest is None:
-            raise OwnerConflict("target_root_manifest_integrity_invalid")
-        completion = self._lifecycle.query_completion_by_ref(manifest.completion_ref)
-        if completion is None:
-            raise OwnerConflict("target_root_completion_evidence_invalid")
-        _validate_evidence(evidence, handle=completion.handle)
-        source_hash = evidence_reader.verify_target_root_completion_evidence(
-            handle=completion.handle, evidence=evidence)
-        if (evidence.final_text is None or source_hash != completion.evidence_content_hash
-            or evidence.evidence_ref != completion.evidence_ref
-            or evidence.operation_ref != completion.harness_operation_ref):
-            raise OwnerConflict("target_root_completion_evidence_invalid")
-        key = "historical-research-note:" + canonical_hash({
-            "completion_ref": completion.completion_ref, "source_evidence_hash": source_hash})
-        body = evidence.final_text.encode("utf-8")
-        intake = self._asset_memory.submit_asset_intake(AssetIntakeRequest(
-            source_kind="file", custody_mode="managed", display_name="research-note.md",
-            media_type="text/markdown; charset=utf-8", content=body,
-            provenance={"schema_ref": "meta-research/historical-research-note/v1",
-                "target_ref": manifest.target_ref, "completion_ref": completion.completion_ref,
-                "manifest_ref": manifest_ref, "source_evidence_ref": evidence.evidence_ref,
-                "source_evidence_hash": source_hash, "source_bytes_sha256": evidence.final_text_sha256}),
-            idempotency_key=key)
-        asset = getattr(intake, "asset", None)
-        if getattr(intake, "status", None) != "accepted" or asset is None:
-            raise OwnerConflict("target_root_artifact_intake_unavailable")
-        self._verify_binding(asset.as_binding(), expected=body)
-        note = {**research_note_metadata(role="analysis", declared_relative_path=FINAL_STATEMENT_PATH,
-                    artifact_kind="file", content=body, tree_hash=evidence.final_text_sha256),
-                "manifest_ref": manifest_ref, "completion_ref": completion.completion_ref,
-                "target_ref": manifest.target_ref, "historical_source": True,
-                "source_evidence_ref": evidence.evidence_ref,
-                "declared_relative_path": FINAL_STATEMENT_PATH,
-                "asset_ref": asset.asset_ref, "version_ref": asset.version_ref,
-                "asset_content_hash": asset.content_hash, "asset_manifest_hash": asset.manifest_hash}
-        with self._database.fenced_write() as connection:
-            old = connection.execute(text("SELECT note_json FROM rm_target_research_notes "
-                "WHERE idempotency_key=:key"), {"key": key}).first()
-            if old is not None:
-                if old.note_json != canonical_json(note):
-                    raise OwnerConflict("research_note_idempotency_conflict")
-            else:
-                connection.execute(text("INSERT INTO rm_target_research_notes "
-                    "(note_ref,target_ref,completion_ref,manifest_ref,version_ref,source_evidence_ref,"
-                    "source_evidence_hash,note_json,note_hash,idempotency_key,accepted_at) VALUES "
-                    "(:note_ref,:target_ref,:completion_ref,:manifest_ref,:version_ref,:source_evidence_ref,"
-                    ":source_evidence_hash,:note_json,:note_hash,:idempotency_key,:accepted_at)"),
-                    {"note_ref": new_ref("research_note"), "target_ref": manifest.target_ref,
-                     "completion_ref": completion.completion_ref, "manifest_ref": manifest_ref,
-                     "version_ref": asset.version_ref, "source_evidence_ref": evidence.evidence_ref,
-                     "source_evidence_hash": source_hash, "note_json": canonical_json(note),
-                     "note_hash": canonical_hash(note), "idempotency_key": key, "accepted_at": time.time()})
-        return note
-
     def query_research_notes_for_target(self, target_ref: str):
         from meta_research.research_notes import query_target_research_notes
         return query_target_research_notes(self._database, self._asset_memory, target_ref)
-
-    def verify_host_intake_rejection(
-        self, completion: AcceptedTargetRootCompletion, *, frozen: _FrozenWorkspace,
-        workspace_parent: Path,
-    ) -> bool:
-        """Reconcile a wrapped rejection against its exact durable RM request."""
-        if (completion.workspace_ref != frozen.workspace_ref
-                or completion.artifact_snapshot_hash != frozen.artifact_snapshot_hash
-                or self.query_for_completion(completion.completion_ref) is not None):
-            return False
-        for artifact in frozen.artifacts:
-            predecessor = self._research_note_predecessor(completion, artifact)
-            if predecessor is None:
-                continue
-            # Failed requests may have scrubbed their payload. Reconstruct the
-            # original missing-change request, including its stable locator,
-            # so RM can verify the stored hash without reopening old files.
-            if artifact.source_path is not None:
-                artifact = replace(artifact, source_path=_frozen_artifact_path(
-                    workspace_parent, completion, artifact.ordinal,
-                ))
-            request = _artifact_intake_request(completion, artifact, predecessor)
-            try:
-                intake = self._asset_memory.query_asset_intake_by_idempotency_key(
-                    _artifact_intake_key(completion, artifact), request,
-                )
-            except OwnerConflict as error:
-                if error.code != "asset_intake_idempotency_conflict":
-                    raise
-                continue
-            if (getattr(intake, "status", None) == "failed"
-                    and getattr(intake, "failure_code", None) == "asset_change_required"
-                    and getattr(intake, "asset", None) is None):
-                return True
-        return False
 
     def accept(
         self,
@@ -758,6 +600,14 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             "entries": entries_value,
             "completion_receipt": completion.receipt.as_public_dict(),
         }
+        if frozen.schema_ref != SELECTION_MANIFEST_SCHEMA:
+            raise OwnerConflict('target_root_manifest_protocol_unsupported')
+        payload['schema_ref'] = frozen.schema_ref
+        payload['selections'] = [
+            {**{key: value for key, value in selected.items() if key != 'capture_path'},
+             'asset_binding': next(entry.binding.as_dict() for entry in frozen_entries
+                 if entry.declared_relative_path == selected['capture_path'])}
+            for selected in frozen.selections]
         payload_hash = canonical_hash(payload)
         request_hash = canonical_hash(
             {"command": "accept_target_root_completion_manifest", **payload}
@@ -908,62 +758,15 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                 return _entry_from_value(entry).binding
         return None
 
-    @staticmethod
-    def candidate_rejection_feedback(
-        code: str, *, result_document_path: str | None = None,
-    ) -> str | None:
-        """Describe only root-correctable RM candidate failures."""
-
-        feedback = _RM_RECOVERABLE_CANDIDATE_FEEDBACK.get(code)
-        if feedback is not None and result_document_path is not None:
-            feedback = feedback.replace("outputs/result.json", result_document_path)
-        return feedback
-
-    def issue_candidate_rejection(
-        self,
-        completion: AcceptedTargetRootCompletion,
-        *,
-        code: str | None = None,
-        feedback: str | None = None,
-    ) -> TargetRootOwnerRejection:
-        """Issue the exact RM rejection stored with a failed candidate."""
-
-        current = self._lifecycle.query_completion_by_ref(
-            completion.completion_ref
-        )
-        stored_code = completion.candidate_rejection_code
-        stored_feedback = completion.candidate_rejection_feedback
-        if stored_code is not None or stored_feedback is not None:
-            if code is not None or feedback is not None:
-                raise OwnerConflict("target_root_completion_rejection_invalid")
-            code = stored_code
-            feedback = stored_feedback
-        if (
-            current != completion
-            or type(code) is not str
-            or type(feedback) is not str
-            or feedback not in {
-                _RM_RECOVERABLE_CANDIDATE_FEEDBACK.get(code),
-                self.candidate_rejection_feedback(
-                    code, result_document_path=completion.handoff.result_document_path,
-                ),
-                *(
-                    _implementation_directory_feedback(index, artifact.relative_path)
-                    for index, artifact in enumerate(completion.handoff.artifacts)
-                    if code == "target_implementation_workspace_invalid"
-                    and artifact.role == "implementation"
-                ),
-            }
-            or (
-                stored_code is not None
-                and (
-                    completion.implementation_revision_ref is not None
-                    or completion.implementation_tree_hash is not None
-                    or completion.result_document_hash is not None
-                    or completion.artifact_snapshot_hash is not None
-                )
-            )
-        ):
+    def issue_candidate_rejection(self, completion: AcceptedTargetRootCompletion) -> TargetRootOwnerRejection:
+        """Sign only the diagnostic already persisted in this immutable candidate."""
+        current = self._lifecycle.query_completion_by_ref(completion.completion_ref)
+        code, feedback = completion.candidate_rejection_code, completion.candidate_rejection_feedback
+        if (current != completion or not isinstance(code, str) or not code
+                or not isinstance(feedback, str) or not feedback or len(feedback) > 4096
+                or any(value is not None for value in (
+                    completion.implementation_revision_ref, completion.implementation_tree_hash,
+                    completion.result_document_hash, completion.artifact_snapshot_hash))):
             raise OwnerConflict("target_root_completion_rejection_invalid")
         identity_hash = canonical_hash(
             {
@@ -1115,6 +918,14 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             "entries": entries_document,
             "completion_receipt": completion.receipt.as_public_dict(),
         }
+        schema_ref = payload_value.get('schema_ref')
+        selections = payload_value.get('selections')
+        if schema_ref != SELECTION_MANIFEST_SCHEMA:
+            raise OwnerConflict('target_root_manifest_protocol_unsupported')
+        if not isinstance(selections, list) or not selections:
+            raise OwnerConflict('target_root_manifest_integrity_invalid')
+        _verify_manifest_selections(entries_document, selections)
+        payload.update(schema_ref=schema_ref, selections=selections)
         payload_hash = canonical_hash(payload)
         request_hash = canonical_hash(
             {"command": "accept_target_root_completion_manifest", **payload}
@@ -1184,25 +995,23 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             payload_hash=payload_hash,
             receipt=receipt,
             accepted_at=float(row.accepted_at),
+            schema_ref=schema_ref, selections=tuple(selections),
         )
 
     def _describe_manifest_entry(
         self, entry: TargetRootCompletionManifestEntry,
     ) -> AssetExportDescription:
-        """Match exact accepted metadata, including historical ZIP custody."""
+        """Match exact metadata for the current native custody protocol."""
         self._verify_binding_hash(entry.binding, expected_hash=entry.content_hash)
         description = self._asset_memory.describe_asset_export(entry.binding.version_ref)
-        archived_directory = (
-            entry.artifact_kind == "directory" and entry.media_type == "application/zip"
-        )
         if (description.memory_ref != entry.binding.version_ref
-                or description.kind != ("file" if archived_directory else entry.artifact_kind)
+                or description.kind != entry.artifact_kind
                 or description.content_hash != entry.content_hash
                 or description.manifest_hash != entry.binding.manifest_hash
                 or description.byte_count != entry.byte_count
-                or (not archived_directory and entry.tree_hash != entry.content_hash)):
+                or entry.tree_hash != entry.content_hash):
             raise OwnerConflict("target_root_manifest_integrity_invalid")
-        if entry.research_note is not None and not archived_directory:
+        if entry.research_note is not None:
             note = entry.research_note
             source_path = note.get("entry_path")
             source = (
@@ -1374,11 +1183,26 @@ class TargetRunFinalizer:
                     raise OwnerConflict(
                         "target_root_completion_evidence_invalid"
                     )
-                handoff = _system_target_completion_handoff(
-                    handle=handle,
-                    evidence=evidence,
-                    root_descriptor=pinned_workspace.descriptor,
-                )
+                candidate = _declared_target_completion_candidate(
+                    handle=handle, evidence=evidence, root_descriptor=pinned_workspace.descriptor)
+                handoff = candidate.handoff
+                if isinstance(candidate, InvalidDeclaredCandidate):
+                    completion = self._lifecycle.accept_completion(
+                        handle=handle, handoff=handoff, harness_operation_ref=evidence.operation_ref,
+                        evidence_ref=evidence.evidence_ref, evidence_content_hash=evidence_content_hash,
+                        workspace_ref=pinned_workspace.workspace_ref,
+                        implementation_revision_ref=None, implementation_tree_hash=None,
+                        result_document_hash=None, artifact_snapshot_hash=None,
+                        candidate_rejection_code=candidate.issue.code,
+                        candidate_rejection_feedback=candidate.issue.feedback,
+                        idempotency_key='target-root-completion:' + canonical_hash({
+                            'target_ref': handle.target_ref, 'target_run_ref': handle.target_run_ref,
+                            'evidence_content_hash': evidence_content_hash}))
+                    rejection = self._record_rejection(completion=completion, manifest_ref=None,
+                        rejection=self._memory.issue_candidate_rejection(completion))
+                    os.close(pinned_workspace.descriptor)
+                    pinned_workspace = None
+                    return self._revision_result(rejection)
                 validate_target_completion_handoff(
                     handoff,
                     expected_target_ref=handle.target_ref,
@@ -1417,13 +1241,10 @@ class TargetRunFinalizer:
                         staging_directory=Path(staging_directory),
                         retained_completion=completion,
                     )
-                except OwnerConflict as error:
-                    feedback = self._memory.candidate_rejection_feedback(
-                        error.code, result_document_path=handoff.result_document_path,
-                    )
-                    if feedback is None:
-                        raise
-                    feedback = getattr(error, "feedback", feedback)
+                except DeclaredCandidateIssue as error:
+                    if completion is not None:
+                        raise OwnerConflict("target_root_artifact_integrity_invalid") from error
+                    feedback = error.feedback
                     completion = self._lifecycle.accept_completion(
                         handle=handle,
                         handoff=handoff,
@@ -1457,6 +1278,10 @@ class TargetRunFinalizer:
                     return self._revision_result(rejection)
                 finally:
                     os.close(pinned_workspace.descriptor)
+                # Publish every captured byte before the AR receipt. A process exit
+                # after that receipt can replay the identical inline and streamed snapshot.
+                frozen = _persist_frozen_sources(frozen,
+                    completion or _CompletionCustody(handle, evidence_content_hash), pinned_workspace.path.parent)
                 completion = self._lifecycle.accept_completion(
                     handle=handle,
                     handoff=handoff,
@@ -1468,9 +1293,6 @@ class TargetRunFinalizer:
                     implementation_tree_hash=frozen.implementation_tree_hash,
                     result_document_hash=frozen.result_document_hash,
                     artifact_snapshot_hash=frozen.artifact_snapshot_hash,
-                    verify_host_intake_rejection=lambda previous: self._memory.verify_host_intake_rejection(
-                        previous, frozen=frozen, workspace_parent=pinned_workspace.path.parent,
-                    ),
                     idempotency_key="target-root-completion:"
                     + canonical_hash(
                         {
@@ -1480,26 +1302,14 @@ class TargetRunFinalizer:
                         }
                     ),
                 )
-                frozen = _persist_frozen_sources(frozen, completion, pinned_workspace.path.parent)
                 memory_result = None
                 try:
                     memory_result = self._memory.accept(
                         completion=completion, frozen=frozen
                     )
-                except OwnerConflict as error:
-                    feedback = self._memory.candidate_rejection_feedback(
-                        error.code, result_document_path=completion.handoff.result_document_path,
-                    )
-                    if feedback is None:
-                        raise
-                    memory_result = self._memory.issue_candidate_rejection(
-                        completion,
-                        code=error.code,
-                        feedback=feedback,
-                    )
                 finally:
                     if memory_result is not None:
-                        _remove_frozen_sources(frozen)
+                        _remove_frozen_source_root(_frozen_sources_root(pinned_workspace.path.parent, completion))
                 if type(memory_result) is TargetRootOwnerRejection:
                     rejection = self._record_rejection(
                         completion=completion,
@@ -1757,10 +1567,22 @@ class TargetRunFinalizer:
             for artifact in declared_implementation
         ):
             raise OwnerConflict("target_implementation_workspace_invalid")
-        if retained_completion is None:
-            _preflight_implementation_directories(root_descriptor, handoff.artifacts)
         frozen_artifacts: list[_FrozenArtifact] = []
-        for ordinal, artifact in enumerate(handoff.artifacts):
+        declarations = handoff.artifacts
+        if retained_completion is not None:
+            protocol = _frozen_sources_root(resolved_workspace.path.parent, retained_completion) / "protocol.json"
+            if not protocol.is_file() or protocol.is_symlink():
+                raise OwnerConflict("target_root_artifact_integrity_invalid")
+            try:
+                version = json.loads(protocol.read_text(encoding="utf-8")).get("schema_ref")
+            except (OSError, ValueError) as error:
+                raise OwnerConflict("target_root_artifact_integrity_invalid") from error
+            if version != SELECTION_MANIFEST_SCHEMA:
+                raise OwnerConflict("target_root_manifest_protocol_unsupported")
+        physical = tuple(item for item in declarations if not any(
+            item.relative_path.startswith(parent.relative_path + '/')
+            for parent in declarations if parent != item))
+        for ordinal, artifact in enumerate(physical):
             frozen_artifact = None
             if retained_completion is not None:
                 frozen_artifact = _reuse_frozen_artifact(
@@ -1768,6 +1590,8 @@ class TargetRunFinalizer:
                     ordinal, artifact.role, artifact.relative_path,
                 )
             if frozen_artifact is None:
+                if retained_completion is not None:
+                    raise OwnerConflict("target_root_artifact_integrity_invalid")
                 frozen_artifact = _freeze_artifact(
                     root_descriptor,
                     ordinal,
@@ -1787,24 +1611,26 @@ class TargetRunFinalizer:
             media_type="text/markdown; charset=utf-8", content=content,
             content_hash=digest, tree_hash=digest))
         artifacts = tuple(frozen_artifacts)
-        snapshot_hash = canonical_hash(
-            {
-                "schema_ref": "meta-research/target-root-artifact-snapshot/v1",
-                "target_ref": handle.target_ref,
-                "target_run_ref": handle.target_run_ref,
-                "workspace_ref": workspace_ref,
-                "artifacts": [item.snapshot_value() for item in artifacts],
-            }
-        )
         implementation = tuple(
             item for item in artifacts if item.role == "implementation"
         )
-        if any(item.artifact_kind != "directory" for item in implementation):
-            raise OwnerConflict("target_implementation_workspace_invalid")
         if not implementation:
             raise OwnerConflict("target_root_implementation_missing")
         from meta_research.formal_run_bindings import implementation_set_hash
-        implementation_tree_hash = implementation_set_hash([item.snapshot_value() for item in implementation])
+        selections = tuple(_frozen_logical_selection(artifact, artifacts) for artifact in declarations)
+        # Harness text is a separate physical/logical artifact, outside workspace declarations.
+        selections += (_frozen_logical_selection(TargetCompletionArtifact(
+            role="analysis", relative_path=FINAL_STATEMENT_PATH), artifacts),)
+        implementation_tree_hash = implementation_set_hash([
+            {**item, 'selection_protocol': SELECTION_MANIFEST_SCHEMA}
+            for item in selections if item['role'] == 'implementation'])
+        snapshot_hash = canonical_hash({
+            'schema_ref': 'meta-research/target-root-artifact-snapshot/v2',
+            'target_ref': handle.target_ref, 'target_run_ref': handle.target_run_ref,
+            'workspace_ref': workspace_ref,
+            'artifacts': [item.snapshot_value() for item in artifacts],
+            'selections': selections,
+        })
         implementation_revision_ref = (
             "target_impl_" + implementation_tree_hash
         )
@@ -1818,7 +1644,7 @@ class TargetRunFinalizer:
             raise OwnerConflict("target_root_result_document_invalid")
         result = _decode_result_document_bytes(result_matches[0].content)
         retained = _retained_artifact_declarations(result.as_dict())
-        frozen_roles = {item.declared_relative_path: item.role for item in artifacts}
+        frozen_roles = {item['declared_relative_path']: item['role'] for item in selections}
         if any(frozen_roles.get(item.relative_path) != item.role for item in retained):
             raise OwnerConflict("target_root_retained_artifact_unbound")
         return _FrozenWorkspace(
@@ -1829,47 +1655,158 @@ class TargetRunFinalizer:
             result_document=result,
             result_document_hash=result.content_hash,
             artifact_snapshot_hash=snapshot_hash,
+            selections=selections, schema_ref=SELECTION_MANIFEST_SCHEMA,
         )
 
 
 def target_root_manifest_projection(manifest):
-    """Preserve the exact historical manifest shape when no note was recorded."""
-    value = projection_plain_value(manifest)
-    for entry in value["entries"]:
-        if entry.get("research_note") is None:
-            entry.pop("research_note", None)
-    return value
+    if manifest.schema_ref != SELECTION_MANIFEST_SCHEMA:
+        raise OwnerConflict('target_root_manifest_protocol_unsupported')
+    return projection_plain_value(manifest)
 
 
-def _implementation_directory_feedback(index: int, path: str) -> str:
-    return (
-        f"$.artifacts[{index}].relative_path={path!r} with role implementation must select an existing directory. "
-        "Correct the corresponding formal_runs[].implementation_paths selection to its intended directory. "
-        "Preserve the completed research and complete another root turn."
-    )
+def _frozen_logical_selection(declaration, artifacts):
+    """Resolve from captured bytes only, never reopen an overlapping live child."""
+    from meta_research.content_selection import selection_tree
+
+    parents = [item for item in artifacts if declaration.relative_path == item.declared_relative_path
+               or declaration.relative_path.startswith(item.declared_relative_path + '/')]
+    if len(parents) != 1:
+        raise OwnerConflict('target_formal_artifact_selection_ambiguous')
+    parent = parents[0]
+    path = declaration.relative_path[len(parent.declared_relative_path):].lstrip('/') or None
+    if parent.artifact_kind == 'file':
+        entries = [{'path': Path(parent.declared_relative_path).name,
+                    'sha256': parent.content_hash, 'size': parent.byte_count}]
+        tree = selection_tree('file', entries, (), path)
+    else:
+        # Capture/retained-custody verification hashes this parent once. Every
+        # overlapping scope filters the same immutable metadata, without I/O.
+        tree = selection_tree('directory', parent.tree_entries, parent.tree_directories, path)
+    return {'declared_relative_path': declaration.relative_path, 'role': declaration.role,
+            'artifact_kind': tree.kind, 'tree_hash': tree.selected_hash,
+            'byte_count': tree.byte_count,
+            'media_type': parent.media_type if path is None else 'application/octet-stream',
+            'capture_path': parent.declared_relative_path, 'path': path}
 
 
-def _preflight_implementation_directories(
-    root_descriptor: int, declarations: tuple[TargetCompletionArtifact, ...]
-) -> None:
-    for index, declaration in enumerate(declarations):
-        if declaration.role != "implementation":
-            continue
-        descriptor, info = _open_workspace_artifact(root_descriptor, declaration.relative_path)
+def _verify_manifest_selections(entries, selections):
+    from meta_research.content_selection import selection_path
+    required = {'declared_relative_path', 'role', 'artifact_kind', 'tree_hash',
+                'byte_count', 'media_type', 'path', 'asset_binding'}
+    seen = set()
+    for selected in selections:
+        if not isinstance(selected, dict) or set(selected) != required:
+            raise OwnerConflict('target_root_manifest_integrity_invalid')
+        path = selected['declared_relative_path']
         try:
-            if not stat.S_ISDIR(info.st_mode):
-                error = OwnerConflict("target_implementation_workspace_invalid")
-                error.feedback = _implementation_directory_feedback(index, declaration.relative_path)
-                raise error
+            validate_bundle_relative_path(path)
+            selection_path(selected['path'])
+        except (ValueError, OwnerConflict) as error:
+            raise OwnerConflict('target_root_manifest_integrity_invalid') from error
+        if path in seen or selected['artifact_kind'] not in {'file', 'directory'}:
+            raise OwnerConflict('target_root_manifest_integrity_invalid')
+        seen.add(path)
+        parents = [entry for entry in entries if entry['binding'] == selected['asset_binding']
+                   and path == entry['declared_relative_path'] + (
+                       '/' + selected['path'] if selected['path'] is not None else '')]
+        if len(parents) != 1 or (selected['path'] is not None and parents[0]['artifact_kind'] != 'directory'):
+            raise OwnerConflict('target_root_manifest_integrity_invalid')
+        if (selected['role'] not in TARGET_COMPLETION_ARTIFACT_ROLES
+                or not isinstance(selected['tree_hash'], str) or len(selected['tree_hash']) != 64
+                or type(selected['byte_count']) is not int or selected['byte_count'] < 0):
+            raise OwnerConflict('target_root_manifest_integrity_invalid')
+
+def _declared_target_completion_candidate(*, handle, evidence, root_descriptor):
+    # The caller has already validated the real handle, evidence, fence and workspace.
+    fallback = TargetCompletionHandoff(
+        schema_ref='meta-research/target-completion-handoff/v1', target_ref=handle.target_ref,
+        target_run_ref=handle.target_run_ref, status='completed',
+        artifacts=tuple(TargetCompletionArtifact(role=role, relative_path=path)
+                        for role, path in _SYSTEM_TARGET_COMPLETION_REQUIRED_ARTIFACTS),
+        result_document_path='outputs/result.json',
+        summary='System-bound invalid Target declaration; final_text_sha256=' + evidence.final_text_sha256 + '.')
+    try:
+        try:
+            descriptor, info = _open_workspace_artifact(root_descriptor, 'outputs/result.json')
+        except OwnerConflict as error:
+            if error.code != 'target_root_artifact_missing':
+                raise
+            raise DeclaredCandidateIssue(error.code, '$.result_document_path', 'outputs/result.json',
+                                         'declared result path does not exist') from error
+        try:
+            if not stat.S_ISREG(info.st_mode):
+                raise DeclaredCandidateIssue('target_root_result_document_invalid',
+                    '$.result_document_path', 'outputs/result.json', 'expected a regular JSON file')
+            raw = _read_stable_regular_file(descriptor, info)
         finally:
             os.close(descriptor)
-
+        try:
+            document = _decode_result_document_bytes(raw).as_dict()
+        except OwnerConflict as error:
+            raise DeclaredCandidateIssue(error.code, '$', 'outputs/result.json',
+                getattr(error, 'feedback', 'invalid result declaration (' + error.code + ')')) from error
+        from meta_research.formal_entities import _declared_work
+        try:
+            _declared_work(document)
+        except OwnerConflict as error:
+            raise DeclaredCandidateIssue(error.code, '$.formal_runs', document.get('formal_runs'),
+                getattr(error, 'feedback', 'invalid formal work declaration')) from error
+        for field in ('dataset_candidates', 'environment_candidates'):
+            candidates = document.get(field, [])
+            if not isinstance(candidates, list) or len(candidates) > 100:
+                raise DeclaredCandidateIssue('target_root_declaration_invalid', '$.' + field,
+                                            candidates, 'expected at most 100 declarations')
+            for index, item in enumerate(candidates):
+                if not isinstance(item, dict) or any(not isinstance(item.get(key), str)
+                    or not item[key].strip() for key in ('artifact_path', 'name', 'purpose')):
+                    raise DeclaredCandidateIssue('target_root_declaration_invalid',
+                        f'$.{field}[{index}]', item, 'expected artifact_path, name and purpose')
+                try:
+                    validate_bundle_relative_path(item['artifact_path'])
+                except TargetImplementationBundleError as error:
+                    raise DeclaredCandidateIssue('target_root_declaration_invalid',
+                        f'$.{field}[{index}].artifact_path', item['artifact_path'],
+                        'expected a canonical relative path') from error
+        for field in ('dataset_candidates', 'environment_candidates'):
+            for index, item in enumerate(document.get(field, [])):
+                try:
+                    candidate_fd, _ = _open_workspace_artifact(root_descriptor, item['artifact_path'])
+                except OwnerConflict as error:
+                    if error.code != 'target_root_artifact_missing':
+                        raise
+                    raise DeclaredCandidateIssue(error.code, f'$.{field}[{index}].artifact_path',
+                        item['artifact_path'], 'declared path does not exist') from error
+                else:
+                    os.close(candidate_fd)
+        handoff = _system_target_completion_handoff(handle=handle, evidence=evidence,
+                                                    root_descriptor=root_descriptor, document=document)
+        for index, declaration in enumerate(handoff.artifacts):
+            try:
+                validate_bundle_relative_path(declaration.relative_path)
+            except TargetImplementationBundleError as error:
+                raise DeclaredCandidateIssue('target_root_declaration_invalid',
+                    f'$.artifacts[{index}].relative_path', declaration.relative_path,
+                    'expected a canonical relative path') from error
+            try:
+                fd, _ = _open_workspace_artifact(root_descriptor, declaration.relative_path)
+            except OwnerConflict as error:
+                if error.code != 'target_root_artifact_missing':
+                    raise
+                raise DeclaredCandidateIssue(error.code, f'$.artifacts[{index}].relative_path',
+                    declaration.relative_path, 'declared path does not exist') from error
+            else:
+                os.close(fd)
+        return DeclaredCandidate(handoff)
+    except DeclaredCandidateIssue as issue:
+        return InvalidDeclaredCandidate(fallback, issue)
 
 def _system_target_completion_handoff(
     *,
     handle: TargetWorkHandle,
     evidence: TargetRootCompletionEvidence,
     root_descriptor: int,
+    document: dict | None = None,
 ) -> TargetCompletionHandoff:
     """Derive the handoff from declared and conventional descriptor-safe paths."""
 
@@ -1879,23 +1816,13 @@ def _system_target_completion_handoff(
         TargetCompletionArtifact(role=role, relative_path=relative_path)
         for role, relative_path in _SYSTEM_TARGET_COMPLETION_REQUIRED_ARTIFACTS
     ]
-    document = {}
-    try:
+    if document is None:
         descriptor, info = _open_workspace_artifact(root_descriptor, "outputs/result.json")
         try:
-            document = json.loads(_read_stable_regular_file(descriptor, info))
+            document = _decode_result_document_bytes(_read_stable_regular_file(descriptor, info)).as_dict()
         finally:
             os.close(descriptor)
-        if not isinstance(document, dict):
-            document = {}
-    except (ValueError, UnicodeDecodeError, RecursionError):
-        # Discovery only selects paths. The freeze boundary validates their
-        # bytes and durably records a correctable candidate rejection.
-        document = {}
-    except OwnerConflict as error:
-        if error.code not in _RM_RECOVERABLE_CANDIDATE_FEEDBACK:
-            raise
-    retained = _retained_artifact_declarations(document, strict=False)
+    retained = _retained_artifact_declarations(document)
     selected_paths = []
     runs = document.get('formal_runs', [])
     for run in runs if isinstance(runs, list) else ():
@@ -1904,15 +1831,15 @@ def _system_target_completion_handoff(
         paths = run.get('implementation_paths')
         if paths is None:
             continue
-        if (not isinstance(paths, list) or not paths or any(not isinstance(path, str)
+        if (not isinstance(paths, list) or not paths or len(paths) > 100 or any(not isinstance(path, str)
                 or (path != 'implementation' and not path.startswith('implementation/'))
-                or any(part in {'', '.', '..'} for part in path.split('/')) for path in paths)):
-            raise OwnerConflict('target_formal_implementation_paths_invalid')
+                or any(part in {'', '.', '..'} for part in path.split('/')) for path in paths)
+                or len(set(paths)) != len(paths)):
+            raise DeclaredCandidateIssue('target_formal_implementation_paths_invalid',
+                '$.formal_runs[].implementation_paths', paths, 'expected canonical implementation file or directory paths')
         selected_paths.extend(paths)
     if selected_paths:
         selected_paths = sorted(set(selected_paths))
-        if any(path.startswith(other + '/') for path in selected_paths for other in selected_paths if path != other):
-            raise OwnerConflict('target_formal_implementation_paths_overlap')
         artifacts = [artifact for artifact in artifacts if artifact.role != 'implementation']
         artifacts[0:0] = [TargetCompletionArtifact(role='implementation', relative_path=path) for path in selected_paths]
     for role, relative_path in _SYSTEM_TARGET_COMPLETION_OPTIONAL_ARTIFACTS:
@@ -1935,6 +1862,17 @@ def _system_target_completion_handoff(
     retained_by_path = {item.relative_path: item for item in retained}
     artifacts = [retained_by_path.pop(item.relative_path, item) for item in artifacts]
     artifacts.extend(retained_by_path.values())
+    by_path = {item.relative_path: item for item in artifacts}
+    for field in ('dataset_candidates', 'environment_candidates'):
+        for candidate in document.get(field, []) if isinstance(document.get(field, []), list) else ():
+            path = candidate.get('artifact_path') if isinstance(candidate, dict) else None
+            if not isinstance(path, str) or path in by_path:
+                continue
+            parents = [item for item in artifacts if path.startswith(item.relative_path + '/')]
+            if parents:
+                role = min(parents, key=lambda item: len(item.relative_path)).role
+                by_path[path] = TargetCompletionArtifact(role=role, relative_path=path)
+    artifacts = list(by_path.values())
     final_text_bytes = evidence.final_text.encode("utf-8")
     summary = (
         "System-bound Target root completion; final_text_sha256="
@@ -1958,7 +1896,7 @@ def _declared_artifact_boundaries(document, relative_path, role):
         return ()
     selected = []
     selected.extend(item.relative_path
-                    for item in _retained_artifact_declarations(document, strict=False))
+                    for item in _retained_artifact_declarations(document))
     runs = document.get('formal_runs', [])
     for run in runs if isinstance(runs, list) else ():
         if not isinstance(run, dict) or run.get('status', 'executed') not in ('executed', 'failed'):
@@ -1989,35 +1927,28 @@ def _declared_artifact_boundaries(document, relative_path, role):
     return tuple(sorted(paths))
 
 
-def _retained_artifact_declarations(document, *, strict=True):
-    """Validate optional exact retention selections without inventing identities."""
-    try:
-        selected = document.get("retained_artifacts", [])
-        if not isinstance(selected, list) or len(selected) > 100:
-            raise OwnerConflict("target_root_retained_artifacts_invalid")
-        artifacts, paths = [], set()
-        for item in selected:
-            if (not isinstance(item, dict) or set(item) != {"relative_path", "role"}
-                    or not isinstance(item["role"], str)
-                    or item["role"] not in {"log", "analysis", "data", "checkpoint"}):
-                raise OwnerConflict("target_root_retained_artifacts_invalid")
-            try:
-                path = validate_bundle_relative_path(item["relative_path"])
-            except TargetImplementationBundleError as error:
-                raise OwnerConflict("target_root_retained_artifacts_invalid") from error
-            if (path in paths or path.split("/")[0] in {"inputs", "implementation", "handoff"}
-                    or path == "outputs" or path == "outputs/result.json"
-                    or path.startswith("outputs/result.json/")):
-                raise OwnerConflict("target_root_retained_artifacts_invalid")
-            paths.add(path)
-            artifacts.append(TargetCompletionArtifact(role=item["role"], relative_path=path))
-        return tuple(artifacts)
-    except OwnerConflict:
-        if strict:
-            raise
-        # Discovery precedes the candidate rejection boundary. Freeze performs
-        # strict validation and records the recoverable RM rejection instead.
-        return ()
+def _retained_artifact_declarations(document):
+    """Validate exact retention selections without dropping invalid declarations."""
+    selected = document.get("retained_artifacts", [])
+    if not isinstance(selected, list) or len(selected) > 100:
+        raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
+    artifacts, paths = [], set()
+    for item in selected:
+        if (not isinstance(item, dict) or set(item) != {"relative_path", "role"}
+                or not isinstance(item["role"], str)
+                or item["role"] not in {"log", "analysis", "data", "checkpoint"}):
+            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
+        try:
+            path = validate_bundle_relative_path(item["relative_path"])
+        except TargetImplementationBundleError as error:
+            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid") from error
+        if (path in paths or path.split("/")[0] in {"inputs", "implementation", "handoff"}
+                or path == "outputs" or path == "outputs/result.json"
+                or path.startswith("outputs/result.json/")):
+            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
+        paths.add(path)
+        artifacts.append(TargetCompletionArtifact(role=item["role"], relative_path=path))
+    return tuple(artifacts)
 
 
 def _declared_boundary_artifact_paths(root_descriptor, relative_path, boundaries):
@@ -2209,7 +2140,7 @@ def _freeze_artifact(
     try:
         if stat.S_ISREG(info.st_mode):
             if role == "result" and info.st_size > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
-                raise OwnerConflict("target_root_result_document_too_large")
+                raise DeclaredCandidateIssue("target_root_result_document_too_large", "$artifact", relative_path)
             if info.st_size > TARGET_ROOT_INLINE_ARTIFACT_BYTES and role != "result":
                 return _freeze_streamed_artifact(descriptor, info, ordinal, role,
                                                 relative_path, staging_directory)
@@ -2230,36 +2161,9 @@ def _freeze_artifact(
                 tree_hash=content_hash,
             )
         if stat.S_ISDIR(info.st_mode):
-            try:
-                first = build_target_implementation_bundle_from_open_directory(
-                    descriptor
-                )
-                second = build_target_implementation_bundle_from_open_directory(
-                    descriptor
-                )
-            except TargetImplementationBundleError as error:
-                code = error.code
-                if code in {"target_implementation_workspace_entry_unsupported",
-                            "target_implementation_bundle_too_large"}:
-                    return _freeze_streamed_artifact(descriptor, info, ordinal, role,
-                                                    relative_path, staging_directory)
-                raise OwnerConflict(code) from error
-            if first.bundle_bytes != second.bundle_bytes:
-                raise OwnerConflict("target_root_workspace_changed")
-            if len(first.bundle_bytes) > MAX_ASSET_BYTES:
-                return _freeze_streamed_artifact(descriptor, info, ordinal, role,
-                                                relative_path, staging_directory)
-            return _FrozenArtifact(
-                ordinal=ordinal,
-                role=role,
-                declared_relative_path=relative_path,
-                artifact_kind="directory",
-                media_type="application/zip",
-                content=first.bundle_bytes,
-                content_hash=first.bundle_sha256,
-                tree_hash=first.tree_sha256,
-            )
-        raise OwnerConflict("target_root_artifact_type_unsupported")
+            return _freeze_streamed_artifact(descriptor, info, ordinal, role,
+                                            relative_path, staging_directory)
+        raise DeclaredCandidateIssue("target_root_artifact_type_unsupported", "$artifact", relative_path)
     finally:
         os.close(descriptor)
 
@@ -2275,8 +2179,9 @@ def _completion_staging_directory(workspace: _PinnedWorkspaceRoot):
 def _frozen_sources_root(workspace_parent: Path,
                          completion: AcceptedTargetRootCompletion) -> Path:
     return workspace_parent / ".target-completion-intakes" / canonical_hash({
-        "completion_ref": completion.completion_ref,
-        "artifact_snapshot_hash": completion.artifact_snapshot_hash,
+        "target_ref": completion.handle.target_ref,
+        "target_run_ref": completion.handle.target_run_ref,
+        "evidence_content_hash": completion.evidence_content_hash,
     })
 
 
@@ -2289,14 +2194,34 @@ def _reuse_frozen_artifact(root: Path, ordinal: int, role: str,
                           relative_path: str) -> _FrozenArtifact | None:
     """Read private custody without recopying it; AR still checks the whole snapshot.
 
-    Only an exact verified completion supplies this root. Inline artifacts are
-    rebuilt from the workspace, and accept_completion compares every resulting
-    hash with the original request before any RM handoff.
+    Only an exact verified completion supplies this root. Both inline files and
+    native directories come from private custody; no live workspace fallback exists.
     """
     try:
         root.lstat()
     except FileNotFoundError:
         return None
+    metadata_path = root / f"artifact-{ordinal:04d}.json"
+    if metadata_path.exists():
+        if metadata_path.is_symlink():
+            raise OwnerConflict("target_root_artifact_integrity_invalid")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise OwnerConflict("target_root_artifact_integrity_invalid") from error
+        if (metadata.get("ordinal") != ordinal or metadata.get("role") != role
+                or metadata.get("declared_relative_path") != relative_path):
+            raise OwnerConflict("target_root_artifact_integrity_invalid")
+        if metadata.get("inline"):
+            inline_path = root / f"artifact-{ordinal:04d}.inline"
+            if inline_path.is_symlink():
+                raise OwnerConflict("target_root_artifact_integrity_invalid")
+            content = inline_path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != metadata.get("content_hash"):
+                raise OwnerConflict("target_root_artifact_integrity_invalid")
+            return _FrozenArtifact(ordinal=ordinal, role=role, declared_relative_path=relative_path,
+                artifact_kind=metadata["artifact_kind"], media_type=metadata["media_type"],
+                content=content, content_hash=metadata["content_hash"], tree_hash=metadata["tree_hash"])
     pinned = _pin_workspace_root("retained-target-completion", root)
     try:
         try:
@@ -2335,8 +2260,6 @@ def _publish_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTarget
     issued a terminal candidate rejection. Content and completion identity bind
     the path, so recreating a snapshot never changes the intake request hash.
     """
-    if not any(artifact.source_path for artifact in frozen.artifacts):
-        return frozen
     parent = workspace_parent / ".target-completion-intakes"
     root = _frozen_sources_root(workspace_parent, completion)
     for directory in (parent, root):
@@ -2345,7 +2268,19 @@ def _publish_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTarget
             raise OwnerConflict("target_root_artifact_storage_unavailable")
     artifacts = []
     for artifact in frozen.artifacts:
+        metadata = {**artifact.snapshot_value(), "inline": artifact.source_path is None}
+        metadata_path = root / f"artifact-{artifact.ordinal:04d}.json"
         if artifact.source_path is None:
+            destination = root / f"artifact-{artifact.ordinal:04d}.inline"
+            if destination.exists():
+                if destination.read_bytes() != artifact.content:
+                    raise OwnerConflict("target_root_artifact_integrity_invalid")
+            else:
+                with destination.open("xb") as stream:
+                    stream.write(artifact.content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            metadata_path.write_text(canonical_json(metadata), encoding="utf-8")
             artifacts.append(artifact)
             continue
         destination = _frozen_artifact_path(workspace_parent, completion, artifact.ordinal)
@@ -2364,7 +2299,9 @@ def _publish_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTarget
         valid_type = stat.S_ISDIR(existing.st_mode) if artifact.artifact_kind == "directory" else stat.S_ISREG(existing.st_mode)
         if not valid_type:
             raise OwnerConflict("target_root_artifact_storage_unavailable")
+        metadata_path.write_text(canonical_json(metadata), encoding="utf-8")
         artifacts.append(replace(artifact, source_path=destination))
+    (root / "protocol.json").write_text(canonical_json({"schema_ref": frozen.schema_ref}), encoding="utf-8")
     return replace(frozen, artifacts=tuple(artifacts))
 
 
@@ -2411,7 +2348,7 @@ def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: in
 
     def copy_file(fd: int, before: os.stat_result, output: Path) -> tuple[str, int]:
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise OwnerConflict("target_root_artifact_type_unsupported")
+            raise DeclaredCandidateIssue("target_root_artifact_type_unsupported", "$artifact", relative_path)
         digest = hashlib.sha256()
         size = 0
         os.lseek(fd, 0, os.SEEK_SET)
@@ -2441,7 +2378,7 @@ def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: in
             try:
                 validate_bundle_relative_path(path)
             except TargetImplementationBundleError as error:
-                raise OwnerConflict("target_implementation_workspace_entry_unsupported") from error
+                raise DeclaredCandidateIssue("target_implementation_workspace_entry_unsupported", "$artifact", path) from error
             child, child_info = _open_artifact_component(fd, name)
             try:
                 if stat.S_ISDIR(child_info.st_mode):
@@ -2459,7 +2396,7 @@ def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: in
                         states[path] = _descriptor_stat_identity(child_info)
                         entries.append({"path": path, "sha256": digest, "size": size})
                 else:
-                    raise OwnerConflict("target_root_artifact_type_unsupported")
+                    raise DeclaredCandidateIssue("target_root_artifact_type_unsupported", "$artifact", relative_path)
             finally:
                 os.close(child)
         if identity != _descriptor_stat_identity(os.fstat(fd)):
@@ -2474,20 +2411,19 @@ def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: in
                 destination.mkdir()
             walk(descriptor, info, "", verify=False)
             walk(descriptor, os.fstat(descriptor), "", verify=True)
-            if role == "implementation" and not entries:
-                raise OwnerConflict("target_implementation_workspace_entry_unsupported")
             entries.sort(key=lambda entry: entry["path"])
             digest = canonical_hash({"kind": "directory", "directories": sorted(directories),
                                      "entries": entries})
             size = sum(entry["size"] for entry in entries)
             kind, media_type = "directory", "application/x-directory"
         else:
-            raise OwnerConflict("target_root_artifact_type_unsupported")
+            raise DeclaredCandidateIssue("target_root_artifact_type_unsupported", "$artifact", relative_path)
     except OSError as error:
         raise OwnerConflict("target_root_artifact_storage_unavailable") from error
     return _FrozenArtifact(ordinal=ordinal, role=role, declared_relative_path=relative_path,
         artifact_kind=kind, media_type=media_type, content=None, content_hash=digest,
-        tree_hash=digest, source_path=destination, source_byte_count=size)
+        tree_hash=digest, source_path=destination, source_byte_count=size,
+        tree_entries=tuple(entries), tree_directories=tuple(sorted(directories)))
 
 
 def _open_workspace_artifact(
@@ -2565,11 +2501,11 @@ def _open_artifact_component(
     try:
         listed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except FileNotFoundError as error:
-        raise OwnerConflict("target_root_artifact_missing") from error
+        raise DeclaredCandidateIssue("target_root_artifact_missing", "$artifact", name) from error
     except OSError as error:
         raise OwnerConflict("target_root_artifact_unavailable") from error
     if stat.S_ISLNK(listed.st_mode):
-        raise OwnerConflict("target_root_artifact_symlink_forbidden")
+        raise DeclaredCandidateIssue("target_root_artifact_symlink_forbidden", "$artifact", name)
     flags = (
         _directory_open_flags()
         if stat.S_ISDIR(listed.st_mode)
@@ -2581,20 +2517,20 @@ def _open_artifact_component(
     try:
         descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     except FileNotFoundError as error:
-        raise OwnerConflict("target_root_artifact_missing") from error
+        raise DeclaredCandidateIssue("target_root_artifact_missing", "$artifact", name) from error
     except OSError as error:
         try:
             current = os.stat(
                 name, dir_fd=parent_descriptor, follow_symlinks=False
             )
         except FileNotFoundError as missing:
-            raise OwnerConflict("target_root_artifact_missing") from missing
+            raise DeclaredCandidateIssue("target_root_artifact_missing", "$artifact", name) from missing
         except OSError as unavailable:
             raise OwnerConflict(
                 "target_root_artifact_unavailable"
             ) from unavailable
         if stat.S_ISLNK(current.st_mode):
-            raise OwnerConflict("target_root_artifact_symlink_forbidden") from error
+            raise DeclaredCandidateIssue("target_root_artifact_symlink_forbidden", "$artifact", name) from error
         if _descriptor_stat_identity(listed) != _descriptor_stat_identity(current):
             raise OwnerConflict("target_root_workspace_changed") from error
         raise OwnerConflict("target_root_artifact_unavailable") from error
@@ -2677,7 +2613,7 @@ def _descriptor_stat_identity(value: os.stat_result) -> tuple[int, ...]:
 
 def _decode_result_document_bytes(content: bytes) -> TargetRootResultDocument:
     if len(content) > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
-        raise OwnerConflict("target_root_result_document_too_large")
+        raise DeclaredCandidateIssue("target_root_result_document_too_large")
     try:
         value = json.loads(
             content.decode("utf-8"),
@@ -2690,7 +2626,7 @@ def _decode_result_document_bytes(content: bytes) -> TargetRootResultDocument:
         RecursionError,
         json.JSONDecodeError,
     ) as error:
-        raise OwnerConflict("target_root_result_document_invalid") from error
+        raise DeclaredCandidateIssue("target_root_result_document_invalid") from error
     # The source artifact and its byte hash stay immutable. Only the decoded
     # result document has a derived canonical hash; formatting is not research.
     return _decode_result_document_value(value)
@@ -2705,7 +2641,7 @@ def _target_root_utf8_size(value: str, *, invalid_code: str) -> int:
 
 def _decode_result_document_value(value: object) -> TargetRootResultDocument:
     if type(value) is not dict or not TARGET_ROOT_REQUIRED_RESULT_DOCUMENT_FIELDS <= set(value):
-        raise OwnerConflict("target_root_result_document_invalid")
+        raise DeclaredCandidateIssue("target_root_result_document_invalid")
     _retained_artifact_declarations(value)
     schema_ref = value.get("schema_ref")
     metrics = value.get("metrics")
@@ -2738,9 +2674,9 @@ def _decode_result_document_value(value: object) -> TargetRootResultDocument:
             or _target_root_utf8_size(disposition, invalid_code="target_root_result_document_invalid") > 256
         ))
     ):
-        raise OwnerConflict("target_root_result_document_invalid")
+        raise DeclaredCandidateIssue("target_root_result_document_invalid")
     if len(metrics) > TARGET_ROOT_MAX_RESULT_METRICS:
-        raise OwnerConflict("target_root_result_metrics_invalid")
+        raise DeclaredCandidateIssue("target_root_result_metrics_invalid")
     normalized: dict[str, TargetMetricValue] = {}
     for name, metric in metrics.items():
         if (
@@ -2756,7 +2692,7 @@ def _decode_result_document_value(value: object) -> TargetRootResultDocument:
             )
             or not valid_target_metric_value(metric)
         ):
-            raise OwnerConflict("target_root_result_metrics_invalid")
+            raise DeclaredCandidateIssue("target_root_result_metrics_invalid")
         normalized[name] = cast(TargetMetricValue, metric)
     document = dict(value)
     # Bound all additional domain content too, including strings and numbers.
@@ -2764,9 +2700,9 @@ def _decode_result_document_value(value: object) -> TargetRootResultDocument:
         validate_target_result_tree(document)
         encoded = canonical_json(document).encode("utf-8")
     except (TypeError, ValueError, UnicodeError, RecursionError) as error:
-        raise OwnerConflict("target_root_result_document_invalid") from error
+        raise DeclaredCandidateIssue("target_root_result_document_invalid") from error
     if len(encoded) > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
-        raise OwnerConflict("target_root_result_document_too_large")
+        raise DeclaredCandidateIssue("target_root_result_document_too_large")
     return TargetRootResultDocument(
         schema_ref=schema_ref,
         metrics=normalized,

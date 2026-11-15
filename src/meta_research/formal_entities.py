@@ -9,6 +9,7 @@ import json
 from contextvars import ContextVar
 from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
+from meta_research.target_content_issue import TargetContentIssue
 
 _REUSED_EVALUATION_SOURCES = ContextVar('reused_evaluation_sources', default=frozenset())
 
@@ -22,10 +23,16 @@ def verified_target_input_asset_refs(owner, *, target_ref, proofs, target_commit
     for proof in proofs:
         if owner is None:
             raise OwnerConflict("target_launch_asset_proof_verifier_unavailable")
+        source_ref = proof.get("selection_ref") or proof["asset_ref"]
+        verified = owner.query_bundle_input_asset_proof(target_ref=target_ref, asset_ref=source_ref)
+        if verified is None or projection_plain_value(verified) != proof:
+            raise OwnerConflict("target_run_input_asset_proof_invalid")
+        if proof.get("selection_ref"):
+            refs.add(source_ref)
+            continue
         projection = owner.query_target_input_asset_projection(
             target_ref=target_ref, asset_ref=proof["asset_ref"])
-        if (projection is None or projection.target_ref != target_ref
-                or projection_plain_value(projection.as_bundle_proof()) != proof):
+        if projection is None or projection.target_ref != target_ref:
             raise OwnerConflict("target_run_input_asset_proof_invalid")
         refs.update((projection.asset.asset_ref, projection.asset.version_ref))
         direct_assets.append(projection.asset)
@@ -110,7 +117,7 @@ def _artifact_paths(value):
         for path in value or []:
             validate_bundle_relative_path(path)
     except (OwnerConflict, TargetImplementationBundleError) as cause:
-        error = OwnerConflict('target_root_commit_domain_invalid')
+        error = TargetContentIssue('target_root_commit_domain_invalid')
         error.feedback = (
             'Run and Evaluation artifact_paths must be a list of at most 100 distinct canonical '
             'relative workspace paths, without traversal, absolute prefixes or unsupported characters. '
@@ -137,7 +144,7 @@ def explicit_run_only(document):
 
 
 def _work_inventory_conflict(path, requirement):
-    error = OwnerConflict('target_formal_work_inventory_invalid')
+    error = TargetContentIssue('target_formal_work_inventory_invalid')
     error.feedback = (path + ' ' + requirement + '. Correct that formal work declaration '
         'and finish another normal turn in the same Root. Preserve the existing research, '
         'trained checkpoints, metrics and retained artifacts; a declaration correction '
@@ -508,7 +515,8 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
     payload = json.loads(root['measurement_payload_json'])
     identities = {key: authority[key] for key in ('baseline_ref', 'variant_ref', 'evaluation_ref', 'protocol_version_ref')}
     result = json.loads(manifest['result_document_json'])
-    entries = json.loads(manifest['entries_json'])
+    from meta_research.formal_run_bindings import db_manifest_selection_entries
+    entries = db_manifest_selection_entries(manifest)
     result_entries = [entry for entry in entries if entry['role'] == 'result']
     if len(result_entries) != 1:
         raise OwnerConflict('target_formal_result_asset_invalid')
@@ -653,7 +661,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
                 invalid_values = [str(key) for key, value in metrics.items()
                                   if not isinstance(key, str) or not valid_target_metric_value(value)]
                 if not names <= metric_keys <= names | optional_names or invalid_values:
-                    conflict = OwnerConflict('target_formal_metric_definition_invalid')
+                    conflict = TargetContentIssue('target_formal_metric_definition_invalid')
                     conflict.feedback = (
                         f"Run {item['run_key']!r}, Evaluation {item['attempt_key']!r} has "
                         f"missing required metric keys {sorted(names - metric_keys)!r}, "
@@ -674,7 +682,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         run_ref, attempt_ref = item['variant_run_ref'], item['evaluation_attempt_ref']
         vb = variant_proof['binding_ref'] if item['ordinal'] == 0 else _ref('variant_input', run_ref)
         eb = None if attempt_ref is None else (evaluation_proof['binding_ref'] if item['ordinal'] == 0 else _ref('evaluation_input', attempt_ref))
-        from meta_research.formal_run_bindings import implementation_binding, resolve_local_inputs
+        from meta_research.formal_run_bindings import implementation_binding, resolve_local_inputs, local_input_selections
         local_inputs = resolve_local_inputs(result, entries, item)
         input_selection_recorded = item['input_refs'] is not None
         legacy_input_selection = False
@@ -692,7 +700,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         if (not isinstance(input_refs, list) or any(not isinstance(ref, str) for ref in input_refs)
                 or len(set(input_refs)) != len(input_refs)
                 or not item['reuse_variant_run'] and not set(input_refs) <= allowed_inputs):
-            raise OwnerConflict('target_formal_input_reference_invalid')
+            raise TargetContentIssue('target_formal_input_reference_invalid')
         input_refs = list(dict.fromkeys([*input_refs, *local_inputs]))
         if item['reuse_variant_run']:
             if item.get('implementation_paths') is not None or local_inputs:
@@ -712,6 +720,11 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
             'accepted_input_target_commit_refs': handle.get('accepted_input_target_commit_refs', []),
             'run_key': item['run_key'],
         }
+        inputs['produced_selections'] = produced_selections(entries,
+            [*(item.get('artifact_paths') or []), *(item.get('checkpoint_paths') or [])])
+        selected_local = local_input_selections(result, entries, item)
+        if selected_local:
+            inputs['local_input_selections'] = selected_local
         if not legacy_input_selection:
             inputs['input_selection_recorded'] = input_selection_recorded
         if item['reuse_variant_run']:
@@ -824,6 +837,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
                              'attempt_key': item['attempt_key'], 'result_asset': result_binding,
                              'checkpoint_refs': [entry['version_ref'] for entry in selected_checkpoints],
                              'checkpoint_scope_role_refs': [entry['role_ref'] for entry in run_checkpoints]}
+        evaluation_inputs['produced_selections'] = produced_selections(entries, item.get('evaluation_artifact_paths'))
         _ensure_input(ensure, eb, 'evaluation_attempt', attempt_ref, evaluation_inputs, at)
         checkpoints = checkpoint_roles
         ensure('rg_evaluation_attempts', 'evaluation_attempt_ref', {
@@ -974,6 +988,11 @@ def _verify_reused_root_source_rows(root, authority, manifest, completion, commi
         'result_document_hash': accepted.result_document_hash, 'artifact_snapshot_hash': accepted.artifact_snapshot_hash,
         'entries': json.loads(manifest['entries_json']), 'completion_receipt': accepted.receipt.as_public_dict(),
     }
+    recorded_payload = json.loads(manifest['payload_json'])
+    from meta_research.formal_run_bindings import SELECTION_MANIFEST_SCHEMA
+    if recorded_payload.get('schema_ref') != SELECTION_MANIFEST_SCHEMA:
+        raise OwnerConflict('target_root_manifest_protocol_unsupported')
+    payload.update(schema_ref=SELECTION_MANIFEST_SCHEMA, selections=recorded_payload['selections'])
     digest = canonical_hash(payload)
     receipt = manifest_receipt('research_memory', RM_TARGET_ROOT_COMPLETION_MANIFEST_RECEIPT_KIND,
         manifest['receipt_ref'], manifest['manifest_ref'],
@@ -1041,10 +1060,13 @@ def _existing_checkpoint_records(connection, run_ref, frozen_refs=None):
             'rg_experiment_input_bindings b ON b.binding_ref=r.input_binding_ref WHERE r.variant_run_ref=:ref'),
             {'ref': producer_ref}).first()
         manifest_ref = json.loads(source.inputs_json).get('manifest_ref') if source else None
-        manifest = connection.execute(text('SELECT entries_json FROM rm_target_root_completion_manifests '
+        manifest = connection.execute(text('SELECT entries_json,payload_json FROM rm_target_root_completion_manifests '
             'WHERE manifest_ref=:ref'), {'ref': manifest_ref}).first() if manifest_ref else None
-        matches = [entry for entry in (json.loads(manifest.entries_json) if manifest else [])
-                   if entry['role'] == 'checkpoint' and entry['binding']['version_ref'] == row['version_ref']]
+        from meta_research.formal_run_bindings import db_manifest_selection_entries
+        source_entries = db_manifest_selection_entries(manifest._mapping) if manifest else []
+        matches = [entry for entry in source_entries if entry['role'] == 'checkpoint'
+                   and _ref('formal_checkpoint_selection_role', producer_ref,
+                       entry['binding']['version_ref'], entry['declared_relative_path']) == row['role_ref']]
         if len(matches) != 1:
             raise OwnerConflict('target_formal_checkpoint_source_invalid')
         records.append({'role_ref': row['role_ref'], 'version_ref': row['version_ref'],
@@ -1077,7 +1099,8 @@ def _register_run_checkpoints(connection, *, ensure, item, entries, accepted_at,
     records = []
     for ordinal, entry in enumerate(selected):
         binding = entry['binding']
-        role_ref = _ref('formal_checkpoint_role', run_ref, binding['version_ref'])
+        role_ref = _ref('formal_checkpoint_selection_role', run_ref, binding['version_ref'],
+                        entry['declared_relative_path'])
         ensure('rg_experiment_asset_roles', 'role_ref', {
             'role_ref': role_ref, 'subject_kind': 'variant_run', 'subject_ref': run_ref,
             'role': 'checkpoint_artifact', 'ordinal': ordinal,
@@ -1096,8 +1119,10 @@ def _register_run_checkpoints(connection, *, ensure, item, entries, accepted_at,
 
 def _recorded_subject_artifacts(connection, items, entries):
     """Read accepted production selections when replaying historical work."""
-    by_version = {entry['binding']['version_ref']: entry['declared_relative_path']
-                  for entry in entries if entry['role'] in {'log', 'analysis', 'data'}}
+    by_version = {}
+    for entry in entries:
+        if entry['role'] in {'log', 'analysis', 'data'}:
+            by_version.setdefault(entry['binding']['version_ref'], []).append(entry['declared_relative_path'])
     if not by_version:
         return {}
     subjects = {(kind, item[key]) for item in items
@@ -1123,7 +1148,7 @@ def _recorded_subject_artifacts(connection, items, entries):
         subject = (row._adjusted_from_kind or row.subject_kind,
                    row._adjusted_from_ref or row.subject_ref)
         if subject in subjects:
-            defaults.setdefault(subject, []).append(by_version[row.version_ref])
+            defaults.setdefault(subject, []).extend(by_version[row.version_ref])
     return defaults
 
 
@@ -1132,6 +1157,17 @@ def _accepted_asset_role_for_replay(connection, row):
     from meta_research.owners.research_graph import _accepted_experiment_asset_role_tolerant
     return _accepted_experiment_asset_role_tolerant(connection, row)
 
+
+
+def produced_selections(entries, paths):
+    selected = set(paths or [])
+    return [{'artifact_path': entry['declared_relative_path'], 'role': entry['role'],
+             'asset_binding': entry['binding'], 'path': entry.get('path')}
+            for entry in entries if entry['declared_relative_path'] in selected]
+
+
+def _artifact_role_ref(kind, subject, entry):
+    return _ref('formal_artifact_parent_role', kind, subject, entry['role'], entry['binding']['version_ref'])
 
 def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref,
                                 paths, entries, accepted_at, reused=False):
@@ -1159,9 +1195,10 @@ def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref
             source = connection.execute(text(f'SELECT b.inputs_json FROM {table} s JOIN rg_experiment_input_bindings b '
                 f'ON b.binding_ref=s.input_binding_ref WHERE s.{key}=:ref'), {'ref': subject_ref}).first()
             manifest_ref = json.loads(source.inputs_json).get('manifest_ref') if source else None
-            manifest = connection.execute(text('SELECT entries_json FROM rm_target_root_completion_manifests '
+            manifest = connection.execute(text('SELECT entries_json,payload_json FROM rm_target_root_completion_manifests '
                 'WHERE manifest_ref=:ref'), {'ref': manifest_ref}).first()
-            original_entries = json.loads(manifest.entries_json) if manifest else []
+            from meta_research.formal_run_bindings import db_manifest_selection_entries
+            original_entries = db_manifest_selection_entries(manifest._mapping) if manifest else []
             selected = _selected_subject_artifacts(original_entries, paths)
             # Current roles under this subject minus later corrections in both
             # directions: roles moved away and roles moved in by an Owner
@@ -1179,19 +1216,22 @@ def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref
                          if row['role_ref'] not in moved_in}
             selected_versions = {
                 entry['binding']['version_ref'] for entry in selected
-                if _ref('formal_artifact_role', subject_kind, subject_ref,
-                        entry['binding']['version_ref']) not in excluded_refs}
+                if _artifact_role_ref(subject_kind, subject_ref, entry) not in excluded_refs}
             if selected_versions != remaining:
                 raise OwnerConflict('target_formal_reused_artifact_mismatch')
         return
     selected = _selected_subject_artifacts(entries, paths)
-    ordinals = {}
+    ordinals, retained = {}, set()
     for entry in selected:
         binding = entry['binding']
+        dependency = (entry['role'], binding['version_ref'])
+        if dependency in retained:
+            continue
+        retained.add(dependency)
         role = {'log': 'log_asset', 'analysis': 'analysis_asset', 'data': 'data_asset'}[entry['role']]
         ordinal = ordinals.get(role, 0)
         ordinals[role] = ordinal + 1
-        role_ref = _ref('formal_artifact_role', subject_kind, subject_ref, binding['version_ref'])
+        role_ref = _artifact_role_ref(subject_kind, subject_ref, entry)
         ensure('rg_experiment_asset_roles', 'role_ref', {
             'role_ref': role_ref, 'subject_kind': subject_kind, 'subject_ref': subject_ref,
             'role': role, 'ordinal': ordinal, 'asset_ref': binding['asset_ref'],
@@ -1212,8 +1252,7 @@ def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref
     # on either side: the manifest selection keeps its deterministic role_ref.
     selected_versions = {
         entry['binding']['version_ref'] for entry in selected
-        if _ref('formal_artifact_role', subject_kind, subject_ref,
-                entry['binding']['version_ref']) not in adjusted}
+        if _artifact_role_ref(subject_kind, subject_ref, entry) not in adjusted}
     if {row[1] for row in actual if row[0] not in adjusted} != selected_versions:
         raise OwnerConflict('target_formal_artifact_assignment_conflict')
 
@@ -1354,7 +1393,7 @@ def _verify_declared_subject_artifact_bindings(work, entries):
             related = sorted(path for path in available if any(
                 path.startswith(selected + '/') or selected.startswith(path + '/')
                 for selected in missing))
-            error = OwnerConflict('target_root_commit_domain_invalid')
+            error = TargetContentIssue('target_root_commit_domain_invalid')
             error.feedback = (
                 kind + ' artifact_paths are not bound to exact retained log, analysis or data assets: '
                 + canonical_json(missing[:8]) + '. '
@@ -1390,7 +1429,7 @@ def _verify_new_checkpoint_selections(items, entries, *, require_explicit=False)
             missing = [path for path in paths if path not in available]
             roles = {entry['declared_relative_path']: entry['role'] for entry in entries}
             examples = [{'path': path, 'manifest_role': roles.get(path)} for path in missing[:8]]
-            error = OwnerConflict('target_root_commit_domain_invalid')
+            error = TargetContentIssue('target_root_commit_domain_invalid')
             error.feedback = (
                 kind + ' checkpoint_paths are not bound to this Run\'s exact retained checkpoint assets '
                 + '(run_key=' + repr(run_key) + '): ' + canonical_json(examples) + '. '
@@ -1434,9 +1473,10 @@ def verify_retained_products(document, entries):
             assigned.update(item.get('evaluation_artifact_paths') or [])
     missing = [entry['declared_relative_path'] for entry in entries
                if entry['role'] in {'analysis', 'data', 'checkpoint'} and not _is_target_note(entry)
-               and entry['declared_relative_path'] not in assigned]
+               and entry['declared_relative_path'] not in assigned
+               and not any(entry['declared_relative_path'].startswith(path + '/') for path in assigned)]
     if missing:
-        error = OwnerConflict('target_root_commit_domain_invalid')
+        error = TargetContentIssue('target_root_commit_domain_invalid')
         error.feedback = ('Retained research products need their actual Run or Evaluation owner: '
             + canonical_json(missing) + '. Assign these exact frozen paths with artifact_paths or '
             'checkpoint_paths in formal_runs. A selected directory containing a Target note still '
@@ -1447,11 +1487,13 @@ def verify_retained_products(document, entries):
     _verify_new_checkpoint_selections(items, entries, require_explicit=True)
     implementation = [entry['declared_relative_path'] for entry in entries
                       if entry['role'] == 'implementation']
+    default_implementation = [entry['declared_relative_path'] for entry in entries
+        if entry['role'] == 'implementation' and entry.get('path') is None]
     for item in items:
         if not item['reuse_variant_run']:
             paths = item.get('implementation_paths')
             assigned.update(path for path in implementation
-                            if (paths is None and len(implementation) == 1)
+                            if (paths is None and len(default_implementation) == 1 and path in default_implementation)
                             or (isinstance(paths, list) and path in paths))
     _verify_reusable_candidates(document, entries, assigned)
 
@@ -1469,7 +1511,7 @@ def _verify_reusable_candidates(document, entries, assigned):
     ):
         candidates = document.get(field, [])
         if not isinstance(candidates, list) or len(candidates) > 100:
-            error = OwnerConflict('target_root_commit_domain_invalid')
+            error = TargetContentIssue('target_root_commit_domain_invalid')
             error.feedback = (field + ' must be a list of at most 100 declarations, each with '
                 'nonempty artifact_path, name and purpose. Preserve the retained research products, '
                 'correct this declaration in the result document and finish another normal root turn.')
@@ -1477,7 +1519,7 @@ def _verify_reusable_candidates(document, entries, assigned):
         for candidate in candidates:
             if (not isinstance(candidate, dict) or any(not isinstance(candidate.get(key), str)
                     or not candidate[key].strip() for key in ('artifact_path', 'name', 'purpose'))):
-                error = OwnerConflict('target_root_commit_domain_invalid')
+                error = TargetContentIssue('target_root_commit_domain_invalid')
                 error.feedback = ('Each ' + field + ' entry needs nonempty artifact_path, name and '
                     'purpose. Preserve the retained research products, correct the incomplete declaration '
                     'and finish another normal root turn.')
@@ -1485,32 +1527,24 @@ def _verify_reusable_candidates(document, entries, assigned):
             try:
                 validate_bundle_relative_path(candidate['artifact_path'])
             except TargetImplementationBundleError as cause:
-                error = OwnerConflict('target_root_commit_domain_invalid')
+                error = TargetContentIssue('target_root_commit_domain_invalid')
                 error.feedback = (label + ' candidate artifact_path must be a canonical relative workspace '
                     'path without traversal, absolute prefixes or unsupported characters: '
                     + repr(candidate['artifact_path']) + '. Correct the declaration to an existing exact '
                     'retained path, preserve all files and finish another normal root turn.')
                 raise error from cause
             declarations.append((field, label, roles, candidate))
-    paths = [candidate['artifact_path'] for _, _, _, candidate in declarations]
-    overlap = next(((parent, child) for parent in paths for child in paths
-                    if child.startswith(parent + '/')), None)
-    if overlap is not None:
-        error = OwnerConflict('target_root_commit_domain_invalid')
-        error.feedback = ('dataset_candidates / environment_candidates contain overlapping parent and child boundaries: '
-            + canonical_json(overlap) + '. Choose non-overlapping exact candidate boundaries according '
-            'to the intended research meaning. Equal paths may share one retained asset across both indexes. '
-            'Preserve all files and correct the declarations before finishing another normal root turn; '
-            'do not broaden a selected resource to its parent.')
-        raise error
     for field, label, roles, candidate in declarations:
         path = candidate['artifact_path']
-        if (path not in assigned or not any(entry['declared_relative_path'] == path
-                                           and entry['role'] in roles for entry in entries)):
+        resolved = resolve_artifact_selection(entries, path)
+        owner_paths = assigned
+        owned = path in owner_paths or (resolved is not None
+            and any(path.startswith(parent + '/') for parent in owner_paths))
+        if (not owned or resolved is None or resolved['role'] not in roles):
             parents = [entry['declared_relative_path'] for entry in entries
                        if entry['role'] in {'data', 'analysis'}
                        and path.startswith(entry['declared_relative_path'] + '/')]
-            error = OwnerConflict('target_root_commit_domain_invalid')
+            error = TargetContentIssue('target_root_commit_domain_invalid')
             error.feedback = (
                 label + ' candidate ' + canonical_json(path) + ' must name its exact retained artifact '
                 'and actual Run or Evaluation owner, with nonempty name and purpose. '
@@ -1522,9 +1556,9 @@ def _verify_reusable_candidates(document, entries, assigned):
                    'Do not broaden this resource to its parent, download it again or rerun the research. '
                    if parents else
                    'Check the exact workspace path and its actual producer attribution. For implementation, '
-                   'checkpoint and log candidates, select an existing manifest entry; implementation_paths '
-                   'selects the actual Run snapshot. Choose non-overlapping boundaries, preserve existing '
-                   'results and correct the declaration before finishing another normal root turn. ')
+                   'checkpoint and log candidates, select a verified logical content selection; implementation_paths '
+                   'selects the actual adopted Run snapshot. Preserve existing results and correct '
+                   'the path and producer declaration before finishing another normal root turn. ')
                 + 'The previous manifest and accepted content remain unchanged.'
             )
             raise error
@@ -1542,3 +1576,11 @@ def verify_formal_variant_scope(connection, *, target_ref, variant_refs):
             raise OwnerConflict('target_formal_variant_definition_invalid')
         if row.quest_ref != quest:
             raise OwnerConflict('target_formal_variant_scope_invalid')
+
+
+def resolve_artifact_selection(entries, artifact_path):
+    """Resolve an exact host-signed logical selection without guessing a parent."""
+    matches = [entry for entry in entries if entry['declared_relative_path'] == artifact_path]
+    if len(matches) > 1:
+        raise OwnerConflict('target_formal_artifact_selection_ambiguous')
+    return matches[0] if matches else None

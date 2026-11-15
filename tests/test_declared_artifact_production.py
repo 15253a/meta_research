@@ -282,20 +282,10 @@ def test_target_note_only_directory_cannot_be_an_assessment_report(tmp_path, mon
 
 
 @pytest.mark.parametrize("body", [b"Current Target understanding.\n", b"n" * (70 * 1024)],
-                         ids=["inline-directory", "native-directory"])
-def test_proven_note_only_directory_remains_target_content_without_a_producer(tmp_path, monkeypatch, body):
+                         ids=["small-native-directory", "large-native-directory"])
+def test_proven_note_only_directory_remains_target_content_without_a_producer(tmp_path, body):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        if len(body) > 64 * 1024:
-            import meta_research.target_run_finalizer as finalizer_module
-
-            # Directory streaming uses encoded bundle size, not uncompressed
-            # text size. Exercise the existing too-large packaging boundary.
-            def streamed_directory(_descriptor):
-                raise finalizer_module.TargetImplementationBundleError("target_implementation_bundle_too_large")
-
-            monkeypatch.setattr(finalizer_module, "build_target_implementation_bundle_from_open_directory",
-                                streamed_directory)
         relative = "outputs/analysis"
         source = workspace / relative
         source.mkdir(parents=True)
@@ -318,16 +308,10 @@ def test_proven_note_only_directory_remains_target_content_without_a_producer(tm
         }
         asset_memory = runtime.owners.research_memory
         description = asset_memory.describe_asset_export(directory.binding.version_ref)
-        assert description.kind == ("directory" if len(body) > 64 * 1024 else "file")
-        if description.kind == "directory":
-            assert asset_memory.read_asset_entry_text(
-                directory.binding.version_ref, entry_path="research-note.md"
-            ).encode("utf-8") == body
-        else:
-            with ZipFile(BytesIO(asset_memory.materialize_asset(
-                directory.binding.version_ref
-            ).content)) as retained:
-                assert retained.read("research-note.md") == body
+        assert description.kind == "directory"
+        assert asset_memory.read_asset_entry_text(
+            directory.binding.version_ref, entry_path="research-note.md"
+        ).encode("utf-8") == body
         assert _accept(runtime, lifecycle, memory, handle, evidence)[0] == accepted
         assert memory.query(manifest.manifest_ref) == manifest
     finally:

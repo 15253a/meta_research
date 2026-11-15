@@ -23,6 +23,11 @@ class AssetContentPageReader:
         self._pages = VerifiedContentPages()
 
     def read_page(self, memory_ref: str, *, entry_path=None, offset=0, limit=8192):
+        source = self._receipt_verifier._asset_export_source(memory_ref)
+        return self._read_verified_page(memory_ref, source, entry_path=entry_path, offset=offset, limit=limit)
+
+    def _read_verified_page(self, memory_ref: str, verified_source, *, entry_path=None, offset=0, limit=8192):
+        """Use the same verified RM source when a selection has already resolved it."""
         from meta_research.owners.research_memory import (
             _accepted_asset, _asset_entry_sources, _open_asset_regular_file,
         )
@@ -31,10 +36,10 @@ class AssetContentPageReader:
                 or not 1 <= limit <= 65536):
             raise OwnerConflict("content_page_invalid")
         # No snapshot/byte cache participates in this immutable receipt check.
-        description, row, custodies, manifest = self._receipt_verifier._asset_export_source(memory_ref)
+        description, row, custodies, manifest = verified_source
         binding = _accepted_asset(row, custodies).as_binding().as_dict()
         entries = manifest["entries"]
-        if entry_path is None and len(entries) != 1:
+        if entry_path is None and description.kind == "directory":
             count = min(limit, 100)
             return {"kind": "directory", "version_ref": memory_ref, "asset_binding": binding,
                     "content_hash": description.content_hash, "manifest_hash": description.manifest_hash,
@@ -74,7 +79,7 @@ class AssetContentPageReader:
                     encoding = "base64"
                     body = base64.b64encode(data).decode("ascii")
             next_offset = offset + len(data)
-            return {"source_ref": memory_ref, "version_ref": memory_ref, "asset_binding": binding,
+            return {"kind": "file", "source_ref": memory_ref, "version_ref": memory_ref, "asset_binding": binding,
                     "entry_path": entry["path"],
                     "content_hash": description.content_hash, "entry_hash": entry["sha256"],
                     "encoding": encoding, "text": body, "offset": offset, "offset_unit": "bytes",

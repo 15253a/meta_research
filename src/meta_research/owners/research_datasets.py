@@ -96,20 +96,20 @@ class ResearchDatasetOwnerMixin:
             {"semantic_key": payload["semantic_key"]}, effect_scope=effect_scope)
 
     def register_dataset_version(self, *, dataset_ref, version_label, meaning,
-                                 asset_bindings, metadata=None, notes="", idempotency_key, effect_scope=None):
+                                 asset_bindings=None, selections=None, metadata=None, notes="", idempotency_key, effect_scope=None):
         dataset_text(dataset_ref, "ref")
         if self.query_dataset(dataset_ref) is None:
             raise OwnerConflict("dataset_not_found")
-        if not isinstance(asset_bindings, (list, tuple)) or not 1 <= len(asset_bindings) <= 256:
-            raise OwnerConflict("dataset_asset_bindings_invalid")
-        bindings = [dataset_asset_binding(value) for value in asset_bindings]
-        if len({item.version_ref for item in bindings}) != len(bindings):
+        from meta_research.resource_selections import resource_selections
+        selected, bindings = resource_selections(selections, asset_bindings=asset_bindings)
+        if not selected:
             raise OwnerConflict("dataset_asset_bindings_invalid")
         payload = {
             "dataset_ref": dataset_ref,
             "version_label": dataset_text(version_label, "version_label"),
             "meaning": dataset_text(meaning, "meaning"),
             "asset_bindings": [item.as_dict() for item in sorted(bindings, key=lambda item: item.version_ref)],
+            "selections": [item.as_dict() for item in selected],
             "metadata": dataset_metadata(metadata),
             "notes": dataset_text(notes, "notes", optional=True),
         }
@@ -124,6 +124,9 @@ class ResearchDatasetOwnerMixin:
                 self._verify_dataset_asset(binding, current=False)
                 with self._database.read() as connection:
                     assert_asset_usable(connection, binding.version_ref)
+            from meta_research.resource_selections import verify_resource_selections
+            verify_resource_selections(self._asset_verifier, payload["selections"],
+                                       asset_bindings=payload["asset_bindings"])
         return self._accept_dataset_fact("register_version", payload, idempotency_key,
             {"dataset_ref": dataset_ref, "version_label": payload["version_label"]},
             verify_new=verify_current, effect_scope=effect_scope)
@@ -404,6 +407,9 @@ class ResearchDatasetOwnerMixin:
                 self._feed.record(connection, f"research_graph.dataset_{operation}_accepted", {key: ref, "payload_hash": payload_hash})
                 result = {"schema_ref": schema, key: ref, **payload, "payload_hash": payload_hash,
                           "accepted_at": now, "receipt": _receipt(schema, ref, payload_hash, receipt_ref, now)}
+                if operation == "register_version":
+                    from meta_research.resource_selections import selection_readers
+                    result.update(selection_readers(payload, ref))
             connection.execute(text("INSERT INTO rg_dataset_commands (idempotency_key, operation, request_hash, result_ref, recorded_at) VALUES (:key, :operation, :hash, :ref, :now)"),
                                {"key": idempotency_key, "operation": operation, "hash": payload_hash, "ref": ref, "now": time.time()})
         return result
@@ -428,6 +434,8 @@ class ResearchDatasetOwnerMixin:
             indexed = _INDEXED_FIELDS[operation]
             if any(payload[field] != mapping[field] for field in indexed):
                 raise ValueError
+            if operation == "register_version" and not isinstance(payload["selections"], list):
+                raise ValueError
         except (KeyError, TypeError, ValueError) as error:
             raise OwnerConflict("dataset_receipt_invalid") from error
         if operation == "register_version":
@@ -440,6 +448,9 @@ class ResearchDatasetOwnerMixin:
                 raise OwnerConflict("dataset_asset_reference_invalid")
             for binding in bindings:
                 self._verify_dataset_asset(binding, current=False)
+            from meta_research.resource_selections import verify_resource_selections
+            verify_resource_selections(self._asset_verifier, payload["selections"],
+                                       asset_bindings=payload["asset_bindings"])
         elif operation == "reference":
             if self.query_dataset_version(payload["dataset_version_ref"]) is None or self.query_question_history_by_ref(payload["question_ref"]) is None:
                 raise OwnerConflict("dataset_reference_invalid")
@@ -450,9 +461,13 @@ class ResearchDatasetOwnerMixin:
                            ("source_dataset_version_ref", "derived_dataset_version_ref"))):
                 raise OwnerConflict("dataset_derivation_invalid")
             self._verify_dataset_research_scope(payload["question_ref"], payload["research_ref"])
-        return {"schema_ref": schema, key: mapping[key], **payload, "payload_hash": row.payload_hash,
-                "accepted_at": row.accepted_at,
-                "receipt": _receipt(schema, mapping[key], row.payload_hash, row.receipt_ref, row.accepted_at)}
+        result = {"schema_ref": schema, key: mapping[key], **payload, "payload_hash": row.payload_hash,
+                  "accepted_at": row.accepted_at,
+                  "receipt": _receipt(schema, mapping[key], row.payload_hash, row.receipt_ref, row.accepted_at)}
+        if operation == "register_version":
+            from meta_research.resource_selections import selection_readers
+            result.update(selection_readers(payload, mapping[key]))
+        return result
 
     def query_dataset_asset_references(self, asset_version_ref):
         with self._database.read_snapshot() as connection:

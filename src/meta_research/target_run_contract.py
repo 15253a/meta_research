@@ -254,11 +254,23 @@ def validate_target_work_handle(
         _require_ref(ref, "accepted TargetCommit")
     if accepted_input_asset_refs != tuple(sorted(set(accepted_input_asset_refs))):
         _fail("expected accepted asset refs are not canonical and unique")
-    proof_refs = tuple(proof.asset_ref for proof in handle.accepted_input_asset_proofs)
+    proof_refs = tuple(proof.input_ref for proof in handle.accepted_input_asset_proofs)
     if proof_refs != accepted_input_asset_refs:
         _fail("TargetRun does not freeze the exact accepted asset refs")
     for proof in handle.accepted_input_asset_proofs:
         _require_ref(proof.asset_ref, "accepted input asset")
+        if proof.selection_ref is None:
+            if proof.selection_path is not None or proof.asset_version_ref is not None:
+                _fail("input selection is incomplete")
+        else:
+            _require_ref(proof.selection_ref, "accepted input selection")
+            _require_ref(proof.asset_version_ref, "accepted input asset version")
+            from meta_research.content_selection import selection_path
+            from meta_research.owners.common import OwnerConflict
+            try:
+                selection_path(proof.selection_path)
+            except (TypeError, ValueError, OwnerConflict):
+                _fail("input selection path is invalid")
         _validate_receipt(
             proof.rm_acceptance_receipt,
             proof.asset_ref,
@@ -578,7 +590,7 @@ def validate_target_execution_preflight(
     expected_inputs = tuple(
         sorted(
             handle.accepted_input_target_commit_refs
-            + tuple(proof.asset_ref for proof in handle.accepted_input_asset_proofs)
+            + tuple(proof.input_ref for proof in handle.accepted_input_asset_proofs)
         )
     )
     if scope.accepted_input_refs != expected_inputs:
@@ -661,7 +673,7 @@ def validate_protected_execution_admission(
         target_ref=handle.target_ref,
         accepted_input_target_commit_refs=handle.accepted_input_target_commit_refs,
         accepted_input_asset_refs=tuple(
-            proof.asset_ref for proof in handle.accepted_input_asset_proofs
+            proof.input_ref for proof in handle.accepted_input_asset_proofs
         ),
     )
     validate_target_execution_preflight(
@@ -1118,7 +1130,7 @@ def _validate_target_root_non_scientific_handoff_notice(
         _fail("Target cancellation handoff contains invalid execution history")
     commits = initial_handle.accepted_input_target_commit_refs
     assets = tuple(
-        proof.asset_ref for proof in initial_handle.accepted_input_asset_proofs
+        proof.input_ref for proof in initial_handle.accepted_input_asset_proofs
     )
     required_recovery_evidence: set[str] = set()
     for index, handle in enumerate(handoff.handle_history):
@@ -1223,7 +1235,7 @@ def _validate_target_root_completion_handoff_notice(
         _fail("Target root completion handoff contains invalid execution history")
     commits = initial_handle.accepted_input_target_commit_refs
     assets = tuple(
-        proof.asset_ref for proof in initial_handle.accepted_input_asset_proofs
+        proof.input_ref for proof in initial_handle.accepted_input_asset_proofs
     )
     retired_sessions: set[str] = set()
     retired_attempts: set[str] = set()
@@ -1344,7 +1356,7 @@ def validate_target_run_handoff_notice(
     digest = validate_target_run_handoff(handoff)
     validate_target_work_notice(notice)
     commits = initial_handle.accepted_input_target_commit_refs
-    assets = tuple(proof.asset_ref for proof in initial_handle.accepted_input_asset_proofs)
+    assets = tuple(proof.input_ref for proof in initial_handle.accepted_input_asset_proofs)
     validate_target_work_handle(
         initial_handle,
         target_ref=initial_handle.target_ref,

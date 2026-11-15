@@ -509,7 +509,7 @@ class TargetRunRuntime:
         completion = self._harnesses.query_target_root_completion_evidence(target_ref)
         if completion is not None:
             revision = self._finalize(handle=handle, evidence=completion)
-            if revision is not None:
+            if getattr(revision, "status", None) == "revision_required":
                 return self._resume_after_rejection(
                     handle=handle,
                     harness_request_ref=harness.harness_request_ref,
@@ -522,7 +522,7 @@ class TargetRunRuntime:
                     revision=revision,
                     source_spec_hash=candidate_projection.source_spec_hash,
                 )
-            return True
+            return getattr(revision, "status", None) == "completed"
 
         if self._mcp_base_url is None:
             self._set_status(
@@ -568,7 +568,7 @@ class TargetRunRuntime:
         completion = self._harnesses.query_target_root_completion_evidence(target_ref)
         if completion is not None:
             revision = self._finalize(handle=handle, evidence=completion)
-            if revision is not None:
+            if getattr(revision, "status", None) == "revision_required":
                 return self._resume_after_rejection(
                     handle=handle,
                     harness_request_ref=harness.harness_request_ref,
@@ -581,7 +581,7 @@ class TargetRunRuntime:
                     revision=revision,
                     source_spec_hash=candidate_projection.source_spec_hash,
                 )
-            return True
+            return getattr(revision, "status", None) == "completed"
         self._set_status(target_ref, "root_turn_completed")
         return True
 
@@ -647,7 +647,7 @@ class TargetRunRuntime:
             "finalizing" if status == "rm_accepted" else "completed",
             pending_code,
         )
-        return None
+        return result
 
     def _resume_after_rejection(
         self,
@@ -766,7 +766,7 @@ class TargetRunRuntime:
                 handle.accepted_input_target_commit_refs
             ),
             "accepted_input_asset_refs": [
-                proof.asset_ref for proof in handle.accepted_input_asset_proofs
+                proof.input_ref for proof in handle.accepted_input_asset_proofs
             ],
             "frozen_input_manifest_path": frozen_input_manifest_path,
             "owner_revision_request": revision_request,

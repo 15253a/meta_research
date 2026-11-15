@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from sqlalchemy import text
@@ -963,7 +962,6 @@ class SQLiteTargetRootLifecycleAuthority:
         artifact_snapshot_hash: str | None,
         candidate_rejection_code: str | None = None,
         candidate_rejection_feedback: str | None = None,
-        verify_host_intake_rejection: Callable[[AcceptedTargetRootCompletion], bool] | None = None,
         idempotency_key: str,
     ) -> AcceptedTargetRootCompletion:
         """Freeze one immutable generation before RM/RG ingest."""
@@ -1135,30 +1133,15 @@ class SQLiteTargetRootLifecycleAuthority:
                         generation = int(latest.generation) + 1
                         predecessor_completion_ref = str(latest.completion_ref)
                         predecessor_rejection_ref = str(predecessor.rejection_ref)
-                    # Reusing any earlier snapshot is allowed only when its
-                    # custody was rejected for this host request defect.
-                    # Keep that exception inside the writer fence and verify
-                    # the persisted rejection, including its exact root.
-                    prior_snapshots = connection.execute(text(
-                        "SELECT completion_ref FROM ar_target_root_completions "
-                        "WHERE artifact_snapshot_hash = :snapshot"
-                    ), {"snapshot": artifact_snapshot_hash}).scalars()
-                    for prior_ref in prior_snapshots:
-                        rejected = self.query_completion_rejection(str(prior_ref))
-                        if (rejected is None
-                                or rejected.issuer != "research_memory"
-                                or rejected.manifest_ref is not None
-                                or rejected.target_ref != handle.target_ref
-                                or rejected.target_run_ref != handle.target_run_ref):
-                            raise OwnerConflict("target_root_completion_successor_unchanged")
-                        host_request_failed = rejected.code == "asset_change_required"
-                        if (rejected.code == "target_root_artifact_intake_failed"
-                                and verify_host_intake_rejection is not None):
-                            previous = self.query_completion_by_ref(str(prior_ref))
-                            host_request_failed = (previous is not None
-                                and verify_host_intake_rejection(previous))
-                        if not host_request_failed:
-                            raise OwnerConflict("target_root_completion_successor_unchanged")
+                    # A new generation must change the rejected snapshot.
+                    # Exact same-evidence replay was handled by the idempotency
+                    # branch above and never creates another generation.
+                    prior_snapshot = connection.execute(text(
+                        "SELECT 1 FROM ar_target_root_completions "
+                        "WHERE artifact_snapshot_hash = :snapshot LIMIT 1"
+                    ), {"snapshot": artifact_snapshot_hash}).first()
+                    if prior_snapshot is not None:
+                        raise OwnerConflict("target_root_completion_successor_unchanged")
                     payload = {
                         "generation": generation,
                         "predecessor_completion_ref": predecessor_completion_ref,
@@ -1743,7 +1726,7 @@ class SQLiteTargetRootLifecycleAuthority:
                     old_handle.accepted_input_target_commit_refs
                 ),
                 accepted_input_asset_refs=tuple(
-                    proof.asset_ref
+                    proof.input_ref
                     for proof in old_handle.accepted_input_asset_proofs
                 ),
             )

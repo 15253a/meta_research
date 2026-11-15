@@ -1438,6 +1438,19 @@ class SQLiteResearchMemoryReceiptVerifier:
             raise OwnerConflict("reference_reader_already_bound")
         self._reference_reader = reference_reader
 
+    def describe_selection(self, binding, path=None):
+        from meta_research.content_selection import ContentSelectionReader
+        return ContentSelectionReader(self).describe(binding, path)
+
+    def read_selection_page(self, binding, path=None, *, entry_path=None, offset=0, limit=8192):
+        from meta_research.content_selection import ContentSelectionReader
+        return ContentSelectionReader(self).read_page(
+            binding, path, entry_path=entry_path, offset=offset, limit=limit)
+
+    def export_selection(self, binding, path, destination):
+        from meta_research.content_selection import ContentSelectionReader
+        return ContentSelectionReader(self).export(binding, path, destination)
+
     def _asset_export_source(self, memory_ref: str):
         with self._database.read() as connection:
             row = connection.execute(
@@ -4754,6 +4767,17 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         page = self._asset_content_pages.read_page(
             memory_ref, entry_path=entry_path, offset=offset, limit=limit)
         return {**page, "lifecycle": self.query_asset_status(page['asset_binding']['asset_ref'], memory_ref)}
+
+    def describe_selection(self, binding, path=None):
+        return self._receipt_verifier.describe_selection(binding, path)
+
+    def read_selection_page(self, binding, path=None, *, entry_path=None, offset=0, limit=8192):
+        page = self._receipt_verifier.read_selection_page(
+            binding, path, entry_path=entry_path, offset=offset, limit=limit)
+        return {**page, "lifecycle": self.query_asset_status(binding.asset_ref, binding.version_ref)}
+
+    def export_selection(self, binding, path, destination):
+        return self._receipt_verifier.export_selection(binding, path, destination)
 
     def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
         return self._receipt_verifier.describe_asset_export(memory_ref)

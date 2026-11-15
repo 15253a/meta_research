@@ -58,14 +58,14 @@ def _unassessed_inventory(document):
 def _source_inputs(completion, manifest, target, authority, run, *, source_owner,
                    legacy_input_selection=False):
     proofs = projection_plain_value(completion.handle.accepted_input_asset_proofs)
-    from meta_research.formal_run_bindings import implementation_binding, resolve_local_inputs
-    entries = [entry.as_dict() for entry in manifest.entries]
+    from meta_research.formal_run_bindings import manifest_selection_entries, implementation_binding, resolve_local_inputs, local_input_selections
+    entries = manifest_selection_entries(manifest)
     revision_ref, tree_hash = implementation_binding(entries, run.get('implementation_paths'),
                                                     run.get('implementation_revision_ref'))
     local_inputs = resolve_local_inputs(manifest.result_document.as_dict(), entries, run)
     defaults = list(dict.fromkeys([
         *completion.handle.accepted_input_target_commit_refs,
-        *(proof["asset_ref"] for proof in proofs), manifest.implementation_revision_ref,
+        *(proof["selection_ref"] or proof["asset_ref"] for proof in proofs), manifest.implementation_revision_ref,
         revision_ref,
     ]))
     allowed = set(defaults) | verified_target_input_asset_refs(
@@ -92,6 +92,12 @@ def _source_inputs(completion, manifest, target, authority, run, *, source_owner
         "accepted_input_asset_proofs": proofs,
         "accepted_input_target_commit_refs": list(completion.handle.accepted_input_target_commit_refs),
     }
+    from meta_research.formal_entities import produced_selections
+    inputs['produced_selections'] = produced_selections(entries,
+        [*(run.get('artifact_paths') or []), *(run.get('checkpoint_paths') or [])])
+    selected_local = local_input_selections(manifest.result_document.as_dict(), entries, run)
+    if selected_local:
+        inputs["local_input_selections"] = selected_local
     if not legacy_input_selection:
         inputs["input_selection_recorded"] = "input_refs" in run
     return inputs
@@ -129,13 +135,13 @@ def _verify_original_binding_source(owner, proof, run_ref):
             or proof.inputs.get("manifest_payload_hash") != manifest.payload_hash
             or proof.inputs.get("completion_ref") != manifest.completion_ref):
         raise OwnerConflict("target_unassessed_execution_integrity_invalid")
-    from meta_research.formal_run_bindings import implementation_binding
+    from meta_research.formal_run_bindings import manifest_selection_entries, implementation_binding
     document = manifest.result_document.as_dict()
     selected_run = [run for run in document.get('formal_runs', [{'run_key': 'primary'}])
                     if run.get('run_key') == proof.inputs.get('run_key')]
     if len(selected_run) != 1:
         raise OwnerConflict("target_unassessed_execution_integrity_invalid")
-    revision, tree_hash = implementation_binding([entry.as_dict() for entry in manifest.entries],
+    revision, tree_hash = implementation_binding(manifest_selection_entries(manifest),
         selected_run[0].get('implementation_paths'), selected_run[0].get('implementation_revision_ref'))
     if (proof.inputs.get('implementation_revision_ref') != revision
             or proof.inputs.get('implementation_tree_hash') != tree_hash):
@@ -204,7 +210,8 @@ def _verify_runs(connection, *, completion, manifest, target, authority, runs, s
             raise OwnerConflict("target_unassessed_execution_missing")
 
     _check_source_rows(connection, completion, manifest, target, authority)
-    entries = [entry.as_dict() for entry in manifest.entries if entry.role == "checkpoint"]
+    from meta_research.formal_run_bindings import manifest_selection_entries
+    entries = [entry for entry in manifest_selection_entries(manifest) if entry['role'] == 'checkpoint']
     checkpoint_defaults = _default_checkpoint_paths(
         {run['run_key']: run.get('checkpoint_paths') for run in runs
          if not run.get('variant_run_ref')}, entries, require_explicit=False)

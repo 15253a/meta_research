@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from meta_research.formal_entities import insert_variant_run, insert_evaluation_attempt, insert_metric_result
+from meta_research.target_content_issue import TargetContentIssue
 
 from meta_research.context_presentation import HISTORY_LIMIT, scientific_handoff
 from meta_research.question_relations import QuestionRelationOwnerMixin
@@ -1984,6 +1985,8 @@ class ResearchGraphInterface(ResearchLiteratureOwnerInterface, ResearchEnvironme
     def query_target_frontier(self, graph_ref: str) -> tuple[AcceptedTarget, ...]: ...
 
     def query_target_launch_request(self, target_ref: str) -> TargetLaunchRequest: ...
+
+    def query_bundle_input_asset_proof(self, *, target_ref: str, asset_ref: str) -> AcceptedInputAssetProof | None: ...
 
     def query_target_input_asset_projection(
         self, *, target_ref: str, asset_ref: str
@@ -5628,6 +5631,12 @@ class SQLiteResearchGraphReceiptVerifier:
             raise OwnerConflict("target_launch_asset_proof_verifier_unavailable")
         return reader.query_input_asset_projection(target_ref=target_ref, asset_ref=asset_ref)
 
+    def query_bundle_input_asset_proof(self, *, target_ref: str, asset_ref: str) -> AcceptedInputAssetProof | None:
+        reader = self._target_input_asset_proof_reader
+        if reader is None:
+            raise OwnerConflict("target_launch_asset_proof_verifier_unavailable")
+        return reader.query_bundle_input_asset_proof(target_ref=target_ref, asset_ref=asset_ref)
+
     def query_target_input_asset_aliases(
         self, *, target_ref: str, assets: tuple[AcceptedAssetBinding, ...]
     ) -> tuple[str, ...]:
@@ -5908,7 +5917,7 @@ class SQLiteResearchGraphReceiptVerifier:
             )
             if proof is not None
         )
-        if tuple(proof.asset_ref for proof in asset_proofs) != direct_asset_refs:
+        if tuple(proof.input_ref for proof in asset_proofs) != direct_asset_refs:
             raise OwnerConflict("target_launch_asset_proof_invalid")
         risk_class = target.spec.get("risk_class")
         if risk_class not in {"normal", "high"}:
@@ -6874,7 +6883,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 ), {"ref": authority.stage_request_ref}).scalar_one()
         for field, expected in authoritative_fields.items():
             if field in result_content and result_content[field] != expected:
-                conflict = OwnerConflict("target_root_commit_domain_invalid")
+                conflict = TargetContentIssue("target_root_commit_domain_invalid")
                 conflict.feedback = (
                     f"$.{field} supplied {result_content[field]!r}, but the accepted source "
                     f"for Target {target.target_ref!r} records {expected!r}. Correct or omit "
@@ -6888,7 +6897,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             run, attempt = _declared_work(result_content)[0]
             missing = sorted(required_keys - metric_keys)
             unexpected = sorted(metric_keys - allowed_keys)
-            conflict = OwnerConflict("target_root_commit_domain_invalid")
+            conflict = TargetContentIssue("target_root_commit_domain_invalid")
             conflict.feedback = (
                 f"Run {run['run_key']!r}, Evaluation {attempt['attempt_key']!r} has "
                 f"missing required metric keys {missing!r} and unexpected metric keys "
@@ -6909,7 +6918,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             or candidate.experiment_keys != authority.experiment_keys
             or candidate.measurement_unit_keys
             != (authority.measurement_unit_key,)
-            or (result_document.schema_ref is not None and result_document.schema_ref
+            or policy not in {"required", "optional", "forbidden"}
+        ):
+            raise OwnerConflict("target_root_commit_domain_invalid")
+        if (
+            (result_document.schema_ref is not None and result_document.schema_ref
                 != authority.measurement_contract.result_schema_ref)
             or (not run_only and not required_keys <= metric_keys <= allowed_keys)
             or any(
@@ -6917,20 +6930,21 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 for value in actual_metrics.values()
             )
             or not valid_optional_result_disposition(result_document.result_disposition)
-            or policy not in {"required", "optional", "forbidden"}
         ):
-            raise OwnerConflict("target_root_commit_domain_invalid")
+            raise TargetContentIssue("target_root_commit_domain_invalid")
         _validate_target_result_schema(
             schema=authority.measurement_contract.result_schema.as_dict(),
             result_content=result_document.as_dict(),
         )
         from meta_research.formal_entities import verify_report_only_assessments
+        from meta_research.formal_run_bindings import manifest_selection_entries
+        selected_entries = manifest_selection_entries(manifest)
         try:
-            verify_report_only_assessments(result_document.as_dict(), [entry.as_dict() for entry in manifest.entries])
+            verify_report_only_assessments(result_document.as_dict(), selected_entries)
         except OwnerConflict as error:
             if error.code not in {'target_formal_evaluation_report_required', 'target_formal_artifact_path_not_bound'}:
                 raise
-            correction = OwnerConflict('target_root_commit_domain_invalid')
+            correction = TargetContentIssue('target_root_commit_domain_invalid')
             correction.feedback = (
                 'The executed report-only assessment needs its nonempty assessment report in '
                 'the completion artifacts, explicitly assigned to that evaluation through artifact_paths. '
@@ -6940,7 +6954,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             raise correction from error
         from meta_research.formal_entities import verify_retained_products
-        verify_retained_products(result_document.as_dict(), [entry.as_dict() for entry in manifest.entries])
+        verify_retained_products(result_document.as_dict(), selected_entries)
         return target, authority, projection, candidate_projection
 
     def verify_target_execution_closure(
@@ -7073,7 +7087,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
 
     def _run_implementation_artifacts(self, run):
         """Resolve code from this execution's original frozen source, including reused runs."""
-        from meta_research.formal_run_bindings import implementation_binding
+        from meta_research.formal_run_bindings import implementation_binding, manifest_selection_entries
 
         source = run['inputs']
         manifest_ref = source.get('manifest_ref')
@@ -7093,20 +7107,23 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         if len(selected) != 1 or selected[0].get('variant_run_ref'):
             raise OwnerConflict('target_formal_entity_integrity_invalid')
         paths = selected[0].get('implementation_paths')
+        entries = manifest_selection_entries(manifest)
         revision, tree_hash = implementation_binding(
-            [entry.as_dict() for entry in manifest.entries], paths,
+            entries, paths,
             selected[0].get('implementation_revision_ref'))
         if (source.get('implementation_revision_ref') != revision
                 or source.get('implementation_tree_hash') != tree_hash
                 or run['implementation_revision_ref'] != revision):
             raise OwnerConflict('target_formal_entity_integrity_invalid')
-        return [{**entry.binding.as_dict(), 'role': 'implementation',
-                 'declared_relative_path': entry.declared_relative_path,
-                 'artifact_kind': entry.artifact_kind, 'media_type': entry.media_type,
-                 'byte_count': entry.byte_count, 'tree_hash': entry.tree_hash,
+        return [{**entry['binding'], 'role': 'implementation',
+                 'declared_relative_path': entry['declared_relative_path'],
+                 'artifact_kind': entry['artifact_kind'], 'media_type': entry['media_type'],
+                 'byte_count': entry['byte_count'], 'tree_hash': entry['tree_hash'],
+                 'selection': {'asset_binding': entry['binding'], 'path': entry['path']},
                  'implementation_revision_ref': revision}
-                for entry in manifest.entries if entry.role == 'implementation'
-                and (paths is None or entry.declared_relative_path in paths)]
+                for entry in entries if entry['role'] == 'implementation'
+                and ((paths is None and entry['path'] is None)
+                     or (paths is not None and entry['declared_relative_path'] in paths))]
 
     def _target_resource_candidates(
         self, target_ref: str, *, facts: tuple[dict[str, object], ...]
@@ -7135,7 +7152,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     != transition.canonical_terminal.rm_asset_receipt):
                 raise OwnerConflict("target_input_dependency_manifest_invalid")
             document = manifest.result_document.as_dict()
-            entries = {entry.declared_relative_path: entry for entry in manifest.entries}
+            from meta_research.formal_entities import resolve_artifact_selection, _declared_work
+            from meta_research.formal_run_bindings import manifest_selection_entries
+            from meta_research.dataset_contract import dataset_asset_binding
+            entries = manifest_selection_entries(manifest)
+            declared_work = _declared_work(document)
             subjects = {(kind, fact[key]) for fact in facts
                         for kind, key in (("variant_run", "variant_run_ref"),
                                           ("evaluation_attempt", "evaluation_attempt_ref"))
@@ -7148,9 +7169,31 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 for field in ("dataset_candidates", "environment_candidates"):
                     candidates = []
                     for declaration in document.get(field, []):
-                        entry = entries.get(declaration["artifact_path"])
+                        entry = resolve_artifact_selection(entries, declaration["artifact_path"])
                         if entry is None:
                             raise OwnerConflict("target_formal_entity_integrity_invalid")
+                        binding = dataset_asset_binding(entry["binding"])
+                        path = declaration["artifact_path"]
+                        declared_subjects = {}
+                        for fact in facts:
+                            for declared_run, declared_attempt in declared_work:
+                                if declared_run.get("run_key") != fact.get("run_key"):
+                                    continue
+                                for subject_kind, subject_ref, selected in (
+                                    ("variant_run", fact.get("variant_run_ref"), declared_run),
+                                    ("evaluation_attempt", fact.get("evaluation_attempt_ref"), declared_attempt),
+                                ):
+                                    if selected is None or subject_ref is None:
+                                        continue
+                                    if (subject_kind == "evaluation_attempt"
+                                            and selected.get("attempt_key") != fact.get("attempt_key")):
+                                        continue
+                                    selected_paths = [*(selected.get("artifact_paths") or []),
+                                                      *(selected.get("checkpoint_paths") or [])]
+                                    covering = [selected_path for selected_path in selected_paths
+                                                if path == selected_path or path.startswith(selected_path + "/")]
+                                    if covering:
+                                        declared_subjects[(subject_kind, subject_ref)] = covering
                         rows = connection.execute(text(
                             "SELECT r.*, (SELECT a.from_subject_kind FROM "
                             "rg_experiment_asset_role_adjustments a WHERE a.role_ref=r.role_ref "
@@ -7159,15 +7202,17 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                             "WHERE a.role_ref=r.role_ref ORDER BY a.accepted_at,a.rowid LIMIT 1) "
                             "AS _adjusted_from_ref FROM rg_experiment_asset_roles r "
                             "WHERE r.version_ref=:version ORDER BY r.role,r.ordinal,r.role_ref"),
-                            {"version": entry.binding.version_ref}).all()
+                            {"version": binding.version_ref}).all()
                         producers = []
                         for row in rows:
                             original = (row._adjusted_from_kind or row.subject_kind,
                                         row._adjusted_from_ref or row.subject_ref)
                             if original not in subjects:
                                 continue
+                            if original not in declared_subjects:
+                                continue
                             role = _accepted_experiment_asset_role_tolerant(connection, row)
-                            if role.binding != entry.binding:
+                            if role.binding != binding:
                                 raise OwnerConflict("target_formal_entity_integrity_invalid")
                             adjustments = connection.execute(text(
                                 "SELECT * FROM rg_experiment_asset_role_adjustments "
@@ -7179,9 +7224,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                                 "subject_kind": row.subject_kind, "subject_ref": row.subject_ref,
                                 "receipt": role.receipt.as_public_dict(),
                                 "accepted_subject_kind": original[0], "accepted_subject_ref": original[1],
+                                **({"declared_artifact_paths": declared_subjects[original]}
+                                   if original in declared_subjects else {}),
                                 "attribution_adjustments": [self._artifact_role_adjustment_record(item)
                                                             for item in adjustments]})
-                        if entry.role == "implementation":
+                        if entry["role"] == "implementation":
                             from meta_research.formal_run_bindings import implementation_binding
                             declarations = {run["run_key"]: run for run in document.get("formal_runs", [])
                                             if run.get("run_key")}
@@ -7191,13 +7238,20 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                                 source = run["inputs"]
                                 declared = declarations.get(fact["run_key"], {})
                                 paths = declared.get("implementation_paths")
+                                scope_paths = paths
+                                if scope_paths is None:
+                                    scope_paths = [item['declared_relative_path'] for item in entries
+                                        if item['role'] == 'implementation'
+                                        and item['path'] is None]
                                 if (run["variant_run_ref"] in selected_runs
                                         or declared.get("variant_run_ref")
                                         or source.get("manifest_ref") != manifest.manifest_ref
-                                        or (paths is not None and entry.declared_relative_path not in paths)):
+                                        or not any(path == selected_path
+                                            or path.startswith(selected_path + "/")
+                                            for selected_path in scope_paths)):
                                     continue
                                 revision, tree_hash = implementation_binding(
-                                    [item.as_dict() for item in manifest.entries], paths)
+                                    entries, paths)
                                 if (source.get("implementation_revision_ref") != revision
                                         or source.get("implementation_tree_hash") != tree_hash):
                                     raise OwnerConflict("target_formal_entity_integrity_invalid")
@@ -7208,8 +7262,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                                     "implementation_revision_ref": revision})
                         if not producers:
                             raise OwnerConflict("target_resource_candidate_producer_missing")
-                        candidates.append({**declaration, "asset_binding": entry.binding.as_dict(),
-                                           "producers": producers})
+                        candidates.append({**declaration, "asset_binding": binding.as_dict(),
+                            "selection": {"asset_binding": binding.as_dict(), "path": entry["path"]},
+                            "producers": producers})
                     result[field] = candidates
             return result
 
@@ -15654,6 +15709,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         return self._receipt_verifier.query_target_input_asset_projection(
             target_ref=target_ref, asset_ref=asset_ref)
 
+    def query_bundle_input_asset_proof(self, *, target_ref: str, asset_ref: str) -> AcceptedInputAssetProof | None:
+        return self._receipt_verifier.query_bundle_input_asset_proof(target_ref=target_ref, asset_ref=asset_ref)
+
     def query_target_input_asset_aliases(
         self, *, target_ref: str, assets: tuple[AcceptedAssetBinding, ...]
     ) -> tuple[str, ...]:
@@ -15762,7 +15820,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                         "WHERE target_ref = :target_ref"
                     ), {"target_ref": target.target_ref}).first()
                 if prior is None:
-                    error = OwnerConflict("target_root_commit_domain_invalid")
+                    error = TargetContentIssue("target_root_commit_domain_invalid")
                     error.feedback = (
                         "The frozen result explicitly records that no VariantRun or "
                         "EvaluationAttempt started. The artifacts remain saved in RM, "
@@ -15773,11 +15831,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                         "its own method and evaluation contract."
                     )
                     raise error
-        except OwnerConflict as error:
-            if error.code not in {"target_root_commit_domain_invalid",
-                                   "target_measurement_result_content_invalid",
-                                   "target_formal_work_inventory_invalid"}:
-                raise
+        except TargetContentIssue as error:
             return reject_candidate(error)
         request_hash = _target_root_commit_request_hash(
             completion=completion,
@@ -15887,11 +15941,14 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             manifest=manifest,
             result_document=result_document,
         )
-        latest_context = self._target_root_domain_context(
-            completion=completion,
-            manifest=manifest,
-            result_document=result_document,
-        )
+        try:
+            latest_context = self._target_root_domain_context(
+                completion=completion,
+                manifest=manifest,
+                result_document=result_document,
+            )
+        except TargetContentIssue as error:
+            return reject_candidate(error)
         if (
             latest_completion != completion
             or latest_manifest != manifest
@@ -16089,10 +16146,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                         "receipt_ref": commit_receipt_ref,
                     },
                 )
-        except OwnerConflict as error:
-            if error.code not in {"target_formal_input_reference_invalid",
-                                  "target_formal_metric_definition_invalid"}:
-                raise
+        except TargetContentIssue as error:
             # fenced_write has rolled back every formal and Commit row before
             # this immutable Owner rejection can reopen the same Root.
             return reject_candidate(error)
