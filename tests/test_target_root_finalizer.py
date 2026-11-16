@@ -848,11 +848,9 @@ def test_invalid_result_candidate_is_rejected_before_rm_and_can_be_revised(
         assert rejected.manifest_ref is None
         assert rejected.rejection_issuer == "research_memory"
         assert rejected.pending_code == "target_root_result_document_invalid"
-        assert rejected.rejection_feedback == (
-            "The declared result document is not valid unambiguous UTF-8 JSON for the "
-            "Target result schema. Rewrite outputs/result.json and complete another "
-            "root turn."
-        )
+        assert 'UTF-8 JSON' in rejected.rejection_feedback
+        assert 'line 1 column 2' in rejected.rejection_feedback
+        assert 'Preserve the completed research' in rejected.rejection_feedback
         first_completion = lifecycle.query_completion(handle.target_ref)
         assert first_completion is not None
         assert first_completion.generation == 1
@@ -946,7 +944,7 @@ def test_oversized_result_document_is_a_recoverable_rm_rejection(
         runtime.close()
 
 
-def test_result_document_rejects_more_metrics_than_the_formal_protocol_can_name(
+def test_rm_result_document_has_no_128_metric_count_limit(
     tmp_path: Path,
 ) -> None:
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
@@ -967,19 +965,16 @@ def test_result_document_rejects_more_metrics_than_the_formal_protocol_can_name(
         evidence_reader=_EvidenceReader(evidence),
     )
     try:
-        rejected = finalizer.finalize(handle=handle, evidence=evidence)
-
-        assert rejected.status == "revision_required"
-        assert rejected.pending_code == "target_root_result_metrics_invalid"
-        assert rejected.rejection_issuer == "research_memory"
-        assert rejected.manifest_ref is None
-        assert lifecycle.query(handle.target_ref).status == "running"  # type: ignore[union-attr]
-        assert memory.query_for_completion(rejected.completion_ref) is None
+        accepted = finalizer.finalize(handle=handle, evidence=evidence)
+        assert accepted.status == "rm_accepted"
+        manifest = memory.query(accepted.manifest_ref)
+        assert manifest.result_document.metrics == result_document['metrics']
+        assert len(manifest.result_document.metrics) == 129
     finally:
         runtime.close()
 
 
-def test_result_document_maps_unbounded_integer_to_typed_metric_rejection(
+def test_result_document_preserves_large_scientific_integer_at_rm(
     tmp_path: Path,
 ) -> None:
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
@@ -1000,19 +995,16 @@ def test_result_document_maps_unbounded_integer_to_typed_metric_rejection(
         evidence_reader=_EvidenceReader(evidence),
     )
     try:
-        rejected = finalizer.finalize(handle=handle, evidence=evidence)
-
-        assert rejected.status == "revision_required"
-        assert rejected.pending_code == "target_root_result_metrics_invalid"
-        assert rejected.rejection_issuer == "research_memory"
-        assert rejected.manifest_ref is None
-        assert lifecycle.query(handle.target_ref).status == "running"  # type: ignore[union-attr]
-        assert memory.query_for_completion(rejected.completion_ref) is None
+        accepted = finalizer.finalize(handle=handle, evidence=evidence)
+        assert accepted.status == "rm_accepted"
+        manifest = memory.query(accepted.manifest_ref)
+        assert manifest.result_document.metrics == {"metric:unbounded": 10**309}
+        assert type(manifest.result_document.metrics["metric:unbounded"]) is int
     finally:
         runtime.close()
 
 
-def test_result_document_rejects_finite_integer_beyond_bundle_canonical_range(
+def test_result_document_preserves_scientific_integer_beyond_control_range(
     tmp_path: Path,
 ) -> None:
     runtime, lifecycle, memory, authority, handle, workspace, evidence = (
@@ -1033,14 +1025,11 @@ def test_result_document_rejects_finite_integer_beyond_bundle_canonical_range(
         evidence_reader=_EvidenceReader(evidence),
     )
     try:
-        rejected = finalizer.finalize(handle=handle, evidence=evidence)
-
-        assert rejected.status == "revision_required"
-        assert rejected.pending_code == "target_root_result_metrics_invalid"
-        assert rejected.rejection_issuer == "research_memory"
-        assert rejected.manifest_ref is None
-        assert lifecycle.query(handle.target_ref).status == "running"  # type: ignore[union-attr]
-        assert memory.query_for_completion(rejected.completion_ref) is None
+        accepted = finalizer.finalize(handle=handle, evidence=evidence)
+        assert accepted.status == "rm_accepted"
+        manifest = memory.query(accepted.manifest_ref)
+        assert manifest.result_document.metrics == {"metric:out-of-range": 2**63}
+        assert type(manifest.result_document.metrics["metric:out-of-range"]) is int
     finally:
         runtime.close()
 
@@ -1099,7 +1088,7 @@ def test_result_document_maps_deep_json_to_recoverable_typed_rejection(
         rejected = finalizer.finalize(handle=handle, evidence=evidence)
 
         assert rejected.status == "revision_required"
-        assert rejected.pending_code == "target_root_result_document_invalid"
+        assert rejected.pending_code == "target_root_result_document_too_large"
         assert rejected.rejection_issuer == "research_memory"
         assert rejected.manifest_ref is None
         assert lifecycle.query(handle.target_ref).status == "running"  # type: ignore[union-attr]

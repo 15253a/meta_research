@@ -105,11 +105,12 @@ def test_environment_candidate_requires_its_meaning(candidate):
     assert "environment_candidates" in failure.value.feedback
 
 
-@pytest.mark.parametrize("candidates", [None, {}, [_candidate("implementation")] * 101])
-def test_environment_candidate_inventory_is_bounded(candidates):
+@pytest.mark.parametrize("candidates", [None, {}])
+def test_environment_candidate_inventory_requires_a_list(candidates):
     with pytest.raises(OwnerConflict) as failure:
         verify_retained_products({"metrics": {"observed": 1}, "environment_candidates": candidates}, [])
-    assert "at most 100" in failure.value.feedback
+    assert "$.environment_candidates" in failure.value.feedback
+    assert "must be a list" in failure.value.feedback
 
 
 @pytest.mark.parametrize("path", ["/implementation", "implementation/../other", "implementation\\simulator"])

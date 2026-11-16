@@ -117,7 +117,7 @@ def _document(value):
     return {"schema_ref": "test/result/v1", "metrics": {"observation": value}, "result_disposition": "positive"}
 
 
-@pytest.mark.parametrize("value", [None, True, False, 0, -(2**63 - 1), 2**63 - 1, 1.5, "观" * 1365,
+@pytest.mark.parametrize("value", [None, True, False, 0, -(2**63), 2**64 - 1, 2**100, 1.5, "观" * 1667,
     [], {}, [None, False, {"evidence": [0, "observed"]}], {"rows": list(range(2048))}])
 def test_json_measurements_preserve_scalar_boundaries_and_support_large_arrays(value):
     document = _document(value)
@@ -125,25 +125,22 @@ def test_json_measurements_preserve_scalar_boundaries_and_support_large_arrays(v
     assert _decode_result_document_bytes(json.dumps(document, ensure_ascii=False).encode()).as_dict() == document
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), -(2**63), 2**63, "x" * 4097,
-    "\ud800", (1, 2), {1: "non-string-key"}, {"nested": [float("nan")]}, {"nested": [2**63]},
-    {"nested": ["\ud800"]}, {"nested": ["观" * 1366]}])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"),
+    "\ud800", (1, 2), {1: "non-string-key"}, {"nested": [float("nan")]},
+    {"nested": ["\ud800"]}])
 def test_non_json_or_unbounded_metric_leaves_remain_rejected(value):
     assert not valid_target_metric_value(value)
     with pytest.raises(OwnerConflict, match="metrics_invalid"):
         _decode_result_document_value(_document(value))
 
 
-def test_deep_recursive_or_expanding_metric_trees_are_rejected():
+def test_deep_or_recursive_metric_trees_are_rejected():
     deep = 0
     for _ in range(65):
         deep = [deep]
     cyclic = []
     cyclic.append(cyclic)
-    expanding = 0
-    for _ in range(40):
-        expanding = [expanding, expanding]
-    for invalid in (deep, cyclic, expanding):
+    for invalid in (deep, cyclic):
         assert not valid_target_metric_value(invalid)
 
 

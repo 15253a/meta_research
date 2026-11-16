@@ -7,6 +7,16 @@ const records = (value: unknown) => Array.isArray(value) ? value.map(record) : [
 const ref = (value: unknown): string | null => typeof value === "string" && value.length > 0 ? value : null;
 const refs = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 
+// Snapshot JSON has already passed through JavaScript Number. Technical details
+// expose identities and content references; scientific values belong in the
+// exact original reader, where the source text is preserved.
+function sourceIdentity(value: unknown): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(record(value)).filter(([key, item]) =>
+    typeof item === "string" && (/(?:_ref|_hash|_sha256|_status)$/.test(key)
+      || ["status", "role", "kind", "artifact_kind", "path", "relative_path", "declared_relative_path", "summary", "note"].includes(key))
+    || key.endsWith("_refs") && Array.isArray(item) && item.every(entry => typeof entry === "string")));
+}
+
 type ExecutionScope = { quest_ref: string; cycle_ref: string; question_ref: string; stage: string; status: string };
 export function exactTargetExecution(target: BundleTargetProjection) {
   const execution = target.current_execution;
@@ -56,8 +66,8 @@ export function targetResearchFacts(target: BundleTargetProjection, candidate?: 
   const measurement = record(closure.root_measurement);
   const inventory = records(measurement.formal_entities);
   const manifest = record(closure.target_root_manifest);
-  const notes = records(closure.research_notes);
-  const inputs = record(measurement.variant_input_binding);
+  const notes = records(closure.research_notes).map(sourceIdentity);
+  const inputs = sourceIdentity(measurement.variant_input_binding);
   const runRefs = [...new Set(inventory.length ? inventory.map(item => ref(item.variant_run_ref)).filter((item): item is string => Boolean(item)) : refs([measurement.variant_run_ref]))];
   const attemptRefs = [...new Set(inventory.length ? inventory.map(item => ref(item.evaluation_attempt_ref)).filter((item): item is string => Boolean(item)) : refs([measurement.evaluation_attempt_ref]))];
   const failedAttempts = new Set(inventory.filter(item => item.evaluation_status === "failed").map(item => item.evaluation_attempt_ref)).size
@@ -92,7 +102,7 @@ export function targetResearchFacts(target: BundleTargetProjection, candidate?: 
   const result = commit ? disposition ? dispositions[disposition] ?? disposition : null : "研究结果尚未接纳";
   const acceptance = result ? `研究记录已接纳 · ${result}` : "研究记录已接纳";
   const summary = runtimePaused ? "研究已暂停，保留 Target 记录" : retrySummary || (runtimeFailure ? "Target 推进受阻" : openRequests.length ? "有待人类答复的求助" : technicalFailure ? "技术执行受阻" : coordination ? "等待研究调整" : commit ? acceptance : (execution?.status === "running" && executionConfirmed !== false || target.current_execution === undefined && executionConfirmed === true) ? "Target 正在开展工作" : execution?.status === "stopped" ? "Target 执行已停止，研究结果尚未接纳" : execution?.status === "completed" ? "Target 执行已结束，研究结果尚未接纳" : target.status === "running" ? "Target 执行状态待确认" : "等待研究工作接续");
-  const resultAsset = record(measurement.result_asset);
+  const resultAsset = sourceIdentity(measurement.result_asset);
   const artifactRefs = [...new Set([...refs(measurement.checkpoint_refs), ...records(manifest.entries).map(item => ref(record(item.binding).version_ref)).filter((item): item is string => Boolean(item)), ...refs([resultAsset.version_ref])])];
   const readableAssets = [...new Map([
     ...(ref(resultAsset.version_ref) ? [{ versionRef: String(resultAsset.version_ref), label: "读取结果原文" }] : []),
@@ -111,8 +121,9 @@ export function targetResearchFacts(target: BundleTargetProjection, candidate?: 
       { label: "求助", text: openRequests.length ? `${openRequests.length} 项待人类答复 · 独立工作可继续` : answered.length ? `${answered.length} 项已有人类回复 · 见协作记录` : "当前未显示关联的待答复请求" },
     ],
     sources: { target_ref: target.target_ref, target_run_ref: target.target_run_ref, target_spec_hash: target.spec_hash, dependency_refs: target.dependency_refs,
-      input_bindings: inputs, root_measurement: measurement, variant_run_refs: runRefs, evaluation_attempt_refs: attemptRefs, result_asset: resultAsset, artifact_refs: artifactRefs,
-      manifest, research_notes: notes, commit_ref: commit?.commit_ref, closure_hash: commit?.closure_hash,
-      human_requests: related.map(request => ({ request_ref: request.request_ref, status: request.status, obligation: request.obligation, responses: request.responses })) },
+      input_bindings: inputs, root_measurement: { ...sourceIdentity(measurement), formal_entities: inventory.map(sourceIdentity) }, variant_run_refs: runRefs, evaluation_attempt_refs: attemptRefs, result_asset: resultAsset, artifact_refs: artifactRefs,
+      manifest: { ...sourceIdentity(manifest), entries: records(manifest.entries).map(entry => ({ ...sourceIdentity(entry), binding: sourceIdentity(entry.binding) })) },
+      research_notes: notes, commit_ref: commit?.commit_ref, closure_hash: commit?.closure_hash,
+      human_requests: related.map(request => ({ request_ref: request.request_ref, status: request.status, obligation: request.obligation, responses: records(request.responses).map(sourceIdentity) })) },
   };
 }

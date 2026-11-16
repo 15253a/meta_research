@@ -101,7 +101,7 @@ def explicit_unexecuted_root_evidence(result_document):
 
 
 def _checkpoint_paths(value):
-    if value is not None and (not isinstance(value, list) or len(value) > 100
+    if value is not None and (not isinstance(value, list)
             or any(not isinstance(path, str) or not path or path != path.strip() for path in value)
             or len(set(value)) != len(value)):
         raise OwnerConflict('target_formal_checkpoint_paths_invalid')
@@ -119,7 +119,7 @@ def _artifact_paths(value):
     except (OwnerConflict, TargetImplementationBundleError) as cause:
         error = TargetContentIssue('target_root_commit_domain_invalid')
         error.feedback = (
-            'Run and Evaluation artifact_paths must be a list of at most 100 distinct canonical '
+            'Run and Evaluation artifact_paths must be a list of distinct canonical '
             'relative workspace paths, without traversal, absolute prefixes or unsupported characters. '
             'Use the exact existing log, analysis or data files or directories produced by that work. '
             'Correct the declaration, preserve all files and finish another normal root turn.'
@@ -128,7 +128,7 @@ def _artifact_paths(value):
     return value
 
 
-def explicit_run_only(document):
+def explicit_run_only(document, *, work=None):
     """Classify explicit actual work with no completed assessment yet.
 
     Failed attempts are real attempts but supply no MetricResult. Full item,
@@ -137,84 +137,133 @@ def explicit_run_only(document):
     if 'formal_runs' not in document or explicit_unexecuted_root_evidence(document) is not None:
         return False
     try:
-        work = _declared_work(document)
+        work = _declared_work(document) if work is None else work
     except OwnerConflict:
         return False
     return all(attempt is None or attempt.get('status') == 'failed' for _, attempt in work)
 
 
-def _work_inventory_conflict(path, requirement):
-    error = TargetContentIssue('target_formal_work_inventory_invalid')
-    error.feedback = (path + ' ' + requirement + '. Correct that formal work declaration '
-        'and finish another normal turn in the same Root. Preserve the existing research, '
-        'trained checkpoints, metrics and retained artifacts; a declaration correction '
-        'does not require repeating the research. The rejected completion remains unchanged.')
-    return error
+def _declaration_value_summary(value):
+    if isinstance(value, (list, dict)):
+        return type(value).__name__ + ' with ' + str(len(value)) + ' entries'
+    rendered = repr(value)
+    return type(value).__name__ + ' ' + (rendered[:120] + '...' if len(rendered) > 120 else rendered)
 
 
 def _declared_work(result_document):
     declared = result_document.get('formal_runs')
     if declared is None:
         declared = [{'run_key': 'primary', 'evaluations': [
-            {'attempt_key': 'primary', 'metrics': result_document['metrics']}]}]
-    if not isinstance(declared, list) or not declared or len(declared) > 100:
-        raise _work_inventory_conflict('$.formal_runs', 'must be a nonempty list of at most 100 actual Runs')
+            {'attempt_key': 'primary', 'metrics': result_document.get('metrics')}]}]
+    problems = []
+    problem_code = 'target_formal_work_inventory_invalid'
+
+    def problem(path, value, requirement):
+        problems.append(path + ': received ' + _declaration_value_summary(value) + '; ' + requirement + '.')
+
+    def paths(value, path, validator):
+        nonlocal problem_code
+        try:
+            validator(value)
+        except OwnerConflict as error:
+            if not problems:
+                problem_code = error.code
+            problem(path, value, getattr(error, 'feedback', 'must be a list of distinct valid workspace paths'))
+
+    def reject_problems():
+        if not problems:
+            return
+        # The existing root feedback channel admits at most 4096 characters.
+        selected, used = [], 0
+        for message in problems:
+            if used + len(message) + 1 > 3000:
+                break
+            selected.append(message)
+            used += len(message) + 1
+        omitted = len(problems) - len(selected)
+        error = TargetContentIssue(problem_code)
+        error.feedback = ('\n'.join(selected)
+            + (f'\n{omitted} additional declaration errors omitted from this bounded feedback.' if omitted else '')
+            + '\nCorrect the declaration and finish another normal turn in the same Root. '
+            'For lists over the limit of 100, merge overly fine Run or Evaluation declarations only '
+            'according to the actual research. Preserve complete research results, original evidence '
+            'and sources; do not invent Runs, discard evidence or arbitrarily average results. '
+            'The whole declaration is rejected without truncation or partial acceptance. '
+            'Keep existing artifacts and checkpoints; this correction does not require repeating the research.')
+        raise error
+
+    if not isinstance(declared, list) or not declared:
+        problem('$.formal_runs', declared, 'must be a nonempty list of actual Runs; limit 100')
+        reject_problems()
+    if len(declared) > 100:
+        problem('$.formal_runs', declared, f'actual count {len(declared)} exceeds the limit 100')
+        # Report independent per-Run errors too; never accept a prefix of this declaration.
     measured, failed, unassessed, keys = [], [], [], set()
     for run_ordinal, run in enumerate(declared):
         run_path = '$.formal_runs[' + str(run_ordinal) + ']'
         if not isinstance(run, dict):
-            raise _work_inventory_conflict(run_path, 'must be an object describing this actual Run')
+            problem(run_path, run, 'must be an object describing this actual Run')
+            continue
         state = run.get('status', 'executed')
         if not isinstance(state, str) or state not in {'executed', 'failed', 'blocked', 'cancelled', 'not_executed'}:
-            raise _work_inventory_conflict(run_path + '.status',
+            problem(run_path + '.status', state,
                 'must be executed, failed, blocked, cancelled or not_executed according to the actual work')
+            continue
         if state in {'blocked', 'cancelled', 'not_executed'}:
             continue
         key = run.get('run_key')
         if not isinstance(key, str) or not key or len(key) > 128 or key in keys:
-            raise _work_inventory_conflict(run_path + '.run_key',
+            problem(run_path + '.run_key', key,
                 'must be a nonempty string of at most 128 characters, unique among the actual Runs')
-        keys.add(key)
+        else:
+            keys.add(key)
         implementation_revision_ref = run.get('implementation_revision_ref')
         if implementation_revision_ref is not None and (
                 not isinstance(implementation_revision_ref, str)
                 or not implementation_revision_ref or len(implementation_revision_ref) > 1024):
-            raise _work_inventory_conflict(run_path + '.implementation_revision_ref',
+            problem(run_path + '.implementation_revision_ref', implementation_revision_ref,
                 'must be omitted or a nonempty exact revision string of at most 1024 characters')
-        _checkpoint_paths(run.get('checkpoint_paths'))
-        _artifact_paths(run.get('artifact_paths'))
+        paths(run.get('checkpoint_paths'), run_path + '.checkpoint_paths', _checkpoint_paths)
+        paths(run.get('artifact_paths'), run_path + '.artifact_paths', _artifact_paths)
         evaluations = run.get('evaluations', [])
-        if not isinstance(evaluations, list) or len(evaluations) > 100:
-            raise _work_inventory_conflict(
-                run_path + '.evaluations',
-                'must be a list of at most 100 actual evaluations; use [] for a Run not yet assessed')
+        if not isinstance(evaluations, list):
+            problem(run_path + '.evaluations', evaluations,
+                'must be a list of actual evaluations; limit 100; use [] for a Run not yet assessed')
+            continue
+        if len(evaluations) > 100:
+            problem(run_path + '.evaluations', evaluations,
+                f'actual count {len(evaluations)} exceeds the per-Run limit 100')
         attempt_keys = set()
         for attempt_ordinal, attempt in enumerate(evaluations):
             attempt_path = run_path + '.evaluations[' + str(attempt_ordinal) + ']'
             if not isinstance(attempt, dict):
-                raise _work_inventory_conflict(attempt_path, 'must be an object describing this actual evaluation')
+                problem(attempt_path, attempt, 'must be an object describing this actual evaluation')
+                continue
             status = attempt.get('status', 'executed')
             if not isinstance(status, str) or status not in {'executed', 'failed', 'blocked', 'cancelled', 'not_executed'}:
-                raise _work_inventory_conflict(attempt_path + '.status',
+                problem(attempt_path + '.status', status,
                     'must be executed, failed, blocked, cancelled or not_executed according to the actual assessment')
+                continue
             if status in {'blocked', 'cancelled', 'not_executed'}:
                 continue
             key, metrics = attempt.get('attempt_key'), attempt.get('metrics')
             if not isinstance(key, str) or not key or len(key) > 128 or key in attempt_keys:
-                raise _work_inventory_conflict(attempt_path + '.attempt_key',
+                problem(attempt_path + '.attempt_key', key,
                     'must be a nonempty string of at most 128 characters, unique within this Run')
+            else:
+                attempt_keys.add(key)
             if ((status == 'executed' and not isinstance(metrics, dict))
                     or (status == 'failed' and metrics is not None and not isinstance(metrics, dict))):
-                raise _work_inventory_conflict(attempt_path + '.metrics',
+                problem(attempt_path + '.metrics', metrics,
                     'must be an object for an executed assessment; a failed assessment may omit it')
             if status == 'failed' and (attempt.get('evaluation_attempt_ref') or attempt.get('metric_result_ref')):
                 raise OwnerConflict('target_formal_reused_evaluation_invalid')
-            attempt_keys.add(key)
-            _checkpoint_paths(attempt.get('checkpoint_paths'))
-            _artifact_paths(attempt.get('artifact_paths'))
+            paths(attempt.get('checkpoint_paths'), attempt_path + '.checkpoint_paths', _checkpoint_paths)
+            paths(attempt.get('artifact_paths'), attempt_path + '.artifact_paths', _artifact_paths)
             (measured if status == 'executed' else failed).append((run, attempt))
         if not attempt_keys:
             unassessed.append((run, None))
+    reject_problems()
     if not measured and not failed and not unassessed:
         raise OwnerConflict('target_formal_work_has_no_executed_result')
     return [*measured, *failed, *unassessed]
@@ -443,22 +492,22 @@ def primary_reused_run(result_document):
     return primary_reused_references(result_document).get('variant_run_ref')
 
 
-def primary_work_metrics(document):
+def primary_work_metrics(document, *, work=None):
     """The selected actual assessment owns metrics; summaries need not repeat them."""
     if 'formal_runs' not in document:
         return document.get('metrics', {})
-    _, attempt = _declared_work(document)[0]
+    _, attempt = (_declared_work(document) if work is None else work)[0]
     return attempt['metrics'] if attempt is not None and attempt.get('status', 'executed') == 'executed' else {}
 
 
-def primary_evaluation_status(document):
-    _, attempt = _declared_work(document)[0]
+def primary_evaluation_status(document, *, work=None):
+    _, attempt = (_declared_work(document) if work is None else work)[0]
     return 'pending' if attempt is None else ('failed' if attempt.get('status') == 'failed' else 'completed')
 
 
-def verify_report_only_assessments(document, entries):
+def verify_report_only_assessments(document, entries, *, work=None):
     """Check report attribution before Owner acceptance can issue correction feedback."""
-    work = _declared_work(document)
+    work = _declared_work(document) if work is None else work
     _verify_declared_subject_artifact_bindings(work, entries)
     new_attempts = [attempt for _, attempt in work
                     if attempt is not None and not attempt.get('evaluation_attempt_ref')]
@@ -501,10 +550,10 @@ def _is_target_note(entry):
             and metadata.get('note_only') is True)
 
 
-def primary_reused_references(result_document):
+def primary_reused_references(result_document, *, work=None):
     if 'formal_runs' not in result_document:
         return {}
-    run, attempt = _declared_work(result_document)[0]
+    run, attempt = (_declared_work(result_document) if work is None else work)[0]
     return {'variant_run_ref': run.get('variant_run_ref'),
             'evaluation_attempt_ref': attempt.get('evaluation_attempt_ref') if attempt is not None else None,
             'metric_result_ref': attempt.get('metric_result_ref') if attempt is not None else None}
@@ -1458,11 +1507,11 @@ def _verify_new_checkpoint_selections(items, entries, *, require_explicit=False)
             select(selected, item.get('evaluation_checkpoint_paths'), 'Evaluation', item['run_key'])
 
 
-def verify_retained_products(document, entries):
+def verify_retained_products(document, entries, *, work=None):
     """Every new retained scientific product has an explicitly declared producer."""
     if explicit_unexecuted_root_evidence(document) is not None:
         return
-    work = _declared_work(document)
+    work = _declared_work(document) if work is None else work
     primary = work[0][0]
     items = _root_work_items_from_declared(work=work,
         payload={'measurement_ref': 'inventory', 'variant_run_ref': primary.get('variant_run_ref', 'primary'),
@@ -1515,17 +1564,19 @@ def _verify_reusable_candidates(document, entries, assigned):
         ('environment_candidates', 'Environment', {'data', 'analysis', 'implementation', 'checkpoint', 'log'}),
     ):
         candidates = document.get(field, [])
-        if not isinstance(candidates, list) or len(candidates) > 100:
+        if not isinstance(candidates, list):
             error = TargetContentIssue('target_root_commit_domain_invalid')
-            error.feedback = (field + ' must be a list of at most 100 declarations, each with '
+            error.feedback = ('$.' + field + ' received ' + _declaration_value_summary(candidates)
+                + '; must be a list of declarations, each with '
                 'nonempty artifact_path, name and purpose. Preserve the retained research products, '
                 'correct this declaration in the result document and finish another normal root turn.')
             raise error
-        for candidate in candidates:
+        for ordinal, candidate in enumerate(candidates):
             if (not isinstance(candidate, dict) or any(not isinstance(candidate.get(key), str)
                     or not candidate[key].strip() for key in ('artifact_path', 'name', 'purpose'))):
                 error = TargetContentIssue('target_root_commit_domain_invalid')
-                error.feedback = ('Each ' + field + ' entry needs nonempty artifact_path, name and '
+                error.feedback = ('$.' + field + '[' + str(ordinal) + '] received '
+                    + _declaration_value_summary(candidate) + '; each entry needs nonempty artifact_path, name and '
                     'purpose. Preserve the retained research products, correct the incomplete declaration '
                     'and finish another normal root turn.')
                 raise error

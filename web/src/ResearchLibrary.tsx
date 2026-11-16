@@ -299,6 +299,6 @@ function ReadableOriginal({ body, language, onTreatments }: { body: string; lang
     </section> : null}
     {visible.map(([key, zh, en]) => <section key={key}><h5>{language === "zh" ? zh : en}</h5><pre className="library-prose">{String(record[key])}</pre></section>)}
     {!visible.length && !isGuidance ? <p>{language === "zh" ? "此来源保留了结构化研究记录，展开完整原文查看。" : "This source preserves a structured research record. Expand the complete original to inspect it."}</p> : null}
-    <details><summary>{language === "zh" ? "完整原文与技术字段" : "Complete original and technical fields"}</summary><pre>{JSON.stringify(record, null, 2)}</pre></details>
+    <details><summary>{language === "zh" ? "完整原文与技术字段" : "Complete original and technical fields"}</summary><pre>{body}</pre></details>
   </div>;
 }

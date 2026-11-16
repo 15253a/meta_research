@@ -2744,6 +2744,7 @@ function TargetResearchFactsView({ facts, label }: { facts: ReturnType<typeof ta
     </dl>
     {facts.readableAssets.length ? <nav className="target-research-asset-links" aria-label="精确资产读取入口"><PageWindow items={facts.readableAssets} size={3} label="产物引用分页" render={asset => <a key={asset.versionRef} href={`/api/v1/research-assets/${encodeURIComponent(asset.versionRef)}/content`} title={asset.versionRef}>{asset.label}</a>} /></nav> : null}
     <BoundedDetails className="lumen-bundle-target-technical" summary="查看精确输入、产物与交接来源">{() => <>
+      <p>此处展示身份、状态与内容引用。完整研究数值请通过上方原文入口读取。</p>
       <pre>{JSON.stringify({ ...facts.sources, research_notes: undefined }, null, 2)}</pre>
       {facts.notes.length ? <PageWindow items={facts.notes} size={4} label="交接说明分页" render={(note, index) => <pre key={index}>{JSON.stringify(note, null, 2)}</pre>} /> : null}
     </>}</BoundedDetails>

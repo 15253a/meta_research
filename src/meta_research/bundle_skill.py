@@ -2401,14 +2401,12 @@ def _protocol_version_candidate_schema() -> dict[str, object]:
             "required_metrics": {
                 "type": "array",
                 "minItems": 0,
-                "maxItems": 64,
                 "uniqueItems": True,
                 "items": _metric_definition_schema(),
             },
             "optional_metrics": {
                 "type": "array",
                 "minItems": 0,
-                "maxItems": 64,
                 "uniqueItems": True,
                 "items": _metric_definition_schema(),
             },

@@ -25,12 +25,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.bundle_protocol import (
-    BUNDLE_CANONICAL_INTEGER_MAX_ABS,
     TargetWorkHandle,
     projection_plain_value,
 )
 from meta_research.target_execution_contract import (
-    TargetMetricValue, valid_target_metric_value, validate_target_result_tree,
+    TargetMetricValue, validate_target_result_tree,
 )
 from meta_research.database import Database
 from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
@@ -80,7 +79,6 @@ from meta_research.target_run_runtime_contract import (
 TARGET_ROOT_RESULT_DOCUMENT_FIELDS = frozenset(
     {"schema_ref", "metrics", "result_disposition"}
 )
-TARGET_ROOT_REQUIRED_RESULT_DOCUMENT_FIELDS = frozenset({"metrics"})
 RM_TARGET_ROOT_COMPLETION_MANIFEST_RECEIPT_KIND = (
     "target_root_completion_manifest_accepted"
 )
@@ -88,9 +86,6 @@ TARGET_ROOT_RG_PENDING_CODE = "target_root_graph_acceptance_unavailable"
 # Small files use bounded inline custody; directories use native streamed capture.
 TARGET_ROOT_INLINE_ARTIFACT_BYTES = 64 * 1024
 TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES = 256 * 1024
-# The formal protocol admits at most 64 required plus 64 optional metric
-# definitions, and requires those two key sets to be disjoint.
-TARGET_ROOT_MAX_RESULT_METRICS = 2 * 64
 
 _SYSTEM_TARGET_COMPLETION_REQUIRED_ARTIFACTS = (
     ("implementation", "implementation"),
@@ -109,7 +104,7 @@ class DeclaredCandidateIssue(OwnerConflict):
 
     def __init__(self, code, field='$', value=None, detail=None):
         super().__init__(code)
-        self.feedback = (f"{field}={repr(value)[:1024]}: {detail or code}. "
+        self.feedback = (f"{field} ({type(value).__name__})={repr(value)[:512]}: {detail or code}. "
                          "Preserve the completed research; correct this declaration and finish "
                          "another normal turn in the same root.")[:4096]
 
@@ -117,6 +112,7 @@ class DeclaredCandidateIssue(OwnerConflict):
 @dataclass(frozen=True, slots=True)
 class DeclaredCandidate:
     handoff: TargetCompletionHandoff
+    capture_plan: _ResultCapturePlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +123,7 @@ class InvalidDeclaredCandidate:
 @dataclass(frozen=True, slots=True)
 class TargetRootResultDocument:
     schema_ref: str | None
-    metrics: dict[str, TargetMetricValue]
+    metrics: dict[str, TargetMetricValue] | None
     result_disposition: str | None
     content_hash: str
     domain_fields: dict[str, object] = field(default_factory=dict)
@@ -136,10 +132,21 @@ class TargetRootResultDocument:
         return {
             **({"schema_ref": self.schema_ref} if self.schema_ref is not None else {}),
             **self.domain_fields,
-            "metrics": self.metrics,
+            **({"metrics": self.metrics} if self.metrics is not None else {}),
             **({"result_disposition": self.result_disposition}
                if self.result_disposition is not None else {}),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ResultCapturePlan:
+    """Invocation-local plan, bound to the one safely read immutable result."""
+
+    handoff: TargetCompletionHandoff
+    result: TargetRootResultDocument
+    raw: bytes
+    raw_hash: str
+    physical: tuple[TargetCompletionArtifact, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,7 +505,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                 or type(result_artifacts[0].content) is not bytes):
             raise OwnerConflict("target_root_result_document_invalid")
         result_artifact = result_artifacts[0]
-        result_document = _decode_result_document_bytes(result_artifact.content)
+        result_document, result_canonical = _parse_result_document_bytes(result_artifact.content)
         if (result_document != frozen.result_document
                 or result_document.content_hash != completion.result_document_hash
                 or hashlib.sha256(result_artifact.content).hexdigest()
@@ -692,9 +699,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                         {
                             **payload,
                             "manifest_ref": manifest_ref,
-                            "result_document_json": canonical_json(
-                                frozen.result_document.as_dict()
-                            ),
+                            "result_document_json": result_canonical.decode('utf-8'),
                             "entries_json": canonical_json(entries_value),
                             "entries_hash": canonical_hash(entries_value),
                             "completion_receipt_ref": (
@@ -887,7 +892,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             entries_value = json.loads(row.entries_json)
             result_value = json.loads(row.result_document_json)
             payload_value = json.loads(row.payload_json)
-            result_document = _decode_result_document_value(result_value)
+            result_document, result_canonical = _parse_result_document_value(result_value)
             entries = tuple(
                 _entry_from_value(value) for value in cast(list[object], entries_value)
             )
@@ -954,7 +959,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             != completion.implementation_revision_ref
             or row.implementation_tree_hash != completion.implementation_tree_hash
             or row.result_document_path != completion.handoff.result_document_path
-            or canonical_json(result_value) != row.result_document_json
+            or result_canonical.decode('utf-8') != row.result_document_json
             or row.result_document_hash != completion.result_document_hash
             or result_document.content_hash != completion.result_document_hash
             or row.artifact_snapshot_hash != completion.artifact_snapshot_hash
@@ -1124,6 +1129,7 @@ class TargetRunFinalizer:
         completion = None
         manifest = None
         handoff: TargetCompletionHandoff | None = None
+        capture_plan: _ResultCapturePlan | None = None
         pinned_workspace: _PinnedWorkspaceRoot | None = None
         if latest is not None:
             rejection = self._lifecycle.query_completion_rejection(
@@ -1203,6 +1209,7 @@ class TargetRunFinalizer:
                     os.close(pinned_workspace.descriptor)
                     pinned_workspace = None
                     return self._revision_result(rejection)
+                capture_plan = candidate.capture_plan
                 validate_target_completion_handoff(
                     handoff,
                     expected_target_ref=handle.target_ref,
@@ -1240,6 +1247,7 @@ class TargetRunFinalizer:
                         final_text=evidence.final_text,
                         staging_directory=Path(staging_directory),
                         retained_completion=completion,
+                        capture_plan=capture_plan,
                     )
                 except DeclaredCandidateIssue as error:
                     if completion is not None:
@@ -1560,6 +1568,7 @@ class TargetRunFinalizer:
         final_text: str,
         staging_directory: Path | None = None,
         retained_completion: AcceptedTargetRootCompletion | None = None,
+        capture_plan: _ResultCapturePlan | None = None,
     ) -> _FrozenWorkspace:
         workspace_ref = resolved_workspace.workspace_ref
         root_descriptor = resolved_workspace.descriptor
@@ -1586,11 +1595,16 @@ class TargetRunFinalizer:
                 raise OwnerConflict("target_root_artifact_integrity_invalid") from error
             if version != SELECTION_MANIFEST_SCHEMA:
                 raise OwnerConflict("target_root_manifest_protocol_unsupported")
-        physical = tuple(item for item in declarations if not any(
-            item.relative_path.startswith(parent.relative_path + '/')
-            for parent in declarations if parent != item))
+        if capture_plan is not None and (capture_plan.handoff != handoff or retained_completion is not None):
+            raise OwnerConflict("target_root_artifact_integrity_invalid")
+        physical = capture_plan.physical if capture_plan is not None else _physical_capture_declarations(declarations)
         for ordinal, artifact in enumerate(physical):
             frozen_artifact = None
+            if capture_plan is not None and artifact.role == "result" and artifact.relative_path == handoff.result_document_path:
+                frozen_artifact = _FrozenArtifact(
+                    ordinal=ordinal, role=artifact.role, declared_relative_path=artifact.relative_path,
+                    artifact_kind="file", media_type="application/json", content=capture_plan.raw,
+                    content_hash=capture_plan.raw_hash, tree_hash=capture_plan.raw_hash)
             if retained_completion is not None:
                 frozen_artifact = _reuse_frozen_artifact(
                     _frozen_sources_root(resolved_workspace.path.parent, retained_completion),
@@ -1649,7 +1663,7 @@ class TargetRunFinalizer:
         )
         if len(result_matches) != 1 or result_matches[0].artifact_kind != "file":
             raise OwnerConflict("target_root_result_document_invalid")
-        result = _decode_result_document_bytes(result_matches[0].content)
+        result = capture_plan.result if capture_plan is not None else _decode_result_document_bytes(result_matches[0].content)
         retained = result.domain_fields.get("retained_artifacts", ())
         frozen_roles = {item['declared_relative_path']: item['role'] for item in selections}
         if any(frozen_roles.get(item["relative_path"]) != item["role"] for item in retained):
@@ -1672,6 +1686,12 @@ def target_root_manifest_projection(manifest):
     return projection_plain_value(manifest)
 
 
+def _physical_capture_declarations(declarations):
+    return tuple(item for item in declarations if not any(
+        item.relative_path.startswith(parent.relative_path + '/')
+        for parent in declarations if parent != item))
+
+
 def _frozen_logical_selection(declaration, artifacts):
     """Resolve from captured bytes only, never reopen an overlapping live child."""
     from meta_research.content_selection import selection_tree
@@ -1689,7 +1709,14 @@ def _frozen_logical_selection(declaration, artifacts):
     else:
         # Capture/retained-custody verification hashes this parent once. Every
         # overlapping scope filters the same immutable metadata, without I/O.
-        tree = selection_tree('directory', parent.tree_entries, parent.tree_directories, path)
+        try:
+            tree = selection_tree('directory', parent.tree_entries, parent.tree_directories, path)
+        except OwnerConflict as error:
+            if error.code == 'content_selection_not_found':
+                raise DeclaredCandidateIssue('target_root_artifact_missing', '$artifact', declaration.relative_path,
+                    'declared source path is absent from the safely captured directory; restore the exact source '
+                    'or correct its declaration while preserving original evidence') from error
+            raise
     return {'declared_relative_path': declaration.relative_path, 'role': declaration.role,
             'artifact_kind': tree.kind, 'tree_hash': tree.selected_hash,
             'byte_count': tree.byte_count,
@@ -1745,48 +1772,16 @@ def _declared_target_completion_candidate(*, handle, evidence, root_descriptor):
             if not stat.S_ISREG(info.st_mode):
                 raise DeclaredCandidateIssue('target_root_result_document_invalid',
                     '$.result_document_path', 'outputs/result.json', 'expected a regular JSON file')
-            raw = _read_stable_regular_file(descriptor, info)
+            raw = _read_stable_regular_file(descriptor, info, result_document=True, relative_path='outputs/result.json')
         finally:
             os.close(descriptor)
         try:
             result = _decode_result_document_bytes(raw)
-            document = result.as_dict()
+        except DeclaredCandidateIssue:
+            raise
         except OwnerConflict as error:
             raise DeclaredCandidateIssue(error.code, '$', 'outputs/result.json',
                 getattr(error, 'feedback', 'invalid result declaration (' + error.code + ')')) from error
-        from meta_research.formal_entities import _declared_work
-        try:
-            _declared_work(document)
-        except OwnerConflict as error:
-            raise DeclaredCandidateIssue(error.code, '$.formal_runs', document.get('formal_runs'),
-                getattr(error, 'feedback', 'invalid formal work declaration')) from error
-        for field in ('dataset_candidates', 'environment_candidates'):
-            candidates = document.get(field, [])
-            if not isinstance(candidates, list) or len(candidates) > 100:
-                raise DeclaredCandidateIssue('target_root_declaration_invalid', '$.' + field,
-                                            candidates, 'expected at most 100 declarations')
-            for index, item in enumerate(candidates):
-                if not isinstance(item, dict) or any(not isinstance(item.get(key), str)
-                    or not item[key].strip() for key in ('artifact_path', 'name', 'purpose')):
-                    raise DeclaredCandidateIssue('target_root_declaration_invalid',
-                        f'$.{field}[{index}]', item, 'expected artifact_path, name and purpose')
-                try:
-                    validate_bundle_relative_path(item['artifact_path'])
-                except TargetImplementationBundleError as error:
-                    raise DeclaredCandidateIssue('target_root_declaration_invalid',
-                        f'$.{field}[{index}].artifact_path', item['artifact_path'],
-                        'expected a canonical relative path') from error
-        for field in ('dataset_candidates', 'environment_candidates'):
-            for index, item in enumerate(document.get(field, [])):
-                try:
-                    candidate_fd, _ = _open_workspace_artifact(root_descriptor, item['artifact_path'])
-                except OwnerConflict as error:
-                    if error.code != 'target_root_artifact_missing':
-                        raise
-                    raise DeclaredCandidateIssue(error.code, f'$.{field}[{index}].artifact_path',
-                        item['artifact_path'], 'declared path does not exist') from error
-                else:
-                    os.close(candidate_fd)
         handoff = _system_target_completion_handoff(handle=handle, evidence=evidence,
                                                     root_descriptor=root_descriptor, document=result)
         for index, declaration in enumerate(handoff.artifacts):
@@ -1796,16 +1791,10 @@ def _declared_target_completion_candidate(*, handle, evidence, root_descriptor):
                 raise DeclaredCandidateIssue('target_root_declaration_invalid',
                     f'$.artifacts[{index}].relative_path', declaration.relative_path,
                     'expected a canonical relative path') from error
-            try:
-                fd, _ = _open_workspace_artifact(root_descriptor, declaration.relative_path)
-            except OwnerConflict as error:
-                if error.code != 'target_root_artifact_missing':
-                    raise
-                raise DeclaredCandidateIssue(error.code, f'$.artifacts[{index}].relative_path',
-                    declaration.relative_path, 'declared path does not exist') from error
-            else:
-                os.close(fd)
-        return DeclaredCandidate(handoff)
+        return DeclaredCandidate(handoff, _ResultCapturePlan(
+            handoff=handoff, result=result, raw=raw,
+            raw_hash=hashlib.sha256(raw).hexdigest(),
+            physical=_physical_capture_declarations(handoff.artifacts)))
     except DeclaredCandidateIssue as issue:
         return InvalidDeclaredCandidate(fallback, issue)
 
@@ -1827,7 +1816,8 @@ def _system_target_completion_handoff(
     if document is None:
         descriptor, info = _open_workspace_artifact(root_descriptor, "outputs/result.json")
         try:
-            document = _decode_result_document_bytes(_read_stable_regular_file(descriptor, info))
+            document = _decode_result_document_bytes(_read_stable_regular_file(descriptor, info,
+                result_document=True, relative_path='outputs/result.json'))
         finally:
             os.close(descriptor)
     retained = document.domain_fields.get("retained_artifacts", ())
@@ -1840,7 +1830,7 @@ def _system_target_completion_handoff(
         paths = run.get('implementation_paths')
         if paths is None:
             continue
-        if (not isinstance(paths, list) or not paths or len(paths) > 100 or any(not isinstance(path, str)
+        if (not isinstance(paths, list) or not paths or any(not isinstance(path, str)
                 or (path != 'implementation' and not path.startswith('implementation/'))
                 or any(part in {'', '.', '..'} for part in path.split('/')) for path in paths)
                 or len(set(paths)) != len(paths)):
@@ -1921,11 +1911,11 @@ def _declared_artifact_boundaries(document, retained, relative_path, role):
                 and not attempt.get('evaluation_attempt_ref'))
         for producer in producers:
             declared = producer.get('checkpoint_paths' if role == 'checkpoint' else 'artifact_paths')
-            if isinstance(declared, list) and len(declared) <= 100:
+            if isinstance(declared, list):
                 selected.extend(declared)
     for field in ('dataset_candidates', 'environment_candidates'):
         candidates = document.get(field, [])
-        if role in {'data', 'analysis'} and isinstance(candidates, list) and len(candidates) <= 100:
+        if role in {'data', 'analysis'} and isinstance(candidates, list):
             selected.extend(candidate.get('artifact_path') for candidate in candidates
                             if isinstance(candidate, dict))
     paths = set()
@@ -1942,22 +1932,27 @@ def _declared_artifact_boundaries(document, retained, relative_path, role):
 def _validate_retained_artifacts(document):
     """Validate retention once when decoding this result document's bytes."""
     selected = document.get("retained_artifacts", [])
-    if not isinstance(selected, list) or len(selected) > 100:
-        raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
+    if not isinstance(selected, list):
+        raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid", '$.retained_artifacts', selected,
+            'expected a list of exact retained artifact paths and roles')
     paths = set()
-    for item in selected:
+    for index, item in enumerate(selected):
+        field_path = f'$.retained_artifacts[{index}]'
         if (not isinstance(item, dict) or set(item) != {"relative_path", "role"}
                 or not isinstance(item["role"], str)
                 or item["role"] not in {"log", "analysis", "data", "checkpoint"}):
-            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
+            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid", field_path, item,
+                'expected relative_path and role (log, analysis, data or checkpoint)')
         try:
             path = validate_bundle_relative_path(item["relative_path"])
         except TargetImplementationBundleError as error:
-            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid") from error
+            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid", field_path + '.relative_path', item['relative_path'],
+                'expected a canonical relative workspace path') from error
         if (path in paths or path.split("/")[0] in {"inputs", "implementation", "handoff"}
                 or path == "outputs" or path == "outputs/result.json"
                 or path.startswith("outputs/result.json/")):
-            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid")
+            raise DeclaredCandidateIssue("target_root_retained_artifacts_invalid", field_path + '.relative_path', path,
+                'expected a unique retained path outside protected inputs, implementation, handoff and result paths')
         paths.add(path)
 
 
@@ -2144,17 +2139,20 @@ def _freeze_artifact(
     root_descriptor: int, ordinal: int, role: str, relative_path: str,
     *, staging_directory: Path | None = None,
 ) -> _FrozenArtifact:
-    descriptor, info = _open_workspace_artifact(
-        root_descriptor, relative_path
-    )
+    try:
+        descriptor, info = _open_workspace_artifact(root_descriptor, relative_path)
+    except OwnerConflict as error:
+        if error.code == "target_root_artifact_missing":
+            raise DeclaredCandidateIssue(error.code, '$artifact', relative_path,
+                'declared source file is missing; restore the exact source or correct its declared path, preserving evidence') from error
+        raise
     try:
         if stat.S_ISREG(info.st_mode):
-            if role == "result" and info.st_size > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
-                raise DeclaredCandidateIssue("target_root_result_document_too_large", "$artifact", relative_path)
             if info.st_size > TARGET_ROOT_INLINE_ARTIFACT_BYTES and role != "result":
                 return _freeze_streamed_artifact(descriptor, info, ordinal, role,
                                                 relative_path, staging_directory)
-            content = _read_stable_regular_file(descriptor, info)
+            content = _read_stable_regular_file(descriptor, info, result_document=role == "result",
+                relative_path=relative_path)
             content_hash = hashlib.sha256(content).hexdigest()
             return _FrozenArtifact(
                 ordinal=ordinal,
@@ -2572,10 +2570,13 @@ def _raise_open_component_error(
 
 
 def _read_stable_regular_file(
-    descriptor: int, before: os.stat_result
+    descriptor: int, before: os.stat_result, *, result_document: bool = False,
+    relative_path: str = '$artifact',
 ) -> bytes:
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise OwnerConflict("target_root_artifact_type_unsupported")
+    if result_document and before.st_size > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
+        raise _result_capacity_issue('$.result_document', before.st_size, 'raw UTF-8 bytes')
     if before.st_size > MAX_ASSET_BYTES:
         raise OwnerConflict("target_root_artifact_too_large")
     try:
@@ -2589,13 +2590,22 @@ def _read_stable_regular_file(
             remaining -= len(chunk)
         after = os.fstat(descriptor)
     except OSError as error:
-        raise OwnerConflict("target_root_artifact_unavailable") from error
+        raise OwnerConflict("target_root_artifact_unavailable", {
+            'category': 'storage_service_error', 'path': relative_path,
+            'rule': 'stable_file_read', 'os_error': type(error).__name__,
+            'correction': 'Restore storage availability and retry acceptance of the preserved research; no experiment rerun is required.',
+        }) from error
     content = b"".join(chunks)
     if (
         _descriptor_stat_identity(before) != _descriptor_stat_identity(after)
         or len(content) != before.st_size
     ):
-        raise OwnerConflict("target_root_workspace_changed")
+        raise OwnerConflict("target_root_workspace_changed", {
+            'category': 'source_changed', 'path': relative_path,
+            'rule': 'descriptor_identity_and_exact_bytes_stable_during_read',
+            'expected_bytes': before.st_size, 'actual_bytes': len(content),
+            'correction': 'Preserve the source evidence, stop concurrent file changes and retry capture from one stable source.',
+        })
     return content
 
 
@@ -2616,8 +2626,12 @@ def _descriptor_stat_identity(value: os.stat_result) -> tuple[int, ...]:
 
 
 def _decode_result_document_bytes(content: bytes) -> TargetRootResultDocument:
+    return _parse_result_document_bytes(content)[0]
+
+
+def _parse_result_document_bytes(content: bytes) -> tuple[TargetRootResultDocument, bytes]:
     if len(content) > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
-        raise DeclaredCandidateIssue("target_root_result_document_too_large")
+        raise _result_capacity_issue('$.result_document', len(content), 'raw UTF-8 bytes')
     try:
         value = json.loads(
             content.decode("utf-8"),
@@ -2630,10 +2644,21 @@ def _decode_result_document_bytes(content: bytes) -> TargetRootResultDocument:
         RecursionError,
         json.JSONDecodeError,
     ) as error:
-        raise DeclaredCandidateIssue("target_root_result_document_invalid") from error
+        if isinstance(error, RecursionError) or 'integer string conversion' in str(error):
+            raise DeclaredCandidateIssue("target_root_result_document_too_large", '$', len(content),
+                'technical parser capacity exceeded; retain the original result and report the capacity limitation; do not rerun the experiment') from error
+        raise DeclaredCandidateIssue("target_root_result_document_invalid", '$', 'result bytes',
+            'expected legal UTF-8 JSON without duplicate keys or non-finite numbers: ' + str(error)[:512]) from error
     # The source artifact and its byte hash stay immutable. Only the decoded
     # result document has a derived canonical hash; formatting is not research.
-    return _decode_result_document_value(value)
+    return _parse_result_document_value(value)
+
+
+def _result_capacity_issue(path, actual, unit):
+    return DeclaredCandidateIssue('target_root_result_document_too_large', path, actual,
+        f'technical capacity: {actual} {unit}, limit {TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES}; '
+        'retain the complete original result and evidence and report this capacity limitation; '
+        'do not truncate values or rerun the experiment')
 
 
 def _target_root_utf8_size(value: str, *, invalid_code: str) -> int:
@@ -2644,45 +2669,56 @@ def _target_root_utf8_size(value: str, *, invalid_code: str) -> int:
 
 
 def _decode_result_document_value(value: object) -> TargetRootResultDocument:
-    if type(value) is not dict or not TARGET_ROOT_REQUIRED_RESULT_DOCUMENT_FIELDS <= set(value):
-        raise DeclaredCandidateIssue("target_root_result_document_invalid")
-    _validate_retained_artifacts(value)
+    return _parse_result_document_value(value)[0]
+
+
+def _parse_result_document_value(value: object) -> tuple[TargetRootResultDocument, bytes]:
+    if type(value) is not dict:
+        raise DeclaredCandidateIssue("target_root_result_document_invalid", '$', value, 'expected a JSON object')
+    # Validate the scientific tree before declaration traversal or encoding.
+    # This also rejects cycles/depth and bounds canonical expansion in memory.
+    try:
+        validate_target_result_tree(value)
+    except OwnerConflict as error:
+        details = error.details or {}
+        path = details.get('path', '$')
+        code = error.code
+        if code == 'target_root_result_document_invalid' and path.startswith('$["metrics"]'):
+            code = 'target_root_result_metrics_invalid'
+        category = details.get('category', 'declaration_error')
+        raise DeclaredCandidateIssue(code, path, details.get('actual_type', 'result document'),
+            category + ': ' + str(details) + '; preserve the original evidence; '
+            + ('report the host capacity limitation without truncating results or rerunning experiments'
+               if category == 'technical_capacity' else 'correct this field to a finite, UTF-8 JSON value')) from error
+    issues = []
+    try:
+        _validate_retained_artifacts(value)
+    except DeclaredCandidateIssue as error:
+        issues.append(error)
     schema_ref = value.get("schema_ref")
     metrics = value.get("metrics")
     disposition = value.get("result_disposition")
     from meta_research.formal_entities import _declared_work
     explicit_work = False
-    if 'formal_runs' in value:
+    if value.get('formal_runs') is not None or isinstance(metrics, dict):
         try:
             _declared_work(value)
-            explicit_work = True
+            explicit_work = isinstance(value.get('formal_runs'), list) and bool(value['formal_runs'])
         except OwnerConflict as error:
-            # The current Owner returns field-specific inventory corrections.
-            # An empty summary need not hide that feedback as a JSON error.
-            explicit_work = error.code == 'target_formal_work_inventory_invalid'
-    if (
-        (schema_ref is not None and (
-            type(schema_ref) is not str
-            or not schema_ref
-            or schema_ref != schema_ref.strip()
-            or _target_root_utf8_size(
-                schema_ref, invalid_code="target_root_result_document_invalid"
-            ) > 256
-        ))
-        or type(metrics) is not dict
-        or (not metrics and not explicit_work)
-        or (disposition is not None and (
-            type(disposition) is not str
-            or not disposition
-            or disposition != disposition.strip()
-            or _target_root_utf8_size(disposition, invalid_code="target_root_result_document_invalid") > 256
-        ))
-    ):
-        raise DeclaredCandidateIssue("target_root_result_document_invalid")
-    if len(metrics) > TARGET_ROOT_MAX_RESULT_METRICS:
-        raise DeclaredCandidateIssue("target_root_result_metrics_invalid")
+            issues.append(DeclaredCandidateIssue(error.code, '$.formal_runs', 'formal work declaration',
+                getattr(error, 'feedback', error.code)))
+    for name, item in (('schema_ref', schema_ref), ('result_disposition', disposition)):
+        if item is not None and (type(item) is not str or not item or item != item.strip()
+                or _target_root_utf8_size(item, invalid_code='target_root_result_document_invalid') > 256):
+            issues.append(DeclaredCandidateIssue('target_root_result_document_invalid', '$.' + name, item,
+                'expected a nonempty trimmed string of at most 256 UTF-8 bytes, or omission'))
+    if (('metrics' in value and type(metrics) is not dict)
+            or (not metrics and not explicit_work)):
+        issues.append(DeclaredCandidateIssue('target_root_result_document_invalid', '$.metrics', metrics,
+            'expected a nonempty summary metric object unless valid explicit formal_runs provide the actual work; '
+            'executed evaluations retain their ProtocolVersion metric requirements'))
     normalized: dict[str, TargetMetricValue] = {}
-    for name, metric in metrics.items():
+    for name, metric in (metrics.items() if type(metrics) is dict else ()):
         if (
             type(name) is not str
             or not name
@@ -2694,41 +2730,68 @@ def _decode_result_document_value(value: object) -> TargetRootResultDocument:
                 )
                 > 256
             )
-            or not valid_target_metric_value(metric)
         ):
-            raise DeclaredCandidateIssue("target_root_result_metrics_invalid")
+            issues.append(DeclaredCandidateIssue("target_root_result_metrics_invalid", '$.metrics.' + str(name), metric,
+                'expected a trimmed metric key of at most 256 UTF-8 bytes and a finite JSON metric value'))
         normalized[name] = cast(TargetMetricValue, metric)
+    for name in ('dataset_candidates', 'environment_candidates'):
+        candidates = value.get(name, [])
+        if not isinstance(candidates, list):
+            issues.append(DeclaredCandidateIssue('target_root_declaration_invalid', '$.' + name, candidates,
+                'expected a list of declarations'))
+            continue
+        for index, candidate in enumerate(candidates):
+            path = f'$.{name}[{index}]'
+            if not isinstance(candidate, dict):
+                issues.append(DeclaredCandidateIssue('target_root_declaration_invalid', path, candidate,
+                    'expected an object with artifact_path, name and purpose'))
+                continue
+            for key in ('artifact_path', 'name', 'purpose'):
+                item = candidate.get(key)
+                if not isinstance(item, str) or not item.strip():
+                    issues.append(DeclaredCandidateIssue('target_root_declaration_invalid', path + '.' + key, item,
+                        'expected a nonempty string describing the actual research source'))
+                elif key == 'artifact_path':
+                    try:
+                        validate_bundle_relative_path(item)
+                    except TargetImplementationBundleError:
+                        issues.append(DeclaredCandidateIssue('target_root_declaration_invalid', path + '.' + key, item,
+                            'expected a canonical relative workspace path'))
+    if issues:
+        issue = issues[0]
+        feedback = '\n'.join(error.feedback for error in issues)
+        issue.feedback = feedback if len(feedback) <= 4096 else feedback[:3990] + '\nAdditional declaration errors omitted by the feedback size limit.'
+        raise issue
     document = dict(value)
-    # Bound all additional domain content too, including strings and numbers.
     try:
-        validate_target_result_tree(document)
         encoded = canonical_json(document).encode("utf-8")
     except (TypeError, ValueError, UnicodeError, RecursionError) as error:
         raise DeclaredCandidateIssue("target_root_result_document_invalid") from error
     if len(encoded) > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
-        raise DeclaredCandidateIssue("target_root_result_document_too_large")
-    return TargetRootResultDocument(
+        raise _result_capacity_issue('$.result_document', len(encoded), 'canonical UTF-8 bytes')
+    result = TargetRootResultDocument(
         schema_ref=schema_ref,
-        metrics=normalized,
+        metrics=normalized if 'metrics' in value else None,
         result_disposition=cast(str | None, disposition),
-        content_hash=canonical_hash(document),
+        content_hash=hashlib.sha256(encoded).hexdigest(),
         domain_fields={key: item for key, item in document.items()
                        if key not in TARGET_ROOT_RESULT_DOCUMENT_FIELDS
                        or (key in {"schema_ref", "result_disposition"} and item is None)},
     )
+    return result, encoded
 
 
 def _exact_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     value: dict[str, object] = {}
     for key, item in pairs:
         if key in value:
-            raise ValueError("duplicate key")
+            raise ValueError("duplicate JSON object key " + repr(key)[:256])
         value[key] = item
     return value
 
 
 def _reject_json_constant(_value: str) -> object:
-    raise ValueError("non-finite JSON number")
+    raise ValueError("non-finite JSON number " + _value)
 
 
 def _entry_from_value(value: object) -> TargetRootCompletionManifestEntry:

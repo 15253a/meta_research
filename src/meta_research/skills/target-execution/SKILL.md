@@ -46,7 +46,7 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 ## 3. 保存结果和实际归属
 
-写 `outputs/result.json`，包含 `metrics` 及忠实表达研究的领域字段。Owner 从当前执行与已接纳记录接续 Target／Run 身份、Protocol、冻结输入和精确版本；这些已有信息无需转抄。`schema_ref` 和历史 `result_disposition` 字段可省略，结果无需总分类或统一 claim；提供身份断言时须与该权威记录一致。初始 `result_schema` 是表达指导，字段、嵌套和类型可随真实观察演化；Protocol 指标集合、来源、合法 JSON 与有限数值检查仍有效。实测零为 `0`，合同允许的未测量值为 `null`，类别、数组和对象保留真实 JSON 值；缺测原因写入结果或 `outputs/analysis`。
+写 `outputs/result.json`，包含忠实表达研究的领域字段及指标。有效 `formal_runs` 已承载实际工作时，顶层 summary `metrics` 可省略或为空；其他情况沿 summary 路径提供指标。Owner 从当前执行与已接纳记录接续 Target／Run 身份、Protocol、冻结输入和精确版本；这些已有信息无需转抄。`schema_ref` 和历史 `result_disposition` 字段可省略，结果无需总分类或统一 claim；提供身份断言时须与该权威记录一致。初始 `result_schema` 是表达指导，字段、嵌套和类型可随真实观察演化；Protocol 指标集合、来源、合法 JSON 与有限数值检查仍有效。实测零为 `0`，合同允许的未测量值为 `null`，类别、数组和对象保留真实 JSON 值；缺测原因写入结果或 `outputs/analysis`。科学整数保留准确 JSON 整数，不受固定 53／63 位幅度限制；结果原文及 canonical 各限 256KiB，科学树深度限 64。容量不足按宿主具体反馈处理，保留原始结果与证据，无需为接纳而改种子或重跑实验。
 
 确定 Run 保存粒度、保存具体实施／评价产物，或出现分离或交替评价、无指标报告评价、待评价实施、复用已接纳 Run、正式工作声明反馈，或交接可复用 Dataset／Environment 候选或过程中发现、取得、阅读的 Literature 时，读取[正式工作交接](references/formal-work.md)。以 `formal_runs` 声明真实生产者、实际采用关系和精确产物路径；系统携带的冻结输入只说明可用来源，真实采用、用途和科学含义由本次研究说明。需要独立选择文件、目录或一组不连续路径及其用途时，用 `retained_artifacts` 声明保留范围和角色。`evaluations: []` 表示尚未评价；空指标的已执行评价必须有真实评价记录及归属报告。一次工具调用或技术重试本身不构成新的科研 Run。
 

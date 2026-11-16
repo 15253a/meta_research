@@ -6,6 +6,7 @@ import sys
 
 from meta_research.bundle_protocol import (
     TARGET_METRIC_MAX_DEPTH, TargetMetricValue, valid_target_metric_value,
+    _target_metric_shape,
 )
 from meta_research.bundle_target_contract import measurement_contract_to_dict
 from meta_research.owners.common import OwnerConflict
@@ -14,25 +15,29 @@ from meta_research.target_implementation_bundle import (
     IMPLEMENTATION_TOTAL_MAX_BYTES, IMPLEMENTATION_BUNDLE_MAX_BYTES,
 )
 
-def validate_target_result_tree(value: object, *, depth: int = 0) -> None:
-    if depth > TARGET_METRIC_MAX_DEPTH:
-        raise OwnerConflict("target_root_result_document_invalid")
-    if type(value) is dict:
-        for key, item in value.items():
-            if type(key) is not str:
-                raise OwnerConflict("target_root_result_document_invalid")
-            validate_target_result_tree(key, depth=depth + 1)
-            validate_target_result_tree(item, depth=depth + 1)
-    elif type(value) is list:
-        for item in value:
-            validate_target_result_tree(item, depth=depth + 1)
-    elif type(value) is str:
-        try:
-            value.encode("utf-8")
-        except UnicodeError as error:
-            raise OwnerConflict("target_root_result_document_invalid") from error
-    elif not valid_target_metric_value(value):
-        raise OwnerConflict("target_root_result_document_invalid")
+def validate_target_result_tree(value: object, *, depth: int = 0) -> int:
+    """Validate one research tree and bound canonical bytes before encoding it.
+
+    Return the exact canonical byte count, permitting the caller to reuse this
+    traversal. Shared in-memory subtrees count in full without being expanded.
+    """
+    from meta_research.target_run_finalizer import TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES
+
+    failures: list[dict[str, object]] = []
+    shape = _target_metric_shape(value, starting_depth=depth, failures=failures)
+    if shape is None:
+        detail = failures[0]
+        capacity = detail["rule"] in {"scientific_depth", "json_encoding_capacity"}
+        raise OwnerConflict(
+            "target_root_result_document_too_large" if capacity else "target_root_result_document_invalid",
+            {"category": "technical_capacity" if capacity else "declaration_error", **detail},
+        )
+    if shape[1] > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
+        raise OwnerConflict("target_root_result_document_too_large", {
+            "category": "technical_capacity", "path": "$", "rule": "canonical_bytes",
+            "actual_bytes": shape[1], "limit": TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES,
+        })
+    return shape[1]
 
 
 def target_execution_context(*, authority: object, target_ref: str,
@@ -56,6 +61,8 @@ def target_execution_context(*, authority: object, target_ref: str,
             "artifact_bytes": None,
             "artifact_set_bytes": None,
             "result_document_bytes": TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES,
+            "result_canonical_bytes": TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES,
+            "scientific_tree_depth": TARGET_METRIC_MAX_DEPTH,
             "storage": "RM streams selected files and directory trees into managed storage; available disk space and actual I/O govern large data and checkpoints.",
             "supported_entries": "regular files and directories, no links",
             "legacy_implementation_bundle": {
@@ -65,7 +72,7 @@ def target_execution_context(*, authority: object, target_ref: str,
                 "directory_bundle_bytes": IMPLEMENTATION_BUNDLE_MAX_BYTES,
             },
         },
-        "result_encoding": "UTF-8 JSON; source bytes retained, semantic hash normalized",
+        "result_encoding": "UTF-8 JSON; source bytes retained, semantic hash normalized; JSON integers retain their exact integer type and value, with no fixed 53/63-bit scientific magnitude limit",
         "result_schema_policy": "Initial result_schema guides structure; evolved domain fields and types are allowed. Protocol metric keys, exact identities, provenance, valid JSON and finite numeric safety remain binding.",
     }
 
