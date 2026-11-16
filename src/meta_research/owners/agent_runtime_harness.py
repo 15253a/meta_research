@@ -414,6 +414,8 @@ class AgentRuntimeHarnessInterface(Protocol):
         self, run_ref: str
     ) -> AgentRuntimeHarnessOperation | None: ...
 
+    def prior_target_inputs(self, run_ref: str) -> tuple[str, ...]: ...
+
     def start_operation(
         self,
         *,
@@ -2449,6 +2451,15 @@ class SQLiteAgentRuntimeHarness:
                 {"run_ref": run_ref},
             ).fetchone()
         return None if row is None else _operation_from_row(row)
+
+    def prior_target_inputs(self, run_ref: str) -> tuple[str, ...]:
+        with self._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT frozen_prompt FROM ar_harness_provider_operations "
+                "WHERE run_ref=:run_ref AND status='completed' "
+                "AND frozen_prompt IS NOT NULL ORDER BY generation DESC"
+            ), {"run_ref": run_ref}).all()
+        return tuple(row.frozen_prompt for row in rows)
 
     def checkpoint_target_root_human_request_session(
         self,

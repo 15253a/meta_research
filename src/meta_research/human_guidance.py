@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from meta_research.owners.common import OwnerConflict, canonical_hash, decoded_object
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json, decoded_object
 
 
 GuidanceRootKind = Literal["idea", "plan", "bundle", "reasoning", "target"]
@@ -139,40 +139,124 @@ class FrozenGuidanceCut:
 
 
 def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True,
-                    include_body: bool = False, include_direction: bool = False) -> str:
-    items = [{
-        "delivery_ref": item.delivery_ref,
-        "constraint_ref": decoded_object(item.guide_json)["constraint_ref"],
-        "revision": decoded_object(item.guide_json)["revision"],
-        "needs_treatment": item.needs_treatment,
-        "applies_to_work": item.applies_to_work,
-    } for item in cut.deliveries]
-    from meta_research.owners.common import canonical_json
-    rendered = (
-        "\n\n## 本次操作的正式人类指导\n"
-        + canonical_json({"binding": cut.binding.as_dict(), "deliveries": items})
-        + "\n可用 human_guidance.read 发现并按需精确完整读取各 delivery_ref。"
-        "列表与此索引不证明已读原文。needs_treatment=true 的指导在本工作中尚需说明处理，"
-        "理解准确原文后用 human_guidance.feedback 说明理解、调整、继续事项及理由；"
-        "原文已由原生输入提供时无需为反馈另行调用读取。"
-        "仅 applies_to_work=true 的指导在其确认范围内适用；背景指导可读但不继承为本工作要求。"
-        "适用且 needs_treatment=false 时参考既有反馈继续履行。"
-        "在途新正式确认且适用本工作的指导通过当前原生输入在原根接续；"
-        "没有适用活动根时交由正确后继接续。按实际影响判断是否涉及 Quest 目标，"
-        "局部严格要求不因力度5需要目标演化；整体变化才沿目标演化流程，"
-        "收到、读取或反馈不表示目标已切换。HumanRequest 答复仍归原请求根。\n"
-    )
-    if include_body and resident:
-        rendered += "\n本次授权内的冻结指导原文与既有处理如下。\n" + canonical_json(cut.as_dict())
-    elif not resident:
-        rendered += "\n冻结原文如下。工具通道未建立时，不记录收到、读取或反馈事实。\n" + canonical_json(cut.as_dict())
-    elif include_direction and cut.direction_cut is not None:
-        rendered += (
-            "\n以下当前有效 Goal 与持续条件完整来自本次操作的冻结指导；"
-            "保持各条件的来源与适用范围。其他工作详情与历史仍按需读取。\n"
-            "current_goal_and_conditions=" + canonical_json({
-                "goal": cut.direction_cut["goal"],
-                "conditions": cut.direction_cut["conditions"],
+                    include_body: bool = False, include_direction: bool = False,
+                    previous_prompts: tuple[str, ...] = ()) -> str:
+    seen = human_input_identities(previous_prompts)
+    events = [_guidance_event(decoded_object(item.guide_json),
+                  item.guidance_status if item.applies_to_work else "outside_scope",
+                  [item.delivery_ref], scope_confirmation=item.scope_confirmation)
+              for item in cut.deliveries]
+    rendered = ""
+    for item, event in zip(cut.deliveries, events, strict=True):
+        if event["status"] == "outside_scope" and not any(
+                identity[0] == "guidance" and identity[1] == event["constraint_ref"] for identity in seen):
+            continue
+        if _human_input_identity(event) not in seen:
+            rendered += "\n" + _human_event_prompt(event)
+        elif (item.needs_treatment and item.applies_to_work
+                and not any(canonical_json(item.delivery_ref) in prompt for prompt in previous_prompts)):
+            rendered += "\n待处理指导的本轮反馈关联：\ncurrent_guidance_delivery=" + canonical_json({
+                "constraint_ref": event["constraint_ref"], "revision": event["revision"],
+                "delivery_ref": item.delivery_ref,
             })
-        )
+    if (include_direction or include_body or not resident) and cut.direction_cut is not None:
+        direction = "current_goal_and_conditions=" + canonical_json({
+            "goal": cut.direction_cut["goal"], "conditions": cut.direction_cut["conditions"],
+        })
+        if not any(direction in prompt.splitlines() for prompt in previous_prompts):
+            rendered += "\n" + direction
     return rendered
+
+
+def live_guidance_prompt(message: dict[str, object]) -> str:
+    if message["kind"] == "human_request_response":
+        return _human_event_prompt(message)
+    change = message["change"]
+    return _human_event_prompt(_guidance_event(change["guide"], change["status"],
+        [item["delivery_ref"] for item in message["deliveries"]],
+        scope_confirmation=next((item["scope_confirmation"] for item in message["deliveries"]
+            if "scope_confirmation" in item), None)))
+
+
+def _guidance_event(guide, status, delivery_refs, *, scope_confirmation=None):
+    guidance = guide["guidance"]
+    if not isinstance(guidance, dict):
+        raise ValueError("human_guidance_body_invalid")
+    event = {
+        "kind": "confirmed_guidance_change",
+        "constraint_ref": guide["constraint_ref"],
+        "revision": guide["revision"],
+        "status": status,
+        "scope_confirmation": scope_confirmation or (
+            "confirmed" if guidance.get("semantic_scope") is not None else "legacy_unconfirmed"),
+        **({"semantic_scope": guidance["semantic_scope"]} if "semantic_scope" in guidance else {}),
+    }
+    if status == "active":
+        event.update({field: guidance[field] for field in (
+            "text", "strength", "applies_to", "preserve_conditions", "work_materials",
+        ) if field in guidance})
+        event["delivery_refs"] = delivery_refs
+    return event
+
+
+def _human_event_prompt(event):
+    event = {name: value for name, value in event.items() if name != "prepared_at"}
+    if event.get("status") == "outside_scope":
+        instruction = "此指导已退出本会话适用范围，不再作为本工作要求。"
+    elif event.get("status") == "withdrawn":
+        instruction = "此指导已撤回。撤回本身不要求停止实验、删除成果或回滚目标。"
+    else:
+        instruction = "本次人类输入如下。"
+    return instruction + "\nhuman_input=" + canonical_json(event)
+
+
+def _human_input_identity(event):
+    if event.get("kind") == "human_request_response":
+        if not all(isinstance(event.get(name), str) and event[name]
+                   for name in ("request_ref", "response_ref")):
+            raise ValueError("human_input_identity_invalid")
+        return ("response", event["request_ref"], event["response_ref"])
+    if (event.get("kind") != "confirmed_guidance_change"
+            or not isinstance(event.get("constraint_ref"), str)
+            or type(event.get("revision")) is not int
+            or event.get("status") not in {"active", "withdrawn", "outside_scope", "superseded"}):
+        raise ValueError("human_input_identity_invalid")
+    return ("guidance", event["constraint_ref"], event["revision"], event["status"])
+
+
+def human_input_identities(prompts):
+    import json
+
+    identities = set()
+    for prompt in prompts:
+        for line in prompt.splitlines():
+            marked = line.startswith("human_input=")
+            if not marked and not line.startswith("{"):
+                continue
+            try:
+                value = json.loads(line.removeprefix("human_input=") if marked else line)
+                if not isinstance(value, dict):
+                    continue
+                if marked:
+                    identities.add(_human_input_identity(value))
+                elif value.get("kind") == "confirmed_guidance_change" and isinstance(value.get("change"), dict):
+                    change = value["change"]
+                    identities.add(_human_input_identity(_guidance_event(change["guide"], change["status"], [])))
+                elif "binding" in value and isinstance(value.get("deliveries"), list):
+                    for item in value["deliveries"]:
+                        if isinstance(item, dict) and "guide" in item:
+                            identities.add(_human_input_identity(_guidance_event(item["guide"],
+                                item.get("guidance_status", "active") if item.get("applies_to_work", True)
+                                else "outside_scope", [])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return identities
+
+
+def human_response_prompt(authority, scope, previous_prompts=()):
+    if authority is None:
+        return ""
+    seen = human_input_identities(previous_prompts)
+    return "".join("\n" + _human_event_prompt(event)
+        for event in authority.human_response_events(scope=scope)
+        if _human_input_identity(event) not in seen)

@@ -11,6 +11,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from provider_supervisor_support import closed_tree_fixture
+
 from meta_research.idea_skill import _compile_codex_output_schema
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -456,12 +458,14 @@ class _SequenceRunner:
                         },
                     }
                 )
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             0,
             stdout="\n".join(json.dumps(event) for event in events),
             stderr="",
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
     def run_job(
         self, job_ref: str, argv: list[str], prompt: str, timeout: float

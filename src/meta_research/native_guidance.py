@@ -15,9 +15,10 @@ import threading
 import time
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.human_guidance import human_input_identities, live_guidance_prompt
 import logging
 from meta_research.provider_supervisor import (
-    read_transport_key_for_operation, read_transport_envelope, write_transport_envelope,
+    ProviderSupervisorError, read_transport_key_for_operation, read_transport_envelope, write_transport_envelope,
 )
 
 
@@ -81,6 +82,67 @@ def live_native_argv(argv, directory, *, enabled=True, force_transport=False, pa
     return [*wrapped, "-"]
 
 
+def native_human_input_history(workspace, native_session_ref, *, exclude_directory=None):
+    if native_session_ref is None:
+        return ()
+    observed = []
+    for path in (Path(workspace) / "provider-operations").glob("*/*/native-turn-id.json"):
+        directory = path.parent
+        if directory == exclude_directory:
+            continue
+        _key_path, key = read_transport_key_for_operation(directory)
+        accepted = read_transport_envelope(path, key)
+        if accepted.get("thread_id") != native_session_ref:
+            continue
+        start = read_transport_envelope(directory / "native-turn-start.json", key)
+        if (start.get("thread_id") != native_session_ref
+                or accepted.get("client_user_message_id") != start.get("client_user_message_id")
+                or not isinstance(accepted.get("turn_id"), str)):
+            raise OwnerConflict("native_guidance_send_identity_invalid")
+        observed.append(start["parameters"]["input"][0]["text"])
+    for path in (Path(workspace) / "provider-operations").glob("*/*/live-guidance/*.sending"):
+        directory = path.parent.parent
+        if directory == exclude_directory:
+            continue
+        _key_path, key = read_transport_key_for_operation(directory)
+        sent = read_transport_envelope(path, key)
+        if sent.get("thread_id") != native_session_ref:
+            continue
+        if (sent.get("id") != path.stem or not isinstance(sent.get("text"), str)
+                or not isinstance(sent.get("turn_id"), str)):
+            raise OwnerConflict("native_guidance_send_identity_invalid")
+        receipt_path = path.with_suffix(".receipt")
+        if not receipt_path.exists():
+            from meta_research.native_codex_bridge import NativeTerminalTurnError, reconcile_native_operation
+
+            try:
+                recovered_turn = reconcile_native_operation(directory)
+            except NativeTerminalTurnError:
+                recovered_turn = True
+            if recovered_turn is None:
+                raise OwnerConflict("human_input_delivery_pending")
+            try:
+                recovered = read_transport_envelope(directory / "native-reconciled.json", key)
+            except ProviderSupervisorError as error:
+                if isinstance(error.__cause__, FileNotFoundError):
+                    raise OwnerConflict("human_input_delivery_pending") from error
+                raise
+            turn = recovered["turn"]
+            found = (recovered["thread_id"] == native_session_ref and turn["id"] == sent["turn_id"]
+                and any(item.get("type") == "userMessage" and item.get("clientId") == sent["id"]
+                    and any(part.get("type") == "text" and part.get("text") == sent["text"]
+                            for part in item.get("content", [])) for item in turn.get("items", [])))
+            if not found:
+                raise OwnerConflict("human_input_delivery_pending")
+            write_transport_envelope(receipt_path, {**sent, "status": "accepted", "reconciled": True}, key)
+        receipt = read_transport_envelope(receipt_path, key)
+        if (receipt.get("status") != "accepted"
+                or any(receipt.get(name) != value for name, value in sent.items())):
+            raise OwnerConflict("native_guidance_receipt_invalid")
+        observed.append(sent["text"])
+    return tuple(observed)
+
+
 class _GuidancePump:
     def __init__(self, authority, scope, binding, directory, key):
         self.authority, self.scope, self.binding = authority, scope, binding
@@ -105,9 +167,23 @@ class _GuidancePump:
                     path = self.directory / "live-guidance" / (identity + ".json")
                     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     if not path.exists():
+                        if message.get("kind") == "human_request_response":
+                            start_path = self.directory / "native-turn-start.json"
+                            if not start_path.exists():
+                                continue
+                            start = read_transport_envelope(start_path, self.key)
+                            prior = native_human_input_history(self.directory.parent.parent.parent,
+                                start["thread_id"], exclude_directory=self.directory)
+                            initial = start["parameters"]["input"][0]["text"]
+                            if human_input_identities((live_guidance_prompt(message),)).issubset(
+                                    human_input_identities((*prior, initial))):
+                                continue
                         write_transport_envelope(path, {"id": identity, "message": message}, self.key)
                 delay = 0.1
             except OwnerConflict as error:
+                if error.code == "human_input_delivery_pending":
+                    delay = 1
+                    continue
                 # Losing current execution authority stops this sender. It must
                 # never revive a terminal root or silently launch another turn.
                 try:

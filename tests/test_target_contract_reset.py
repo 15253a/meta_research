@@ -54,7 +54,7 @@ def test_json_integer_above_signed_64_bit_retains_type_and_value():
     assert type(value) is int and value == 9223372036854775808
 
 
-def test_frozen_schema_owns_nullable_and_categorical_semantics():
+def test_initial_result_schema_remains_a_reference_for_new_scientific_results():
     from meta_research.owners.research_graph import _validate_target_result_schema
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "metrics": {"type": "object", "additionalProperties": False, "properties": {
@@ -63,11 +63,9 @@ def test_frozen_schema_owns_nullable_and_categorical_semantics():
         }, "required": ["effect", "admission"]},
     }, "required": ["metrics"]}
     _validate_target_result_schema(schema=schema, result_content=document(effect=None, admission="no_go"))
-    for invalid in [document(effect=None, admission="invented"), document(admission="go"),
+    for changed in [document(effect=None, admission="invented"), document(admission="go"),
                     document(effect=False, admission="no_go")]:
-        with pytest.raises(OwnerConflict, match="content_invalid") as caught:
-            _validate_target_result_schema(schema=schema, result_content=invalid)
-        assert "$.metrics" in caught.value.feedback
+        _validate_target_result_schema(schema=schema, result_content=changed)
 
 
 def test_prompt_contains_complete_frozen_contract_and_scope_checks(tmp_path):

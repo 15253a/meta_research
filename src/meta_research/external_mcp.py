@@ -285,7 +285,8 @@ def _external_result(value: dict[str, Any]) -> dict[str, Any]:
             "content": [{"type": "text", "text": canonical_json(value)}]}
 
 
-def compose_external_mcp_prompt(prompt: str, snapshot: ExternalMcpOperationSnapshot) -> str:
+def compose_external_mcp_prompt(prompt: str, snapshot: ExternalMcpOperationSnapshot, *,
+                                resume=False, previous_prompts=(), ordered=False) -> str:
     context = []
     for frozen in snapshot.services:
         context.append(_external_service_overview(frozen))
@@ -296,6 +297,25 @@ def compose_external_mcp_prompt(prompt: str, snapshot: ExternalMcpOperationSnaps
     if snapshot.recovery_guidance is not None:
         value.update(root_kind=snapshot.root_kind, operation_key=snapshot.operation_key,
             configuration_revision=snapshot.configuration_revision, guidance=_TOOL_GUIDANCE + " " + _DISCOVERY_GUIDANCE)
+    if resume:
+        from meta_research.runtime_conditions import split_runtime_prompt
+        prior = []
+        for text in previous_prompts:
+            _, text = split_runtime_prompt(text)
+            rendered, _ = split_external_mcp_prompt(text)
+            if rendered:
+                prior.append(json.loads(rendered))
+        if ordered:
+            prior = prior[:1]
+        if prior and all(item["services"] == context and
+                         item.get("configuration_revision") == snapshot.configuration_revision for item in prior):
+            return prompt
+        if not prior and not context:
+            return prompt
+        current_ids = {item["service_id"] for item in context}
+        removed = sorted({item["service_id"] for old in prior for item in old["services"]} - current_ids)
+        value = {"services": context, "removed_service_ids": removed,
+                 "configuration_revision": snapshot.configuration_revision}
     rendered = canonical_json(value)
     return f"{_PREFIX}{len(rendered.encode())}):\n{rendered}\n\n{prompt}"
 

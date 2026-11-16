@@ -451,6 +451,71 @@ def compose_runtime_prompt(prompt: str, conditions: str) -> str:
     return f"{_PREFIX}{len(conditions)}]\n{conditions}\n\n{prompt}"
 
 
+def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ordered=False) -> str:
+    if not previous:
+        return conditions
+    current_values, current_directories = _runtime_prompt_values(conditions)
+    observed = [_runtime_prompt_values(value) for value in previous]
+    if not current_values and current_directories is None:
+        compared = previous[:1] if ordered else previous
+        return "" if all(value == conditions for value in compared) else conditions
+    updates = {}
+    for field, value in current_values.items():
+        if field == "research_time":
+            updates[field] = {key: value[key] for key in (
+                "budget_revision", "approved_seconds", "used_seconds", "remaining_seconds",
+                "overrun_seconds", "observed_at", "accuracy", "status", "budget_policy",
+                "accounting_corrections", "unknown_intervals") if key in value}
+        else:
+            known = [values[field] for values, _ in observed if field in values]
+            if ordered:
+                known = known[:1]
+            if not known or any(item != value for item in known):
+                updates[field] = value
+    lines = []
+    if updates:
+        lines.append("当前运行条件更新=" + json.dumps(updates, ensure_ascii=False, separators=(",", ":")))
+        if "research_style" in updates:
+            lines.append(render_research_style(updates["research_style"]))
+    if current_directories is not None:
+        prior_lists = [directories for _, directories in observed if directories is not None]
+        if ordered:
+            prior_lists = prior_lists[:1]
+        current_by_ref = {item["workspace_ref"]: item for item in current_directories}
+        known_refs = {item["workspace_ref"] for directories in prior_lists for item in directories}
+        changed = [item for ref, item in current_by_ref.items()
+                   if not prior_lists or any(item not in directories for directories in prior_lists)]
+        removed = sorted(known_refs - current_by_ref.keys())
+        if changed or removed:
+            lines.append("工作目录授权更新=" + json.dumps({"directories": current_directories,
+                "removed_workspace_refs": removed}, ensure_ascii=False, separators=(",", ":")))
+    return "\n".join(lines)
+
+
+def runtime_conditions_from_prompt(prompt: str) -> str:
+    from meta_research.external_mcp import split_external_mcp_prompt
+    _, prompt = split_external_mcp_prompt(prompt)
+    if prompt.startswith("Execution reading tools:\n"):
+        prompt = prompt.split("\n", 2)[2]
+    return split_runtime_prompt(prompt)[0]
+
+
+def _runtime_prompt_values(conditions):
+    values, directories = {}, None
+    for line in conditions.splitlines():
+        if line.startswith("当前运行条件更新="):
+            values.update(json.loads(line.split("=", 1)[1]))
+        elif line.startswith("{"):
+            value = json.loads(line)
+            if "quest_ref" in value and "revision" in value:
+                values.update(value)
+        if "Work directories: " in line:
+            directories = json.loads(line.split("Work directories: ", 1)[1])
+        elif line.startswith("工作目录授权更新="):
+            directories = json.loads(line.split("=", 1)[1])["directories"]
+    return values, directories
+
+
 def split_runtime_prompt(prompt: str) -> tuple[str, str]:
     if not prompt.startswith(_PREFIX):
         return "", prompt

@@ -447,17 +447,9 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         if request.runtime_binding != self.runtime_binding():
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         lineage = _plan_owner_rejection_prompt(request)
-        human_resume = (
-            ""
-            if request.native_session_ref is None
-            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
-            "human_request.open.reconcile，读取 resolution 后再判断"
-            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
-        )
         primary_prompt = (
             stage_position_prompt(request, "plan") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{_plan_skill_instructions()}\n\n"
-            f"{human_resume}"
             "Use research_graph.plan_evidence.page to browse further candidates and "
             "research_memory.plan_evidence.read with the exact commit/version/hash/role to read content. "
             "Discovery pages are bounded indexes, not an exhaustive history or an adopted set. "
@@ -500,6 +492,12 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"完整 IdeaSet={canonical_json(request.accepted_idea_set)}\n"
             f"provider_context_view={stage_context_json('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
+        ) if request.native_session_ref is None else (
+            "继续当前原生会话的 Plan 工作。处理本次反馈，交回完整候选。\n"
+            f"{lineage}"
+            f"stage_request_ref={request.stage_request_ref}\n"
+            f"context_pack_ref={request.context_pack_ref}\n"
+            "如缺少完成本次修正所需的材料，沿此冻结引用定向补读。\n"
         )
         primary_output, primary_session, _primary_stdout = (
             self._invoke_root_operation(

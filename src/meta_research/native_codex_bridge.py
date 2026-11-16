@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from meta_research.owners.common import canonical_hash
+from meta_research.human_guidance import live_guidance_prompt
 
 from meta_research.provider_supervisor import (
     read_transport_key_for_operation, read_transport_envelope, write_transport_envelope, read_supervisor_request,
@@ -228,7 +229,6 @@ class NativeCodexBridge:
             command_id = command.get("id")
             if command_id != path.stem or not isinstance(command.get("message"), dict):
                 raise ValueError("native_guidance_command_invalid")
-            text = "正式人类指导变化（保留此前工作历史）：\n" + json.dumps(command["message"], ensure_ascii=False)
             result_path = path.with_suffix(".receipt")
             sending_path = path.with_suffix(".sending")
             if result_path.exists():
@@ -242,16 +242,19 @@ class NativeCodexBridge:
                     continue
                 self._next_reconcile[command_id] = time.monotonic() + 5
                 sent = read_transport_envelope(sending_path, self.key)
-                if sent != {"id": command_id, "thread_id": self.thread_id,
-                            "turn_id": self.turn_id, "text": text}:
+                if (set(sent) != {"id", "thread_id", "turn_id", "text"}
+                        or sent["id"] != command_id or sent["thread_id"] != self.thread_id
+                        or sent["turn_id"] != self.turn_id
+                        or not isinstance(sent["text"], str) or not sent["text"]):
                     raise ValueError("native_guidance_send_identity_invalid")
-                observed = self._observed_input(command_id, text)
+                observed = self._observed_input(command_id, sent["text"])
                 if observed:
                     self._save_state(result_path, {**sent, "status": "accepted", "reconciled": True})
                     self._seen.add(command_id)
                 # Absence from a live or partial history is no proof of failed
                 # delivery. Keep the original send unresolved; never retransmit.
                 continue
+            text = live_guidance_prompt(command["message"])
             sent = {"id": command_id, "thread_id": self.thread_id,
                     "turn_id": self.turn_id, "text": text}
             self._save_state(sending_path, sent)

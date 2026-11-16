@@ -8,11 +8,47 @@ from meta_research.human_guidance import (
     FrozenGuidanceBinding, GuidanceRuntimeScope, StageGuidanceOperation,
     TargetGuidanceOperation, VerifiedGuidanceWork,
 )
-from meta_research.owners.common import OwnerConflict, decoded_object
+from meta_research.owners.common import OwnerConflict, canonical_hash, decoded_object
 from meta_research.provider_supervisor import provider_operation_ref
 
 
 class GuidanceRuntimeMixin:
+    def root_human_response_events(self, scope: GuidanceRuntimeScope):
+        verified = self._verify_root_agent_runtime_scope(**scope.as_dict(),
+            allowed_statuses=frozenset({"admitted", "executed", "running", "suspended"}))
+        with self._database.read() as connection:
+            effects = connection.execute(text(
+                "SELECT request_ref, effect_id, operation_binding_json, operation_binding_hash "
+                "FROM owner_human_request_open_effects WHERE issuer='agent_runtime' "
+                "AND waiter_ref=:waiter ORDER BY created_at, request_ref"
+            ), {"waiter": "root_run:" + scope.run_ref}).all()
+        events = []
+        for effect in effects:
+            binding = decoded_object(effect.operation_binding_json)
+            if canonical_hash(binding) != effect.operation_binding_hash:
+                raise OwnerConflict("root_human_request_operation_binding_invalid")
+            if (binding.get("root_kind") != scope.root_kind
+                    or binding.get("task_ref") != scope.run_ref
+                    or binding.get("root_session_ref") != scope.root_session_ref
+                    or binding.get("quest_ref") != verified["quest_ref"]):
+                continue
+            request = self.query_human_request(effect.request_ref)
+            if request is None or request.get("current") is not True:
+                continue
+            for response in request["responses"]:
+                delivery = response.get("delivery")
+                events.append({
+                    "kind": "human_request_response", "request_ref": effect.request_ref,
+                    "response_ref": response["response_ref"], "effect_id": effect.effect_id,
+                    "prepared_at": response["created_at"],
+                    "decision": response["decision"], "note": response["note"],
+                    "facts": response["facts"],
+                    **({"delivery": {name: delivery[name] for name in
+                        ("reply_file", "uploaded_files", "linked_locators", "work_materials") if name in delivery}}
+                       if isinstance(delivery, dict) else {}),
+                })
+        return events
+
     def verify_stage_guidance_operation(self, operation: StageGuidanceOperation) -> VerifiedGuidanceWork:
         scope = operation.scope
         name = operation.operation_name

@@ -438,16 +438,21 @@ class ReasoningStageWorker:
         rejected = self._agent_runtime.query_reasoning_continuation_rejections(run.autonomous_checkpoint.checkpoint_ref, phase)
         operation_ref = "reasoning-continuation_" + canonical_hash({"base_job_ref": base_job_ref, "phase": phase, "revision": len(rejected)})
         job_ref = self._agent_runtime.root_provider_continuation_job_ref(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, root_session_ref=run.root_session_ref, base_job_ref=operation_ref)
+        feedback_by_rejection = tuple(
+            tuple(item.get("feedback", [
+                "The previous completion was rejected: " + item["detail_code"]
+                + ". Correct the full output and resubmit in this same Session."
+            ])) for item in rejected
+        )
         return replace(
             self._skill_request(request, run, job_ref=job_ref),
+            continuation_predecessor_job_ref=(None if not rejected else rejected[-1]["job_ref"]),
             continuation_feedback=tuple(
                 feedback
-                for item in rejected
-                for feedback in item.get("feedback", [
-                    "The previous completion was rejected: " + item["detail_code"]
-                    + ". Correct the full output and resubmit in this same Session."
-                ])
+                for rejection in feedback_by_rejection
+                for feedback in rejection
             ),
+            current_continuation_feedback=(() if not feedback_by_rejection else feedback_by_rejection[-1]),
         )
 
     def _execute_attempt(

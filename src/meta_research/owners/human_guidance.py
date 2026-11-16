@@ -19,6 +19,13 @@ from meta_research.quest_goal import ResearchRoot
 
 
 class HumanGuidanceMixin:
+    def root_input_order(self, scope):
+        return self._agent_runtime.query_root_input_order(
+            run_ref=scope.run_ref, root_session_ref=scope.root_session_ref)
+
+    def human_response_events(self, *, scope):
+        return self._agent_runtime.root_human_response_events(scope)
+
     def prepare_live_guidance(self, *, scope, binding):
         from meta_research.owners.live_guidance import prepare_live_guidance
         return prepare_live_guidance(self, scope=scope, binding=binding)

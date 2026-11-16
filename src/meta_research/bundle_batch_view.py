@@ -54,6 +54,59 @@ def _brief_plan_bindings(plan, completion):
 _READ_OP = "research_memory.stage_context.read"
 _LIMIT = 16384
 
+
+def target_reading_record(record):
+    value = deepcopy(record)
+    spec = value.get("spec")
+    if isinstance(spec, dict) and value.get("candidate") == spec.get("candidate"):
+        value.pop("candidate", None)
+    return value
+
+
+def bundle_record_hash(record, field):
+    value = target_reading_record(record) if field == "current_targets" else record
+    if field == "current_targets":
+        value = {name: content for name, content in value.items() if name not in {
+            "dispatch_allowed", "human_request_ref", "human_request_status", "human_request_command",
+        }}
+    return canonical_hash(value)
+
+
+def continued_target_record(record):
+    value = {name: deepcopy(content) for name, content in record.items()
+             if name not in {"spec", "candidate"}}
+    candidate = record.get("spec", {}).get("candidate", record.get("candidate", {}))
+    if isinstance(candidate, dict):
+        value["accepted_candidate"] = {name: deepcopy(candidate[name]) for name in (
+            "local_label", "experiment_keys", "measurement_unit_keys", "held_fixed_bindings",
+        ) if name in candidate}
+    return value
+
+
+def continue_batch_reading_context(view, delivered):
+    value = deepcopy(view)
+    for field, key in (("current_targets", "target_ref"), ("target_commits", "commit_ref")):
+        readers = {entry[key] for entry in value.get("responsibility_index", {}).get(field, ())
+                   if entry.get("reader") is not None}
+        records = value.get(field, ())
+        counts = {}
+        for record in records:
+            counts[record[key]] = counts.get(record[key], 0) + 1
+        previous, current = [], []
+        for record in records:
+            known = (record[key] in readers and counts[record[key]] == 1
+                     and bundle_record_hash(record, field) in delivered.get(field, ()))
+            (previous if known else current).append(record)
+        if not previous:
+            continue
+        value[field] = current
+        if field == "current_targets":
+            value["known_current_targets"] = [continued_target_record(record) for record in previous]
+        else:
+            value["known_target_commit_refs"] = [record[key] for record in previous]
+    return value
+
+
 def _full_reading_view(prompt_context):
     return {name: value for name, value in prompt_context.items()
             if name not in _EXCLUDED_RUNTIME_KEYS}
@@ -133,7 +186,6 @@ def render_delta_batch_reading_context(request, prompt_context, *, verified_plan
     full = _full_reading_view(prompt_context)
     plan_verified = _plan_verified(request, prompt_context, verified_plan_reader)
     if (not request.native_session_ref or request.native_replacement_context is not None
-            or request.provider_feedback is not None
             or (not plan_verified and not verified_source_readers)):
         return deepcopy(full)
     completion = request.initial_target_plan.get("completion_contract")
