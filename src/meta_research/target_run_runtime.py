@@ -513,14 +513,7 @@ class TargetRunRuntime:
                 return self._resume_after_rejection(
                     handle=handle,
                     harness_request_ref=harness.harness_request_ref,
-                    candidate=candidate,
-                    formal_plan=formal_plan,
-                    launch=launch,
-                    frozen_input_manifest_path=(
-                        frozen_input_paths[0] if frozen_input_paths else None
-                    ),
                     revision=revision,
-                    source_spec_hash=candidate_projection.source_spec_hash,
                 )
             return getattr(revision, "status", None) == "completed"
 
@@ -531,25 +524,26 @@ class TargetRunRuntime:
                 "target_run_mcp_endpoint_unavailable",
             )
             return False
-        # The authority binds the accepted source spec. The launch binding
-        # identifies its execution projection and therefore has a different hash.
-        prompt = self._root_prompt(
-            research_context=self._reading_research_context(handle.target_ref,
-                frozen_input_paths[0] if frozen_input_paths else None),
-            execution_contract=target_execution_context(
-                authority=self._research_graph.query_target_measurement_domain_authority(handle.target_ref),
-                target_ref=handle.target_ref,
-                graph_ref=launch.graph_ref,
-                target_spec_hash=candidate_projection.source_spec_hash,
-            ),
-            handle=handle,
-            candidate=candidate,
-            formal_plan=formal_plan,
-            launch=launch,
-            frozen_input_manifest_path=(
-                frozen_input_paths[0] if frozen_input_paths else None
-            ),
-        )
+        if getattr(harness, "native_session_ref", None) is not None:
+            prompt = self._continuation_prompt(handle=handle)
+        else:
+            prompt = self._root_prompt(
+                research_context=self._reading_research_context(handle.target_ref,
+                    frozen_input_paths[0] if frozen_input_paths else None),
+                execution_contract=target_execution_context(
+                    authority=self._research_graph.query_target_measurement_domain_authority(handle.target_ref),
+                    target_ref=handle.target_ref,
+                    graph_ref=launch.graph_ref,
+                    target_spec_hash=candidate_projection.source_spec_hash,
+                ),
+                handle=handle,
+                candidate=candidate,
+                formal_plan=formal_plan,
+                launch=launch,
+                frozen_input_manifest_path=(
+                    frozen_input_paths[0] if frozen_input_paths else None
+                ),
+            )
         try:
             self._harnesses.run_or_resume_target_root(
                 harness.harness_request_ref,
@@ -572,14 +566,7 @@ class TargetRunRuntime:
                 return self._resume_after_rejection(
                     handle=handle,
                     harness_request_ref=harness.harness_request_ref,
-                    candidate=candidate,
-                    formal_plan=formal_plan,
-                    launch=launch,
-                    frozen_input_manifest_path=(
-                        frozen_input_paths[0] if frozen_input_paths else None
-                    ),
                     revision=revision,
-                    source_spec_hash=candidate_projection.source_spec_hash,
                 )
             return getattr(revision, "status", None) == "completed"
         self._set_status(target_ref, "root_turn_completed")
@@ -654,12 +641,7 @@ class TargetRunRuntime:
         *,
         handle: TargetWorkHandle,
         harness_request_ref: str,
-        candidate: TargetCandidate,
-        formal_plan: FormalPlan,
-        launch: object,
-        frozen_input_manifest_path: str | None,
         revision: object,
-        source_spec_hash: str,
     ) -> bool:
         """Wake the same native root Session with one issuer-owned rejection."""
 
@@ -679,19 +661,8 @@ class TargetRunRuntime:
             "code": getattr(revision, "pending_code"),
             "feedback": getattr(revision, "rejection_feedback"),
         }
-        prompt = self._root_prompt(
-            research_context=self._reading_research_context(handle.target_ref, frozen_input_manifest_path),
-            execution_contract=target_execution_context(
-                authority=self._research_graph.query_target_measurement_domain_authority(handle.target_ref),
-                target_ref=handle.target_ref,
-                graph_ref=launch.graph_ref,
-                target_spec_hash=source_spec_hash,
-            ),
+        prompt = self._continuation_prompt(
             handle=handle,
-            candidate=candidate,
-            formal_plan=formal_plan,
-            launch=launch,
-            frozen_input_manifest_path=frozen_input_manifest_path,
             revision_request=revision_request,
         )
         try:
@@ -710,6 +681,24 @@ class TargetRunRuntime:
             return False
         self._set_status(handle.target_ref, "root_revision_turn_completed")
         return True
+
+    @staticmethod
+    def _continuation_prompt(
+        *,
+        handle: TargetWorkHandle,
+        revision_request: dict[str, object] | None = None,
+    ) -> str:
+        material = {
+            "target_ref": handle.target_ref,
+            "target_run_ref": handle.target_run_ref,
+        }
+        if revision_request is None:
+            return "继续本 Target 尚未完成的工作，完成后按原交接合同提交。\n" + canonical_json(material)
+        return (
+            "本次交接未通过接纳。针对以下反馈修正 outputs/result.json 及实际受影响的工作，"
+            "保留已成立的研究、来源和产物，按原交接合同重新提交。\n"
+            + canonical_json({**material, "owner_revision_request": revision_request})
+        )
 
     def _reading_research_context(self, target_ref, frozen_input_manifest_path):
         # Research explanations can acquire later immutable versions. Keep
@@ -732,7 +721,6 @@ class TargetRunRuntime:
         formal_plan: FormalPlan,
         launch: object,
         frozen_input_manifest_path: str | None,
-        revision_request: dict[str, object] | None = None,
         research_context: dict[str, object] | None = None,
     ) -> str:
         research = dict(research_context or {})
@@ -769,7 +757,6 @@ class TargetRunRuntime:
                 proof.input_ref for proof in handle.accepted_input_asset_proofs
             ],
             "frozen_input_manifest_path": frozen_input_manifest_path,
-            "owner_revision_request": revision_request,
             "completion_binding": {
                 "owner": "system",
                 "required_workspace_paths": {
@@ -799,8 +786,7 @@ class TargetRunRuntime:
             STAGE_CONTEXT_DELIVERY_GUIDANCE +
             target_execution_skill_text() + "\n\n"
             "下列 research_context 与 execution_contract 携带本 Target 适用的 Owner 冻结科学正文与合同。"
-            "按角色方法在本次范围内实施或恢复；owner_revision_request 存在时修正其具体反馈，"
-            "保留已成立的研究、来源和产物，仅重做被变更失效的工作。"
+            "按角色方法在本次范围内实施或恢复，保留已成立的研究、来源和产物。"
             "最终交接前完成独立子智能体审阅，按 completion_binding 交付真实文件、结果及未完成事项。"
             "frozen_input_manifest_path 是实际冻结原件的只读绝对路径；inputs/manifest.json 只是指针。"
             "缺少必需依据时保留准确来源和阻塞，继续可独立推进的已授权工作。\n\n"

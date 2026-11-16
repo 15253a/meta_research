@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from provider_supervisor_support import closed_tree_fixture
 
 from meta_research.bundle_contract import (
     MAX_BUNDLE_TARGET_PLAN_BYTES,
@@ -544,12 +545,14 @@ class _SequenceRunner:
                         "item": item,
                     }
                 )
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             0,
             stdout="\n".join(json.dumps(event) for event in events),
             stderr="",
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
     def run_job(
         self,
@@ -572,7 +575,7 @@ class _LargeSequenceRunner(_SequenceRunner):
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         completed = super().__call__(argv, prompt, timeout, environment)
-        return subprocess.CompletedProcess(
+        large = subprocess.CompletedProcess(
             completed.args,
             completed.returncode,
             stdout=completed.stdout
@@ -580,6 +583,8 @@ class _LargeSequenceRunner(_SequenceRunner):
             + "x" * (16 * 1024 * 1024 + 4096),
             stderr=completed.stderr,
         )
+        large.process_tree = completed.process_tree
+        return large
 
 
 class _DurableLimitProbe(_CancellableProcessRunner):

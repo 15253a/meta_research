@@ -4,7 +4,7 @@ from contextlib import ExitStack
 from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpOperationSnapshot, ExternalMcpRuntime, compose_external_mcp_prompt
 from meta_research.external_mcp_client import ExternalMcpClientError
 
-from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, GuidanceOperationIdentity, TargetGuidanceOperation, GUIDANCE_OPERATION_IDS, guidance_prompt)
+from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, GuidanceOperationIdentity, TargetGuidanceOperation, GUIDANCE_OPERATION_IDS, guidance_prompt, human_response_prompt)
 from meta_research.native_guidance import live_guidance_operation
 
 import hashlib
@@ -83,7 +83,8 @@ from meta_research.target_raw_output import (
     TargetRawOutputStore,
     TargetRawOutputUnavailable,
 )
-from meta_research.runtime_conditions import compose_runtime_prompt, render_runtime_conditions, selected_stage_model
+from meta_research.runtime_conditions import (compose_runtime_prompt, render_runtime_conditions, selected_stage_model,
+    resume_runtime_conditions, runtime_conditions_from_prompt)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -2098,7 +2099,7 @@ class HarnessRuntime:
             raise HarnessAdmissionError("target_run_workspace_unavailable")
         return workspace_ref, path
 
-    def _target_work_prompt(self, prompt, admission, request, workspace_ref, directory):
+    def _target_work_prompt(self, prompt, admission, request, workspace_ref, directory, *, resume=False):
         conditions = render_runtime_conditions(directory, run_ref=admission.run.run_ref, target_ref=request.target_ref)
         if self._root_workspaces is not None:
             try:
@@ -2106,6 +2107,10 @@ class HarnessRuntime:
                     request.target_ref, workspace_ref, directory)
             except Exception as error:
                 raise HarnessAdmissionError(str(getattr(error, "code", "target_run_workspace_unavailable"))) from error
+        if resume:
+            prior = self._owner.prior_target_inputs(admission.run.run_ref)
+            conditions = resume_runtime_conditions(conditions,
+                tuple(value for text in prior if (value := runtime_conditions_from_prompt(text))), ordered=True)
         return compose_runtime_prompt(prompt, conditions)
 
     def _operation_requires_resume(self, request_ref: str) -> bool:
@@ -2179,7 +2184,20 @@ class HarnessRuntime:
             except Exception as error:
                 raise HarnessAdmissionError(str(getattr(error, "code", "guidance_preparation_failed"))) from error
             guidance_binding = cut.binding
-            prompt += guidance_prompt(cut)
+            prior = self._owner.prior_target_inputs(admission.run.run_ref) if resume else ()
+            if resume:
+                history_reader = getattr(self._adapters[request.harness_family], "native_human_input_history", None)
+                if callable(history_reader):
+                    try:
+                        prior += history_reader(admission.run.native_session_ref)
+                    except Exception as error:
+                        if getattr(error, "code", None) == "human_input_delivery_pending":
+                            raise HarnessAdmissionError("provider_outcome_unknown") from error
+                        raise
+            scope = GuidanceRuntimeScope("target", admission.run.run_ref, admission.run.attempt_ref,
+                admission.run.root_session_ref, admission.run.fence_ref, admission.run.capability_binding_hash)
+            prompt += human_response_prompt(self._human_guidance_authority, scope, prior)
+            prompt += guidance_prompt(cut, previous_prompts=prior)
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )
@@ -2193,17 +2211,19 @@ class HarnessRuntime:
                 model_ref = selected_stage_model(working_directory, "target", run_ref=admission.run.run_ref,
                                                  target_ref=request.target_ref, default=request.model_ref)
             request = replace(request, model_ref=model_ref)
-            prompt = self._target_work_prompt(prompt, admission, request, workspace_ref, working_directory)
+            prompt = self._target_work_prompt(prompt, admission, request, workspace_ref, working_directory, resume=resume)
         external_snapshot = None
         if isinstance(request, TargetHarnessRequest) and self._external_mcp is not None:
             try:
                 # These hints belong to a new operation's durable prompt snapshot.
                 from meta_research.target_execution_contract import target_execution_reading_prompt
-                if working_directory is not None:
+                if working_directory is not None and not resume:
                     prompt = target_execution_reading_prompt(prompt, working_directory)
                 external_snapshot = self._external_mcp.operation_snapshot(operation_identity=operation_ref,
                     root_kind="target", task_prompt=prompt)
-                prompt = compose_external_mcp_prompt(prompt, external_snapshot)
+                prompt = compose_external_mcp_prompt(prompt, external_snapshot, resume=resume,
+                    previous_prompts=self._owner.prior_target_inputs(admission.run.run_ref) if resume else (),
+                    ordered=True)
             except (ExternalMcpError, ExternalMcpClientError) as error:
                 raise HarnessAdmissionError(error.code) from error
         invocation_material = _turn_invocation_material(

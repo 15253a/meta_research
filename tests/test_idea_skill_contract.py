@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from dataclasses import replace
 from importlib.resources import files
 import json
@@ -12,6 +13,8 @@ import threading
 import time
 
 import pytest
+
+from provider_supervisor_support import closed_tree_fixture
 
 from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
@@ -38,6 +41,7 @@ from meta_research.semantic_owner_gateway import (
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     ProviderSupervisorError,
+    SupervisorFileLock,
     read_transport_envelope,
     write_transport_envelope,
 )
@@ -523,7 +527,7 @@ class _SequenceRunner:
                         agent_status="completed",
                     )
                 )
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             0,
             stdout="\n".join(
@@ -531,6 +535,8 @@ class _SequenceRunner:
             ),
             stderr="",
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
     def run_job(
         self, job_ref: str, argv: list[str], prompt: str, timeout: float
@@ -735,12 +741,14 @@ class _Codex0147LossyReviewRunner:
         )
         assert len(lossy_stdout) == 7
         assert not any("spawn" in json.dumps(event) for event in lossy_stdout)
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             0,
             stdout="\n".join(json.dumps(event) for event in lossy_stdout),
             stderr="",
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
     def _write_ledgers(
         self,
@@ -1182,7 +1190,7 @@ class _ExitFailureRunner:
             json.dumps(_provider_idea_message(_idea_set()), ensure_ascii=False),
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             17,
             stdout=json.dumps(
@@ -1190,6 +1198,8 @@ class _ExitFailureRunner:
             ),
             stderr="provider failed after writing an output",
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
     def run_job(
         self, job_ref: str, argv: list[str], prompt: str, timeout: float
@@ -1203,7 +1213,7 @@ class _ConflictingExitFailureRunner(_ExitFailureRunner):
         self, argv: list[str], prompt: str, timeout: float
     ) -> subprocess.CompletedProcess[str]:
         completed = super().__call__(argv, prompt, timeout)
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             completed.args,
             completed.returncode,
             stdout="\n".join(
@@ -1219,6 +1229,8 @@ class _ConflictingExitFailureRunner(_ExitFailureRunner):
             ),
             stderr=completed.stderr,
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
 
 class _DetachedSupervisorRunner:
@@ -1292,7 +1304,7 @@ class _MultipleNativeSessionRunner(_SequenceRunner):
         self, argv: list[str], prompt: str, timeout: float
     ) -> subprocess.CompletedProcess[str]:
         completed = super().__call__(argv, prompt, timeout)
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             completed.args,
             completed.returncode,
             stdout="\n".join(
@@ -1308,6 +1320,8 @@ class _MultipleNativeSessionRunner(_SequenceRunner):
             ),
             stderr=completed.stderr,
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
 
 @pytest.fixture(autouse=True)
@@ -2480,7 +2494,7 @@ def test_graceful_stop_leaves_a_signed_provider_termination(
     assert forbidden_replay.calls == []
 
 
-def test_cleanup_terminates_provider_orphaned_by_supervisor_crash(
+def test_cleanup_requires_terminal_proof_after_supervisor_crash(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "orphaned-supervisor-provider"
@@ -2502,30 +2516,41 @@ def test_cleanup_terminates_provider_orphaned_by_supervisor_crash(
         job_ref=job_ref,
     )
 
-    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_io_unavailable"):
-        adapter.generate_draft(request)
-    operation = next(workspace.glob("provider-operations/*/primary"))
-    deadline = time.monotonic() + 5
-    while not (operation / "provider-started.json").is_file():
-        if time.monotonic() >= deadline:
-            raise AssertionError("provider process marker was not published")
-        time.sleep(0.01)
-    marker = json.loads(
-        (operation / "provider-started.json").read_text(encoding="utf-8")
-    )["payload"]
-    provider_process_id = int(marker["provider_process_id"])
-    assert runner.process is not None
-    os.kill(runner.process.pid, signal.SIGKILL)
-    runner.process.wait(timeout=2)
-    assert not (operation / "supervisor-exit.json").exists()
+    # Adopt this fixture's helper after deliberately killing its supervisor so
+    # cleanup can reap it; this is not evidence authorizing host reconciliation.
+    libc = ctypes.CDLL(None, use_errno=True)
+    prior_subreaper = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(prior_subreaper), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    provider_process_id = None
+    try:
+        with pytest.raises(IdeaSkillUnavailable, match="codex_cli_io_unavailable"):
+            adapter.generate_draft(request)
+        operation = next(workspace.glob("provider-operations/*/primary"))
+        deadline = time.monotonic() + 5
+        while not (operation / "provider-started.json").is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError("provider process marker was not published")
+            time.sleep(0.01)
+        marker = json.loads(
+            (operation / "provider-started.json").read_text(encoding="utf-8")
+        )["payload"]
+        provider_process_id = int(marker["provider_process_id"])
+        assert runner.process is not None
+        os.kill(runner.process.pid, signal.SIGKILL)
+        runner.process.wait(timeout=2)
+        assert not (operation / "supervisor-exit.json").exists()
 
-    assert adapter.reconcile_cancelled_job(job_ref) is True
-    deadline = time.monotonic() + 2
-    while Path(f"/proc/{provider_process_id}").exists():
-        if time.monotonic() >= deadline:
-            raise AssertionError("orphaned provider survived cleanup reconciliation")
-        time.sleep(0.01)
-    assert not (operation / "supervisor-exit.json").exists()
+        assert adapter.reconcile_cancelled_job(job_ref) is False
+        assert not (operation / "supervisor-exit.json").exists()
+    finally:
+        if provider_process_id is not None:
+            os.kill(provider_process_id, signal.SIGTERM)
+            os.waitpid(provider_process_id, 0)
+        elif runner.process is not None:
+            runner.process.terminate()
+            runner.process.wait(timeout=5)
+        assert libc.prctl(36, prior_subreaper.value, 0, 0, 0) == 0
 
 
 def test_durable_job_cancel_survives_daemon_runner_replacement(
@@ -2663,7 +2688,7 @@ def test_durable_supervisor_rejects_old_operation_schemas(
     assert not (operation / "completed.json").exists()
 
 
-def test_cancelled_prelaunch_operation_becomes_safe_after_startup_window(
+def test_cancelled_prelaunch_operation_requires_exclusive_launch_fence(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "prelaunch-cancel-provider"
@@ -2687,10 +2712,8 @@ def test_cancelled_prelaunch_operation_becomes_safe_after_startup_window(
     operation = next(workspace.glob("provider-operations/*/primary"))
     request_path = operation / "supervisor-request.json"
     assert request_path.is_file()
-    assert adapter.reconcile_cancelled_job(job_ref) is False
-
-    # Simulate a restart after the runner's persisted five-second launch window.
-    os.utime(request_path, (0, 0))
+    with SupervisorFileLock(operation / "supervisor.lock"):
+        assert adapter.reconcile_cancelled_job(job_ref) is False
     assert adapter.reconcile_cancelled_job(job_ref) is True
     assert not (operation / "supervisor-ready.json").exists()
     assert not (operation / "provider-started.json").exists()

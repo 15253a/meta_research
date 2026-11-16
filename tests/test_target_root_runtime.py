@@ -125,6 +125,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
                 execution_attempt_ref=handle.execution_attempt_ref,
                 execution_fence_ref=handle.execution_fence_ref,
                 harness_request_ref="target-harness-request-root",
+                native_session_ref=None,
             )
 
         def query_target_root_completion_evidence(self, target_ref: str):
@@ -135,6 +136,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
             assert request_ref == "target-harness-request-root"
             assert set(values) == {"prompt", "mcp_base_url"}
             self.root_calls.append((request_ref, values))
+            target_agent.harness.native_session_ref = "target-native-root"
             if len(self.root_calls) == 2:
                 self.evidence = SimpleNamespace(evidence_ref="root-evidence")
             return SimpleNamespace(status="executed")
@@ -190,7 +192,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
         assert runtime.query_status(handle.target_ref).phase == expected_phase  # type: ignore[union-attr]
 
     assert len(harnesses.root_calls) == 2
-    for _request_ref, values in harnesses.root_calls:
+    for _request_ref, values in harnesses.root_calls[:1]:
         prompt = values["prompt"]
         source = Path(prompt.split("Skill source: ", 1)[1].splitlines()[0])
         method = source.read_text(encoding="utf-8")

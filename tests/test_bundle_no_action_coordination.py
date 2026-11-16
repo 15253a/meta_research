@@ -232,13 +232,15 @@ def test_wait_preserves_batch_opportunity_after_new_inbox_generation(tmp_path, r
             from meta_research.idea_skill import IdeaSkillUnavailable
             from test_bundle_input_drift_recovery import _adapter
             from test_bundle_skill_adapter import _inbox_checkpoint
-            output = {"strategy_update": provider.valid_batch.strategy_update,
+            output = {"action": "propose_targets", "replan_basis": None,
+                      "strategy_update": {**provider.valid_batch.strategy_update, "notes": ""},
                       "rationale": provider.valid_batch.rationale}
             adapter_root = tmp_path / "real-adapter"
             adapter_root.mkdir()
             adapter, transport = _adapter(adapter_root, output, durable=True,
                 native_session_ref=run.native_session_ref)
-            rejected = {"strategy_update": {**provider.valid_batch.strategy_update, "candidates": []},
+            rejected = {"action": "propose_targets", "replan_basis": None,
+                        "strategy_update": {**output["strategy_update"], "candidates": []},
                         "rationale": "The original batch has no actionable work."}
             transport._outputs = iter([rejected, output])
             binding = adapter.runtime_binding()
@@ -253,7 +255,7 @@ def test_wait_preserves_batch_opportunity_after_new_inbox_generation(tmp_path, r
             new_request = replace(provider.batches[-1], runtime_binding=binding)
             assert new_request.job_ref != original_request.job_ref
             accepted = adapter.propose_target_batch(new_request)
-            assert accepted.strategy_update == provider.valid_batch.strategy_update
+            assert accepted.strategy_update == output["strategy_update"]
             assert len(transport.calls) == 2
             assert {name: (original_directory / name).read_bytes() for name in original_bytes} == original_bytes
     finally:

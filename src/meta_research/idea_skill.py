@@ -12,6 +12,7 @@ from meta_research.sealed_provider_operations import (
     read_completed_operation as _read_completed_operation,
     _read_result_text as _read_idea_result,
     read_business_input as _read_operation_business_input,
+    completed_native_inputs,
     read_invocation as _read_operation_invocation,
     read_sealed_invocation as _read_sealed_operation_invocation,
     read_spool_text as _read_spool_text,
@@ -32,13 +33,13 @@ from meta_research.sealed_provider_operations import (
 )
 
 from meta_research.resource_preparation import resource_preparation, prepared_resource, resource_bytes, resource_sha256
-from meta_research.native_guidance import native_guidance_operation, bind_live_guidance, live_native_argv
+from meta_research.native_guidance import native_guidance_operation, bind_live_guidance, live_native_argv, native_human_input_history
 
 from contextlib import ExitStack
 from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpRuntime, compose_external_mcp_prompt
 from meta_research.external_mcp_client import ExternalMcpClientError
 
-from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, StageGuidanceOperation, GUIDANCE_ROOT_KINDS, guidance_prompt)
+from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, StageGuidanceOperation, GUIDANCE_ROOT_KINDS, guidance_prompt, human_response_prompt)
 
 from meta_research.context_presentation import stage_context_json, stage_position_prompt, STAGE_CONTEXT_DELIVERY_GUIDANCE
 from meta_research.root_workspace import RootWorkspaces, WorkspaceBinding
@@ -68,6 +69,7 @@ from typing import Callable, Protocol, cast
 from meta_research.system_prompt import read_output_language
 from meta_research.runtime_conditions import (
     compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt, selected_stage_model,
+    resume_runtime_conditions,
 )
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
@@ -87,7 +89,7 @@ from meta_research.idea_contract import (
     validate_idea_outcome,
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
-from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
@@ -1108,7 +1110,7 @@ class CodexIdeaSkillAdapter:
 
     def _prepare_stage_guidance(self, *, run_ref, attempt_ref, root_session_ref,
             fence_ref, runtime_binding_hash, job_ref, operation_name, prompt, resident=True,
-            include_body=False, include_direction=False):
+            include_body=False, include_direction=False, native_session_ref=None):
         authority = self._human_guidance_authority
         if authority is None or self._root_agent_kind not in GUIDANCE_ROOT_KINDS:
             return prompt, None
@@ -1122,8 +1124,21 @@ class CodexIdeaSkillAdapter:
         except Exception as error:
             raise IdeaSkillUnavailable(str(getattr(error, "code", "guidance_preparation_failed"))) from error
         bind_live_guidance(authority, operation.scope, cut.binding)
+        directory = self._workspace / "provider-operations" / canonical_hash({"job_ref": job_ref}) / operation_name
+        if (directory / "invocation.json").exists():
+            return prompt, cut.binding
+        prior, _ = self._prior_native_inputs(native_session_ref, run_ref=run_ref,
+            root_session_ref=root_session_ref, exclude_directory=directory)
+        if native_session_ref is not None:
+            try:
+                prior += native_human_input_history(self._workspace, native_session_ref, exclude_directory=directory)
+            except OwnerConflict as error:
+                if error.code == "human_input_delivery_pending":
+                    raise IdeaSkillUnavailable("codex_operation_reconciliation_pending") from error
+                raise
+        prompt += human_response_prompt(authority, operation.scope, prior)
         return prompt + guidance_prompt(cut, resident=resident, include_body=include_body,
-                                        include_direction=include_direction), cut.binding
+                                        include_direction=include_direction, previous_prompts=prior), cut.binding
 
     def bind_resident_mcp_authority(
         self, authority: RootResidentMcpAuthority
@@ -1764,17 +1779,9 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         skill = _idea_skill_instructions()
         lineage = _idea_owner_rejection_prompt(request)
-        human_resume = (
-            ""
-            if request.native_session_ref is None
-            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
-            "human_request.open.reconcile，读取 resolution 后再判断"
-            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
-        )
         primary_prompt = (
             stage_position_prompt(request, "idea") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{skill}\n\n"
-            f"{human_resume}"
             "在当前原根连续完成研究、自主组织原生子智能体独立审阅、聚合反馈并修订后，"
             "交回最终完整候选；根承担最终判断，不提前返回草稿等待系统再次启动审阅。"
             "你是 Idea 主 Agent。只返回 {\"outcome\": ...}，其中 outcome 是一个完整 "
@@ -1800,6 +1807,12 @@ class CodexIdeaSkillAdapter:
             f"runtime_binding={canonical_json(request.runtime_binding.as_dict())}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"provider_context_view={stage_context_json('idea', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
+        ) if request.native_session_ref is None else (
+            "继续当前原生会话的 Idea 工作。处理本次反馈，交回完整候选。\n"
+            f"{lineage}"
+            f"stage_request_ref={request.stage_request_ref}\n"
+            f"context_pack_ref={request.context_pack_ref}\n"
+            "如缺少完成本次修正所需的材料，沿此冻结引用定向补读。\n"
         )
         primary_output, primary_session, _primary_stdout = (
             self._invoke_root_operation(
@@ -1927,6 +1940,15 @@ class CodexIdeaSkillAdapter:
         execution_access_mode: str | None = None,
         execution_write_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
+        if operation_input is None and job_ref is not None:
+            path = (self._workspace / "provider-operations"
+                    / canonical_hash({"job_ref": job_ref}) / operation_name / "invocation.json")
+            if not path.exists():
+                operation_input = {"kind": "root_prompt", "prompt": prompt}
+            else:
+                _, key = self._transport_key()
+                if "operation_input_hash" in _read_sealed_operation_invocation(path, key=key):
+                    operation_input = {"kind": "root_prompt", "prompt": prompt}
         if runtime_binding_hash is None and runtime_binding is not None:
             runtime_binding_hash = canonical_hash(runtime_binding)
         prompt, guidance_binding = self._prepare_stage_guidance(
@@ -1934,6 +1956,7 @@ class CodexIdeaSkillAdapter:
             fence_ref=fence_ref, runtime_binding_hash=runtime_binding_hash,
             job_ref=job_ref, operation_name=operation_name, prompt=prompt,
             resident=self._root_resident_mcp.enabled,
+            native_session_ref=native_session_ref,
         )
         if not self._root_resident_mcp.enabled:
             return self._invoke(
@@ -2073,11 +2096,54 @@ class CodexIdeaSkillAdapter:
             sandbox_read_root=sandbox_read_root,
         )
 
-    def _turn_conditions(self, runner, run_ref, workspace_binding):
+    def _prior_native_inputs(self, native_session_ref, *, run_ref=None, root_session_ref=None,
+                             exclude_directory=None):
+        if native_session_ref is None:
+            return (), False
+        _, key = self._transport_key()
+        authority = self._human_guidance_authority
+        order_reader = getattr(authority, "root_input_order", None)
+        order = None
+        if run_ref is not None and root_session_ref is not None and callable(order_reader):
+            from types import SimpleNamespace
+            order = order_reader(SimpleNamespace(run_ref=run_ref, root_session_ref=root_session_ref))
+        inputs = list(completed_native_inputs(self._workspace, native_session_ref,
+            key=key, exclude_directory=exclude_directory,
+            job_refs=None if order is None else {item[1] for item in order}))
+        if order is not None:
+            ranked = []
+            for invocation, _, text in inputs:
+                matches = []
+                for index, (unit_ref, operation_ref, attempt_ref, unit_kind) in enumerate(order):
+                    if invocation["job_ref"] != operation_ref:
+                        continue
+                    phase = invocation["operation_name"]
+                    if phase.startswith(("dispatch-", "target-batch-")):
+                        expected = "provider_unit_" + canonical_hash({"operation_ref": operation_ref,
+                            "operation_name": phase, "attempt_ref": attempt_ref})[:64]
+                        if expected != unit_ref:
+                            continue
+                    elif not (unit_kind.endswith("_" + phase)
+                              or phase == "autonomous-resume" and unit_kind == "reasoning_review"):
+                        continue
+                    matches.append(index)
+                if len(matches) == 1:
+                    ranked.append((matches[0], text))
+            return tuple(text for _, text in sorted(ranked)), True
+        return tuple(text for _, _, text in inputs), False
+
+    def _turn_conditions(self, runner, run_ref, workspace_binding, *, native_session_ref=None,
+                         exclude_directory=None):
         conditions = (getattr(runner, "runtime_conditions", None)
                       or render_runtime_conditions(self._workspace, run_ref=run_ref))
         if workspace_binding is not None and workspace_binding.location.cycle_ref and self._workspaces is not None:
             conditions += self._workspaces.native_directory_prompt(workspace_binding.location)
+        if native_session_ref is not None:
+            prior, ordered = self._prior_native_inputs(native_session_ref, run_ref=run_ref,
+                root_session_ref=workspace_binding.location.root_session_ref if workspace_binding else None,
+                exclude_directory=exclude_directory)
+            conditions = resume_runtime_conditions(conditions,
+                tuple(value for text in prior if (value := split_runtime_prompt(text)[0])), ordered=ordered)
         return conditions
 
     def _invoke(
@@ -2105,20 +2171,20 @@ class CodexIdeaSkillAdapter:
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
         )
-        if workspace_binding is not None and not workspace_binding.location.cycle_ref:
+        if native_session_ref is None and workspace_binding is not None and not workspace_binding.location.cycle_ref:
             prompt += ("\n\nYour working directory is " + str(workspace_binding.directory)
                        + ". Use native tools for your work files and inbox. "
                        "Use granted material operations for registered external inputs. "
                        "File presence does not admit a formal asset.")
         raw_schema = schema
-        if isinstance(raw_schema.get("oneOf"), list):
+        if native_session_ref is None and isinstance(raw_schema.get("oneOf"), list):
             prompt = (
                 f"{prompt}\n\nProvider transport envelope: return exactly "
                 f'{{"{_CODEX_ROOT_OUTPUT_KEY}": <domain output>}}. '
                 "The nested value is the requested domain output; do not add "
                 "any other root key."
             )
-        if _schema_contains_json_object_transport(raw_schema):
+        if native_session_ref is None and _schema_contains_json_object_transport(raw_schema):
             prompt = (
                 f"{prompt}\n\nProvider transport encoding: every schema field "
                 "described as a canonical JSON object string must contain a "
@@ -2152,7 +2218,10 @@ class CodexIdeaSkillAdapter:
                     snapshot = self._external_mcp.operation_snapshot(operation_identity=identity,
                         root_kind=self._root_agent_kind, task_prompt=prompt, binding=binding, legacy_empty=legacy)
                     if not legacy:
-                        prompt = compose_external_mcp_prompt(prompt, snapshot)
+                        prior, ordered = self._prior_native_inputs(native_session_ref, run_ref=run_ref,
+                            root_session_ref=workspace_binding.location.root_session_ref if workspace_binding else None)
+                        prompt = compose_external_mcp_prompt(prompt, snapshot, resume=native_session_ref is not None,
+                            previous_prompts=prior, ordered=ordered)
                         external_mcp_access = external_channels.enter_context(self._external_mcp.channel(snapshot, resident_token=mcp_token))
                 except (ExternalMcpError, ExternalMcpClientError) as error:
                     raise IdeaSkillUnavailable(error.code) from error
@@ -2188,7 +2257,8 @@ class CodexIdeaSkillAdapter:
                 )
             else:
                 prompt = compose_runtime_prompt(
-                    prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding)
+                    prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding,
+                        native_session_ref=native_session_ref)
                 )
                 _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
                 model_ref = selected_stage_model(self._workspace, self._root_agent_kind, run_ref=run_ref, default=self._model_ref)
@@ -2317,7 +2387,8 @@ class CodexIdeaSkillAdapter:
         else:
             model_ref = selected_stage_model(self._workspace, self._root_agent_kind, run_ref=run_ref, default=self._model_ref)
             prompt = compose_runtime_prompt(
-                prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding)
+                prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding,
+                    native_session_ref=native_session_ref, exclude_directory=directory)
             )
         _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
         capability_profile = root_capability_profile(self._root_agent_kind, model_ref)

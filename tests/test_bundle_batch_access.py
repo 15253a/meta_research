@@ -133,7 +133,7 @@ def test_plan_probe_is_bounded_and_real_read_rejects_revocation_between_pages(tm
         original(*dependencies, {**descriptor["arguments"], "offset": page["next_offset"]})
 
 
-def test_late_guidance_body_is_included_only_in_requested_batch_view(tmp_path):
+def test_new_guidance_body_reaches_both_batch_view_modes(tmp_path):
     from meta_research.human_guidance import (FrozenGuidanceBinding, FrozenGuidanceCut,
         FrozenGuidanceDelivery, GuidanceOperationIdentity)
     adapter, _ = _adapter(tmp_path, _output("batch"))
@@ -142,9 +142,10 @@ def test_late_guidance_body_is_included_only_in_requested_batch_view(tmp_path):
                                    "quest", "snapshot", "a" * 64)
     cut = FrozenGuidanceCut(binding, "provenance", (FrozenGuidanceDelivery(
         "delivery", json.dumps({"constraint_ref": "constraint", "revision": 2,
-                               "text": "Late counterexample: keep the independent device check."}),
+                               "guidance": {"text": "Late counterexample: keep the independent device check."}}),
         True, None),))
-    adapter.bind_human_guidance_authority(NS(freeze_operation_guidance=lambda _: cut))
+    adapter.bind_human_guidance_authority(NS(freeze_operation_guidance=lambda _: cut,
+                                            human_response_events=lambda **_: ()))
     args = {key: getattr(request, key) for key in
             ("run_ref", "attempt_ref", "root_session_ref", "fence_ref", "job_ref")}
     args.update(runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
@@ -153,4 +154,4 @@ def test_late_guidance_body_is_included_only_in_requested_batch_view(tmp_path):
     assert "Late counterexample: keep the independent device check." in rendered
     assert actual == binding
     ordinary, _ = adapter._prepare_stage_guidance(**args)
-    assert "Late counterexample: keep the independent device check." not in ordinary
+    assert "Late counterexample: keep the independent device check." in ordinary

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from meta_research.harness import HarnessAdmissionError
 from meta_research.target_run_runtime import TargetRunRuntime
 from test_target_run_owner import _records
@@ -12,7 +14,7 @@ from test_target_run_owner import _records
 SOURCE_SPEC_HASH = "b" * 64
 
 
-def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Path) -> None:
+def capture_target_context(tmp_path: Path, retained_session: bool, *, verify=False):
     from meta_research.codex_runtime import CODEX_MODEL_REF
     from meta_research.harness_adapters import CodexHarnessAdapter, HarnessInvocation
     from meta_research.root_resident_mcp import RootResidentMcpChannels
@@ -144,6 +146,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Pat
                 execution_attempt_ref=handle.execution_attempt_ref,
                 execution_fence_ref=handle.execution_fence_ref,
                 harness_request_ref="target-harness-request-root",
+                native_session_ref=None,
             )
 
         def query_target_root_completion_evidence(self, target_ref: str):
@@ -155,6 +158,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Pat
             assert set(values) == {"prompt", "mcp_base_url"}
             self.root_calls.append((request_ref, values))
             turn = len(self.root_calls)
+            native_session_ref = target_agent.harness.native_session_ref
             delivered = adapter.invoke(HarnessInvocation(
                 harness_family="codex", provider_operation_ref=f"target-context-turn:{turn}",
                 run_ref=handle.target_run_ref, attempt_ref=handle.execution_attempt_ref,
@@ -162,11 +166,12 @@ def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Pat
                 fence_ref=handle.execution_fence_ref, model_ref=CODEX_MODEL_REF,
                 prompt=values["prompt"], mcp_url=values["mcp_base_url"] + "/mcp",
                 mcp_token="test-target-context-bearer", root_kind="target",
-                native_session_ref=None if turn == 1 else session_ref,
-                entry_path="initial" if turn == 1 else "resume",
+                native_session_ref=native_session_ref,
+                entry_path="initial" if native_session_ref is None else "resume",
                 authorized_operation_ids=operations,
             ))
             assert delivered.native_session_ref == session_ref
+            target_agent.harness.native_session_ref = delivered.native_session_ref
             assert delivered.profile["root_capability_diagnostics"]["side_effect_authorization"]["operation_ids"] == list(operations)
             if len(self.root_calls) == 2:
                 self.evidence = SimpleNamespace(evidence_ref="root-evidence")
@@ -221,24 +226,47 @@ def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Pat
     for expected_phase in expected_phases:
         assert runtime.process_once(handle.target_ref) is True
         assert runtime.query_status(handle.target_ref).phase == expected_phase  # type: ignore[union-attr]
+        if expected_phase == "root_turn_completed":
+            if not retained_session:
+                target_agent.harness.native_session_ref = None
+            runtime = TargetRunRuntime(
+                agent_runtime=agent_runtime,
+                research_graph=ResearchGraph(),
+                target_graph=target_graph,
+                target_agent=target_agent,
+                target_root_lifecycle=lifecycle,
+                harnesses=harnesses,
+                finalizer=finalizer,
+            )
+            runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
 
+    if not verify:
+        return provider_calls
     assert len(harnesses.root_calls) == 2
     assert len(provider_calls) == 2
-    assert provider_calls[1][0][-3:] == ["resume", session_ref, "-"]
-    for (_request_ref, values), (argv, prompt) in zip(harnesses.root_calls, provider_calls, strict=True):
+    assert (provider_calls[1][0][-3:] == ["resume", session_ref, "-"]) is retained_session
+    for index, ((_request_ref, values), (argv, prompt)) in enumerate(zip(harnesses.root_calls, provider_calls, strict=True)):
         assert prompt == values["prompt"]
-        material = json.loads(prompt.split("Exact Owner context:\n", 1)[1])
-        research = material["research_context"]
-        assert research["question"]["unknown_statement"] == "fixture research question" + "q" * 5000
-        assert research["plan_notes"] == "plan failed, unmeasured, limited: " + "p" * 9000
-        assert research["bundle_notes"] == "bundle held-fixed caveats: " + "b" * 9000
-        assert "exact_context_path" not in research
-        assert material["execution_contract"]["measurement_contract"]["protocol_version"]["split"] == {"split": "heldout"}
+        if index == 0 or not retained_session:
+            material = json.loads(prompt.split("Exact Owner context:\n", 1)[1])
+            research = material["research_context"]
+            assert research["question"]["unknown_statement"] == "fixture research question" + "q" * 5000
+            assert research["plan_notes"] == "plan failed, unmeasured, limited: " + "p" * 9000
+            assert research["bundle_notes"] == "bundle held-fixed caveats: " + "b" * 9000
+            assert "exact_context_path" not in research
+            assert material["execution_contract"]["measurement_contract"]["protocol_version"]["split"] == {"split": "heldout"}
+            assert "/var/lib/meta-research/target-frozen-inputs/manifest.json" in prompt
+        else:
+            assert handle.target_ref in prompt and handle.target_run_ref in prompt
+            for unchanged in ("research_context", "execution_contract", "candidate", "formal_plan",
+                              "fixture research question", "plan failed, unmeasured, limited:",
+                              "bundle held-fixed caveats:", "Skill source:", "frozen_input_manifest_path"):
+                assert unchanged not in prompt
         developer = _developer(argv)
-        source = Path(prompt.split("Skill source: ", 1)[1].splitlines()[0])
         role_source = Path(developer.split("Role skill source: ", 1)[1].splitlines()[0])
         reference_root = Path(developer.split("Shared reference root: ", 1)[1].splitlines()[0])
-        assert source.is_absolute() and source == role_source == reference_root / "target-execution/SKILL.md"
+        source = role_source
+        assert source.is_absolute() and source == reference_root / "target-execution/SKILL.md"
         method = source.read_text(encoding="utf-8")
         assert method.strip() in developer and method not in prompt
         assert "实施、观察和修订" in method
@@ -250,9 +278,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Pat
         guidance_path = (source.parent / "../references/research-guidance.md").resolve()
         assert guidance_path == reference_root / "references/research-guidance.md"
         guidance = guidance_path.read_text(encoding="utf-8")
-        assert "交代问题、范围、已授入口、所分配工作的时间约束、检查点和完成条件" in guidance
         assert guidance not in developer and guidance not in prompt
-        assert "/var/lib/meta-research/target-frozen-inputs/manifest.json" in prompt
     (tmp_path / "target-context-observation.json").write_text(json.dumps(provider_calls), encoding="utf-8")
     assert finalizer.calls == [(handle, harnesses.evidence)]
     assert finalizer.materialize_calls == 3
@@ -270,7 +296,28 @@ def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Pat
     assert len(harnesses.root_calls) == 2
 
 
-def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> None:
+@pytest.mark.parametrize("retained_session", (True, False))
+def test_light_driver_resumes_one_root_until_one_final_publication(tmp_path: Path, retained_session: bool) -> None:
+    capture_target_context(tmp_path, retained_session, verify=True)
+
+
+def capture_target_rejection(tmp_path: Path, *, verify=False):
+    from meta_research.codex_runtime import CODEX_MODEL_REF
+    from meta_research.harness_adapters import CodexHarnessAdapter, HarnessInvocation
+    from meta_research.root_resident_mcp import RootResidentMcpChannels
+    from test_public_guidance_delivery import _developer
+    from test_root_capability_floor import _NoActivityCodexRunner
+
+    session_ref = "target-context-rejection-root"
+    provider_calls = []
+    no_activity_runner = _NoActivityCodexRunner(session_ref)
+
+    def runner(argv, prompt, timeout, environment):
+        if "--cd" in argv:
+            provider_calls.append((list(argv), prompt))
+        return no_activity_runner(argv, prompt, timeout, environment)
+
+    adapter = CodexHarnessAdapter(tmp_path / "provider", runner=runner)
     candidate, formal_plan, handle, _preflight, request = _records()
     launch = SimpleNamespace(
         stage_request_ref="stage-request:target",
@@ -321,6 +368,7 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
             execution_attempt_ref=handle.execution_attempt_ref,
             execution_fence_ref=handle.execution_fence_ref,
             harness_request_ref="target-harness-request-revision",
+            native_session_ref=session_ref,
         )
 
         def query_target_harness_admission(self, _target_ref: str):
@@ -353,6 +401,16 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
             assert request_ref == "target-harness-request-revision"
             assert mcp_base_url == "http://127.0.0.1:8765"
             self.resume_prompts.append(prompt)
+            adapter.invoke(HarnessInvocation(
+                harness_family="codex", provider_operation_ref="target-context-revision:1",
+                run_ref=handle.target_run_ref, attempt_ref=handle.execution_attempt_ref,
+                attempt_generation=1, root_session_ref=handle.root_session_ref,
+                fence_ref=handle.execution_fence_ref, model_ref=CODEX_MODEL_REF,
+                prompt=prompt, mcp_url=mcp_base_url + "/mcp",
+                mcp_token="test-target-context-bearer", root_kind="target",
+                native_session_ref=session_ref, entry_path="resume",
+                authorized_operation_ids=RootResidentMcpChannels("target").operation_ids,
+            ))
             self.evidence = successor_evidence
             return SimpleNamespace(status="executed")
 
@@ -406,6 +464,8 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
     runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
 
     assert runtime.process_once(handle.target_ref) is True
+    if not verify:
+        return provider_calls
     status = runtime.query_status(handle.target_ref)
     assert status is not None and status.phase == "root_revision_turn_completed"
     assert len(harnesses.resume_prompts) == 1
@@ -415,6 +475,15 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
     )
     assert '"manifest_ref":null' in harnesses.resume_prompts[0]
     assert handle.target_run_ref in harnesses.resume_prompts[0]
+    assert len(provider_calls) == 1
+    argv, prompt = provider_calls[0]
+    assert argv[-3:] == ["resume", session_ref, "-"]
+    assert prompt == harnesses.resume_prompts[0]
+    for unchanged in ("research_context", "execution_contract", "candidate", "formal_plan",
+                      "fixture research question", "completion_binding", "Skill source:"):
+        assert unchanged not in prompt
+    assert "仅履行本角色及当前授权范围内的职责。" in _developer(argv)
+    (tmp_path / "target-rejection-observation.json").write_text(json.dumps(provider_calls), encoding="utf-8")
     assert finalizer.calls == [old_evidence]
 
     assert runtime.process_once(handle.target_ref) is True
@@ -426,6 +495,10 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
             "target_commit_ref": "target-root-commit",
         }
     ]
+
+
+def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback(tmp_path: Path) -> None:
+    capture_target_rejection(tmp_path, verify=True)
 
 
 def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() -> None:

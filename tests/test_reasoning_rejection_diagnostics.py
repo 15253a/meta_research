@@ -145,25 +145,26 @@ def test_missing_parent_feedback_survives_real_rejection_restart_and_delivery(tm
 
 
 class _CorrectingContinuationSkill(SummarySkill):
-    def __init__(self, phase):
+    def __init__(self, phase, invalid_limit=1):
         super().__init__("create")
         self.phase = phase
         self.requests = []
-        self.invalid_returned = False
+        self.invalid_returned = 0
+        self.invalid_limit = invalid_limit
 
     def decide_after_deepfetch(self, request, checkpoint, facts, summary):
         self.requests.append(("summary-decision", request))
         result = super().decide_after_deepfetch(request, checkpoint, facts, summary)
-        if self.phase == "summary-decision" and not self.invalid_returned:
-            self.invalid_returned = True
+        if self.phase == "summary-decision" and self.invalid_returned < self.invalid_limit:
+            self.invalid_returned += 1
             result["final_output"]["scientific_outcome"]["research_synthesis"]["parent_questions"] = []
         return result
 
     def resume_after_autonomous_creation(self, request, checkpoint, creation_result):
         self.requests.append(("creation-final", request))
         result = super().resume_after_autonomous_creation(request, checkpoint, creation_result)
-        if self.phase == "creation-final" and not self.invalid_returned:
-            self.invalid_returned = True
+        if self.phase == "creation-final" and self.invalid_returned < self.invalid_limit:
+            self.invalid_returned += 1
             outcome = deepcopy(result.scientific_outcome)
             outcome["research_synthesis"]["parent_questions"] = []
             return replace(result, scientific_outcome=outcome)
@@ -171,9 +172,10 @@ class _CorrectingContinuationSkill(SummarySkill):
 
 
 @pytest.mark.parametrize("phase", ["summary-decision", "creation-final"])
-def test_continuation_diagnostic_is_durable_and_delivered_after_restart(tmp_path, phase):
+@pytest.mark.parametrize("rejection_count", [1, 2])
+def test_continuation_diagnostic_is_durable_and_delivered_after_restart(tmp_path, phase, rejection_count):
     path = tmp_path / phase
-    skill = _CorrectingContinuationSkill(phase)
+    skill = _CorrectingContinuationSkill(phase, rejection_count)
     runtime = runtime_at(path, skill)
     try:
         cycle_ref, parents = _prepare_child_reasoning(runtime, 2)
@@ -202,10 +204,10 @@ def test_continuation_diagnostic_is_durable_and_delivered_after_restart(tmp_path
                 runtime.deepfetch.process_once()
             runtime.reasoning_stage.process_once()
             records = ar.query_reasoning_continuation_rejections(checkpoint.checkpoint_ref, phase)
-            if records:
+            if len(records) == rejection_count:
                 break
-        assert len(records) == 1, runtime.reasoning_stage.transient_error
-        rejection = records[0]
+        assert len(records) == rejection_count, runtime.reasoning_stage.transient_error
+        rejection = records[-1]
         assert rejection["detail_code"] == "scientific_outcome_research_synthesis_invalid"
         assert all(parent in " ".join(rejection["feedback"]) for parent in parents)
         assert rejection["native_session_ref"] == "native:summary"
@@ -220,10 +222,12 @@ def test_continuation_diagnostic_is_durable_and_delivered_after_restart(tmp_path
                 break
         assert commit is not None, runtime.reasoning_stage.transient_error
         revised = [request for name, request in skill.requests if name == phase and request.continuation_feedback]
-        assert len(revised) == 1
-        assert revised[0].continuation_feedback == tuple(rejection["feedback"])
-        assert revised[0].native_session_ref == "native:summary"
-        assert revised[0].root_session_ref == run.root_session_ref
+        assert len(revised) == rejection_count
+        assert revised[-1].continuation_feedback == tuple(feedback for record in records for feedback in record["feedback"])
+        assert revised[-1].current_continuation_feedback == tuple(rejection["feedback"])
+        assert revised[-1].continuation_predecessor_job_ref == rejection["job_ref"]
+        assert revised[-1].native_session_ref == "native:summary"
+        assert revised[-1].root_session_ref == run.root_session_ref
         assert runtime.owners.agent_runtime.query_reasoning_autonomous_checkpoint(checkpoint.checkpoint_ref) == checkpoint
         assert runtime.owners.agent_runtime.query_reasoning_continuation_rejections(checkpoint.checkpoint_ref, phase) == records
     finally:

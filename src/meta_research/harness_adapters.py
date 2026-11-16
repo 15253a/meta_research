@@ -352,6 +352,10 @@ class _NativeCliHarnessAdapter:
         """Consume a previously verified terminal operation without launching."""
         return self._invoke(invocation, terminal_replay_only=True)
 
+    def native_human_input_history(self, native_session_ref):
+        reader = getattr(self._runner, "native_human_input_history", None)
+        return () if reader is None else reader(native_session_ref)
+
     def recover_terminal_prompt(self, invocation: HarnessInvocation) -> str | None:
         """Read the frozen prompt; Harness still verifies its Owner invocation hash."""
         self._validate_invocation(invocation)
@@ -1480,6 +1484,10 @@ class HarnessSupervisorTransport:
         environment: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
         return self(argv, prompt, timeout, environment, _terminal_replay_only=True)
+
+    def native_human_input_history(self, native_session_ref):
+        from meta_research.native_guidance import native_human_input_history
+        return native_human_input_history(self._workspace, native_session_ref)
 
     def recover_terminal_prompt(
         self, argv: list[str], timeout: float | None, environment: dict[str, str]

@@ -16,6 +16,19 @@ from meta_research.provider_supervisor import (
 from meta_research.native_codex_bridge import reconcile_native_operation
 
 
+def _guidance_message():
+    guide = {"constraint_ref": "calibration-guidance", "revision": 2,
+        "guidance": {"text": "Keep the exact calibration condition.",
+            "assistant_understanding": "Keep the exact calibration condition.",
+            "semantic_scope": {"kind": "quest", "quest_ref": "quest-calibration"},
+            "strength": 5, "applies_to": ["Calibration work"], "preserve_conditions": ["Device identity"],
+            "work_materials": {"files": [{"path": "human-inputs/calibration.csv", "sha256": "c" * 64}]}}}
+    return {"kind": "confirmed_guidance_change", "change": {"status": "active", "guide": guide},
+        "binding": {"snapshot_ref": "internal-snapshot"}, "supplement": {"snapshot_ref": "internal-supplement"},
+        "prepared_at": 1, "deliveries": [{"delivery_ref": "calibration-delivery", "guide": guide}],
+        "instruction": "internal delivery bookkeeping"}
+
+
 _SERVER = r'''
 import json,sys
 from pathlib import Path
@@ -58,9 +71,7 @@ for line in sys.stdin:
 '''
 
 
-@pytest.mark.parametrize("unknown", [False, True])
-@pytest.mark.parametrize("resume", [False, True])
-def test_native_input_arrives_during_active_turn_and_uncertain_send_is_not_replayed(tmp_path, unknown, resume):
+def capture_native_guidance_input(tmp_path, *, unknown=False, resume=False):
     if os.name != "posix":
         pytest.skip("The production durable provider process boundary runs on Linux")
     server = tmp_path / ("lost-codex" if unknown else "codex")
@@ -93,8 +104,7 @@ def test_native_input_arrives_during_active_turn_and_uncertain_send_is_not_repla
         mailbox.mkdir()
         command_id = "b" * 64
         write_transport_envelope(mailbox / (command_id + ".json"), {
-            "id": command_id, "message": {"kind": "confirmed_guidance_change",
-                "change": {"status": "active", "text": "Keep the exact calibration condition."}}}, key)
+            "id": command_id, "message": _guidance_message()}, key)
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr.decode()
         assert json.loads(result.read_text()) == {"ok": True}
@@ -104,16 +114,31 @@ def test_native_input_arrives_during_active_turn_and_uncertain_send_is_not_repla
         assert len(steers) == 1
         assert steers[0]["threadId"] == ("original-native-root" if resume else "native-root")
         assert steers[0]["expectedTurnId"] == "active-turn"
-        assert "Keep the exact calibration condition." in steers[0]["input"][0]["text"]
+        delivered = steers[0]["input"][0]["text"]
         receipt = read_transport_envelope(mailbox / (command_id + ".receipt"), key)
         assert receipt["status"] == "accepted"
         assert receipt["reconciled"] is unknown
         events = [json.loads(line) for line in stdout.splitlines()]
         assert any(item.get("type") == "thread.started" for item in events)
         assert events[-1]["type"] == "turn.completed"
+        return {"prompt": delivered, "requests": observed, "receipt": receipt,
+            "argv": argv, "schema": json.loads(schema.read_text())}
     finally:
         if process.poll() is None:
             process.terminate(); process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+def test_native_input_arrives_during_active_turn_and_uncertain_send_is_not_replayed(tmp_path, unknown, resume):
+    capture = capture_native_guidance_input(tmp_path, unknown=unknown, resume=resume)
+    delivered = capture["prompt"]
+    (tmp_path / "human-guidance-provider-input.txt").write_text(delivered, encoding="utf-8")
+    assert delivered.count("Keep the exact calibration condition.") == 1
+    assert "human-inputs/calibration.csv" in delivered
+    assert "calibration-delivery" in delivered
+    for internal in ("internal-snapshot", "internal-supplement", "prepared_at", "assistant_understanding"):
+        assert internal not in delivered
 
 
 def _lost_start_server(server):
@@ -575,4 +600,120 @@ def test_confirmed_guidance_reaches_the_active_driver_adapter_and_native_turn(tm
     finally:
         if worker.is_alive():
             provider.request_stop();worker.join(timeout=10)
+        runtime.close()
+
+
+@pytest.mark.parametrize("reply_after_turn", (False, True))
+def test_human_reply_reaches_active_steer_or_next_turn_in_original_session(tmp_path, reply_after_turn):
+    if os.name != "posix":
+        pytest.skip("The production durable provider process boundary runs on Linux")
+    from threading import Thread
+    from meta_research.human_reply import ProvidedReply, Upload
+    from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
+    from meta_research.owners.common import canonical_hash
+    from test_public_idea_stage import _runtime, _confirm_direct_quest, _DeterministicIdeaSkill
+    from test_root_human_request_lifecycle import _open_arguments
+
+    server = tmp_path / "human-reply-codex"
+    source = _SERVER.replace("import json,sys", "import json,sys,time,threading")
+    source = source.replace("def send(value): print(json.dumps(value),flush=True)", '''
+def send(value): print(json.dumps(value),flush=True)
+def finish_when_requested():
+    while not Path(__file__).with_suffix('.finish').exists(): time.sleep(0.02)
+    payload=Path(__file__).with_suffix('.payload').read_text()
+    send({'method':'item/completed','params':{'threadId':thread,'turnId':turn,
+        'item':{'type':'agentMessage','id':'final','text':payload}}})
+    send({'method':'turn/completed','params':{'threadId':thread,
+        'turn':{'id':turn,'status':'completed'}}})
+''')
+    if reply_after_turn:
+        source = source.replace("elif method=='turn/start': response={'turn':{'id':turn,'status':'inProgress'}}",
+            "elif method=='turn/start':\n        response={'turn':{'id':turn,'status':'inProgress'}}\n        threading.Thread(target=finish_when_requested,daemon=True).start()")
+    server.write_text("#!" + sys.executable + "\n" + source)
+    server.chmod(0o700)
+    observed, requested, errors = [], [], []
+
+    class NativeIdea(CodexIdeaSkillAdapter):
+        def generate_draft(self, request):
+            requested.append(request)
+            candidate = _DeterministicIdeaSkill().generate_draft(request)
+            server.with_suffix(".payload").write_text(json.dumps(_provider_idea_message(candidate.draft)))
+            try:
+                result = super().generate_draft(request)
+            except IdeaSkillUnavailable as error:
+                errors.append(error.code)
+                raise
+            observed.append(result)
+            return result
+
+    provider = NativeIdea(tmp_path / "native-provider", executable=str(server))
+    runtime = _runtime(tmp_path / "runtime", provider)
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
+    stop = False
+
+    def work():
+        while not stop and len(observed) < (2 if reply_after_turn else 1):
+            runtime.idea_stage.process_once()
+            time.sleep(0.02)
+
+    worker = Thread(target=work)
+    try:
+        _confirm_direct_quest(runtime)
+        worker.start()
+        requests = server.with_suffix(".requests")
+        deadline = time.monotonic() + 20
+        while not requests.exists() or '"method": "turn/start"' not in requests.read_text():
+            assert worker.is_alive(), runtime.idea_stage.transient_error
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        request = requested[0]
+        opened = provider._root_resident_mcp.call_operation(
+            run_ref=request.run_ref, attempt_ref=request.attempt_ref,
+            root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
+            capability_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
+            phase="primary", job_ref=request.job_ref, operation_id="human_request.open",
+            arguments=_open_arguments("actual-native-human-reply", "offline_action"))
+        if reply_after_turn:
+            server.with_suffix(".finish").write_text("complete current native turn")
+            deadline = time.monotonic() + 15
+            while not list((tmp_path / "native-provider").rglob("completed.json")):
+                assert time.monotonic() < deadline, errors
+                time.sleep(0.02)
+            time.sleep(0.2)
+        else:
+            time.sleep(0.3)
+            assert not list((tmp_path / "native-provider").rglob("live-guidance-closed.json"))
+        note = "Exact human reply: measured decrease; the second trial is still missing."
+        response = runtime.owners.human_collaboration.respond_to_human_request(opened["request_ref"],
+            reply=ProvidedReply(note, {"calibration_value": -3, "missing_trial": 2},
+                (Upload("observations/calibration.csv", "text/csv", b"trial,value\n1,-3\n"),)),
+            idempotency_key="actual-native-human-reply-response")
+        worker.join(timeout=20)
+        assert not worker.is_alive(), (errors, runtime.idea_stage.transient_error)
+        assert observed, (errors, runtime.idea_stage.transient_error)
+        calls = [json.loads(line) for line in requests.read_text().splitlines()]
+        starts = [item["params"] for item in calls if item["method"] == "turn/start"]
+        steers = [item["params"] for item in calls if item["method"] == "turn/steer"]
+        if reply_after_turn:
+            assert len(starts) == 2 and steers == []
+            assert starts[-1]["threadId"] == starts[0]["threadId"] == "native-root"
+            assert any(item["method"] == "thread/resume" for item in calls)
+            message = starts[-1]["input"][0]["text"]
+        else:
+            assert len(starts) == 1 and len(steers) == 1
+            assert steers[0]["threadId"] == "native-root"
+            message = steers[0]["input"][0]["text"]
+        (tmp_path / "human-reply-provider-input.txt").write_text(message, encoding="utf-8")
+        assert message.count(note) == 1
+        assert '"calibration_value":-3' in message and '"missing_trial":2' in message
+        assert opened["request_ref"] in message and response["response_ref"] in message
+        assert "observations/calibration.csv" in message
+        assert response["delivery"]["reply_file"]["path"] in message
+        current = runtime.owners.agent_runtime.query_human_request(opened["request_ref"])
+        assert current["direct_waiters"][0]["status"] == "consumed"
+    finally:
+        stop = True
+        if worker.is_alive():
+            provider.request_stop()
+            worker.join(timeout=10)
         runtime.close()

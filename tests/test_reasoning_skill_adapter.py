@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from provider_supervisor_support import closed_tree_fixture
+
 from meta_research.idea_skill import _compile_codex_output_schema
 from meta_research.harness import FullConformanceBinding, ResidentMcpChannel
 from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
@@ -676,12 +678,14 @@ class _SequenceRunner:
                         },
                     }
                 )
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             0,
             stdout="\n".join(json.dumps(event) for event in events),
             stderr="",
         )
+        completed.process_tree = closed_tree_fixture()
+        return completed
 
     def run_job(
         self,

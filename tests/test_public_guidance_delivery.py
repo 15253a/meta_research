@@ -92,7 +92,7 @@ def test_plan_revision_keeps_readable_references_and_exact_scientific_increment(
     assert argv[-3:] == ["resume", first.primary_session_ref, "-"]
     assert runner.observed[1] == runner.observed[0]
     assert "Correct the device comparison, preserve the frozen IdeaSet." in user
-    assert "哪种约束保留稀有形态？" in user and "比较拓扑一致性与像素重建。" in user
+    assert "哪种约束保留稀有形态？" not in user and "比较拓扑一致性与像素重建。" not in user
     assert schema == runner.calls[0][2]
 
 

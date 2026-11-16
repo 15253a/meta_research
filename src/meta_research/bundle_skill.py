@@ -15,6 +15,7 @@ from meta_research.runtime_binding_compatibility import bundle_bindings_compatib
 from dataclasses import dataclass, replace
 import hashlib
 import hmac
+import json
 import os
 from importlib.resources import files
 from pathlib import Path
@@ -999,6 +1000,62 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
     def bind_batch_source_readers(self, reader) -> None:
         self._batch_source_readers = reader
 
+    def _delivered_bundle_records(self, request, operation_name):
+        from meta_research.bundle_batch_view import bundle_record_hash
+        from meta_research.sealed_provider_operations import completed_native_inputs
+
+        delivered = {"current_targets": set(), "target_commits": set()}
+        if not request.native_session_ref or request.native_replacement_context is not None:
+            return delivered
+        directory = (self._workspace / "provider-operations"
+                     / canonical_hash({"job_ref": request.job_ref}) / operation_name)
+        if (directory / "invocation.json").exists():
+            return delivered
+        versions = {field: {} for field in delivered}
+        shown = {field: set() for field in delivered}
+        _, key = self._transport_key()
+        identity = _rolling_operation_identity(request)
+        for _, business, prompt in completed_native_inputs(
+                self._workspace, request.native_session_ref, key=key, exclude_directory=directory):
+            if not isinstance(business, dict) or business.get("kind") not in {
+                    "bundle_dispatch", "bundle_target_batch"}:
+                continue
+            prior = business.get("identity", {})
+            if not isinstance(prior, dict) or any(prior.get(name) != identity.get(name) for name in (
+                    "stage_request_ref", "run_ref", "root_session_ref", "graph_ref")):
+                continue
+            fields = business.get("request", {})
+            is_dispatch = business["kind"] == "bundle_dispatch"
+            prefix = "frontier=" if is_dispatch else "batch_context="
+            lines = [line[len(prefix):] for line in prompt.splitlines() if line.startswith(prefix)]
+            if len(lines) != 1:
+                continue
+            try:
+                view = json.loads(lines[0])
+                if is_dispatch:
+                    view = {"current_targets": view}
+                    fields = {"current_targets": fields["frontier"]}
+                for field, ref_key in (("current_targets", "target_ref"), ("target_commits", "commit_ref")):
+                    records = fields.get(field, [])
+                    presented = view.get(field, [])
+                    if not isinstance(records, list) or not isinstance(presented, list):
+                        continue
+                    hashes = set()
+                    for record in records:
+                        digest = bundle_record_hash(record, field)
+                        hashes.add(digest)
+                        versions[field].setdefault(record[ref_key], set()).add(digest)
+                    for record in presented:
+                        digest = bundle_record_hash(record, field)
+                        if digest in hashes:
+                            shown[field].add(digest)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        for field in delivered:
+            delivered[field] = {next(iter(hashes)) for hashes in versions[field].values()
+                                if len(hashes) == 1 and hashes.issubset(shown[field])}
+        return delivered
+
     def _operation_output_schema(self, schema, job_ref, operation_name):
         from meta_research.bundle_output_assembly import full_prose_output_schema
         from meta_research.sealed_provider_operations import read_sealed_invocation
@@ -1069,6 +1126,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             job_ref=job_ref, operation_name=operation_name, prompt=prompt,
             include_body=inline_guidance,
             include_direction=native_session_ref is None,
+            native_session_ref=native_session_ref,
         )
         authority = self._full_conformance_authority
         if authority is None or self._root_resident_mcp.endpoint_url is None:
@@ -1289,27 +1347,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         lineage = _owner_rejection_prompt(request)
-        human_resume = (
-            ""
-            if request.native_session_ref is None
-            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
-            "human_request.open.reconcile，读取 resolution 后再判断"
-            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
-        )
-        scientific_input = (
-            f"accepted_question={canonical_json(request.accepted_question_content)}\n"
-            + STAGE_CONTEXT_DELIVERY_GUIDANCE
-            + f"provider_context_view={stage_context_json('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
-            if request.native_session_ref is None
-            else "继续本原根已收到的准确 Question、FormalPlan 与采用来源；本回合只追加当前反馈。"
-            "需要恢复正文时，用 research_memory.stage_context.read 和本请求的 context_pack_ref，"
-            "以 source=question 或 source=context_pack 读取原冻结材料，不能以 latest 替换。\n"
-        )
         prompt = (
             stage_position_prompt(request, "bundle") + stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
-            f"{human_resume}"
             "本回合按角色方法及 references/contract.md 的正式输出合同形成完整候选，"
             f"{_bundle_output_assembly_prompt()}"
             "完成独立子智能体审阅并由根自主修订后，返回 target_plan 或 exhaustion_assessment。"
@@ -1326,7 +1367,15 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{canonical_hash(list(request.predecessor_rejections))}\n"
             "predecessor_rejections="
             f"{canonical_json(list(request.predecessor_rejections))}\n"
-            + scientific_input
+            f"accepted_question={canonical_json(request.accepted_question_content)}\n"
+            + STAGE_CONTEXT_DELIVERY_GUIDANCE
+            + f"provider_context_view={stage_context_json('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
+        ) if request.native_session_ref is None else (
+            "继续原 Bundle 根，处理本次反馈并按原合同返回完整 target_plan 或 exhaustion_assessment。"
+            "仅在确实缺少材料时用 research_memory.stage_context.read 定向读取原冻结正文。\n"
+            f"{lineage}\n{_provider_correction_prompt(request.provider_feedback)}\n"
+            f"context_pack_ref={request.context_pack_ref}\n"
+            f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
         )
         output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
@@ -1499,43 +1548,33 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 "frontier": list(request.frontier), "state": request.state,
                 "inbox_checkpoint": request.inbox_checkpoint},
         }
+        from meta_research.bundle_batch_view import (
+            bundle_record_hash, continued_target_record, target_reading_record,
+        )
+
+        operation_name = f"dispatch-{request.generation}"
+        delivered = self._delivered_bundle_records(request, operation_name)
+        frontier = [continued_target_record(record)
+                    if bundle_record_hash(record, "current_targets") in delivered["current_targets"]
+                    else target_reading_record(record) for record in request.frontier]
+        position = _rolling_position_prompt(request)
         prompt = (
-            _rolling_position_prompt(request) +
+            (position if request.native_session_ref is None else "") +
             stage_replacement_prompt(request) +
-            f"{_bundle_skill_instructions()}\n\n"
+            (f"{_bundle_skill_instructions()}\n\n" if request.native_session_ref is None else "") +
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
-            "继续使用当前 Bundle 根 Session。先读取这次 durable frontier 与 "
-            "TargetCommit/blocker 状态，再自主选择本次可并行开展的一个或多个 Target。选择体现当前 "
-            "优先级、依赖、已实现结果与局部阻塞；不得把 Agent tree 当成 Target DAG，"
-            "返回 dispatch 时在 selected_target_refs 中列出本次选定的全部 Target，每项只列一次。"
-            "每项必须位于 frontier，具有当前启动权限，且未列入 state.launch_input_errors。"
-            "需要等待证据、依赖或重新评估研究优先级时可返回 wait，并在 rationale "
-            "说明等待条件；技术可启动不代表研究上必须立即启动。冻结语义确需 "
-            "改变时返回 replan_required，说明已有证据与需由后继 Cycle 承接的修订，"
-            "并在这次终态交接前委派原生独立子智能体审阅完整判断和必要原文，根根据"
-            "自由格式反馈自主修订；同根自查不替代独立审阅。"
-            "保留真实 Owner receipt。frontier 中的高风险 Target 若 "
-            "dispatch_allowed=false，它是本次 Bundle 根 Agent 的授权协作义务，"
-            "不是可调度 Target。human_request_status=not_open 时，必须原样使用 "
-            "human_request_command.semantic_operation_id 和 arguments 调用 resident semantic "
-            "MCP 创建 formal HumanRequest；若 effect outcome 不明，必须用同一 "
-            "arguments 调用 reconciliation_operation_id，不得换 effect_id 重放。"
-            "请求已打开、已满足或已拒绝时不得再造新请求。由 Owner 评估 response、"
-            "重验 authorization 并释放 waiter。绝对不得把 "
-            "dispatch_allowed=false 的 Target 返回为 dispatch，也不得因 provider、"
-            "validator 或 readiness 错误自行伪造 HumanRequest。"
-            "需要同根编制下一批策略而非等待外部条件时，只有 state.strategy_revision_available=true "
-            "才可返回 revise_strategy；下一次正式 target-batch 会接收此请求，仍须提出真实工作或有证据的策略收口。"
-            "此动作不创建或接纳任何 Target。wait 会持久等待，不会自动安排下一批。"
-            "返回 wait、replan_required 或 revise_strategy 时，selected_target_refs 必须为空数组。\n"
+            "根据本次 durable frontier 与 state 作完整调度决定。已交付的候选正文沿用原会话。"
+            "selected_target_refs 可选择多个当前有权限且无 launch_input_errors 的 Target。"
+            "本次人类协作按 human_request_status 与 human_request_command 执行；"
+            "未知效果仍用原 effect_id 对账。需要下一批策略时仅在 strategy_revision_available=true "
+            "选择 revise_strategy；wait 继续等待外部条件。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"graph_ref={request.graph_ref}\n"
             f"generation={request.generation}\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
-            f"frontier={canonical_json(list(request.frontier))}\n"
+            f"frontier={canonical_json(frontier)}\n"
             f"state={canonical_json(request.state)}"
         )
-        operation_name = f"dispatch-{request.generation}"
         try:
             output, session_ref, _stdout = self._invoke_with_resident_mcp(
                 run_ref=request.run_ref,
@@ -1616,7 +1655,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "kind": "bundle_target_batch", "identity": _rolling_operation_identity(request),
             "request": prompt_context,
         }
-        from meta_research.bundle_batch_view import render_delta_batch_reading_context
+        from meta_research.bundle_batch_view import (
+            continue_batch_reading_context, render_delta_batch_reading_context,
+        )
         from meta_research.semantic_mcp import SemanticMcpError
 
         operation_name = f"target-batch-{request.base_generation + 1}"
@@ -1626,8 +1667,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         reader = None
         sources = None
         baseline = None
-        if (not sealed and request.native_session_ref and request.target_commits
-                and request.native_replacement_context is None and not request.provider_feedback
+        if (not sealed and request.native_session_ref
+                and request.native_replacement_context is None
                 and self._batch_plan_reader is not None):
             try:
                 reader = self._batch_plan_reader(request)
@@ -1642,24 +1683,19 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         reading_context = render_delta_batch_reading_context(request, prompt_context,
             verified_plan_reader=reader, verified_source_readers=sources,
             verified_delivery_baseline=baseline)
+        reading_context = continue_batch_reading_context(
+            reading_context, self._delivered_bundle_records(request, operation_name))
+        position = _rolling_position_prompt(request)
         prompt = (
-            _rolling_position_prompt(request) +
+            (position if request.native_session_ref is None else "") +
             stage_replacement_prompt(request) +
-            f"{_bundle_skill_instructions()}\n\n"
+            (f"{_bundle_skill_instructions()}\n\n" if request.native_session_ref is None else "") +
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
-            "继续当前 Bundle 根。根据本次正式 TargetCommit、仍未完成的责任及真实反馈，"
+            "继续当前 Bundle 根，根据本次新结果与反馈提交完整 FormalStrategyUpdate 或 replan_basis。"
+            "known_current_targets 和 known_target_commit_refs 指向本会话已交付的未变正文；"
+            "仅在确实缺失材料时用当前 context_pack_ref 定向补读。"
             f"{_bundle_output_assembly_prompt()}"
-            "按 references/contract.md 形成下一份 FormalStrategyUpdate。需要继续实施时追加候选；"
-            "全部所需 cells 已由 current accepted TargetCommit 覆盖时，先读最后结果、整理可复用资源、"
-            "完成独立审阅，再以空 candidates、strategy_complete=true 和完整 notes 封口。"
-            "保留后续研究线索与零或一个建题推荐，修订事实不改写冻结输入。\n"
-            "Use action=propose_targets with a real strategy_update and replan_basis=null for ordinary work. "
-            "If continuing requires revising frozen responsibilities, explicitly choose action=replan_required, "
-            "strategy_update=null, and a complete replan_basis: actual work and retained artifacts, exact current "
-            "source_target_commit_refs, limitations, unfinished work, and next research focus. "
-            "Keep rationale within 512 characters. This submits your real synthesis to the normal BundleReport "
-            "and Reasoning boundary; it does not assert success or exhaustion. Do not invent a candidate, "
-            "duplicate an accepted cell, or deliberately emit an invalid empty batch to exit.\n"
+            "完成独立审阅与必要综合后交接，保留未解决事项，不重复已完成工作。\n"
             f"batch_context={canonical_json(reading_context)}"
         )
         if len(prompt.encode("utf-8")) > BUNDLE_TARGET_BATCH_PROMPT_MAX_BYTES:

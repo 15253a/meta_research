@@ -80,13 +80,22 @@ def test_mismatched_reader_never_omits_plan(tmp_path, field, value):
 
 @pytest.mark.parametrize("changes", [
     {"native_session_ref": None}, {"native_replacement_context": {}},
-    {"provider_feedback": {"reason": "owner rejection"}},
 ])
 def test_other_paths_keep_full_plan(tmp_path, changes):
     request, prompt, reader = _inputs(tmp_path)
     view = render_delta_batch_reading_context(replace(request, **changes), prompt,
         verified_plan_reader=reader)
     assert view["formal_plan"] == request.plan_document
+
+
+def test_correction_keeps_exact_reader_and_new_results(tmp_path):
+    request, prompt, reader = _inputs(tmp_path)
+    view = render_delta_batch_reading_context(
+        replace(request, provider_feedback={"reason": "owner rejection"}), prompt,
+        verified_plan_reader=reader)
+    assert "formal_plan" not in view
+    assert view["formal_plan_reader"]["content_hash"] == canonical_hash(request.plan_document)
+    assert view["target_commits"] == list(request.target_commits)
 
 
 @pytest.mark.parametrize("change", ["different_prose", "missing_brief", "duplicate_brief"])

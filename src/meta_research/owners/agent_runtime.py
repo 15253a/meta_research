@@ -15159,6 +15159,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
         return tuple(matches)
 
+    def query_root_input_order(self, *, run_ref: str, root_session_ref: str):
+        with self._database.read() as connection:
+            run = connection.execute(text(
+                "SELECT root_session_ref FROM ar_stage_runs WHERE run_ref=:run_ref"
+            ), {"run_ref": run_ref}).first()
+            if run is None or run.root_session_ref != root_session_ref:
+                raise OwnerConflict("stage_root_observation_scope_invalid")
+            rows = connection.execute(text(
+                "SELECT unit_ref,operation_ref,attempt_ref,unit_kind FROM ar_provider_units "
+                "WHERE run_ref=:run_ref ORDER BY rowid DESC"
+            ), {"run_ref": run_ref}).all()
+        return tuple(tuple(row) for row in rows)
+
     def root_provider_continuation_job_ref(
         self,
         *,

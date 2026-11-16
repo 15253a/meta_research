@@ -36,6 +36,14 @@ from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
+from meta_research.sealed_provider_operations import (
+    read_business_input,
+    read_sealed_invocation,
+    read_spool_text,
+    operation_transport_limits,
+    verify_native_session,
+    _verified_success_exit,
+)
 from meta_research.quest_drafting import (
     QUESTION_CONTENT_GUIDANCE,
     QUESTION_FIELD_MAX_LENGTHS,
@@ -218,6 +226,8 @@ class ReasoningSkillRequest:
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
     continuation_feedback: tuple[str, ...] = ()
+    continuation_predecessor_job_ref: str | None = None
+    current_continuation_feedback: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -964,6 +974,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
             job_ref=request.job_ref, operation_name=operation_name, prompt=prompt,
             include_direction=native_session_ref is None,
+            native_session_ref=native_session_ref,
         )
         authority = self._full_conformance_authority
         if authority is None or self._root_resident_mcp.endpoint_url is None:
@@ -1134,23 +1145,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         if not reasoning_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise ReasoningSkillUnavailable("reasoning_runtime_binding_drift")
         lineage = _owner_rejection_prompt(request)
-        human_resume = (
-            ""
-            if request.native_session_ref is None
-            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
-            "human_request.open.reconcile，读取 resolution 后再判断"
-            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
-        )
-        scientific_input = (
-            f"accepted_question={canonical_json(request.accepted_question_content)}\n"
-            f"provider_context_view={stage_context_json('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}\n"
-            if request.native_session_ref is None else
-            "继续本原根已交付的准确科学输入；必要时按 context_pack_ref 沿准确 reader 补读。\n"
-        )
         prompt = (
             stage_position_prompt(request, "reasoning") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{_reasoning_skill_instructions(request)}\n\n"
-            f"{human_resume}"
             "在当前原根连续完成研究、自主组织独立子智能体审阅、聚合反馈并修订后，"
             "交回最终完整候选；根承担最终判断，不提前返回草稿等待系统再次启动审阅。"
             "你是当前 Reasoning 根 Agent，而不是 State Owner。先通过 resident "
@@ -1196,11 +1193,18 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"foreground_epoch={request.foreground_epoch}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
-            f"{scientific_input}"
+            f"accepted_question={canonical_json(request.accepted_question_content)}\n"
+            f"provider_context_view={stage_context_json('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}\n"
             "Additional exact sources are available through the authenticated stage context reader. "
             "The literature preview is not a citation limit: use source=literature_records "
             "to page the exact frozen revision and cite any verified record in that revision; "
             "the Owner checks actual cited record IDs, not preview membership."
+        ) if request.native_session_ref is None else (
+            "继续当前原生会话的 Reasoning 工作。处理本次反馈，交回完整候选。\n"
+            f"{lineage}"
+            f"stage_request_ref={request.stage_request_ref}\n"
+            f"context_pack_ref={request.context_pack_ref}\n"
+            "如缺少完成本次修正所需的材料，沿此冻结引用定向补读。\n"
         )
         output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             request=request,
@@ -1281,6 +1285,36 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         )
         return result
 
+    def _previous_continuation_input(self, request: ReasoningSkillRequest) -> dict[str, object] | None:
+        job_ref = request.continuation_predecessor_job_ref
+        if job_ref is None or request.native_session_ref is None:
+            return None
+        directory = (self._workspace / "provider-operations"
+                     / canonical_hash({"job_ref": job_ref}) / "autonomous-resume")
+        try:
+            _, key = self._transport_key()
+            invocation = read_sealed_invocation(directory / "invocation.json", key=key)
+            limits = operation_transport_limits(invocation)
+            body = read_business_input(directory, invocation, limits)
+            previous_request = body.get("request")
+            if (invocation.get("job_ref") != job_ref
+                    or invocation.get("operation_name") != "autonomous-resume"
+                    or invocation.get("native_session_ref") != request.native_session_ref
+                    or body.get("kind") != "reasoning_stage"
+                    or not isinstance(previous_request, dict)
+                    or any(previous_request.get(name) != getattr(request, name)
+                           for name in ("root_session_ref", "run_ref", "context_pack_ref", "context_pack_hash"))):
+                return None
+            _verified_success_exit(directory, invocation_hash=canonical_hash(invocation))
+            verify_native_session(
+                read_spool_text(directory / "stdout.jsonl", limits.stream_max_bytes),
+                expected=request.native_session_ref,
+            )
+            extra = body.get("extra")
+            return extra if isinstance(extra, dict) else None
+        except (OSError, ValueError, ReasoningSkillUnavailable):
+            return None
+
     def decide_after_deepfetch(self, request: ReasoningSkillRequest, checkpoint: dict[str, object], facts: dict[str, object], summary: object) -> dict[str, object]:
         """Read the exact accepted summary in the original native Session."""
         _validate_request(request)
@@ -1290,9 +1324,21 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         schema = {"type": "object", "additionalProperties": False,
             "properties": {"action": {"type": "string", "enum": ["create", "decline", "retry"]}, "final_output": final_schema},
             "required": ["action", "final_output"]}
-        prompt = (_reasoning_skill_instructions(request) + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；候选可来自 Bundle 推荐或本根综合判断。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
-            + "completion_feedback=" + canonical_json(list(request.continuation_feedback)) + "\ncheckpoint=" + canonical_json(checkpoint) + "\nfacts=" + canonical_json(facts) + "\nsummary=" + canonical_json(summary))
-        decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref, operation_input=stage_operation_input(request, "reasoning", extra={"checkpoint": checkpoint, "facts": facts, "summary": summary}))
+        previous = self._previous_continuation_input(request)
+        if previous is not None and "summary" not in previous:
+            previous = None
+        prompt = (
+            "在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；候选可来自 Bundle 推荐或本根综合判断。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
+            if previous is None else "继续本次 DeepFetch summary 的决定，修正本次反馈并交回完整结果。\n"
+        )
+        feedback = (request.continuation_feedback if request.current_continuation_feedback is None
+                    else request.current_continuation_feedback)
+        prompt += "completion_feedback=" + canonical_json(list(feedback)) + "\n"
+        materials = {"checkpoint": checkpoint, "facts": facts, "summary": summary}
+        for name, value in materials.items():
+            if previous is None or name not in previous or previous[name] != value:
+                prompt += name + "=" + canonical_json(value) + "\n"
+        decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref, operation_input=stage_operation_input(request, "reasoning", extra=materials))
         if native_session != request.native_session_ref:
             raise ReasoningSkillUnavailable("codex_primary_session_changed")
         if isinstance(decision.get("final_output"), dict):
@@ -1330,8 +1376,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         if request.native_session_ref is None:
             raise ReasoningSkillUnavailable("reasoning_native_session_missing")
         lineage = _owner_rejection_prompt(request)
+        previous = self._previous_continuation_input(request)
+        if previous is not None and "creation_result" not in previous:
+            previous = None
+        if previous is not None:
+            lineage = ""
         prompt = (
-            f"{_reasoning_skill_instructions(request)}\n\n"
             "本回合是同一 Reasoning root/native Session 的 autonomous finalization phase。"
             "create_question 已返回 accepted QuestionAnchor、present/open facts 和真实 "
             "QuestionLiteratureRevision。结合新信息检查当前选择事实及已有成果。创建新问题"
@@ -1341,11 +1391,16 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "新资料可改变尚未提交的后继选择；后续 Cycle 再将其纳入新的证据与综合。"
             "形成一个 NextCycleProposal，或在已有完成依据充分时形成 CandidateCompletion。"
             "reviewed_draft 使用 exact checkpoint；直接返回已有 final_output 结构，"
-            "由 Owner 接纳并创建后继 Cycle。"
-            f"{lineage}\ncompletion_feedback={canonical_json(list(request.continuation_feedback))}\n"
-            f"checkpoint={canonical_json(checkpoint)}\n"
-            f"creation_result={canonical_json(creation_result)}"
+            "由 Owner 接纳并创建后继 Cycle。\n"
+            if previous is None else "继续 autonomous finalization，修正本次反馈并交回完整结果。\n"
         )
+        feedback = (request.continuation_feedback if request.current_continuation_feedback is None
+                    else request.current_continuation_feedback)
+        prompt += f"{lineage}\ncompletion_feedback={canonical_json(list(feedback))}\n"
+        materials = {"checkpoint": checkpoint, "creation_result": creation_result}
+        for name, value in materials.items():
+            if previous is None or name not in previous or previous[name] != value:
+                prompt += name + "=" + canonical_json(value) + "\n"
         reviewed, resumed_session, _stdout = self._invoke_with_resident_mcp(
             request=request,
             operation_name="autonomous-resume",
@@ -1354,7 +1409,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 request, _reasoning_stage_output_schema(request)
             ),
             native_session_ref=request.native_session_ref,
-            operation_input=stage_operation_input(request, "reasoning", extra={"checkpoint": checkpoint, "creation_result": creation_result}),
+            operation_input=stage_operation_input(request, "reasoning", extra=materials),
         )
         if (
             resumed_session != request.native_session_ref

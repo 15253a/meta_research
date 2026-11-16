@@ -455,6 +455,39 @@ def _provider_terminal_contract_checkpoint(
     }
 
 
+def completed_native_inputs(workspace: Path, native_session_ref: str, *, key: bytes,
+                            exclude_directory: Path | None = None, job_refs=None):
+    """Read existing completed input evidence without recovering pending work."""
+    root = workspace / "provider-operations"
+    paths = (root.glob("*/*/invocation.json") if job_refs is None else
+             (path for job in job_refs for path in
+              (root / canonical_hash({"job_ref": job})).glob("*/invocation.json")))
+    for path in paths:
+        directory = path.parent
+        if directory == exclude_directory or not (directory / "completed.json").is_file():
+            continue
+        try:
+            completion = json.loads((directory / "completed.json").read_text(encoding="utf-8"))
+            if not isinstance(completion, dict) or completion.get("native_session_ref") != native_session_ref:
+                continue
+            invocation = read_sealed_invocation(path, key=key)
+            if invocation.get("native_session_ref") not in (None, native_session_ref):
+                continue
+            digest = canonical_hash(invocation)
+            _, _, limits = verify_operation_inputs(directory, invocation_hash=digest)
+            _verified_success_exit(directory, invocation_hash=digest)
+            prompt = read_spool_text(directory / "prompt.txt", limits.prompt_max_bytes)
+            _, session, _ = read_completed_operation(directory, invocation_hash=digest,
+                native_session_ref=native_session_ref, transport_limits=limits)
+            if session != native_session_ref:
+                continue
+            business = (read_business_input(directory, invocation, limits)
+                        if "operation_input_hash" in invocation else None)
+        except (OSError, ValueError, ProviderOperationUnavailable, ProviderSupervisorError):
+            continue
+        yield invocation, business, prompt
+
+
 def read_business_input(
     directory: Path,
     invocation: dict[str, object],

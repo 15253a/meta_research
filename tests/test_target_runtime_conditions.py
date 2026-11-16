@@ -99,9 +99,10 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
         assert runner.request_path is None
         assert recovered.reconciliation_generation == 0
         return
-    assert runner.calls == 1
+    assert runner.calls == 0
     assert recovered.reconciliation_generation == 1
-    assert split_runtime_prompt(runner.request_path.with_name("prompt.txt").read_text()) == (
+    assert runner.request_path is None
+    assert split_runtime_prompt(recovered.frozen_prompt) == (
         original_conditions, "Original frozen Target work.",
     )
 
@@ -109,11 +110,11 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
         raise AssertionError("Signed terminal replay must not read current conditions")
 
     monkeypatch.setattr("meta_research.harness.render_runtime_conditions", no_fresh_conditions)
-    with pytest.raises(HarnessAdmissionError, match="provider_stopped"):
+    with pytest.raises(HarnessAdmissionError, match="provider_io_unavailable"):
         runtime().run_or_resume_target_root(
             target_request.request_ref, prompt="Original frozen Target work.",
             mcp_base_url=endpoint,
         )
-    assert owner.query_run(target_request.request_ref).native_session_ref == "retained-native-session"
+    assert owner.query_run(target_request.request_ref).native_session_ref is None
     assert owner.latest_operation(run.run_ref).operation_ref == original.operation_ref
-    assert runner.calls == 1
+    assert runner.calls == 0

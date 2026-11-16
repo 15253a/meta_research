@@ -12,10 +12,10 @@ from meta_research.owners.human_collaboration_ladder import guidance_binding_fro
 def prepare_live_guidance(owner, *, scope, binding):
     from meta_research.owners.human_guidance import _cut, guidance_applies_to_work
     owner.verify_frozen_guidance_binding(binding)
-    work = owner._agent_runtime.verify_guidance_read_scope(scope, binding)
+    work = owner._agent_runtime.verify_guidance_read_scope(scope, binding, reconcile=True)
     original = owner.recover_operation_guidance(binding.identity)
     with owner._database.fenced_write() as connection:
-        owner._agent_runtime.verify_guidance_read_scope(scope, binding)
+        owner._agent_runtime.verify_guidance_read_scope(scope, binding, reconcile=True)
         supplements = _supplements(connection, binding)
         known = {decoded_object(item.guide_json)["constraint_ref"]: item
                  for item in original.deliveries if item.applies_to_work}
@@ -88,7 +88,7 @@ def prepare_live_guidance(owner, *, scope, binding):
                     "按其确认范围和力度处理。撤回不自动停止实验、删除成果或回滚目标。"
                     "outside_scope表示原已收到指导现已退出本根适用范围，不继续当作本工作要求。"
                     "原初始输入保持；需要反馈时使用本消息准确delivery_ref。"})
-        return messages
+        return [*messages, *owner.human_response_events(scope=scope)]
 
 
 def _supplements(connection, binding):

@@ -102,7 +102,9 @@ def test_stage_receives_library_configuration_and_refreshes_it_on_next_call(root
     assert len(runner.calls) == 1
     _idea_call(adapter, run="run-one", job="job:next", native="runtime-native")
     conditions, _ = split_runtime_prompt(runner.calls[1][1])
-    assert json.loads(conditions.splitlines()[-1])["literature_configuration"] == changed
+    update = next(line.removeprefix("当前运行条件更新=") for line in conditions.splitlines()
+                  if line.startswith("当前运行条件更新="))
+    assert json.loads(update)["literature_configuration"] == changed
     assert library["library_entry_url"] not in conditions
 
 
@@ -133,7 +135,7 @@ def test_public_idea_provider_receives_saved_style_and_restores_original_operati
     next_prompt = runner.calls[1][1]
     assert '开放探索：主动探索新方向' in next_prompt
     assert '联系已有研究积累' in next_prompt
-    assert 'GPU-one-3' in next_prompt and '30d' in next_prompt
+    assert 'GPU-one-3' not in next_prompt and '30d' not in next_prompt
     assert '不取消或覆盖人的持续条件' in next_prompt
 
 
