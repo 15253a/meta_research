@@ -21,7 +21,9 @@ test("accepted work without an overall classification retains evaluation, missin
     assert.equal(facts.pendingEvaluation, true);
     assert.equal(facts.technicalFailure, false);
     assert.equal(facts.facts.find(item => item.label === "评价").text, "执行已记录 · 评价待办");
-    assert.deepEqual(facts.sources.root_measurement, measurement);
+    assert.equal(facts.sources.root_measurement.execution_status, "executed");
+    assert.equal(facts.sources.root_measurement.evaluation_status, "pending");
+    assert.equal(facts.sources.root_measurement.metrics, undefined);
     assert.equal(facts.sources.commit_ref, "commit:1");
     assert.equal(facts.sources.target_spec_hash, "hash:1");
     assert.deepEqual(facts.readableAssets, [
@@ -29,6 +31,23 @@ test("accepted work without an overall classification retains evaluation, missin
       { versionRef: "note:v1", label: "读取交接说明" },
     ]);
   }
+});
+
+test("snapshot scientific numbers are never presented as exact technical source values", () => {
+  // response.json has already rounded this integer before the projection sees it.
+  const measurement = JSON.parse('{"metrics":{"bootstrap_seed":14748774831839608929},"metrics_hash":"exact-metrics-hash","execution_status":"executed","result_document":{"seed":14748774831839608929},"result_asset":{"version_ref":"result:v1","source_bytes_sha256":"exact-original-hash"},"formal_entities":[{"variant_run_ref":"run:1","evaluation_attempt_ref":"eval:1","metrics":{"seed":14748774831839608929}}]}');
+  const accepted = commit(measurement);
+  accepted.closure.target_root_manifest = { manifest_ref: "manifest:1", payload_hash: "manifest-hash", entries: [{ path: "result.json", role: "result", content_hash: "exact-original-hash", binding: { version_ref: "result:v1" }, metadata: { seed: measurement.metrics.bootstrap_seed } }] };
+  accepted.closure.research_notes[0].metadata = { seed: measurement.metrics.bootstrap_seed };
+  const facts = targetResearchFacts(target, accepted);
+  const displayed = JSON.stringify({ sources: facts.sources, notes: facts.notes });
+  assert.ok(!displayed.includes("14748774831839609000"));
+  assert.ok(!displayed.includes('"metrics":'));
+  assert.equal(facts.sources.root_measurement.metrics_hash, "exact-metrics-hash");
+  assert.equal(facts.sources.result_asset.source_bytes_sha256, "exact-original-hash");
+  assert.equal(facts.sources.manifest.entries[0].content_hash, "exact-original-hash");
+  assert.equal(facts.sources.root_measurement.formal_entities[0].evaluation_attempt_ref, "eval:1");
+  assert.ok(facts.readableAssets.some(asset => asset.versionRef === "result:v1"));
 });
 
 test("accepted run-only work keeps its evaluation pending and its negative finding out of technical failure", () => {

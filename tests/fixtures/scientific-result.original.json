@@ -1,0 +1,3736 @@
+{
+  "status": "completed",
+  "summary": "A01T匹配60层×400完整生成完成。预算8存在区间覆盖不足/结构缺测，预算16有意义变化辨别率低；真实三个可用区间上界均高于ε=.16，另一个缺测。建议暂放现有固定预算/区间下的稳定或漂移归因，保留精确材料用于窄设计改进。",
+  "metrics": {},
+  "input_and_coordinate_audit": [
+    {
+      "whiten_Creg_max_abs": 9.015010959956271e-14,
+      "whiten_unregularized_C_max_abs_diagnostic_only": 0.10234899185290414,
+      "B_orthogonality_max_abs": 2.220446049250313e-16,
+      "Aq_e0_max_abs": 1.8167124839893902e-16,
+      "coordinates": "K/H在已施加Helmert B的21维共同CAR内，uV²/Hz；剩余仅W一次；svec全部对角在先，严格上三角sqrt2",
+      "truths": [
+        {
+          "world": "stable",
+          "a1": 0.4,
+          "a2": 0.4,
+          "d12": 0.0,
+          "nominal_d12": 0,
+          "epsilon": 0.16,
+          "min_H_eigenvalues": [
+            -5.4903885330173455e-18,
+            -5.4903885330173455e-18
+          ]
+        },
+        {
+          "world": "meaningful",
+          "a1": 0.4,
+          "a2": 0.8,
+          "d12": 0.1599999999999999,
+          "nominal_d12": 0.16,
+          "epsilon": 0.16,
+          "min_H_eigenvalues": [
+            -5.4903885330173455e-18,
+            -1.0980777066034691e-17
+          ]
+        },
+        {
+          "world": "obvious",
+          "a1": 0.4,
+          "a2": 2.4,
+          "d12": 4.0,
+          "nominal_d12": 4,
+          "epsilon": 0.16,
+          "min_H_eigenvalues": [
+            -5.4903885330173455e-18,
+            -1.5700945596588063e-17
+          ]
+        }
+      ],
+      "original_audit_version": "asset_version_9f1b209ee13f4a3b9852a3c1d07bc676",
+      "source_record_sha256": "74d900ce83a115509f663c0ac45bd36d56f05be528064743c49b0c2efb5088a3"
+    }
+  ],
+  "frozen_matching_protocol": [
+    {
+      "path": "implementation/frozen-config.json",
+      "sha256": "b8060a12b3407bc67ee2bffde2bb49a8f664a917cf266212630722e828c9c535",
+      "scientific_parameters_frozen_at": "2026-11-16T00:15:40.373821+00:00",
+      "bootstrap_attempts": 999,
+      "minimum_valid": 500,
+      "complete_repetitions": 400,
+      "epsilon": 0.16,
+      "numerical_repair": {
+        "at": "2026-11-16T00:20:13.389082+00:00",
+        "old_config_sha256": "53b30003de348da97696176c4b33ecc28edba6bff5173d94a169b4f675a90f9f",
+        "old_evaluate_sha256": "a415400a37ab88a4d04388883b8a0f89f0e8170e520dd0fc45a05066bd024603",
+        "new_evaluate_sha256": "86b3afc341962e308651e64b9d0bbc4534ef344f54b397e0b224466c472b0640",
+        "cause": "独立审阅纯构造同日程背景的Gram相消伪波动；改用先对比后内积的等价计算，未改变任何生成/区间参数。",
+        "evidence": "outputs/analysis/method-check-cancellation.json",
+        "full_rerun": "保留相同完整生成/重采样seed及原数据；原尝试保留，按修复程序重算main/held/real。run6已消费，但未用于选择修复或任何参数。"
+      },
+      "source_protocol": "asset_version_122feaef2df54f9fb559e7e587c472e2",
+      "detailed_report": {
+        "path": "outputs/analysis/result-detail.json",
+        "sha256": "656a46acef5dc6b038a53dcab3bfdfec7071c186e922975e66b600d42a01f0b8",
+        "meaning": "完整60层科学字段逐值保留；主结果每层detail_index指向同序记录。覆盖/检出率条件于可用区间；缺测未知界、生成索引路径及细分诊断见详细报告和原逐重复文件。"
+      }
+    }
+  ],
+  "structural_resampling_audit": [
+    {
+      "key": "nested_prefix__odd_even__n8",
+      "n": 8,
+      "split": "odd_even",
+      "block_count": 4,
+      "block_seconds": 60,
+      "origin": "各自原始32766任务run边界，未重新对齐首个selected cue",
+      "run_start_samples": [
+        91518,
+        188353
+      ],
+      "grid_end_seconds": 240,
+      "observed_last_cue_seconds": 195.056,
+      "reachable_resampling": {
+        "ordered_draws_each_run": 256,
+        "valid_ordered_draws_by_run": [
+          240,
+          160
+        ],
+        "valid_fraction_independent": 0.5859375,
+        "valid_ordered_draws_joint": 160,
+        "valid_fraction_joint": 0.625,
+        "unique_multiplicity_vectors_total": 35,
+        "unique_valid_multiplicity_vectors_joint": 16,
+        "unique_normalized_event_weights_by_run": [
+          7,
+          14
+        ],
+        "a_run_entire_contrast_fixed_in_all_reachable_valid_resamples": false
+      },
+      "detail_path": "outputs/analysis/structural-audit.json",
+      "detail_index": 0
+    },
+    {
+      "key": "nested_prefix__first_last__n8",
+      "n": 8,
+      "split": "first_last",
+      "block_count": 4,
+      "block_seconds": 60,
+      "origin": "各自原始32766任务run边界，未重新对齐首个selected cue",
+      "run_start_samples": [
+        91518,
+        188353
+      ],
+      "grid_end_seconds": 240,
+      "observed_last_cue_seconds": 195.056,
+      "reachable_resampling": {
+        "ordered_draws_each_run": 256,
+        "valid_ordered_draws_by_run": [
+          110,
+          160
+        ],
+        "valid_fraction_independent": 0.2685546875,
+        "valid_ordered_draws_joint": 96,
+        "valid_fraction_joint": 0.375,
+        "unique_multiplicity_vectors_total": 35,
+        "unique_valid_multiplicity_vectors_joint": 7,
+        "unique_normalized_event_weights_by_run": [
+          1,
+          14
+        ],
+        "a_run_entire_contrast_fixed_in_all_reachable_valid_resamples": true
+      },
+      "detail_path": "outputs/analysis/structural-audit.json",
+      "detail_index": 1
+    },
+    {
+      "key": "nested_prefix__odd_even__n16",
+      "n": 16,
+      "split": "odd_even",
+      "block_count": 6,
+      "block_seconds": 60,
+      "origin": "各自原始32766任务run边界，未重新对齐首个selected cue",
+      "run_start_samples": [
+        91518,
+        188353
+      ],
+      "grid_end_seconds": 360,
+      "observed_last_cue_seconds": 316.728,
+      "reachable_resampling": {
+        "ordered_draws_each_run": 46656,
+        "valid_ordered_draws_by_run": [
+          45927,
+          45801
+        ],
+        "valid_fraction_independent": 0.966335720486111,
+        "valid_ordered_draws_joint": 45136,
+        "valid_fraction_joint": 0.9674211248285323,
+        "unique_multiplicity_vectors_total": 462,
+        "unique_valid_multiplicity_vectors_joint": 401,
+        "unique_normalized_event_weights_by_run": [
+          373,
+          412
+        ],
+        "a_run_entire_contrast_fixed_in_all_reachable_valid_resamples": false
+      },
+      "detail_path": "outputs/analysis/structural-audit.json",
+      "detail_index": 2
+    },
+    {
+      "key": "nested_prefix__first_last__n16",
+      "n": 16,
+      "split": "first_last",
+      "block_count": 6,
+      "block_seconds": 60,
+      "origin": "各自原始32766任务run边界，未重新对齐首个selected cue",
+      "run_start_samples": [
+        91518,
+        188353
+      ],
+      "grid_end_seconds": 360,
+      "observed_last_cue_seconds": 316.728,
+      "reachable_resampling": {
+        "ordered_draws_each_run": 46656,
+        "valid_ordered_draws_by_run": [
+          38528,
+          40504
+        ],
+        "valid_fraction_independent": 0.7169013117166346,
+        "valid_ordered_draws_joint": 37262,
+        "valid_fraction_joint": 0.7986539780521262,
+        "unique_multiplicity_vectors_total": 462,
+        "unique_valid_multiplicity_vectors_joint": 266,
+        "unique_normalized_event_weights_by_run": [
+          190,
+          302
+        ],
+        "a_run_entire_contrast_fixed_in_all_reachable_valid_resamples": false
+      },
+      "detail_path": "outputs/analysis/structural-audit.json",
+      "detail_index": 3
+    }
+  ],
+  "matching_control_results": [
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.16685018058607304,
+      "bias": 0.16685018058607304,
+      "bias_MCSE": 0.1776568915755283,
+      "detection_count": 38,
+      "detection_rate_given_available": 0.095,
+      "detection_MC95_given_available": [
+        0.06999661149327467,
+        0.12770834691750552
+      ],
+      "coverage_count": 332,
+      "coverage_given_available": 0.83,
+      "coverage_MC95_given_available": [
+        0.7900908679413299,
+        0.8636310177980344
+      ],
+      "mean_interval_width": 10.94939615888503,
+      "upper_below_epsilon_count": 32,
+      "upper_below_epsilon_rate_given_available": 0.08,
+      "upper_below_epsilon_MC95": [
+        0.05723575041013351,
+        0.11075457683067555
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234241,
+      "bootstrap_invalid_empty_total": 165359,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n8__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 0
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.2835717493866929,
+      "bias": 0.12357174938669299,
+      "bias_MCSE": 0.190623404275236,
+      "detection_count": 51,
+      "detection_rate_given_available": 0.1275,
+      "detection_MC95_given_available": [
+        0.0983211891565858,
+        0.1637654701224651
+      ],
+      "coverage_count": 317,
+      "coverage_given_available": 0.7925,
+      "coverage_MC95_given_available": [
+        0.7500694660392275,
+        0.829365841775209
+      ],
+      "mean_interval_width": 10.950767200497806,
+      "upper_below_epsilon_count": 38,
+      "upper_below_epsilon_rate_given_available": 0.095,
+      "upper_below_epsilon_MC95": [
+        0.06999661149327467,
+        0.12770834691750552
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234000,
+      "bootstrap_invalid_empty_total": 165600,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n8__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 1
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.193848050274069,
+      "bias": 0.19384805027406937,
+      "bias_MCSE": 0.17561587430571252,
+      "detection_count": 160,
+      "detection_rate_given_available": 0.4,
+      "detection_MC95_given_available": [
+        0.3531615288938136,
+        0.4487409299730458
+      ],
+      "coverage_count": 333,
+      "coverage_given_available": 0.8325,
+      "coverage_MC95_given_available": [
+        0.7927798983351753,
+        0.8658944259325176
+      ],
+      "mean_interval_width": 11.611977409542465,
+      "upper_below_epsilon_count": 2,
+      "upper_below_epsilon_rate_given_available": 0.005,
+      "upper_below_epsilon_MC95": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234243,
+      "bootstrap_invalid_empty_total": 165357,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n8__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 2
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 1.0916883470546286,
+      "bias": 1.0916883470546286,
+      "bias_MCSE": 0.14907926984727843,
+      "detection_count": 41,
+      "detection_rate_given_available": 0.1025,
+      "detection_MC95_given_available": [
+        0.07645885298219338,
+        0.1361034210135723
+      ],
+      "coverage_count": 334,
+      "coverage_given_available": 0.835,
+      "coverage_MC95_given_available": [
+        0.7954717951637494,
+        0.8681549676322718
+      ],
+      "mean_interval_width": 10.266439751694762,
+      "upper_below_epsilon_count": 30,
+      "upper_below_epsilon_rate_given_available": 0.075,
+      "upper_below_epsilon_MC95": [
+        0.05303774392284765,
+        0.10504770626130436
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 233999,
+      "bootstrap_invalid_empty_total": 165601,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n8__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 3
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 1.4857895185326135,
+      "bias": 1.3257895185326136,
+      "bias_MCSE": 0.167716439080463,
+      "detection_count": 43,
+      "detection_rate_given_available": 0.1075,
+      "detection_MC95_given_available": [
+        0.08079372047159449,
+        0.14167343058082826
+      ],
+      "coverage_count": 342,
+      "coverage_given_available": 0.855,
+      "coverage_MC95_given_available": [
+        0.8171167606818923,
+        0.8861295103407572
+      ],
+      "mean_interval_width": 9.950923798704144,
+      "upper_below_epsilon_count": 20,
+      "upper_below_epsilon_rate_given_available": 0.05,
+      "upper_below_epsilon_MC95": [
+        0.03259742983714726,
+        0.07596363506371961
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234287,
+      "bootstrap_invalid_empty_total": 165313,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n8__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 4
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.899237319722539,
+      "bias": 0.8992373197225394,
+      "bias_MCSE": 0.15755389654004062,
+      "detection_count": 187,
+      "detection_rate_given_available": 0.4675,
+      "detection_MC95_given_available": [
+        0.4191457978919653,
+        0.516472501239764
+      ],
+      "coverage_count": 330,
+      "coverage_given_available": 0.825,
+      "coverage_MC95_given_available": [
+        0.7847212102757525,
+        0.8590957984069546
+      ],
+      "mean_interval_width": 9.701297025685024,
+      "upper_below_epsilon_count": 3,
+      "upper_below_epsilon_rate_given_available": 0.0075,
+      "upper_below_epsilon_MC95": [
+        0.0025538891952499396,
+        0.021815720724032123
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234969,
+      "bootstrap_invalid_empty_total": 164631,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n8__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 5
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": -0.23571774917504615,
+      "bias": -0.23571774917504615,
+      "bias_MCSE": 0.16197895401715925,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107502,
+      "bootstrap_invalid_empty_total": 292098,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n8__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 6
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": 0.26692133523376116,
+      "bias": 0.10692133523376127,
+      "bias_MCSE": 0.18269901765978822,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107764,
+      "bootstrap_invalid_empty_total": 291836,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n8__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 7
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": 3.999371657204376,
+      "bias": -0.0006283427956241816,
+      "bias_MCSE": 0.1799229118807097,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107468,
+      "bootstrap_invalid_empty_total": 292132,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n8__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 8
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": -0.22552201043017228,
+      "bias": -0.22552201043017228,
+      "bias_MCSE": 0.1761948232164409,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107300,
+      "bootstrap_invalid_empty_total": 292300,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n8__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 9
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": -0.179030795455581,
+      "bias": -0.3390307954555809,
+      "bias_MCSE": 0.19170015827785938,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107412,
+      "bootstrap_invalid_empty_total": 292188,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n8__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 10
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 8,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": 3.561929713166841,
+      "bias": -0.4380702868331592,
+      "bias_MCSE": 0.16547189604732992,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 106882,
+      "bootstrap_invalid_empty_total": 292718,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n8__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 11
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.10595275118482311,
+      "bias": -0.10595275118482311,
+      "bias_MCSE": 0.0881643244278866,
+      "detection_count": 3,
+      "detection_rate_given_available": 0.0075,
+      "detection_MC95_given_available": [
+        0.0025538891952499396,
+        0.021815720724032123
+      ],
+      "coverage_count": 395,
+      "coverage_given_available": 0.9875,
+      "coverage_MC95_given_available": [
+        0.9710762638040326,
+        0.9946492492200284
+      ],
+      "mean_interval_width": 10.322294254134063,
+      "upper_below_epsilon_count": 5,
+      "upper_below_epsilon_rate_given_available": 0.0125,
+      "upper_below_epsilon_MC95": [
+        0.005350750779971611,
+        0.028923736195967484
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386217,
+      "bootstrap_invalid_empty_total": 13383,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 12
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.1770926008870762,
+      "bias": 0.017092600887076315,
+      "bias_MCSE": 0.08547017547805048,
+      "detection_count": 2,
+      "detection_rate_given_available": 0.005,
+      "detection_MC95_given_available": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "coverage_count": 395,
+      "coverage_given_available": 0.9875,
+      "coverage_MC95_given_available": [
+        0.9710762638040326,
+        0.9946492492200284
+      ],
+      "mean_interval_width": 10.780344083838946,
+      "upper_below_epsilon_count": 3,
+      "upper_below_epsilon_rate_given_available": 0.0075,
+      "upper_below_epsilon_MC95": [
+        0.0025538891952499396,
+        0.021815720724032123
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386292,
+      "bootstrap_invalid_empty_total": 13308,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 13
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.036572428239115,
+      "bias": 0.036572428239114885,
+      "bias_MCSE": 0.0980702713698006,
+      "detection_count": 139,
+      "detection_rate_given_available": 0.3475,
+      "detection_MC95_given_available": [
+        0.3024860405122664,
+        0.39541520925969403
+      ],
+      "coverage_count": 396,
+      "coverage_given_available": 0.99,
+      "coverage_MC95_given_available": [
+        0.9745734353473804,
+        0.996104516205009
+      ],
+      "mean_interval_width": 10.838584005993143,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386253,
+      "bootstrap_invalid_empty_total": 13347,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 14
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "shared",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.8122538232919624,
+      "bias": -0.8122538232919624,
+      "bias_MCSE": 0.07952910226245913,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 390,
+      "coverage_given_available": 0.975,
+      "coverage_MC95_given_available": [
+        0.9545984121283544,
+        0.986364908254064
+      ],
+      "mean_interval_width": 12.668597245096215,
+      "upper_below_epsilon_count": 14,
+      "upper_below_epsilon_rate_given_available": 0.035,
+      "upper_below_epsilon_MC95": [
+        0.02096129419797776,
+        0.057885139532918004
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386696,
+      "bootstrap_invalid_empty_total": 12904,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__iid__shared__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 15
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "shared",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.6470629849621689,
+      "bias": -0.8070629849621688,
+      "bias_MCSE": 0.08176057384169641,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 394,
+      "coverage_given_available": 0.985,
+      "coverage_MC95_given_available": [
+        0.9676653664151732,
+        0.9931077080805591
+      ],
+      "mean_interval_width": 12.944853326345523,
+      "upper_below_epsilon_count": 6,
+      "upper_below_epsilon_rate_given_available": 0.015,
+      "upper_below_epsilon_MC95": [
+        0.006892291919440893,
+        0.03233463358482672
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386694,
+      "bootstrap_invalid_empty_total": 12906,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__iid__shared__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 16
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "shared",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 3.174118009441066,
+      "bias": -0.8258819905589339,
+      "bias_MCSE": 0.07944367787084843,
+      "detection_count": 15,
+      "detection_rate_given_available": 0.0375,
+      "detection_MC95_given_available": [
+        0.022855029814710867,
+        0.060943842444513396
+      ],
+      "coverage_count": 390,
+      "coverage_given_available": 0.975,
+      "coverage_MC95_given_available": [
+        0.9545984121283544,
+        0.986364908254064
+      ],
+      "mean_interval_width": 13.115569575739155,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386700,
+      "bootstrap_invalid_empty_total": 12900,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__iid__shared__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 17
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.17724316913603314,
+      "bias": 0.17724316913603314,
+      "bias_MCSE": 0.07872468737898305,
+      "detection_count": 1,
+      "detection_rate_given_available": 0.0025,
+      "detection_MC95_given_available": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "coverage_count": 399,
+      "coverage_given_available": 0.9975,
+      "coverage_MC95_given_available": [
+        0.9859767149241766,
+        0.9995585522131983
+      ],
+      "mean_interval_width": 11.198433216334342,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386235,
+      "bootstrap_invalid_empty_total": 13365,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 18
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.16969356101806038,
+      "bias": 0.009693561018060487,
+      "bias_MCSE": 0.08025514695249268,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 400,
+      "coverage_given_available": 1.0,
+      "coverage_MC95_given_available": [
+        0.9904877056657034,
+        0.9999999999999999
+      ],
+      "mean_interval_width": 11.20806115366255,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386474,
+      "bootstrap_invalid_empty_total": 13126,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 19
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.171763075662297,
+      "bias": 0.1717630756622972,
+      "bias_MCSE": 0.08412400092536848,
+      "detection_count": 94,
+      "detection_rate_given_available": 0.235,
+      "detection_MC95_given_available": [
+        0.1960909748126292,
+        0.278950541184548
+      ],
+      "coverage_count": 398,
+      "coverage_given_available": 0.995,
+      "coverage_MC95_given_available": [
+        0.9819550815637568,
+        0.9986277470452896
+      ],
+      "mean_interval_width": 11.142791578484502,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386121,
+      "bootstrap_invalid_empty_total": 13479,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 20
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "shared",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.0014356355080023242,
+      "bias": -0.0014356355080023242,
+      "bias_MCSE": 0.08752851496970314,
+      "detection_count": 2,
+      "detection_rate_given_available": 0.005,
+      "detection_MC95_given_available": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "coverage_count": 397,
+      "coverage_given_available": 0.9925,
+      "coverage_MC95_given_available": [
+        0.9781842792759678,
+        0.9974461108047501
+      ],
+      "mean_interval_width": 12.943717746484106,
+      "upper_below_epsilon_count": 1,
+      "upper_below_epsilon_rate_given_available": 0.0025,
+      "upper_below_epsilon_MC95": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386628,
+      "bootstrap_invalid_empty_total": 12972,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__time_circular_block__shared__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 21
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "shared",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.17543999125736456,
+      "bias": 0.015439991257364671,
+      "bias_MCSE": 0.08835675670243617,
+      "detection_count": 2,
+      "detection_rate_given_available": 0.005,
+      "detection_MC95_given_available": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "coverage_count": 396,
+      "coverage_given_available": 0.99,
+      "coverage_MC95_given_available": [
+        0.9745734353473804,
+        0.996104516205009
+      ],
+      "mean_interval_width": 12.71518145556133,
+      "upper_below_epsilon_count": 2,
+      "upper_below_epsilon_rate_given_available": 0.005,
+      "upper_below_epsilon_MC95": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386742,
+      "bootstrap_invalid_empty_total": 12858,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__time_circular_block__shared__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 22
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "shared",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 3.8603459483692593,
+      "bias": -0.13965405163074074,
+      "bias_MCSE": 0.08350035354042737,
+      "detection_count": 93,
+      "detection_rate_given_available": 0.2325,
+      "detection_MC95_given_available": [
+        0.19376640712110382,
+        0.2763226703477448
+      ],
+      "coverage_count": 394,
+      "coverage_given_available": 0.985,
+      "coverage_MC95_given_available": [
+        0.9676653664151732,
+        0.9931077080805591
+      ],
+      "mean_interval_width": 11.804874473316042,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386618,
+      "bootstrap_invalid_empty_total": 12982,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__odd_even__n16__time_circular_block__shared__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 23
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.18179969992100795,
+      "bias": -0.18179969992100795,
+      "bias_MCSE": 0.08561500211066833,
+      "detection_count": 6,
+      "detection_rate_given_available": 0.015,
+      "detection_MC95_given_available": [
+        0.006892291919440893,
+        0.03233463358482672
+      ],
+      "coverage_count": 389,
+      "coverage_given_available": 0.9725,
+      "coverage_MC95_given_available": [
+        0.9514345181143852,
+        0.9845763637397046
+      ],
+      "mean_interval_width": 9.96187382990468,
+      "upper_below_epsilon_count": 5,
+      "upper_below_epsilon_rate_given_available": 0.0125,
+      "upper_below_epsilon_MC95": [
+        0.005350750779971611,
+        0.028923736195967484
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286614,
+      "bootstrap_invalid_empty_total": 112986,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n16__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 24
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.15420599954437159,
+      "bias": -0.0057940004556283065,
+      "bias_MCSE": 0.08838107391370731,
+      "detection_count": 5,
+      "detection_rate_given_available": 0.0125,
+      "detection_MC95_given_available": [
+        0.005350750779971611,
+        0.028923736195967484
+      ],
+      "coverage_count": 392,
+      "coverage_given_available": 0.98,
+      "coverage_MC95_given_available": [
+        0.96103658423074,
+        0.9898316132083353
+      ],
+      "mean_interval_width": 9.511876549536138,
+      "upper_below_epsilon_count": 4,
+      "upper_below_epsilon_rate_given_available": 0.01,
+      "upper_below_epsilon_MC95": [
+        0.003895483794990993,
+        0.025426564652619582
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286350,
+      "bootstrap_invalid_empty_total": 113250,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n16__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 25
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 3.892704201723002,
+      "bias": -0.10729579827699798,
+      "bias_MCSE": 0.08352966043588797,
+      "detection_count": 163,
+      "detection_rate_given_available": 0.4075,
+      "detection_MC95_given_available": [
+        0.3604480792409669,
+        0.4563116952108779
+      ],
+      "coverage_count": 396,
+      "coverage_given_available": 0.99,
+      "coverage_MC95_given_available": [
+        0.9745734353473804,
+        0.996104516205009
+      ],
+      "mean_interval_width": 9.722944349340322,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286418,
+      "bootstrap_invalid_empty_total": 113182,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n16__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 26
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.02763946840626338,
+      "bias": 0.02763946840626338,
+      "bias_MCSE": 0.07668281964672437,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 399,
+      "coverage_given_available": 0.9975,
+      "coverage_MC95_given_available": [
+        0.9859767149241766,
+        0.9995585522131983
+      ],
+      "mean_interval_width": 9.284937485891367,
+      "upper_below_epsilon_count": 2,
+      "upper_below_epsilon_rate_given_available": 0.005,
+      "upper_below_epsilon_MC95": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286627,
+      "bootstrap_invalid_empty_total": 112973,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n16__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 27
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.3262109199782642,
+      "bias": 0.1662109199782643,
+      "bias_MCSE": 0.07965435469521326,
+      "detection_count": 3,
+      "detection_rate_given_available": 0.0075,
+      "detection_MC95_given_available": [
+        0.0025538891952499396,
+        0.021815720724032123
+      ],
+      "coverage_count": 398,
+      "coverage_given_available": 0.995,
+      "coverage_MC95_given_available": [
+        0.9819550815637568,
+        0.9986277470452896
+      ],
+      "mean_interval_width": 9.327849608255397,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286639,
+      "bootstrap_invalid_empty_total": 112961,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n16__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 28
+    },
+    {
+      "phase": "main",
+      "background_run": 3,
+      "n": 16,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.006887698743407,
+      "bias": 0.006887698743407,
+      "bias_MCSE": 0.0777883123745875,
+      "detection_count": 166,
+      "detection_rate_given_available": 0.415,
+      "detection_MC95_given_available": [
+        0.36774607523110986,
+        0.4638710148057205
+      ],
+      "coverage_count": 396,
+      "coverage_given_available": 0.99,
+      "coverage_MC95_given_available": [
+        0.9745734353473804,
+        0.996104516205009
+      ],
+      "mean_interval_width": 9.322801147527649,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286766,
+      "bootstrap_invalid_empty_total": 112834,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/main/run3/nested_prefix__first_last__n16__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 29
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.12138401796869443,
+      "bias": 0.12138401796869443,
+      "bias_MCSE": 0.175661278250912,
+      "detection_count": 41,
+      "detection_rate_given_available": 0.1025,
+      "detection_MC95_given_available": [
+        0.07645885298219338,
+        0.1361034210135723
+      ],
+      "coverage_count": 332,
+      "coverage_given_available": 0.83,
+      "coverage_MC95_given_available": [
+        0.7900908679413299,
+        0.8636310177980344
+      ],
+      "mean_interval_width": 10.603111171502007,
+      "upper_below_epsilon_count": 30,
+      "upper_below_epsilon_rate_given_available": 0.075,
+      "upper_below_epsilon_MC95": [
+        0.05303774392284765,
+        0.10504770626130436
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234582,
+      "bootstrap_invalid_empty_total": 165018,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n8__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 30
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.07022275789500154,
+      "bias": -0.23022275789500143,
+      "bias_MCSE": 0.17211609135441647,
+      "detection_count": 25,
+      "detection_rate_given_available": 0.0625,
+      "detection_MC95_given_available": [
+        0.04268914141220244,
+        0.09063411613030699
+      ],
+      "coverage_count": 329,
+      "coverage_given_available": 0.8225,
+      "coverage_MC95_given_available": [
+        0.782040489241534,
+        0.8568240809128447
+      ],
+      "mean_interval_width": 11.011819161531562,
+      "upper_below_epsilon_count": 46,
+      "upper_below_epsilon_rate_given_available": 0.115,
+      "upper_below_epsilon_MC95": [
+        0.0873329226216324,
+        0.1499915440157759
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234525,
+      "bootstrap_invalid_empty_total": 165075,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n8__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 31
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 3.7366494747572587,
+      "bias": -0.2633505252427413,
+      "bias_MCSE": 0.18121688072218625,
+      "detection_count": 155,
+      "detection_rate_given_available": 0.3875,
+      "detection_MC95_given_available": [
+        0.34104299567214824,
+        0.43609727055306846
+      ],
+      "coverage_count": 309,
+      "coverage_given_available": 0.7725,
+      "coverage_MC95_given_available": [
+        0.7289390669951599,
+        0.8108767325926485
+      ],
+      "mean_interval_width": 10.829818780390974,
+      "upper_below_epsilon_count": 9,
+      "upper_below_epsilon_rate_given_available": 0.0225,
+      "upper_below_epsilon_MC95": [
+        0.011881583530495034,
+        0.04220265755875813
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 233736,
+      "bootstrap_invalid_empty_total": 165864,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n8__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 32
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 1.5734683723759946,
+      "bias": 1.5734683723759946,
+      "bias_MCSE": 0.16774996688212035,
+      "detection_count": 30,
+      "detection_rate_given_available": 0.075,
+      "detection_MC95_given_available": [
+        0.05303774392284765,
+        0.10504770626130436
+      ],
+      "coverage_count": 348,
+      "coverage_given_available": 0.87,
+      "coverage_MC95_given_available": [
+        0.8334921544792615,
+        0.8994687477133592
+      ],
+      "mean_interval_width": 10.858701630568822,
+      "upper_below_epsilon_count": 26,
+      "upper_below_epsilon_rate_given_available": 0.065,
+      "upper_below_epsilon_MC95": [
+        0.04474048189620036,
+        0.09353521417463759
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 233817,
+      "bootstrap_invalid_empty_total": 165783,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n8__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 33
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 399,
+      "interval_missing": 1,
+      "mean_T12": 1.7900665245644216,
+      "bias": 1.6300665245644217,
+      "bias_MCSE": 0.1881927869803195,
+      "detection_count": 49,
+      "detection_rate_given_available": 0.12280701754385964,
+      "detection_MC95_given_available": [
+        0.09415180233424914,
+        0.15865598740723336
+      ],
+      "coverage_count": 330,
+      "coverage_given_available": 0.8270676691729323,
+      "coverage_MC95_given_available": [
+        0.7868864402152634,
+        0.8610111241617234
+      ],
+      "mean_interval_width": 10.319685581471221,
+      "upper_below_epsilon_count": 24,
+      "upper_below_epsilon_rate_given_available": 0.06015037593984962,
+      "upper_below_epsilon_MC95": [
+        0.04075068363210938,
+        0.08793879875745994
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234114,
+      "bootstrap_invalid_empty_total": 165486,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n8__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 34
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 5.93747378160426,
+      "bias": 1.9374737816042602,
+      "bias_MCSE": 0.20682790501015225,
+      "detection_count": 192,
+      "detection_rate_given_available": 0.48,
+      "detection_MC95_given_available": [
+        0.43146340667729527,
+        0.5289170850960765
+      ],
+      "coverage_count": 327,
+      "coverage_given_available": 0.8175,
+      "coverage_MC95_given_available": [
+        0.7766870404912806,
+        0.8522726526064411
+      ],
+      "mean_interval_width": 10.860045006053124,
+      "upper_below_epsilon_count": 1,
+      "upper_below_epsilon_rate_given_available": 0.0025,
+      "upper_below_epsilon_MC95": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 234478,
+      "bootstrap_invalid_empty_total": 165122,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n8__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 35
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": -0.06377588046237113,
+      "bias": -0.06377588046237113,
+      "bias_MCSE": 0.17141716348920877,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107483,
+      "bootstrap_invalid_empty_total": 292117,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n8__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 36
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": -0.0778765682165279,
+      "bias": -0.2378765682165278,
+      "bias_MCSE": 0.16889915318739981,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107156,
+      "bootstrap_invalid_empty_total": 292444,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n8__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 37
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": 4.207785604796823,
+      "bias": 0.20778560479682273,
+      "bias_MCSE": 0.15983193713971225,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107636,
+      "bootstrap_invalid_empty_total": 291964,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n8__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 38
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": -0.08190823271010114,
+      "bias": -0.08190823271010114,
+      "bias_MCSE": 0.1540035992329319,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107673,
+      "bootstrap_invalid_empty_total": 291927,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n8__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 39
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": 0.10946536296157496,
+      "bias": -0.05053463703842494,
+      "bias_MCSE": 0.1640316070598403,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107220,
+      "bootstrap_invalid_empty_total": 292380,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n8__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 40
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 8,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 0,
+      "interval_missing": 400,
+      "mean_T12": 4.131953618091429,
+      "bias": 0.13195361809142891,
+      "bias_MCSE": 0.19924706982481935,
+      "detection_count": 0,
+      "detection_rate_given_available": null,
+      "detection_MC95_given_available": [
+        null,
+        null
+      ],
+      "coverage_count": 0,
+      "coverage_given_available": null,
+      "coverage_MC95_given_available": [
+        null,
+        null
+      ],
+      "mean_interval_width": null,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": null,
+      "upper_below_epsilon_MC95": [
+        null,
+        null
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 107331,
+      "bootstrap_invalid_empty_total": 292269,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n8__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 41
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.010620975482461431,
+      "bias": -0.010620975482461431,
+      "bias_MCSE": 0.0869167198159432,
+      "detection_count": 1,
+      "detection_rate_given_available": 0.0025,
+      "detection_MC95_given_available": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "coverage_count": 394,
+      "coverage_given_available": 0.985,
+      "coverage_MC95_given_available": [
+        0.9676653664151732,
+        0.9931077080805591
+      ],
+      "mean_interval_width": 10.055646144431268,
+      "upper_below_epsilon_count": 5,
+      "upper_below_epsilon_rate_given_available": 0.0125,
+      "upper_below_epsilon_MC95": [
+        0.005350750779971611,
+        0.028923736195967484
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386419,
+      "bootstrap_invalid_empty_total": 13181,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 42
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.1985446781922926,
+      "bias": 0.03854467819229271,
+      "bias_MCSE": 0.08322241767939748,
+      "detection_count": 2,
+      "detection_rate_given_available": 0.005,
+      "detection_MC95_given_available": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "coverage_count": 396,
+      "coverage_given_available": 0.99,
+      "coverage_MC95_given_available": [
+        0.9745734353473804,
+        0.996104516205009
+      ],
+      "mean_interval_width": 10.127098229867173,
+      "upper_below_epsilon_count": 2,
+      "upper_below_epsilon_rate_given_available": 0.005,
+      "upper_below_epsilon_MC95": [
+        0.0013722529547103846,
+        0.018044918436243156
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386158,
+      "bootstrap_invalid_empty_total": 13442,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 43
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.065500859304808,
+      "bias": 0.06550085930480787,
+      "bias_MCSE": 0.09477563630578237,
+      "detection_count": 135,
+      "detection_rate_given_available": 0.3375,
+      "detection_MC95_given_available": [
+        0.2929016377213044,
+        0.38518985793734206
+      ],
+      "coverage_count": 394,
+      "coverage_given_available": 0.985,
+      "coverage_MC95_given_available": [
+        0.9676653664151732,
+        0.9931077080805591
+      ],
+      "mean_interval_width": 10.562905731368778,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386131,
+      "bootstrap_invalid_empty_total": 13469,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 44
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "shared",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.6885243194506957,
+      "bias": -0.6885243194506957,
+      "bias_MCSE": 0.07569586067816575,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 393,
+      "coverage_given_available": 0.9825,
+      "coverage_MC95_given_available": [
+        0.964322927074442,
+        0.991497708892962
+      ],
+      "mean_interval_width": 12.359194607497214,
+      "upper_below_epsilon_count": 8,
+      "upper_below_epsilon_rate_given_available": 0.02,
+      "upper_below_epsilon_MC95": [
+        0.010168386791664645,
+        0.03896341576926
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386872,
+      "bootstrap_invalid_empty_total": 12728,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__iid__shared__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 45
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "shared",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.6264824122898147,
+      "bias": -0.7864824122898146,
+      "bias_MCSE": 0.07923904852753766,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 393,
+      "coverage_given_available": 0.9825,
+      "coverage_MC95_given_available": [
+        0.964322927074442,
+        0.991497708892962
+      ],
+      "mean_interval_width": 12.69023529946391,
+      "upper_below_epsilon_count": 7,
+      "upper_below_epsilon_rate_given_available": 0.0175,
+      "upper_below_epsilon_MC95": [
+        0.008502291107038103,
+        0.03567707292555804
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386652,
+      "bootstrap_invalid_empty_total": 12948,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__iid__shared__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 46
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "iid",
+      "trajectory": "shared",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 3.1657365930480137,
+      "bias": -0.8342634069519863,
+      "bias_MCSE": 0.08916510047680377,
+      "detection_count": 20,
+      "detection_rate_given_available": 0.05,
+      "detection_MC95_given_available": [
+        0.03259742983714726,
+        0.07596363506371961
+      ],
+      "coverage_count": 391,
+      "coverage_given_available": 0.9775,
+      "coverage_MC95_given_available": [
+        0.9577973424412419,
+        0.988118416469505
+      ],
+      "mean_interval_width": 13.128930565845735,
+      "upper_below_epsilon_count": 1,
+      "upper_below_epsilon_rate_given_available": 0.0025,
+      "upper_below_epsilon_MC95": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386617,
+      "bootstrap_invalid_empty_total": 12983,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__iid__shared__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 47
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.36681529074922425,
+      "bias": 0.36681529074922425,
+      "bias_MCSE": 0.08341979460317907,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 399,
+      "coverage_given_available": 0.9975,
+      "coverage_MC95_given_available": [
+        0.9859767149241766,
+        0.9995585522131983
+      ],
+      "mean_interval_width": 11.696153011262732,
+      "upper_below_epsilon_count": 1,
+      "upper_below_epsilon_rate_given_available": 0.0025,
+      "upper_below_epsilon_MC95": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386338,
+      "bootstrap_invalid_empty_total": 13262,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 48
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.3695291726399859,
+      "bias": 0.20952917263998602,
+      "bias_MCSE": 0.08250316333047639,
+      "detection_count": 0,
+      "detection_rate_given_available": 0.0,
+      "detection_MC95_given_available": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "coverage_count": 400,
+      "coverage_given_available": 1.0,
+      "coverage_MC95_given_available": [
+        0.9904877056657034,
+        0.9999999999999999
+      ],
+      "mean_interval_width": 12.143627171548433,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386149,
+      "bootstrap_invalid_empty_total": 13451,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 49
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.243545522824011,
+      "bias": 0.24354552282401087,
+      "bias_MCSE": 0.09000095686184598,
+      "detection_count": 80,
+      "detection_rate_given_available": 0.2,
+      "detection_MC95_given_available": [
+        0.16373705973387687,
+        0.24197031686670106
+      ],
+      "coverage_count": 400,
+      "coverage_given_available": 1.0,
+      "coverage_MC95_given_available": [
+        0.9904877056657034,
+        0.9999999999999999
+      ],
+      "mean_interval_width": 12.024926271575914,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386229,
+      "bootstrap_invalid_empty_total": 13371,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 50
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "shared",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.19607694396896796,
+      "bias": 0.19607694396896796,
+      "bias_MCSE": 0.0873184562458226,
+      "detection_count": 1,
+      "detection_rate_given_available": 0.0025,
+      "detection_MC95_given_available": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "coverage_count": 399,
+      "coverage_given_available": 0.9975,
+      "coverage_MC95_given_available": [
+        0.9859767149241766,
+        0.9995585522131983
+      ],
+      "mean_interval_width": 13.095756699009035,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386492,
+      "bootstrap_invalid_empty_total": 13108,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__time_circular_block__shared__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 51
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "shared",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.42975849295138985,
+      "bias": 0.26975849295139,
+      "bias_MCSE": 0.09388744448236735,
+      "detection_count": 1,
+      "detection_rate_given_available": 0.0025,
+      "detection_MC95_given_available": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "coverage_count": 399,
+      "coverage_given_available": 0.9975,
+      "coverage_MC95_given_available": [
+        0.9859767149241766,
+        0.9995585522131983
+      ],
+      "mean_interval_width": 13.339326925080426,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386835,
+      "bootstrap_invalid_empty_total": 12765,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__time_circular_block__shared__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 52
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "odd_even",
+      "generator": "time_circular_block",
+      "trajectory": "shared",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.206194946563844,
+      "bias": 0.20619494656384418,
+      "bias_MCSE": 0.08888941428952189,
+      "detection_count": 79,
+      "detection_rate_given_available": 0.1975,
+      "detection_MC95_given_available": [
+        0.1614426641926397,
+        0.23931227387960974
+      ],
+      "coverage_count": 397,
+      "coverage_given_available": 0.9925,
+      "coverage_MC95_given_available": [
+        0.9781842792759678,
+        0.9974461108047501
+      ],
+      "mean_interval_width": 13.009046591033744,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 386378,
+      "bootstrap_invalid_empty_total": 13222,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__odd_even__n16__time_circular_block__shared__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 53
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.04121477595593341,
+      "bias": -0.04121477595593341,
+      "bias_MCSE": 0.08468701873193112,
+      "detection_count": 3,
+      "detection_rate_given_available": 0.0075,
+      "detection_MC95_given_available": [
+        0.0025538891952499396,
+        0.021815720724032123
+      ],
+      "coverage_count": 391,
+      "coverage_given_available": 0.9775,
+      "coverage_MC95_given_available": [
+        0.9577973424412419,
+        0.988118416469505
+      ],
+      "mean_interval_width": 9.098784572289995,
+      "upper_below_epsilon_count": 6,
+      "upper_below_epsilon_rate_given_available": 0.015,
+      "upper_below_epsilon_MC95": [
+        0.006892291919440893,
+        0.03233463358482672
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286866,
+      "bootstrap_invalid_empty_total": 112734,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n16__iid__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 54
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.08881541550264557,
+      "bias": -0.07118458449735432,
+      "bias_MCSE": 0.08985796139616664,
+      "detection_count": 8,
+      "detection_rate_given_available": 0.02,
+      "detection_MC95_given_available": [
+        0.010168386791664645,
+        0.03896341576926
+      ],
+      "coverage_count": 384,
+      "coverage_given_available": 0.96,
+      "coverage_MC95_given_available": [
+        0.9360177522821589,
+        0.9752309369302883
+      ],
+      "mean_interval_width": 9.530227547419,
+      "upper_below_epsilon_count": 9,
+      "upper_below_epsilon_rate_given_available": 0.0225,
+      "upper_below_epsilon_MC95": [
+        0.011881583530495034,
+        0.04220265755875813
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286469,
+      "bootstrap_invalid_empty_total": 113131,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n16__iid__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 55
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "first_last",
+      "generator": "iid",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 4.003423271930835,
+      "bias": 0.0034232719308349147,
+      "bias_MCSE": 0.09575013755361893,
+      "detection_count": 153,
+      "detection_rate_given_available": 0.3825,
+      "detection_MC95_given_available": [
+        0.33620468254006386,
+        0.43103070662849585
+      ],
+      "coverage_count": 391,
+      "coverage_given_available": 0.9775,
+      "coverage_MC95_given_available": [
+        0.9577973424412419,
+        0.988118416469505
+      ],
+      "mean_interval_width": 9.733420195870718,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286394,
+      "bootstrap_invalid_empty_total": 113206,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n16__iid__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 56
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "stable",
+      "truth_d12": 0.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": -0.12731089443134175,
+      "bias": -0.12731089443134175,
+      "bias_MCSE": 0.08686971790299801,
+      "detection_count": 1,
+      "detection_rate_given_available": 0.0025,
+      "detection_MC95_given_available": [
+        0.0004414477868016362,
+        0.01402328507582339
+      ],
+      "coverage_count": 396,
+      "coverage_given_available": 0.99,
+      "coverage_MC95_given_available": [
+        0.9745734353473804,
+        0.996104516205009
+      ],
+      "mean_interval_width": 9.759770879871734,
+      "upper_below_epsilon_count": 7,
+      "upper_below_epsilon_rate_given_available": 0.0175,
+      "upper_below_epsilon_MC95": [
+        0.008502291107038103,
+        0.03567707292555804
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286374,
+      "bootstrap_invalid_empty_total": 113226,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n16__time_circular_block__independent__stable/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 57
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "meaningful",
+      "truth_d12": 0.1599999999999999,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 0.14936899149921998,
+      "bias": -0.010631008500779915,
+      "bias_MCSE": 0.07990971815291115,
+      "detection_count": 3,
+      "detection_rate_given_available": 0.0075,
+      "detection_MC95_given_available": [
+        0.0025538891952499396,
+        0.021815720724032123
+      ],
+      "coverage_count": 395,
+      "coverage_given_available": 0.9875,
+      "coverage_MC95_given_available": [
+        0.9710762638040326,
+        0.9946492492200284
+      ],
+      "mean_interval_width": 9.469025649396608,
+      "upper_below_epsilon_count": 3,
+      "upper_below_epsilon_rate_given_available": 0.0075,
+      "upper_below_epsilon_MC95": [
+        0.0025538891952499396,
+        0.021815720724032123
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286510,
+      "bootstrap_invalid_empty_total": 113090,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n16__time_circular_block__independent__meaningful/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 58
+    },
+    {
+      "phase": "held",
+      "background_run": 6,
+      "n": 16,
+      "split": "first_last",
+      "generator": "time_circular_block",
+      "trajectory": "independent",
+      "world": "obvious",
+      "truth_d12": 4.0,
+      "epsilon": 0.16,
+      "complete_generated": 400,
+      "interval_available": 400,
+      "interval_missing": 0,
+      "mean_T12": 3.823980048667041,
+      "bias": -0.17601995133295878,
+      "bias_MCSE": 0.09461027591724253,
+      "detection_count": 140,
+      "detection_rate_given_available": 0.35,
+      "detection_MC95_given_available": [
+        0.3048856490077627,
+        0.3979680392925262
+      ],
+      "coverage_count": 392,
+      "coverage_given_available": 0.98,
+      "coverage_MC95_given_available": [
+        0.96103658423074,
+        0.9898316132083353
+      ],
+      "mean_interval_width": 10.031177429445554,
+      "upper_below_epsilon_count": 0,
+      "upper_below_epsilon_rate_given_available": 0.0,
+      "upper_below_epsilon_MC95": [
+        8.673617379884035e-19,
+        0.009512294334296508
+      ],
+      "bootstrap_attempted_total": 399600,
+      "bootstrap_valid_total": 286142,
+      "bootstrap_invalid_empty_total": 113458,
+      "bootstrap_invalid_nonfinite_total": 0,
+      "epsilon_boundary_count_abs_1e-10": 0,
+      "truth_boundary_count_abs_1e-10": 0,
+      "replicate_path": "outputs/data/held/run6/nested_prefix__first_last__n16__time_circular_block__independent__obvious/replicates.json",
+      "detail_path": "outputs/analysis/result-detail.json",
+      "detail_index": 59
+    }
+  ],
+  "real_primary_intervals": [
+    {
+      "stratum": "nested_prefix__odd_even__n8",
+      "n": 8,
+      "split": "odd_even",
+      "T12": 0.9691769383018645,
+      "accepted_point": 0.9691769383018649,
+      "point_reproduction_abs_error": 4.440892098500626e-16,
+      "CI95": [
+        -6.250608793208302,
+        6.426151369299115
+      ],
+      "bootstrap": {
+        "attempted": 999,
+        "valid": 557,
+        "empty_strata": 442,
+        "nonfinite": 0,
+        "valid_fraction": 0.5575575575575575,
+        "interval_missing_reasons": [],
+        "distinct_Tstar_at_float64": 80,
+        "Tstar_min_max": [
+          -4.685979513993008,
+          8.196334562590241
+        ]
+      },
+      "bootstrap_seed": 14748774831839608929,
+      "epsilon": 0.16,
+      "conditional_upper_below_epsilon": false,
+      "positive_lower": false
+    },
+    {
+      "stratum": "nested_prefix__first_last__n8",
+      "n": 8,
+      "split": "first_last",
+      "T12": 2.8769348904889305,
+      "accepted_point": 2.8769348904889314,
+      "point_reproduction_abs_error": 8.881784197001252e-16,
+      "CI95": [
+        null,
+        null
+      ],
+      "bootstrap": {
+        "attempted": 999,
+        "valid": 291,
+        "empty_strata": 708,
+        "nonfinite": 0,
+        "valid_fraction": 0.2912912912912913,
+        "interval_missing_reasons": [
+          "有效抽样少于500",
+          "某run全部可达有效重抽的归一事件权重固定"
+        ],
+        "distinct_Tstar_at_float64": 14,
+        "Tstar_min_max": [
+          2.6693592486116753,
+          3.59766656244394
+        ]
+      },
+      "bootstrap_seed": 8976028519620969738,
+      "epsilon": 0.16,
+      "conditional_upper_below_epsilon": null,
+      "positive_lower": null
+    },
+    {
+      "stratum": "nested_prefix__odd_even__n16",
+      "n": 16,
+      "split": "odd_even",
+      "T12": -0.5868339286442567,
+      "accepted_point": -0.5868339286442575,
+      "point_reproduction_abs_error": 8.881784197001252e-16,
+      "CI95": [
+        -5.951332313401747,
+        1.9697463220099196
+      ],
+      "bootstrap": {
+        "attempted": 999,
+        "valid": 966,
+        "empty_strata": 33,
+        "nonfinite": 0,
+        "valid_fraction": 0.9669669669669669,
+        "interval_missing_reasons": [],
+        "distinct_Tstar_at_float64": 956,
+        "Tstar_min_max": [
+          -6.188036762179691,
+          6.758472669323356
+        ]
+      },
+      "bootstrap_seed": 1382166834405497376,
+      "epsilon": 0.16,
+      "conditional_upper_below_epsilon": false,
+      "positive_lower": false
+    },
+    {
+      "stratum": "nested_prefix__first_last__n16",
+      "n": 16,
+      "split": "first_last",
+      "T12": 0.4745779401562455,
+      "accepted_point": 0.47457794015624655,
+      "point_reproduction_abs_error": 1.0547118733938987e-15,
+      "CI95": [
+        -3.8183653814957608,
+        2.9421258835265247
+      ],
+      "bootstrap": {
+        "attempted": 999,
+        "valid": 736,
+        "empty_strata": 263,
+        "nonfinite": 0,
+        "valid_fraction": 0.7367367367367368,
+        "interval_missing_reasons": [],
+        "distinct_Tstar_at_float64": 726,
+        "Tstar_min_max": [
+          -3.1814060872927596,
+          5.6055080196729925
+        ]
+      },
+      "bootstrap_seed": 9334609596563458211,
+      "epsilon": 0.16,
+      "conditional_upper_below_epsilon": false,
+      "positive_lower": false
+    }
+  ],
+  "calibration_and_time_sensitivity": [
+    {
+      "source": "asset_version_e728b0768ffd4135aed30a0cd47662c6",
+      "fixed_task_calibration_sensitivity": [
+        {
+          "stratum": "nested_prefix__odd_even__n8",
+          "task_samples_fixed": true,
+          "calibration_T12": {
+            "primary": 0.9691769383018649,
+            "odd_windows": 0.5417754654689186,
+            "even_windows": 1.3089907665340619
+          },
+          "meaning": "仅条件性校准子集敏感性，不是统计区间、独立运行或总不确定性"
+        },
+        {
+          "stratum": "nested_prefix__odd_even__n16",
+          "task_samples_fixed": true,
+          "calibration_T12": {
+            "primary": -0.5868339286442575,
+            "odd_windows": -0.9147335743232541,
+            "even_windows": -0.3417116254604955
+          },
+          "meaning": "仅条件性校准子集敏感性，不是统计区间、独立运行或总不确定性"
+        },
+        {
+          "stratum": "nested_prefix__odd_even__n24",
+          "task_samples_fixed": true,
+          "calibration_T12": {
+            "primary": null,
+            "odd_windows": null,
+            "even_windows": null
+          },
+          "meaning": "仅条件性校准子集敏感性，不是统计区间、独立运行或总不确定性"
+        },
+        {
+          "stratum": "nested_prefix__first_last__n8",
+          "task_samples_fixed": true,
+          "calibration_T12": {
+            "primary": 2.8769348904889314,
+            "odd_windows": 2.8246252016253544,
+            "even_windows": 2.9975966834594137
+          },
+          "meaning": "仅条件性校准子集敏感性，不是统计区间、独立运行或总不确定性"
+        },
+        {
+          "stratum": "nested_prefix__first_last__n16",
+          "task_samples_fixed": true,
+          "calibration_T12": {
+            "primary": 0.47457794015624655,
+            "odd_windows": 0.4363666285502591,
+            "even_windows": 0.5015539775023968
+          },
+          "meaning": "仅条件性校准子集敏感性，不是统计区间、独立运行或总不确定性"
+        },
+        {
+          "stratum": "nested_prefix__first_last__n24",
+          "task_samples_fixed": true,
+          "calibration_T12": {
+            "primary": null,
+            "odd_windows": null,
+            "even_windows": null
+          },
+          "meaning": "仅条件性校准子集敏感性，不是统计区间、独立运行或总不确定性"
+        }
+      ],
+      "report_path": "outputs/analysis/calibration-and-time-assessment.json",
+      "meaning": "固定任务样本的原W奇偶子集点敏感性；run4/5共同支持只作原预算/时间描述，不替换主pair。"
+    }
+  ],
+  "joint_interpretation": [
+    {
+      "report_path": "outputs/analysis/joint-assessment.md",
+      "decision": "暂放当前程序的真实稳定/漂移归因实现；准确材料及误差交叉项线索保留在本Question。",
+      "complete_generated": 24000,
+      "interval_available": 19199,
+      "interval_missing": 4801,
+      "program_holdout": "run6已消费同人开发条件，不是新生物学确认。",
+      "old_control_descriptive_ranges_reused": {
+        "held_meaningful_detection_range": [
+          0.0,
+          0.005
+        ],
+        "held_obvious_detection_range": [
+          0.01,
+          0.0625
+        ],
+        "held_stable_false_positive_range": [
+          0.005,
+          0.015
+        ],
+        "held_independent_coverage_range": [
+          0.975,
+          0.995
+        ],
+        "main_complete_generation_count": 19200,
+        "main_valid_count": 19200,
+        "main_missing_count": 0,
+        "main_strata": 48,
+        "cost_probe_complete_count": 4800
+      },
+      "cross_record_comparison": "未隔离n、维数、背景与日程效应，不能作单因素因果改善结论。"
+    }
+  ],
+  "missing_measurements": [
+    {
+      "stratum": "nested_prefix__odd_even__n24",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "nested_prefix__first_last__n24",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_dispersed__odd_even__n8",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_dispersed__odd_even__n16",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_dispersed__odd_even__n24",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_dispersed__first_last__n8",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_dispersed__first_last__n16",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_dispersed__first_last__n24",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_contiguous__odd_even__n8",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_contiguous__odd_even__n16",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_contiguous__odd_even__n24",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_contiguous__first_last__n8",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_contiguous__first_last__n16",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "stratum": "common_span_contiguous__first_last__n24",
+      "object": "原序T12",
+      "value": null,
+      "reason": "至少一个原序run缺少该抽样/预算必要格；不以其他pair替代"
+    },
+    {
+      "object": "真实预算8前后主区间",
+      "value": null,
+      "reason": [
+        "有效抽样少于500",
+        "某run全部可达有效重抽的归一事件权重固定"
+      ],
+      "point_available": true,
+      "valid_bootstrap": 291,
+      "attempted_bootstrap": 999
+    },
+    {
+      "object": "main nested_prefix__first_last__n8 iid independent stable 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "所有有效T星数值退化": 1,
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "main nested_prefix__first_last__n8 iid independent meaningful 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "main nested_prefix__first_last__n8 iid independent obvious 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "main nested_prefix__first_last__n8 time_circular_block independent stable 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "所有有效T星数值退化": 2,
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "main nested_prefix__first_last__n8 time_circular_block independent meaningful 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "main nested_prefix__first_last__n8 time_circular_block independent obvious 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "所有有效T星数值退化": 1,
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "held nested_prefix__odd_even__n8 time_circular_block independent meaningful 区间",
+      "missing": 1,
+      "complete_generated": 400,
+      "reason_counts": {
+        "所有有效T星数值退化": 1
+      }
+    },
+    {
+      "object": "held nested_prefix__first_last__n8 iid independent stable 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "held nested_prefix__first_last__n8 iid independent meaningful 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "held nested_prefix__first_last__n8 iid independent obvious 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "held nested_prefix__first_last__n8 time_circular_block independent stable 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "所有有效T星数值退化": 2,
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "held nested_prefix__first_last__n8 time_circular_block independent meaningful 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    },
+    {
+      "object": "held nested_prefix__first_last__n8 time_circular_block independent obvious 区间",
+      "missing": 400,
+      "complete_generated": 400,
+      "reason_counts": {
+        "有效抽样少于500": 400,
+        "某run全部可达有效重抽的归一事件权重固定": 400
+      }
+    }
+  ],
+  "limitations": [
+    "单人A01T开发，run及随机重复不增加生物学样本量；run6只作程序层保留。",
+    "固定W条件推断；未重新估计校准总不确定性。",
+    "60秒块依据日程预定，非真实EEG相关长度的估计；少块/条件有效重抽会限制区间校准。",
+    "PSD加性特征世界没有效应依赖的任务随机方差，不重验波形/FFT前端；人工hold/环绕/跨块重启只保留明示时序。",
+    "同位置背景边际均值一致不消除两半误差交叉项，真实平方距离解释的必要前提未证明。",
+    "n8奇偶名义95%覆盖不足，n8前后结构缺测；不能把其检出或点区间当作校准成功。",
+    "未取得新人员/会话、真实设备/跨人/跨任务确认、机制或脑源结论；局部D政策收益仍未安排。",
+    "未保存每次999个bootstrap值，可用冻结池/seed重建；原数值尝试及修复版本保留。"
+  ],
+  "formal_runs": [
+    {
+      "run_key": "matching-preparation",
+      "status": "executed",
+      "input_refs": [
+        "asset_version_3535b6c7dc364721b20673e7e4240975",
+        "asset_version_e1940b25fc5a428cbbd784399e4f259d",
+        "asset_version_122feaef2df54f9fb559e7e587c472e2",
+        "asset_version_036169e5aae141eda246a6e03e556c5b",
+        "asset_version_1d488a4fb282458f8eac4c1d4121a8de",
+        "asset_version_8e8c4e922b154582a9c130773d3a2d12",
+        "asset_version_3a24ebf0721d49eaa21844e4dfea84d8",
+        "asset_version_0c3cb730e16845a8b1b7f56d35748031",
+        "asset_version_e728b0768ffd4135aed30a0cd47662c6",
+        "asset_version_6e398c04dcb54d3ca1bd3b36f5c65aff",
+        "asset_version_f0b08359222a4026989e8801014603d4",
+        "asset_version_d23b4593d97948b29e8f65aaacb5fc9f",
+        "asset_version_9f1b209ee13f4a3b9852a3c1d07bc676"
+      ],
+      "implementation_paths": [
+        "implementation/common.py",
+        "implementation/prepare.py",
+        "implementation/evaluate.py",
+        "implementation/frozen-config.json",
+        "implementation/validate.py",
+        "implementation/README.md",
+        "implementation/requirements-lock.txt",
+        "implementation/prepare_environment.py",
+        "implementation/assemble.py",
+        "implementation/final_check.py"
+      ],
+      "checkpoint_paths": [],
+      "artifact_paths": [
+        "outputs/data/mapping-and-truth.npz",
+        "outputs/analysis/coordinate-audit.json"
+      ],
+      "evaluations": [
+        {
+          "attempt_key": "assessment",
+          "status": "executed",
+          "metrics": {},
+          "artifact_paths": [
+            "outputs/analysis/preparation-assessment.md",
+            "outputs/analysis/input-map.json",
+            "outputs/analysis/coordinate-audit.json",
+            "outputs/analysis/structural-audit.json",
+            "outputs/analysis/environment-assessment.json",
+            "outputs/analysis/structure-independent.md"
+          ]
+        }
+      ]
+    },
+    {
+      "run_key": "run3-matched-controls",
+      "status": "executed",
+      "input_refs": [
+        "asset_version_3535b6c7dc364721b20673e7e4240975",
+        "asset_version_e1940b25fc5a428cbbd784399e4f259d",
+        "asset_version_122feaef2df54f9fb559e7e587c472e2",
+        "asset_version_036169e5aae141eda246a6e03e556c5b",
+        "asset_version_1d488a4fb282458f8eac4c1d4121a8de",
+        "asset_version_8e8c4e922b154582a9c130773d3a2d12",
+        "asset_version_3a24ebf0721d49eaa21844e4dfea84d8",
+        "asset_version_0c3cb730e16845a8b1b7f56d35748031",
+        "asset_version_e728b0768ffd4135aed30a0cd47662c6",
+        "asset_version_6e398c04dcb54d3ca1bd3b36f5c65aff",
+        "asset_version_f0b08359222a4026989e8801014603d4",
+        "asset_version_d23b4593d97948b29e8f65aaacb5fc9f",
+        "asset_version_9f1b209ee13f4a3b9852a3c1d07bc676"
+      ],
+      "implementation_paths": [
+        "implementation/common.py",
+        "implementation/prepare.py",
+        "implementation/evaluate.py",
+        "implementation/frozen-config.json",
+        "implementation/validate.py",
+        "implementation/README.md",
+        "implementation/requirements-lock.txt",
+        "implementation/prepare_environment.py",
+        "implementation/assemble.py",
+        "implementation/final_check.py",
+        "implementation/evaluate-before-numerical-repair.py",
+        "implementation/frozen-config-before-numerical-repair.json"
+      ],
+      "checkpoint_paths": [],
+      "artifact_paths": [
+        "outputs/data/main",
+        "outputs/data/run3",
+        "outputs/data/pre-numerical-repair/main",
+        "outputs/data/pre-numerical-repair/probe",
+        "outputs/analysis/main-summary.json"
+      ],
+      "local_inputs": [
+        {
+          "producer_run_key": "matching-preparation",
+          "artifact_path": "outputs/data/mapping-and-truth.npz"
+        }
+      ],
+      "evaluations": [
+        {
+          "attempt_key": "assessment",
+          "status": "executed",
+          "metrics": {},
+          "artifact_paths": [
+            "outputs/analysis/main-assessment.md",
+            "outputs/analysis/main-summary.json",
+            "outputs/analysis/run3-pool-audit.json",
+            "outputs/analysis/pre-numerical-repair/main-summary.json",
+            "outputs/analysis/pre-numerical-repair/probe-summary.json"
+          ]
+        }
+      ]
+    },
+    {
+      "run_key": "run6-held-program-controls",
+      "status": "executed",
+      "input_refs": [
+        "asset_version_3535b6c7dc364721b20673e7e4240975",
+        "asset_version_e1940b25fc5a428cbbd784399e4f259d",
+        "asset_version_122feaef2df54f9fb559e7e587c472e2",
+        "asset_version_036169e5aae141eda246a6e03e556c5b",
+        "asset_version_1d488a4fb282458f8eac4c1d4121a8de",
+        "asset_version_8e8c4e922b154582a9c130773d3a2d12",
+        "asset_version_3a24ebf0721d49eaa21844e4dfea84d8",
+        "asset_version_0c3cb730e16845a8b1b7f56d35748031",
+        "asset_version_e728b0768ffd4135aed30a0cd47662c6",
+        "asset_version_6e398c04dcb54d3ca1bd3b36f5c65aff",
+        "asset_version_f0b08359222a4026989e8801014603d4",
+        "asset_version_d23b4593d97948b29e8f65aaacb5fc9f",
+        "asset_version_9f1b209ee13f4a3b9852a3c1d07bc676"
+      ],
+      "implementation_paths": [
+        "implementation/common.py",
+        "implementation/prepare.py",
+        "implementation/evaluate.py",
+        "implementation/frozen-config.json",
+        "implementation/validate.py",
+        "implementation/README.md",
+        "implementation/requirements-lock.txt",
+        "implementation/prepare_environment.py",
+        "implementation/assemble.py",
+        "implementation/final_check.py",
+        "implementation/evaluate-before-numerical-repair.py",
+        "implementation/frozen-config-before-numerical-repair.json"
+      ],
+      "checkpoint_paths": [],
+      "artifact_paths": [
+        "outputs/data/held",
+        "outputs/data/run6",
+        "outputs/data/pre-numerical-repair/held",
+        "outputs/analysis/held-summary.json"
+      ],
+      "local_inputs": [
+        {
+          "producer_run_key": "matching-preparation",
+          "artifact_path": "outputs/data/mapping-and-truth.npz"
+        }
+      ],
+      "evaluations": [
+        {
+          "attempt_key": "assessment",
+          "status": "executed",
+          "metrics": {},
+          "artifact_paths": [
+            "outputs/analysis/held-assessment.md",
+            "outputs/analysis/held-summary.json",
+            "outputs/analysis/run6-pool-audit.json",
+            "outputs/analysis/pre-numerical-repair/held-summary.json"
+          ]
+        }
+      ]
+    },
+    {
+      "run_key": "real-primary-intervals",
+      "status": "executed",
+      "input_refs": [
+        "asset_version_3535b6c7dc364721b20673e7e4240975",
+        "asset_version_e1940b25fc5a428cbbd784399e4f259d",
+        "asset_version_122feaef2df54f9fb559e7e587c472e2",
+        "asset_version_036169e5aae141eda246a6e03e556c5b",
+        "asset_version_1d488a4fb282458f8eac4c1d4121a8de",
+        "asset_version_8e8c4e922b154582a9c130773d3a2d12",
+        "asset_version_3a24ebf0721d49eaa21844e4dfea84d8",
+        "asset_version_0c3cb730e16845a8b1b7f56d35748031",
+        "asset_version_e728b0768ffd4135aed30a0cd47662c6",
+        "asset_version_6e398c04dcb54d3ca1bd3b36f5c65aff",
+        "asset_version_f0b08359222a4026989e8801014603d4",
+        "asset_version_d23b4593d97948b29e8f65aaacb5fc9f",
+        "asset_version_9f1b209ee13f4a3b9852a3c1d07bc676"
+      ],
+      "implementation_paths": [
+        "implementation/common.py",
+        "implementation/prepare.py",
+        "implementation/evaluate.py",
+        "implementation/frozen-config.json",
+        "implementation/validate.py",
+        "implementation/README.md",
+        "implementation/requirements-lock.txt",
+        "implementation/prepare_environment.py",
+        "implementation/assemble.py",
+        "implementation/final_check.py",
+        "implementation/evaluate-before-numerical-repair.py",
+        "implementation/frozen-config-before-numerical-repair.json"
+      ],
+      "checkpoint_paths": [],
+      "artifact_paths": [
+        "outputs/analysis/real-intervals.json"
+      ],
+      "local_inputs": [
+        {
+          "producer_run_key": "matching-preparation",
+          "artifact_path": "outputs/data/mapping-and-truth.npz"
+        }
+      ],
+      "evaluations": [
+        {
+          "attempt_key": "assessment",
+          "status": "executed",
+          "metrics": {},
+          "artifact_paths": [
+            "outputs/analysis/real-assessment.md",
+            "outputs/analysis/real-intervals.json",
+            "outputs/analysis/calibration-and-time-assessment.json",
+            "outputs/analysis/pre-numerical-repair/real-intervals.json"
+          ]
+        }
+      ]
+    },
+    {
+      "run_key": "numerical-and-joint-verification",
+      "status": "executed",
+      "input_refs": [
+        "asset_version_3535b6c7dc364721b20673e7e4240975",
+        "asset_version_e1940b25fc5a428cbbd784399e4f259d",
+        "asset_version_122feaef2df54f9fb559e7e587c472e2",
+        "asset_version_036169e5aae141eda246a6e03e556c5b",
+        "asset_version_1d488a4fb282458f8eac4c1d4121a8de",
+        "asset_version_8e8c4e922b154582a9c130773d3a2d12",
+        "asset_version_3a24ebf0721d49eaa21844e4dfea84d8",
+        "asset_version_0c3cb730e16845a8b1b7f56d35748031",
+        "asset_version_e728b0768ffd4135aed30a0cd47662c6",
+        "asset_version_6e398c04dcb54d3ca1bd3b36f5c65aff",
+        "asset_version_f0b08359222a4026989e8801014603d4",
+        "asset_version_d23b4593d97948b29e8f65aaacb5fc9f",
+        "asset_version_9f1b209ee13f4a3b9852a3c1d07bc676"
+      ],
+      "implementation_paths": [
+        "implementation/common.py",
+        "implementation/prepare.py",
+        "implementation/evaluate.py",
+        "implementation/frozen-config.json",
+        "implementation/validate.py",
+        "implementation/README.md",
+        "implementation/requirements-lock.txt",
+        "implementation/prepare_environment.py",
+        "implementation/assemble.py",
+        "implementation/final_check.py",
+        "implementation/evaluate-before-numerical-repair.py",
+        "implementation/frozen-config-before-numerical-repair.json",
+        "implementation/compact_declaration.py"
+      ],
+      "checkpoint_paths": [],
+      "artifact_paths": [
+        "outputs/data/algebra-copy.npz"
+      ],
+      "local_inputs": [
+        {
+          "producer_run_key": "matching-preparation",
+          "artifact_path": "outputs/data/mapping-and-truth.npz"
+        },
+        {
+          "producer_run_key": "run3-matched-controls",
+          "artifact_path": "outputs/data/main"
+        },
+        {
+          "producer_run_key": "run3-matched-controls",
+          "artifact_path": "outputs/data/run3"
+        },
+        {
+          "producer_run_key": "run6-held-program-controls",
+          "artifact_path": "outputs/data/held"
+        },
+        {
+          "producer_run_key": "run6-held-program-controls",
+          "artifact_path": "outputs/data/run6"
+        },
+        {
+          "producer_run_key": "matching-preparation",
+          "artifact_path": "outputs/analysis/coordinate-audit.json"
+        },
+        {
+          "producer_run_key": "run3-matched-controls",
+          "artifact_path": "outputs/analysis/main-summary.json"
+        },
+        {
+          "producer_run_key": "run6-held-program-controls",
+          "artifact_path": "outputs/analysis/held-summary.json"
+        },
+        {
+          "producer_run_key": "real-primary-intervals",
+          "artifact_path": "outputs/analysis/real-intervals.json"
+        }
+      ],
+      "evaluations": [
+        {
+          "attempt_key": "assessment",
+          "status": "executed",
+          "metrics": {},
+          "artifact_paths": [
+            "outputs/analysis/verification-assessment.md",
+            "outputs/analysis/algebra-assessment.json",
+            "outputs/analysis/exact-generator-expectations.json",
+            "outputs/analysis/numerical-assessment.json",
+            "outputs/analysis/numerical-repair-provenance.json",
+            "outputs/analysis/numerical-repair-comparison.json",
+            "outputs/analysis/pre-numerical-repair/algebra-assessment.json",
+            "outputs/analysis/method-check.md",
+            "outputs/analysis/method-check-numeric.json",
+            "outputs/analysis/method-check-cancellation.json",
+            "outputs/analysis/all-strata.csv",
+            "outputs/analysis/joint-assessment.md",
+            "outputs/analysis/final-independent-review.md",
+            "outputs/analysis/final-method-review.md",
+            "outputs/analysis/final-method-review-checks.json",
+            "outputs/analysis/review-resolution.md",
+            "outputs/analysis/final-check.json",
+            "outputs/analysis/result-detail.json"
+          ]
+        }
+      ]
+    }
+  ],
+  "retained_artifacts": [
+    {
+      "relative_path": "outputs/analysis/research-note.md",
+      "role": "analysis"
+    }
+  ],
+  "dataset_candidates": [
+    {
+      "artifact_path": "outputs/data/main",
+      "name": "A01T run3真实日程匹配生成记录",
+      "purpose": "复用每层完整生成背景索引/seed/相位/T/区间及有效缺测分母，条件于固定主W；单人程序开发。"
+    },
+    {
+      "artifact_path": "outputs/data/held",
+      "name": "A01T run6程序保留匹配生成记录",
+      "purpose": "复核冻结程序在同人保留背景的覆盖和辨别力，不冒称新生物学确认。"
+    },
+    {
+      "artifact_path": "outputs/data/mapping-and-truth.npz",
+      "name": "A01T匹配共同映射与固定PSD真值",
+      "purpose": "保存未白化21维H、L、W、δ、svec置换与已知d，供准确重现。"
+    }
+  ],
+  "environment_candidates": [
+    {
+      "artifact_path": "outputs/analysis/environment-assessment.json",
+      "name": "A01T匹配CPU NumPy局部环境说明",
+      "purpose": "按已接纳环境说明复用项目Python及NumPy2.2.6，保存实际版本/局部wheel hash/重建路线；不保管临时vendor本体。"
+    }
+  ],
+  "independent_review": {
+    "preliminary_method": "outputs/analysis/method-check.md",
+    "structural": "outputs/analysis/structure-independent.md",
+    "final": "outputs/analysis/final-independent-review.md",
+    "final_method": "outputs/analysis/final-method-review.md",
+    "root_resolution": "outputs/analysis/review-resolution.md"
+  }
+}

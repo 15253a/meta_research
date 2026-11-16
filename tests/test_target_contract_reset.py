@@ -42,11 +42,16 @@ def test_full_domain_payload_is_preserved():
     b'{"schema_ref":"x","metrics":{"x":0,"x":1},"result_disposition":"denied"}',
     b'{"schema_ref":"x","metrics":{"x":NaN},"result_disposition":"denied"}',
     b'{"schema_ref":"x","metrics":{"x":1e999},"result_disposition":"denied"}',
-    b'{"schema_ref":"x","metrics":{"x":9223372036854775808},"result_disposition":"denied"}',
 ])
 def test_ambiguous_or_unbounded_results_remain_invalid(content):
     with pytest.raises(OwnerConflict):
         _decode_result_document_bytes(content)
+
+
+def test_json_integer_above_signed_64_bit_retains_type_and_value():
+    content = b'{"schema_ref":"x","metrics":{"x":9223372036854775808},"result_disposition":"denied"}'
+    value = _decode_result_document_bytes(content).metrics["x"]
+    assert type(value) is int and value == 9223372036854775808
 
 
 def test_frozen_schema_owns_nullable_and_categorical_semantics():

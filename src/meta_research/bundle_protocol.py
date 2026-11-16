@@ -60,32 +60,97 @@ TargetMetricValue: TypeAlias = (
 
 
 def valid_target_metric_value(value: object) -> bool:
-    """Admit JSON research values while retaining the established scalar bounds."""
-    nodes = 0
-    def valid(item: object, depth: int) -> bool:
-        nonlocal nodes
-        nodes += 1
-        # Reuse the final Bundle projection budget before traversing an expanded tree.
-        if nodes > BUNDLE_ROOT_MAX_NODES or depth > TARGET_METRIC_MAX_DEPTH:
-            return False
-        if item is None or type(item) is bool:
-            return True
-        if type(item) is int:
-            return abs(item) <= BUNDLE_CANONICAL_INTEGER_MAX_ABS
-        if type(item) is float:
-            return math.isfinite(item)
-        if type(item) is str:
+    """Admit finite, UTF-8 JSON research values with exact Python integers.
+
+    Scientific values have a depth limit and count towards their containing
+    document's byte budget. Control scalar and collection limits do not apply.
+    """
+    return _target_metric_shape(value) is not None
+
+
+def _target_metric_shape(
+    value: object, *, starting_depth: int = 0,
+    failures: list[dict[str, object]] | None = None,
+) -> tuple[int, int] | None:
+    """Return subtree depth and exact canonical byte size without expanding aliases.
+
+    Memoization is local to this validation. It neither trusts mutable values
+    across calls nor lets repeated in-memory subtrees evade the byte budget.
+    """
+    active: set[int] = set()
+    shapes: dict[int, tuple[int, int]] = {}
+
+    def invalid(path: str, item: object, rule: str, **details: object) -> None:
+        if failures is not None and not failures:
+            failures.append({"path": path, "actual_type": type(item).__name__,
+                "rule": rule, **details})
+
+    def measure(item: object, depth: int, path: str) -> tuple[int, int] | None:
+        if depth > TARGET_METRIC_MAX_DEPTH:
+            invalid(path, item, "scientific_depth", actual_depth=depth,
+                limit=TARGET_METRIC_MAX_DEPTH)
+            return None
+        if type(item) not in {list, dict}:
+            if item is None:
+                return 0, 4
+            if type(item) is bool:
+                return 0, 4 if item else 5
+            if type(item) is float:
+                if math.isfinite(item):
+                    return 0, len(repr(item))
+                invalid(path, item, "finite_json_value")
+                return None
+            if type(item) not in {int, str}:
+                invalid(path, item, "finite_json_value")
+                return None
             try:
-                return len(item.encode("utf-8")) <= BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES
+                if type(item) is int:
+                    return 0, len(str(item))
+                encoded = json.dumps(item, ensure_ascii=False, allow_nan=False,
+                    separators=(",", ":")).encode("utf-8")
             except UnicodeError:
-                return False
-        if type(item) is list:
-            return all(valid(child, depth + 1) for child in item)
-        if type(item) is dict:
-            return all(type(key) is str and valid(key, depth + 1)
-                       and valid(child, depth + 1) for key, child in item.items())
-        return False
-    return valid(value, 0)
+                invalid(path, item, "valid_utf8")
+                return None
+            except (ValueError, TypeError):
+                invalid(path, item, "json_encoding_capacity")
+                return None
+            return 0, len(encoded)
+        identity = id(item)
+        if identity in active:
+            invalid(path, item, "acyclic_json_tree")
+            return None
+        if identity in shapes:
+            shape = shapes[identity]
+            if depth + shape[0] > TARGET_METRIC_MAX_DEPTH:
+                invalid(path, item, "scientific_depth", actual_depth=depth + shape[0],
+                    limit=TARGET_METRIC_MAX_DEPTH)
+                return None
+            return shape
+        active.add(identity)
+        height, size = 0, 2 + max(0, len(item) - 1)
+        children = item if type(item) is list else item.items()
+        for index, child in enumerate(children):
+            child_path = f"{path}[{index}]"
+            if type(item) is dict:
+                key, child = child
+                if type(key) is not str:
+                    invalid(path, key, "string_object_key")
+                    return None
+                child_path = path + "[" + json.dumps(key[:80], ensure_ascii=True) + "]"
+                key_shape = measure(key, depth + 1, child_path)
+                if key_shape is None:
+                    return None
+                size += key_shape[1] + 1
+            shape = measure(child, depth + 1, child_path)
+            if shape is None:
+                return None
+            height = max(height, shape[0] + 1)
+            size += shape[1]
+        active.remove(identity)
+        shapes[identity] = height, size
+        return height, size
+
+    return measure(value, starting_depth, "$")
 
 
 def _copy_target_metric_value(value: TargetMetricValue) -> TargetMetricValue:
@@ -98,13 +163,39 @@ def _copy_target_metric_value(value: TargetMetricValue) -> TargetMetricValue:
 
 def decode_target_metric_values(value: object) -> tuple[TargetMetricValue, ...]:
     """Decode only the metric-values field, without opening other Bundle fields."""
-    if type(value) is not list or not all(valid_target_metric_value(item) for item in value):
+    if type(value) is not list:
         raise TypeError("non-canonical Target metric values")
+    size = 2 + max(0, len(value) - 1)
+    for item in value:
+        shape = _target_metric_shape(item)
+        if shape is None:
+            raise TypeError("non-canonical Target metric values")
+        size += shape[1]
+        # The scientific branch alone cannot exceed its enclosing Bundle root.
+        # Check before copying an in-memory DAG into an expanded JSON tree.
+        if size > BUNDLE_ROOT_MAX_SERIALIZED_BYTES:
+            raise _bundle_byte_capacity_error("Target metric values", size,
+                BUNDLE_ROOT_MAX_SERIALIZED_BYTES, lower_bound=True)
     return tuple(_copy_target_metric_value(item) for item in value)
 
 
 class BundleProtocolError(ValueError):
     """A Bundle-facing value is missing, open-shaped, stale, or non-canonical."""
+
+    def __init__(self, message: str, details: dict[str, object] | None = None):
+        super().__init__(message)
+        self.details = details
+
+
+def _bundle_byte_capacity_error(
+    name: str, actual: int, limit: int, *, lower_bound: bool = False,
+) -> BundleProtocolError:
+    qualifier = "at least " if lower_bound else ""
+    return BundleProtocolError(
+        f"{name} exceeds the root projection byte budget: {qualifier}{actual} UTF-8 bytes; limit {limit}",
+        {"category": "technical_capacity", "path": "$", "rule": "serialized_utf8_bytes",
+         "actual_bytes": actual, "actual_is_lower_bound": lower_bound, "limit": limit},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,9 +817,10 @@ def validate_closed_bundle_projection(
     def add_scalar_bytes(size: int) -> None:
         state["scalar_bytes"] += size
         if state["scalar_bytes"] > max_serialized_bytes:
-            raise BundleProtocolError(name + " exceeds the root projection byte budget")
+            raise _bundle_byte_capacity_error(name, state["scalar_bytes"],
+                max_serialized_bytes, lower_bound=True)
 
-    def visit(item_value: object, *, metric: bool = False, plan_text: bool = False,
+    def visit(item_value: object, *, plan_text: bool = False,
               synthesis_commit_refs: tuple[str, ...] | None = None) -> None:
         state["nodes"] += 1
         if state["nodes"] > BUNDLE_ROOT_MAX_NODES:
@@ -740,9 +832,16 @@ def validate_closed_bundle_projection(
             for item in fields(item_value):
                 field_value = getattr(item_value, item.name)
                 if type(item_value) is AcceptedMeasurementClosure and item.name == "metric_values":
-                    if type(field_value) is not tuple or not all(valid_target_metric_value(value) for value in field_value):
+                    if type(field_value) is not tuple:
                         raise BundleProtocolError(name + " field metric_values has a non-canonical schema type")
-                    visit(field_value, metric=True)
+                    # The scientific branch has its own JSON/depth semantics;
+                    # do not reapply control node, tuple, string or integer caps.
+                    add_scalar_bytes(2 + max(0, len(field_value) - 1))
+                    for value in field_value:
+                        shape = _target_metric_shape(value)
+                        if shape is None:
+                            raise BundleProtocolError(name + " field metric_values has a non-canonical schema type")
+                        add_scalar_bytes(shape[1])
                     continue
                 if not _matches_annotation(field_value, hints.get(item.name)):
                     raise BundleProtocolError(
@@ -774,21 +873,12 @@ def validate_closed_bundle_projection(
                 raise BundleProtocolError(name + " contains an oversized tuple")
             seen: set[object] = set()
             for nested in item_value:
-                visit(nested, metric=metric, plan_text=plan_text,
+                visit(nested, plan_text=plan_text,
                       synthesis_commit_refs=synthesis_commit_refs)
                 if type(nested) in _DUPLICATE_SENSITIVE_TYPES:
                     if nested in seen:
                         raise BundleProtocolError(name + " contains an exact duplicate proof")
                     seen.add(nested)
-            return
-        if metric and type(item_value) in {list, dict}:
-            if type(item_value) is dict:
-                for key, nested in item_value.items():
-                    visit(key, metric=True)
-                    visit(nested, metric=True)
-            else:
-                for nested in item_value:
-                    visit(nested, metric=True)
             return
         if type(item_value) is str:
             try:
@@ -831,7 +921,7 @@ def validate_closed_bundle_projection(
     except RecursionError as error:
         raise BundleProtocolError(name + " contains a recursive projection") from error
     if len(serialized) > max_serialized_bytes:
-        raise BundleProtocolError(name + " exceeds the root projection byte budget")
+        raise _bundle_byte_capacity_error(name, len(serialized), max_serialized_bytes)
     return hashlib.sha256(serialized).hexdigest()
 
 

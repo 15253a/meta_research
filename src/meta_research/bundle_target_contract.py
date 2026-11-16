@@ -61,7 +61,6 @@ PROTOCOL_VERSION_CANDIDATE_SCHEMA_REF = (
 LEGACY_TARGET_PLAN_SCHEMA_REF = "meta-research/target-plan/v2"
 
 _BUNDLE_ROOT_MAX_DEPTH = 64
-_METRIC_DEFINITION_MAX_ITEMS = 64
 _DOMAIN_ROUTING_FIELDS = frozenset(
     {
         "adapter",
@@ -1142,7 +1141,6 @@ def _validate_metric_definitions(
     if (
         type(metrics) is not tuple
         or (not metrics and not allow_empty)
-        or len(metrics) > _METRIC_DEFINITION_MAX_ITEMS
     ):
         raise BundleTargetContractError(f"{name}_invalid")
     keys: list[str] = []

@@ -15,6 +15,7 @@ snapshot.research_assets.items=[];
 snapshot.research_assets.total_count=1089;
 let language="zh"; let input=null; let failContentOnce=true;
 const requests=[]; const errors=[];
+const scientificOriginal = '{\n  "summary": "Dataset original contents.",\n  "bootstrap_seed": 14748774831839608929\n}\n';
 const server=createServer(async(req,res)=>{
   const u=new URL(req.url,"http://fixture");
   const send=(body,status=200)=>{
@@ -82,7 +83,7 @@ const server=createServer(async(req,res)=>{
       }
       if(u.searchParams.get("source_ref")==="literature-source"&&u.searchParams.get("offset")==="26"&&failContentOnce){failContentOnce=false;return send({detail:{code:"temporary_read_failure"}},503);}
       if(u.searchParams.get("source_ref")==="dv1"&&!u.searchParams.has("entry_path")) return send({kind:"directory",entries:[{path:"measurements.txt",size:26}],next_offset:null});
-      if(u.searchParams.has("entry_path")) return send({text:"Dataset original contents.",next_offset:26,complete:true});
+      if(u.searchParams.has("entry_path")) return send({text:scientificOriginal,next_offset:null,complete:true});
       return send({text:Number(u.searchParams.get("offset"))===0?"Exact original paragraph. ":"Continuation of the original.",next_offset:Number(u.searchParams.get("offset"))===0?26:null});
     }
     if(u.pathname==="/api/v1/research-inputs"){
@@ -144,6 +145,9 @@ try{
   await dialog.getByRole("button",{name:"阅读原文",exact:true}).click();
   await dialog.getByRole("button",{name:"measurements.txt",exact:true}).click();
   await expect(dialog.getByText("Dataset original contents.",{exact:true})).toBeVisible();
+  await dialog.getByText("完整原文与技术字段",{exact:true}).click();
+  assert.equal(await dialog.locator(".library-original details[open] pre").textContent(), scientificOriginal);
+  await expect(dialog.locator(".library-original")).not.toContainText("14748774831839609000");
   await expect(dialog.getByRole("button",{name:"继续读取",exact:true})).toHaveCount(0);
   await dialog.getByRole("tab",{name:"文献",exact:true}).click();
   await expect(dialog.getByText("literature material 0",{exact:true})).toBeVisible();

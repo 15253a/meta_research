@@ -225,7 +225,7 @@ class FormalMetricResult:
     metric_result_ref: str
     evaluation_attempt_ref: str
     result_role_ref: str
-    metrics: dict[str, float]
+    metrics: dict[str, int | float]
     metrics_hash: str
     receipt: AcceptanceReceipt
 

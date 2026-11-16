@@ -6881,15 +6881,16 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         )
         candidate = candidate_projection.candidate
         protocol = authority.measurement_contract.protocol_version
-        from meta_research.formal_entities import primary_work_metrics
+        from meta_research.formal_entities import _declared_work, primary_work_metrics
         result_content = result_document.as_dict()
-        actual_metrics = primary_work_metrics(result_content)
+        work = _declared_work(result_content)
+        actual_metrics = primary_work_metrics(result_content, work=work)
         metric_keys = set(actual_metrics)
         required_keys = set(protocol.required_metric_keys)
         allowed_keys = required_keys | set(protocol.optional_metric_keys)
         policy = authority.measurement_contract.checkpoint_policy
         from meta_research.formal_entities import explicit_run_only
-        run_only = explicit_run_only(result_content)
+        run_only = explicit_run_only(result_content, work=work)
         authoritative_fields = {
             "target_ref": target.target_ref,
             "target_run_ref": completion.handle.target_run_ref,
@@ -6926,8 +6927,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 )
                 raise conflict
         if not run_only and not required_keys <= metric_keys <= allowed_keys:
-            from meta_research.formal_entities import _declared_work
-            run, attempt = _declared_work(result_content)[0]
+            run, attempt = work[0]
             missing = sorted(required_keys - metric_keys)
             unexpected = sorted(metric_keys - allowed_keys)
             conflict = TargetContentIssue("target_root_commit_domain_invalid")
@@ -6972,7 +6972,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         from meta_research.formal_run_bindings import manifest_selection_entries
         selected_entries = manifest_selection_entries(manifest)
         try:
-            verify_report_only_assessments(result_content, selected_entries)
+            verify_report_only_assessments(result_content, selected_entries, work=work)
         except OwnerConflict as error:
             if error.code not in {'target_formal_evaluation_report_required', 'target_formal_artifact_path_not_bound'}:
                 raise
@@ -6986,7 +6986,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             raise correction from error
         from meta_research.formal_entities import verify_retained_products
-        verify_retained_products(result_content, selected_entries)
+        verify_retained_products(result_content, selected_entries, work=work)
         return target, authority, projection, candidate_projection
 
     def verify_target_execution_closure(
@@ -7623,9 +7623,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
 
         return resolve
 
-    def _root_reused_primary_binding(self, result_document, kind="variant_run"):
+    def _root_reused_primary_binding(self, result_document, kind="variant_run", *, work=None):
         from meta_research.formal_entities import primary_reused_references
-        run_ref = primary_reused_references(result_document.as_dict()).get(kind + "_ref")
+        run_ref = primary_reused_references(result_document.as_dict(), work=work).get(kind + "_ref")
         if run_ref is None:
             return None
         with self._database.read() as connection:
@@ -14745,7 +14745,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         AcceptedTargetGenericResultManifest,
         AcceptedExperimentAssetRole,
         dict[str, object],
-        dict[str, float],
+        dict[str, int | float],
         str | None,
     ]:
         """Rebuild one current Target result solely from native Owner facts."""
@@ -15073,10 +15073,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                         },
                     )
                 else:
+                    # The readback below checks the received canonical bytes,
+                    # value, hash and receipt, including an existing float
+                    # representation written by an earlier measurement owner.
                     if (
                         existing.result_role_ref != result_role.role_ref
-                        or existing.metrics_json != canonical_json(metrics)
-                        or existing.metrics_hash != metrics_hash
                         or existing.required_metrics_hash
                         != required_metrics_hash
                         or existing.run_ref != generic_binding.target_run_ref
@@ -15136,14 +15137,18 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         try:
             stored_metrics = decoded_object(row.metrics_json)
             metrics = {
-                name: float(value)
+                name: value
                 for name, value in stored_metrics.items()
-                if type(name) is str and type(value) in {int, float}
+                if type(name) is str and (type(value) is int
+                    or (type(value) is float and math.isfinite(value)))
             }
         except (TypeError, ValueError) as error:
             raise OwnerConflict("target_formal_measurement_integrity_invalid") from error
         protocol = authority.measurement_contract.protocol_version
-        metrics_hash = canonical_hash(expected_metrics)
+        # Verify the received representation against its own stored hash and
+        # receipt. Earlier writers stored exact small integers as floats;
+        # source-value equality below still checks their scientific value.
+        metrics_hash = canonical_hash(metrics)
         required_metrics_hash = canonical_hash(list(protocol.required_metric_keys))
         receipt_bindings = _target_formal_measurement_receipt_bindings(
             authority=authority,
@@ -15168,7 +15173,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             or attempt_row.status != "measurement_accepted"
             or stored_metrics != expected_metrics
             or metrics != expected_metrics
-            or canonical_json(expected_metrics) != row.metrics_json
+            or canonical_json(metrics) != row.metrics_json
             or row.metrics_hash != metrics_hash
             or row.required_metrics_hash != required_metrics_hash
             or row.result_role_ref != result_role.role_ref
@@ -15903,11 +15908,15 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
 
         measurement_ref = new_ref("target_root_measurement")
-        reused_variant_binding = self._root_reused_primary_binding(result_document)
-        reused_evaluation_binding = self._root_reused_primary_binding(result_document, "evaluation_attempt")
-        from meta_research.formal_entities import primary_reused_references, primary_evaluation_status
-        reused_refs = primary_reused_references(result_document.as_dict())
-        evaluation_status = primary_evaluation_status(result_document.as_dict())
+        from meta_research.formal_entities import _declared_work, primary_reused_references, primary_evaluation_status
+        # This local build starts after issuer and persisted-state verification.
+        # The pre-write issuer/domain recheck below establishes its own work view.
+        result_content = result_document.as_dict()
+        work = _declared_work(result_content)
+        reused_variant_binding = self._root_reused_primary_binding(result_document, work=work)
+        reused_evaluation_binding = self._root_reused_primary_binding(result_document, "evaluation_attempt", work=work)
+        reused_refs = primary_reused_references(result_content, work=work)
+        evaluation_status = primary_evaluation_status(result_content, work=work)
         variant_run_ref = reused_variant_binding.subject_ref if reused_variant_binding else new_ref("target_root_variant_run")
         evaluation_attempt_ref = None if evaluation_status == "pending" else (reused_evaluation_binding.subject_ref if reused_evaluation_binding else new_ref("target_root_evaluation_attempt"))
         metric_result_ref = (reused_refs.get("metric_result_ref") or new_ref("target_root_metric_result")) if evaluation_status == "completed" else None
@@ -15945,6 +15954,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             commit_receipt_ref=commit_receipt_ref,
             reused_variant_binding=reused_variant_binding,
             reused_evaluation_binding=reused_evaluation_binding,
+            work=work,
         )
         receipt_bindings = {
             "target_ref": target.target_ref,
@@ -17004,17 +17014,14 @@ def _accepted_experiment_input_binding(row) -> AcceptedExperimentInputBinding:
     )
 
 
-_MAX_EXACT_JSON_INTEGER = (1 << 53) - 1
-
-
 def _target_jsonschema_number(_checker: object, value: object) -> bool:
     if type(value) is int:
-        return abs(value) <= _MAX_EXACT_JSON_INTEGER
+        return True
     return type(value) is float and math.isfinite(value)
 
 
 def _target_jsonschema_integer(_checker: object, value: object) -> bool:
-    return type(value) is int and abs(value) <= _MAX_EXACT_JSON_INTEGER
+    return type(value) is int
 
 
 _TargetResultSchemaValidator = validators.extend(
@@ -17029,8 +17036,6 @@ _TargetResultSchemaValidator = validators.extend(
 
 def _validate_target_json_numeric_tree(value: object) -> None:
     if type(value) is int:
-        if abs(value) > _MAX_EXACT_JSON_INTEGER:
-            raise OwnerConflict("target_measurement_result_number_invalid")
         return
     if type(value) is float:
         if not math.isfinite(value):
@@ -17114,7 +17119,7 @@ def _target_metric_values(
     result_content: dict[str, object],
     required_metric_keys: tuple[str, ...],
     optional_metric_keys: tuple[str, ...],
-) -> dict[str, float]:
+) -> dict[str, int | float]:
     raw_metrics = result_content.get("metrics")
     raw_ordered = result_content.get("metric_values")
     metrics: dict[str, object]
@@ -17134,15 +17139,14 @@ def _target_metric_values(
         raise OwnerConflict("target_measurement_metrics_incomplete")
     if any(key not in metrics for key in required_metric_keys):
         raise OwnerConflict("target_measurement_metrics_incomplete")
-    accepted: dict[str, float] = {}
+    accepted: dict[str, int | float] = {}
     for key, value in metrics.items():
         if (
             type(value) not in {int, float}
-            or (type(value) is int and abs(value) > _MAX_EXACT_JSON_INTEGER)
             or (type(value) is float and not math.isfinite(value))
         ):
             raise OwnerConflict("target_measurement_metric_invalid")
-        accepted[key] = float(value)
+        accepted[key] = value
     return accepted
 
 
@@ -20421,7 +20425,7 @@ def _native_target_commit_material(
             {brief.experiment_key: brief for brief in formal_plan.briefs},
         )
     except (BundleProtocolError, TypeError, ValueError) as error:
-        raise OwnerConflict("formal_v3_measurement_closure_invalid") from error
+        raise _measurement_closure_conflict("formal_v3_measurement_closure_invalid", error) from error
 
     closure: dict[str, object] = {
         "schema_ref": "meta-research/target-commit-closure/v3",
@@ -20496,6 +20500,22 @@ def _native_target_commit_material(
     )
 
 
+def _measurement_closure_conflict(code: str, error: Exception) -> OwnerConflict:
+    """Keep Bundle capacity facts when crossing the RG Owner boundary."""
+    details = getattr(error, "details", None)
+    conflict = OwnerConflict(code, dict(details) if isinstance(details, dict) else None)
+    if conflict.details and conflict.details.get("category") == "technical_capacity":
+        actual = conflict.details.get("actual_bytes")
+        qualifier = "at least " if conflict.details.get("actual_is_lower_bound") else ""
+        conflict.feedback = (
+            f"{conflict.details.get('path', '$')}: technical capacity: {qualifier}{actual} "
+            f"serialized UTF-8 bytes; limit {conflict.details.get('limit')}. "
+            "Preserve the complete research results, original evidence and sources; "
+            "report this host capacity limitation. Do not truncate results or rerun the experiment."
+        )
+    return conflict
+
+
 def _target_root_commit_request_hash(
     *,
     completion: AcceptedTargetRootCompletion,
@@ -20539,6 +20559,7 @@ def _target_root_commit_material(
     compact: bool = True,
     reused_variant_binding: ExecutionInputBindingProof | None = None,
     reused_evaluation_binding: ExecutionInputBindingProof | None = None,
+    work: list[tuple[dict[str, object], dict[str, object] | None]] | None = None,
 ) -> _TargetRootCommitMaterial:
     """Build the root TargetCommit solely from freshly verified issuer facts."""
 
@@ -20559,7 +20580,9 @@ def _target_root_commit_material(
         if entry.role == "checkpoint"
     )
     from meta_research.formal_entities import _declared_work
-    primary_run, _primary_attempt = _declared_work(result_document.as_dict())[0]
+    result_content = result_document.as_dict()
+    work = _declared_work(result_content) if work is None else work
+    primary_run, _primary_attempt = work[0]
     selected_inputs = primary_run.get("input_refs")
     selected_refs = (selected_inputs if isinstance(selected_inputs, list)
                      and all(isinstance(ref, str) for ref in selected_inputs) else ())
@@ -20646,7 +20669,7 @@ def _target_root_commit_material(
         )
     if reused_evaluation_binding is not None:
         evaluation_binding = reused_evaluation_binding
-    metrics = dict(result_document.metrics)
+    metrics = dict(result_document.metrics or {})
     measurement_payload = {
         "schema_ref": "meta-research/target-root-formal-measurement/v1",
         "measurement_ref": measurement_ref,
@@ -20668,21 +20691,21 @@ def _target_root_commit_material(
         "checkpoint_refs": list(checkpoint_refs),
         "variant_input_binding": projection_plain_value(variant_binding),
         "evaluation_input_binding": projection_plain_value(evaluation_binding),
-        "result_document": result_document.as_dict(),
+        "result_document": result_content,
     }
     if compact:
         from meta_research.formal_entities import (
-            has_variant_declaration, root_work_items, formal_inventory,
+            has_variant_declaration, _root_work_items_from_declared, formal_inventory,
         )
-        items = root_work_items(payload=measurement_payload,
+        items = _root_work_items_from_declared(payload=measurement_payload,
                                 identities=authority.identities.as_public_dict(),
-                                result_document=result_document.as_dict())
+                                work=work)
         # A declared primary carries its own real method identity (registered
         # during entity persistence); the draft identity only constrains items
         # that did not declare one.  The payload inventory keeps the draft
         # ref for such items; rg_variant_runs holds the authoritative one.
         primary_declared = has_variant_declaration(
-            result_document.as_dict(), items[0]["run_key"])
+            result_content, items[0]["run_key"])
         if (not primary_declared and (
                 items[0]["variant_ref"] != authority.identities.variant_ref or
                 items[0]["evaluation_ref"] not in (None, authority.identities.evaluation_ref))):
@@ -20769,7 +20792,7 @@ def _target_root_commit_material(
             },
         )
     except (BundleProtocolError, TypeError, ValueError) as error:
-        raise OwnerConflict("target_root_measurement_closure_invalid") from error
+        raise _measurement_closure_conflict("target_root_measurement_closure_invalid", error) from error
     closure = {
         "schema_ref": TARGET_ROOT_COMMIT_CLOSURE_SCHEMA_REF,
         "accepted_measurement": projection_plain_value(terminal),

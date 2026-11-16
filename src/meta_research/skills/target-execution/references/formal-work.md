@@ -1,12 +1,12 @@
 # 正式工作交接
 
-在多个实际实施或评价、无指标报告评价、实施待评价、复用已接纳 Run／评价时，在 `outputs/result.json` 使用 `formal_runs`。存在此列表时，每项 `evaluations[].metrics` 承载对应真实评价；顶层 `metrics` 可为 `{}`，无需复制。没有 `formal_runs` 时，非空顶层 `metrics` 表达所选 authority 下的一次实施和评价。
+在多个实际实施或评价、无指标报告评价、实施待评价、复用已接纳 Run／评价时，在 `outputs/result.json` 使用 `formal_runs`。存在非空且有效的正式工作声明时，每项 `evaluations[].metrics` 承载对应真实评价；顶层 summary `metrics` 可省略或为 `{}`，无需复制。`formal_runs: []` 或 `null` 不构成有效正式工作；没有有效 `formal_runs` 时保持 summary 路径，非空顶层 `metrics` 表达所选 authority 下的一次实施和评价。
 
 ## 实际 Run、评价与产物
 
 Run 的保存粒度由其评价对当前科研任务的有效性决定：结合要回答的问题、比较对象和可解释的评价边界组织真实实施。每个 `run_key` 对应在这个边界上有独立研究含义的一项真实工作，`attempt_key` 对应该 Run 内的一次真实评价。共同支持同一研究判断的折、随机种子、训练阶段、批次、检查点或工具操作，可作为 Run 内部明细保存；形成有科研意义的独立实施与评价对象时，按真实因果关系另列。
 
-Run 数量不预设。按研究含义合并或拆分声明时，保留原始执行明细、产物、指标及新旧归属对应关系，在研究说明中解释粒度与评价如何支持当前科研任务。审计、观察、推导和湿实验同样适用；失败或尚未评价的真实工作按事实保留。
+按研究含义组织 Run。合并或拆分声明时，保留原始执行明细、产物、指标及新旧归属对应关系，在研究说明中解释粒度与评价如何支持当前科研任务。审计、观察、推导和湿实验同样适用；失败或尚未评价的真实工作按事实保留。
 
 ```json
 {
@@ -31,7 +31,7 @@ Run 数量不预设。按研究含义合并或拆分声明时，保留原始执�
 
 示例指标需替换为实际 Protocol 的精确 key 和真实值。数据获取或整理时，Baseline／Variant 表达来源特点和方法；Run 保存实际获得的材料，评价检查完整性、来源、适用性或具体科学标准。Protocol 未声明指标时，已实施评价可用 `metrics: {}`，将真实报告归入其 `artifact_paths`；MetricResult 保留空指标和精确结果文档来源。空对象本身不证明实施：尚未评价用 `evaluations: []`；已声明 required metrics 仍须满足真实取值或合同允许的缺测。
 
-`formal_runs` 是非空 Run 对象列表；`evaluations` 是评价对象列表。`run_key` 在这些实际 Run 中唯一，`attempt_key` 在各自 Run 内唯一，均为非空且不超过 128 字符的字符串。收到 `target_formal_work_inventory_invalid` 时，按 Owner 给出的 JSON 路径修正相应列表、键、状态、指标对象或实现版本声明，保留原有工作和产物，在同一 Root 正常结束下一轮。即使顶层 `metrics: {}`，也按具体字段反馈修正，不为格式修订复制评价指标或重新训练；被拒版本保持可读。
+`formal_runs` 是非空 Run 对象列表，每份最多 100 项，包含按状态跳过的 Run；每个实际处理 Run 的 `evaluations` 对象列表最多 100 项，多个 Run 的 Evaluation 不合计限额。超限时整份声明拒绝，反馈给出字段路径、实际条数和上限；根据真实研究内容合并过细的 Run／Evaluation 声明，完整保留结果、原始证据及来源。宿主不截断或部分接纳；合并不通过随意平均结果、虚构 Run 或丢弃证据规避上限。`run_key` 在这些实际 Run 中唯一，`attempt_key` 在各自 Run 内唯一，均为非空且不超过 128 字符的字符串。收到 `target_formal_work_inventory_invalid` 时，按 Owner 给出的 JSON 路径修正相应列表、键、状态、指标对象或实现版本声明，保留原有工作和产物，在同一 Root 正常结束下一轮。即使顶层 `metrics` 省略或为空，也按具体字段反馈修正，不为格式修订复制评价指标或重新训练；被拒版本保持可读。
 
 状态为 `executed | failed | blocked | cancelled | not_executed`。`failed` 仅用于已实施且失败的工作，保留日志和产物；失败 EvaluationAttempt 不产生 MetricResult，可省略 `metrics`、用 `{}` 或保留部分观察但不称其为完成测量。其余未实施状态按事实填写。已执行 Run 可以没有评价或带被阻塞的评价，不补造结果。
 
@@ -51,7 +51,7 @@ Target 整体说明按 `role=analysis` 单独保留规范文件 `outputs/analysi
 }
 ```
 
-每项只含 `relative_path` 与 `role`，最多 100 项；role 为 `log | analysis | data | checkpoint`。路径是当前可写工作区内实际存在的规范相对文件或目录，避开冻结 `inputs/`、宿主 `handoff/`、`implementation/` 与结果文档；实现仍用 `implementation_paths`。一组不连续路径就是集合选择，沿每项已有内容保存，不新造集合身份。相同精确路径只声明一次；此字段选择内容及用途，生产者另由实际 Run／评价的选择器声明。显式 role 优先于常规目录角色。
+每项只含 `relative_path` 与 `role`；role 为 `log | analysis | data | checkpoint`。路径是当前可写工作区内实际存在的规范相对文件或目录，避开冻结 `inputs/`、宿主 `handoff/`、`implementation/` 与结果文档；实现仍用 `implementation_paths`。一组不连续路径就是集合选择，沿每项已有内容保存，不新造集合身份。相同精确路径只声明一次；此字段选择内容及用途，生产者另由实际 Run／评价的选择器声明。显式 role 优先于常规目录角色。
 
 宿主按声明边界冻结资产：选择目录就保留整个目录，选择深层文件就保留该文件，并保留常规目录内相邻的其他产物；相同精确路径可由不同真实工作引用。独立工作产生相同字节时分别声明实际工作，底层内容可以共享；采用既有原件增加用途时复用精确引用，不声明为本次重新产生。外部历史成果沿真实外部来源和既有输入接纳，不冒充当前 Run 的新产出。按研究需要组织目录，大文件同样声明真实归属并流式保存。
 
