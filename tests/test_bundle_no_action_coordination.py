@@ -59,11 +59,11 @@ class _NoActionBundle(_CurrentBindingBundleSkill):
     def terminal_contract_failure_checkpoint(self, **values):
         return _provider_evidence(failure_code=values["failure_code"], detail_code=values["detail_code"])
 
-    def schedule_target(self, request):
+    def schedule_targets(self, request):
         if request.frontier:
-            return super().schedule_target(request)
+            return super().schedule_targets(request)
         self.coordination.append(request)
-        return BundleDispatchResult(self.action, None,
+        return BundleDispatchResult(self.action, (),
             "The accepted preparation work cannot meet remaining frozen obligations without revising the stop rule in a successor Cycle.",
             request.native_session_ref, "test_deterministic")
 
@@ -177,7 +177,7 @@ def test_no_action_correction_reaches_exact_root_coordinator_and_preserves_unmet
         assert runtime.owners.research_graph.query_target_commits(graph.graph_ref) == commits
         assert len(provider.coordination) == 1 and len(provider.batches) == 1
         decision = owner.query_bundle_dispatch_decisions(run.run_ref)[-1]
-        assert decision.action == action and decision.selected_target_ref is None and decision.frontier == ()
+        assert decision.action == action and decision.selected_target_refs == () and decision.frontier == ()
         accepted = owner.query_bundle_run_report(run.run_ref)
         stage_commit = runtime.owners.advancement_engine.query_bundle_stage_commit(run.request_ref)
         if action == "replan_required":

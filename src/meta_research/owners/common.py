@@ -870,6 +870,10 @@ class TargetGraphReceiptVerifier(Protocol):
         self, request: "TargetLaunchRequest"
     ) -> "TargetLaunchVerification": ...
 
+    def read_target_launch_authority(
+        self, target_ref: str
+    ) -> tuple["TargetLaunchRequest", "TargetLaunchVerification"]: ...
+
     def query_target_frontier_commit_transition(
         self, target_ref: str
     ) -> AcceptedTargetCommitTransition | None: ...

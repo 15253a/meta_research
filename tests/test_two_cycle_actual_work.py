@@ -123,7 +123,8 @@ def _ready_existing(runtime):
         decisions=runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
         if not decisions:continue
         graph=runtime.owners.research_graph.query_target_graph(run.request_ref)
-        target=next(t for t in graph.targets if t.target_ref==decisions[-1].selected_target_ref)
+        selected, = decisions[-1].selected_target_refs
+        target = next(t for t in graph.targets if t.target_ref == selected)
         if runtime.owners.research_graph.query_target_candidate_projection(target_ref=target.target_ref) is None:continue
         launch=runtime.owners.research_graph.query_target_launch_request(target.target_ref)
         return graph,target,run,decisions[-1],launch

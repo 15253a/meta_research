@@ -110,7 +110,7 @@ def test_owner_rejects_unproven_batch_replan_source(tmp_path, damage):
             owner.record_bundle_dispatch_decision(run_ref=run.run_ref, attempt_ref=run.attempt_ref,
                 fence_ref=run.fence_ref, native_session_ref=run.native_session_ref,
                 graph_ref=decision.graph_ref, generation=decision.generation + 1,
-                frontier=(), state=state, action="replan_required", selected_target_ref=None,
+                frontier=(), state=state, action="replan_required", selected_target_refs=(),
                 rationale=decision.rationale, inbox_checkpoint=checkpoint,
                 idempotency_key="invalid-batch-source:" + damage)
         assert len(owner.query_bundle_dispatch_decisions(run.run_ref)) == decision.generation

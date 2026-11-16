@@ -29,11 +29,13 @@ from meta_research.bundle_exhaustion import (
     validate_bundle_exhaustion_assessment,
 )
 from meta_research.bundle_contract import (
+    BUNDLE_DISPATCH_DECISION_SCHEMA_REF,
     MAX_BUNDLE_TARGETS,
     TARGET_PLAN_REVIEW_SCHEMA_REF,
     TARGET_PLAN_SCHEMA_REF,
     BundleContractError,
     validate_bundle_context_pack,
+    validate_dispatch_selection,
     validate_target_plan,
 )
 from meta_research.bundle_target_contract import (
@@ -313,7 +315,7 @@ class BundleDispatchRequest:
 @dataclass(frozen=True)
 class BundleDispatchResult:
     action: str
-    selected_target_ref: str | None
+    selected_target_refs: tuple[str, ...]
     rationale: str
     native_session_ref: str
     adapter_kind: str
@@ -369,7 +371,7 @@ class BundleSkillProvider(Protocol):
         self, request: BundleSkillRequest
     ) -> BundleSkillResult | BundleExhaustionSkillResult: ...
 
-    def schedule_target(
+    def schedule_targets(
         self, request: BundleDispatchRequest
     ) -> BundleDispatchResult: ...
 
@@ -406,30 +408,15 @@ def validate_bundle_dispatch_result(
         or len(result.rationale) > 512
     ):
         raise BundleSkillContractError("bundle_dispatch_invalid")
-    matching = [
-        item
-        for item in request.frontier
-        if item.get("target_ref") == result.selected_target_ref
-    ]
-    if (
-        result.action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
-        or (
-            result.action == "dispatch"
-            and (
-                not result.selected_target_ref
-                or len(matching) != 1
-                or matching[0].get("dispatch_allowed", True) is not True
-            )
+    try:
+        validate_dispatch_selection(
+            result.action, result.selected_target_refs, request.frontier, request.state
         )
-        or (result.action != "dispatch" and result.selected_target_ref is not None)
-    ):
-        raise BundleSkillContractError("bundle_dispatch_target_not_in_frontier")
-    if result.action == "revise_strategy" and (request.frontier
-            or request.state.get("strategy_revision_available") is not True):
-        raise BundleSkillContractError("bundle_strategy_revision_not_ready")
+    except BundleContractError as error:
+        raise BundleSkillContractError(str(error)) from error
     return canonical_hash(
         {
-            "schema_ref": "meta-research/bundle-dispatch-decision/v1",
+            "schema_ref": BUNDLE_DISPATCH_DECISION_SCHEMA_REF,
             "stage_request_ref": request.stage_request_ref,
             "run_ref": request.run_ref,
             "attempt_ref": request.attempt_ref,
@@ -442,11 +429,33 @@ def validate_bundle_dispatch_result(
             "inbox_checkpoint_ref": request.inbox_checkpoint["checkpoint_ref"],
             "inbox_checkpoint_hash": checkpoint_hash,
             "action": result.action,
-            "selected_target_ref": result.selected_target_ref,
+            "selected_target_refs": list(result.selected_target_refs),
             "rationale": result.rationale,
             "native_session_ref": result.native_session_ref,
             "adapter_kind": result.adapter_kind,
         }
+    )
+
+
+def _bundle_dispatch_result_from_output(
+    output: dict[str, object], native_session_ref: str | None,
+) -> BundleDispatchResult:
+    action = output.get("action")
+    refs = output.get("selected_target_refs")
+    rationale = output.get("rationale")
+    if (
+        native_session_ref is None
+        or not isinstance(action, str)
+        or not isinstance(refs, list)
+        or not isinstance(rationale, str)
+    ):
+        raise BundleSkillContractError("codex_bundle_dispatch_invalid")
+    return BundleDispatchResult(
+        action=action,
+        selected_target_refs=tuple(refs),
+        rationale=rationale,
+        native_session_ref=native_session_ref,
+        adapter_kind="codex_cli",
     )
 
 
@@ -1170,7 +1179,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "target-plan-envelope": _target_plan_envelope_schema(
                 _schema_template_request()
             ),
-            "target-dispatch": _dispatch_schema(("__target__",)),
+            "target-dispatch": _dispatch_schema(),
             "target-batch": _target_batch_schema(_schema_template_request()),
         }
         from meta_research.bundle_output_assembly import full_prose_output_schema
@@ -1474,7 +1483,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
 
     @resource_preparation
-    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+    def schedule_targets(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         _validate_rolling_native_request(request)
         _validate_inbox_checkpoint_projection(
             request.inbox_checkpoint,
@@ -1484,7 +1493,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
-        target_refs = tuple(cast(str, item["target_ref"]) for item in request.frontier)
         operation_input = {
             "kind": "bundle_dispatch", "identity": _rolling_operation_identity(request),
             "request": {"generation": request.generation,
@@ -1497,9 +1505,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{_bundle_skill_instructions()}\n\n"
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续使用当前 Bundle 根 Session。先读取这次 durable frontier 与 "
-            "TargetCommit/blocker 状态，再自主选择下一项可调度 Target。选择体现当前 "
+            "TargetCommit/blocker 状态，再自主选择本次可并行开展的一个或多个 Target。选择体现当前 "
             "优先级、依赖、已实现结果与局部阻塞；不得把 Agent tree 当成 Target DAG，"
-            "选择 frontier 内有当前启动权限且值得投入的 Target 时返回 dispatch。"
+            "返回 dispatch 时在 selected_target_refs 中列出本次选定的全部 Target，每项只列一次。"
+            "每项必须位于 frontier，具有当前启动权限，且未列入 state.launch_input_errors。"
             "需要等待证据、依赖或重新评估研究优先级时可返回 wait，并在 rationale "
             "说明等待条件；技术可启动不代表研究上必须立即启动。冻结语义确需 "
             "改变时返回 replan_required，说明已有证据与需由后继 Cycle 承接的修订，"
@@ -1511,14 +1520,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "human_request_command.semantic_operation_id 和 arguments 调用 resident semantic "
             "MCP 创建 formal HumanRequest；若 effect outcome 不明，必须用同一 "
             "arguments 调用 reconciliation_operation_id，不得换 effect_id 重放。"
-            "请求已打开、已满足或已拒绝时不得再造新请求；返回 wait，"
-            "由 Owner 评估 response、重验 authorization 并释放 waiter。绝对不得把 "
+            "请求已打开、已满足或已拒绝时不得再造新请求。由 Owner 评估 response、"
+            "重验 authorization 并释放 waiter。绝对不得把 "
             "dispatch_allowed=false 的 Target 返回为 dispatch，也不得因 provider、"
             "validator 或 readiness 错误自行伪造 HumanRequest。"
             "需要同根编制下一批策略而非等待外部条件时，只有 state.strategy_revision_available=true "
             "才可返回 revise_strategy；下一次正式 target-batch 会接收此请求，仍须提出真实工作或有证据的策略收口。"
             "此动作不创建或接纳任何 Target。wait 会持久等待，不会自动安排下一批。"
-            "返回 wait、replan_required 或 revise_strategy 时，selected_target_ref 必须为 null。\n"
+            "返回 wait、replan_required 或 revise_strategy 时，selected_target_refs 必须为空数组。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"graph_ref={request.graph_ref}\n"
             f"generation={request.generation}\n"
@@ -1536,7 +1545,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 runtime_binding=request.runtime_binding,
                 operation_name=operation_name,
                 prompt=prompt,
-                schema=_dispatch_schema(target_refs),
+                schema=_dispatch_schema(),
                 native_session_ref=request.native_session_ref,
                 job_ref=request.job_ref,
                 operation_input=operation_input,
@@ -1551,42 +1560,17 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 # before invocation identity. Recovery verifies the old seal.
                 recover_rejected_dispatch(self, request, operation_name)
             raise
-        action = output.get("action")
-        selected_target_ref = output.get("selected_target_ref")
-        rationale = output.get("rationale")
-        if (
-            session_ref is None
-            or not isinstance(action, str)
-            or (
-                selected_target_ref is not None
-                and not isinstance(selected_target_ref, str)
-            )
-            or not isinstance(rationale, str)
-        ):
+        try:
+            result = _bundle_dispatch_result_from_output(output, session_ref)
+            validate_bundle_dispatch_result(request, result)
+        except BundleSkillContractError as error:
             checkpoint_session = session_ref or request.native_session_ref
             if checkpoint_session is None:
-                raise BundleSkillUnavailable("codex_bundle_dispatch_invalid")
+                raise BundleSkillUnavailable(str(error)) from error
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
                 operation_name=operation_name,
                 native_session_ref=checkpoint_session,
-                failure_code="bundle_review_result_contract_invalid",
-                detail_code="codex_bundle_dispatch_invalid",
-            )
-        result = BundleDispatchResult(
-            action=action,
-            selected_target_ref=selected_target_ref,
-            rationale=rationale,
-            native_session_ref=session_ref,
-            adapter_kind="codex_cli",
-        )
-        try:
-            validate_bundle_dispatch_result(request, result)
-        except BundleSkillContractError as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name=operation_name,
-                native_session_ref=session_ref,
                 failure_code="bundle_review_result_contract_invalid",
                 detail_code=str(error),
             ) from error
@@ -2094,8 +2078,7 @@ def _exhaustion_exploration_record_schema(
     }
 
 
-def _dispatch_schema(target_refs: tuple[str, ...]) -> dict[str, object]:
-    del target_refs
+def _dispatch_schema() -> dict[str, object]:
     text = {"type": "string", "minLength": 1}
     return {
         "type": "object",
@@ -2105,15 +2088,15 @@ def _dispatch_schema(target_refs: tuple[str, ...]) -> dict[str, object]:
                 "type": "string",
                 "enum": ["dispatch", "wait", "replan_required", "revise_strategy"],
             },
-            "selected_target_ref": {
-                "anyOf": [
-                    text,
-                    {"type": "null"},
-                ],
+            "selected_target_refs": {
+                "type": "array",
+                "items": text,
+                "maxItems": MAX_BUNDLE_TARGETS,
+                "uniqueItems": True,
             },
             "rationale": {**text, "maxLength": 512},
         },
-        "required": ["action", "selected_target_ref", "rationale"],
+        "required": ["action", "selected_target_refs", "rationale"],
     }
 
 

@@ -160,9 +160,9 @@ class _BundleTransport(CodexBundleSkillAdapter):
     def finalize_draft(self, request, draft):
         return _DeterministicBundleSkill().finalize_draft(request, draft)
 
-    def schedule_target(self, request):
+    def schedule_targets(self, request):
         self.call(request, f"dispatch-{request.generation}")
-        return _DeterministicBundleSkill().schedule_target(request)
+        return _DeterministicBundleSkill().schedule_targets(request)
 
     def propose_target_batch(self, request):
         self.call(request, f"target-batch-{request.base_generation + 1}")

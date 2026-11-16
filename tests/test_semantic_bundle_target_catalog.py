@@ -208,9 +208,9 @@ class _FakeResearchGraph:
 class _FakeAgentRuntime:
     def __init__(self) -> None:
         self.scope_checks = 0
-        self.admissions = []
         self.stale = False
-        self.ack = None
+        self.launch = None
+        self.launch_reads = []
         self.frontier = None
         self.inbox_reads = []
         self.runtime_binding = SimpleNamespace(
@@ -274,21 +274,14 @@ class _FakeAgentRuntime:
                 attempt_ref="bundle-attempt:1",
                 fence_ref="bundle-fence:1",
                 action="dispatch",
-                selected_target_ref="target:1",
+                selected_target_refs=("target:other", "target:1"),
             ),
         )
 
-    def admit_target_launch(self, request, **values):
-        self.admissions.append((request, values))
-        self.ack = TargetLaunchAck(
-            target_ref=request.target_ref,
-            operation_ref="target-launch-operation:1",
-        )
-        return self.ack
-
-    def query_target_launch_ack(self, target_ref: str):
+    def query_admitted_target_launch(self, target_ref: str):
         assert target_ref == "target:1"
-        return self.ack
+        self.launch_reads.append(target_ref)
+        return self.launch
 
     def query_target_frontier_entry(self, target_ref: str):
         assert target_ref == "target:1"
@@ -598,49 +591,50 @@ def test_missing_matrix_is_typed_and_does_not_register_placeholder_tools():
     } & missing_names
 
 
-def test_target_work_uses_context_effect_identity_and_revalidates_scope():
-    gateway, graph, _memory, runtime = _gateway()
+def test_target_work_waits_for_host_admission_and_revalidates_scope():
+    gateway, _graph, _memory, runtime = _gateway()
     operation_ids = (
         "agent_runtime.target_work.request",
         "agent_runtime.target_work.request.reconcile",
     )
     connection = _issue(gateway, operation_ids)
-    result = _call(
-        gateway,
-        connection,
-        "agent_runtime.target_work.request",
-        {
-            "effect_id": "launch:1",
-            "target_ref": "target:1",
-            "dispatch_decision_ref": "dispatch:1",
-        },
-    )
-    assert result["isError"] is False
-    assert result["structuredContent"] == {
-        "status": "effect_confirmed",
+    arguments = {
         "effect_id": "launch:1",
         "target_ref": "target:1",
-        "operation_ref": "target-launch-operation:1",
+        "dispatch_decision_ref": "dispatch:1",
     }
-    request, values = runtime.admissions[0]
-    assert request == _launch_request()
-    assert values["dispatch_decision_ref"] == "dispatch:1"
-    assert values["idempotency_key"].startswith("mcp-effect:")
+    result = _call(gateway, connection, operation_ids[0], arguments)
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "status": "unknown_outcome",
+        "effect_id": "launch:1",
+    }
+    assert runtime.launch is None
     assert runtime.scope_checks == 1
-    assert graph.launch_queries == 1
 
-    reconciled = _call(
-        gateway,
-        connection,
-        "agent_runtime.target_work.request.reconcile",
-        {
+    runtime.launch = SimpleNamespace(
+        request=_launch_request(),
+        dispatch_decision_ref="dispatch:other",
+        ack=TargetLaunchAck(
+            target_ref="target:1",
+            operation_ref="target-launch-operation:1",
+        ),
+    )
+    mismatched = _call(gateway, connection, operation_ids[1], arguments)
+    assert mismatched["isError"] is True
+    assert mismatched["structuredContent"]["code"] == "target_work_dispatch_invalid"
+
+    runtime.launch.dispatch_decision_ref = "dispatch:1"
+    for operation_id in operation_ids:
+        reconciled = _call(gateway, connection, operation_id, arguments)
+        assert reconciled["isError"] is False
+        assert reconciled["structuredContent"] == {
+            "status": "effect_confirmed",
             "effect_id": "launch:1",
             "target_ref": "target:1",
-            "dispatch_decision_ref": "dispatch:1",
-        },
-    )
-    assert reconciled["structuredContent"]["status"] == "effect_confirmed"
-    assert runtime.scope_checks == 2
+            "operation_ref": "target-launch-operation:1",
+        }
+    assert runtime.scope_checks == 4
 
 
 def test_bundle_handler_rejects_stale_context_before_rg_or_ar_side_effects():
@@ -664,7 +658,7 @@ def test_bundle_handler_rejects_stale_context_before_rg_or_ar_side_effects():
     assert result["isError"] is True
     assert result["structuredContent"]["code"] == "semantic_call_scope_stale"
     assert graph.launch_queries == 0
-    assert runtime.admissions == []
+    assert runtime.launch_reads == []
 
 
 def test_target_handler_rereads_frontier_and_rejects_a_stale_context_identity():

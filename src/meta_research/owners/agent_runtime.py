@@ -152,12 +152,16 @@ from meta_research.reasoning_contract import (
     validate_new_reasoning_successor_entry,
 )
 from meta_research.bundle_contract import (
+    BUNDLE_DISPATCH_DECISION_SCHEMA_REF,
+    MAX_BUNDLE_TARGETS,
     TARGET_PLAN_REVIEW_SCHEMA_REF,
+    BundleContractError,
     material_target_plan_hash,
     target_graph_append_proposal,
     target_execution_assertion,
     target_execution_authorization_requirement,
     target_execution_technical_binding,
+    validate_dispatch_selection,
     validate_target_graph_append_proposal,
 )
 from meta_research.owners._sqlite_snapshot import (
@@ -566,7 +570,7 @@ class BundleDispatchDecision:
     frontier: tuple[dict[str, object], ...]
     state: dict[str, object]
     action: str
-    selected_target_ref: str | None
+    selected_target_refs: tuple[str, ...]
     rationale: str
     decision_hash: str
     receipt: AcceptanceReceipt
@@ -580,7 +584,7 @@ class BundleDispatchDecision:
             "frontier": list(self.frontier),
             "state": self.state,
             "action": self.action,
-            "selected_target_ref": self.selected_target_ref,
+            "selected_target_refs": list(self.selected_target_refs),
             "rationale": self.rationale,
             "decision_hash": self.decision_hash,
             "receipt": self.receipt.as_public_dict(),
@@ -646,7 +650,16 @@ class AdmittedTargetLaunch:
     stage_request_ref: str
     quest_ref: str
     target_run_ref: str
+    dispatch_decision_ref: str
     receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class TargetLaunchAuthorization:
+    request_ref: str
+    waiter_ref: str
+    generation: int
+    authorization_receipt_ref: str
 
 
 @dataclass(frozen=True)
@@ -1536,7 +1549,7 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         frontier: tuple[dict[str, object], ...],
         state: dict[str, object],
         action: str,
-        selected_target_ref: str | None,
+        selected_target_refs: tuple[str, ...],
         rationale: str,
         inbox_checkpoint: BundleInboxCheckpoint,
         idempotency_key: str,
@@ -1737,6 +1750,13 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         human_waiter_generation: int | None = None,
         human_authorization_receipt_ref: str | None = None,
     ) -> TargetLaunchAck: ...
+
+    def settle_bundle_dispatch_launches(
+        self,
+        dispatch_decision_ref: str,
+        *,
+        authorizations: dict[str, TargetLaunchAuthorization],
+    ) -> tuple[TargetLaunchAck, ...]: ...
 
     def query_target_launch_ack(self, target_ref: str) -> TargetLaunchAck | None: ...
 
@@ -2232,6 +2252,121 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         empty until a TargetRun worker starts real recoverable execution.
         """
 
+        verifier = self._target_graph_verifier
+        if verifier is None:
+            raise OwnerConflict("target_graph_verifier_unavailable")
+        _validate_stage_idempotency_key(idempotency_key)
+        verification = verifier.verify_target_launch_request(request)
+        with self._database.fenced_write() as connection:
+            ack = self._admit_target_launch(
+                connection, request, verification,
+                dispatch_decision_ref=dispatch_decision_ref,
+                idempotency_key=idempotency_key,
+                human_request_ref=human_request_ref,
+                human_waiter_ref=human_waiter_ref,
+                human_waiter_generation=human_waiter_generation,
+                human_authorization_receipt_ref=human_authorization_receipt_ref,
+            )
+        persisted = self.query_target_launch_ack(request.target_ref)
+        if persisted != ack:
+            raise OwnerConflict("target_launch_missing_after_commit")
+        return persisted
+
+    def settle_bundle_dispatch_launches(
+        self,
+        dispatch_decision_ref: str,
+        *,
+        authorizations: dict[str, TargetLaunchAuthorization],
+    ) -> tuple[TargetLaunchAck, ...]:
+        verifier = self._target_graph_verifier
+        if verifier is None:
+            raise OwnerConflict("target_graph_verifier_unavailable")
+        admitted_now: list[TargetLaunchAck] = []
+        with self._database.fenced_write() as connection:
+            scope = self._require_current_bundle_dispatch(connection, dispatch_decision_ref)
+            dispatch, _run, _attempt = scope
+            existing = connection.execute(
+                text("SELECT * FROM ar_target_launches WHERE dispatch_decision_ref = :decision_ref"),
+                {"decision_ref": dispatch_decision_ref},
+            ).all()
+            if existing:
+                if {row.target_ref for row in existing} != set(dispatch.selected_target_refs):
+                    raise OwnerConflict("target_launch_conflict")
+                for row in existing:
+                    _target_launch_ack(row, _target_launch_request_from_row(row))
+                return ()
+            for target_ref in dispatch.selected_target_refs:
+                authorization = authorizations.get(target_ref)
+                request, verification = verifier.read_target_launch_authority(target_ref)
+                ack = self._admit_target_launch(
+                    connection, request, verification,
+                    dispatch_decision_ref=dispatch_decision_ref,
+                    idempotency_key=f"target-launch-admit:{canonical_hash([target_ref])}",
+                    human_request_ref=None if authorization is None else authorization.request_ref,
+                    human_waiter_ref=None if authorization is None else authorization.waiter_ref,
+                    human_waiter_generation=None if authorization is None else authorization.generation,
+                    human_authorization_receipt_ref=None if authorization is None else authorization.authorization_receipt_ref,
+                    scope=scope,
+                )
+                admitted_now.append(ack)
+        return tuple(admitted_now)
+
+    def _require_current_bundle_dispatch(self, connection, dispatch_decision_ref: str):
+        dispatch_row = connection.execute(
+            text(
+                "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
+                "decision_ref = :decision_ref"
+            ),
+            {"decision_ref": dispatch_decision_ref},
+        ).first()
+        if dispatch_row is None:
+            raise OwnerConflict("target_launch_dispatch_invalid")
+        dispatch = _bundle_dispatch_decision(dispatch_row)
+        checkpoint = _bundle_inbox_checkpoint_for_operation(
+            connection,
+            operation_kind="dispatch",
+            operation_ref=dispatch_decision_ref,
+            require_current=True,
+        )
+        latest_dispatch = connection.execute(
+            text(
+                "SELECT decision_ref FROM ar_bundle_dispatch_decisions WHERE "
+                "run_ref = :run_ref ORDER BY generation DESC LIMIT 1"
+            ),
+            {"run_ref": dispatch.run_ref},
+        ).first()
+        if (
+            latest_dispatch is None
+            or latest_dispatch.decision_ref != dispatch_decision_ref
+            or dispatch.action != "dispatch"
+            or checkpoint.run_ref != dispatch.run_ref
+            or checkpoint.attempt_ref != dispatch.attempt_ref
+            or checkpoint.fence_ref != dispatch.fence_ref
+        ):
+            raise OwnerConflict("target_launch_dispatch_invalid")
+        run, attempt, session, fence = _load_stage_fence(
+            connection, dispatch.run_ref, dispatch.attempt_ref, dispatch.fence_ref
+        )
+        _require_bundle_rolling_fence(connection, run, attempt, fence)
+        if run.stage != "bundle" or session.native_session_ref != dispatch.native_session_ref:
+            raise OwnerConflict("target_launch_dispatch_invalid")
+        _verify_target_launch_stage_current(self, run)
+        return dispatch, run, attempt
+
+    def _admit_target_launch(
+        self,
+        connection,
+        request: TargetLaunchRequest,
+        verification,
+        *,
+        dispatch_decision_ref: str,
+        idempotency_key: str,
+        human_request_ref: str | None,
+        human_waiter_ref: str | None,
+        human_waiter_generation: int | None,
+        human_authorization_receipt_ref: str | None,
+        scope=None,
+    ) -> TargetLaunchAck:
         _validate_stage_idempotency_key(idempotency_key)
         if not isinstance(dispatch_decision_ref, str) or not dispatch_decision_ref:
             raise OwnerConflict("target_launch_dispatch_invalid")
@@ -2259,18 +2394,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         ):
             raise OwnerConflict("target_launch_authorization_invalid")
         human_request_projection = (
-            self.query_human_request(cast(str, human_request_ref))
+            self.query_human_request(
+                cast(str, human_request_ref), materialize_expiration=False
+            )
             if has_human_authorization
             else None
         )
         consume_human_waiter_on_launch = False
-        verifier = self._target_graph_verifier
-        if verifier is None:
-            raise OwnerConflict("target_graph_verifier_unavailable")
-        # Reverify the sole current RG projection before idempotency replay.
-        # A historical source-wrapper row must not bypass a tightened launch
-        # authority merely because its idempotency key already exists.
-        verification = verifier.verify_target_launch_request(request)
         command = {
             "command": "admit_target_launch",
             "request": projection_plain_value(request),
@@ -2281,521 +2411,447 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             "human_authorization_receipt_ref": human_authorization_receipt_ref,
         }
         request_hash = canonical_hash(command)
-        with self._database.fenced_write() as connection:
-            replay = connection.execute(
+        replay = connection.execute(
+            text(
+                "SELECT * FROM ar_target_launches WHERE idempotency_key = "
+                ":idempotency_key"
+            ),
+            {"idempotency_key": idempotency_key},
+        ).first()
+        if replay is not None:
+            if replay.request_hash != request_hash:
+                raise OwnerConflict("idempotency_conflict")
+            return _target_launch_ack(replay, request)
+        if scope is None:
+            dispatch, bundle_run, bundle_attempt = self._require_current_bundle_dispatch(
+                connection, dispatch_decision_ref
+            )
+            if len(dispatch.selected_target_refs) != 1:
+                raise OwnerConflict("target_launch_batch_settlement_required")
+        else:
+            dispatch, bundle_run, bundle_attempt = scope
+        if (
+            request.target_ref not in dispatch.selected_target_refs
+            or dispatch.graph_ref != verification.graph_ref
+            or bundle_run.request_ref != verification.stage_request_ref
+        ):
+            raise OwnerConflict("target_launch_dispatch_invalid")
+        selected_item = next(
+            item for item in dispatch.frontier if item["target_ref"] == request.target_ref
+        )
+        if (
+            selected_item.get("spec_hash") != verification.source_spec_hash
+            or selected_item.get("risk_class") != verification.risk_class
+        ):
+            raise OwnerConflict("target_launch_dispatch_invalid")
+        selected_uses_coordination = "dispatch_allowed" in selected_item
+        if (verification.risk_class == "high") != has_human_authorization:
+            raise OwnerConflict("target_launch_authorization_invalid")
+        duplicate = connection.execute(
+            text("SELECT target_ref FROM ar_target_launches WHERE target_ref = :target_ref"),
+            {"target_ref": request.target_ref},
+        ).first()
+        if duplicate is not None:
+            raise OwnerConflict("target_launch_conflict")
+        launch_ref = new_ref("target_launch")
+        if has_human_authorization:
+            assertion = target_execution_assertion(
+                quest_ref=verification.quest_ref,
+                stage_request_ref=verification.stage_request_ref,
+                graph_ref=verification.graph_ref,
+                target_ref=request.target_ref,
+                target_spec_hash=request.target_spec_binding.content_hash_ref,
+                risk_class=verification.risk_class,
+            )
+            requirement = target_execution_authorization_requirement(
+                quest_ref=verification.quest_ref,
+                stage_request_ref=verification.stage_request_ref,
+                graph_ref=verification.graph_ref,
+                target_ref=request.target_ref,
+                target_spec_hash=request.target_spec_binding.content_hash_ref,
+            )
+            root_assertion = {
+                "schema_ref": "meta-research/root-agent-human-request-target/v1",
+                "root": {
+                    "run_kind": "bundle_stage",
+                    "run_ref": dispatch.run_ref,
+                    "attempt_ref": dispatch.attempt_ref,
+                    "root_session_ref": bundle_run.root_session_ref,
+                    "fence_ref": dispatch.fence_ref,
+                    "waiter_generation": int(bundle_attempt.generation),
+                },
+                "condition": assertion,
+            }
+            human_request = connection.execute(
                 text(
-                    "SELECT * FROM ar_target_launches WHERE idempotency_key = "
-                    ":idempotency_key"
+                    "SELECT * FROM owner_human_requests WHERE issuer = "
+                    ":issuer AND request_ref = :request_ref"
                 ),
-                {"idempotency_key": idempotency_key},
+                {"issuer": AR_OWNER, "request_ref": human_request_ref},
             ).first()
-            if replay is not None:
-                if replay.request_hash != request_hash:
-                    raise OwnerConflict("idempotency_conflict")
-                return _target_launch_ack(replay, request)
-            dispatch_row = connection.execute(
+            waiter = connection.execute(
                 text(
-                    "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
-                    "decision_ref = :decision_ref"
-                ),
-                {"decision_ref": dispatch_decision_ref},
-            ).first()
-            if dispatch_row is None:
-                raise OwnerConflict("target_launch_dispatch_invalid")
-            dispatch = _bundle_dispatch_decision(dispatch_row)
-            selected_items = tuple(
-                item
-                for item in dispatch.frontier
-                if item.get("target_ref") == request.target_ref
-            )
-            if len(selected_items) != 1:
-                raise OwnerConflict("target_launch_dispatch_invalid")
-            selected_item = selected_items[0]
-            selected_uses_coordination = "dispatch_allowed" in selected_item
-            if (
-                selected_uses_coordination
-                and selected_item.get("dispatch_allowed") is not True
-            ):
-                raise OwnerConflict("target_launch_dispatch_invalid")
-            dispatch_checkpoint = _bundle_inbox_checkpoint_for_operation(
-                connection,
-                operation_kind="dispatch",
-                operation_ref=dispatch_decision_ref,
-                require_current=True,
-            )
-            latest_dispatch = connection.execute(
-                text(
-                    "SELECT decision_ref FROM ar_bundle_dispatch_decisions WHERE "
-                    "run_ref = :run_ref ORDER BY generation DESC LIMIT 1"
-                ),
-                {"run_ref": dispatch.run_ref},
-            ).first()
-            stage_run = connection.execute(
-                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
-                {"run_ref": dispatch.run_ref},
-            ).first()
-            if (
-                latest_dispatch is None
-                or latest_dispatch.decision_ref != dispatch_decision_ref
-                or dispatch.action != "dispatch"
-                or dispatch.selected_target_ref != request.target_ref
-                or dispatch.graph_ref != verification.graph_ref
-                or stage_run is None
-                or stage_run.stage != "bundle"
-                or stage_run.status not in {"running", "awaiting_acceptance"}
-                or stage_run.request_ref != verification.stage_request_ref
-                or stage_run.current_attempt_ref != dispatch.attempt_ref
-                or stage_run.current_fence_ref != dispatch.fence_ref
-                or dispatch_checkpoint.run_ref != dispatch.run_ref
-                or dispatch_checkpoint.attempt_ref != dispatch.attempt_ref
-                or dispatch_checkpoint.fence_ref != dispatch.fence_ref
-            ):
-                raise OwnerConflict("target_launch_dispatch_invalid")
-            bundle_run, bundle_attempt, bundle_session, bundle_fence = (
-                _load_stage_fence(
-                    connection,
-                    dispatch.run_ref,
-                    dispatch.attempt_ref,
-                    dispatch.fence_ref,
-                )
-            )
-            _require_bundle_rolling_fence(connection, bundle_run, bundle_attempt, bundle_fence)
-            if (
-                bundle_run.run_ref != stage_run.run_ref
-                or bundle_run.request_ref != stage_run.request_ref
-                or bundle_run.current_attempt_ref != stage_run.current_attempt_ref
-                or bundle_run.current_fence_ref != stage_run.current_fence_ref
-                or bundle_run.root_session_ref != stage_run.root_session_ref
-                or bundle_session.session_ref != stage_run.root_session_ref
-                or bundle_session.native_session_ref != dispatch.native_session_ref
-            ):
-                raise OwnerConflict("target_launch_dispatch_invalid")
-            _verify_target_launch_stage_current(self, stage_run)
-            verifier.verify_bundle_dispatch_frontier(
-                request_ref=stage_run.request_ref,
-                run_ref=dispatch.run_ref,
-                graph_ref=dispatch.graph_ref,
-                frontier=dispatch.frontier,
-                allow_legacy_high_risk=True,
-            )
-            if (verification.risk_class == "high") != has_human_authorization:
-                raise OwnerConflict("target_launch_authorization_invalid")
-            duplicate = connection.execute(
-                text(
-                    "SELECT * FROM ar_target_launches WHERE target_ref = :target_ref "
-                    "OR dispatch_decision_ref = :dispatch_decision_ref"
+                    "SELECT * FROM owner_human_request_waiters WHERE "
+                    "request_ref = :request_ref AND waiter_ref = :waiter_ref"
                 ),
                 {
-                    "target_ref": request.target_ref,
-                    "dispatch_decision_ref": dispatch_decision_ref,
+                    "request_ref": human_request_ref,
+                    "waiter_ref": human_waiter_ref,
                 },
             ).first()
-            if duplicate is not None:
-                raise OwnerConflict("target_launch_conflict")
-
-            # All request/currentness/dispatch checks above are read-only.  The
-            # first persistent admission identity is allocated only here.
-            launch_ref = new_ref("target_launch")
-            if has_human_authorization:
-                assertion = target_execution_assertion(
+            validation = connection.execute(
+                text(
+                    "SELECT * FROM owner_human_request_resume_validations WHERE "
+                    "request_ref = :request_ref AND waiter_ref = :waiter_ref "
+                    "ORDER BY created_at DESC, validation_ref DESC LIMIT 1"
+                ),
+                {
+                    "request_ref": human_request_ref,
+                    "waiter_ref": human_waiter_ref,
+                },
+            ).first()
+            consumption = connection.execute(
+                text(
+                    "SELECT * FROM owner_human_request_resume_consumptions "
+                    "WHERE request_ref = :request_ref AND waiter_ref = "
+                    ":waiter_ref AND generation = :generation"
+                ),
+                {
+                    "request_ref": human_request_ref,
+                    "waiter_ref": human_waiter_ref,
+                    "generation": human_waiter_generation,
+                },
+            ).first()
+            if human_request is None or waiter is None or validation is None:
+                raise OwnerConflict("target_launch_authorization_invalid")
+            try:
+                stored_assertion = decoded_object(
+                    human_request.target_assertion_json
+                )
+                stored_requirement = decoded_object(
+                    human_request.required_authorization_json
+                )
+                stored_conditions = json.loads(
+                    human_request.acceptance_conditions_json
+                )
+                waiter_assertion = decoded_object(
+                    waiter.target_assertion_json
+                )
+                waiter_blockers = json.loads(waiter.other_blockers_json)
+                validation_blockers = json.loads(
+                    validation.other_blockers_json
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                raise OwnerConflict(
+                    "target_launch_authorization_invalid"
+                ) from error
+            if stored_assertion == assertion:
+                # Persisted pre-root-authority requests remain restartable.
+                # Their target-scoped waiter is accepted only with the exact
+                # historical assertion and generation-one identity.
+                expected_assertion = assertion
+                expected_waiter_ref = request.target_ref
+                expected_waiter_generation = 1
+            elif target_execution_technical_binding(stored_assertion) == root_assertion:
+                # Narrative is frozen in the same request contract; it does
+                # not alter the exact execution subject or waiter identity.
+                root_assertion = stored_assertion
+                expected_assertion = stored_assertion
+                expected_waiter_ref = f"root_run:{dispatch.run_ref}"
+                expected_waiter_generation = int(bundle_attempt.generation)
+            else:
+                raise OwnerConflict("target_launch_authorization_invalid")
+            expected_contract = {
+                "quest_ref": verification.quest_ref,
+                "kind": "capability_authorization",
+                "obligation": _TARGET_AUTHORIZATION_OBLIGATION,
+                "business_purpose": _TARGET_AUTHORIZATION_PURPOSE,
+                "target_assertion": expected_assertion,
+                "acceptance_conditions": list(
+                    _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS
+                ),
+                "required_authorization": requirement,
+                "expires_at": None,
+            }
+            consumed_root_waiter = (
+                None
+                if expected_assertion != root_assertion
+                else _bundle_root_human_waiter_consumption(
+                    human_request_projection,
+                    request_ref=cast(str, human_request_ref),
+                    waiter_ref=expected_waiter_ref,
+                    generation=expected_waiter_generation,
+                    target_assertion=expected_assertion,
+                    authorization_receipt_ref=cast(
+                        str, human_authorization_receipt_ref
+                    ),
                     quest_ref=verification.quest_ref,
-                    stage_request_ref=verification.stage_request_ref,
-                    graph_ref=verification.graph_ref,
-                    target_ref=request.target_ref,
-                    target_spec_hash=request.target_spec_binding.content_hash_ref,
-                    risk_class=verification.risk_class,
+                    runtime_binding_hash=bundle_run.runtime_binding_hash,
                 )
-                requirement = target_execution_authorization_requirement(
-                    quest_ref=verification.quest_ref,
-                    stage_request_ref=verification.stage_request_ref,
-                    graph_ref=verification.graph_ref,
-                    target_ref=request.target_ref,
-                    target_spec_hash=request.target_spec_binding.content_hash_ref,
+            )
+            consumed_root_waiter_current = bool(
+                waiter.status == "consumed"
+                and consumed_root_waiter is not None
+                and consumption is not None
+                and consumption.consumption_ref
+                == consumed_root_waiter["consumption_ref"]
+                and consumption.request_ref
+                == consumed_root_waiter["request_ref"]
+                and consumption.waiter_ref
+                == consumed_root_waiter["waiter_ref"]
+                and int(consumption.generation)
+                == consumed_root_waiter["generation"]
+                and consumption.validation_ref
+                == consumed_root_waiter["validation_ref"]
+                and consumption.work_ref == consumed_root_waiter["work_ref"]
+                and consumption.work_hash == consumed_root_waiter["work_hash"]
+                and consumption.receipt_ref
+                == cast(dict[str, object], consumed_root_waiter["receipt"])[
+                    "receipt_ref"
+                ]
+                and consumption.receipt_hash
+                == cast(dict[str, object], consumed_root_waiter["receipt"])[
+                    "payload_hash"
+                ]
+            )
+            consume_human_waiter_on_launch = waiter.status == "released"
+            if (
+                human_request.kind != "capability_authorization"
+                or human_request.quest_ref != verification.quest_ref
+                or human_request.status != "satisfied"
+                or not bool(human_request.is_current)
+                or human_request.obligation != _TARGET_AUTHORIZATION_OBLIGATION
+                or human_request.business_purpose
+                != _TARGET_AUTHORIZATION_PURPOSE
+                or human_request.expires_at is not None
+                or canonical_json(stored_assertion)
+                != human_request.target_assertion_json
+                or human_request.target_assertion_hash
+                != canonical_hash(expected_assertion)
+                or stored_conditions
+                != list(_TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS)
+                or canonical_json(stored_conditions)
+                != human_request.acceptance_conditions_json
+                or human_request.acceptance_conditions_hash
+                != canonical_hash(stored_conditions)
+                or stored_requirement != requirement
+                or canonical_json(stored_requirement)
+                != human_request.required_authorization_json
+                or human_request.required_authorization_hash
+                != canonical_hash(requirement)
+                or human_request.identity_hash
+                != canonical_hash(expected_contract)
+                or human_waiter_ref != expected_waiter_ref
+                or cast(int, human_waiter_generation)
+                != expected_waiter_generation
+                or waiter.request_ref != human_request_ref
+                or waiter.waiter_ref != expected_waiter_ref
+                or int(waiter.generation)
+                != expected_waiter_generation
+                or waiter_assertion != expected_assertion
+                or canonical_json(waiter_assertion)
+                != waiter.target_assertion_json
+                or waiter.target_assertion_hash
+                != canonical_hash(expected_assertion)
+                or waiter.wait_scope != "local"
+                or waiter_blockers != []
+                or canonical_json(waiter_blockers)
+                != waiter.other_blockers_json
+                or waiter.other_blockers_hash != canonical_hash([])
+                or not (
+                    consume_human_waiter_on_launch
+                    or consumed_root_waiter_current
                 )
-                root_assertion = {
-                    "schema_ref": "meta-research/root-agent-human-request-target/v1",
-                    "root": {
-                        "run_kind": "bundle_stage",
-                        "run_ref": dispatch.run_ref,
-                        "attempt_ref": dispatch.attempt_ref,
-                        "root_session_ref": stage_run.root_session_ref,
-                        "fence_ref": dispatch.fence_ref,
-                        "waiter_generation": int(bundle_attempt.generation),
-                    },
-                    "condition": assertion,
-                }
-                human_request = connection.execute(
-                    text(
-                        "SELECT * FROM owner_human_requests WHERE issuer = "
-                        ":issuer AND request_ref = :request_ref"
-                    ),
-                    {"issuer": AR_OWNER, "request_ref": human_request_ref},
-                ).first()
-                waiter = connection.execute(
-                    text(
-                        "SELECT * FROM owner_human_request_waiters WHERE "
-                        "request_ref = :request_ref AND waiter_ref = :waiter_ref"
-                    ),
-                    {
-                        "request_ref": human_request_ref,
-                        "waiter_ref": human_waiter_ref,
-                    },
-                ).first()
-                validation = connection.execute(
-                    text(
-                        "SELECT * FROM owner_human_request_resume_validations WHERE "
-                        "request_ref = :request_ref AND waiter_ref = :waiter_ref "
-                        "ORDER BY created_at DESC, validation_ref DESC LIMIT 1"
-                    ),
-                    {
-                        "request_ref": human_request_ref,
-                        "waiter_ref": human_waiter_ref,
-                    },
-                ).first()
-                consumption = connection.execute(
-                    text(
-                        "SELECT * FROM owner_human_request_resume_consumptions "
-                        "WHERE request_ref = :request_ref AND waiter_ref = "
-                        ":waiter_ref AND generation = :generation"
-                    ),
-                    {
-                        "request_ref": human_request_ref,
-                        "waiter_ref": human_waiter_ref,
-                        "generation": human_waiter_generation,
-                    },
-                ).first()
-                if human_request is None or waiter is None or validation is None:
-                    raise OwnerConflict("target_launch_authorization_invalid")
-                try:
-                    stored_assertion = decoded_object(
-                        human_request.target_assertion_json
-                    )
-                    stored_requirement = decoded_object(
-                        human_request.required_authorization_json
-                    )
-                    stored_conditions = json.loads(
-                        human_request.acceptance_conditions_json
-                    )
-                    waiter_assertion = decoded_object(
-                        waiter.target_assertion_json
-                    )
-                    waiter_blockers = json.loads(waiter.other_blockers_json)
-                    validation_blockers = json.loads(
-                        validation.other_blockers_json
-                    )
-                except (json.JSONDecodeError, TypeError, ValueError) as error:
-                    raise OwnerConflict(
-                        "target_launch_authorization_invalid"
-                    ) from error
-                if stored_assertion == assertion:
-                    # Persisted pre-root-authority requests remain restartable.
-                    # Their target-scoped waiter is accepted only with the exact
-                    # historical assertion and generation-one identity.
-                    expected_assertion = assertion
-                    expected_waiter_ref = request.target_ref
-                    expected_waiter_generation = 1
-                elif target_execution_technical_binding(stored_assertion) == root_assertion:
-                    # Narrative is frozen in the same request contract; it does
-                    # not alter the exact execution subject or waiter identity.
-                    root_assertion = stored_assertion
-                    expected_assertion = stored_assertion
-                    expected_waiter_ref = f"root_run:{dispatch.run_ref}"
-                    expected_waiter_generation = int(bundle_attempt.generation)
-                else:
-                    raise OwnerConflict("target_launch_authorization_invalid")
-                expected_contract = {
-                    "quest_ref": verification.quest_ref,
-                    "kind": "capability_authorization",
-                    "obligation": _TARGET_AUTHORIZATION_OBLIGATION,
-                    "business_purpose": _TARGET_AUTHORIZATION_PURPOSE,
-                    "target_assertion": expected_assertion,
-                    "acceptance_conditions": list(
-                        _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS
-                    ),
-                    "required_authorization": requirement,
-                    "expires_at": None,
-                }
-                consumed_root_waiter = (
-                    None
-                    if expected_assertion != root_assertion
-                    else _bundle_root_human_waiter_consumption(
-                        human_request_projection,
-                        request_ref=cast(str, human_request_ref),
-                        waiter_ref=expected_waiter_ref,
-                        generation=expected_waiter_generation,
-                        target_assertion=expected_assertion,
-                        authorization_receipt_ref=cast(
-                            str, human_authorization_receipt_ref
-                        ),
-                        quest_ref=verification.quest_ref,
-                        runtime_binding_hash=bundle_run.runtime_binding_hash,
+                or validation.request_ref != human_request_ref
+                or validation.waiter_ref != expected_waiter_ref
+                or int(validation.generation)
+                != expected_waiter_generation
+                or validation.target_assertion_hash
+                != canonical_hash(expected_assertion)
+                or validation.authorization_receipt_ref
+                != human_authorization_receipt_ref
+                or validation_blockers != []
+                or canonical_json(validation_blockers)
+                != validation.other_blockers_json
+                or validation.other_blockers_hash != canonical_hash([])
+                or validation.status != "released"
+                or validation.reason_code is not None
+                or (
+                    selected_uses_coordination
+                    and (
+                        selected_item.get("dispatch_allowed") is not True
+                        or selected_item.get("human_request_ref")
+                        != human_request_ref
+                        or selected_item.get("human_request_status")
+                        != "satisfied"
                     )
                 )
-                consumed_root_waiter_current = bool(
-                    waiter.status == "consumed"
-                    and consumed_root_waiter is not None
-                    and consumption is not None
-                    and consumption.consumption_ref
-                    == consumed_root_waiter["consumption_ref"]
-                    and consumption.request_ref
-                    == consumed_root_waiter["request_ref"]
-                    and consumption.waiter_ref
-                    == consumed_root_waiter["waiter_ref"]
-                    and int(consumption.generation)
-                    == consumed_root_waiter["generation"]
-                    and consumption.validation_ref
-                    == consumed_root_waiter["validation_ref"]
-                    and consumption.work_ref == consumed_root_waiter["work_ref"]
-                    and consumption.work_hash == consumed_root_waiter["work_hash"]
-                    and consumption.receipt_ref
-                    == cast(dict[str, object], consumed_root_waiter["receipt"])[
-                        "receipt_ref"
-                    ]
-                    and consumption.receipt_hash
-                    == cast(dict[str, object], consumed_root_waiter["receipt"])[
-                        "payload_hash"
-                    ]
+            ):
+                raise OwnerConflict("target_launch_authorization_invalid")
+            authorization_verifier = self._authorization_verifier
+            if authorization_verifier is None:
+                raise OwnerConflict(
+                    "human_collaboration_verifier_unavailable"
                 )
-                consume_human_waiter_on_launch = waiter.status == "released"
-                if (
-                    human_request.kind != "capability_authorization"
-                    or human_request.quest_ref != verification.quest_ref
-                    or human_request.status != "satisfied"
-                    or not bool(human_request.is_current)
-                    or human_request.obligation != _TARGET_AUTHORIZATION_OBLIGATION
-                    or human_request.business_purpose
-                    != _TARGET_AUTHORIZATION_PURPOSE
-                    or human_request.expires_at is not None
-                    or canonical_json(stored_assertion)
-                    != human_request.target_assertion_json
-                    or human_request.target_assertion_hash
-                    != canonical_hash(expected_assertion)
-                    or stored_conditions
-                    != list(_TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS)
-                    or canonical_json(stored_conditions)
-                    != human_request.acceptance_conditions_json
-                    or human_request.acceptance_conditions_hash
-                    != canonical_hash(stored_conditions)
-                    or stored_requirement != requirement
-                    or canonical_json(stored_requirement)
-                    != human_request.required_authorization_json
-                    or human_request.required_authorization_hash
-                    != canonical_hash(requirement)
-                    or human_request.identity_hash
-                    != canonical_hash(expected_contract)
-                    or human_waiter_ref != expected_waiter_ref
-                    or cast(int, human_waiter_generation)
-                    != expected_waiter_generation
-                    or waiter.request_ref != human_request_ref
-                    or waiter.waiter_ref != expected_waiter_ref
-                    or int(waiter.generation)
-                    != expected_waiter_generation
-                    or waiter_assertion != expected_assertion
-                    or canonical_json(waiter_assertion)
-                    != waiter.target_assertion_json
-                    or waiter.target_assertion_hash
-                    != canonical_hash(expected_assertion)
-                    or waiter.wait_scope != "local"
-                    or waiter_blockers != []
-                    or canonical_json(waiter_blockers)
-                    != waiter.other_blockers_json
-                    or waiter.other_blockers_hash != canonical_hash([])
-                    or not (
-                        consume_human_waiter_on_launch
-                        or consumed_root_waiter_current
-                    )
-                    or validation.request_ref != human_request_ref
-                    or validation.waiter_ref != expected_waiter_ref
-                    or int(validation.generation)
-                    != expected_waiter_generation
-                    or validation.target_assertion_hash
-                    != canonical_hash(expected_assertion)
-                    or validation.authorization_receipt_ref
-                    != human_authorization_receipt_ref
-                    or validation_blockers != []
-                    or canonical_json(validation_blockers)
-                    != validation.other_blockers_json
-                    or validation.other_blockers_hash != canonical_hash([])
-                    or validation.status != "released"
-                    or validation.reason_code is not None
-                    or (
-                        selected_uses_coordination
-                        and (
-                            selected_item.get("dispatch_allowed") is not True
-                            or selected_item.get("human_request_ref")
-                            != human_request_ref
-                            or selected_item.get("human_request_status")
-                            != "satisfied"
-                        )
-                    )
-                ):
-                    raise OwnerConflict("target_launch_authorization_invalid")
-                authorization_verifier = self._authorization_verifier
-                if authorization_verifier is None:
-                    raise OwnerConflict(
-                        "human_collaboration_verifier_unavailable"
-                    )
-                authorization_verifier.verify_capability_authorization(
-                    requirement=requirement,
-                    receipt_ref=cast(str, human_authorization_receipt_ref),
-                )
+            authorization_verifier.verify_capability_authorization(
+                requirement=requirement,
+                receipt_ref=cast(str, human_authorization_receipt_ref),
+            )
 
-            # Close the cross-Owner TOCTOU window immediately before AR's
-            # first launch write.  Both issuer reads must resolve the exact
-            # same formal candidate projection and current graph authority.
+        if scope is None:
+            verifier = self._target_graph_verifier
+            if verifier is None:
+                raise OwnerConflict("target_graph_verifier_unavailable")
             if verifier.verify_target_launch_request(request) != verification:
                 raise OwnerConflict("target_launch_authority_stale")
-            target_run_ref = new_ref("target_run")
-            operation_ref = new_ref("target_launch_operation")
-            ack = TargetLaunchAck(
-                target_ref=request.target_ref,
-                operation_ref=operation_ref,
-            )
-            try:
-                validate_target_launch_ack(ack, request)
-            except BundleProtocolError as error:
-                raise OwnerConflict("target_launch_ack_invalid") from error
-            accepted_input_target_commit_refs_json = canonical_json(
+        target_run_ref = new_ref("target_run")
+        operation_ref = new_ref("target_launch_operation")
+        ack = TargetLaunchAck(
+            target_ref=request.target_ref,
+            operation_ref=operation_ref,
+        )
+        try:
+            validate_target_launch_ack(ack, request)
+        except BundleProtocolError as error:
+            raise OwnerConflict("target_launch_ack_invalid") from error
+        accepted_input_target_commit_refs_json = canonical_json(
+            list(request.accepted_input_target_commit_refs)
+        )
+        accepted_input_asset_refs_json = canonical_json(
+            list(request.accepted_input_asset_refs)
+        )
+        asset_proofs_value = projection_plain_value(verification.asset_proofs)
+        accepted_input_asset_proofs_json = canonical_json(asset_proofs_value)
+        launch_bindings = {
+            "operation_ref": operation_ref,
+            "target_ref": request.target_ref,
+            "graph_ref": verification.graph_ref,
+            "stage_request_ref": verification.stage_request_ref,
+            "quest_ref": verification.quest_ref,
+            "target_spec_content_hash_ref": (
+                request.target_spec_binding.content_hash_ref
+            ),
+            "target_spec_receipt_ref": (
+                request.target_spec_acceptance_receipt.receipt_ref
+            ),
+            "accepted_input_target_commit_refs_hash": canonical_hash(
                 list(request.accepted_input_target_commit_refs)
-            )
-            accepted_input_asset_refs_json = canonical_json(
+            ),
+            "accepted_input_asset_refs_hash": canonical_hash(
                 list(request.accepted_input_asset_refs)
+            ),
+            "accepted_input_asset_proofs_hash": canonical_hash(
+                asset_proofs_value
+            ),
+            "recoverable_required": True,
+            "target_run_ref": target_run_ref,
+            "status": "admitted",
+            "dispatch_decision_ref": dispatch.decision_ref,
+            "dispatch_receipt_ref": dispatch.receipt.receipt_ref,
+            "dispatch_receipt_hash": dispatch.receipt.payload_hash,
+            "human_request_ref": human_request_ref,
+            "human_waiter_ref": human_waiter_ref,
+            "human_waiter_generation": human_waiter_generation,
+            "human_authorization_receipt_ref": (
+                human_authorization_receipt_ref
+            ),
+        }
+        receipt_ref = new_ref("target_launch_admission_receipt")
+        receipt_hash = _owner_receipt_hash(
+            TARGET_LAUNCH_ADMISSION_RECEIPT_KIND,
+            launch_ref,
+            launch_bindings,
+        )
+        now = time.time()
+        connection.execute(
+            text(
+                "INSERT INTO ar_target_launches (launch_ref, operation_ref, "
+                "target_ref, graph_ref, stage_request_ref, quest_ref, "
+                "target_spec_content_hash_ref, target_spec_receipt_ref, "
+                "target_spec_receipt_subject_ref, "
+                "accepted_input_target_commit_refs_json, "
+                "accepted_input_target_commit_refs_hash, "
+                "accepted_input_asset_refs_json, "
+                "accepted_input_asset_refs_hash, "
+                "accepted_input_asset_proofs_json, "
+                "accepted_input_asset_proofs_hash, recoverable_required, "
+                "target_run_ref, status, root_session_ref, "
+                "execution_attempt_ref, execution_fence_ref, "
+                "execution_input_binding_ref, "
+                "execution_input_binding_receipt_ref, "
+                "execution_input_binding_receipt_hash, current_handle_json, "
+                "current_handle_hash, dispatch_decision_ref, "
+                "dispatch_receipt_ref, dispatch_receipt_hash, "
+                "human_request_ref, human_waiter_ref, "
+                "human_waiter_generation, human_authorization_receipt_ref, "
+                "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                "admitted_at) VALUES (:launch_ref, :operation_ref, "
+                ":target_ref, :graph_ref, :stage_request_ref, :quest_ref, "
+                ":target_spec_content_hash_ref, :target_spec_receipt_ref, "
+                ":target_spec_receipt_subject_ref, "
+                ":accepted_input_target_commit_refs_json, "
+                ":accepted_input_target_commit_refs_hash, "
+                ":accepted_input_asset_refs_json, "
+                ":accepted_input_asset_refs_hash, "
+                ":accepted_input_asset_proofs_json, "
+                ":accepted_input_asset_proofs_hash, :recoverable_required, "
+                ":target_run_ref, :status, NULL, NULL, NULL, NULL, NULL, "
+                "NULL, NULL, NULL, "
+                ":dispatch_decision_ref, :dispatch_receipt_ref, "
+                ":dispatch_receipt_hash, :human_request_ref, "
+                ":human_waiter_ref, :human_waiter_generation, "
+                ":human_authorization_receipt_ref, :idempotency_key, "
+                ":request_hash, :receipt_ref, :receipt_hash, :admitted_at)"
+            ),
+            {
+                **launch_bindings,
+                "launch_ref": launch_ref,
+                "target_spec_receipt_subject_ref": (
+                    request.target_spec_acceptance_receipt.subject_ref
+                ),
+                "accepted_input_target_commit_refs_json": (
+                    accepted_input_target_commit_refs_json
+                ),
+                "accepted_input_asset_refs_json": (
+                    accepted_input_asset_refs_json
+                ),
+                "accepted_input_asset_proofs_json": (
+                    accepted_input_asset_proofs_json
+                ),
+                "idempotency_key": idempotency_key,
+                "request_hash": request_hash,
+                "receipt_ref": receipt_ref,
+                "receipt_hash": receipt_hash,
+                "admitted_at": now,
+            },
+        )
+        if has_human_authorization and consume_human_waiter_on_launch:
+            self._consume_human_request_waiter(
+                connection,
+                request_ref=cast(str, human_request_ref),
+                waiter_ref=cast(str, human_waiter_ref),
+                generation=cast(int, human_waiter_generation),
+                work_ref=launch_ref,
+                work_hash=request_hash,
             )
-            asset_proofs_value = projection_plain_value(verification.asset_proofs)
-            accepted_input_asset_proofs_json = canonical_json(asset_proofs_value)
-            launch_bindings = {
+        connection.execute(
+            text(
+                "UPDATE agent_runtime_state SET revision = revision + 1 "
+                "WHERE singleton = 'owner'"
+            )
+        )
+        self._feed.record(
+            connection,
+            "agent_runtime.target_launch_admitted",
+            {
+                "launch_ref": launch_ref,
                 "operation_ref": operation_ref,
                 "target_ref": request.target_ref,
-                "graph_ref": verification.graph_ref,
-                "stage_request_ref": verification.stage_request_ref,
-                "quest_ref": verification.quest_ref,
-                "target_spec_content_hash_ref": (
-                    request.target_spec_binding.content_hash_ref
-                ),
-                "target_spec_receipt_ref": (
-                    request.target_spec_acceptance_receipt.receipt_ref
-                ),
-                "accepted_input_target_commit_refs_hash": canonical_hash(
-                    list(request.accepted_input_target_commit_refs)
-                ),
-                "accepted_input_asset_refs_hash": canonical_hash(
-                    list(request.accepted_input_asset_refs)
-                ),
-                "accepted_input_asset_proofs_hash": canonical_hash(
-                    asset_proofs_value
-                ),
-                "recoverable_required": True,
-                "target_run_ref": target_run_ref,
-                "status": "admitted",
                 "dispatch_decision_ref": dispatch.decision_ref,
-                "dispatch_receipt_ref": dispatch.receipt.receipt_ref,
-                "dispatch_receipt_hash": dispatch.receipt.payload_hash,
-                "human_request_ref": human_request_ref,
-                "human_waiter_ref": human_waiter_ref,
-                "human_waiter_generation": human_waiter_generation,
-                "human_authorization_receipt_ref": (
-                    human_authorization_receipt_ref
-                ),
-            }
-            receipt_ref = new_ref("target_launch_admission_receipt")
-            receipt_hash = _owner_receipt_hash(
-                TARGET_LAUNCH_ADMISSION_RECEIPT_KIND,
-                launch_ref,
-                launch_bindings,
-            )
-            now = time.time()
-            connection.execute(
-                text(
-                    "INSERT INTO ar_target_launches (launch_ref, operation_ref, "
-                    "target_ref, graph_ref, stage_request_ref, quest_ref, "
-                    "target_spec_content_hash_ref, target_spec_receipt_ref, "
-                    "target_spec_receipt_subject_ref, "
-                    "accepted_input_target_commit_refs_json, "
-                    "accepted_input_target_commit_refs_hash, "
-                    "accepted_input_asset_refs_json, "
-                    "accepted_input_asset_refs_hash, "
-                    "accepted_input_asset_proofs_json, "
-                    "accepted_input_asset_proofs_hash, recoverable_required, "
-                    "target_run_ref, status, root_session_ref, "
-                    "execution_attempt_ref, execution_fence_ref, "
-                    "execution_input_binding_ref, "
-                    "execution_input_binding_receipt_ref, "
-                    "execution_input_binding_receipt_hash, current_handle_json, "
-                    "current_handle_hash, dispatch_decision_ref, "
-                    "dispatch_receipt_ref, dispatch_receipt_hash, "
-                    "human_request_ref, human_waiter_ref, "
-                    "human_waiter_generation, human_authorization_receipt_ref, "
-                    "idempotency_key, request_hash, receipt_ref, receipt_hash, "
-                    "admitted_at) VALUES (:launch_ref, :operation_ref, "
-                    ":target_ref, :graph_ref, :stage_request_ref, :quest_ref, "
-                    ":target_spec_content_hash_ref, :target_spec_receipt_ref, "
-                    ":target_spec_receipt_subject_ref, "
-                    ":accepted_input_target_commit_refs_json, "
-                    ":accepted_input_target_commit_refs_hash, "
-                    ":accepted_input_asset_refs_json, "
-                    ":accepted_input_asset_refs_hash, "
-                    ":accepted_input_asset_proofs_json, "
-                    ":accepted_input_asset_proofs_hash, :recoverable_required, "
-                    ":target_run_ref, :status, NULL, NULL, NULL, NULL, NULL, "
-                    "NULL, NULL, NULL, "
-                    ":dispatch_decision_ref, :dispatch_receipt_ref, "
-                    ":dispatch_receipt_hash, :human_request_ref, "
-                    ":human_waiter_ref, :human_waiter_generation, "
-                    ":human_authorization_receipt_ref, :idempotency_key, "
-                    ":request_hash, :receipt_ref, :receipt_hash, :admitted_at)"
-                ),
-                {
-                    **launch_bindings,
-                    "launch_ref": launch_ref,
-                    "target_spec_receipt_subject_ref": (
-                        request.target_spec_acceptance_receipt.subject_ref
-                    ),
-                    "accepted_input_target_commit_refs_json": (
-                        accepted_input_target_commit_refs_json
-                    ),
-                    "accepted_input_asset_refs_json": (
-                        accepted_input_asset_refs_json
-                    ),
-                    "accepted_input_asset_proofs_json": (
-                        accepted_input_asset_proofs_json
-                    ),
-                    "idempotency_key": idempotency_key,
-                    "request_hash": request_hash,
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "admitted_at": now,
-                },
-            )
-            if has_human_authorization and consume_human_waiter_on_launch:
-                self._consume_human_request_waiter(
-                    connection,
-                    request_ref=cast(str, human_request_ref),
-                    waiter_ref=cast(str, human_waiter_ref),
-                    generation=cast(int, human_waiter_generation),
-                    work_ref=launch_ref,
-                    work_hash=request_hash,
-                )
-            connection.execute(
-                text(
-                    "UPDATE agent_runtime_state SET revision = revision + 1 "
-                    "WHERE singleton = 'owner'"
-                )
-            )
-            self._feed.record(
-                connection,
-                "agent_runtime.target_launch_admitted",
-                {
-                    "launch_ref": launch_ref,
-                    "operation_ref": operation_ref,
-                    "target_ref": request.target_ref,
-                    "dispatch_decision_ref": dispatch.decision_ref,
-                    "receipt_ref": receipt_ref,
-                },
-            )
-        persisted = self.query_target_launch_ack(request.target_ref)
-        if persisted != ack:
-            raise OwnerConflict("target_launch_missing_after_commit")
-        return persisted
+                "receipt_ref": receipt_ref,
+            },
+        )
+        return ack
 
     def query_target_launch_ack(self, target_ref: str) -> TargetLaunchAck | None:
         """Read the accepted launch, checking its own persisted receipt."""
@@ -2841,6 +2897,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             stage_request_ref=row.stage_request_ref,
             quest_ref=row.quest_ref,
             target_run_ref=row.target_run_ref,
+            dispatch_decision_ref=row.dispatch_decision_ref,
             receipt=AcceptanceReceipt(
                 issuer=AR_OWNER,
                 kind=TARGET_LAUNCH_ADMISSION_RECEIPT_KIND,
@@ -6364,7 +6421,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or dispatch.receipt.receipt_ref != launch.dispatch_receipt_ref
             or dispatch.receipt.payload_hash != launch.dispatch_receipt_hash
             or dispatch.action != "dispatch"
-            or dispatch.selected_target_ref != target_ref
+            or target_ref not in dispatch.selected_target_refs
             or dispatch.graph_ref != launch.graph_ref
             or stage_run.request_ref != launch.stage_request_ref
             or not dispatch_lineage_current
@@ -9427,7 +9484,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "reuse_receipt_invalid": "candidate.route.reuse_receipt: use the verified reuse-eligibility receipt for this candidate; TargetCommit acceptance is a different receipt.",
                     "candidate_measurement_cell_not_required": "candidate.measurement_contract: select a measurement cell present in the frozen NormalizedCompletionContract.",
                     "candidate_held_fixed_binding_incomplete": "candidate.held_fixed: provide the bindings for every declared controlled variable.",
-                    "bundle_dispatch_target_not_in_frontier": "dispatch: select a currently authorized frontier target; use null selected_target_ref for wait/replan_required/revise_strategy; revise_strategy requires an open strategy with every existing Target committed.",
+                    "bundle_dispatch_target_not_in_frontier": "For dispatch, list unique frontier Targets with current authorization and prepared launch inputs in selected_target_refs. Use an empty array for the other actions. revise_strategy requires an open strategy with every existing Target committed.",
                     "bundle_strategy_revision_not_ready": "revise_strategy: wait for actual outstanding work or evidence; only an open strategy with no frontier and every existing Target committed can return to the next target batch.",
                 }.get(code, "Correct the reported contract failure in the retained previous output; preserve accepted facts and current source bindings.")),
             }
@@ -20281,7 +20338,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         frontier: tuple[dict[str, object], ...],
         state: dict[str, object],
         action: str,
-        selected_target_ref: str | None,
+        selected_target_refs: tuple[str, ...],
         rationale: str,
         inbox_checkpoint: BundleInboxCheckpoint,
         idempotency_key: str,
@@ -20294,7 +20351,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or not graph_ref
             or isinstance(generation, bool)
             or generation < 1
-            or len(frontier) > 64
+            or len(frontier) > MAX_BUNDLE_TARGETS
             or not isinstance(state, dict)
             or not isinstance(rationale, str)
             or not rationale.strip()
@@ -20302,25 +20359,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             or any(not isinstance(item, dict) for item in frontier)
         ):
             raise OwnerConflict("bundle_dispatch_decision_invalid")
-        selected = [
-            item for item in frontier if item.get("target_ref") == selected_target_ref
-        ]
-        if (
-            action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
-            or (
-                action == "dispatch"
-                and (
-                    not selected_target_ref
-                    or len(selected) != 1
-                    or selected[0].get("dispatch_allowed", True) is not True
-                )
-            )
-            or (action != "dispatch" and selected_target_ref is not None)
-        ):
-            raise OwnerConflict("bundle_dispatch_target_not_in_frontier")
-        if action == "revise_strategy" and (frontier
-                or state.get("strategy_revision_available") is not True):
-            raise OwnerConflict("bundle_strategy_revision_not_ready")
+        try:
+            validate_dispatch_selection(action, selected_target_refs, frontier, state)
+        except BundleContractError as error:
+            raise OwnerConflict(str(error)) from error
         validate_bundle_inbox_checkpoint(inbox_checkpoint)
         if (
             inbox_checkpoint.run_ref != run_ref
@@ -20332,6 +20374,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         frontier_hash = canonical_hash(list(frontier))
         state_json = canonical_json(state)
         state_hash = canonical_hash(state)
+        selected_refs = list(selected_target_refs)
         command_hash = canonical_hash(
             {
                 "command": "record_bundle_dispatch_decision",
@@ -20344,7 +20387,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "frontier_hash": frontier_hash,
                 "state_hash": state_hash,
                 "action": action,
-                "selected_target_ref": selected_target_ref,
+                "selected_target_refs": selected_refs,
                 "rationale": rationale,
                 "inbox_checkpoint_ref": inbox_checkpoint.checkpoint_ref,
                 "inbox_checkpoint_hash": inbox_checkpoint.checkpoint_hash,
@@ -20463,7 +20506,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 if generation != expected_generation:
                     raise OwnerConflict("bundle_dispatch_generation_stale")
                 decision = {
-                    "schema_ref": "meta-research/bundle-dispatch-decision/v1",
+                    "schema_ref": BUNDLE_DISPATCH_DECISION_SCHEMA_REF,
                     "run_ref": run_ref,
                     "attempt_ref": attempt_ref,
                     "fence_ref": fence_ref,
@@ -20473,7 +20516,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     "frontier_hash": frontier_hash,
                     "state_hash": state_hash,
                     "action": action,
-                    "selected_target_ref": selected_target_ref,
+                    "selected_target_refs": selected_refs,
                     "rationale": rationale,
                 }
                 decision_hash = canonical_hash(decision)
@@ -20493,12 +20536,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "(decision_ref, run_ref, attempt_ref, fence_ref, "
                         "native_session_ref, graph_ref, generation, frontier_json, "
                         "frontier_hash, state_json, state_hash, "
-                        "action, selected_target_ref, rationale, decision_hash, "
+                        "action, selected_target_refs_json, rationale, decision_hash, "
                         "idempotency_key, request_hash, receipt_ref, receipt_hash, "
                         "created_at) VALUES (:decision_ref, :run_ref, "
                         ":attempt_ref, :fence_ref, :native_session_ref, :graph_ref, "
                         ":generation, :frontier_json, :frontier_hash, :state_json, "
-                        ":state_hash, :action, :selected_target_ref, :rationale, "
+                        ":state_hash, :action, :selected_target_refs_json, :rationale, "
                         ":decision_hash, :idempotency_key, :request_hash, "
                         ":receipt_ref, :receipt_hash, :created_at)"
                     ),
@@ -20507,6 +20550,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "decision_ref": decision_ref,
                         "frontier_json": frontier_json,
                         "state_json": state_json,
+                        "selected_target_refs_json": canonical_json(selected_refs),
                         "idempotency_key": idempotency_key,
                         "request_hash": command_hash,
                         "receipt_ref": receipt_ref,
@@ -20540,7 +20584,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "graph_ref": graph_ref,
                         "generation": generation,
                         "action": action,
-                        "selected_target_ref": selected_target_ref,
+                        "selected_target_refs": selected_refs,
                         "receipt_ref": receipt_ref,
                     },
                 )
@@ -25377,15 +25421,23 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
     try:
         frontier_value = json.loads(row.frontier_json)
         state = decoded_object(row.state_json)
+        selected_refs = json.loads(row.selected_target_refs_json)
     except (json.JSONDecodeError, TypeError, ValueError) as error:
         raise OwnerConflict("bundle_dispatch_decision_invalid") from error
-    if not isinstance(frontier_value, list) or any(
-        not isinstance(item, dict) for item in frontier_value
+    if (
+        not isinstance(frontier_value, list)
+        or any(not isinstance(item, dict) for item in frontier_value)
+        or not isinstance(selected_refs, list)
     ):
         raise OwnerConflict("bundle_dispatch_decision_invalid")
     frontier = tuple(cast(dict[str, object], item) for item in frontier_value)
+    selected_target_refs = tuple(selected_refs)
+    try:
+        validate_dispatch_selection(row.action, selected_target_refs, frontier, state)
+    except BundleContractError as error:
+        raise OwnerConflict("bundle_dispatch_decision_invalid") from error
     decision = {
-        "schema_ref": "meta-research/bundle-dispatch-decision/v1",
+        "schema_ref": BUNDLE_DISPATCH_DECISION_SCHEMA_REF,
         "run_ref": row.run_ref,
         "attempt_ref": row.attempt_ref,
         "fence_ref": row.fence_ref,
@@ -25395,7 +25447,7 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
         "frontier_hash": row.frontier_hash,
         "state_hash": row.state_hash,
         "action": row.action,
-        "selected_target_ref": row.selected_target_ref,
+        "selected_target_refs": selected_refs,
         "rationale": row.rationale,
     }
     bindings = {**decision, "decision_hash": row.decision_hash}
@@ -25404,30 +25456,8 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
         or canonical_hash(list(frontier)) != row.frontier_hash
         or canonical_json(state) != row.state_json
         or canonical_hash(state) != row.state_hash
+        or canonical_json(selected_refs) != row.selected_target_refs_json
         or canonical_hash(decision) != row.decision_hash
-        or row.action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
-        or (row.action == "revise_strategy" and (frontier
-            or state.get("strategy_revision_available") is not True))
-        or (
-            row.action == "dispatch"
-            and (
-                sum(
-                    item.get("target_ref") == row.selected_target_ref
-                    for item in frontier
-                )
-                != 1
-                or next(
-                    item
-                    for item in frontier
-                    if item.get("target_ref") == row.selected_target_ref
-                ).get("dispatch_allowed", True)
-                is not True
-            )
-        )
-        or (
-            row.action != "dispatch"
-            and row.selected_target_ref is not None
-        )
         or row.receipt_hash
         != _owner_receipt_hash(BUNDLE_DISPATCH_RECEIPT_KIND, row.decision_ref, bindings)
     ):
@@ -25443,7 +25473,7 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
         frontier=frontier,
         state=state,
         action=row.action,
-        selected_target_ref=row.selected_target_ref,
+        selected_target_refs=selected_target_refs,
         rationale=row.rationale,
         created_at=float(row.created_at),
         decision_hash=row.decision_hash,

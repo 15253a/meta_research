@@ -18,7 +18,7 @@ def sealed_external_bundle(tmp_path, request):
     adapter, runner = _adapter(tmp_path, _output(kind), durable=True)
     adapter.bind_external_mcp(external)
     original_request = _request(adapter, kind)
-    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke = adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch
     result = invoke(original_request)
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
     snapshot, = (tmp_path / "settings/external-mcp/operations").glob("*.json")

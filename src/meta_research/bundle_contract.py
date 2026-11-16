@@ -26,6 +26,7 @@ TARGET_PLAN_REVIEW_SCHEMA_REF = "meta-research/target-plan-review/v1"
 TARGET_GRAPH_APPEND_PROPOSAL_SCHEMA_REF = (
     "meta-research/target-graph-append-proposal/v2"
 )
+BUNDLE_DISPATCH_DECISION_SCHEMA_REF = "meta-research/bundle-dispatch-decision/v2"
 MAX_BUNDLE_TARGETS = 64
 MAX_BUNDLE_TARGET_PLAN_BYTES = BUNDLE_ROOT_MAX_SERIALIZED_BYTES
 
@@ -43,6 +44,38 @@ class BundleContractError(ValueError):
         super().__init__(code)
         if code != diagnostic:
             self.add_note(diagnostic)
+
+
+def validate_dispatch_selection(
+    action: str,
+    refs: tuple[str, ...],
+    frontier: tuple[dict[str, object], ...],
+    state: dict[str, object],
+) -> None:
+    if (
+        not isinstance(action, str)
+        or action not in {"dispatch", "wait", "replan_required", "revise_strategy"}
+        or not isinstance(refs, tuple)
+        or len(refs) > MAX_BUNDLE_TARGETS
+        or any(not isinstance(ref, str) or not ref for ref in refs)
+        or len(set(refs)) != len(refs)
+        or bool(refs) != (action == "dispatch")
+    ):
+        raise BundleContractError("bundle_dispatch_target_not_in_frontier")
+    errors = state.get("launch_input_errors")
+    for ref in refs:
+        matches = [item for item in frontier if item.get("target_ref") == ref]
+        if len(matches) != 1 or matches[0].get("dispatch_allowed", True) is not True:
+            raise BundleContractError("bundle_dispatch_target_not_in_frontier")
+        if isinstance(errors, dict) and ref in errors:
+            diagnostic = errors[ref]
+            raise BundleContractError(
+                diagnostic if isinstance(diagnostic, str) else "bundle_dispatch_target_not_in_frontier"
+            )
+    if action == "revise_strategy" and (
+        frontier or state.get("strategy_revision_available") is not True
+    ):
+        raise BundleContractError("bundle_strategy_revision_not_ready")
 
 
 def target_execution_assertion(

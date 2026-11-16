@@ -810,7 +810,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
             {"target_plan": target_plan},
             {
                 "action": "dispatch",
-                "selected_target_ref": "target:accepted-structure",
+                "selected_target_refs": ["target:accepted-structure"],
                 "rationale": "This frontier item closes the frozen gap.",
             },
             {
@@ -925,7 +925,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
         runtime_binding=binding,
         inbox_checkpoint=request.inbox_checkpoint,
     )
-    dispatch = adapter.schedule_target(dispatch_request)
+    dispatch = adapter.schedule_targets(dispatch_request)
     batch_request = BundleTargetBatchRequest(
         cycle_ref="cycle:bundle-1",
         cycle_position={"cycle_ref": "cycle:bundle-1", "round": 1, "cycle_focus": "Audit frozen scientific inputs", "focus_source": {"request_ref": "fixture-start"}},
@@ -1072,18 +1072,14 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     assert "execution" not in target_schema["properties"]
     assert "semantic_inputs" not in target_schema["properties"]
     assert "Metric definitions 保持顺序" in contract
-    assert dispatch.selected_target_ref == "target:accepted-structure"
+    assert dispatch.selected_target_refs == ("target:accepted-structure",)
     assert dispatch.native_session_ref == result.primary_session_ref
     assert dispatch_argv[-3:] == ["resume", "codex-bundle-primary:1", "-"]
     assert f"inbox_checkpoint={serialized_checkpoint}" in dispatch_prompt
     assert "durable frontier" in dispatch_prompt
-    selected_target_schema = dispatch_schema["properties"][
-        "selected_target_ref"
-    ]["anyOf"]
-    assert selected_target_schema == [
-        {"type": "string", "minLength": 1},
-        {"type": "null"},
-    ]
+    selected_target_schema = dispatch_schema["properties"]["selected_target_refs"]
+    assert selected_target_schema["type"] == "array"
+    assert selected_target_schema["items"] == {"type": "string", "minLength": 1}
     assert batch.strategy_update["strategy_complete"] is True
     assert len(batch.strategy_update["candidates"]) == 1
     assert batch.native_session_ref == result.primary_session_ref
@@ -1117,7 +1113,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     with pytest.raises(
         BundleContractError, match="bundle_inbox_checkpoint_invalid"
     ):
-        adapter.schedule_target(
+        adapter.schedule_targets(
             replace(dispatch_request, inbox_checkpoint=forged_checkpoint)
         )
     with pytest.raises(

@@ -47,7 +47,7 @@ def _ready_launch(runtime):
         if decisions:
             graph = runtime.owners.research_graph.query_target_graph(run.request_ref)
             assert graph is not None
-            selected = decisions[-1].selected_target_ref
+            selected, = decisions[-1].selected_target_refs
             target = next(
                 target for target in graph.targets if target.target_ref == selected
             )
@@ -77,6 +77,18 @@ def _side_effect_counts(runtime) -> dict[str, int]:
                 "rm_asset_versions",
             )
         }
+
+
+def _launch_authority(runtime, target_ref):
+    with runtime._database.read() as connection:
+        return connection.execute(
+            text(
+                "SELECT dispatch_decision_ref, human_request_ref, human_waiter_ref, "
+                "human_waiter_generation, human_authorization_receipt_ref "
+                "FROM ar_target_launches WHERE target_ref = :target"
+            ),
+            {"target": target_ref},
+        ).one()
 
 
 def test_target_launch_admission_precedes_target_execution_side_effects(
@@ -194,33 +206,9 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
     try:
         _graph, target, _run, dispatch, expected_request = _ready_launch(runtime)
         before = _side_effect_counts(runtime)
-        launch_calls: list[tuple[object, dict[str, object]]] = []
-        request_reads: list[str] = []
-        target_runtime_calls: list[str] = []
-        original_admit = runtime.owners.agent_runtime.admit_target_launch
-        original_request = runtime.owners.research_graph.query_target_launch_request
-
-        def observe_request(target_ref: str):
-            request_reads.append(target_ref)
-            return original_request(target_ref)
-
-        def observe_admit(request, **kwargs):
-            launch_calls.append((request, kwargs))
-            return original_admit(request, **kwargs)
-
         def forbidden_execution(*_args, **_kwargs):
             raise AssertionError("launch-first worker entered Target execution")
 
-        monkeypatch.setattr(
-            runtime.owners.research_graph,
-            "query_target_launch_request",
-            observe_request,
-        )
-        monkeypatch.setattr(
-            runtime.owners.agent_runtime,
-            "admit_target_launch",
-            observe_admit,
-        )
         monkeypatch.setattr(
             runtime.harnesses,
             "admit_target_run",
@@ -233,17 +221,12 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
         )
 
         assert runtime.bundle_stage.process_once() is True
-        assert not hasattr(runtime.bundle_stage, "_target_run_runtime")
-        assert target_runtime_calls == []
-        assert request_reads == [target.target_ref]
-        assert len(launch_calls) == 1
-        launched_request, launch_kwargs = launch_calls[0]
-        assert launched_request == expected_request
-        assert launch_kwargs["dispatch_decision_ref"] == dispatch.decision_ref
-        assert launch_kwargs["human_request_ref"] is None
-        assert launch_kwargs["human_waiter_ref"] is None
-        assert launch_kwargs["human_waiter_generation"] is None
-        assert launch_kwargs["human_authorization_receipt_ref"] is None
+        launch = runtime.owners.agent_runtime.query_admitted_target_launch(target.target_ref)
+        assert launch is not None
+        assert launch.request == expected_request
+        assert _launch_authority(runtime, target.target_ref) == (
+            dispatch.decision_ref, None, None, None, None,
+        )
         assert runtime.bundle_stage.observation.code == "target_launch_admitted"
 
         admitted = _side_effect_counts(runtime)
@@ -263,9 +246,6 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
                 break
         else:
             raise AssertionError("Bundle did not yield the admitted Target")
-        assert target_runtime_calls == []
-        assert request_reads == [target.target_ref]
-        assert len(launch_calls) == 1
         assert _side_effect_counts(runtime) == admitted
         assert (
             runtime.owners.agent_runtime.query_target_launch_ack(target.target_ref)
@@ -296,7 +276,6 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
                 break
         else:
             raise AssertionError("Bundle did not yield the running Target to daemon")
-        assert target_runtime_calls == []
     finally:
         runtime.close()
 
@@ -380,7 +359,7 @@ def test_target_launch_requires_the_latest_dispatch_decision(tmp_path: Path) -> 
             frontier=first.frontier,
             state=first.state,
             action="dispatch",
-            selected_target_ref=target.target_ref,
+            selected_target_refs=(target.target_ref,),
             rationale="Reconfirm the unchanged exact frontier before launch.",
             inbox_checkpoint=inbox_checkpoint,
             idempotency_key="target-launch-current-dispatch-second",
@@ -405,7 +384,6 @@ def test_target_launch_requires_the_latest_dispatch_decision(tmp_path: Path) -> 
 
 def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _RequestScopedHighRiskBundleSkill()
     runtime = _bundle_runtime(
@@ -470,33 +448,16 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
             )
         assert _side_effect_counts(runtime) == before
 
-        launch_calls: list[tuple[object, dict[str, object]]] = []
-        original_admit = runtime.owners.agent_runtime.admit_target_launch
-
-        def observe_admit(launch_request, **kwargs):
-            launch_calls.append((launch_request, kwargs))
-            return original_admit(launch_request, **kwargs)
-
-        monkeypatch.setattr(
-            runtime.owners.agent_runtime,
-            "admit_target_launch",
-            observe_admit,
-        )
         assert runtime.bundle_stage.process_once() is True
-        assert not hasattr(runtime.bundle_stage, "_target_run_runtime")
-        assert len(launch_calls) == 1
-        launched_request, launch_kwargs = launch_calls[0]
-        assert launched_request == request
-        assert (
-            launch_kwargs["dispatch_decision_ref"]
-            == decisions[-1].decision_ref
-        )
-        assert launch_kwargs["human_request_ref"] == human_request["request_ref"]
-        assert launch_kwargs["human_waiter_ref"] == f"root_run:{run.run_ref}"
-        assert launch_kwargs["human_waiter_generation"] == run.attempt_generation
-        assert (
-            launch_kwargs["human_authorization_receipt_ref"]
-            == authorization["receipt_ref"]
+        launch = runtime.owners.agent_runtime.query_admitted_target_launch(target.target_ref)
+        assert launch is not None
+        assert launch.request == request
+        assert _launch_authority(runtime, target.target_ref) == (
+            decisions[-1].decision_ref,
+            human_request["request_ref"],
+            f"root_run:{run.run_ref}",
+            run.attempt_generation,
+            authorization["receipt_ref"],
         )
         ack = runtime.owners.agent_runtime.query_target_launch_ack(target.target_ref)
         assert ack is not None
@@ -516,7 +477,6 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
                 break
         else:
             raise AssertionError("Bundle did not yield the admitted Target")
-        assert len(launch_calls) == 1
         assert _side_effect_counts(runtime) == admitted
         assert runtime.bundle_stage.observation.code == "target_launch_pending"
     finally:

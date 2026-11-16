@@ -75,6 +75,7 @@ from meta_research.owners.agent_runtime import (
     BundleInboxCheckpoint,
     BundleRuntimeBinding,
     BundleStageRun,
+    TargetLaunchAuthorization,
 )
 from meta_research.owners.common import (
     AcceptedFormalPlanBinding,
@@ -148,14 +149,6 @@ class _EligibleBundle:
 
     def accepted_formal_plan(self) -> AcceptedFormalPlanBinding:
         return self.binding
-
-
-@dataclass(frozen=True)
-class _TargetAuthorization:
-    request_ref: str
-    waiter_ref: str
-    generation: int
-    authorization_receipt_ref: str
 
 
 class BundleStageWorker:
@@ -730,7 +723,7 @@ class BundleStageWorker:
                             fence_ref=run.fence_ref, native_session_ref=result.native_session_ref,
                             graph_ref=graph.graph_ref, generation=len(decisions) + 1,
                             frontier=(), state=state, action="replan_required",
-                            selected_target_ref=None, rationale=result.rationale,
+                            selected_target_refs=(), rationale=result.rationale,
                             inbox_checkpoint=inbox_checkpoint,
                             idempotency_key=_operation_key("bundle-batch-replan", run.run_ref,
                                 batch_operation_ref, batch_unit_ref),
@@ -804,7 +797,7 @@ class BundleStageWorker:
             and self._agent_runtime.query_admitted_target_launch(target.target_ref)
             is None
         )
-        authorizations: dict[str, _TargetAuthorization] = {}
+        authorizations: dict[str, TargetLaunchAuthorization] = {}
         for target in frontier:
             if target.spec.get("risk_class") != "high":
                 continue
@@ -869,30 +862,28 @@ class BundleStageWorker:
         root_human_request_needed = any(
             request is None for request in human_requests.values()
         )
-        same_input = latest is not None and (
+        same_authority = latest is not None and (
             latest.attempt_ref == run.attempt_ref
             and latest.fence_ref == run.fence_ref
             and latest.graph_ref == graph.graph_ref
-            and latest.frontier == dispatch_frontier
-            and previous_state == dispatch_state
+            and latest.native_session_ref == run.native_session_ref
             and self._operation_uses_inbox_checkpoint(
                 operation_kind="dispatch",
                 operation_ref=latest.decision_ref,
                 checkpoint=inbox_checkpoint,
             )
-            and (
-                latest.action != "dispatch"
-                or latest.selected_target_ref
-                in {target.target_ref for target in launchable}
-            )
         )
         pending_dispatch = (
             latest
-            if same_input
+            if same_authority
             and latest.action == "dispatch"
-            and latest.selected_target_ref
-            in {target.target_ref for target in launchable}
+            and {target.target_ref for target in frontier}.intersection(latest.selected_target_refs)
             else None
+        )
+        same_input = same_authority and (
+            latest.frontier == dispatch_frontier
+            and previous_state == dispatch_state
+            and (latest.action != "dispatch" or pending_dispatch is not None)
         )
         coordination_needed = bool(frontier) or coordination_after_no_action
         dispatch_generation = (
@@ -981,16 +972,9 @@ class BundleStageWorker:
             try:
                 try:
                     provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
-                    result = provider.schedule_target(dispatch_request)
+                    result = provider.schedule_targets(dispatch_request)
                     validate_bundle_dispatch_result(dispatch_request, result)
                     self._validate_replan_remaining_work(graph, result.action)
-                    if result.action == "dispatch":
-                        selected = cast(str, result.selected_target_ref)
-                        if selected not in {target.target_ref for target in launchable}:
-                            self._observation = BundleObservation("waiting", "target_high_risk_authorization_required")
-                            return False
-                        if selected in input_errors:
-                            raise BundleSkillContractError(input_errors[selected])
                 except BundleSkillUnavailable as error:
                     error = self._recover_stopped_error(error, run.run_ref)
                     if error.code == "codex_operation_reconciliation_pending":
@@ -1045,7 +1029,7 @@ class BundleStageWorker:
                     frontier=dispatch_frontier,
                     state=dispatch_state,
                     action=result.action,
-                    selected_target_ref=result.selected_target_ref,
+                    selected_target_refs=result.selected_target_refs,
                     rationale=result.rationale,
                     inbox_checkpoint=inbox_checkpoint,
                     idempotency_key=_operation_key(
@@ -1075,64 +1059,30 @@ class BundleStageWorker:
             ):
                 self._observation = BundleObservation("ready")
                 return True
-            target = next(
-                target
-                for target in launchable
-                if target.target_ref == pending_dispatch.selected_target_ref
-            )
-            ack = self._agent_runtime.query_target_launch_ack(target.target_ref)
-            admitted_now = False
-            if ack is None:
-                # An already recorded dispatch may predate pre-decision preparation.
-                if self._prepare_launch_inputs(target):
-                    return True
-                launch_request = self._research_graph.query_target_launch_request(
-                    target.target_ref
+            try:
+                admitted_now = self._agent_runtime.settle_bundle_dispatch_launches(
+                    pending_dispatch.decision_ref, authorizations=authorizations,
                 )
-                authorization = authorizations.get(target.target_ref)
-                ack = self._agent_runtime.admit_target_launch(
-                    launch_request,
-                    dispatch_decision_ref=pending_dispatch.decision_ref,
-                    idempotency_key=_operation_key(
-                        "target-launch-admit", target.target_ref
-                    ),
-                    human_request_ref=(
-                        None if authorization is None else authorization.request_ref
-                    ),
-                    human_waiter_ref=(
-                        None if authorization is None else authorization.waiter_ref
-                    ),
-                    human_waiter_generation=(
-                        None if authorization is None else authorization.generation
-                    ),
-                    human_authorization_receipt_ref=(
-                        None
-                        if authorization is None
-                        else authorization.authorization_receipt_ref
-                    ),
-                )
-                admitted_now = True
-            if ack.target_ref != target.target_ref:
-                raise OwnerConflict("target_launch_ack_invalid")
+            except OwnerConflict as error:
+                if error.code not in {
+                    "capability_authorization_receipt_invalid",
+                    "target_launch_authorization_invalid",
+                    "target_launch_frontier_invalid",
+                    "target_candidate_projection_required",
+                    "target_input_asset_unavailable",
+                    "target_input_asset_not_selected",
+                    "target_input_asset_version_not_selected",
+                    "target_input_evidence_not_selected",
+                    "target_input_selection_not_selected",
+                }:
+                    raise
+                self._observation = BundleObservation("waiting", error.code)
+                return False
             if admitted_now:
                 self._observation = BundleObservation("waiting", "target_launch_admitted")
                 return True
-            current_frontier = self._agent_runtime.query_target_frontier_entry(
-                target.target_ref
-            )
-            if current_frontier is not None:
-                # Bundle owns launch and pre-activation only.  Once AR has a
-                # durable TargetRun frontier, the independent Target daemon is
-                # the sole lifecycle driver; Bundle only consumes Inbox and
-                # authoritative frontier/handoff projections.
-                self._observation = BundleObservation("waiting", "target_root_running")
-                return False
-            # Launch is the last Bundle-owned Target mutation.  The light
-            # Target daemon discovers this admitted launch independently and
-            # wakes the one long-lived root Session; Bundle never drives that
-            # Session or interprets its implementation/training progress.
-            self._observation = BundleObservation("waiting", "target_launch_pending")
-            return False
+            self._observation = BundleObservation("ready")
+            return True
         if not frontier and dispatch_state["running_targets"]:
             self._observation = BundleObservation("waiting", "target_root_running"
                 if any(
@@ -1459,7 +1409,7 @@ class BundleStageWorker:
         graph: AcceptedTargetGraph,
         target: AcceptedTarget,
         run: BundleStageRun,
-    ) -> tuple[_TargetAuthorization | None, bool]:
+    ) -> tuple[TargetLaunchAuthorization | None, bool]:
         projection = self._research_graph.query_target_candidate_projection(
             target_ref=target.target_ref
         )
@@ -1596,7 +1546,7 @@ class BundleStageWorker:
             return None, False
         self._observation = BundleObservation("ready")
         return (
-            _TargetAuthorization(
+            TargetLaunchAuthorization(
                 request_ref=cast(str, request["request_ref"]),
                 waiter_ref=cast(str, current_waiter["waiter_ref"]),
                 generation=cast(int, current_waiter["generation"]),
@@ -1948,7 +1898,7 @@ class BundleStageWorker:
         graph: AcceptedTargetGraph,
         target: AcceptedTarget,
         run: BundleStageRun,
-        authorization: _TargetAuthorization | None,
+        authorization: TargetLaunchAuthorization | None,
         human_request: dict[str, object] | None,
     ) -> dict[str, object]:
         value = self._target_projection(target)

@@ -14,7 +14,7 @@ from test_bundle_skill_adapter import _FullConformanceAuthority, _SequenceRunner
 
 @pytest.fixture
 def adapter(tmp_path):
-    runner = _SequenceRunner([{'action':'dispatch','selected_target_ref':'target:followup','rationale':'Continue the accepted frontier.'}])
+    runner = _SequenceRunner([{'action':'dispatch','selected_target_refs':['target:followup'],'rationale':'Continue the accepted frontier.'}])
     adapter = CodexBundleSkillAdapter(tmp_path/'provider', executable=str(_fake_codex(tmp_path/'codex')), process_runner=runner)
     authority = _FullConformanceAuthority()
     adapter.bind_full_conformance_authority(authority)
@@ -57,7 +57,7 @@ def test_unreviewed_drift_is_rejected_before_provider(adapter, field):
         drift = replace(old,**{field:'f'*64 if field.endswith('_hash') else 'unexpected-value'})
     assert not bundle_bindings_compatible(drift,current)
     with pytest.raises(BundleSkillUnavailable,match='bundle_runtime_binding_drift'):
-        provider.schedule_target(request(drift))
+        provider.schedule_targets(request(drift))
     assert runner.calls == []
     assert authority.issued == []
 
@@ -65,8 +65,8 @@ def test_unreviewed_drift_is_rejected_before_provider(adapter, field):
 def test_current_binding_executes_and_preserves_exact_authorization(adapter):
     provider, runner, authority = adapter
     frozen = provider.runtime_binding()
-    result = provider.schedule_target(request(frozen))
-    assert result.selected_target_ref == "target:followup"
+    result = provider.schedule_targets(request(frozen))
+    assert result.selected_target_refs == ("target:followup",)
     assert len(runner.calls) == 1
     assert authority.issued[0]["capability_binding_hash"] == canonical_hash(frozen.as_dict())
     assert bundle_bindings_compatible(frozen, frozen)

@@ -1012,6 +1012,7 @@ class TargetLaunchVerification:
     stage_request_ref: str
     quest_ref: str
     risk_class: str
+    source_spec_hash: str
     asset_proofs: tuple[AcceptedInputAssetProof, ...]
 
 
@@ -5703,17 +5704,20 @@ class SQLiteResearchGraphReceiptVerifier:
         # Reuse immutable source verification only within this read. AR's
         # pre-lock and in-lock checks enter separate cuts and still compare
         # their independently verified results before the first launch write.
-        with self._database.read_snapshot():
-            authoritative, verification = self._formal_target_launch_authority(
-                request.target_ref
-            )
+        authoritative, verification = self.read_target_launch_authority(request.target_ref)
         if request != authoritative:
             raise OwnerConflict("target_launch_authority_stale")
         return verification
 
     def query_target_launch_request(self, target_ref: str) -> TargetLaunchRequest:
-        request, _verification = self._formal_target_launch_authority(target_ref)
+        request, _verification = self.read_target_launch_authority(target_ref)
         return request
+
+    def read_target_launch_authority(
+        self, target_ref: str
+    ) -> tuple[TargetLaunchRequest, TargetLaunchVerification]:
+        with self._database.read_snapshot():
+            return self._formal_target_launch_authority(target_ref)
 
     def _formal_target_launch_authority(
         self, target_ref: str
@@ -5950,6 +5954,7 @@ class SQLiteResearchGraphReceiptVerifier:
             stage_request_ref=graph.request_ref,
             quest_ref=graph.quest_ref,
             risk_class=cast(str, risk_class),
+            source_spec_hash=target.spec_hash,
             asset_proofs=asset_proofs,
         )
 

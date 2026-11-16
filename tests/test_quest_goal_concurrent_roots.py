@@ -31,18 +31,17 @@ def _two_admitted_roots(runtime):
             (
                 item
                 for item in decisions
-                if item.selected_target_ref != first_target.target_ref
+                if any(ref != first_target.target_ref for ref in item.selected_target_refs)
             ),
             None,
         )
         if second_decision is None:
             continue
         graph = runtime.owners.research_graph.query_target_graph(run.request_ref)
-        second_target = next(
-            item
-            for item in graph.targets
-            if item.target_ref == second_decision.selected_target_ref
+        second_ref, = (
+            ref for ref in second_decision.selected_target_refs if ref != first_target.target_ref
         )
+        second_target = next(item for item in graph.targets if item.target_ref == second_ref)
         if runtime.owners.research_graph.query_target_candidate_projection(
             target_ref=second_target.target_ref
         ) is not None:

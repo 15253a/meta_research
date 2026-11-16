@@ -135,7 +135,7 @@ def test_bundle_rolling_dispatch_keeps_methods_and_delivers_current_frontier(tmp
     context_hash = canonical_hash(context)
     runner = _RoleReadingRunner(BundleRunner([
         {"target_plan": _target_plan(plan, context_hash)},
-        {"action": "dispatch", "selected_target_ref": "target:accepted-structure", "rationale": "This frontier item closes the frozen gap."},
+        {"action": "dispatch", "selected_target_refs": ["target:accepted-structure"], "rationale": "This frontier item closes the frozen gap."},
     ]), "bundle_stage")
     adapter = CodexBundleSkillAdapter(tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
     authority = _FullConformanceAuthority()
@@ -151,7 +151,7 @@ def test_bundle_rolling_dispatch_keeps_methods_and_delivers_current_frontier(tmp
         inbox_checkpoint=_inbox_checkpoint(run_ref="bundle-run:1", attempt_ref="bundle-attempt:1", fence_ref="bundle-fence:1"),
     )
     first = adapter.execute(request)
-    dispatch = adapter.schedule_target(BundleDispatchRequest(
+    dispatch = adapter.schedule_targets(BundleDispatchRequest(
         cycle_ref=request.cycle_ref, cycle_position=position, stage_request_ref=request.stage_request_ref,
         run_ref=request.run_ref, attempt_ref=request.attempt_ref, fence_ref=request.fence_ref,
         graph_ref="target-graph:1", generation=1,
@@ -162,7 +162,7 @@ def test_bundle_rolling_dispatch_keeps_methods_and_delivers_current_frontier(tmp
     ))
     assert canonical_json(plan) in runner.calls[0][1]
     assert dispatch.native_session_ref == first.primary_session_ref
-    assert dispatch.selected_target_ref == "target:accepted-structure"
+    assert dispatch.selected_target_refs == ("target:accepted-structure",)
     assert runner.calls[1][0][-3:] == ["resume", first.primary_session_ref, "-"]
     assert "target:accepted-structure" in runner.calls[1][1]
     assert len(authority.issued) == len(authority.revoked) == 2

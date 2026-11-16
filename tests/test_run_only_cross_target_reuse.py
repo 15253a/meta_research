@@ -37,7 +37,7 @@ def test_unassessed_cross_target_reuse_is_queryable_without_duplicating_executio
             generation=previous.generation + 1,
             frontier=tuple(item for item in previous.frontier if item['target_ref'] == second.target_ref),
             state=runtime.bundle_stage._dispatch_state(graph, (), run=run), action='dispatch',
-            selected_target_ref=second.target_ref, rationale='Assess an existing execution in a second independent Target.',
+            selected_target_refs=(second.target_ref,), rationale='Assess an existing execution in a second independent Target.',
             inbox_checkpoint=checkpoint, idempotency_key='cross-target-reuse-dispatch')
         graph_owner.accept_target_candidate_projection(target_ref=second.target_ref,
             idempotency_key='accept-target-root-candidate-projection:second')

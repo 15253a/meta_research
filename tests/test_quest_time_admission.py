@@ -62,9 +62,9 @@ class _ObservedDispatch(_DeterministicBundleSkill):
         self.requests = []
         self.rejections = []
 
-    def schedule_target(self, request):
+    def schedule_targets(self, request):
         self.requests.append(request)
-        return super().schedule_target(request)
+        return super().schedule_targets(request)
 
     def terminal_contract_failure_checkpoint(self, **values):
         self.rejections.append(values)
@@ -100,7 +100,8 @@ def test_budget_deviation_does_not_reject_dispatch_or_force_correction(tmp_path,
             "policy": "advisory",
         }
         assert runtime.bundle_stage.process_once()
-        assert ar.query_target_launch_ack(decisions[0].selected_target_ref) is not None
+        selected, = decisions[0].selected_target_refs
+        assert ar.query_target_launch_ack(selected) is not None
         assert len(provider.requests) == 1
         assert ar.query_bundle_dispatch_decisions(first.run_ref) == decisions
     finally:
@@ -129,17 +130,17 @@ def test_crossing_planning_budget_keeps_recorded_dispatch_and_admits_once(tmp_pa
         ar = runtime.owners.agent_runtime
         original = ar.query_bundle_dispatch_decisions(first.run_ref)
         assert len(original) == 1 and original[0].action == "dispatch"
-        selected = original[0].selected_target_ref
+        selected, = original[0].selected_target_refs
         if boundary == "before-admission":
             now[0] = 1061.0
         else:
-            admit = ar.admit_target_launch
+            settle = ar.settle_bundle_dispatch_launches
 
-            def cross_budget(request, **values):
+            def cross_budget(decision_ref, **values):
                 now[0] = 1061.0
-                return admit(request, **values)
+                return settle(decision_ref, **values)
 
-            monkeypatch.setattr(ar, "admit_target_launch", cross_budget)
+            monkeypatch.setattr(ar, "settle_bundle_dispatch_launches", cross_budget)
         assert runtime.bundle_stage.process_once()
         admitted = ar.query_target_launch_ack(selected)
         assert admitted is not None

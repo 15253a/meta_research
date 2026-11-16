@@ -47,7 +47,7 @@ def test_new_preparation_observes_same_size_replaced_executable(adapter):
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     assert provider.runtime_binding() != frozen
     with pytest.raises(BundleSkillUnavailable, match="bundle_runtime_binding_drift"):
-        provider.schedule_target(request(frozen))
+        provider.schedule_targets(request(frozen))
     assert runner.calls == [] and authority.issued == []
 
 

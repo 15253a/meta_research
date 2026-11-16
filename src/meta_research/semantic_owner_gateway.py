@@ -36,7 +36,6 @@ from meta_research.bundle_protocol import (
     projection_plain_value,
     validate_bundle_inbox_batch,
     validate_closed_bundle_projection,
-    validate_target_launch_ack,
     validate_target_launch_request,
 )
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
@@ -951,7 +950,7 @@ def _bundle_target_operations(
     research_memory: ResearchMemoryInterface,
     agent_runtime: AgentRuntimeInterface,
 ) -> tuple[SemanticOperation, ...]:
-    target_effects = (_target_work_operations(research_graph, agent_runtime),)
+    target_effects = (_target_work_operations(agent_runtime),)
     return (
         SemanticOperation(
             semantic_operation_id="advancement_engine.bundle_stage_run.observe",
@@ -1178,7 +1177,6 @@ def _implementation_content_operations(
 
 
 def _target_work_operations(
-    research_graph: ResearchGraphInterface,
     agent_runtime: AgentRuntimeInterface,
 ) -> tuple[SemanticOperation, SemanticOperation]:
     effect_id = "agent_runtime.target_work.request"
@@ -1188,25 +1186,25 @@ def _target_work_operations(
             semantic_operation_id=effect_id,
             owning_module="agent_runtime",
             description=(
-                "Atomically admit exact RG-authored Target work and return an opaque ack."
+                "Read an opaque ack after Bundle publishes the dispatch's Target launches."
             ),
             input_schema=_target_work_input_schema(),
             output_schema=_target_work_output_schema(),
             access_mode="effect",
             reconciliation_operation_id=reconcile_id,
-            handler=lambda context, arguments: _request_target_work(
-                research_graph, agent_runtime, context, arguments
+            handler=lambda context, arguments: _reconcile_target_work(
+                agent_runtime, context, arguments
             ),
         ),
         SemanticOperation(
             semantic_operation_id=reconcile_id,
             owning_module="agent_runtime",
-            description="Reconcile a Target work admission before replay.",
+            description="Reconcile the exact Target launch bound to this Bundle dispatch.",
             input_schema=_target_work_input_schema(),
             output_schema=_target_work_output_schema(),
             access_mode="reconcile",
             handler=lambda context, arguments: _reconcile_target_work(
-                research_graph, agent_runtime, context, arguments
+                agent_runtime, context, arguments
             ),
         ),
     )
@@ -2861,88 +2859,30 @@ def _read_target_launch_request(
     return {"status": "current", "request": _launch_request_public(request)}
 
 
-def _request_target_work(
-    research_graph: ResearchGraphInterface,
-    agent_runtime: AgentRuntimeInterface,
-    context: SemanticCallContext,
-    arguments: dict[str, object],
-) -> dict[str, object]:
-    _verify_bundle_scope(agent_runtime, context)
-    effect_id, effect_key = _semantic_effect_key(context, arguments)
-    target_ref = str(arguments["target_ref"])
-    _verify_target_dispatch(
-        agent_runtime,
-        context,
-        target_ref=target_ref,
-        decision_ref=str(arguments["dispatch_decision_ref"]),
-    )
-    request = research_graph.query_target_launch_request(target_ref)
-    try:
-        validate_target_launch_request(request)
-        ack = agent_runtime.admit_target_launch(
-            request,
-            dispatch_decision_ref=str(arguments["dispatch_decision_ref"]),
-            idempotency_key=effect_key,
-            **_target_work_human_arguments(arguments),
-        )
-        validate_target_launch_ack(ack, request)
-    except BundleProtocolError as error:
-        raise SemanticMcpError("target_work_request_invalid") from error
-    return {
-        "status": "effect_confirmed",
-        "effect_id": effect_id,
-        "target_ref": ack.target_ref,
-        "operation_ref": ack.operation_ref,
-    }
-
-
 def _reconcile_target_work(
-    research_graph: ResearchGraphInterface,
     agent_runtime: AgentRuntimeInterface,
     context: SemanticCallContext,
     arguments: dict[str, object],
 ) -> dict[str, object]:
     _verify_bundle_scope(agent_runtime, context)
     effect_id, _effect_key = _semantic_effect_key(context, arguments)
-    _target_work_human_arguments(arguments)
     target_ref = str(arguments["target_ref"])
+    decision_ref = str(arguments["dispatch_decision_ref"])
     _verify_target_dispatch(
-        agent_runtime,
-        context,
-        target_ref=target_ref,
-        decision_ref=str(arguments["dispatch_decision_ref"]),
+        agent_runtime, context, target_ref=target_ref, decision_ref=decision_ref,
     )
-    request = research_graph.query_target_launch_request(target_ref)
-    try:
-        validate_target_launch_request(request)
-    except BundleProtocolError as error:
-        raise SemanticMcpError("target_work_request_invalid") from error
-    ack = agent_runtime.query_target_launch_ack(target_ref)
-    if ack is None:
+    launch = agent_runtime.query_admitted_target_launch(target_ref)
+    if launch is None:
         return {"status": "unknown_outcome", "effect_id": effect_id}
-    try:
-        validate_target_launch_ack(ack, request)
-    except BundleProtocolError as error:
-        raise SemanticMcpError("target_work_reconciliation_invalid") from error
+    if launch.dispatch_decision_ref != decision_ref:
+        raise SemanticMcpError("target_work_dispatch_invalid")
+    ack = launch.ack
     return {
         "status": "effect_confirmed",
         "effect_id": effect_id,
         "target_ref": ack.target_ref,
         "operation_ref": ack.operation_ref,
     }
-
-
-def _target_work_human_arguments(arguments: dict[str, object]) -> dict[str, object]:
-    names = (
-        "human_request_ref",
-        "human_waiter_ref",
-        "human_waiter_generation",
-        "human_authorization_receipt_ref",
-    )
-    supplied = tuple(name in arguments for name in names)
-    if any(supplied) and not all(supplied):
-        raise SemanticMcpError("target_work_authorization_invalid")
-    return {name: arguments[name] for name in names if name in arguments}
 
 
 def _verify_target_dispatch(
@@ -2965,7 +2905,7 @@ def _verify_target_dispatch(
         or decision.attempt_ref != context.attempt_ref
         or decision.fence_ref != context.fence_ref
         or decision.action != "dispatch"
-        or decision.selected_target_ref != target_ref
+        or target_ref not in decision.selected_target_refs
     ):
         raise SemanticMcpError("target_work_dispatch_invalid")
 
@@ -3662,10 +3602,6 @@ def _target_work_input_schema() -> dict[str, object]:
             "effect_id": _string(max_length=128),
             "target_ref": _string(),
             "dispatch_decision_ref": _string(),
-            "human_request_ref": _string(),
-            "human_waiter_ref": _string(),
-            "human_waiter_generation": {"type": "integer"},
-            "human_authorization_receipt_ref": _string(),
         },
         required=("effect_id", "target_ref", "dispatch_decision_ref"),
     )

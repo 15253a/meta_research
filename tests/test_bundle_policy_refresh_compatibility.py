@@ -41,8 +41,8 @@ def test_later_policy_edits_resume_existing_run_without_hash_registration(adapte
     worker._provider = provider
     worker._observation = BundleObservation("ready")
     assert worker._runtime_binding_is_current(SimpleNamespace(runtime_binding=frozen))
-    result = provider.schedule_target(request(frozen))
-    assert result.selected_target_ref == "target:followup"
+    result = provider.schedule_targets(request(frozen))
+    assert result.selected_target_refs == ("target:followup",)
     assert len(runner.calls) == 1
     assert authority.issued[0]["capability_binding_hash"] == canonical_hash(original)
     assert frozen.as_dict() == original
@@ -173,7 +173,7 @@ def test_policy_refresh_does_not_accept_code_tools_or_protocol_drift(adapter, pr
     drift = replace(frozen, resource_bindings=resources, instruction_set_hash="f" * 64)
     assert not bundle_bindings_compatible(drift, frozen)
     with pytest.raises(BundleSkillUnavailable, match="bundle_runtime_binding_drift"):
-        provider.schedule_target(request(drift))
+        provider.schedule_targets(request(drift))
     assert runner.calls == []
     assert authority.issued == []
 

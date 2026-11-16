@@ -110,10 +110,17 @@ def test_two_active_target_roots_treat_independently_and_cannot_read_each_others
             current = runtime.bundle_stage.query_current()
             run = runtime.owners.agent_runtime.query_bundle_stage_run(current["stage_run_request"]["request_ref"])
             decisions = runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
-            second_decision = next((item for item in decisions if item.selected_target_ref != first_target.target_ref), None)
+            second_decision = next(
+                (item for item in decisions
+                 if any(ref != first_target.target_ref for ref in item.selected_target_refs)),
+                None,
+            )
             if second_decision is not None:
                 graph = runtime.owners.research_graph.query_target_graph(run.request_ref)
-                second_target = next(item for item in graph.targets if item.target_ref == second_decision.selected_target_ref)
+                second_ref, = (
+                    ref for ref in second_decision.selected_target_refs if ref != first_target.target_ref
+                )
+                second_target = next(item for item in graph.targets if item.target_ref == second_ref)
                 if runtime.owners.research_graph.query_target_candidate_projection(target_ref=second_target.target_ref) is not None:
                     break
         else:

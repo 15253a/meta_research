@@ -81,14 +81,14 @@ def recover_rejected_dispatch(
 ) -> None:
     """Preserve a completed result; superseded inputs require a new Attempt."""
     from meta_research.bundle_skill import (
-        BundleDispatchResult, BundleSkillContractError, _dispatch_schema,
+        BundleSkillContractError, _bundle_dispatch_result_from_output, _dispatch_schema,
         validate_bundle_dispatch_result, _rolling_operation_identity,
     )
     if request.job_ref is None:
         return
     try:
         operation_input, output, session = _completed_operation(
-            adapter, request, operation_name, _dispatch_schema(()),
+            adapter, request, operation_name, _dispatch_schema(),
         )
         if (operation_input.get("kind") != "bundle_dispatch"
                 or operation_input.get("identity") != _rolling_operation_identity(request)):
@@ -108,11 +108,8 @@ def recover_rejected_dispatch(
         raise
     except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as error:
         raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error
-    result = BundleDispatchResult(
-        action=output.get("action"), selected_target_ref=output.get("selected_target_ref"),
-        rationale=output.get("rationale"), native_session_ref=session, adapter_kind="codex_cli",
-    )
     try:
+        result = _bundle_dispatch_result_from_output(output, session)
         validate_bundle_dispatch_result(original, result)
     except BundleSkillContractError as error:
         _correction(adapter, request, operation_name, str(error), session)

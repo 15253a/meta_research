@@ -113,8 +113,9 @@ def committed_targets(tmp_path):
             runtime.bundle_stage.process_once()
             decisions = runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
             dispatch = decisions[-1]
-            if dispatch.selected_target_ref and dispatch.selected_target_ref != target.target_ref:
-                second = next(value for value in graph.targets if value.target_ref == dispatch.selected_target_ref)
+            if dispatch.selected_target_refs and target.target_ref not in dispatch.selected_target_refs:
+                selected, = dispatch.selected_target_refs
+                second = next(value for value in graph.targets if value.target_ref == selected)
                 if runtime.owners.research_graph.query_target_candidate_projection(target_ref=second.target_ref) is not None:
                     break
         else:

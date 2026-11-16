@@ -76,11 +76,11 @@ class _CorrectingRoot(_CurrentBindingBundleSkill):
             return replace(result, strategy_update={**result.strategy_update, "strategy_complete": False})
         return replace(result, strategy_update={**result.strategy_update, "notes": SYNTHESIS})
 
-    def schedule_target(self, request):
+    def schedule_targets(self, request):
         if request.frontier:
-            return super().schedule_target(request)
+            return super().schedule_targets(request)
         self.coordination.append(request)
-        return BundleDispatchResult("replan_required", None,
+        return BundleDispatchResult("replan_required", (),
             "The whole Question remains unresolved despite completing the frozen work.",
             request.native_session_ref, "test_deterministic")
 
@@ -175,12 +175,12 @@ class _EarlyScientificRoot(_CurrentBindingBundleSkill):
     _target_plan = _TwoTargetBundleSkill._target_plan
     _second_dependencies = _TwoTargetBundleSkill._second_dependencies
 
-    def schedule_target(self, request):
+    def schedule_targets(self, request):
         if request.state["target_commit_refs"]:
-            return BundleDispatchResult("replan_required", None,
+            return BundleDispatchResult("replan_required", (),
                 "The accepted first result invalidates the premise of the planned replication; reassess its protocol.",
                 request.native_session_ref, "test_deterministic")
-        return super().schedule_target(request)
+        return super().schedule_targets(request)
 
 
 def test_scientific_replan_does_not_launch_the_remaining_planned_target(tmp_path):
@@ -229,7 +229,7 @@ def _record_original_replan(runtime, run, graph):
         graph_ref=graph.graph_ref, generation=generation, frontier=(),
         state=runtime.bundle_stage._dispatch_state(graph,
             runtime.owners.research_graph.query_target_commits(graph.graph_ref), run=run),
-        action="replan_required", selected_target_ref=None,
+        action="replan_required", selected_target_refs=(),
         rationale="The current scientific scope should be reconsidered.",
         inbox_checkpoint=checkpoint, idempotency_key="historical-coordinator-replan")
     return decision, unit

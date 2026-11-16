@@ -79,7 +79,7 @@ def _request(adapter, kind):
 
 def _output(kind):
     if kind == "dispatch":
-        return {"action": "wait", "selected_target_ref": None, "rationale": "Wait for upstream evidence."}
+        return {"action": "wait", "selected_target_refs": [], "rationale": "Wait for upstream evidence."}
     return {"strategy_update": {"schema_ref": FORMAL_STRATEGY_UPDATE_SCHEMA_REF,
              "revision": 2, "candidates": [], "requires_accepted_labels": [], "strategy_complete": True},
             "rationale": "The frozen cell has been committed."}
@@ -96,7 +96,7 @@ def _changed(request, kind):
 def test_completed_input_drift_retains_result_and_requests_owner_correction(tmp_path, kind, durable):
     adapter, runner = _adapter(tmp_path, _output(kind), durable=durable)
     request = _request(adapter, kind)
-    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke = adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch
     original = invoke(request)
     assert invoke(request) == original
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
@@ -125,12 +125,36 @@ def test_completed_input_drift_retains_result_and_requests_owner_correction(tmp_
     assert {name: (operation / name).read_bytes() for name in original_files} == original_files
 
 
+@pytest.mark.parametrize("selection_field", [{}, {"selected_target_refs": None}])
+def test_malformed_sealed_dispatch_preserves_owner_correction_under_input_drift(
+    tmp_path, selection_field,
+):
+    adapter, runner = _adapter(
+        tmp_path,
+        {"action": "dispatch", "rationale": "Run the ready comparison.", **selection_field},
+        durable=True,
+    )
+    request = _request(adapter, "dispatch")
+    with pytest.raises(IdeaSkillUnavailable, match="^bundle_review_result_contract_invalid$") as first:
+        adapter.schedule_targets(request)
+    assert first.value.recovery_checkpoint["contract_failure_detail_code"] == "codex_bundle_dispatch_invalid"
+    operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
+    assert (operation / "supervisor-exit.json").is_file()
+    original = {path.name: path.read_bytes() for path in operation.iterdir() if path.is_file()}
+
+    with pytest.raises(IdeaSkillUnavailable, match="^bundle_review_result_contract_invalid$") as recovered:
+        adapter.schedule_targets(_changed(request, "dispatch"))
+    assert recovered.value.recovery_checkpoint["contract_failure_detail_code"] == "codex_bundle_dispatch_invalid"
+    assert len(runner.calls) == 1
+    assert {name: (operation / name).read_bytes() for name in original} == original
+
+
 @pytest.mark.parametrize("kind", ("dispatch", "batch"))
 @pytest.mark.parametrize("durable", (False, True))
 def test_pending_changed_input_only_reconciles_original_operation(tmp_path, kind, durable):
     adapter, runner = _adapter(tmp_path, _output(kind), durable=durable)
     request = _request(adapter, kind)
-    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke = adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch
     invoke(request)
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
     # Model a process whose output exists but has no authenticated terminal seal.
@@ -148,7 +172,7 @@ def test_pending_changed_input_only_reconciles_original_operation(tmp_path, kind
 def test_foreign_root_and_damaged_seals_cannot_authorize_input_correction(tmp_path, kind, durable):
     adapter, runner = _adapter(tmp_path, _output(kind), durable=durable)
     request = _request(adapter, kind)
-    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke = adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch
     invoke(request)
     with pytest.raises(IdeaSkillUnavailable) as wrong_root:
         invoke(replace(_changed(request, kind), root_session_ref="another-root"))
@@ -169,14 +193,14 @@ def test_foreign_root_and_damaged_seals_cannot_authorize_input_correction(tmp_pa
 def test_damaged_durable_exit_cannot_authorize_input_correction(tmp_path):
     adapter, runner = _adapter(tmp_path, _output("dispatch"), durable=True)
     request = _request(adapter, "dispatch")
-    adapter.schedule_target(request)
+    adapter.schedule_targets(request)
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
     receipt = operation / "supervisor-exit.json"
     envelope = json.loads(receipt.read_text())
     envelope["seal"] = "0" * 64
     receipt.write_text(json.dumps(envelope))
     with pytest.raises(IdeaSkillUnavailable) as damaged:
-        adapter.schedule_target(_changed(request, "dispatch"))
+        adapter.schedule_targets(_changed(request, "dispatch"))
     assert damaged.value.code == "codex_operation_spool_invalid"
     assert damaged.value.recovery_checkpoint is None
     assert len(runner.calls) == 1
@@ -186,7 +210,7 @@ def test_damaged_durable_exit_cannot_authorize_input_correction(tmp_path):
 def test_damaged_business_input_cannot_authorize_recovery_or_rerun(tmp_path, kind):
     adapter, runner = _adapter(tmp_path, _output(kind), durable=True)
     request = _request(adapter, kind)
-    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke = adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch
     invoke(request)
     operation = next((tmp_path / "provider/provider-operations").glob("*/*"))
     source = operation / "business-input.json"
@@ -204,7 +228,7 @@ def test_damaged_business_input_cannot_authorize_recovery_or_rerun(tmp_path, kin
 def test_reading_layout_change_reuses_same_exact_operation(tmp_path, monkeypatch, kind):
     adapter, runner = _adapter(tmp_path, _output(kind), durable=True)
     request = _request(adapter, kind)
-    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke = adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch
     result = invoke(request)
     original = adapter._invoke_with_resident_mcp
 
@@ -223,9 +247,9 @@ def test_equal_length_business_input_change_still_requires_owner_correction(tmp_
     request = replace(request, state={**request.state, "target_commit_refs": ["commit:initial"]})
     changed = replace(request, state={**request.state, "target_commit_refs": ["commit:changed"]})
     assert len(json.dumps(request.state)) == len(json.dumps(changed.state))
-    adapter.schedule_target(request)
+    adapter.schedule_targets(request)
     with pytest.raises(IdeaSkillUnavailable) as failure:
-        adapter.schedule_target(changed)
+        adapter.schedule_targets(changed)
     assert failure.value.code == "bundle_review_result_contract_invalid"
     assert failure.value.recovery_checkpoint["contract_failure_detail_code"] == "bundle_operation_inputs_changed"
     assert len(runner.calls) == 1
@@ -278,7 +302,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         unit_ref = "bundle-input-cut-recovery"
         owner.begin_provider_unit(unit_ref=unit_ref, operation_ref=original.primary_invocation.operation_ref,
             run_ref=original.run_ref, attempt_ref=original.attempt_ref, fence_ref=original.fence_ref, unit_kind="bundle_review")
-        completed = adapter.schedule_target(request)
+        completed = adapter.schedule_targets(request)
         assert completed.native_session_ref == observed_native
         # The signed result exists, but its acknowledgement never reached AR.
         assert owner.query_bundle_stage_run(original.request_ref).native_session_ref == original.native_session_ref
@@ -288,7 +312,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
         if fresh_replacement:
             assert "resume" not in runner.calls[0][0]
         with pytest.raises(IdeaSkillUnavailable) as failed:
-            adapter.schedule_target(_changed(request, "dispatch"))
+            adapter.schedule_targets(_changed(request, "dispatch"))
         assert failed.value.code == "bundle_review_result_contract_invalid"
         assert failed.value.recovery_checkpoint["native_session_ref"] == observed_native
         owner.record_stage_provider_hard_ceiling(
@@ -317,7 +341,7 @@ def test_input_correction_creates_new_attempt_and_operation_with_same_native_ses
             job_ref=successor.primary_invocation.operation_ref,
             inbox_checkpoint=_inbox_checkpoint(run_ref=successor.run_ref,
                 attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref))
-        assert adapter.schedule_target(next_request).action == "wait"
+        assert adapter.schedule_targets(next_request).action == "wait"
         assert len(runner.calls) == 2
         operations = list((provider_path / "provider/provider-operations").glob("*/*"))
         assert len(operations) == 2

@@ -396,16 +396,16 @@ class _DeterministicBundleSkill:
         draft = self.generate_draft(request)
         return self.finalize_draft(request, draft)
 
-    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+    def schedule_targets(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         selected = (
-            None if not request.frontier else str(request.frontier[-1]["target_ref"])
+            () if not request.frontier else (str(request.frontier[-1]["target_ref"]),)
         )
         return BundleDispatchResult(
-            action="wait" if selected is None else "dispatch",
-            selected_target_ref=selected,
+            action="wait" if not selected else "dispatch",
+            selected_target_refs=selected,
             rationale=(
                 "No currently dispatchable Target."
-                if selected is None
+                if not selected
                 else "Select the highest-priority durable frontier item."
             ),
             native_session_ref=request.native_session_ref,
@@ -614,11 +614,11 @@ class _HighRiskWaitingBundleSkill(_HighRiskBundleSkill):
     def __init__(self) -> None:
         self.schedule_requests: list[BundleDispatchRequest] = []
 
-    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+    def schedule_targets(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         self.schedule_requests.append(request)
         return BundleDispatchResult(
             action="wait",
-            selected_target_ref=None,
+            selected_target_refs=(),
             rationale="Wait for the exact high-risk Target authorization.",
             native_session_ref=request.native_session_ref,
             adapter_kind="test_high_risk_waiting",
@@ -629,20 +629,20 @@ class _RequestScopedHighRiskBundleSkill(_HighRiskBundleSkill):
     def __init__(self) -> None:
         self.schedule_requests: list[BundleDispatchRequest] = []
 
-    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+    def schedule_targets(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         self.schedule_requests.append(request)
         dispatchable = [
             target
             for target in request.frontier
             if target.get("dispatch_allowed") is True
         ]
-        selected = None if not dispatchable else str(dispatchable[-1]["target_ref"])
+        selected = () if not dispatchable else (str(dispatchable[-1]["target_ref"]),)
         return BundleDispatchResult(
-            action="wait" if selected is None else "dispatch",
-            selected_target_ref=selected,
+            action="wait" if not selected else "dispatch",
+            selected_target_refs=selected,
             rationale=(
                 "Wait for the exact high-risk Target authorization."
-                if selected is None
+                if not selected
                 else "Dispatch the exact authorized high-risk Target."
             ),
             native_session_ref=request.native_session_ref,
@@ -655,11 +655,11 @@ class _NonDispatchingBundleSkill(_DeterministicBundleSkill):
         self.action = action
         self.schedule_calls = 0
 
-    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+    def schedule_targets(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         self.schedule_calls += 1
         return BundleDispatchResult(
             action=self.action,
-            selected_target_ref=None,
+            selected_target_refs=(),
             rationale="Pause despite an executable Target.",
             native_session_ref=request.native_session_ref,
             adapter_kind="test_non_dispatching",
@@ -698,13 +698,13 @@ class _ProtectedRollingBundleSkill(_RollingBundleSkill):
         super().__init__()
         self.schedule_requests: list[BundleDispatchRequest] = []
 
-    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+    def schedule_targets(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         self.schedule_requests.append(request)
-        return super().schedule_target(request)
+        return super().schedule_targets(request)
 
 
 class _UnknownDispatchBundleSkill(_ProtectedRollingBundleSkill):
-    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+    def schedule_targets(self, request: BundleDispatchRequest) -> BundleDispatchResult:
         self.schedule_requests.append(request)
         raise BundleSkillUnavailable("codex_operation_reconciliation_pending")
 
@@ -827,7 +827,6 @@ def _accept_real_target_root_commit(runtime):
     # Import lazily because the shared target-root fixture imports this module
     # for the production composition helper above.
     from test_target_root_finalizer import (
-        _EvidenceReader,
         _admit_independent_target_root,
     )
 
@@ -846,6 +845,16 @@ def _accept_real_target_root_commit(runtime):
         formal_plan=formal_plan,
         idempotency_key=f"activate-protected-bundle-root:{target.target_ref}",
     )
+    commit_ref = _finalize_target_root(runtime, launch, handle, admission.run.attempt_generation)
+    commits = runtime.owners.research_graph.query_target_commits(launch.graph_ref)
+    assert [commit.commit_ref for commit in commits] == [commit_ref]
+    return target, launch.graph_ref
+
+
+def _finalize_target_root(runtime, launch, handle, attempt_generation):
+    from test_target_root_finalizer import _EvidenceReader
+
+    lifecycle = runtime.target_root_lifecycle
     memory = SQLiteTargetRootCompletionMemoryAuthority(
         runtime._database,
         runtime.feed,
@@ -854,7 +863,7 @@ def _accept_real_target_root_commit(runtime):
     )
     authority = (
         runtime.owners.research_graph.query_target_measurement_domain_authority(
-            target.target_ref
+            handle.target_ref
         )
     )
     assert authority is not None
@@ -907,13 +916,13 @@ def _accept_real_target_root_commit(runtime):
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
         attempt_ref=handle.execution_attempt_ref,
-        attempt_generation=admission.run.attempt_generation,
+        attempt_generation=attempt_generation,
         root_session_ref=handle.root_session_ref,
         native_session_ref="native_protected_bundle_root",
         fence_ref=handle.execution_fence_ref,
-        operation_ref="harness_protected_bundle_root_final_turn",
+        operation_ref=f"harness_final_turn:{handle.target_run_ref}",
         operation_generation=1,
-        evidence_ref="harness_evidence_protected_bundle_root_final_turn",
+        evidence_ref=f"harness_evidence_final_turn:{handle.target_run_ref}",
         evidence_sequence=10,
         workspace_ref=_workspace_ref, final_text=final_text,
         final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest(),
@@ -930,18 +939,16 @@ def _accept_real_target_root_commit(runtime):
     assert result.status == "completed"
     assert result.target_commit_ref is not None
     published = runtime.owners.agent_runtime.publish_target_root_completion(
-        target_ref=target.target_ref,
+        target_ref=handle.target_ref,
         completion_ref=result.completion_ref,
         target_commit_ref=result.target_commit_ref,
     )
     assert published.terminal is not None
     lifecycle.mark_completed(
-        target_ref=target.target_ref,
+        target_ref=handle.target_ref,
         completion_ref=result.completion_ref,
     )
-    commits = runtime.owners.research_graph.query_target_commits(launch.graph_ref)
-    assert [commit.commit_ref for commit in commits] == [result.target_commit_ref]
-    return target, launch.graph_ref
+    return result.target_commit_ref
 
 
 def _target_commit_count(runtime) -> int:
@@ -1927,8 +1934,8 @@ def test_bundle_root_session_selects_from_the_durable_parallel_frontier(
 
         targets = current["target_graph"]["targets"]
         assert len(current["target_graph"]["frontier"]) == 2
-        assert decisions[-1].selected_target_ref == targets[-1]["target_ref"]
-        assert decisions[-1].selected_target_ref != targets[0]["target_ref"]
+        assert decisions[-1].selected_target_refs == (targets[-1]["target_ref"],)
+        assert targets[0]["target_ref"] not in decisions[-1].selected_target_refs
         assert decisions[-1].native_session_ref == current["run"]["native_session_ref"]
 
         for _step in range(4):
@@ -2574,7 +2581,7 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         )
         assert dispatches
         dispatch = dispatches[-1]
-        assert dispatch.selected_target_ref == target["target_ref"]
+        assert dispatch.selected_target_refs == (target["target_ref"],)
         persisted = runtime.owners.agent_runtime.query_human_request(
             request["request_ref"]
         )
