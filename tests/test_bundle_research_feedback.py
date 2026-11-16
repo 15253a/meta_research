@@ -10,7 +10,7 @@ from test_binding_compatibility import adapter, request
 def test_research_decision_can_defer_a_launchable_target(adapter, action):
     provider, _, _ = adapter
     req = request(provider.runtime_binding())
-    result = BundleDispatchResult(action, None, 'Reassess conflicting evidence before expanding this experiment.', req.native_session_ref, 'codex_cli')
+    result = BundleDispatchResult(action, (), 'Reassess conflicting evidence before expanding this experiment.', req.native_session_ref, 'codex_cli')
     assert validate_bundle_dispatch_result(req, result)
 
 
@@ -18,7 +18,7 @@ def test_dispatch_still_requires_current_launch_authority(adapter):
     provider, _, _ = adapter
     req = request(provider.runtime_binding())
     req = replace(req, frontier=({'target_ref': 'target:followup', 'dispatch_allowed': False},))
-    result = BundleDispatchResult('dispatch', 'target:followup', 'Run it.', req.native_session_ref, 'codex_cli')
+    result = BundleDispatchResult('dispatch', ('target:followup',), 'Run it.', req.native_session_ref, 'codex_cli')
     with pytest.raises(BundleSkillContractError, match='target_not_in_frontier'):
         validate_bundle_dispatch_result(req, result)
 

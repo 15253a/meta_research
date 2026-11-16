@@ -30,7 +30,7 @@ def _next_target(runtime, authority, handle, tmp_path, monkeypatch):
         generation=previous.generation+1,
         frontier=tuple(item for item in previous.frontier if item['target_ref'] == second.target_ref),
         state=runtime.bundle_stage._dispatch_state(graph, (), run=run), action='dispatch',
-        selected_target_ref=second.target_ref, rationale='Assess a corrected state attribution.',
+        selected_target_refs=(second.target_ref,), rationale='Assess a corrected state attribution.',
         inbox_checkpoint=checkpoint, idempotency_key='moved-state-dispatch')
     graph_owner.accept_target_candidate_projection(target_ref=second.target_ref, idempotency_key='second-projection')
     request = graph_owner.query_target_launch_request(second.target_ref)

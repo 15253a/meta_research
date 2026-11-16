@@ -77,7 +77,7 @@ def _actual_operation_schemas() -> Iterator[tuple[str, dict[str, object]]]:
 
     bundle = _bundle_template_request()
     yield "bundle-primary", _target_plan_envelope_schema(bundle)
-    yield "bundle-dispatch", _dispatch_schema(("target:template",))
+    yield "bundle-dispatch", _dispatch_schema()
     yield "bundle-rolling-batch", _target_batch_schema(bundle)
 
     reasoning = _reasoning_template_request()

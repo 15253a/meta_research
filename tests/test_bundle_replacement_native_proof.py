@@ -125,7 +125,7 @@ def _bundle(tmp_path, kind):
 
 
 def _invoke(adapter, request, kind):
-    return (adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch)(request)
+    return (adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch)(request)
 
 
 def _calls(executable):
@@ -246,7 +246,7 @@ def test_unknown_initial_rolling_turn_reconciles_actual_terminal_native_and_orig
     adapter, request, executable, workspace = _bundle(tmp_path, "dispatch")
     executable.with_suffix(".terminal").write_text(status, encoding="utf-8")
     with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_reconciliation_pending$") as unknown:
-        adapter.schedule_target(request)
+        adapter.schedule_targets(request)
     assert unknown.value.recovery_checkpoint is None
     operation = _operation(workspace, "dispatch")
     original = {p.name: p.read_bytes() for p in operation.iterdir() if p.is_file()}
@@ -258,7 +258,7 @@ def test_unknown_initial_rolling_turn_reconciles_actual_terminal_native_and_orig
     assert receipt["returncode"] == 75 and receipt["termination_reason"] == "completed"
 
     with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_failed$") as reconciled:
-        adapter.schedule_target(request)
+        adapter.schedule_targets(request)
 
     proof = reconciled.value.recovery_checkpoint
     assert proof["schema_ref"] == "meta-research/provider-native-turn-terminal/v1"
@@ -278,7 +278,7 @@ def test_unknown_initial_rolling_turn_reconciles_actual_terminal_native_and_orig
     assert {name: (operation / name).read_bytes() for name in original} == original
     assert not (operation / "completed.json").exists()
     with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_failed$") as repeated:
-        adapter.schedule_target(request)
+        adapter.schedule_targets(request)
     assert repeated.value.recovery_checkpoint == proof
     methods = [item["method"] for item in _calls(executable)]
     assert methods.count("thread/start") == methods.count("turn/start") == methods.count("thread/read") == 1

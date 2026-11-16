@@ -88,12 +88,14 @@ def test_admitted_frontier_keeps_exact_receipt_and_handle_checks(
     runtime, target, _, bundle_run = running_target
     owner = runtime.owners.agent_runtime
     where = (
-        "selected_target_ref" if table == "ar_bundle_dispatch_decisions"
-        else "target_ref"
+        "decision_ref = (SELECT dispatch_decision_ref FROM ar_target_launches "
+        "WHERE target_ref = :target)"
+        if table == "ar_bundle_dispatch_decisions"
+        else "target_ref = :target"
     )
     with runtime._database.write() as connection:
         connection.execute(
-            text(f"UPDATE {table} SET {field} = :value WHERE {where} = :target"),
+            text(f"UPDATE {table} SET {field} = :value WHERE {where}"),
             {"value": invalid_value, "target": target.target_ref},
         )
     for query in (

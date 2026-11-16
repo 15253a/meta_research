@@ -20,9 +20,9 @@ class _DispatchCountingSkill(_DeterministicBundleSkill):
     def __init__(self) -> None:
         self.schedule_calls = 0
 
-    def schedule_target(self, request):
+    def schedule_targets(self, request):
         self.schedule_calls += 1
-        return super().schedule_target(request)
+        return super().schedule_targets(request)
 
 
 def _notice(*, target_ref: str, sequence: int, suffix: str) -> TargetWorkNotice:
@@ -249,7 +249,7 @@ def test_scoped_inbox_isolates_runs_and_missing_frontier_cannot_redispatch(
                 frontier=first_decisions[0].frontier,
                 state=first_decisions[0].state,
                 action=first_decisions[0].action,
-                selected_target_ref=first_decisions[0].selected_target_ref,
+                selected_target_refs=first_decisions[0].selected_target_refs,
                 rationale="This stale decision must not be persisted.",
                 inbox_checkpoint=stale_checkpoint,
                 idempotency_key="stale-inbox-target-dispatch",

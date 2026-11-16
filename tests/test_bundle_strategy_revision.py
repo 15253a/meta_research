@@ -28,7 +28,7 @@ def test_explicit_revise_strategy_reenters_batch_once_without_fabricating_work(t
         _coordinate(runtime, provider)
         decisions = owner.query_bundle_dispatch_decisions(run.run_ref)
         assert decisions[-1].action == "revise_strategy"
-        assert decisions[-1].selected_target_ref is None
+        assert decisions[-1].selected_target_refs == ()
         assert runtime.owners.research_graph.query_target_graph(run.request_ref) == graph
         assert runtime.owners.research_graph.query_target_commits(graph.graph_ref) == commits
         for _ in range(8):
@@ -48,7 +48,7 @@ def test_explicit_revise_strategy_reenters_batch_once_without_fabricating_work(t
         invalid = replace(provider.coordination[0], state={"strategy_revision_available": False})
         with pytest.raises(BundleSkillContractError, match="bundle_strategy_revision_not_ready"):
             validate_bundle_dispatch_result(invalid, BundleDispatchResult(
-                "revise_strategy", None, "Next batch requested.", run.native_session_ref, "test_deterministic"))
+                "revise_strategy", (), "Next batch requested.", run.native_session_ref, "test_deterministic"))
     finally:
         runtime.close()
 
@@ -97,8 +97,8 @@ def test_real_dispatch_adapter_contract_renews_after_accepted_pause_resume(tmp_p
     schema = bundle_module._dispatch_schema
     file_hash = bundle_module._file_sha256
     resources = bundle_module._bundle_skill_resources
-    def dispatch_schema(refs):
-        value = schema(refs)
+    def dispatch_schema():
+        value = schema()
         if historical[0]:
             value["properties"]["action"]["enum"].remove("revise_strategy")
         return value

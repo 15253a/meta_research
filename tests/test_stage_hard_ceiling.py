@@ -1776,7 +1776,7 @@ def test_bundle_rolling_invalid_result_retains_terminal_proof_for_correction(
             if rolling_operation == "dispatch-contract":
                 yield {
                     "action": "dispatch",
-                    "selected_target_ref": "target-outside-current-frontier",
+                    "selected_target_refs": ["target-outside-current-frontier"],
                     "rationale": "An unauthorized target must be rejected.",
                 }
             else:
@@ -1787,11 +1787,11 @@ def test_bundle_rolling_invalid_result_retains_terminal_proof_for_correction(
         assert frontier
         yield {
             "action": "dispatch",
-            "selected_target_ref": (
+            "selected_target_refs": [
                 frontier[-1]
                 if isinstance(frontier[-1], str)
                 else frontier[-1]["target_ref"]
-            ),
+            ],
             "rationale": "Dispatch the current accepted frontier target.",
         }
         yield {"strategy_update": {}}

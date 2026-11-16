@@ -169,7 +169,7 @@ def _record_replan_choice(runtime, graph, run, rationale):
         native_session_ref=run.native_session_ref, graph_ref=graph.graph_ref,
         generation=len(decisions) + 1, frontier=(),
         state=runtime.bundle_stage._dispatch_state(graph, commits, run=run),
-        action="replan_required", selected_target_ref=None, rationale=rationale,
+        action="replan_required", selected_target_refs=(), rationale=rationale,
         inbox_checkpoint=checkpoint, idempotency_key="research-replan-after-observation",
     )
 

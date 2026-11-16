@@ -56,7 +56,7 @@ def test_rolling_provider_refuses_cycle_position_from_another_cycle(tmp_path, ki
     request = _request(adapter, kind)
     request = replace(request, cycle_position={**request.cycle_position, "cycle_ref": "cycle:foreign"})
     with pytest.raises(BundleSkillUnavailable, match="bundle_cycle_position_invalid"):
-        (adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch)(request)
+        (adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch)(request)
     assert runner.calls == []
 
 

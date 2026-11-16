@@ -23,8 +23,12 @@ def sealed_dispatch(tmp_path, monkeypatch, request):
     monkeypatch.setattr("meta_research.idea_skill.render_runtime_conditions", lambda workspace, **scope: "Frozen test runtime conditions.")
     if request.param == "envelope":
         dispatch_schema = bundle_skill._dispatch_schema
-        monkeypatch.setattr(bundle_skill, "_dispatch_schema", lambda frontier: {"oneOf": [dispatch_schema(frontier)]})
-    output = {"action": "dispatch", "selected_target_ref": "target:followup", "rationale": "Continue."}
+        monkeypatch.setattr(bundle_skill, "_dispatch_schema", lambda: {"oneOf": [dispatch_schema()]})
+    output = {
+        "action": "dispatch",
+        "selected_target_refs": ["target:replication", "target:followup"],
+        "rationale": "Run both independent comparisons.",
+    }
     runner = _SignedDispatchRunner([output, output])
     provider = CodexBundleSkillAdapter(
         tmp_path / "provider", executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner,
@@ -33,8 +37,14 @@ def sealed_dispatch(tmp_path, monkeypatch, request):
     provider.bind_full_conformance_authority(authority)
     provider.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     frozen = provider.runtime_binding()
-    dispatch = replace(dispatch_request(frozen), job_ref="bundle-job:sealed")
-    result = provider.schedule_target(dispatch)
+    dispatch = dispatch_request(frozen)
+    dispatch = replace(
+        dispatch,
+        job_ref="bundle-job:sealed",
+        frontier=(*dispatch.frontier, {"target_ref": "target:replication", "target_key": "replication"}),
+    )
+    result = provider.schedule_targets(dispatch)
+    assert result.selected_target_refs == ("target:replication", "target:followup")
     directory = tmp_path / "provider" / "provider-operations" / canonical_hash({"job_ref": dispatch.job_ref}) / "dispatch-1"
     original = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
     assert provider.runtime_binding() == frozen
@@ -44,13 +54,13 @@ def sealed_dispatch(tmp_path, monkeypatch, request):
 def test_completed_signed_operation_replays_without_rewriting_frozen_inputs(sealed_dispatch, tmp_path, monkeypatch):
     provider, runner, authority, dispatch, first, directory, original = sealed_dispatch
 
-    assert provider.schedule_target(dispatch) == first
+    assert provider.schedule_targets(dispatch) == first
     assert len(runner.calls) == 1
     assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == original
     assert authority.issued[-1]["capability_binding_hash"] == canonical_hash(dispatch.runtime_binding.as_dict())
 
     next_request = replace(dispatch, job_ref="bundle-job:next", generation=2)
-    assert provider.schedule_target(next_request).native_session_ref == dispatch.native_session_ref
+    assert provider.schedule_targets(next_request).native_session_ref == dispatch.native_session_ref
     assert len(runner.calls) == 2
     assert runner.calls[1][0][-3:] == ["resume", dispatch.native_session_ref, "-"]
     assert authority.issued[-1]["capability_binding_hash"] == canonical_hash(dispatch.runtime_binding.as_dict())
@@ -70,7 +80,7 @@ def test_completed_signed_operation_replays_without_rewriting_frozen_inputs(seal
     assert not bundle_bindings_compatible(dispatch.runtime_binding, current)
     for old_request in (dispatch, replace(dispatch, job_ref="bundle-job:stale-next", generation=3)):
         with pytest.raises(BundleSkillUnavailable, match="^bundle_runtime_binding_drift$"):
-            provider.schedule_target(old_request)
+            provider.schedule_targets(old_request)
     assert len(runner.calls) == 2
     assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == original
 
@@ -130,12 +140,12 @@ def test_model_edit_applies_to_next_call_and_preserves_sealed_replay(sealed_disp
     provider, runner, _, dispatch, first, directory, original = sealed_dispatch
     selected = "gpt-5.6-sol"
     monkeypatch.setattr("meta_research.idea_skill.selected_stage_model", lambda *args, **kwargs: selected)
-    assert provider.schedule_target(dispatch) == first
+    assert provider.schedule_targets(dispatch) == first
     assert len(runner.calls) == 1
     assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == original
 
     next_call = replace(dispatch, job_ref="bundle-job:changed-model", generation=2)
-    provider.schedule_target(next_call)
+    provider.schedule_targets(next_call)
     argv = runner.calls[-1][0]
     assert argv[argv.index("--model") + 1] == selected
     assert 'model_reasoning_effort="ultra"' in argv
@@ -167,7 +177,7 @@ def test_instruction_replay_keeps_request_identity_and_signed_invocation_exact(s
 
     expected = "bundle_review_result_contract_invalid" if mutation == "request" else "codex_operation_identity_conflict"
     with pytest.raises(BundleSkillUnavailable, match=expected) as failure:
-        provider.schedule_target(dispatch)
+        provider.schedule_targets(dispatch)
     if mutation == "request":
         assert failure.value.recovery_checkpoint["contract_failure_detail_code"] == "bundle_operation_inputs_changed"
     assert len(runner.calls) == 1

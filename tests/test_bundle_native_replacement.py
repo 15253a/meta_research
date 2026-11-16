@@ -28,7 +28,7 @@ def test_rolling_adapter_initializes_proven_replacement_and_binds_exact_context(
     request = _request(adapter, kind)
     context = _replacement_context(request)
     request = replace(request, native_session_ref=None, native_replacement_context=context)
-    invoke = adapter.schedule_target if kind == "dispatch" else adapter.propose_target_batch
+    invoke = adapter.schedule_targets if kind == "dispatch" else adapter.propose_target_batch
     result = invoke(request)
     assert result.native_session_ref and result.native_session_ref != context["retired_native_session_ref"]
     assert len(runner.calls) == 1
@@ -50,7 +50,7 @@ def test_rolling_adapter_refuses_unproven_or_changed_replacement_before_provider
     else:
         context["frozen_stage_input"] = {"cycle_ref": "changed-cycle"}
     with pytest.raises(IdeaSkillUnavailable, match="bundle_native_replacement_context_invalid"):
-        adapter.schedule_target(replace(request, native_session_ref=None, native_replacement_context=context))
+        adapter.schedule_targets(replace(request, native_session_ref=None, native_replacement_context=context))
     assert not runner.calls
 
 
@@ -64,9 +64,9 @@ class _ReplacementAwareBundle(_CurrentBindingBundleSkill):
         self.primary_calls += 1
         return super().generate_draft(request)
 
-    def schedule_target(self, request):
+    def schedule_targets(self, request):
         self.rolling_requests.append(request)
-        result = super().schedule_target(request)
+        result = super().schedule_targets(request)
         return replace(result, native_session_ref="bundle-native-replacement") if request.native_session_ref is None else result
 
     def propose_target_batch(self, request):
@@ -99,8 +99,8 @@ class _FirstReplacementTurnCorrection(_ReplacementAwareBundle):
             "result_file_hash": "c" * 64, "contract_failure_code": values["failure_code"],
             "contract_failure_detail_code": values["detail_code"]}
 
-    def schedule_target(self, request):
-        result = super().schedule_target(request)
+    def schedule_targets(self, request):
+        result = super().schedule_targets(request)
         return self._first_turn(request, result, "dispatch")
 
     def propose_target_batch(self, request):

@@ -167,7 +167,7 @@ def _seed_admitted_launch(path: Path, request: TargetLaunchRequest, handle) -> N
     frontier = [{"target_ref": request.target_ref}]
     state: dict[str, object] = {}
     decision = {
-        "schema_ref": "meta-research/bundle-dispatch-decision/v1",
+        "schema_ref": "meta-research/bundle-dispatch-decision/v2",
         "run_ref": run_ref,
         "attempt_ref": attempt_ref,
         "fence_ref": fence_ref,
@@ -177,7 +177,7 @@ def _seed_admitted_launch(path: Path, request: TargetLaunchRequest, handle) -> N
         "frontier_hash": canonical_hash(frontier),
         "state_hash": canonical_hash(state),
         "action": "dispatch",
-        "selected_target_ref": request.target_ref,
+        "selected_target_refs": [request.target_ref],
         "rationale": "dispatch exact admitted Target",
     }
     decision_hash = canonical_hash(decision)
@@ -326,7 +326,7 @@ def _seed_admitted_launch(path: Path, request: TargetLaunchRequest, handle) -> N
             "INSERT INTO ar_bundle_dispatch_decisions (decision_ref, run_ref, "
             "attempt_ref, fence_ref, native_session_ref, graph_ref, generation, "
             "frontier_json, frontier_hash, state_json, state_hash, action, "
-            "selected_target_ref, rationale, decision_hash, idempotency_key, "
+            "selected_target_refs_json, rationale, decision_hash, idempotency_key, "
             "request_hash, receipt_ref, receipt_hash, created_at) VALUES "
             "(?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'dispatch', ?, ?, ?, "
             "'dispatch-idempotency-1', ?, ?, ?, 1.0)",
@@ -341,7 +341,7 @@ def _seed_admitted_launch(path: Path, request: TargetLaunchRequest, handle) -> N
                 canonical_hash(frontier),
                 canonical_json(state),
                 canonical_hash(state),
-                request.target_ref,
+                canonical_json(decision["selected_target_refs"]),
                 decision["rationale"],
                 decision_hash,
                 "5" * 64,

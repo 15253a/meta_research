@@ -92,16 +92,18 @@ AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据�
 
 ## 调度与继续策略
 
-调度输出使用本次 schema 的 `action`、`selected_target_ref` 和 `rationale`。依据当前执行事实选择：
+调度输出使用本次 schema 的 `action`、`selected_target_refs` 和 `rationale`。依据当前执行事实选择：
 
 | action | 本次决定 |
 | --- | --- |
-| `dispatch` | 从当前可派发 frontier 选择真实 Target，填写其准确 `selected_target_ref`。 |
+| `dispatch` | 从当前 frontier 选择可并行开展且值得投入的一个或多个 Target。把具有启动权限、输入已就绪的准确引用一次性列入 `selected_target_refs`，每项只列一次。 |
 | `revise_strategy` | 策略尚未封口、frontier 为空、没有在途或阻塞 Target，且已有 Target 均已正式接纳 TargetCommit 时，请求原 Bundle 根形成下一次滚动策略提案。 |
 | `wait` | 等待具体外部条件、在途工作，或作出有依据的研究暂缓；在 rationale 中说明等待什么以及接续依据。 |
 | `replan_required` | 根据真实结果与未完成责任，判断冻结研究承诺或工作安排需由后继修订，并说明依据。 |
 
-后三项的 `selected_target_ref` 为 `null`。`revise_strategy` 只进入同根下一次正式 `target-batch` 提案，候选仍需正常接纳与调度；原 Plan、已接纳 Target 和 Commit 保持原样。需要编制下一批或汇总策略时明确选择这一动作，`wait` 不会要求系统代根生成下一批。当前决策采用最新运行条件，历史 operation 仍沿原精确输入对账。
+一次 `dispatch` 形成一个决定。宿主逐项重验权限和输入，全部通过后一起发布启动回执。各 Target 在自己的根 Session 中独立执行、修复和交接。下一次 `target-batch` 仍须等当前图中的 Target 全部形成已接纳的 TargetCommit。
+
+其他动作的 `selected_target_refs` 为空数组。`revise_strategy` 只进入同根下一次正式 `target-batch` 提案，候选仍需正常接纳与调度；原 Plan、已接纳 Target 和 Commit 保持原样。需要编制下一批或汇总策略时明确选择这一动作，`wait` 不会要求系统代根生成下一批。当前决策采用最新运行条件，历史 operation 仍沿原精确输入对账。
 
 ## 批次重规划交接
 
