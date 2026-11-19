@@ -834,6 +834,32 @@ def test_successor_reconciles_only_a_signed_reply_with_matching_owner_lineage(tm
     assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize(("output", "detail"), [
+    (["invalid root"], "codex_output_invalid"),
+    ({"plan": dict(_plan(), selected_evidence_bindings=[{"source_binding": "not JSON"}])}, "codex_plan_invalid"),
+], ids=["raw-json-array", "invalid-binding-encoding"])
+def test_replaced_plan_reports_the_original_signed_rejection(tmp_path, output, detail):
+    runner = _SequenceRunner([output])
+    adapter = CodexPlanSkillAdapter(tmp_path / "provider",
+        executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
+    prior = _request(runtime_binding=adapter.runtime_binding(), job_ref="original-plan-job",
+        run_ref="plan-run", attempt_ref="first-attempt", fence_ref="first-fence")
+    current = replace(prior, attempt_ref="next-attempt", fence_ref="next-fence", submission_revision=2,
+        replayable_primary_attempts=((prior.attempt_ref, prior.fence_ref, 1),))
+
+    with pytest.raises(PlanSkillUnavailable, match="^plan_primary_result_contract_invalid$") as first:
+        adapter.generate_draft(prior)
+    with pytest.raises(PlanSkillUnavailable, match="^plan_primary_result_contract_invalid$") as replay:
+        adapter.generate_draft(current)
+    assert first.value.rejected_candidate
+    assert replay.value.rejected_candidate == first.value.rejected_candidate
+    assert replay.value.rejected_detail_code == first.value.rejected_detail_code == detail
+    assert replay.value.rejected_native_session_ref == first.value.rejected_native_session_ref == "codex-plan-primary:1"
+    assert replay.value.recovery_checkpoint == first.value.recovery_checkpoint
+    assert first.value.recovery_checkpoint["contract_failure_detail_code"] == detail
+    assert len(runner.calls) == 1
+
+
 @pytest.mark.parametrize(("content", "reason"), [
     (b'{"plan":null}', "schema_invalid"),
     (b'{"plan":{},"plan":{}}', "encoding_invalid"),
