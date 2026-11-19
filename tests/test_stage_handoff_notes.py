@@ -164,7 +164,9 @@ def test_accepted_reasoning_notes_reach_next_idea_provider(tmp_path, monkeypatch
         assert closure["scientific_outcome_hash"] == content.outcome_hash
         outcome = idea_fixtures._idea_set()
         runner = idea_fixtures._SequenceRunner([{"outcome": outcome}, idea_fixtures._review_turn_output()])
-        adapter = CodexIdeaSkillAdapter(tmp_path / "idea-provider", process_runner=runner)
+        adapter = CodexIdeaSkillAdapter(tmp_path / "idea-provider",
+            executable=str(idea_fixtures._fake_codex_executable(tmp_path / "codex", read_all_input=True)),
+            process_runner=runner)
         context = deepcopy(idea_fixtures._request().context_pack)
         context["prior_accepted_bindings"] = [{"closure": closure, "outcome_ref": accepted.outcome_ref}]
         request = idea_fixtures._request(runtime_binding=adapter.runtime_binding(), context_pack=context, context_pack_hash=canonical_hash(context))
@@ -297,22 +299,31 @@ def test_late_notes_survive_real_stage_commit_and_reasoning_request(tmp_path, mo
         from meta_research.reasoning_stage import _frozen_evidence_closure
         downstream = tmp_path / "actual-reasoning"
         downstream.mkdir()
-        runner = reasoning_fixtures._SequenceRunner([reasoning_fixtures._stage_output()])
-        adapter = CodexReasoningSkillAdapter(downstream / "provider", executable=str(reasoning_fixtures._fake_codex(downstream / "codex")), process_runner=runner)
+        class PromptReceived(Exception):
+            pass
+
+        def receive_prompt(_argv, prompt, _timeout, environment=None):
+            raise PromptReceived(prompt)
+
+        adapter = CodexReasoningSkillAdapter(downstream / "provider",
+            executable=str(reasoning_fixtures._fake_codex(downstream / "codex")), process_runner=receive_prompt)
         adapter.bind_full_conformance_authority(reasoning_fixtures._FullConformanceAuthority())
         adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
         request = replace(reasoning_fixtures._request(), runtime_binding=adapter.runtime_binding(),
             stage_request_ref=requested.request_ref, cycle_ref=requested.cycle_ref,
             question_ref=requested.accepted_question.question_ref, quest_ref=requested.accepted_question.quest_ref,
+            accepted_question_content=runtime.owners.research_memory.read_question_content(
+                requested.accepted_question.content_ref, requested.accepted_question.content_hash),
             foreground_epoch=requested.epoch, context_pack_ref=requested.context_pack_ref,
             context_pack_hash=requested.context_pack_hash, context_pack=requested.context_pack,
             goal_revision_ref=requested.context_pack["research_context"]["goal_revision_ref"],
             frozen_evidence_closure=_frozen_evidence_closure(requested.context_pack))
-        # Observe delivery at the real provider boundary; this synthetic provider
-        # draft is not submitted to any Owner.
-        adapter.generate_draft(request)
-        _context_sections(runner.calls[0][1], request.context_pack_hash,
+        with pytest.raises(PromptReceived) as received:
+            adapter.generate_draft(request)
+        sections = _context_sections(received.value.args[0], request.context_pack_hash,
             complete_sections=("upstream_stage_closure",))
-        assert LATE_NOTE in runner.calls[0][1]
+        delivered = _preview_rows(sections["upstream_stage_closure"])[-1]
+        assert delivered["commit_ref"] == commit.commit_ref
+        assert delivered["closure"]["notes"] == LATE_NOTE
     finally:
         fixture.close()
