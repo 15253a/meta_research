@@ -93,10 +93,12 @@ def test_field_diagnostics_keep_distinct_receipts_and_replay_old_fact(tmp_path) 
         diagnostic("asset_version_ref", "present", operator_required=True),
         diagnostic("role_ref", {"reader": {"input": {"kind": "artifact"}}}),
         diagnostic("role_ref", {"reader": {"input": {"kind": "metadata"}}}),
+        replace(diagnostic("target_commit_ref", "present"), audit_ref="explicit-replacement"),
         diagnostic("target_commit_ref", "present", audit_ref="error:caller-assigned"),
     ]
     recorded = [store.record(fact) for fact in facts]
     assert recorded[0] == historical
+    assert recorded[-2].audit_ref == "explicit-replacement"
     assert recorded[-1].audit_ref == "error:caller-assigned"
     assert len({item.audit_ref for item in recorded}) == len(facts)
     database.close()

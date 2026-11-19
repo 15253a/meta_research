@@ -156,7 +156,7 @@ class ErrorContract:
     recovery_component: str = "semantic_mcp"
     audit_ref: str | None = None
     correlation_ref: str | None = None
-    legacy_generated_audit_ref: str | None = field(default=None, repr=False, compare=False)
+    _generated_audit_ref: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.code or not self.phase or not self.operation_id:
@@ -173,6 +173,12 @@ class ErrorContract:
             raise ValueError("error_contract_unknown_reconcile_required")
         if self.effect_status is EffectStatus.STALE and self.retry_allowed:
             raise ValueError("error_contract_stale_retry_invalid")
+
+    @property
+    def legacy_generated_audit_ref(self) -> str | None:
+        if self._generated_audit_ref is None or self.audit_ref != self._generated_audit_ref:
+            return None
+        return _audit_identity({"code": self.code, "operation_id": self.operation_id, "effect_id": self.effect_id})
 
     @property
     def category(self) -> str:
@@ -333,13 +339,8 @@ def error_contract_from_legacy(
         return contract
     facts = contract.as_details()
     del facts["audit_ref"]
-    return replace(
-        contract,
-        audit_ref=_audit_identity(facts),
-        legacy_generated_audit_ref=_audit_identity(
-            {"code": code, "operation_id": operation_id, "effect_id": effect_id}
-        ),
-    )
+    generated = _audit_identity(facts)
+    return replace(contract, audit_ref=generated, _generated_audit_ref=generated)
 
 
 def error_contract_from_exception(
