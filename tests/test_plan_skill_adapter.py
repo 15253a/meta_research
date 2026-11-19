@@ -777,7 +777,8 @@ def test_durable_plan_primary_shape_failure_is_terminal_and_not_replayed(
     assert no_replay.calls == []
 
 
-def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path):
+@pytest.mark.parametrize("envelope", [False, True], ids=["document", "envelope"])
+def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path, envelope):
     adapter = CodexPlanSkillAdapter(tmp_path, executable=str(_fake_codex(tmp_path / "codex")))
     request = _request(runtime_binding=adapter.runtime_binding(), job_ref="job:workspace-plan")
     workdir = tmp_path / "root"
@@ -793,7 +794,7 @@ def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(t
     plan["answer_contract"].pop("answer_contract_hash")
     plan["experiment_briefs"][0]["reuse_material_refs"] = []
     plan.update(notes="逐项复核后的候选", selected_evidence_bindings=[])
-    original = json.dumps({"plan": plan}, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    original = json.dumps({"plan": plan} if envelope else plan, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     digest = hashlib.sha256(original).hexdigest()
     source = workdir / "plan_candidate.json"
     source.write_bytes(original)
@@ -864,6 +865,8 @@ def test_replaced_plan_reports_the_original_signed_rejection(tmp_path, output, d
     (b'{"plan":null}', "schema_invalid"),
     (b'{"plan":{},"plan":{}}', "encoding_invalid"),
     (b'{"plan":{"file_sha256":"../candidate"}}', "schema_invalid"),
+    (b'{"file_sha256":"' + b"0" * 64 + b'"}', "schema_invalid"),
+    (b'{"kind":"PlanDocument","schema_ref":"meta-research/plan-document/v1"}', "schema_invalid"),
 ])
 def test_workspace_plan_submission_validates_the_full_wire_contract(tmp_path, content, reason):
     adapter = CodexPlanSkillAdapter(tmp_path, executable=str(_fake_codex(tmp_path / "codex")))
