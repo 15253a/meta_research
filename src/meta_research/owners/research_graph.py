@@ -6886,16 +6886,19 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         )
         candidate = candidate_projection.candidate
         protocol = authority.measurement_contract.protocol_version
-        from meta_research.formal_entities import _declared_work, primary_work_metrics
+        from meta_research.formal_entities import (
+            _declared_work, check_primary_metric_keys, primary_work_metrics,
+        )
         result_content = result_document.as_dict()
         work = _declared_work(result_content)
         actual_metrics = primary_work_metrics(result_content, work=work)
-        metric_keys = set(actual_metrics)
-        required_keys = set(protocol.required_metric_keys)
-        allowed_keys = required_keys | set(protocol.optional_metric_keys)
+        metric_check = check_primary_metric_keys(
+            result_content,
+            required_metric_keys=protocol.required_metric_keys,
+            optional_metric_keys=protocol.optional_metric_keys,
+            work=work,
+        )
         policy = authority.measurement_contract.checkpoint_policy
-        from meta_research.formal_entities import explicit_run_only
-        run_only = explicit_run_only(result_content, work=work)
         authoritative_fields = {
             "target_ref": target.target_ref,
             "target_run_ref": completion.handle.target_run_ref,
@@ -6931,13 +6934,12 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     "the metrics, artifacts and actual work, which need no rerun for this conflict."
                 )
                 raise conflict
-        if not run_only and not required_keys <= metric_keys <= allowed_keys:
-            run, attempt = work[0]
-            missing = sorted(required_keys - metric_keys)
-            unexpected = sorted(metric_keys - allowed_keys)
+        if not metric_check.conforms:
+            missing = list(metric_check.missing_keys)
+            unexpected = list(metric_check.unexpected_keys)
             conflict = TargetContentIssue("target_root_commit_domain_invalid")
             conflict.feedback = (
-                f"Run {run['run_key']!r}, Evaluation {attempt['attempt_key']!r} has "
+                f"Run {metric_check.run_key!r}, Evaluation {metric_check.attempt_key!r} has "
                 f"missing required metric keys {missing!r} and unexpected metric keys "
                 f"{unexpected!r} under ProtocolVersion {authority.identities.protocol_version_ref!r}. "
                 "Correct that evaluation's metric declaration or add its genuinely missing "

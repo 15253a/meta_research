@@ -1,6 +1,8 @@
 """Public, frozen Target input contract and bounded JSON result semantics."""
 from __future__ import annotations
 
+import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -9,7 +11,7 @@ from meta_research.bundle_protocol import (
     _target_metric_shape,
 )
 from meta_research.bundle_target_contract import measurement_contract_to_dict
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.common import OwnerConflict, canonical_json
 from meta_research.target_implementation_bundle import (
     IMPLEMENTATION_ENTRY_MAX_BYTES, IMPLEMENTATION_ENTRY_MAX_COUNT,
     IMPLEMENTATION_TOTAL_MAX_BYTES, IMPLEMENTATION_BUNDLE_MAX_BYTES,
@@ -52,8 +54,25 @@ def target_execution_context(*, authority: object, target_ref: str,
             or getattr(authority, "graph_ref", None) != graph_ref
             or getattr(authority, "target_spec_hash", None) != target_spec_hash):
         raise OwnerConflict("target_measurement_domain_authority_invalid")
+    protocol = authority.measurement_contract.protocol_version
+    draft_check_protocol = {
+        "protocol_version_ref": authority.identities.protocol_version_ref,
+        "required_metric_keys": list(protocol.required_metric_keys),
+        "optional_metric_keys": list(protocol.optional_metric_keys),
+    }
     return {
         "authority_ref": authority.authority_ref,
+        "result_draft_check": {
+            "argv": [
+                str(Path(sys.executable).absolute()), "-m", "meta_research.target_execution_contract",
+                "--check-result", canonical_json(draft_check_protocol),
+            ],
+            "usage": (
+                "形成草稿后，可从本 Target 工作目录按此 argv 运行一次只读指标键检查。"
+                "按原参数使用当前冻结 Protocol，在输出中查看缺少或多出的正式评价指标键和草稿摘要。"
+                "有确定冲突时修正对应声明并保留已有工作。正式接纳仍由 Owner 在结束后核验。"
+            ),
+        },
         "authority_hash": authority.authority_hash,
         "target_spec_hash": authority.target_spec_hash,
         "measurement_contract": measurement_contract_to_dict(authority.measurement_contract),
@@ -109,3 +128,52 @@ def target_execution_reading_prompt(prompt: str, workspace_directory: Path) -> s
         return prompt
     from meta_research.owners.common import canonical_json
     return "Execution reading tools:\n" + canonical_json(target_execution_reading_tools(workspace_directory)) + "\n" + prompt
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Check a Target result draft against its supplied primary Protocol keys.")
+    parser.add_argument("--check-result", required=True, metavar="PROTOCOL_JSON")
+    args = parser.parse_args(argv)
+    try:
+        protocol = json.loads(args.check_result)
+    except (ValueError, RecursionError):
+        parser.error("--check-result needs the JSON from the Target execution contract")
+    if (
+        not isinstance(protocol, dict)
+        or set(protocol) != {"protocol_version_ref", "required_metric_keys", "optional_metric_keys"}
+        or not isinstance(protocol["protocol_version_ref"], str)
+        or not protocol["protocol_version_ref"]
+        or any(
+            not isinstance(protocol[key], list)
+            or any(not isinstance(name, str) or not name for name in protocol[key])
+            for key in ("required_metric_keys", "optional_metric_keys")
+        )
+    ):
+        parser.error("--check-result needs the exact ProtocolVersion ref and its two key lists")
+
+    from meta_research.formal_entities import check_primary_metric_keys
+    from meta_research.target_run_finalizer import read_reserved_target_result_draft
+
+    details: dict[str, object] = {"protocol_version_ref": protocol.pop("protocol_version_ref")}
+    try:
+        draft = read_reserved_target_result_draft(Path.cwd())
+        details["draft_sha256"] = draft.raw_sha256
+        check = check_primary_metric_keys(draft.document.as_dict(), **protocol)
+        status = "keys_match" if check.conforms else "metric_key_mismatch"
+        details.update(
+            status="no_completed_assessment" if check.run_only else status,
+            run_key=check.run_key,
+            attempt_key=check.attempt_key,
+            missing_metric_keys=list(check.missing_keys),
+            unexpected_metric_keys=list(check.unexpected_keys),
+        )
+    except OwnerConflict as error:
+        details.update(status="draft_unreadable", code=error.code)
+        if feedback := getattr(error, "feedback", None):
+            details["feedback"] = feedback
+    print(canonical_json(details))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

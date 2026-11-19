@@ -589,5 +589,6 @@ def _measurement_authority(target_ref, launch):
         target_ref=target_ref, graph_ref=launch.graph_ref,
         target_spec_hash=SOURCE_SPEC_HASH,
         authority_ref="authority-a", authority_hash="a" * 64,
+        identities=SimpleNamespace(protocol_version_ref="protocol-a"),
         measurement_contract=contract,
     )

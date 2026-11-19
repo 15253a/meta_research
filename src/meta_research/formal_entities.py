@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from contextvars import ContextVar
+from dataclasses import dataclass
 from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.target_content_issue import TargetContentIssue
@@ -579,6 +580,49 @@ def primary_work_metrics(document, *, work=None):
 def primary_evaluation_status(document, *, work=None):
     _, attempt = (_declared_work(document) if work is None else work)[0]
     return 'pending' if attempt is None else ('failed' if attempt.get('status') == 'failed' else 'completed')
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryMetricKeyCheck:
+    """One deterministic verdict on the selected primary evaluation's metric keys.
+
+    Names only: this is the frozen Protocol's key set against the one draft, not
+    an assessment of values, artifacts or scientific adequacy.
+    """
+
+    run_key: str
+    attempt_key: str | None
+    missing_keys: tuple[str, ...]
+    unexpected_keys: tuple[str, ...]
+    run_only: bool
+
+    @property
+    def conforms(self) -> bool:
+        return not self.missing_keys and not self.unexpected_keys
+
+
+def check_primary_metric_keys(document, *, required_metric_keys, optional_metric_keys, work=None):
+    """Apply exactly the metric-key predicate formal acceptance applies.
+
+    The selected primary actual assessment owns the metrics; a summary-only
+    document uses its top-level ``metrics``. Explicit actual work with no
+    completed assessment yet carries no MetricResult and is not checked. Every
+    other key, value, artifact and identity rule stays with its own boundary.
+    """
+    work = _declared_work(document) if work is None else work
+    run, attempt = work[0]
+    run_only = explicit_run_only(document, work=work)
+    actual = primary_work_metrics(document, work=work)
+    metric_keys = set(actual)
+    required_keys = set(required_metric_keys)
+    allowed_keys = required_keys | set(optional_metric_keys)
+    return PrimaryMetricKeyCheck(
+        run_key=run['run_key'],
+        attempt_key=attempt['attempt_key'] if attempt is not None else None,
+        missing_keys=() if run_only else tuple(sorted(required_keys - metric_keys)),
+        unexpected_keys=() if run_only else tuple(sorted(metric_keys - allowed_keys)),
+        run_only=run_only,
+    )
 
 
 def verify_report_only_assessments(document, entries, *, work=None):

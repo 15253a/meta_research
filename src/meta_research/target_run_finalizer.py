@@ -1761,20 +1761,7 @@ def _declared_target_completion_candidate(*, handle, evidence, root_descriptor):
         result_document_path='outputs/result.json',
         summary='System-bound invalid Target declaration; final_text_sha256=' + evidence.final_text_sha256 + '.')
     try:
-        try:
-            descriptor, info = _open_workspace_artifact(root_descriptor, 'outputs/result.json')
-        except OwnerConflict as error:
-            if error.code != 'target_root_artifact_missing':
-                raise
-            raise DeclaredCandidateIssue(error.code, '$.result_document_path', 'outputs/result.json',
-                                         'declared result path does not exist') from error
-        try:
-            if not stat.S_ISREG(info.st_mode):
-                raise DeclaredCandidateIssue('target_root_result_document_invalid',
-                    '$.result_document_path', 'outputs/result.json', 'expected a regular JSON file')
-            raw = _read_stable_regular_file(descriptor, info, result_document=True, relative_path='outputs/result.json')
-        finally:
-            os.close(descriptor)
+        raw = _read_result_draft_bytes(root_descriptor)
         try:
             result = _decode_result_document_bytes(raw)
         except DeclaredCandidateIssue:
@@ -2627,6 +2614,46 @@ def _descriptor_stat_identity(value: os.stat_result) -> tuple[int, ...]:
 
 def _decode_result_document_bytes(content: bytes) -> TargetRootResultDocument:
     return _parse_result_document_bytes(content)[0]
+
+
+@dataclass(frozen=True, slots=True)
+class TargetResultDraft:
+    """One draft read as bytes, bound to the hash those exact bytes have."""
+
+    raw_sha256: str
+    document: TargetRootResultDocument
+
+
+def _read_result_draft_bytes(root_descriptor: int) -> bytes:
+    path = "outputs/result.json"
+    try:
+        descriptor, info = _open_workspace_artifact(root_descriptor, path)
+    except OwnerConflict as error:
+        if error.code != "target_root_artifact_missing":
+            raise
+        raise DeclaredCandidateIssue(error.code, "$.result_document_path", path,
+                                     "declared result path does not exist") from error
+    try:
+        if not stat.S_ISREG(info.st_mode):
+            raise DeclaredCandidateIssue("target_root_result_document_invalid",
+                "$.result_document_path", path, "expected a regular JSON file")
+        return _read_stable_regular_file(descriptor, info, result_document=True,
+                                         relative_path=path)
+    finally:
+        os.close(descriptor)
+
+
+def read_reserved_target_result_draft(workspace_root: Path) -> TargetResultDraft:
+    """Read one draft with the same bounded no-follow path as formal completion."""
+    pinned = _pin_workspace_root("target-result-draft-check", workspace_root)
+    try:
+        raw = _read_result_draft_bytes(pinned.descriptor)
+    finally:
+        os.close(pinned.descriptor)
+    return TargetResultDraft(
+        raw_sha256=hashlib.sha256(raw).hexdigest(),
+        document=_decode_result_document_bytes(raw),
+    )
 
 
 def _parse_result_document_bytes(content: bytes) -> tuple[TargetRootResultDocument, bytes]:

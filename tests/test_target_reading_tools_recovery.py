@@ -33,7 +33,16 @@ def test_reading_tools_only_enter_new_snapshot_and_unknown_operation_keeps_origi
     (tmp_path / "inputs/manifest.json").write_text(canonical_json({
         "schema_ref": "meta-research/target-root-input-pointer/v1",
         "read_only_manifest_path": str(manifest), "manifest_sha256": hashlib.sha256(original).hexdigest()}))
-    prompt = "Exact Owner context:\n" + canonical_json({"frozen_input_manifest_path": str(manifest)})
+    material = {"frozen_input_manifest_path": str(manifest)}
+    new_release_material = {
+        **material,
+        "execution_contract": {"result_draft_check": {"argv": [
+            "project-python", "-m", "meta_research.target_execution_contract", "--check-result",
+            '{"protocol_version_ref": "protocol:1", "required_metric_keys": ["effect"], "optional_metric_keys": []}',
+        ]}},
+    }
+    new_release_prompt = "Exact Owner context:\n" + canonical_json(new_release_material)
+    prompt = "Exact Owner context:\n" + canonical_json(material) if old_operation else new_release_prompt
 
     def runtime():
         adapter = CodexHarnessAdapter(tmp_path / "adapter", runner=HarnessSupervisorTransport(tmp_path / "supervisor",
@@ -65,6 +74,7 @@ def test_reading_tools_only_enter_new_snapshot_and_unknown_operation_keeps_origi
         frozen = captured[0].prompt
         assert sealed.frozen_prompt == frozen
         assert ("Execution reading tools:\n" in frozen) is not old_operation
+        assert ("result_draft_check" in frozen) is not old_operation
         if not old_operation:
             tools = json.loads(frozen.split("Execution reading tools:\n", 1)[1].splitlines()[0])
             assert Path(tools["project_python"]).is_absolute()
@@ -73,7 +83,7 @@ def test_reading_tools_only_enter_new_snapshot_and_unknown_operation_keeps_origi
         monkeypatch.setattr(contract, "target_execution_reading_prompt", augment)
         monkeypatch.setattr(CodexHarnessAdapter, "invoke", invoke)
         with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
-            runtime().run_or_resume_target_root(request.request_ref, prompt=prompt, mcp_base_url="http://127.0.0.1:8999")
+            runtime().run_or_resume_target_root(request.request_ref, prompt=new_release_prompt, mcp_base_url="http://127.0.0.1:8999")
         recovered = owner.latest_operation(run.run_ref)
         assert recovered.operation_ref == sealed.operation_ref
         assert recovered.invocation_hash == sealed.invocation_hash
@@ -86,7 +96,7 @@ def test_reading_tools_only_enter_new_snapshot_and_unknown_operation_keeps_origi
         assert runner.calls == 0
         assert runner.request_path is None
         with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
-            runtime().run_or_resume_target_root(request.request_ref, prompt=prompt, mcp_base_url="http://127.0.0.1:8999")
+            runtime().run_or_resume_target_root(request.request_ref, prompt=new_release_prompt, mcp_base_url="http://127.0.0.1:8999")
         retained = owner.latest_operation(run.run_ref)
         assert runner.calls == 0
         assert runner.request_path is None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 
@@ -68,7 +69,7 @@ def test_initial_result_schema_remains_a_reference_for_new_scientific_results():
         _validate_target_result_schema(schema=schema, result_content=changed)
 
 
-def test_prompt_contains_complete_frozen_contract_and_scope_checks(tmp_path):
+def test_prompt_contains_complete_frozen_contract_and_scope_checks(tmp_path, monkeypatch, capsys):
     from pathlib import Path
     from types import SimpleNamespace
     from test_public_guidance_delivery import _developer
@@ -90,6 +91,55 @@ def test_prompt_contains_complete_frozen_contract_and_scope_checks(tmp_path):
     frozen = context["execution_contract"]["measurement_contract"]
     assert frozen["protocol_version"]["required_metrics"][0]["metric_key"] == "effect"
     assert frozen["protocol_version"]["preprocessing"] == {"normalization": "train_only"}
+    argv = context["execution_contract"]["result_draft_check"]["argv"]
+    assert argv[1:4] == ["-m", "meta_research.target_execution_contract", "--check-result"]
+    assert json.loads(argv[-1]) == {
+        "protocol_version_ref": "protocol-a", "required_metric_keys": ["effect"], "optional_metric_keys": [],
+    }
+
+    from meta_research.target_execution_contract import main
+    monkeypatch.chdir(tmp_path)
+    draft = tmp_path / "outputs/result.json"
+    draft.parent.mkdir()
+    value = {
+        "metrics": {"effect": None, "summary_only": 2},
+        "formal_runs": [{"run_key": "metadata", "evaluations": [
+            {"attempt_key": "directory", "metrics": {"extra": 0}},
+        ]}],
+    }
+    raw = json.dumps(value, indent=2).encode()
+    draft.write_bytes(raw)
+    assert main(argv[3:]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "metric_key_mismatch",
+        "draft_sha256": hashlib.sha256(raw).hexdigest(),
+        "protocol_version_ref": "protocol-a",
+        "run_key": "metadata", "attempt_key": "directory",
+        "missing_metric_keys": ["effect"], "unexpected_metric_keys": ["extra"],
+    }
+    assert draft.read_bytes() == raw
+    value["formal_runs"][0]["evaluations"][0]["metrics"] = {"effect": None}
+    draft.write_text(canonical_json(value), encoding="utf-8")
+    assert main(argv[3:]) == 0
+    fixed = json.loads(capsys.readouterr().out)
+    assert fixed["status"] == "keys_match"
+    assert fixed["draft_sha256"] != hashlib.sha256(raw).hexdigest()
+    assert json.loads(draft.read_bytes()) == value
+
+    value["formal_runs"][0]["evaluations"] = []
+    draft.write_text(canonical_json(value), encoding="utf-8")
+    assert main(argv[3:]) == 0
+    run_only = json.loads(capsys.readouterr().out)
+    assert run_only["status"] == "no_completed_assessment"
+    assert run_only["missing_metric_keys"] == run_only["unexpected_metric_keys"] == []
+
+    outside = tmp_path / "outside.json"
+    draft.rename(outside)
+    draft.symlink_to(outside)
+    assert main(argv[3:]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "draft_unreadable"
+    assert json.loads(outside.read_bytes()) == value
+
     assert frozen["result_schema"] == {"type": "object"}
     assert frozen["checkpoint_policy"] == "optional"
     limits = context["execution_contract"]["artifact_limits"]
