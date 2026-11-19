@@ -25,30 +25,34 @@ Plan 接受 TargetCommit、HumanInput、ScientificOutcome、AssetVersion 和 Lit
 
 ### Plan 证据正文的分页读取
 
-`research_memory.plan_evidence.read` 首轮传 `offset=0` 与具体 `limit`，例如 8192。返回值只取 MCP 真实 `structuredContent`：先看信封，`isError`、`error` 或 `structuredContent.code` 任一出现即抛 `Error`，只用该 code 作说明；再校验页，`text` 须为字符串，`total_characters` 须通过 `Number.isSafeInteger` 且非负。
+`research_memory.plan_evidence.read` 使用 reader 的四个来源身份、`offset` 与 `limit`。分组用的本地键留在调用者。每一页先检查 MCP 错误并带回字段诊断，交由当前 Agent 决定如何修正。成功页的 `text` 须为字符串，`total_characters` 须为非负安全整数。
 
-本页终点取 `offset + Array.from(p.text).length`（按码点计数），超过 `total_characters` 即报错。`next_offset` 缺省只在本页终点等于 `total_characters` 时才算 EOF；出现时须为安全整数、等于本页终点、大于 `offset` 且小于 `total_characters`。任何失败都立即停止后续请求；空字符串的合法页照常收取；只有整段读完后才按完整正文采用，读全不等于证据已被采用。
+本页终点为 `offset + Array.from(p.text).length`（按码点计数）。末页返回 `next_offset: null`，早期记录可缺省该键，两者均须核对本页终点等于 `total_characters`。续页游标须为安全整数，等于本页终点并使读取向前推进。空字符串的合法末页照常收取。完整性核对通过后，再判断整段内容能支持什么。
 
 ```javascript
 async function readPlanEvidence(call, binding, consume) {
   const operation_id = "research_memory.plan_evidence.read";
+  const { target_commit_ref, asset_version_ref, content_hash, role_ref } = binding;
   for (let offset = 0; ; ) {
-    const result = await call({ operation_id, arguments: { ...binding, offset, limit: 8192 } });
+    const result = await call({ operation_id, arguments: {
+      target_commit_ref, asset_version_ref, content_hash, role_ref, offset, limit: 8192
+    } });
     const p = result?.structuredContent;
     const code = p?.code ?? (typeof result?.error === "string" ? result.error : undefined);
     if (result?.isError === true || result?.error != null || code != null)
-      throw new Error(`plan_evidence.read 失败：${code ?? "isError"}`);
+      throw new Error(JSON.stringify({ code: code ?? "isError", details: p?.details }));
     if (!p || typeof p.text !== "string") throw new Error("plan_evidence.read 缺少字符串 text");
     const total = p.total_characters;
     if (!Number.isSafeInteger(total) || total < 0) throw new Error("total_characters 须为非负安全整数");
     const end = offset + Array.from(p.text).length;
     if (end > total) throw new Error(`页越界：end=${end} total=${total}`);
     const next = p.next_offset;
-    if (next === undefined && end !== total) throw new Error("next_offset 缺省但本页未到末尾");
-    if (next !== undefined && !(Number.isSafeInteger(next) && next === end && next > offset && next < total))
+    const atEnd = next === null || next === undefined;
+    if (atEnd && end !== total) throw new Error("末页长度与 total_characters 不符");
+    if (!atEnd && !(Number.isSafeInteger(next) && next === end && next > offset && next < total))
       throw new Error(`非法 next_offset：${next}`);
     await consume(p);
-    if (next === undefined) return;
+    if (atEnd) return;
     offset = next;
   }
 }

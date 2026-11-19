@@ -841,7 +841,11 @@ def _plan_evidence_operations(
             semantic_operation_id="research_memory.plan_evidence.read",
             owning_module="research_memory",
             description="Read an exact evidence asset version and hash in bounded text chunks within the current Plan Quest; historical reads require a frozen request binding.",
-            return_description="Offsets count characters. Continue at the returned next_offset; null marks the last page.",
+            return_description=(
+                "Check isError on every response before reading a cursor. On error stop the paging loop "
+                "and inspect structuredContent.details for the correction. On success next_offset is "
+                "the next character offset, or null on the last page."
+            ),
             input_schema={"type": "object", "properties": {
                 "target_commit_ref": _string(max_length=256),
                 "asset_version_ref": _string(max_length=256), "content_hash": _hash_schema(),
