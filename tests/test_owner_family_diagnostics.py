@@ -99,6 +99,12 @@ def test_plan_evidence_owner_failures_keep_exact_binding_and_same_grant_continue
         read_op = 'research_memory.plan_evidence.read'
         content = _accepted(_call(runtime, channel, read_op, **read_args))
         assert content['text'] == '{"accepted":true}\n'
+        assert content['next_offset'] is None
+        first = _accepted(_call(runtime, channel, read_op, **{**read_args, 'limit': 5}))
+        assert first['next_offset'] == 5
+        last = _accepted(_call(runtime, channel, read_op, **{**read_args, 'offset': first['next_offset']}))
+        assert last['next_offset'] is None
+        assert first['text'] + last['text'] == content['text']
         # Only unavailable Owner I/O is injected; recovery uses real retained
         # evidence, its immutable version/hash, and the original Plan grant.
         for owner, method, op, args in (

@@ -841,6 +841,7 @@ def _plan_evidence_operations(
             semantic_operation_id="research_memory.plan_evidence.read",
             owning_module="research_memory",
             description="Read an exact evidence asset version and hash in bounded text chunks within the current Plan Quest; historical reads require a frozen request binding.",
+            return_description="Offsets count characters. Continue at the returned next_offset; null marks the last page.",
             input_schema={"type": "object", "properties": {
                 "target_commit_ref": _string(max_length=256),
                 "asset_version_ref": _string(max_length=256), "content_hash": _hash_schema(),
@@ -853,8 +854,8 @@ def _plan_evidence_operations(
                 "selected_evidence_binding": {"type": "object"},
                 "frozen_for_plan": {"type": "boolean"}, "text": {"type": "string"},
                 "total_characters": {"type": "integer"},
-                "next_offset": {"type": "integer"},
-            }, "required": ["context_pack_ref", "source_binding", "frozen_for_plan", "text", "total_characters"], "additionalProperties": False},
+                "next_offset": {"type": ["integer", "null"]},
+            }, "required": ["context_pack_ref", "source_binding", "frozen_for_plan", "text", "total_characters", "next_offset"], "additionalProperties": False},
             handler=lambda context, arguments: _read_plan_evidence_content(
                 advancement_engine, agent_runtime, research_graph, research_memory,
                 context, arguments,
@@ -943,7 +944,7 @@ def _read_plan_evidence_content(advancement_engine, agent_runtime, research_grap
         "selected_evidence_binding": target_adoption_binding(binding),
         "frozen_for_plan": frozen is not None, "text": body[offset:next_offset],
         "total_characters": len(body),
-        **({"next_offset": next_offset} if next_offset < len(body) else {}),
+        "next_offset": next_offset if next_offset < len(body) else None,
     }
 
 
