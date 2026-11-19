@@ -13,7 +13,7 @@ from sqlalchemy import text
 from meta_research.bundle_protocol import TargetWorkHandle, projection_plain_value
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
-from meta_research.error_contract import error_contract_from_legacy
+from meta_research.error_contract import PROVIDER_INSUFFICIENT_BALANCE, error_contract_from_legacy
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json, new_ref
 from meta_research import target_recovery_model
 from meta_research.provider_supervisor import (
@@ -37,6 +37,7 @@ TARGET_ROOT_RECOVERY_READY_CODE = "target_root_recovery_ready"
 TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE = "human_request_wait"
 _TARGET_ROOT_RETRY_BASE_SECONDS = 1.0
 _TARGET_ROOT_RETRY_MAX_SECONDS = 60.0
+_TARGET_BALANCE_RETRY_SECONDS = 300.0
 _PROVIDER_CEILING_CODES = frozenset(
     {
         "provider_timeout",
@@ -3476,7 +3477,7 @@ class SQLiteAgentRuntimeHarness:
                     failed_at=now,
                     next_retry_at=(
                         now
-                        + _target_root_retry_delay(consecutive_failures)
+                        + _target_root_retry_delay(consecutive_failures, failure_code=code)
                     ),
                 )
         return retry
@@ -4685,14 +4686,21 @@ def _target_root_retry(
         consecutive_failures=consecutive_failures,
         failed_at=anchor_at,
         next_retry_at=(
-            anchor_at + _target_root_retry_delay(consecutive_failures)
+            anchor_at + _target_root_retry_delay(
+                consecutive_failures,
+                failure_code=failure_code if run.status == "failed" else None,
+            )
         ),
     )
 
 
-def _target_root_retry_delay(consecutive_failures: int) -> float:
+def _target_root_retry_delay(
+    consecutive_failures: int, *, failure_code: str | None = None,
+) -> float:
     if consecutive_failures < 1:
         raise AgentRuntimeHarnessError("target_root_failure_recovery_unsafe")
+    if failure_code == PROVIDER_INSUFFICIENT_BALANCE:
+        return _TARGET_BALANCE_RETRY_SECONDS
     return min(
         _TARGET_ROOT_RETRY_BASE_SECONDS
         * (2 ** min(consecutive_failures - 1, 30)),

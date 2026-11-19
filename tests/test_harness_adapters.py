@@ -23,6 +23,7 @@ from meta_research.harness_adapters import (
     HarnessAdapterUnavailable,
     HarnessInvocation,
     HarnessSupervisorTransport,
+    _codex_turn_insufficient_balance,
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
@@ -49,6 +50,27 @@ def test_signed_supervisor_receipt_preserves_native_signal_returncode(
     )
     assert completed.returncode == -native_signal
     assert completed.meta_research_transport_receipt["provider_returncode"] == -native_signal
+
+
+@pytest.mark.parametrize(("status", "body", "expected"), [
+    (403, "insufficient balance, url: https://provider.invalid", True),
+    (403, '{"code":"INSUFFICIENT_BALANCE","message":"rejected"}, url: https://provider.invalid', True),
+    (403, '{"code":"other","message":"insufficient balance"}', False),
+    (403, '{"code":"INSUFFICIENT_BALANCE"} unexpected suffix', False),
+    (401, '{"code":"INSUFFICIENT_BALANCE"}', False),
+    (429, '{"code":"INSUFFICIENT_BALANCE"}', False),
+])
+def test_codex_turn_balance_failure_requires_explicit_provider_rejection(status, body, expected):
+    failure = {
+        "type": "turn.failed",
+        "error": {
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": status}},
+            "message": f"unexpected status 403 Forbidden: {body}",
+        },
+    }
+    bridge = {"type": "meta_research.provider_error", "error_kind": "auth_revoked"}
+    assert _codex_turn_insufficient_balance((failure, bridge)) is expected
+    assert not _codex_turn_insufficient_balance((failure, {"type": "turn.completed"}, bridge))
 
 
 _REAL_CODEX_CHILD_LEDGER = Path(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from meta_research.error_contract import PROVIDER_INSUFFICIENT_BALANCE
 from meta_research.external_mcp import ExternalMcpAccess
 from meta_research.resource_preparation import resource_preparation
 from meta_research.native_guidance import live_native_argv, sealed_native_cli_version
@@ -491,12 +492,22 @@ class _NativeCliHarnessAdapter:
                 "stopped": "provider_stopped",
                 "launch_failed": "provider_launch_failed",
             }.get(reason)
-            code = signed_code or (
-                "provider_auth_revoked"
-                if _looks_like_auth_failure(completed.stderr)
-                or _stream_has_auth_failure(completed.stdout)
-                else "provider_failed"
-            )
+            if (
+                invocation.root_kind == "target"
+                and isinstance(receipt, dict)
+                and reason == "completed"
+                and receipt.get("provider_returncode") == completed.returncode
+                and receipt.get("supervisor_receipt_hash")
+                and _codex_turn_insufficient_balance(events)
+            ):
+                code = PROVIDER_INSUFFICIENT_BALANCE
+            else:
+                code = signed_code or (
+                    "provider_auth_revoked"
+                    if _looks_like_auth_failure(completed.stderr)
+                    or _stream_has_auth_failure(completed.stdout)
+                    else "provider_failed"
+                )
             raise HarnessAdapterUnavailable(
                 code,
                 transport_receipt=(cast(dict[str, object], receipt) if isinstance(receipt, dict) else None),
@@ -4048,6 +4059,40 @@ def _capabilities_from_inventory(names: tuple[str, ...]) -> set[str]:
     if names:
         capabilities.add("tool_inventory")
     return capabilities
+
+
+def _codex_turn_insufficient_balance(events: tuple[dict[str, object], ...]) -> bool:
+    if events and events[-1].get("type") == "meta_research.provider_error":
+        events = events[:-1]
+    if not events or events[-1].get("type") != "turn.failed":
+        return False
+    error = events[-1].get("error")
+    if not isinstance(error, dict):
+        return False
+    info = error.get("codexErrorInfo")
+    connection = info.get("httpConnectionFailed") if isinstance(info, dict) else None
+    message = error.get("message")
+    prefix = "unexpected status 403 forbidden:"
+    if (
+        not isinstance(connection, dict)
+        or connection.get("httpStatusCode") != 403
+        or not isinstance(message, str)
+        or not message.casefold().startswith(prefix)
+    ):
+        return False
+    body = message[len(prefix):].lstrip()
+    plain = body.casefold()
+    if plain == "insufficient balance" or plain.startswith("insufficient balance, url:"):
+        return True
+    try:
+        response, end = json.JSONDecoder().raw_decode(body)
+    except (ValueError, RecursionError):
+        return False
+    suffix = body[end:].strip().casefold()
+    if suffix and not suffix.startswith(", url:"):
+        return False
+    code = response.get("code") if isinstance(response, dict) else None
+    return isinstance(code, str) and code.strip().casefold() == "insufficient_balance"
 
 
 def _looks_like_auth_failure(stderr: str) -> bool:

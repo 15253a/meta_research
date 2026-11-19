@@ -48,6 +48,9 @@ _ROUTING = {
     "system": RecoveryOwner.SYSTEM,
     "operator": RecoveryOwner.OPERATOR,
 }
+PROVIDER_INSUFFICIENT_BALANCE = "provider_insufficient_balance"
+
+
 STABLE_ERROR_CODE_MAP = {
     "semantic_input_schema_mismatch": "input.invalid",
     "capability_unavailable": "capability.unavailable",
@@ -229,6 +232,11 @@ def error_contract_from_legacy(
     """Map an existing code/details pair without changing Owner semantics."""
 
     raw = dict(details or {})
+    if code == PROVIDER_INSUFFICIENT_BALANCE and type(raw.get("next_retry_at")) in {int, float}:
+        raw.setdefault("effect_status", "waiting")
+        raw.setdefault("next_action", "wait")
+        raw.setdefault("recovery_component", "target_runtime")
+        raw.setdefault("handoff", {"next_retry_at": raw["next_retry_at"]})
     operation_id = str(raw.get("operation_id") or operation_id)
     effect_id = effect_id or (raw.get("effect_id") if isinstance(raw.get("effect_id"), str) else None)
     operation_ref = operation_ref or (raw.get("operation_ref") if isinstance(raw.get("operation_ref"), str) else None)
