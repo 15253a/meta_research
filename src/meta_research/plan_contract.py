@@ -39,6 +39,12 @@ class PlanContractError(ValueError):
     """A Plan candidate or its frozen invocation closure is invalid."""
 
 
+def adoption_binding_with_reader_quest(binding, quest_ref):
+    """Keep the accepted source identity when making its reader Quest explicit."""
+    reader = binding["reader"]
+    return {**binding, "reader": {**reader, "args": {**reader["args"], "source_quest_ref": quest_ref}}}
+
+
 def validate_plan_context_pack(
     context_pack: dict[str, object],
     *,

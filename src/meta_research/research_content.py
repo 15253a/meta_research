@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from meta_research.context_presentation import ExactContextPages, context_read_page
 from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.plan_contract import adoption_binding_with_reader_quest
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
 from meta_research.research_pagination import bind_page, page_state
 from meta_research.accepted_materials import DeepFetchAcceptedMaterials
@@ -499,9 +500,9 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
             result = read_content(research_graph,research_memory,quest_ref=quest_ref,human_collaboration=human_collaboration,page_cache=page_cache,
                 reader_source_quest_ref=selected_quest, **arguments)
             if selected_quest is not None:
-                exact_reader = result.get("selected_evidence_binding", {}).get("reader")
-                if exact_reader is not None:
-                    exact_reader["args"] = _reader(exact_reader["args"], selected_quest)
+                binding = result.get("selected_evidence_binding")
+                if binding is not None:
+                    result["selected_evidence_binding"] = adoption_binding_with_reader_quest(binding, selected_quest)
                 history_reader = result.get("lifecycle", {}).get("history_reader")
                 if history_reader is not None:
                     history_reader["args"] = _reader(history_reader["args"], selected_quest)

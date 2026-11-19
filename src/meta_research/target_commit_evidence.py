@@ -22,7 +22,11 @@ from meta_research.owners.research_graph import (
     TargetCommitEvidenceAuthority,
 )
 from meta_research.owners.research_memory import ResearchMemoryInterface
-from meta_research.plan_contract import EVIDENCE_REF_SCHEMA_REF, GENERIC_EVIDENCE_KINDS
+from meta_research.plan_contract import (
+    EVIDENCE_REF_SCHEMA_REF,
+    GENERIC_EVIDENCE_KINDS,
+    adoption_binding_with_reader_quest,
+)
 
 
 TARGET_COMMIT_EVIDENCE_SCHEMA_REF = "meta-research/target-commit-evidence/v1"
@@ -42,6 +46,10 @@ def target_adoption_binding(binding):
             "reader": {"operation": "research_memory.content.read", "args": {
                 "source_ref": binding.get("target_commit_root_ref"),
                 "version_ref": binding.get("asset_version_ref")}}}
+
+
+def _matches_adoption_binding(item, expected, quest_ref):
+    return item == expected or item == adoption_binding_with_reader_quest(expected, quest_ref)
 
 
 def target_commit_evidence_closure_refs(
@@ -418,7 +426,8 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                 continue
             if "source_kind" in item:
                 binding = item.get("source_binding")
-                if (not isinstance(binding, dict) or item != target_adoption_binding(binding)):
+                if (not isinstance(binding, dict) or not _matches_adoption_binding(
+                        item, target_adoption_binding(binding), quest_ref)):
                     raise OwnerConflict("plan_evidence_source_invalid")
             else:
                 # This is the existing frozen discovery-page protocol, rather
@@ -461,8 +470,12 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             raise OwnerConflict("plan_evidence_source_invalid")
         source = self._research_graph.resolve_reasoning_historical_evidence_leaf(
             quest_ref=quest_ref, ref=item["source_ref"])
-        if source is None or item != adopted_source_binding(
-                self._research_graph, quest_ref=quest_ref, source_ref=item["source_ref"], leaf=source):
+        if source is None:
+            raise OwnerConflict("plan_evidence_source_invalid")
+        expected = adopted_source_binding(
+            self._research_graph, quest_ref=quest_ref, source_ref=item["source_ref"], leaf=source
+        )
+        if not _matches_adoption_binding(item, expected, quest_ref):
             raise OwnerConflict("plan_evidence_source_invalid")
         return source
 
