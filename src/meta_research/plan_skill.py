@@ -26,11 +26,14 @@ from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     _DISABLED_CODEX_FEATURES,
     _CODEX_JSON_OBJECT_STRING_MARKER,
+    _CODEX_TRANSPORT_DECODE_FAILURE_KEY,
+    _SEALED_TRANSPORT_CONTRACT_FAILURES,
     _compile_codex_output_schema,
     _decode_codex_provider_output,
     _codex_harness_manifest,
     _file_sha256,
     _shared_codex_adapter_source_hash,
+    _unwrap_codex_root_output,
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -602,16 +605,24 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 break
         else:
             raise PlanSkillUnavailable("codex_operation_identity_conflict")
-        output, session, _ = read_completed_operation(
-            directory, invocation_hash=canonical_hash(invocation),
-            native_session_ref=request.native_session_ref, transport_limits=limits,
-        )
         try:
-            decoded = _decode_codex_provider_output(output, schema)
+            output, session, _ = read_completed_operation(
+                directory, invocation_hash=canonical_hash(invocation),
+                native_session_ref=request.native_session_ref, transport_limits=limits,
+            )
+        except PlanSkillUnavailable as error:
+            if error.code not in _SEALED_TRANSPORT_CONTRACT_FAILURES:
+                raise
+            raise self._sealed_transport_contract_failure(
+                directory=directory, job_ref=request.job_ref, operation_name="primary",
+                native_session_ref=request.native_session_ref,
+            ) from error
+        try:
+            decoded = _decode_codex_provider_output(_unwrap_codex_root_output(output, schema), schema)
         except PlanSkillUnavailable as error:
             if error.code != "codex_json_object_transport_invalid":
                 raise
-            decoded = {}
+            decoded = {_CODEX_TRANSPORT_DECODE_FAILURE_KEY: error.code}
         return decoded, session, invocation
 
     def _read_submitted_plan(
