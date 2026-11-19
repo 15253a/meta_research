@@ -9363,11 +9363,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                            "primary_draft": None if item.primary_draft_json is None else decoded_object(item.primary_draft_json),
                            "execution": None if item.payload_json is None else decoded_object(item.payload_json)}
                           for item in attempts if item.primary_draft_json is not None or item.payload_json is not None]
+            inherited = checkpoint.get("inherited_terminal")
             return {"kind": "native_session_replacement", "stage_request_ref": row.request_ref,
                     "context_pack_ref": row.context_pack_ref, "context_pack_hash": row.context_pack_hash,
-                    "retired_attempt_ref": row.attempt_ref,
-                    "retired_native_session_ref": checkpoint["provider_exit"]["native_session_ref"],
-                    "provider_operation_ref": checkpoint["provider_operation_ref"],
+                    "retired_attempt_ref": row.attempt_ref if inherited is None else inherited["originating_attempt_ref"],
+                    "retired_native_session_ref": _retired_checkpoint_native(checkpoint),
+                    "provider_operation_ref": checkpoint["provider_operation_ref"] if inherited is None else inherited["terminal_operation_ref"],
+                    **({"unexecuted_attempt_ref": row.attempt_ref, "inherited_terminal": inherited} if inherited is not None else {}),
                     "safe_point_ref": row.safe_point_ref, "replacement_checkpoint_hash": row.checkpoint_hash,
                     "saved_work": saved_work,
                     "owner_feedback": [{"candidate_ref": item.candidate_ref,
@@ -9402,6 +9404,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 if replacement.reason_code == "bundle_runtime_refreshed":
                     from meta_research.bundle_runtime_refresh import verify_runtime_refresh_replacement
                     verify_runtime_refresh_replacement(connection, run_ref, feedback_attempt_ref)
+                    from meta_research.bundle_provider_transition import replacement_checkpoint
+                    checkpoint = replacement_checkpoint(connection, run_ref, control.attempt_ref, control.fence_ref)
+                    if checkpoint is not None and checkpoint.replacement_attempt_ref == feedback_attempt_ref:
+                        # This approved new native session starts from the saved graph. Its
+                        # retired primary's correction is not an instruction for this turn.
+                        break
                 run, current, session, current_fence = _load_stage_fence(
                     connection, run_ref, feedback_attempt_ref, cursor_fence_ref)
                 previous = connection.execute(text(
@@ -9476,6 +9484,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     + ". Reconcile original external effects before repeating them."
                     if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
+                    "bundle_propose_targets_replan_basis_not_null": (
+                        "preserve strategy_update and set replan_basis=null when action=propose_targets"
+                    ),
+                    "strategy_consumed_unaccepted_result": (
+                        "match each actual consumption by target_ref from target_commits[].target_ref "
+                        "to current_targets[].spec.candidate.local_label; requires_accepted_labels "
+                        "must be those labels and not global commit_ref; each included real dependency "
+                        "must also be in each proposed candidate's depends_on_labels"
+                    ),
                     "bundle_replan_work_already_complete": "当前 Plan 的工作已全部完成。研究问题尚未解决，不代表本轮工作未完成。请整理结果、局限和后续建议，正常结束 Bundle，交给 Reasoning 综合。",
                     "bundle_completion_synthesis_missing": "本轮工作已全部完成，但仍缺少完整收尾说明。请在正常收尾的 notes 中说明结果、局限和后续建议，再交给 Reasoning 综合；保留已接纳的结果，不重复 Target。",
                     "bundle_operation_inputs_changed": "旧输出针对旧 frontier/state/commit 快照；根据当前快照重新判断并保留已接纳事实。这表示决策输入已变化，不表示科学证据无效或输出格式错误。",
@@ -9573,8 +9590,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         and unit.unit_kind == "bundle_review" and primary.operation_ref == unit.operation_ref
                         and primary.status == "prepared" and bound_attempt.primary_draft_json is None
                         and bound_attempt.payload_json is None
-                        and provider_exit["native_session_ref"] != decoded_object(
-                            rolling_basis.checkpoint_json)["provider_exit"]["native_session_ref"])
+                        and provider_exit["native_session_ref"] != _retired_checkpoint_native(
+                            decoded_object(rolling_basis.checkpoint_json)))
                     bind_initial_native = bind_primary or bind_rolling
                 if ((session.native_session_ref != provider_exit["native_session_ref"] and not bind_initial_native)
                         or session.status != "active" or other_unit is not None
@@ -10644,8 +10661,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             self._operator_stop_resume_checkpoints(reservation_document["affected_runs"])
             if action == "resume" else {}
         )
-        now = time.time()
-        with self._database.write() as connection:
+        # Reserve SQLite's writer before checking or replacing a paused Bundle fence.
+        bundle_resume = action == "resume" and any(
+            item["run_kind"] == "bundle_stage" and item["status"] == "suspended"
+            for item in reservation_document["affected_runs"]
+        )
+        transaction = self._database.fenced_write if bundle_resume else self._database.write
+        with transaction() as connection:
+            now = time.time()
             replay = connection.execute(
                 text(
                     "SELECT * FROM ar_control_operations WHERE idempotency_key = "
@@ -10847,6 +10870,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         safe_points.append(resumed_safe_point)
                         row = SimpleNamespace(**{
                             **vars(row), "safe_point_ref": resumed_safe_point["safe_point_ref"]
+                        })
+                    elif (row.run_kind == "bundle_stage" and row.status == "suspended"
+                          and (stopped_bundle := _paused_bundle_stopped_checkpoint(self, connection, row)) is not None):
+                        retired = row
+                        row = self._replace_fenced_managed_attempt(
+                            connection, row, now, reuse_checkpoint=True,
+                            reuse_operation_refs=False, preserve_native_session=True,
+                        )
+                        self._feed.record(connection, "agent_runtime.paused_bundle_checkpoint_resumed", {
+                            "run_ref": row.run_ref, "root_session_ref": row.root_session_ref,
+                            "retired_attempt_ref": retired.attempt_ref, "retired_fence_ref": retired.fence_ref,
+                            "attempt_ref": row.attempt_ref, "fence_ref": row.fence_ref,
+                            "resume_operation_ref": operation_ref, **stopped_bundle,
                         })
                     elif row.status in {
                         "suspended_fenced",
@@ -24668,6 +24704,14 @@ _CORRECTION_ANCESTRY_SQL = (
 )
 
 
+def _retired_checkpoint_native(checkpoint):
+    if checkpoint.get("action") == "bundle_provider_transition":
+        if "inherited_terminal" in checkpoint:
+            return checkpoint["inherited_terminal"]["originating_native_session_ref"]
+        return checkpoint["retired_native_session_ref"]
+    return checkpoint["provider_exit"]["native_session_ref"]
+
+
 def _stage_native_replacement_row(connection, run_ref, attempt_ref, fence_ref):
     row = connection.execute(text(_CORRECTION_ANCESTRY_SQL +
         "SELECT s.*,r.context_pack_ref,r.context_pack_hash,r.request_ref,c.status AS control_status "
@@ -24683,7 +24727,8 @@ def _stage_native_replacement_row(connection, run_ref, attempt_ref, fence_ref):
         "AND (a.depth=0 OR r.stage='bundle') ORDER BY a.depth,s.created_at DESC LIMIT 1"
     ), {"run": run_ref, "attempt": attempt_ref, "fence": fence_ref}).first()
     if row is None:
-        return None
+        from meta_research.bundle_provider_transition import replacement_checkpoint
+        return replacement_checkpoint(connection, run_ref, attempt_ref, fence_ref)
     if row.control_status != "running":
         raise OwnerConflict("native_session_replacement_stale")
     if row.safe_point_ref is None:
@@ -24769,8 +24814,36 @@ def _require_bundle_report_fence(connection, run, attempt, fence):
     if basis is None:
         raise OwnerConflict("bundle_report_replacement_context_invalid")
     point = decoded_object(basis.checkpoint_json)
+    transitioning = point.get("action") == "bundle_provider_transition"
+    # A v2 checkpoint inherits the terminal unit from the retired handoff instead
+    # of repeating it; v1 carries the same facts at the top level.
+    terminal = point.get("inherited_terminal") if transitioning else None
+    if terminal is None:
+        unit_ref = point.get("provider_unit_ref")
+        operation_ref = point.get("provider_operation_ref")
+    else:
+        unit_ref = terminal["terminal_unit_ref"]
+        operation_ref = terminal["terminal_operation_ref"]
     unit = connection.execute(text("SELECT * FROM ar_provider_units WHERE unit_ref=:unit"),
-                              {"unit": point.get("provider_unit_ref")}).first()
+                              {"unit": unit_ref}).first()
+    if transitioning:
+        # replacement_checkpoint already verified the exact transition and signed ledger.
+        old_fence = basis.fence_ref if terminal is None else terminal["originating_fence_ref"]
+        old_attempt = basis.attempt_ref if terminal is None else terminal["originating_attempt_ref"]
+        rejected = {row.fence_ref for row in connection.execute(text(
+            "SELECT fence_ref FROM ar_execution_fences WHERE run_ref=:run AND status='rejected' "
+            "AND ((fence_ref=:fence AND attempt_ref=:attempt) "
+            "OR (fence_ref=:old_fence AND attempt_ref=:old_attempt))"),
+            {"run":run.run_ref, "fence":basis.fence_ref, "attempt":basis.attempt_ref,
+             "old_fence":old_fence, "old_attempt":old_attempt}).all()}
+        pending = connection.execute(text("SELECT 1 FROM ar_provider_units WHERE run_ref=:run "
+            "AND status IN ('active','revocation_pending') LIMIT 1"), {"run":run.run_ref}).first()
+        if (rejected != {basis.fence_ref, old_fence} or unit is None or unit.status != "completed"
+                or (unit.run_ref, unit.attempt_ref, unit.fence_ref, unit.operation_ref)
+                != (run.run_ref, old_attempt, old_fence, operation_ref)
+                or pending is not None or _managed_run_has_pending_root_human_request(connection, control)):
+            raise OwnerConflict("bundle_report_replacement_not_quiescent")
+        return
     isolation = connection.execute(text(
         "SELECT 1 FROM ar_fence_revocations v JOIN ar_execution_fences f ON f.fence_ref=v.fence_ref "
         "WHERE v.run_ref=:run AND v.attempt_ref=:attempt AND v.fence_ref=:fence "
@@ -29915,6 +29988,116 @@ def _resumed_bundle_checkpoint(connection, control):
     if primary.operation_ref == old_primary.operation_ref:
         return None
     return old, native, [decision.decision_ref for decision in decisions]
+
+
+def _paused_bundle_stopped_checkpoint(owner, connection, control):
+    """Resolve a rolling stop whose current safe-point pointer was overwritten by pause."""
+    revoked = connection.execute(text("SELECT * FROM ar_fence_revocations WHERE fence_ref=:fence"),
+        {"fence": control.fence_ref}).first()
+    fence_status = connection.execute(text("SELECT status FROM ar_execution_fences WHERE fence_ref=:fence"),
+        {"fence": control.fence_ref}).scalar_one_or_none()
+    if revoked is None and fence_status in {"current", "submitted"}:
+        return None  # An ordinary quiet pause keeps its live Stage Attempt.
+    if (revoked is None or revoked.reason_code != "codex_operation_stopped"
+            or control.cleanup_status != "none" or control.run_kind != "bundle_stage" or control.status != "suspended"):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    run, attempt, session, fence = _load_stage_fence(connection, control.run_ref, control.attempt_ref, control.fence_ref)
+    if (run.stage != "bundle" or run.status != "awaiting_acceptance" or attempt.status != "executed"
+            or (run.current_attempt_ref, run.current_fence_ref, run.root_session_ref, run.cycle_ref, run.epoch)
+            != (attempt.attempt_ref, fence.fence_ref, control.root_session_ref, control.cycle_ref, control.epoch)
+            or not session.native_session_ref or session.status != "active" or attempt.decision_receipt_ref is not None):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    stop = connection.execute(text(
+        "SELECT * FROM ar_safe_points WHERE operation_ref=:op AND run_ref=:run AND attempt_ref=:attempt "
+        "AND root_session_ref=:root AND fence_ref=:fence"),
+        {"op": revoked.operation_ref, "run": control.run_ref, "attempt": control.attempt_ref,
+         "root": control.root_session_ref, "fence": control.fence_ref}).one_or_none()
+    if stop is None:
+        raise OwnerConflict("runtime_safe_point_invalid")
+    historical = SimpleNamespace(**{**dict(control._mapping), "safe_point_ref": stop.safe_point_ref})
+    saved = _stopped_stage_checkpoint(connection, historical)
+    if saved is None:
+        raise OwnerConflict("runtime_safe_point_invalid")
+    checkpoint = saved["checkpoint"]
+    unit_kind = connection.execute(text("SELECT unit_kind FROM ar_provider_units WHERE unit_ref=:unit"),
+        {"unit": checkpoint["provider_unit_ref"]}).scalar_one()
+    if unit_kind != "bundle_review":
+        raise OwnerConflict("runtime_safe_point_invalid")
+    controls = _verify_pauses_after_bundle_stop(owner, connection, control, saved)
+    execution = _attempt_execution(run, attempt, session)
+    verified = owner.verify_attempt_execution_receipt(
+        request_ref=run.request_ref, run_ref=run.run_ref, attempt_ref=attempt.attempt_ref,
+        fence_ref=fence.fence_ref, submission_ref=execution.submission_ref,
+        payload_hash=execution.payload_hash, receipt=execution.receipt)
+    if verified != execution.material_outcome_hash:
+        raise OwnerConflict("attempt_execution_receipt_invalid")
+    return {
+        "stop_safe_point_ref": stop.safe_point_ref, "stop_checkpoint_hash": stop.checkpoint_hash,
+        "pause_safe_point_ref": control.safe_point_ref, "control_operation_refs": controls,
+        "stopped_unit_ref": checkpoint["provider_unit_ref"], "stopped_operation_ref": checkpoint["provider_operation_ref"],
+        "source_execution_receipt_ref": execution.receipt.receipt_ref,
+        "source_execution_receipt_hash": execution.receipt.payload_hash,
+    }
+
+
+def _verify_pauses_after_bundle_stop(owner, connection, control, stopped):
+    """Follow applied AR controls, including legacy resumes that retained the revoked fence."""
+    identity = _managed_run_reservation(control)
+    del identity["status"], identity["control_revision"]
+    if type(stopped["checkpoint"].get("control_revision")) is not int:
+        raise OwnerConflict("runtime_safe_point_invalid")
+    revision = stopped["checkpoint"]["control_revision"] + 1
+    status, point = "suspended_fenced", stopped["safe_point_ref"]
+    operations = []
+    for op in connection.execute(text(
+            "SELECT o.* FROM ar_control_operations o WHERE o.quest_ref=:quest AND o.cycle_ref=:cycle "
+            "AND o.epoch=:epoch AND o.created_at>=:stop AND EXISTS (SELECT 1 FROM json_each(o.affected_runs_json) "
+            "WHERE json_extract(value,'$.run_ref')=:run) ORDER BY o.created_at,o.operation_ref"),
+            {"quest": control.quest_ref, "cycle": control.cycle_ref, "epoch": control.epoch,
+             "stop": stopped["created_at"], "run": control.run_ref}):
+        expected_action = "resume" if status == "suspended" else "pause"
+        reservation = connection.execute(text("SELECT * FROM ar_control_reservations WHERE operation_ref=:op"),
+            {"op": op.operation_ref}).first()
+        if (op.action != expected_action or reservation is None or reservation.status != "applied"
+                or reservation.action != op.action or reservation.expected_revision != op.expected_revision):
+            raise OwnerConflict("runtime_safe_point_invalid")
+        reserved = _runtime_control_reservation_document(reservation)["affected_runs"]
+        before = [item for item in reserved if item.get("run_ref") == control.run_ref]
+        valid_before = [{**identity, "status": status, "control_revision": revision}]
+        if not operations and reservation.created_at <= stopped["created_at"]:
+            # The pause can reserve the running Attempt just before the worker commits its signed stop.
+            valid_before.append({**identity, "status": "running", "control_revision": revision - 1})
+        if len(before) != 1 or before[0] not in valid_before:
+            raise OwnerConflict("runtime_safe_point_invalid")
+        receipt = _runtime_control_receipt(op)
+        owner.verify_runtime_control_receipt(operation_ref=op.operation_ref, action=op.action,
+            target=decoded_object(reservation.payload_json)["target"], receipt=receipt)
+        points = [p for p in receipt["safe_points"] if p.get("run_ref") == control.run_ref]
+        if op.action == "pause":
+            if len(points) != 1:
+                raise OwnerConflict("runtime_safe_point_invalid")
+            point = points[0]["safe_point_ref"]
+            saved = _query_managed_safe_point(connection, SimpleNamespace(run_ref=control.run_ref, safe_point_ref=point))
+            expected = {**identity, "action": "pause", "operation_ref": op.operation_ref,
+                        "run_status": status, "control_revision": revision}
+            if (saved is None or saved["checkpoint_hash"] != points[0]["checkpoint_hash"]
+                    or any(saved["checkpoint"].get(k) != v for k, v in expected.items())):
+                raise OwnerConflict("runtime_safe_point_invalid")
+            status = "suspended"
+        else:
+            if points:
+                raise OwnerConflict("runtime_safe_point_invalid")
+            status = "running"
+        expected_after = {k: identity[k] for k in ("run_ref", "run_kind", "attempt_ref", "root_session_ref", "fence_ref")}
+        expected_after.update(status=status, cleanup_status="none", safe_point_ref=point)
+        after = [item for item in receipt["affected_runs"] if item.get("run_ref") == control.run_ref]
+        if after != [expected_after]:
+            raise OwnerConflict("runtime_safe_point_invalid")
+        revision += 1
+        operations.append(op.operation_ref)
+    if not operations or (revision, status, point) != (control.control_revision, control.status, control.safe_point_ref):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    return operations
 
 
 def _stopped_stage_checkpoint(connection, control):

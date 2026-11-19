@@ -23,6 +23,7 @@ from meta_research.chat_progress import (
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_LOCKED_VERSION,
+    DEFAULT_CODEX_CLI_VERSION,
     CODEX_REASONING_EFFORT_CONFIG,
 )
 from meta_research.provider_supervisor import (
@@ -67,6 +68,13 @@ _DRAFTING_MODEL_CATALOG_SPECS = {
     "gpt-5.6-sol": (
         "codex_drafting_model_catalog_gpt_5_6_sol.json",
         "9d9b4936f927a6a855625bbbe0f52241d044d0d271c8fe2def611a7188cd5c9b",
+    ),
+    # Codex 0.169.0 native model metadata, narrowed to the schema-only drafting role.
+    # Canonical SHA-256 of the source gpt-6.2-sol record:
+    # 7de17e6e6e7ef595824a740dc1dc24e6306fddc39de476ef810dd9ce251a2b3d.
+    "gpt-6.2-sol": (
+        "codex_drafting_model_catalog_gpt_6_2_sol.json",
+        "b751e15ada2e36a46a93e38f586d0e83ec05243d58ca0902ec9943b6450bdc03",
     ),
 }
 _drafting_catalog_name, _DRAFTING_MODEL_CATALOG_SHA256 = (
@@ -1491,12 +1499,30 @@ def _read_drafting_invocation(
 
 def _validate_drafting_execution_contract_asset(
     invocation: dict[str, object],
+    *,
+    signed_history: bool = False,
 ) -> None:
     if invocation.get("schema_ref") != DRAFTING_JOB_SCHEMA_V2:
         return
     contract = invocation.get("execution_contract")
     if not isinstance(contract, dict):
         raise DraftingUnavailable("codex_execution_contract_outdated")
+    if (signed_history and contract.get("provider_version") == DEFAULT_CODEX_CLI_VERSION
+            and CODEX_DRAFTING_LOCKED_VERSION != DEFAULT_CODEX_CLI_VERSION):
+        # The verified request and terminal receipt bind the original argv,
+        # version admission and catalog. Only that settled operation may be read.
+        model = contract.get("model_ref")
+        spec = _DRAFTING_MODEL_CATALOG_SPECS.get(model) if isinstance(model, str) else None
+        if spec is None or spec[1] != contract.get("model_catalog_hash"):
+            raise DraftingUnavailable("codex_execution_contract_outdated")
+        try:
+            historical_path = Path(str(contract["model_catalog_path"]))
+            if (historical_path.stat().st_size > _DRAFTING_MODEL_CATALOG_MAX_BYTES
+                    or hashlib.sha256(historical_path.read_bytes()).hexdigest() != spec[1]):
+                raise DraftingUnavailable("codex_execution_contract_outdated")
+        except OSError as error:
+            raise DraftingUnavailable("codex_execution_contract_outdated") from error
+        return
     try:
         current_path = _DRAFTING_MODEL_CATALOG_PATH.resolve(strict=True)
         current_hash = _verified_drafting_model_catalog(
@@ -1651,7 +1677,7 @@ def _read_verified_supervisor_result(
         )
     ):
         raise DraftingUnavailable("codex_prompt_too_large")
-    _validate_drafting_execution_contract_asset(invocation)
+    _validate_drafting_execution_contract_asset(invocation, signed_history=True)
     termination_reason = receipt.get("termination_reason")
     returncode = receipt.get("returncode")
     if termination_reason != "completed" or returncode != 0:

@@ -23,6 +23,37 @@
 
 Plan 接受 TargetCommit、HumanInput、ScientificOutcome、AssetVersion 和 LiteratureSnapshot 五类采用来源。reader 提供的 `selected_evidence_binding` 包含 evidence_ref、source_kind、source_ref、source_binding、reader，原样保留。EvidenceUse 说明支持主张与边界；仅供 Brief 复用的材料也在完整集合中保存。普通人类意见按真实内容解释，不自动成为测量、授权或完成确认。
 
+### Plan 证据正文的分页读取
+
+`research_memory.plan_evidence.read` 首轮传 `offset=0` 与具体 `limit`，例如 8192。返回值只取 MCP 真实 `structuredContent`：先看信封，`isError`、`error` 或 `structuredContent.code` 任一出现即抛 `Error`，只用该 code 作说明；再校验页，`text` 须为字符串，`total_characters` 须通过 `Number.isSafeInteger` 且非负。
+
+本页终点取 `offset + Array.from(p.text).length`（按码点计数），超过 `total_characters` 即报错。`next_offset` 缺省只在本页终点等于 `total_characters` 时才算 EOF；出现时须为安全整数、等于本页终点、大于 `offset` 且小于 `total_characters`。任何失败都立即停止后续请求；空字符串的合法页照常收取；只有整段读完后才按完整正文采用，读全不等于证据已被采用。
+
+```javascript
+async function readPlanEvidence(call, binding, consume) {
+  const operation_id = "research_memory.plan_evidence.read";
+  for (let offset = 0; ; ) {
+    const result = await call({ operation_id, arguments: { ...binding, offset, limit: 8192 } });
+    const p = result?.structuredContent;
+    const code = p?.code ?? (typeof result?.error === "string" ? result.error : undefined);
+    if (result?.isError === true || result?.error != null || code != null)
+      throw new Error(`plan_evidence.read 失败：${code ?? "isError"}`);
+    if (!p || typeof p.text !== "string") throw new Error("plan_evidence.read 缺少字符串 text");
+    const total = p.total_characters;
+    if (!Number.isSafeInteger(total) || total < 0) throw new Error("total_characters 须为非负安全整数");
+    const end = offset + Array.from(p.text).length;
+    if (end > total) throw new Error(`页越界：end=${end} total=${total}`);
+    const next = p.next_offset;
+    if (next === undefined && end !== total) throw new Error("next_offset 缺省但本页未到末尾");
+    if (next !== undefined && !(Number.isSafeInteger(next) && next === end && next > offset && next < total))
+      throw new Error(`非法 next_offset：${next}`);
+    await consume(p);
+    if (next === undefined) return;
+    offset = next;
+  }
+}
+```
+
 `research_memory.assets.intake` 受理 text、固定 target_workspace_note，以及从获授权 Workspace 或人类材料引用选中的文件／目录。按实际合同选择 source 与 managed／linked_local 保管，取得准确版本及 reader；来源选择和生产归属见[材料保管](../../references/materials-and-custody.md#stage-自产材料正式阶段正文与独立保管归属)。排队、未命中对账及拒绝结果不是已接纳资产；成功结果和配对 reader 以真实 Owner 返回为准。
 
 调用 `research_memory.research_notes.read` 时仅传工具 schema 参数；`summary_only` 是阅读视图说明，不是 reader 参数。正式原件的当前状态、更正及可用性遵循实际返回，不能因保留历史身份而忽略当前执行资格。

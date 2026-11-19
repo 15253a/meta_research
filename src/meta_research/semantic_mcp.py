@@ -11,6 +11,8 @@ from meta_research.human_guidance import FrozenGuidanceBinding
 from meta_research import __version__
 from meta_research.owners.common import canonical_hash, new_ref
 from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
+from meta_research.error_contract import error_contract_from_legacy
+from meta_research.error_audit import ErrorAuditStore
 from meta_research.work_material_contract import RUNTIME_MATERIAL_OPERATION_IDS
 from meta_research.tool_navigation import (
     PURPOSES, call_tool, common_operations, operation_summary, purpose_overview, purpose_paths,
@@ -126,6 +128,27 @@ class SemanticCallContext:
                 "phase": self.phase,
                 "operation_id": operation_id,
                 "effect_id": effect_id,
+            }
+        )
+
+    def operation_ref(self, effect_id: str | None = None) -> str:
+        return "mcp-operation:" + canonical_hash(
+            {
+                "run_ref": self.run_ref,
+                "root_session_ref": self.root_session_ref,
+                "root_kind": self.root_kind,
+                "phase": self.phase,
+                "operation_id": self.operation_id,
+                "effect_id": effect_id,
+            }
+        )
+
+    def correlation_ref(self) -> str:
+        return "mcp-correlation:" + canonical_hash(
+            {
+                "run_ref": self.run_ref,
+                "root_session_ref": self.root_session_ref,
+                "root_kind": self.root_kind,
             }
         )
 
@@ -287,7 +310,12 @@ class SemanticMcpGateway:
     its own server and grants. Handlers and availability checks remain live.
     """
 
-    def __init__(self, operations: tuple[SemanticOperation, ...]) -> None:
+    def __init__(
+        self,
+        operations: tuple[SemanticOperation, ...],
+        *,
+        error_audit_store: ErrorAuditStore | None = None,
+    ) -> None:
         if not operations:
             raise SemanticMcpError("semantic_operation_catalog_empty")
         ordered = tuple(sorted((replace(item,
@@ -306,6 +334,7 @@ class SemanticMcpGateway:
         self._server_instance_ref = new_ref("mcp_server")
         self._health_receipt_ref = new_ref("mcp_health")
         self._grants: dict[str, _ChannelGrant] = {}
+        self._error_audit_store = error_audit_store
 
     @property
     def operation_ids(self) -> tuple[str, ...]:
@@ -490,13 +519,29 @@ class SemanticMcpGateway:
             problem = _schema_problem(arguments, call_tool()["inputSchema"])
             if problem is not None:
                 return 200, {"jsonrpc": "2.0", "id": request_id,
-                             "result": _tool_error("semantic_input_schema_mismatch", problem)}
+                             "result": _contract_tool_error(
+                                 "semantic_input_schema_mismatch", problem,
+                                 context=context, phase="input_validation",
+                                 error_audit_store=self._error_audit_store)}
             # Select the original identity before all existing authorization,
             # validation and dispatch. Never recurse or create an effect identity.
             operation_id = str(arguments["operation_id"])
             arguments = arguments["arguments"]
         operation = self._operations.get(operation_id)
         if operation is None or operation_id not in operation_ids:
+            if operation is not None and operation.access_mode in {"effect", "reconcile"}:
+                return 200, {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": _contract_tool_error(
+                        "capability_unavailable",
+                        {"reason": "not_granted"},
+                        context=replace(context, operation_id=operation_id),
+                        operation=operation,
+                        phase="admission",
+                        error_audit_store=self._error_audit_store,
+                    ),
+                }
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -504,6 +549,19 @@ class SemanticMcpGateway:
             }
         unavailable = self._unavailable_reason(operation_id, context)
         if unavailable is not None:
+            if operation.access_mode in {"effect", "reconcile"}:
+                return 200, {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": _contract_tool_error(
+                        "capability_unavailable",
+                        {"reason": unavailable},
+                        context=replace(context, operation_id=operation_id),
+                        operation=operation,
+                        phase="admission",
+                        error_audit_store=self._error_audit_store,
+                    ),
+                }
             return 200, {"jsonrpc": "2.0", "id": request_id,
                          "result": _tool_error("capability_unavailable", {"reason": unavailable})}
         problem = _schema_problem(arguments, operation.input_schema)
@@ -513,13 +571,15 @@ class SemanticMcpGateway:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error("semantic_input_schema_mismatch", {
+                "result": _contract_tool_error("semantic_input_schema_mismatch", {
                     **problem, "operation_id": operation_id,
                     "category": "arguments", "execution_stage": "input_validation",
                     "call_execution": "not_started",
                     "message": "Input violates this field constraint; this call did not run.",
                     "correction": "Fix the indicated field using expected. Reconcile any earlier uncertain effect unchanged before modifying its submission.",
-                }),
+                }, context=replace(context, operation_id=operation_id),
+                   operation=operation, phase="input_validation",
+                   error_audit_store=self._error_audit_store),
             }
         try:
             context = replace(context, operation_id=operation_id)
@@ -536,26 +596,58 @@ class SemanticMcpGateway:
                             "effect_id", "reconciliation_operation_id", "correction"):
                     if key in recovery:
                         details.setdefault(key, recovery[key])
+                if (
+                    operation.semantic_operation_id
+                    == "agent_runtime.target_work.request"
+                    and error.code
+                    in {"target_work_request_invalid", "target_launch_authorization_invalid"}
+                ):
+                    details["effect_status"] = "not_started"
+                    details.setdefault("call_execution", "not_started")
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error(error.code, details or None),
+                "result": _contract_tool_error(
+                    error.code,
+                    details or None,
+                    context=context,
+                    operation=operation,
+                    phase=str(details.get("execution_stage") or "handler"),
+                    effect_id=(arguments.get("effect_id")
+                               if isinstance(arguments.get("effect_id"), str)
+                               else None),
+                    error_audit_store=self._error_audit_store,
+                ),
             }
         except Exception:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error("semantic_operation_failed",
-                    _post_handler_failure(operation, arguments, "handler")),
+                "result": _contract_tool_error(
+                    "semantic_operation_failed",
+                    _post_handler_failure(operation, arguments, "handler"),
+                    context=context,
+                    operation=operation,
+                    phase="handler",
+                    effect_id=(arguments.get("effect_id")
+                               if isinstance(arguments.get("effect_id"), str)
+                               else None),
+                    error_audit_store=self._error_audit_store,
+                ),
             }
         output_problem = _schema_problem(result, operation.output_schema)
         if output_problem is not None:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error("semantic_output_schema_mismatch", {
+                "result": _contract_tool_error("semantic_output_schema_mismatch", {
                     **_post_handler_failure(operation, arguments, "output_validation"),
-                    **output_problem}),
+                    **output_problem}, context=context, operation=operation,
+                    phase="output_validation",
+                    effect_id=(arguments.get("effect_id")
+                               if isinstance(arguments.get("effect_id"), str)
+                               else None),
+                    error_audit_store=self._error_audit_store),
             }
         encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         return 200, {
@@ -928,6 +1020,73 @@ def _tool_error(code: str, details: dict[str, object] | None = None) -> dict[str
         "structuredContent": payload,
         "isError": True,
     }
+
+
+def _contract_tool_error(
+    code: str,
+    details: dict[str, object] | None = None,
+    *,
+    context: SemanticCallContext | None = None,
+    operation: SemanticOperation | None = None,
+    phase: str = "handler",
+    effect_id: str | None = None,
+    error_audit_store: ErrorAuditStore | None = None,
+) -> dict[str, object]:
+    operation_id = (
+        operation.semantic_operation_id
+        if operation is not None
+        else context.operation_id
+        if context is not None and context.operation_id
+        else "mcp"
+    )
+    effect = operation is not None and operation.access_mode in {"effect", "reconcile"}
+    operation_ref = (
+        context.operation_ref(effect_id)
+        if context is not None
+        else None
+    )
+    contract = error_contract_from_legacy(
+        code,
+        details,
+        phase=phase,
+        operation_id=operation_id,
+        effect=effect,
+        operation_ref=operation_ref,
+        effect_id=effect_id,
+        correlation_ref=(context.correlation_ref() if context is not None else None),
+    )
+    projected = contract.as_details()
+    legacy_effect_status = (details or {}).get("effect_status")
+    if (
+        isinstance(legacy_effect_status, str)
+        and legacy_effect_status not in {
+            "not_started", "applied", "waiting", "rejected", "unknown", "stale", "cancelled",
+        }
+        and not (
+            operation is not None
+            and operation.semantic_operation_id.startswith("agent_runtime.target_work.")
+        )
+    ):
+        projected["normalized_effect_status"] = projected["effect_status"]
+        projected["effect_status"] = legacy_effect_status
+    for key, value in (details or {}).items():
+        if key not in projected or projected[key] is None:
+            projected[key] = value
+    if error_audit_store is not None:
+        try:
+            error_audit_store.record(contract)
+        except Exception:
+            # A missing audit fact is an operational failure. Keep the original
+            # legacy code for callers, but route the projection to Operator.
+            projected.update({
+                "audit_status": "unavailable",
+                "audit_failure": "error_audit_write_failed",
+                "operator_required": True,
+                "recovery_owner": "operator",
+                "next_action": "escalate",
+                "category": "operator",
+            })
+    return _tool_error(contract.legacy_code or contract.code, projected)
 
 
 def _token_hash(value: str) -> str:

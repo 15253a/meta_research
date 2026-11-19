@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from meta_research.external_mcp import ExternalMcpAccess
 from meta_research.resource_preparation import resource_preparation
-from meta_research.native_guidance import live_native_argv
+from meta_research.native_guidance import live_native_argv, sealed_native_cli_version
 
 import json
 import hashlib
+from copy import copy
 import logging
 import math
 import os
@@ -22,7 +23,9 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 
 from meta_research.system_prompt import read_output_language
-from meta_research.codex_runtime import CODEX_LOCKED_VERSION, CODEX_ROOT_REASONING_PRESET_CONFIG
+from meta_research.codex_runtime import (
+    CODEX_LOCKED_VERSION, CODEX_ROOT_REASONING_PRESET_CONFIG, DEFAULT_CODEX_CLI_VERSION, SUPPORTED_CODEX_CLI_VERSIONS,
+)
 from meta_research.codex_ledger import CodexHomeLedgerReader
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.provider_call_observations import reported_usage, compaction_observation
@@ -292,6 +295,7 @@ class _NativeCliHarnessAdapter:
         workspace: Path,
         *,
         executable: str | None = None,
+        managed_executable_for_version: Callable[[str], Path] | None = None,
         runner: HarnessProcessRunner | None = None,
         timeout_seconds: float | None = None,
         target_root_timeout_seconds: float | None = (
@@ -317,6 +321,7 @@ class _NativeCliHarnessAdapter:
         self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         if executable is not None:
             self.executable = executable
+        self._managed_executable_for_version = managed_executable_for_version
         self._runner = runner or HarnessSupervisorTransport(
             workspace / "shared-provider-supervisor"
         )
@@ -415,7 +420,8 @@ class _NativeCliHarnessAdapter:
         try:
             self._validate_invocation(invocation)
             provider_version = self._provider_version()
-            self._record_provider_capability(provider_version)
+            if not terminal_replay_only:
+                self._record_provider_capability(provider_version)
             try:
                 root_capability_profile(invocation.root_kind or "target", invocation.model_ref).as_dict()
             except (OSError, UnicodeError, ModuleNotFoundError) as error:
@@ -894,7 +900,10 @@ class _NativeCliHarnessAdapter:
         if match is None:
             raise HarnessAdapterUnavailable("provider_version_unavailable")
         observed = match.group(0)
-        if observed != self.locked_version:
+        if observed != self.locked_version or (
+            self._managed_executable_for_version is not None
+            and completed.stdout.strip() != f"codex-cli {self.locked_version}"
+        ):
             raise HarnessAdapterUnavailable("provider_version_drift")
         return observed
 
@@ -1026,6 +1035,58 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
     family = "codex"
     executable = "codex"
     locked_version = CODEX_LOCKED_VERSION
+
+    @property
+    def supports_managed_recovery_runtimes(self) -> bool:
+        return self._managed_executable_for_version is not None and isinstance(self._runner, HarnessSupervisorTransport)
+
+    def _pinned_adapter(self, version: str) -> CodexHarnessAdapter:
+        if version not in SUPPORTED_CODEX_CLI_VERSIONS or self._managed_executable_for_version is None:
+            raise HarnessAdapterUnavailable("provider_runtime_binding_unavailable")
+        executable = self._managed_executable_for_version(version)
+        if version == self.locked_version and str(executable) == self.executable:
+            return self
+        pinned = copy(self)
+        pinned.executable = str(executable)
+        pinned.locked_version = version
+        if isinstance(self._runner, HarnessSupervisorTransport):
+            pinned._runner = copy(self._runner)
+            pinned._runner._cli_version = version
+        pinned._cached_installation_profile = None
+        return pinned
+
+    def _runtime_identity(self) -> dict[str, str]:
+        from meta_research.idea_skill import _codex_harness_manifest
+
+        version = self._provider_version()
+        harness_ref, _ = _codex_harness_manifest(self.executable)
+        return {"cli_version": version, "harness_adapter_ref": harness_ref}
+
+    def recovery_runtime_identity(
+        self, *, operation_ref: str | None = None, owner_invocation_hash: str | None = None
+    ) -> dict[str, str]:
+        if operation_ref is None and owner_invocation_hash is None:
+            return self._pinned_adapter(self.locked_version)._runtime_identity()
+        if not operation_ref or not owner_invocation_hash or not isinstance(self._runner, HarnessSupervisorTransport):
+            raise HarnessAdapterUnavailable("provider_runtime_binding_unavailable")
+        executable, version = self._runner.terminal_native_launch(operation_ref, owner_invocation_hash)
+        from meta_research.paths import DataRootError
+
+        try:
+            candidate = self._pinned_adapter(version)
+        except DataRootError as error:
+            raise HarnessAdapterUnavailable("provider_runtime_binding_unavailable") from error
+        if candidate.executable != executable:
+            raise HarnessAdapterUnavailable("provider_runtime_binding_unavailable")
+        return candidate._runtime_identity()
+
+    def for_recovery_runtime(self, identity: dict[str, str]) -> CodexHarnessAdapter:
+        if not isinstance(identity, dict) or set(identity) != {"cli_version", "harness_adapter_ref"}:
+            raise HarnessAdapterUnavailable("provider_runtime_binding_unavailable")
+        candidate = self._pinned_adapter(identity["cli_version"])
+        if candidate._runtime_identity() != identity:
+            raise HarnessAdapterUnavailable("provider_runtime_binding_mismatch")
+        return candidate
 
     def _sandbox_mode(self, invocation: HarnessInvocation) -> str:
         return (
@@ -1217,6 +1278,7 @@ class HarnessSupervisorTransport:
         self._process_runner = process_runner or _CancellableProcessRunner()
         self._event_sink = event_sink
         self._raw_output_store = raw_output_store
+        self._cli_version = CODEX_LOCKED_VERSION
 
     def __call__(
         self,
@@ -1247,8 +1309,16 @@ class HarnessSupervisorTransport:
             "environment_names": sorted(environment),
         }
         invocation_hash = canonical_hash(invocation)
+        directory = self._workspace / "provider-operations" / invocation_hash[:2] / invocation_hash
+        receipt_path = directory / "supervisor-exit.json"
+        terminal_replay = receipt_path.is_file()
+        if _terminal_replay_only and not terminal_replay:
+            raise OSError("terminal provider receipt unavailable")
         owner_invocation_hash = environment.get(_OWNER_INVOCATION_HASH_ENV)
-        if owner_invocation_hash is not None:
+        if owner_invocation_hash is not None and terminal_replay:
+            if self._owner_transport_digest(operation_ref, owner_invocation_hash, family) != invocation_hash:
+                raise OSError("owner invocation binding unavailable")
+        elif owner_invocation_hash is not None:
             if re.fullmatch(r"[0-9a-f]{64}", owner_invocation_hash) is None:
                 raise OSError("owner invocation identity unavailable")
             binding = {
@@ -1273,7 +1343,7 @@ class HarnessSupervisorTransport:
                 )
             except ProviderSupervisorError as error:
                 raise OSError("owner invocation binding unavailable") from error
-        if self._raw_output_store is not None:
+        if self._raw_output_store is not None and not terminal_replay:
             try:
                 self._raw_output_store.bind_operation(
                     operation_ref,
@@ -1284,38 +1354,32 @@ class HarnessSupervisorTransport:
                 # Raw output is a private display mapping.  It can never turn
                 # a real provider operation into a failed Target Run.
                 pass
-        operation_root = self._workspace / "provider-operations"
-        directory = operation_root / invocation_hash[:2] / invocation_hash
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not terminal_replay:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         prompt_path = directory / "prompt.txt"
         schema_path = directory / "output-schema.json"
         stdout_path = directory / "stdout.jsonl"
         result_path = directory / "last-message.json"
         provider_argv_path = directory / "provider-argv.json"
         request_path = directory / "supervisor-request.json"
-        receipt_path = directory / "supervisor-exit.json"
-        if _terminal_replay_only and not receipt_path.is_file():
-            raise OSError("terminal provider receipt unavailable")
-        _ensure_private(prompt_path, prompt)
-        _ensure_private(
-            schema_path,
-            json.dumps(
-                {"type": "object"}, sort_keys=True, separators=(",", ":")
-            ),
-        )
-        try:
-            _ensure_private(
-                provider_argv_path,
-                json.dumps(live_native_argv(argv, directory,
-                    enabled=family == "codex" and isinstance(self._process_runner, _CancellableProcessRunner)),
-                    ensure_ascii=False, separators=(",", ":")),
-            )
-        except (OSError, ValueError, ProviderSupervisorError) as error:
-            raise OSError("native_provider_spool_invalid") from error
+        schema_text = json.dumps({"type": "object"}, sort_keys=True, separators=(",", ":"))
+        if terminal_replay:
+            if prompt_path.read_text(encoding="utf-8") != prompt or schema_path.read_text(encoding="utf-8") != schema_text:
+                raise OSError("provider operation identity conflict")
+            self._verify_terminal_argv(directory, argv)
+        else:
+            _ensure_private(prompt_path, prompt)
+            _ensure_private(schema_path, schema_text)
+            try:
+                _ensure_private(provider_argv_path, json.dumps(live_native_argv(argv, directory,
+                        enabled=family == "codex" and isinstance(self._process_runner, _CancellableProcessRunner),
+                        cli_version=self._cli_version, seal_direct_launch=True),
+                        ensure_ascii=False, separators=(",", ":")))
+            except (OSError, ValueError, ProviderSupervisorError) as error:
+                raise OSError("native_provider_spool_invalid") from error
         working_directory = provider_working_directory(argv, environment)
         request = self._supervisor_request(directory, invocation_hash, family, timeout, working_directory)
         bridge_argv = cast(list[str], request["argv"])
-        terminal_replay = _terminal_replay_only or receipt_path.exists()
         try:
             if terminal_replay:
                 self._verify_terminal_request(request_path, request)
@@ -1479,6 +1543,32 @@ class HarnessSupervisorTransport:
         ):
             raise ProviderSupervisorError("provider_supervisor_spool_invalid")
 
+    def _verify_terminal_argv(self, directory: Path, argv: list[str]) -> None:
+        """The frozen native argv is authoritative across a release interpreter move."""
+        try:
+            stored = json.loads((directory / "provider-argv.json").read_text(encoding="utf-8"))
+            native_path = directory / "native-provider-argv.json"
+            if native_path.is_symlink():
+                raise ValueError("invalid native launch path")
+            if native_path.exists():
+                launch = read_transport_envelope(native_path, self._transport_key)
+                if launch["argv"] != argv or sealed_native_cli_version(launch) != self._cli_version:
+                    raise ValueError("invalid native launch identity")
+            if stored == argv:
+                return
+            if (not native_path.is_file() or not isinstance(stored, list) or not stored
+                    or not isinstance(stored[0], str) or not Path(stored[0]).is_absolute()):
+                raise ValueError("invalid native bridge")
+            wrapped = [stored[0], "-m", "meta_research.native_codex_bridge", "--provider-argv",
+                       str(native_path), "--operation-directory", str(directory)]
+            for flag in ("--output-schema", "--output-last-message"):
+                if flag in argv:
+                    wrapped.extend((flag, argv[argv.index(flag) + 1]))
+            if stored != [*wrapped, "-"]:
+                raise ValueError("invalid native bridge arguments")
+        except (OSError, KeyError, ValueError, IndexError, ProviderSupervisorError) as error:
+            raise OSError("terminal provider argv invalid") from error
+
     def replay_terminal(
         self, argv: list[str], prompt: str, timeout: float | None,
         environment: dict[str, str],
@@ -1551,10 +1641,7 @@ class HarnessSupervisorTransport:
                     self._supervisor_request(directory, invocation_hash, family, timeout,
                         provider_working_directory(argv, environment)),
                 )
-                if (directory / "provider-argv.json").read_text(encoding="utf-8") != json.dumps(
-                    argv, ensure_ascii=False, separators=(",", ":")
-                ):
-                    raise OSError("terminal provider argv invalid")
+                self._verify_terminal_argv(directory, argv)
                 if not receipt_path.is_file():
                     # A frozen Owner prompt is sufficient only before transport
                     # exists. An issued spool without its terminal receipt may
@@ -1575,6 +1662,75 @@ class HarnessSupervisorTransport:
             raise OSError("terminal provider input ambiguous")
         return matches[0] if matches else None
 
+    def _owner_transport_digest(self, operation_ref: str, owner_invocation_hash: str, family: str) -> str | None:
+        if not isinstance(owner_invocation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", owner_invocation_hash):
+            raise OSError("owner invocation identity unavailable")
+        path = self._workspace / "owner-invocation-bindings" / owner_invocation_hash[:2] / (owner_invocation_hash + ".json")
+        if any(candidate.is_symlink() for candidate in (path, path.parent, path.parent.parent)):
+            raise OSError("invalid provider operation binding")
+        if not path.exists():
+            return None
+        try:
+            binding = read_transport_envelope(path, self._transport_key)
+        except ProviderSupervisorError as error:
+            raise OSError("invalid provider operation binding") from error
+        digest = binding.get("transport_invocation_hash")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or binding != {
+            "schema_ref": "meta-research/harness-operation-binding/v1",
+            "owner_invocation_hash": owner_invocation_hash, "provider_operation_ref": operation_ref,
+            "family": family, "transport_invocation_hash": digest,
+        }:
+            raise OSError("invalid provider operation binding")
+        return digest
+
+    def terminal_native_launch(self, operation_ref: str, owner_hash: str) -> tuple[str, str]:
+        """Recover the executable hashed into this exact terminal Owner operation."""
+        try:
+            digest = self._owner_transport_digest(operation_ref, owner_hash, "codex")
+            if digest is None:
+                raise HarnessAdapterUnavailable("provider_runtime_terminal_unavailable", durable_outcome="unknown")
+            directory = self._workspace / "provider-operations" / digest[:2] / digest
+            if any(path.is_symlink() for path in (directory, directory.parent, directory.parent.parent)):
+                raise OSError("invalid provider spool")
+            exit_path = directory / "supervisor-exit.json"
+            if exit_path.is_symlink():
+                raise OSError("invalid provider spool")
+            if not exit_path.exists():
+                raise HarnessAdapterUnavailable("provider_runtime_terminal_unavailable", durable_outcome="unknown")
+            if self.recover_transport_receipt(operation_ref, family="codex", owner_invocation_hash=owner_hash) is None:
+                raise OSError("invalid terminal receipt")
+            native_path = directory / "native-provider-argv.json"
+            if native_path.is_symlink():
+                raise OSError("invalid provider spool")
+            if native_path.exists():
+                launch = read_transport_envelope(native_path, self._transport_key)
+                version = sealed_native_cli_version(launch)
+                argv = launch["argv"]
+            else:
+                # Direct historical execs have a transport-bound argv but predate version selection.
+                version = DEFAULT_CODEX_CLI_VERSION
+                argv = json.loads((directory / "provider-argv.json").read_text(encoding="utf-8"))
+            if not isinstance(argv, list) or len(argv) < 2 or argv[1] != "exec" or not all(isinstance(a, str) for a in argv):
+                raise OSError("invalid provider argv")
+            request = read_supervisor_request(directory / "supervisor-request.json", self._transport_key)
+            if (directory / "prompt.txt").stat().st_size > _STREAM_LIMIT:
+                raise OSError("invalid provider prompt")
+            names = [_MCP_TOKEN_ENV, _HARNESS_FAMILY_ENV, _HARNESS_WORKSPACE_ENV,
+                     _PROVIDER_OPERATION_ENV, _HARNESS_EVIDENCE_SCOPE_ENV, _HARNESS_OBSERVATION_SCOPE_ENV,
+                     _OWNER_INVOCATION_HASH_ENV, "NO_PROXY", "no_proxy"]
+            if 'mcp_servers.meta_research_external.bearer_token_env_var="META_RESEARCH_EXTERNAL_MCP_TOKEN"' in argv:
+                names.append("META_RESEARCH_EXTERNAL_MCP_TOKEN")
+            if canonical_hash({
+                "schema_ref": "meta-research/harness-provider-operation/v1", "family": "codex",
+                "provider_operation_ref": operation_ref, "argv": argv,
+                "prompt_hash": canonical_hash((directory / "prompt.txt").read_text(encoding="utf-8")),
+                "timeout_seconds": request["timeout_seconds"], "environment_names": sorted(names),
+            }) != digest:
+                raise OSError("terminal provider identity mismatch")
+            return argv[0], version
+        except (OSError, KeyError, ValueError, ProviderSupervisorError) as error:
+            raise HarnessAdapterUnavailable("provider_runtime_binding_unavailable", durable_outcome="unknown") from error
+
     def recover_transport_receipt(
         self, operation_ref: str, *, family: str, owner_invocation_hash: str | None = None
     ) -> dict[str, object] | None:
@@ -1591,28 +1747,9 @@ class HarnessSupervisorTransport:
         # the original CLI invocation even when it ran through a native bridge.
         digest = None
         if owner_invocation_hash is not None:
-            if not isinstance(owner_invocation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", owner_invocation_hash):
-                raise OSError("owner invocation identity unavailable")
-            path = self._workspace / "owner-invocation-bindings" / owner_invocation_hash[:2] / (owner_invocation_hash + ".json")
-            if any(candidate.is_symlink() for candidate in (path, path.parent, path.parent.parent)):
-                raise OSError("invalid provider operation binding")
-            if not path.exists():
-                # Owner-directed reconciliation only reads this original
-                # operation. A missing binding cannot justify scanning other
-                # operations, nor borrowing their termination evidence.
+            digest = self._owner_transport_digest(operation_ref, owner_invocation_hash, family)
+            if digest is None:
                 return None
-            if path.exists():
-                try:
-                    binding = read_transport_envelope(path, self._transport_key)
-                except ProviderSupervisorError as error:
-                    raise OSError("invalid provider operation binding") from error
-                digest = binding.get("transport_invocation_hash")
-                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or binding != {
-                    "schema_ref": "meta-research/harness-operation-binding/v1",
-                    "owner_invocation_hash": owner_invocation_hash, "provider_operation_ref": operation_ref,
-                    "family": family, "transport_invocation_hash": digest,
-                }:
-                    raise OSError("invalid provider operation binding")
         # Keys used by the v1 native CLI transport. Values (including tokens)
         # are neither read from a live process nor retained in the spool.
         legacy_environment_names = sorted((
@@ -2796,6 +2933,7 @@ def _evidence_from_events(
     subagent_evidence = _verified_subagent_evidence(
         family,
         events,
+        provider_version=provider_version,
         evidence_refs_by_sequence={
             int(item["sequence"]): str(item["event_ref"])
             for item in summaries
@@ -2828,7 +2966,7 @@ def _evidence_from_events(
     profile: dict[str, object] = {
         "schema_ref": "meta-research/harness-capability-profile/v1",
         "harness_family": family,
-        "locked_version": CODEX_LOCKED_VERSION,
+        "locked_version": provider_version,
         "provider_version": provider_version,
         "native_session_ref": native_session_ref,
         "capabilities": capabilities,
@@ -2944,6 +3082,7 @@ def _verified_subagent_evidence(
     family: HarnessFamily,
     events: tuple[dict[str, object], ...],
     *,
+    provider_version: str = CODEX_LOCKED_VERSION,
     evidence_refs_by_sequence: dict[int, str],
     root_session_ref: str,
     codex_child_ledger_reader: CodexChildLedgerReader | None = None,
@@ -2952,6 +3091,7 @@ def _verified_subagent_evidence(
     return _verified_codex_subagent_evidence(
         events,
         evidence_refs_by_sequence=evidence_refs_by_sequence,
+        provider_version=provider_version,
         root_session_ref=root_session_ref,
         codex_child_ledger_reader=codex_child_ledger_reader,
         expected_working_directory=expected_working_directory,
@@ -2961,6 +3101,7 @@ def _verified_subagent_evidence(
 def _verified_codex_subagent_evidence(
     events: tuple[dict[str, object], ...],
     *,
+    provider_version: str = CODEX_LOCKED_VERSION,
     evidence_refs_by_sequence: dict[int, str],
     root_session_ref: str,
     codex_child_ledger_reader: CodexChildLedgerReader | None = None,
@@ -3054,6 +3195,7 @@ def _verified_codex_subagent_evidence(
                 spawn=spawn,
                 child_ref=child_ref,
                 terminal_child_state=terminal_child_state,
+                provider_version=provider_version,
                 root_session_ref=root_session_ref,
                 root_code_review_skill_calls=root_code_review_skill_calls,
                 codex_child_ledger_reader=codex_child_ledger_reader,
@@ -3064,6 +3206,7 @@ def _verified_codex_subagent_evidence(
                 spawn=spawn,
                 child_ref=child_ref,
                 terminal_child_state=terminal_child_state,
+                provider_version=provider_version,
                 root_session_ref=root_session_ref,
                 codex_child_ledger_reader=codex_child_ledger_reader,
                 expected_working_directory=expected_working_directory,
@@ -3390,6 +3533,7 @@ def _verified_codex_root_preflight_evidence(
 
 def _verified_codex_child_code_review_evidence(
     *,
+    provider_version: str = CODEX_LOCKED_VERSION,
     spawn: dict[str, object],
     child_ref: str,
     terminal_child_state: dict[str, object] | None,
@@ -3431,6 +3575,7 @@ def _verified_codex_child_code_review_evidence(
     metadata = _verified_child_ledger_metadata(
         records,
         child_ref=child_ref,
+        provider_version=provider_version,
         root_session_ref=root_session_ref,
         expected_working_directory=expected_working_directory,
         allowed_sandbox_modes=_target_review_sandbox_modes(),
@@ -3490,6 +3635,7 @@ def _verified_codex_child_code_review_evidence(
 
 def _verified_codex_child_result_review_evidence(
     *,
+    provider_version: str = CODEX_LOCKED_VERSION,
     spawn: dict[str, object],
     child_ref: str,
     terminal_child_state: dict[str, object] | None,
@@ -3541,6 +3687,7 @@ def _verified_codex_child_result_review_evidence(
     metadata = _verified_child_ledger_metadata(
         records,
         child_ref=child_ref,
+        provider_version=provider_version,
         root_session_ref=root_session_ref,
         expected_working_directory=expected_working_directory,
         allowed_sandbox_modes=_target_review_sandbox_modes(read_only=True),
@@ -3640,6 +3787,7 @@ def _child_prompt_occurrences(
 def _verified_child_ledger_metadata(
     records: tuple[dict[str, object], ...],
     *,
+    provider_version: str = CODEX_LOCKED_VERSION,
     child_ref: str,
     root_session_ref: str,
     expected_working_directory: str,
@@ -3670,7 +3818,7 @@ def _verified_child_ledger_metadata(
         or value.get("cwd") != expected_working_directory
         or value.get("thread_source") != "subagent"
         or value.get("originator") != "codex_exec"
-        or value.get("cli_version") != CODEX_LOCKED_VERSION
+        or value.get("cli_version") != provider_version
         or sandbox_mode is None
     ):
         return None
@@ -3680,7 +3828,7 @@ def _verified_child_ledger_metadata(
         "thread_source": "subagent",
         "cwd": expected_working_directory,
         "originator": "codex_exec",
-        "cli_version": CODEX_LOCKED_VERSION,
+        "cli_version": provider_version,
         "sandbox_mode": sandbox_mode,
     }
 

@@ -102,6 +102,11 @@ def historical_bundle_runtime(connection, row, *, generation=None):
     projected = row if selected is None else SimpleNamespace(**{**_values(row), **selected["prior_identity"]})
     projected = _scope_from_original_invocation(connection, projected, generation)
     if hasattr(projected, "native_session_ref"):
+        retired = next((entry for entry in entries if "provider_transition" in entry
+                        and entry["retired_generation"] >= generation), None)
+        if retired:
+            projected = SimpleNamespace(**{**_values(projected), "native_session_ref": retired["native_session_ref"]})
+    if hasattr(projected, "native_session_ref"):
         source = next((entry for entry in reversed(entries)
                        if entry["prior_identity"]["request_ref"] == projected.request_ref), None)
         if source is not None and row.request_ref != projected.request_ref:
@@ -167,14 +172,25 @@ def verify_runtime_refresh_replacement(connection, run_ref, replacement_attempt_
 def inherited_primary_binding_hash(connection, run, attempt):
     """A copied primary is evidence from its original execution, not new work."""
     for value in reversed(_ledger(connection, run.run_ref)) if run.stage == "bundle" else ():
-        if (int(attempt.generation) > value["retired_generation"]
+        if ("provider_transition" not in value and int(attempt.generation) > value["retired_generation"]
                 and all(getattr(attempt, name) == expected for name, expected in value["copied_primary"].items())):
             return value["primary_source_runtime_binding_hash"]
     return run.runtime_binding_hash
 
 
-def _same_execution_scope(prior, current):
-    if (prior.schema_ref != current.schema_ref or prior.model_ref != current.model_ref
+# The managed CLI cutover changes four of the shared Codex adapter components.
+# These digests seal the entire reviewed eleven-component predecessor and successor.
+_SHARED_CODEX_ADAPTER_PREFIX = "adapter-source:meta_research.idea_skill@sha256:"
+_REVIEWED_SHARED_CODEX_ADAPTER_UPGRADES = frozenset({
+    ("f86a6690e2708d110b00b8cc03e8fbfe8dd91bdf84f6ea11982af26fef45f196",
+     "4545da63164d874be75827b06d9b486eced080bc41289d45dcff68d5897f5f29"),
+})
+
+
+def _same_execution_scope(prior, current, *, authorized_provider_change=False):
+    if prior.schema_ref != current.schema_ref:
+        return False
+    if not authorized_provider_change and (prior.model_ref != current.model_ref
             or prior.harness_adapter_ref != current.harness_adapter_ref):
         return False
     # The aggregate profile also includes shared prose. Every explicit capability
@@ -182,12 +198,29 @@ def _same_execution_scope(prior, current):
     def without_profile(values):
         return tuple(v for v in values if not v.startswith("root-capability-profile:sha256:"))
     def execution_resources(values):
-        return tuple(v for v in values if not v.startswith(_POLICY_PREFIXES))
+        def installed_cli_resource(value):
+            # An exact capability grant binds the full old and new artifact manifests.
+            # The Node executable, transport seal, sandbox and all MCP permissions remain exact.
+            return (authorized_provider_change and value.startswith("harness-artifact:/")
+                    and "/codex-cli/installs/" in value and "/node_modules/" in value)
+        return tuple(v for v in values if not v.startswith(_POLICY_PREFIXES) and not installed_cli_resource(v))
+
+    old_resources = execution_resources(prior.resource_bindings)
+    new_resources = execution_resources(current.resource_bindings)
+    def same_resource(old, new):
+        if old == new:
+            return True
+        return (authorized_provider_change and old.startswith(_SHARED_CODEX_ADAPTER_PREFIX)
+                and new.startswith(_SHARED_CODEX_ADAPTER_PREFIX)
+                and (old.removeprefix(_SHARED_CODEX_ADAPTER_PREFIX), new.removeprefix(_SHARED_CODEX_ADAPTER_PREFIX))
+                in _REVIEWED_SHARED_CODEX_ADAPTER_UPGRADES)
+
     def other_connections(values):
         return tuple(v for v in values if not v.startswith("harness-operation-binding:semantic-mcp-"))
     return (without_profile(prior.capability_bindings) == without_profile(current.capability_bindings)
             and other_connections(prior.mcp_bindings) == other_connections(current.mcp_bindings)
-            and execution_resources(prior.resource_bindings) == execution_resources(current.resource_bindings))
+            and len(old_resources) == len(new_resources)
+            and all(same_resource(old, new) for old, new in zip(old_resources, new_resources)))
 
 
 def _formal_pause_resume(owner, connection, control):
@@ -238,7 +271,8 @@ def _formal_pause_resume(owner, connection, control):
     return {**proofs,"safe_point_ref":saved["safe_point_ref"],"checkpoint_hash":saved["checkpoint_hash"]}
 
 
-def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_binding, harness_authority):
+def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_binding, harness_authority,
+                           provider_transition_preview=False, authorization_receipt_ref=None):
     """Admit the installed provider at a proven retry or quiet operator resume."""
     from meta_research.owners.agent_runtime import (
         _load_stage_fence, _runtime_binding_from_row, _validated_runtime_binding,
@@ -252,10 +286,20 @@ def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_bi
     if bind_bundle_runtime_to_full_conformance(current, operation_binding,
             required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS) != current:
         raise OwnerConflict("bundle_runtime_refresh_current_contract_invalid")
-    with owner._database.fenced_write() as connection:
+    explicit = provider_transition_preview or authorization_receipt_ref is not None
+    with (owner._database.read() if provider_transition_preview else owner._database.fenced_write()) as connection:
+        if authorization_receipt_ref is not None:
+            for old in _ledger(connection, run_ref):
+                if old.get("provider_authorization", {}).get("authorization_receipt_ref") == authorization_receipt_ref:
+                    if old["provider_authorization"]["requirement"]["scope"]["to_model"] != current.model_ref:
+                        raise OwnerConflict("idempotency_conflict")
+                    return {"refresh_ref": old["refresh_ref"], "replacement_attempt_ref": old["replacement_attempt_ref"],
+                            "replacement_fence_ref": old["replacement_fence_ref"]}
         run, attempt, session, fence = _load_stage_fence(connection, run_ref, attempt_ref, fence_ref)
         prior = _runtime_binding_from_row(run)
         if run.runtime_binding_hash == binding_hash:
+            if explicit:
+                raise OwnerConflict("bundle_provider_transition_not_required")
             return False
         if attempt.status not in {"running", "executed"}:
             raise OwnerConflict("bundle_runtime_refresh_not_ready")
@@ -271,15 +315,28 @@ def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_bi
                        and attempt.submission_ref is None)
         operator_resume = (_formal_pause_resume(owner, connection, control)
                            if control.cleanup_status == "none" else None)
-        if (run.stage != "bundle" or control.status != "running" or not (human_retry or operator_resume)
+        unexecuted_transition = (explicit and prior.model_ref == current.model_ref
+                                 and session.native_session_ref is None and attempt.primary_draft_json is None)
+        if (run.stage != "bundle" or control.status != "running" or not (explicit or human_retry or operator_resume)
                 or _prepared_control_affects_run(connection, run_ref)
                 or any(unit.status not in {"completed", "revoked"} for unit in units)
-                or not units or not session.native_session_ref or attempt.primary_draft_json is None
-                or not _same_execution_scope(prior, current)):
+                or not units
+                or (not unexecuted_transition and (not session.native_session_ref or attempt.primary_draft_json is None))
+                or not explicit and not _same_execution_scope(prior, current)):
             raise OwnerConflict("bundle_runtime_refresh_not_ready")
         # A broad research grant remains necessary. A refreshed clock or guidance
         # cannot itself grant access, resources, or high-risk Target execution.
         owner._authorization_verifier.verify_broad_research_authorization(quest_ref=control.quest_ref)
+        grant = None
+        if explicit:
+            from meta_research import bundle_provider_transition as transition
+            if unexecuted_transition:
+                proposal = transition.preview_unexecuted(owner, connection, control, run, attempt, session, prior, current, units)
+            else:
+                proposal = transition.preview(connection, control, run, attempt, session, prior, current, units)
+            if provider_transition_preview:
+                return proposal
+            grant = transition.authorize(owner, connection, proposal, authorization_receipt_ref)
         now = time.time()
         prior_identity = {field: getattr(run, field) for field in _FIELDS}
         primary_source = inherited_primary_binding_hash(connection, run, attempt)
@@ -295,7 +352,7 @@ def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_bi
         connection.execute(text("UPDATE ar_stage_runs SET runtime_binding_json=:binding, runtime_binding_hash=:hash, admission_hash=:admission WHERE run_ref=:run"),
                            {"binding": binding_json, "hash": binding_hash, "admission": effective_admission, "run": run_ref})
         successor = owner._replace_fenced_managed_attempt(connection, control, now,
-            reuse_checkpoint=True, reuse_operation_refs=False, preserve_native_session=True,
+            reuse_checkpoint=not explicit, reuse_operation_refs=False, preserve_native_session=not explicit,
             replacement_reason_code=_REASON)
         connection.execute(text("UPDATE ar_execution_fences SET status='rejected',closed_at=:now WHERE fence_ref=:fence"),
                            {"now": now, "fence": fence_ref})
@@ -310,15 +367,21 @@ def refresh_bundle_runtime(owner, *, run_ref, attempt_ref, fence_ref, runtime_bi
                  "runtime_binding_hash": binding_hash, "effective_admission_hash": effective_admission,
                  "current_operation_binding": operation_binding.as_dict(),
                  "primary_draft_hash": attempt.primary_draft_hash,
-                 "copied_primary": {name: getattr(attempt, name) for name in (
+                 "copied_primary": {name: (None if explicit else getattr(attempt, name)) for name in (
                      "primary_draft_hash", "primary_recorded_at", "primary_adapter_kind", "primary_provider_unit_ref")},
                  "primary_source_runtime_binding_hash": primary_source,
                  "operator_resume": operator_resume,
                  "terminal_units": [{"unit_ref": u.unit_ref,"status": u.status,"operation_ref": u.operation_ref} for u in units]}
+        if grant is not None:
+            value["provider_authorization"] = grant
+            value["provider_transition"] = transition.record_checkpoint(connection, grant, session.session_ref, now)
         connection.execute(text("INSERT INTO ar_bundle_runtime_refreshes VALUES (:ref,:run,:retired,:replacement,:generation,:payload,:hash,:now)"),
                            {"ref": refresh_ref, "run": run_ref, "retired": attempt_ref,
                             "replacement": successor.attempt_ref, "generation": int(attempt.generation),
                             "payload": canonical_json(value), "hash": canonical_hash(value), "now": now})
         connection.execute(text("UPDATE agent_runtime_state SET revision=revision+1 WHERE singleton='owner'"))
         owner._feed.record(connection, "agent_runtime.bundle_runtime_refreshed", value)
+    if explicit:
+        return {"refresh_ref": refresh_ref, "replacement_attempt_ref": successor.attempt_ref,
+                "replacement_fence_ref": successor.fence_ref}
     return True

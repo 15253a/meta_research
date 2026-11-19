@@ -13,7 +13,9 @@ from sqlalchemy import text
 from meta_research.bundle_protocol import TargetWorkHandle, projection_plain_value
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
-from meta_research.owners.common import canonical_hash, canonical_json, new_ref
+from meta_research.error_contract import error_contract_from_legacy
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json, new_ref
+from meta_research import target_recovery_model
 from meta_research.provider_supervisor import (
     ProviderSupervisorError,
     TypedExecutionFence,
@@ -78,6 +80,14 @@ class AgentRuntimeHarnessError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+    def as_error_contract(self, *, operation_id: str = "agent_runtime.harness"):
+        return error_contract_from_legacy(
+            self.code,
+            phase="harness",
+            operation_id=operation_id,
+            effect=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -426,7 +436,13 @@ class AgentRuntimeHarnessInterface(Protocol):
         resume: bool,
         model_ref: str | None = None,
         frozen_prompt: str | None = None,
+        recovery_model_binding: dict[str, object] | None = None,
+        invocation_material: dict[str, object] | None = None,
     ) -> None: ...
+
+    def resolve_target_retry_model(self, run_ref: str, generation: int) -> dict | None: ...
+
+    def sealed_target_retry_model(self, operation_ref: str) -> dict | None: ...
 
     def checkpoint_target_root_human_request_session(
         self,
@@ -550,10 +566,18 @@ class SQLiteAgentRuntimeHarness:
     def __init__(self, database: Database, feed: DurableFeed) -> None:
         self._database = database
         self._feed = feed
+        self._target_recovery_runtime_identity = None
         self._target_provider_ceiling_receipt_verifier: (
             TargetProviderCeilingReceiptVerifier | None
         ) = None
         self._recover_interrupted_operations()
+
+    def bind_target_recovery_runtime_identity(self, runtime_identity) -> None:
+        if not callable(runtime_identity) or (
+            self._target_recovery_runtime_identity is not None and self._target_recovery_runtime_identity != runtime_identity
+        ):
+            raise AgentRuntimeHarnessError(target_recovery_model.INVALID)
+        self._target_recovery_runtime_identity = runtime_identity
 
     def bind_target_provider_ceiling_receipt_verifier(
         self,
@@ -2594,6 +2618,60 @@ class SQLiteAgentRuntimeHarness:
                 connection, run_ref
             )
 
+    def resolve_target_retry_model(self, run_ref: str, generation: int) -> dict | None:
+        with self._database.read_snapshot() as connection:
+            return self._target_retry_model(connection, run_ref, generation)
+
+    def _target_retry_model(self, connection, run_ref: str, generation: int) -> dict | None:
+        from meta_research.harness_adapters import HarnessAdapterUnavailable
+        try:
+            return target_recovery_model.current_binding(
+                connection, self._database, run_ref, generation, self._verify_model_retry_receipt,
+                self._target_recovery_runtime_identity,
+            )
+        except OwnerConflict as error:
+            raise AgentRuntimeHarnessError(target_recovery_model.INVALID) from error
+        except HarnessAdapterUnavailable as error:
+            raise AgentRuntimeHarnessError(error.code) from error
+
+    def target_retry_failed_before_transport(self, operation_ref: str) -> bool:
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT r.run_ref,r.attempt_ref,r.fence_ref,r.root_session_ref,r.profile_json,r.profile_hash,"
+                "op.outcome_code FROM ar_harness_provider_operations op JOIN ar_harness_runs r "
+                "ON r.run_ref=op.run_ref WHERE op.operation_ref=:ref AND op.status='failed'"
+            ), {"ref": operation_ref}).first()
+        if row is None:
+            return False
+        profile = _profile_from_row(row) or {}
+        proof = {
+            "provider_operation_ref": operation_ref, "run_ref": row.run_ref, "attempt_ref": row.attempt_ref,
+            "fence_ref": row.fence_ref, "root_session_ref": row.root_session_ref, "failure_code": row.outcome_code,
+        }
+        return proof in profile.get("provider_preparation_failures", []) and not any(
+            receipt.get("provider_operation_ref") == operation_ref
+            for receipt in profile.get("provider_transport_receipts", []) if isinstance(receipt, dict)
+        )
+
+    def _verify_model_retry_receipt(self, predecessor) -> str:
+        profile = _profile_from_row(predecessor) or {}
+        matches = [
+            item for item in profile.get("provider_transport_receipts", [])
+            if isinstance(item, dict) and item.get("provider_operation_ref") == predecessor.operation_ref
+        ]
+        if len(matches) != 1:
+            raise AgentRuntimeHarnessError("provider_terminal_proof_missing")
+        receipt = {k: v for k, v in matches[0].items() if k != "provider_operation_ref"}
+        self._verify_terminal_target_receipt(predecessor.operation_ref, receipt, predecessor.invocation_hash)
+        return receipt["supervisor_receipt_hash"]
+
+    def sealed_target_retry_model(self, operation_ref: str) -> dict | None:
+        try:
+            with self._database.read() as connection:
+                return target_recovery_model.sealed_binding(connection, operation_ref)
+        except OwnerConflict as error:
+            raise AgentRuntimeHarnessError(target_recovery_model.INVALID) from error
+
     def start_operation(
         self,
         *,
@@ -2604,9 +2682,12 @@ class SQLiteAgentRuntimeHarness:
         resume: bool,
         model_ref: str | None = None,
         frozen_prompt: str | None = None,
+        recovery_model_binding: dict[str, object] | None = None,
+        invocation_material: dict[str, object] | None = None,
     ) -> None:
         now = time.time()
-        with self._database.write() as connection:
+        write = self._database.fenced_write if generation > 1 else self._database.write
+        with write() as connection:
             failed_target = connection.execute(text(
                 "SELECT 1 FROM ar_target_root_lifecycles WHERE target_run_ref=:run_ref AND status='failed'"
             ), {"run_ref": run_ref}).first()
@@ -2623,19 +2704,64 @@ class SQLiteAgentRuntimeHarness:
             if row is not None:
                 if str(row.invocation_hash) != invocation_hash:
                     raise AgentRuntimeHarnessError("harness_operation_conflict")
+                try:
+                    stored_binding = target_recovery_model.sealed_binding(connection, operation_ref)
+                except OwnerConflict as error:
+                    raise AgentRuntimeHarnessError(target_recovery_model.INVALID) from error
+                if stored_binding != recovery_model_binding or (
+                    stored_binding is not None and (
+                        not isinstance(invocation_material, dict) or canonical_hash(invocation_material) != invocation_hash
+                        or invocation_material.get("recovery_model_binding") != stored_binding
+                    )
+                ):
+                    raise AgentRuntimeHarnessError("harness_operation_conflict")
                 raise AgentRuntimeHarnessError(
                     "provider_outcome_unknown"
                     if row.status in {"running", "unknown_outcome"}
                     else "harness_operation_already_terminal"
                 )
             target_prior = connection.execute(text(
-                "SELECT operations.operation_ref FROM ar_harness_provider_operations AS operations "
+                "SELECT operations.operation_ref, operations.status, operations.model_ref FROM ar_harness_provider_operations AS operations "
                 "JOIN ar_target_harness_admissions AS admissions ON admissions.target_run_ref=operations.run_ref "
                 "WHERE operations.run_ref=:ref AND operations.status IN ('failed', 'executed') "
                 "ORDER BY operations.generation DESC LIMIT 1"
             ), {"ref": run_ref}).first()
             if target_prior is not None:
                 self.verify_operation_terminal(str(target_prior.operation_ref))
+            expected_binding = None
+            if target_prior is not None and target_prior.status == "failed":
+                expected_binding = self._target_retry_model(connection, run_ref, generation)
+                if expected_binding is not None and (
+                    model_ref != expected_binding["scope"]["new_model_ref"]
+                    or operation_ref != provider_operation_ref(run_ref, "harness_turn", generation)
+                ):
+                    raise AgentRuntimeHarnessError(target_recovery_model.INVALID)
+                if expected_binding is None and target_prior.model_ref and model_ref != target_prior.model_ref:
+                    raise AgentRuntimeHarnessError(target_recovery_model.INVALID)
+            if expected_binding != recovery_model_binding:
+                raise AgentRuntimeHarnessError(target_recovery_model.INVALID)
+            if expected_binding is not None:
+                scope = expected_binding["scope"]
+                required_material = {
+                    "schema_ref": "meta-research/harness-invocation/v1", "run_ref": run_ref,
+                    "attempt_ref": scope["attempt_ref"], "fence_ref": scope["fence_ref"],
+                    "operation_ref": operation_ref, "generation": generation, "resume": resume,
+                    "model_ref": model_ref, "prompt_hash": canonical_hash(frozen_prompt),
+                    "recovery_model_binding": expected_binding,
+                }
+                if (not isinstance(invocation_material, dict) or canonical_hash(invocation_material) != invocation_hash
+                        or any(invocation_material.get(key) != value for key, value in required_material.items())):
+                    raise AgentRuntimeHarnessError(target_recovery_model.INVALID)
+                reopened = connection.execute(text(
+                    "SELECT 1 FROM durable_feed WHERE event_type='agent_runtime.target_root_failure_recovered' "
+                    "AND json_extract(payload_json,'$.target_run_ref')=:run_ref "
+                    "AND json_extract(payload_json,'$.attempt_ref')=:attempt_ref "
+                    "AND json_extract(payload_json,'$.fence_ref')=:fence_ref "
+                    "AND json_extract(payload_json,'$.operation_ref')=:predecessor_operation_ref "
+                    "AND json_extract(payload_json,'$.operation_generation')=:predecessor_generation LIMIT 1"
+                ), scope).first()
+                if reopened is None:
+                    raise AgentRuntimeHarnessError(target_recovery_model.INVALID)
             continuation_generation = (
                 _target_root_human_request_continuation_generation(
                     connection, run_ref
@@ -2688,6 +2814,9 @@ class SQLiteAgentRuntimeHarness:
                     "run_ref": run_ref,
                     "operation_ref": operation_ref,
                     "generation": generation,
+                    **({"recovery_model_binding": recovery_model_binding,
+                        "recovery_model_binding_hash": canonical_hash(recovery_model_binding)}
+                       if recovery_model_binding else {}),
                 },
             )
 

@@ -131,7 +131,7 @@ def test_current_adapter_adopts_changed_shared_profile_and_tool_contract_after_r
     monkeypatch.setattr("meta_research.idea_skill.shared_reference_resources", resources)
     monkeypatch.setattr("meta_research.bundle_skill.shared_reference_resources", resources)
     gateway_type = gateway_module.SemanticMcpGateway
-    def gateway(operations):
+    def gateway(operations, **kwargs):
         values = []
         for op in operations:
             if historical[0] and op.semantic_operation_id == "advancement_engine.research_time.read":
@@ -140,7 +140,7 @@ def test_current_adapter_adopts_changed_shared_profile_and_tool_contract_after_r
                 schema["required"] = [name for name in schema["required"] if name != "budget_policy"]
                 op = replace(op, description="Read approved allowance before admission.", output_schema=schema)
             values.append(op)
-        return gateway_type(tuple(values))
+        return gateway_type(tuple(values), **kwargs)
     monkeypatch.setattr(gateway_module, "SemanticMcpGateway", gateway)
     executable = _fake_codex(tmp_path / "codex")
     def real_binding(provider):

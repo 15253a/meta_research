@@ -226,9 +226,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit(result, args.as_json, human=f"Daemon is {result['status']}")
     except (CliError, DataRootError) as error:
         if getattr(args, "as_json", False):
+            from meta_research.error_contract import error_contract_from_exception
+
+            contract = error_contract_from_exception(
+                error,
+                phase="cli",
+                operation_id="cli." + str(args.command),
+            )
             print(
                 json.dumps(
-                    {"status": "error", "reason": str(error)}, separators=(",", ":")
+                    {
+                        "status": "error",
+                        "reason": str(error),
+                        "error_contract": contract.as_public_dict(),
+                    },
+                    separators=(",", ":"),
                 )
             )
         else:

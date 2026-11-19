@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 from typing import cast
 
-from meta_research.codex_runtime import CODEX_LOCKED_VERSION
+from meta_research.native_guidance import sealed_native_cli_version
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.provider_supervisor import (
     PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES, ProviderSupervisorError,
@@ -404,11 +404,12 @@ def native_session_unavailable(directory, marker, native_session_ref):
         proof = read_transport_envelope(proof_path, key)
         error = proof.get("error")
         expected_message = "no rollout found for thread id " + native_session_ref
-        provider_argv = read_transport_envelope(directory / "native-provider-argv.json", key)["argv"]
+        launch = read_transport_envelope(directory / "native-provider-argv.json", key)
+        provider_argv = launch["argv"]
         if (proof.get("supervisor_invocation_hash") != marker.get("invocation_hash")
                 or proof.get("provider_argv_hash") != canonical_hash(provider_argv)
                 or proof.get("method") != "thread/resume" or proof.get("thread_id") != native_session_ref
-                or proof.get("provider_version_output") != "codex-cli " + CODEX_LOCKED_VERSION
+                or proof.get("provider_version_output") != "codex-cli " + sealed_native_cli_version(launch)
                 or not isinstance(error, dict) or type(error.get("code")) is not int
                 or error["code"] != -32600 or error.get("message") != expected_message):
             return None

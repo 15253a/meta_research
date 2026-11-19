@@ -28,7 +28,10 @@ from meta_research.idea_skill import (
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
+from meta_research.research_guidance import (
+    BINDING_SKILLS_ROOT, SHARED_REFERENCE_PATHS, shared_reference_resources,
+    cycle_role_skill_text, prepare_cycle_role_resources, role_skill_source,
+)
 from meta_research.plan_contract import (
     MAX_PLAN_EXPERIMENT_BRIEFS,
     MAX_PLAN_OBLIGATIONS,
@@ -380,7 +383,8 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
-                    "skill_instructions": _plan_skill_instructions(),
+                    "skill_instructions": _plan_skill_instructions(
+                        binding_identity_root=BINDING_SKILLS_ROOT),
                     "adapter_source_hash": adapter_source_hash,
                     "shared_adapter_source_hash": shared_adapter_source_hash,
                     "resident_mcp_source_hash": resident_mcp_source_hash,
@@ -627,9 +631,10 @@ def _plan_skill_resources() -> dict[str, str]:
         raise PlanSkillUnavailable("plan_skill_resource_unavailable") from error
 
 
-def _plan_skill_instructions() -> str:
+def _plan_skill_instructions(*, binding_identity_root: str | None = None) -> str:
     return (
-        "Role skill source: " + str(Path(__file__).with_name("skills") / "plan_stage" / "SKILL.md")
+        "Role skill source: " + role_skill_source(
+            "plan_stage", binding_identity_root=binding_identity_root)
         + "\nHarness maintains this role's research method. Read references/contract.md when "
         "forming obligations, coverage or Briefs; read references/owner-operations.md for sources, "
         "handoff and feedback; read references/tool-contracts.md for tool arguments and current "

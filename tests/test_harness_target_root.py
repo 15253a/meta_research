@@ -450,6 +450,11 @@ class _Owner:
     def query_run(self, request_ref: str) -> AgentRuntimeHarnessRun | None:
         return self.run if request_ref == self.run.request_ref else None
 
+    def prior_target_inputs(self, run_ref: str) -> tuple[str, ...]:
+        return tuple(operation.frozen_prompt for operation in reversed(self.operations)
+                     if operation.run_ref == run_ref and operation.status == "completed"
+                     and operation.frozen_prompt is not None)
+
     def channel_is_current(self, _token_hash: str) -> bool:
         return False
 
@@ -1437,27 +1442,31 @@ def test_recovery_replays_temporary_channel_failure_without_stale_cache(
     ]
 
 
+@pytest.mark.parametrize(("first_model", "next_model"), [
+    ("gpt-5.6-sol", "gpt-6.1-sol"),
+    ("gpt-6.1-sol", "gpt-6.2-sol"),
+])
 def test_target_root_lifecycle_chooses_first_then_resume_in_one_native_session(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, first_model, next_model,
 ) -> None:
     runtime, owner, adapter = _runtime(tmp_path)
 
-    selected = ["gpt-5.6-sol"]
+    selected = [first_model]
     monkeypatch.setattr("meta_research.harness.selected_stage_model", lambda *args, **kwargs: selected[0])
     first = runtime.run_or_resume_target_root(
         "target-harness-request:test",
         prompt="Own implementation through final training completion.",
         mcp_base_url="http://127.0.0.1:8765",
     )
-    selected[0] = "gpt-6.1-sol"
+    selected[0] = next_model
     resumed = runtime.run_or_resume_target_root(
         "target-harness-request:test",
         prompt="Continue the same Target root lifecycle.",
         mcp_base_url="http://127.0.0.1:8765",
     )
 
-    assert [turn.model_ref for turn in adapter.invocations] == ["gpt-5.6-sol", "gpt-6.1-sol"]
-    assert [turn.model_ref for turn in owner.operations] == ["gpt-5.6-sol", "gpt-6.1-sol"]
+    assert [turn.model_ref for turn in adapter.invocations] == [first_model, next_model]
+    assert [turn.model_ref for turn in owner.operations] == [first_model, next_model]
     assert TARGET_ROOT_LIFECYCLE_PHASE == "target_root_lifecycle"
     assert first.native_session_ref == "native-target-root"
     assert resumed.native_session_ref == first.native_session_ref

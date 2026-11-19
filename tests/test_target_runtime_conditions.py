@@ -8,10 +8,15 @@ from meta_research.runtime_conditions import split_runtime_prompt
 from test_harness_frozen_terminal_recovery import interrupted_root  # noqa: F401
 
 
-def test_target_conditions_survive_recovery_and_refresh_on_next_turn(request, monkeypatch):
+@pytest.mark.parametrize(("frozen_model", "next_model"), [
+    ("gpt-5.6-sol", "gpt-6.1-sol"),
+    ("gpt-6.1-sol", "gpt-6.2-sol"),
+    ("gpt-6.2-sol", "gpt-6.1-sol"),
+])
+def test_target_conditions_survive_recovery_and_refresh_on_next_turn(request, monkeypatch, frozen_model, next_model):
     conditions = ["用户选择 GPU-A100-1，预算30d"]
     scopes = []
-    selected = ["gpt-5.6-sol"]
+    selected = [frozen_model]
     monkeypatch.setattr("meta_research.harness.selected_stage_model", lambda *args, **kwargs: selected[0])
 
     def current(_workspace, **scope):
@@ -28,7 +33,7 @@ def test_target_conditions_survive_recovery_and_refresh_on_next_turn(request, mo
     assert scopes == [{"run_ref": run.run_ref, "target_ref": target_request.target_ref}]
 
     assert first.model_ref == selected[0]
-    selected[0] = "gpt-6.1-sol"
+    selected[0] = next_model
     conditions[0] = "当前仅使用 GPU-A100-2，预算7d"
     with pytest.raises(HarnessAdmissionError, match="provider_stopped"):
         runtime().run_or_resume_target_root(
@@ -60,7 +65,7 @@ def test_target_conditions_survive_recovery_and_refresh_on_next_turn(request, mo
 
 @pytest.mark.parametrize("changed", (None, "conditions", "mcp_endpoint"))
 def test_target_recovers_before_transport_only_with_exact_original_invocation(
-    request, monkeypatch, changed,
+    request, monkeypatch, changed, tmp_path,
 ):
     conditions = ["Selected GPU: GPU-A; time budget: 30d"]
     original_conditions = conditions[0]
@@ -74,9 +79,21 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
         raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
 
     monkeypatch.setattr(CodexHarnessAdapter, "invoke", fail_before_transport)
-    _db, owner, target_request, runner, runtime = request.getfixturevalue("interrupted_root")
+    db, owner, target_request, runner, runtime = request.getfixturevalue("interrupted_root")
     run = owner.query_run(target_request.request_ref)
     original = owner.latest_operation(run.run_ref)
+    def assert_no_transport_or_success():
+        spool = tmp_path / "supervisor"
+        assert not list((spool / "owner-invocation-bindings").rglob("*.json"))
+        assert not list((spool / "provider-operations").rglob("supervisor-request.json"))
+        assert not list((spool / "provider-operations").rglob("supervisor-exit.json"))
+        with db.read() as connection:
+            success_count = connection.exec_driver_sql(
+                "SELECT count(*) FROM durable_feed WHERE event_type='agent_runtime.harness_operation_completed' "
+                "AND json_extract(payload_json,'$.operation_ref')=?", (original.operation_ref,)
+            ).scalar_one()
+        assert success_count == 0
+    assert_no_transport_or_success()
     assert original.status == "unknown_outcome"
     assert runner.calls == 0
     assert runner.request_path is None
@@ -94,6 +111,8 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
     assert recovered.operation_ref == original.operation_ref
     assert recovered.invocation_hash == original.invocation_hash
     assert recovered.generation == original.generation == 1
+    assert recovered.status == "unknown_outcome"
+    assert_no_transport_or_success()
     if changed == "mcp_endpoint":
         assert runner.calls == 0
         assert runner.request_path is None
@@ -110,11 +129,14 @@ def test_target_recovers_before_transport_only_with_exact_original_invocation(
         raise AssertionError("Signed terminal replay must not read current conditions")
 
     monkeypatch.setattr("meta_research.harness.render_runtime_conditions", no_fresh_conditions)
-    with pytest.raises(HarnessAdmissionError, match="provider_io_unavailable"):
+    with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
         runtime().run_or_resume_target_root(
             target_request.request_ref, prompt="Original frozen Target work.",
             mcp_base_url=endpoint,
         )
     assert owner.query_run(target_request.request_ref).native_session_ref is None
-    assert owner.latest_operation(run.run_ref).operation_ref == original.operation_ref
-    assert runner.calls == 0
+    repeated = owner.latest_operation(run.run_ref)
+    assert (repeated.operation_ref, repeated.invocation_hash, repeated.status) == (
+        original.operation_ref, original.invocation_hash, "unknown_outcome")
+    assert runner.calls == 0 and runner.request_path is None
+    assert_no_transport_or_success()

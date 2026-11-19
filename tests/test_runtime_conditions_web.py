@@ -90,8 +90,8 @@ def test_edit_conditions_through_authenticated_api_keeps_research_facts(tmp_path
         assert "GPU-test-1" in value["text"] and "81920" in value["text"]
         assert "30d" in value["text"]
         assert value["stage_models"] == dict.fromkeys(("idea", "plan", "bundle", "target", "reasoning"), "gpt-6.1-sol")
-        assert "gpt-5.6-sol" in value["available_stage_models"]
-        selected = {**value["stage_models"], "plan": "gpt-5.6-sol"}
+        assert {"gpt-5.6-sol", "gpt-6.1-sol", "gpt-6.2-sol"} <= set(value["available_stage_models"])
+        selected = {**value["stage_models"], "plan": "gpt-5.6-sol", "target": "gpt-6.2-sol"}
         payload = {"stage_models": selected, "text": "仅使用 GPU-test-1；优先完成 CPU 核验，再按需训练。", "expected_revision": value["revision"]}
         assert client.put(url, json=payload).status_code == 403
         for invalid in ({**selected, "companion": "gpt-5.6-sol"}, {**selected, "idea": "unknown"}, {"idea": "gpt-5.6-sol"}):

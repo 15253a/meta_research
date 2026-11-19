@@ -8,12 +8,18 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import text
 
-from meta_research import research_guidance
+from meta_research import research_guidance, root_capabilities
 from meta_research.owners.agent_runtime import _runtime_binding_from_row
 from meta_research.owners.common import (
     AcceptanceReceipt, OwnerConflict, canonical_hash, canonical_json,
 )
-from meta_research.root_capabilities import CODEX_MODEL_REF, root_capability_profile
+from meta_research.research_guidance import (
+    cycle_role_instructions, shared_reference_instructions,
+    target_role_reference_hash,
+)
+from meta_research.root_capabilities import (
+    CODEX_MODEL_REF, ROOT_AGENT_KINDS, root_capability_profile,
+)
 from test_public_bundle_stage import (
     _DeterministicBundleSkill, _bundle_runtime, _prepare_bundle_request,
 )
@@ -39,17 +45,29 @@ def relocated_history(tmp_path, monkeypatch):
         monkeypatch.setattr(provider_type, "runtime_binding", binding)
     runtime = _bundle_runtime(tmp_path / "data")
     try:
-        _prepare_bundle_request(runtime)
-        assert runtime.bundle_stage.process_once()
-        with runtime._database.read() as connection:
-            rows = [dict(row) for row in connection.execute(text(
-                "SELECT * FROM ar_stage_runs ORDER BY stage"
-            )).mappings()]
-        assert {row["stage"]: row["status"] for row in rows} == {
-            "idea": "completed", "plan": "completed", "bundle": "running",
-        }
-        old_profiles = {stage: root_capability_profile(stage, CODEX_MODEL_REF).digest
-                        for stage in ("idea", "plan", "bundle")}
+        def legacy_index():
+            return canonical_hash({
+                "navigation": {kind: shared_reference_instructions(kind)
+                               for kind in ROOT_AGENT_KINDS},
+                "role_methods": {kind: cycle_role_instructions(kind)
+                                 for kind in ROOT_AGENT_KINDS},
+                "target_references": target_role_reference_hash(),
+            })
+
+        with monkeypatch.context() as legacy:
+            legacy.setattr(root_capabilities, "_shared_reference_index_hash",
+                           legacy_index)
+            _prepare_bundle_request(runtime)
+            assert runtime.bundle_stage.process_once()
+            with runtime._database.read() as connection:
+                rows = [dict(row) for row in connection.execute(text(
+                    "SELECT * FROM ar_stage_runs ORDER BY stage"
+                )).mappings()]
+            assert {row["stage"]: row["status"] for row in rows} == {
+                "idea": "completed", "plan": "completed", "bundle": "running",
+            }
+            old_profiles = {stage: root_capability_profile(stage, CODEX_MODEL_REF).digest
+                            for stage in ("idea", "plan", "bundle")}
         relocated = tmp_path / "another-installation" / "meta_research" / "skills"
         shutil.copytree(research_guidance.shared_reference_root(), relocated)
         monkeypatch.setattr(research_guidance, "shared_reference_root", lambda: relocated)

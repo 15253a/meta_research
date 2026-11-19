@@ -63,6 +63,7 @@ from meta_research.semantic_mcp import (
     SemanticMcpGateway,
     SemanticOperation,
 )
+from meta_research.error_audit import ErrorAuditStore
 from meta_research.root_capabilities import (
     ROOT_AGENT_KINDS,
     RootAgentKind,
@@ -248,6 +249,7 @@ def create_semantic_owner_gateway(
     search_sources=None,
     recorder_channels=None,
     writing_credentials=None,
+    error_audit_store: ErrorAuditStore | None = None,
 ) -> SemanticMcpGateway:
     """Bind semantic operations to public Owner interfaces only.
 
@@ -390,7 +392,9 @@ def create_semantic_owner_gateway(
     operations.append(content_model_operation(agent_runtime, human_collaboration, writing_credentials))
     if recorder_channels is not None:
         operations.append(recorder_channels.operation)
-    return SemanticMcpGateway(tuple(operations))
+    return SemanticMcpGateway(
+        tuple(operations), error_audit_store=error_audit_store
+    )
 
 
 def _research_time_operation(advancement_engine, agent_runtime):

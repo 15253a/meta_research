@@ -15,8 +15,26 @@ from test_stage_terminal_contract_authority import _provider_evidence
 from test_target_root_finalizer import _current_bundle_runtime
 
 
+@pytest.mark.parametrize("code,expected_hint_parts", [
+    (
+        "candidate_measurement_cell_not_required",
+        ("candidate.measurement_contract", "NormalizedCompletionContract"),
+    ),
+    (
+        "bundle_target_batch_invalid",
+        ("Correct the reported contract failure",),
+    ),
+    (
+        "bundle_propose_targets_replan_basis_not_null",
+        ("propose_targets", "replan_basis", "null"),
+    ),
+    (
+        "strategy_consumed_unaccepted_result",
+        ("requires_accepted_labels", "local_label", "commit_ref", "depends_on_labels"),
+    ),
+])
 def test_owner_correction_reaches_successor_provider_prompt_with_exact_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code, expected_hint_parts,
 ) -> None:
     runtime = _current_bundle_runtime(tmp_path / "bundle-feedback")
     try:
@@ -53,7 +71,7 @@ def test_owner_correction_reaches_successor_provider_prompt_with_exact_scope(
             failure_code="bundle_primary_result_contract_invalid",
             provider_exit=_provider_evidence(
                 failure_code="bundle_primary_result_contract_invalid",
-                detail_code="candidate_measurement_cell_not_required",
+                detail_code=code,
             ),
         )
         successor = owner.query_bundle_stage_run(original.request_ref)
@@ -67,7 +85,8 @@ def test_owner_correction_reaches_successor_provider_prompt_with_exact_scope(
             fence_ref=successor.fence_ref,
         )
         assert feedback is not None
-        assert feedback["detail_code"] == "candidate_measurement_cell_not_required"
+        assert feedback["detail_code"] == code
+        assert all(part in feedback["repair_hint"] for part in expected_hint_parts)
         assert feedback["provider_unit_ref"] == unit_ref
         assert feedback["provider_operation_ref"] == original.primary_invocation.operation_ref
         assert feedback["rejected_attempt_ref"] == original.attempt_ref
@@ -110,7 +129,7 @@ def test_owner_correction_reaches_successor_provider_prompt_with_exact_scope(
         assert invocation["job_ref"] == successor.primary_invocation.operation_ref
         assert invocation["operation_name"] == "primary"
         assert "provider_correction_feedback=" + canonical_json(feedback) in invocation["prompt"]
-        assert "candidate_measurement_cell_not_required" in invocation["prompt"]
+        assert code in invocation["prompt"]
 
         # Hash-valid but incorrectly rebound metadata is not source authority.
         with runtime._database.write() as connection:

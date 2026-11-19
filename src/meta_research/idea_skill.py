@@ -90,7 +90,10 @@ from meta_research.idea_contract import (
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
+from meta_research.research_guidance import (
+    BINDING_SKILLS_ROOT, SHARED_REFERENCE_PATHS, shared_reference_resources,
+    cycle_role_skill_text, prepare_cycle_role_resources, role_skill_source,
+)
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES,
@@ -1461,7 +1464,8 @@ class CodexIdeaSkillAdapter:
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
-                    "skill_instructions": _idea_skill_instructions(),
+                    "skill_instructions": _idea_skill_instructions(
+                        binding_identity_root=BINDING_SKILLS_ROOT),
                     "adapter_source_hash": adapter_source_hash,
                     "shared_adapter_source_hash": _shared_codex_adapter_source_hash(),
                     "resident_mcp_source_hash": resident_mcp_source_hash,
@@ -3096,9 +3100,10 @@ def _idea_skill_resources() -> dict[str, str]:
         raise IdeaSkillUnavailable("idea_skill_resource_unavailable") from error
 
 
-def _idea_skill_instructions() -> str:
+def _idea_skill_instructions(*, binding_identity_root: str | None = None) -> str:
     return (
-        "Role skill source: " + str(Path(__file__).with_name("skills") / "idea_stage" / "SKILL.md")
+        "Role skill source: " + role_skill_source(
+            "idea_stage", binding_identity_root=binding_identity_root)
         + "\nHarness maintains this role's research method. Read references/io-contract.md when "
         "establishing inputs or handing off; read references/contract.md when forming an outcome, "
         "handling rejection or considering exhaustion. Resolve links relative to the source directory."

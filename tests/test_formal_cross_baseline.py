@@ -7,16 +7,24 @@ another Baseline and newly declared method objects.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 
 from meta_research.baseline_identity import resolve_baseline_method_identity
-from meta_research.formal_entities import _variant_declaration, root_work_items
+from meta_research.formal_entities import (
+    _resolve_declared_variants, _variant_declaration, root_work_items,
+)
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.owners.research_graph import _get_or_create_target_measurement_identity
+from meta_research.target_content_issue import TargetContentIssue
+from meta_research.target_run_finalizer import TargetRunFinalizer
 from test_root_formal_entities import _accept
-from test_target_root_finalizer import _root_finalizer_fixture
+from test_target_root_finalizer import (
+    _EvidenceReader, _completion_handoff, _replace_completion_evidence,
+    _root_finalizer_fixture,
+)
 
 
 NEW_METHOD_FORWARD = {
@@ -183,3 +191,222 @@ def test_declaration_requires_both_contract_and_recipe():
     with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
         _variant_declaration({"run_key": "a", "baseline_forward_contract": NEW_METHOD_FORWARD,
                               "variant_recipe": {}})
+
+
+CONFLICTING_CONTRACT = {
+    **NEW_METHOD_FORWARD["method_contract"],
+    "output_semantics": "causal effect estimates and interval bounds",
+}
+
+
+def _declared_run(document, metrics, *, contract):
+    """Declare one extra named method run beside the authority's primary work."""
+    primary = next(run for run in document["formal_runs"]
+                   if run["run_key"] == "primary")
+    primary = {**primary, "evaluations": [{"attempt_key": "main", "metrics": metrics}]}
+    document["formal_runs"] = [
+        primary,
+        {"run_key": "audit-work",
+         "baseline_forward_contract": {**NEW_METHOD_FORWARD, "method_contract": contract},
+         "variant_recipe": NEW_RECIPE, "evaluations": []},
+    ]
+    document["metrics"] = {}
+
+
+def test_declared_method_content_conflict_becomes_revision_required_after_rm(
+    tmp_path: Path,
+) -> None:
+    """A wrong reuse of an existing name/version is a correctable Target declaration."""
+    runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    try:
+        with runtime._database.write() as connection:
+            registered_baseline, _variant = _register_method(
+                connection, NEW_METHOD_FORWARD, NEW_RECIPE)
+        path = workspace / "outputs/result.json"
+        document = json.loads(path.read_text())
+        metrics = document["metrics"]
+        _declared_run(document, metrics, contract=CONFLICTING_CONTRACT)
+        path.write_text(canonical_json(document))
+
+        finalizer = TargetRunFinalizer(
+            lifecycle=lifecycle, memory=memory,
+            workspace_resolver=runtime.target_run_authorities.agent_runtime,
+            evidence_reader=_EvidenceReader(evidence),
+            measurement_authority=runtime.owners.research_graph,
+            graph_authority=runtime.owners.research_graph,
+        )
+        rejected = finalizer.finalize(handle=handle, evidence=evidence)
+
+        assert rejected.status == "revision_required"
+        assert rejected.completion_generation == 1
+        assert rejected.rejection_issuer == "research_graph"
+        assert rejected.pending_code == "baseline_method_version_content_conflict"
+        assert rejected.target_commit_ref is None
+        # The signed feedback itself carries the declared identity: the Owner
+        # rejection records only this text, never the exception details.
+        assert "audit-work" in rejected.rejection_feedback
+        assert "$.formal_runs[1]" in rejected.rejection_feedback
+        assert "device_time_distribution_audit" in rejected.rejection_feedback
+        assert "method_version '1'" in rejected.rejection_feedback
+        assert canonical_hash(NEW_METHOD_FORWARD["method_contract"]) in rejected.rejection_feedback
+        assert canonical_hash(CONFLICTING_CONTRACT) in rejected.rejection_feedback
+        assert memory.query(rejected.manifest_ref) is not None
+        completion = lifecycle.query_completion(handle.target_ref)
+        assert completion is not None and completion.generation == 1
+        rejection = lifecycle.query_completion_rejection(completion.completion_ref)
+        assert rejection is not None
+        assert rejection.code == "baseline_method_version_content_conflict"
+        assert rejection.receipt.subject_ref == completion.completion_ref
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_root_measurements")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_commits")
+            ).scalar_one() == 0
+
+        # The same frozen generation replays its exact signed rejection.
+        replay = finalizer.finalize(handle=handle, evidence=evidence)
+        assert replay == rejected
+        assert lifecycle.query_completion_rejection(completion.completion_ref) == rejection
+
+        # The corrected successor reuses the same registered Baseline.
+        corrected = json.loads(path.read_text())
+        corrected["formal_runs"][1]["baseline_forward_contract"]["method_contract"] = (
+            NEW_METHOD_FORWARD["method_contract"])
+        path.write_text(canonical_json(corrected))
+        successor_evidence = _replace_completion_evidence(
+            workspace, evidence,
+            handoff=_completion_handoff(workspace, evidence),
+            operation_ref="harness_target_root_successor_turn",
+            operation_generation=evidence.operation_generation + 1,
+            evidence_ref="harness_evidence_target_root_successor_turn",
+            evidence_sequence=evidence.evidence_sequence + 10,
+            observed_at=evidence.observed_at + 1.0,
+        )
+        successor = TargetRunFinalizer(
+            lifecycle=lifecycle, memory=memory,
+            workspace_resolver=runtime.target_run_authorities.agent_runtime,
+            evidence_reader=_EvidenceReader(successor_evidence),
+            measurement_authority=runtime.owners.research_graph,
+            graph_authority=runtime.owners.research_graph,
+        ).finalize(handle=handle, evidence=successor_evidence)
+        assert successor.status == "completed"
+        assert successor.completion_generation == 2
+        facts = {fact["run_key"]: fact
+                 for fact in runtime.owners.research_graph.query_target_formal_results(handle.target_ref)}
+        with runtime._database.read() as connection:
+            audit_baseline = connection.execute(text(
+                "SELECT baseline_ref FROM rg_experiment_variants WHERE variant_ref = :ref"),
+                {"ref": facts["audit-work"]["variant_run"]["variant_ref"]}).scalar_one()
+        assert audit_baseline == registered_baseline
+        assert lifecycle.query_completion_rejection(
+            completion.completion_ref) == rejection
+    finally:
+        runtime.close()
+
+
+def test_only_the_content_conflict_is_a_target_content_issue(tmp_path):
+    """Integrity, other declaration faults and verification stay OwnerConflict."""
+    runtime, _lifecycle, _memory, _authority, handle, _workspace, _evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    items = [{"run_key": "audit-work", "reuse_variant_run": False, "variant_ref": None}]
+    document = {"formal_runs": [
+        {"run_key": "audit-work",
+         "baseline_forward_contract": {**NEW_METHOD_FORWARD, "method_contract": CONFLICTING_CONTRACT},
+         "variant_recipe": NEW_RECIPE, "evaluations": []},
+    ]}
+    try:
+        with runtime._database.write() as connection:
+            _register_method(connection, NEW_METHOD_FORWARD, NEW_RECIPE)
+            with pytest.raises(OwnerConflict) as caught:
+                _resolve_declared_variants(
+                    connection, items=items, result_document=document,
+                    root={"target_ref": handle.target_ref}, accepted_at=1.0,
+                    verify_only=True,
+                )
+        assert not isinstance(caught.value, TargetContentIssue)
+        assert caught.value.code == "baseline_method_version_content_conflict"
+
+        envelope_fault = {"formal_runs": [
+            {"run_key": "audit-work",
+             "baseline_forward_contract": {**NEW_METHOD_FORWARD, "execution_binding": "x"},
+             "variant_recipe": NEW_RECIPE, "evaluations": []},
+        ]}
+        with runtime._database.write() as connection:
+            with pytest.raises(OwnerConflict) as caught:
+                _resolve_declared_variants(
+                    connection, items=items, result_document=envelope_fault,
+                    root={"target_ref": handle.target_ref}, accepted_at=2.0,
+                    verify_only=False,
+                )
+        assert not isinstance(caught.value, TargetContentIssue)
+        assert caught.value.code == "baseline_method_envelope_invalid"
+    finally:
+        runtime.close()
+
+
+def test_tampered_registry_hash_stays_owner_conflict_on_the_live_path(tmp_path):
+    """An unreadable method registry fails closed, even where a conflict would be revisable."""
+    runtime, _lifecycle, _memory, _authority, handle, _workspace, _evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    items = [{"run_key": "audit-work", "reuse_variant_run": False, "variant_ref": None}]
+    document = {"formal_runs": [
+        {"run_key": "audit-work",
+         "baseline_forward_contract": {**NEW_METHOD_FORWARD, "method_contract": CONFLICTING_CONTRACT},
+         "variant_recipe": NEW_RECIPE, "evaluations": []},
+    ]}
+    try:
+        with runtime._database.write() as connection:
+            _register_method(connection, NEW_METHOD_FORWARD, NEW_RECIPE)
+            connection.execute(text(
+                "UPDATE rg_baseline_method_versions SET method_contract_hash = :hash "
+                "WHERE method_key = :key"), {
+                "hash": canonical_hash({"meaning": "tampered"}),
+                "key": NEW_METHOD_FORWARD["method_key"]})
+            with pytest.raises(OwnerConflict) as caught:
+                _resolve_declared_variants(
+                    connection, items=items, result_document=document,
+                    root={"target_ref": handle.target_ref}, accepted_at=1.0,
+                    verify_only=False,
+                )
+        assert not isinstance(caught.value, TargetContentIssue)
+        assert caught.value.code == "baseline_method_version_integrity_invalid"
+    finally:
+        runtime.close()
+
+
+def test_baseline_ref_only_declaration_names_its_registered_method(tmp_path):
+    """A reference-only declaration reports the referenced method's exact identity."""
+    runtime, _lifecycle, _memory, _authority, handle, _workspace, _evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    items = [{"run_key": "audit-work", "reuse_variant_run": False, "variant_ref": None}]
+    document = {"formal_runs": [
+        {"run_key": "audit-work",
+         "baseline_forward_contract": {"baseline_ref": None,
+                                       "method_contract": CONFLICTING_CONTRACT},
+         "variant_recipe": NEW_RECIPE, "evaluations": []},
+    ]}
+    try:
+        with runtime._database.write() as connection:
+            baseline_ref, _variant = _register_method(connection, NEW_METHOD_FORWARD, NEW_RECIPE)
+            document["formal_runs"][0]["baseline_forward_contract"]["baseline_ref"] = baseline_ref
+            with pytest.raises(TargetContentIssue) as caught:
+                _resolve_declared_variants(
+                    connection, items=items, result_document=document,
+                    root={"target_ref": handle.target_ref}, accepted_at=1.0,
+                    verify_only=False,
+                )
+        assert caught.value.code == "baseline_method_version_content_conflict"
+        assert baseline_ref in caught.value.feedback
+        assert "method_key 'device_time_distribution_audit'" in caught.value.feedback
+        assert "method_version '1'" in caught.value.feedback
+        assert canonical_hash(NEW_METHOD_FORWARD["method_contract"]) in caught.value.feedback
+        assert canonical_hash(CONFLICTING_CONTRACT) in caught.value.feedback
+    finally:
+        runtime.close()

@@ -5,10 +5,13 @@ import json
 from pathlib import Path
 import subprocess
 import tomllib
+from types import SimpleNamespace
 
 import pytest
 
+from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.owners.common import OwnerConflict
+from meta_research.paths import DataRoot
 from meta_research.quest_drafting import CODEX_DRAFTING_LOCKED_VERSION, DraftingUnavailable
 from meta_research.recorder_sources import RecorderChannels, READ_SOURCE
 from meta_research.semantic_mcp import SemanticMcpGateway
@@ -151,6 +154,78 @@ class RecorderRunner:
 
 def adapter(tmp_path, runner):
     return CodexTimelineSummaryAdapter(tmp_path / "provider", process_runner=runner, channels=runner.channels)
+
+
+def test_recorder_factory_reads_managed_stage_home_and_inherits_credential_environment(tmp_path, monkeypatch):
+    from meta_research.timeline_summaries import create_timeline_summary_service
+
+    root = DataRoot(tmp_path / "data")
+    root.codex_home.mkdir(parents=True)
+    runtime = SimpleNamespace(data_root=root, recorder_channels=RecorderRunner().channels)
+    monkeypatch.setattr("meta_research.timeline_summary_sources.TimelineSummarySourceReader", lambda runtime: object())
+    monkeypatch.setenv("TEST_RESEARCH_KEY", "test-secret-value")
+    service = create_timeline_summary_service(runtime, "codex")
+    provider = service._provider_factory()
+    args = (tmp_path / "schema.json", tmp_path / "result.json")
+    default = provider._provider_argv(*args, native_session_ref=None, ephemeral=False)
+    assert not any(arg.startswith("model_provider=") for arg in default)
+    (root.codex_home / "config.toml").write_text(
+        'profile="deployment"\n[profiles.deployment]\nmodel_provider="gateway"\n'
+        '[model_providers.gateway]\nname="Gateway"\nenv_key="TEST_RESEARCH_KEY"\n', encoding="utf-8")
+    argv = provider._provider_argv(*args, native_session_ref=None, ephemeral=False)
+    assert 'model_provider="gateway"' in argv and 'model_providers.gateway.env_key="TEST_RESEARCH_KEY"' in argv
+    assert "test-secret-value" not in repr(argv)
+    invocation_env = provider._process_runner._subprocess_environment({"META_RESEARCH_MCP_TOKEN": "grant"})
+    assert invocation_env["TEST_RESEARCH_KEY"] == "test-secret-value"
+    assert invocation_env["CODEX_HOME"] == str(root.codex_home)
+
+
+def test_native_recorder_uses_only_selected_stage_provider_route_on_start_and_resume(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'model_provider = "research-gateway"\nmodel = "other-model"\n'
+        '[model_providers.research-gateway]\nname = "Research Gateway"\n'
+        'base_url = "https://example.test/v1"\nwire_api = "responses"\nenv_key = "TEST_RESEARCH_KEY"\n'
+        '[model_providers.unused]\nexperimental_bearer_token = "private-marker"\n'
+        '[mcp_servers.extra]\nurl = "https://unrelated.test/mcp"\n', encoding="utf-8")
+    monkeypatch.setenv("TEST_RESEARCH_KEY", "test-secret-value")
+    runner = RecorderRunner()
+    provider = CodexTimelineSummaryAdapter(tmp_path / "provider", process_runner=runner,
+                                           channels=runner.channels, stage_provider_config=config)
+    _, native, _ = provider.summarize(**job())
+    provider.summarize(**dict(job(), job_ref="next-observation", native_session_ref=native))
+    for argv, prompt in runner.calls:
+        assert "--ignore-user-config" in argv and "--ignore-rules" in argv
+        assert argv[argv.index("--model") + 1] == CODEX_MODEL_REF
+        configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--config"]
+        route = tomllib.loads("\n".join(c for c in configs if c.startswith("model_provider")))
+        assert route == {
+            "model_provider": "research-gateway",
+            "model_providers": {"research-gateway": {
+                "name": "Research Gateway", "base_url": "https://example.test/v1",
+                "wire_api": "responses", "env_key": "TEST_RESEARCH_KEY"}},
+        }
+        assert f'mcp_servers.meta_research.url="{runner.channels.url}"' in configs
+        assert all(value not in repr((argv, prompt)) for value in
+                   ("test-secret-value", "private-marker", "other-model", "unrelated.test"))
+
+
+@pytest.mark.parametrize("bad_field", [
+    'experimental_bearer_token = "private-marker"',
+    'base_url = "https://user:private-marker@example.test/v1"',
+    'base_url = "https://example.test/v1?token=private-marker"',
+    'env_key = "private-marker!"',
+])
+def test_recorder_rejects_unsafe_selected_definition_before_provider_dispatch(tmp_path, bad_field):
+    config = tmp_path / "config.toml"
+    config.write_text('model_provider="gateway"\n[model_providers.gateway]\n' + bad_field, encoding="utf-8")
+    runner = RecorderRunner()
+    provider = CodexTimelineSummaryAdapter(tmp_path / "provider", process_runner=runner,
+                                           channels=runner.channels, stage_provider_config=config)
+    with pytest.raises(DraftingUnavailable, match="^timeline_summary_provider_config_invalid$"):
+        provider.summarize(**job())
+    assert runner.calls == []
+    assert not provider._durable_job_directory(job()["job_ref"]).exists()
 
 
 class ObservedNodes:

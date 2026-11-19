@@ -540,7 +540,7 @@ def create_timeline_summary_service(runtime, executable: str, *, provider=None) 
         from meta_research.timeline_summary_provider import CodexTimelineSummaryAdapter
         return provider or CodexTimelineSummaryAdapter(
             root / 'provider', executable=executable, timeout_seconds=GENERATION_TIMEOUT_SECONDS,
-            channels=runtime.recorder_channels,
+            channels=runtime.recorder_channels, stage_provider_config=runtime.data_root.codex_home / 'config.toml',
             process_runner=_CancellableProcessRunner(protected_environment=runtime.data_root.codex_environment))
 
     def prompt_version():

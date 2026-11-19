@@ -32,6 +32,7 @@ from meta_research.deepfetch import (
     DeepFetchRunRequest,
 )
 from meta_research.feed import DurableFeed
+from meta_research.error_audit import ErrorAuditStore
 from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.harness import HarnessRuntime
 from meta_research.goal_work_reconciler import GoalWorkReconciler
@@ -95,7 +96,6 @@ from meta_research.power_inhibitors import (
 )
 from meta_research.projection import PublicProjection
 from meta_research.quest_drafting import (
-    CODEX_DRAFTING_LOCKED_VERSION,
     HostComputeProbe,
     IntentDraftingProvider,
     NvidiaSmiProbe,
@@ -565,13 +565,12 @@ def build_production_runtime(
     startup_harness_diagnostics: bool = True,
     telemetry_exporter_factory: Callable[[str], TelemetryExporter] | None = None,
 ) -> ProductionRuntime:
-    codex_executable = str(
-        data_root.validated_codex_cli_executable(CODEX_DRAFTING_LOCKED_VERSION)
-    )
+    codex_executable = str(data_root.deployment_codex_cli_executable())
     upgrade_database(data_root.database)
     database = Database(data_root.database)
     feed = DurableFeed(database)
     feed.ensure_initialized()
+    error_audit_store = ErrorAuditStore(database, feed)
     runtime_protection = RuntimeProtection(
         database=database,
         feed=feed,
@@ -995,6 +994,7 @@ def build_production_runtime(
         human_collaboration_snapshot=owners.human_collaboration.query_snapshot,
         human_collaboration=owners.human_collaboration,
         target_run_agent=target_run_agent,
+        error_audit_store=error_audit_store,
     )
     recorder_channels.gateway = semantic_gateway
     root_workspaces.bind_creation_gateway(semantic_gateway)
@@ -1016,6 +1016,7 @@ def build_production_runtime(
             CodexHarnessAdapter(
                 data_root.run / "harness",
                 executable=codex_executable,
+                managed_executable_for_version=data_root.validated_codex_cli_executable,
                 runner=codex_harness_transport,
                 codex_home=data_root.codex_home.absolute(),
                 target_root_timeout_seconds=target_root_timeout_seconds,

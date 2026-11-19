@@ -333,6 +333,71 @@ def _lookup_declared_baseline(connection, forward):
     raise OwnerConflict('target_formal_entity_missing')
 
 
+def _declared_method_content_conflict(connection, *, run_key, forward, error, selector):
+    """Turn one correctable declaration conflict into Target correction feedback.
+
+    Only the live registration of a declared method name/version is revisable.
+    Integrity, unknown-identity and verification-only faults stay OwnerConflict.
+    The Owner rejection signs this text alone, so the declared identity, the
+    registered contract hash and the exact declaration path live in it.
+    """
+    from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
+
+    method_key = forward.get('method_key')
+    method_version = forward.get('method_version')
+    # The conflict is raised only for an already verified envelope, so a supplied
+    # contract is a nonempty object and the registry row was verified moments ago
+    # in this same transaction: read its hash as it stands. A reference-only
+    # declaration may name its version only by reference, and a legacy row may
+    # have no registered method version at all.
+    submitted = (canonical_hash(forward['method_contract'])
+                 if 'method_contract' in forward else None)
+    if method_key is None:
+        row = connection.execute(text(
+            'SELECT method_key, method_version, method_contract_hash '
+            'FROM rg_baseline_method_versions WHERE baseline_ref = :ref'),
+            {'ref': forward['baseline_ref']}).first()
+    else:
+        row = connection.execute(text(
+            'SELECT method_key, method_version, method_contract_hash '
+            'FROM rg_baseline_method_versions WHERE method_key = :method_key '
+            'AND method_version = :method_version'),
+            {'method_key': method_key, 'method_version': method_version}).first()
+    registered = None if row is None else row.method_contract_hash
+    if row is None and 'baseline_ref' in forward:
+        # A byte-addressed legacy Baseline keeps its contract in the Baseline
+        # itself; that stored hash is the one the declaration must match.
+        registered = connection.execute(text(
+            'SELECT forward_contract_hash FROM rg_experiment_baselines '
+            'WHERE baseline_ref = :ref'), {'ref': forward['baseline_ref']}).scalar_one_or_none()
+    issue = TargetContentIssue(error.code, {
+        'run_key': run_key,
+        'selector': selector,
+        'method_key': method_key if row is None else row.method_key,
+        'method_version': method_version if row is None else row.method_version,
+        'registered_method_contract_hash': registered,
+        'submitted_method_contract_hash': submitted,
+    })
+    declared = ', '.join(part for part in (
+        f'method_key {method_key!r}' if method_key is not None else None,
+        f'method_version {method_version!r}' if method_version is not None else None,
+        f'baseline_ref {forward["baseline_ref"]!r}' if 'baseline_ref' in forward else None,
+    ) if part is not None)
+    if row is not None and method_key is None:
+        declared += (f', registered as method_key {row.method_key!r} '
+                     f'method_version {row.method_version!r}')
+    issue.feedback = (
+        f"{selector} (Run {run_key!r}) declares {declared}, a method version that is "
+        f"already registered with different immutable semantics. "
+        f"{BASELINE_METHOD_REJECTION_FEEDBACK[error.code]} "
+        f"Registered method_contract hash: {registered or 'unavailable'}; "
+        f"submitted method_contract hash: {submitted or 'unavailable'}. "
+        "Reuse the registered contract exactly for this run, or finish this Root "
+        "with a new method_version when the meaning differs."
+    )
+    return issue
+
+
 def _resolve_declared_variants(connection, *, items, result_document, root, accepted_at, verify_only):
     """Give declared work items their real Baseline/Variant identity.
 
@@ -344,10 +409,11 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
     if not isinstance(declared, list):
         declared = []
     declarations = {}
-    for run in declared:
+    for ordinal, run in enumerate(declared):
         if isinstance(run, dict) and run.get('run_key'):
-            declarations[run['run_key']] = _variant_declaration(run)
-    if not any(declarations.values()):
+            declarations[run['run_key']] = (
+                _variant_declaration(run), '$.formal_runs[' + str(ordinal) + ']')
+    if not any(declaration is not None for declaration, _ in declarations.values()):
         return
     from meta_research.baseline_identity import resolve_baseline_method_identity
     from meta_research.owners.research_graph import _get_or_create_target_measurement_identity
@@ -357,7 +423,10 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
     if not isinstance(quest_ref, str) or not quest_ref:
         raise OwnerConflict('target_formal_variant_declaration_invalid')
     for item in items:
-        declaration = declarations.get(item['run_key'])
+        selected = declarations.get(item['run_key'])
+        if selected is None:
+            continue
+        declaration, selector = selected
         if declaration is None:
             continue
         if item['reuse_variant_run']:
@@ -375,8 +444,15 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
                 raise OwnerConflict('target_formal_entity_missing')
             item['variant_ref'] = str(row[0])
             continue
-        baseline_ref, _created = resolve_baseline_method_identity(
-            connection, forward=forward, quest_ref=quest_ref, accepted_at=accepted_at)
+        try:
+            baseline_ref, _created = resolve_baseline_method_identity(
+                connection, forward=forward, quest_ref=quest_ref, accepted_at=accepted_at)
+        except OwnerConflict as error:
+            if error.code != 'baseline_method_version_content_conflict':
+                raise
+            raise _declared_method_content_conflict(
+                connection, run_key=item['run_key'], forward=forward, error=error,
+                selector=selector) from None
         variant_ref, _variant_created = _get_or_create_target_measurement_identity(
             connection, table='rg_experiment_variants', ref_column='variant_ref',
             ref_prefix='variant', natural={'baseline_ref': baseline_ref,

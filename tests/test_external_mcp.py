@@ -102,7 +102,10 @@ def test_external_catalog_continuation_and_frozen_contract_with_updated_instruct
         contract = call("external_tools_contract", {"name": page["items"][0]["name"]})["result"]["structuredContent"]
         assert contract["research_instructions"] == "Original instructions"
         assert call("external_tools_catalog", {**continuation, "query": "temperature"})["error"]["data"]["code"] == "tool_catalog_changed"
-    assert runtime.dispatch_http(access.token, request("tools/list"))[0] == 401
+    status, auth_failure, _ = runtime.dispatch_http(access.token, request("tools/list"))
+    assert status == 401
+    assert auth_failure["error"]["code"] == "external_mcp_authentication_required"
+    assert auth_failure["error"]["data"]["error_contract"]["details"]["operator_required"] is True
 
 
 @pytest.mark.parametrize("method", [[], {}, None, 1])
@@ -113,6 +116,7 @@ def test_malformed_protocol_method_is_rejected_without_a_business_call(tmp_path,
         status, result, _ = runtime.dispatch_http(access.token, request(method))
         assert status == 400
         assert result["error"]["code"] == "external_mcp_request_invalid"
+        assert result["error"]["data"]["error_contract"]["details"]["feedback_stage_agent"] is True
         assert not (tmp_path / "calls.jsonl").exists()
         assert runtime.dispatch_http(access.token, request("tools/list"))[0] == 200
 
@@ -249,6 +253,11 @@ def test_call_failure_identifies_original_work_and_requires_a_verified_repair(tm
             "tool": "read_temperature", "outcome": "unknown" if failure_stage == "tools/call" else "not_called",
             "business_action_attempted": failure_stage == "tools/call"}
         assert expected.items() <= failure.items()
+        if "error" in failed:
+            contract = failure["error_contract"]
+            assert contract["code"] == failure["code"]
+            assert contract["details"]["effect_status"] == "unknown"
+            assert contract["details"]["reconcile_same_effect"] is True
         if failure_stage == "tools/call":
             assert failure["provider_diagnostic_status"] == "unstructured_not_forwarded"
             assert "Reconcile" in failure["correction"]

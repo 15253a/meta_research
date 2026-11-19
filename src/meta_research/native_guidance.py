@@ -15,6 +15,7 @@ import threading
 import time
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.codex_runtime import CODEX_LOCKED_VERSION, DEFAULT_CODEX_CLI_VERSION, SUPPORTED_CODEX_CLI_VERSIONS
 from meta_research.human_guidance import human_input_identities, live_guidance_prompt
 import logging
 from meta_research.provider_supervisor import (
@@ -52,20 +53,39 @@ def bind_live_guidance(authority, scope, binding):
         state.update(authority=authority, scope=scope, binding=binding)
 
 
-def live_native_argv(argv, directory, *, enabled=True, force_transport=False, passthrough_exec=False):
+def sealed_native_cli_version(document):
+    """Legacy signed launch envelopes predate deployment selection and used the original lock."""
+    if set(document) == {"argv"}:
+        return DEFAULT_CODEX_CLI_VERSION
+    if set(document) == {"argv", "cli_version"} and document["cli_version"] in SUPPORTED_CODEX_CLI_VERSIONS:
+        return document["cli_version"]
+    raise ValueError("native_provider_identity_invalid")
+
+
+def live_native_argv(argv, directory, *, enabled=True, force_transport=False, passthrough_exec=False,
+                     cli_version=CODEX_LOCKED_VERSION, seal_direct_launch=False):
     state = _operation.get()
     has_guidance = state is not None and state["binding"] is not None
-    if not enabled or not (has_guidance or force_transport):
+    wrap = has_guidance or force_transport
+    if not enabled or (not wrap and (not seal_direct_launch or cli_version == DEFAULT_CODEX_CLI_VERSION)):
         return argv
+    if cli_version not in SUPPORTED_CODEX_CLI_VERSIONS:
+        raise ValueError("native_provider_identity_invalid")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     _key_path, key = read_transport_key_for_operation(directory)
     original = directory / "native-provider-argv.json"
     if original.exists():
-        if read_transport_envelope(original, key) != {"argv": argv}:
+        existing = read_transport_envelope(original, key)
+        if sealed_native_cli_version(existing) != cli_version or existing["argv"] != argv:
             raise OSError("native_provider_identity_conflict")
     else:
-        write_transport_envelope(original, {"argv": argv}, key)
+        document = {"argv": argv}
+        if cli_version != DEFAULT_CODEX_CLI_VERSION:
+            document["cli_version"] = cli_version
+        write_transport_envelope(original, document, key)
+    if not wrap:
+        return argv
     if has_guidance:
         pump = _GuidancePump(state["authority"], state["scope"], state["binding"], directory, key)
         state["pumps"].append(pump)

@@ -1,6 +1,8 @@
 """Canonical packaged references, disclosed through role-scoped pointers."""
+from __future__ import annotations
+
 from importlib.resources import files
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from meta_research.owners.common import canonical_hash
 from meta_research.resource_preparation import prepared_resource
@@ -10,6 +12,38 @@ SHARED_REFERENCE_NAMES = (
     "cycle-work.md", "materials-and-custody.md",
 )
 SHARED_REFERENCE_PATHS = frozenset(f"references/{name}" for name in SHARED_REFERENCE_NAMES)
+
+# Fixed POSIX package locator used solely for binding identity.  Two identical
+# release copies installed under different real prefixes must share one
+# execution identity, so hashed instruction text interpolates this logical
+# locator instead of the deployment path.  Text actually delivered to the
+# model keeps the real, readable absolute path from ``shared_reference_root``.
+BINDING_SKILLS_ROOT = "/meta_research/skills"
+
+
+def skills_location(
+    *components: str, binding_identity_root: str | None = None
+) -> str:
+    """Return a skills location for either a binding hash or live instructions.
+
+    ``components`` is a package-relative path (or its parts), never an absolute
+    path: the live branch joins it onto ``shared_reference_root`` so the native
+    filesystem spelling (including Windows separators) is preserved, while the
+    binding branch joins it onto the fixed POSIX logical root.
+    """
+    relative = PurePosixPath(*components)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"skills location must be package-relative: {relative}")
+    if binding_identity_root is None:
+        return str(shared_reference_root().joinpath(*relative.parts))
+    return str(PurePosixPath(binding_identity_root) / relative)
+
+
+def role_skill_source(
+    directory: str, *, binding_identity_root: str | None = None
+) -> str:
+    """Render the role ``SKILL.md`` locator, real or binding-logical."""
+    return skills_location(directory, "SKILL.md", binding_identity_root=binding_identity_root)
 
 CYCLE_ROLE_DIRECTORIES = {
     "idea": "idea_stage", "plan": "plan_stage", "bundle": "bundle_stage",
@@ -24,12 +58,19 @@ def cycle_role_skill_text(root_kind: str) -> str:
 
 
 @prepared_resource
-def cycle_role_instructions(root_kind: str) -> str:
-    """Maintain the selected role method in Harness instructions, not turn data."""
+def cycle_role_instructions(
+    root_kind: str, *, binding_identity_root: str | None = None
+) -> str:
+    """Maintain the selected role method in Harness instructions, not turn data.
+
+    ``binding_identity_root`` renders the same prose with the fixed logical
+    package locator so an execution identity never depends on the deployment
+    prefix.  Live instructions pass ``None`` and keep the real readable path.
+    """
     directory = CYCLE_ROLE_DIRECTORIES.get(root_kind)
     if directory is None:
         return ""
-    source = shared_reference_root() / directory / "SKILL.md"
+    source = role_skill_source(directory, binding_identity_root=binding_identity_root)
     return (f"Role skill source: {source}\n"
             "Resolve role reference links relative to this source directory.\n"
             + cycle_role_skill_text(root_kind))
@@ -84,24 +125,30 @@ def shared_writing_resources() -> dict[str, str]:
     return {name: (root / name).read_text(encoding="utf-8") for name in names}
 
 
-def shared_writing_instructions(root_kind: str) -> str:
+def shared_writing_instructions(
+    root_kind: str, *, binding_identity_root: str | None = None
+) -> str:
     if root_kind not in {*CYCLE_ROLE_DIRECTORIES, "companion"}:
         return ""
     # Validate all linked resources at the existing preparation boundary. A
     # missing installed reference must not silently select an older skill.
     shared_writing_resources()
-    return ("\nShared writing skill source: " + str(shared_reference_root() / "writing-report" / "SKILL.md")
+    return ("\nShared writing skill source: "
+            + skills_location("writing-report", "SKILL.md", binding_identity_root=binding_identity_root)
             + "\n写作或修改论文、报告、配套 PPT、提纲或局部稿件时，读取这份共用 writing-report Skill，"
             "按任务读取其中的文体、证据与交接参考；在当前任务、目录和权限内完成写作。"
             "正式文件需独立审阅、实际渲染及视觉检查；局部工作按请求范围检查。\n")
 
 
-def companion_reference_instructions(root_kind: str) -> str:
+def companion_reference_instructions(
+    root_kind: str, *, binding_identity_root: str | None = None
+) -> str:
     if root_kind != "companion":
         return ""
-    root = shared_reference_root()
-    return ("\nCompanion role source: " + str(root / "companion-work.md")
-            + "\nCreation role source: " + str(root / "first_creation" / "SKILL.md")
+    return ("\nCompanion role source: "
+            + skills_location("companion-work.md", binding_identity_root=binding_identity_root)
+            + "\nCreation role source: "
+            + skills_location("first_creation", "SKILL.md", binding_identity_root=binding_identity_root)
             + "\n按本次业务分支读取并遵循相应主指导：日常交流及独立写作使用 Companion；"
             "创建理解、重评、首题父子任务及 manual_question_creation 使用 first_creation 与相应上下文合同。"
             "解释系统运行、阶段成果或时间线摘要时，先从 Companion role source 读取当前主指导，"
@@ -110,8 +157,16 @@ def companion_reference_instructions(root_kind: str) -> str:
             "manual 窗口仅起草六字段 Proposal，用户正式确认由原入口处理。\n")
 
 
-def shared_reference_instructions(root_kind: str) -> str:
-    """Point native readers at the sole packaged source without inlining it."""
+def shared_reference_instructions(
+    root_kind: str, *, binding_identity_root: str | None = None
+) -> str:
+    """Point native readers at the sole packaged source without inlining it.
+
+    Only the structured package pointer is interpolated from
+    ``binding_identity_root`` when hashing an execution identity; all prose
+    stays byte-identical, and live rendering passes ``None``.
+    """
+    reference_root = skills_location(binding_identity_root=binding_identity_root)
     purposes = {
         "research-guidance.md": ("安排投入、持续会话或委派审阅", "判断研究价值、协作需要与连续工作"),
         "human-guidance.md": ("主动求助、接收指导或处理人类材料", "把人的参与接入研究并保持协作连续性"),
@@ -123,7 +178,7 @@ def shared_reference_instructions(root_kind: str) -> str:
     names = SHARED_REFERENCE_NAMES
     if root_kind == "acquisition":
         return (
-            f"Shared reference root: {shared_reference_root()}\n"
+            f"Shared reference root: {reference_root}\n"
             "公共参考中的 references/... 相对此安装目录；文件内链接相对该文件。"
             "已有完整且有效的正文直接使用；按需读取与指定获取有关的部分。"
             "原件不可读时如实报告，不以其他版本替代。\n"
@@ -135,7 +190,7 @@ def shared_reference_instructions(root_kind: str) -> str:
     elif root_kind not in cycle_roles:
         names = tuple(name for name in names if name != "cycle-work.md")
     return (
-        f"Shared reference root: {shared_reference_root()}\n"
+        f"Shared reference root: {reference_root}\n"
         "公共参考中的 references/... 相对此安装目录；文件内链接相对该文件。"
         "已有完整且仍有效的正文时直接使用；触发相关工作时，通过原生文件工具读取对应部分。"
         "读取失败如实报告缺少的文件，不使用其他版本替代。\n"
@@ -143,6 +198,6 @@ def shared_reference_instructions(root_kind: str) -> str:
         "Cycle 阶段提交、正式指导确认及目标演化规则仅适用于获得相应职责和工具的研究根；"
         "Acquisition 负责指定获取，Companion／Writing 按各自请求协作，不因此接管 Cycle。\n"
         + "\n".join(f"- **{purposes[name][0]}**：读取 `references/{name}`，{purposes[name][1]}。" for name in names)
-        + shared_writing_instructions(root_kind)
-        + companion_reference_instructions(root_kind)
+        + shared_writing_instructions(root_kind, binding_identity_root=binding_identity_root)
+        + companion_reference_instructions(root_kind, binding_identity_root=binding_identity_root)
     )

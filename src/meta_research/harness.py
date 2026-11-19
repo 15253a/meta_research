@@ -45,6 +45,7 @@ from meta_research.owners.agent_runtime_harness import (
     target_provider_ceiling_recovery_ref,
 )
 from meta_research.owners.common import canonical_hash
+from meta_research.error_contract import error_contract_from_legacy
 from meta_research.provider_supervisor import (
     PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS,
     ProviderSupervisorError,
@@ -224,6 +225,17 @@ class HarnessAdmissionError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.next_retry_at = next_retry_at
+
+    def as_error_contract(self, *, operation_id: str = "harness.admission"):
+        return error_contract_from_legacy(
+            self.code,
+            {"next_retry_at": self.next_retry_at}
+            if self.next_retry_at is not None
+            else None,
+            phase="admission",
+            operation_id=operation_id,
+            effect=True,
+        )
 
 
 class ResidentMcpScopeVerifier(Protocol):
@@ -496,6 +508,11 @@ class HarnessRuntime:
             or not adapter_families <= {"codex"}
         ):
             raise HarnessAdmissionError("harness_adapter_catalog_invalid")
+        bind_retry_runtime = getattr(owner, "bind_target_recovery_runtime_identity", None)
+        runtime_identity = getattr(self._adapters["codex"], "recovery_runtime_identity", None)
+        if (bind_retry_runtime is not None and runtime_identity is not None
+                and getattr(self._adapters["codex"], "supports_managed_recovery_runtimes", False)):
+            bind_retry_runtime(runtime_identity)
         try:
             self._full_conformance_operation_bindings = (
                 self._gateway.required_bindings(
@@ -2201,12 +2218,25 @@ class HarnessRuntime:
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )
+        recovery_model_binding = None
+        target_adapter = self._adapters[request.harness_family]
         if isinstance(request, TargetHarnessRequest) and working_directory is not None:
             # Only a new operation gets current conditions. Reconciliation below
             # verifies and replays the original sealed prompt, including its conditions.
             previous = self._owner.latest_operation(admission.run.run_ref) if generation > 1 else None
             if previous is not None and previous.status == "failed":
                 model_ref = previous.model_ref or request.model_ref
+                resolver = getattr(self._owner, "resolve_target_retry_model", None)
+                if resolver is not None:
+                    try:
+                        recovery_model_binding = resolver(admission.run.run_ref, generation)
+                    except AgentRuntimeHarnessError as error:
+                        raise HarnessAdmissionError(error.code) from error
+                    if recovery_model_binding is not None:
+                        model_ref = recovery_model_binding["scope"]["new_model_ref"]
+                target_adapter = self._target_retry_adapter(
+                    target_adapter, previous, recovery_model_binding, terminal_only=False
+                )
             else:
                 model_ref = selected_stage_model(working_directory, "target", run_ref=admission.run.run_ref,
                                                  target_ref=request.target_ref, default=request.model_ref)
@@ -2237,6 +2267,7 @@ class HarnessRuntime:
             workspace_ref=workspace_ref,
             guidance_binding=guidance_binding,
             external_mcp_binding=None if external_snapshot is None else external_snapshot.binding(),
+            recovery_model_binding=recovery_model_binding,
         )
         invocation_hash = canonical_hash(invocation_material)
         self._start_operation(
@@ -2247,6 +2278,8 @@ class HarnessRuntime:
             resume=resume,
             model_ref=request.model_ref,
             frozen_prompt=prompt,
+            recovery_model_binding=recovery_model_binding,
+            invocation_material=invocation_material if recovery_model_binding else None,
         )
         if consume_recovery_channel:
             self._recovered_target_requests.pop(request_ref, None)
@@ -2257,6 +2290,7 @@ class HarnessRuntime:
             mcp_base_url=mcp_base_url,
             operation_ref=operation_ref,
             owner_invocation_hash=invocation_hash,
+            adapter=target_adapter,
             resume=resume,
             required_capabilities=required_capabilities,
             workspace_ref=workspace_ref,
@@ -2323,6 +2357,17 @@ class HarnessRuntime:
             raise HarnessAdmissionError("provider_reconciliation_not_required")
         if operation.model_ref is not None:
             request = replace(request, model_ref=operation.model_ref)
+        binding_reader = getattr(self._owner, "sealed_target_retry_model", None)
+        try:
+            recovery_model_binding = (
+                binding_reader(operation.operation_ref)
+                if isinstance(request, TargetHarnessRequest) and binding_reader is not None else None
+            )
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        adapter = self._adapters[request.harness_family]
+        if isinstance(request, TargetHarnessRequest):
+            adapter = self._target_retry_adapter(adapter, operation, recovery_model_binding, terminal_only=True)
         generation = operation.generation
         resume = admission.run.native_session_ref is not None
         if resume and admission.run.native_session_ref is None:
@@ -2360,12 +2405,13 @@ class HarnessRuntime:
                 workspace_ref=workspace_ref,
                 guidance_binding=guidance_binding,
                 external_mcp_binding=None if external_snapshot is None else external_snapshot.binding(),
+                recovery_model_binding=recovery_model_binding,
             )
         )
         terminal_replay_only = isinstance(request, TargetHarnessRequest)
         if invocation_hash != operation.invocation_hash:
             recover = getattr(
-                self._adapters[request.harness_family], "recover_terminal_prompt", None
+                adapter, "recover_terminal_prompt", None
             )
             frozen_prompt = None
             if isinstance(request, TargetHarnessRequest) and callable(recover):
@@ -2393,6 +2439,7 @@ class HarnessRuntime:
                 workspace_ref=workspace_ref,
                 guidance_binding=guidance_binding,
                 external_mcp_binding=None if external_snapshot is None else external_snapshot.binding(),
+                recovery_model_binding=recovery_model_binding,
             ))
             if frozen_hash != operation.invocation_hash:
                 raise HarnessAdmissionError("harness_operation_conflict")
@@ -2408,6 +2455,7 @@ class HarnessRuntime:
             operation_ref=operation_ref,
             owner_invocation_hash=operation.invocation_hash,
             resume=resume,
+            adapter=adapter,
             reconciling=True,
             reconciliation_generation=reconciliation_generation,
             required_capabilities=required_capabilities,
@@ -2418,6 +2466,29 @@ class HarnessRuntime:
             guidance_binding=guidance_binding,
             external_mcp_snapshot=external_snapshot,
         )
+
+    def _target_retry_adapter(self, adapter, operation, binding, *, terminal_only):
+        if binding is None and not getattr(adapter, "supports_managed_recovery_runtimes", False):
+            return adapter
+        if not callable(getattr(adapter, "recovery_runtime_identity", None)):
+            if binding is not None:
+                raise HarnessAdmissionError("target_recovery_model_authorization_invalid")
+            return adapter
+        try:
+            identity = binding["scope"]["successor_runtime"] if binding is not None else (
+                adapter.recovery_runtime_identity(
+                    operation_ref=operation.operation_ref, owner_invocation_hash=operation.invocation_hash
+                )
+            )
+            return adapter.for_recovery_runtime(identity)
+        except HarnessAdapterUnavailable as error:
+            if binding is None and error.code == "provider_runtime_terminal_unavailable":
+                if terminal_only:
+                    return adapter
+                preparation = getattr(self._owner, "target_retry_failed_before_transport", None)
+                if preparation is not None and preparation(operation.operation_ref):
+                    return adapter
+            raise HarnessAdmissionError(error.code) from error
 
     @staticmethod
     def _provider_invocation(
@@ -2471,6 +2542,7 @@ class HarnessRuntime:
         operation_ref: str,
         owner_invocation_hash: str,
         resume: bool,
+        adapter: HarnessAdapter | None = None,
         reconciling: bool = False,
         reconciliation_generation: int = 0,
         required_capabilities: tuple[str, ...] | None = None,
@@ -2481,7 +2553,8 @@ class HarnessRuntime:
         guidance_binding: FrozenGuidanceBinding | None = None,
         external_mcp_snapshot: ExternalMcpOperationSnapshot | None = None,
     ) -> HarnessProbeRun:
-        adapter = self._adapters[request.harness_family]
+        if adapter is None:
+            adapter = self._adapters[request.harness_family]
         entry_path = (
             "recovery" if reconciling else "resume" if resume else "initial"
         )
@@ -3670,6 +3743,8 @@ class HarnessRuntime:
         resume: bool,
         model_ref: str,
         frozen_prompt: str,
+        recovery_model_binding: dict[str, object] | None = None,
+        invocation_material: dict[str, object] | None = None,
     ) -> None:
         try:
             self._owner.start_operation(
@@ -3680,6 +3755,8 @@ class HarnessRuntime:
                 resume=resume,
                 model_ref=model_ref,
                 frozen_prompt=frozen_prompt,
+                **({"recovery_model_binding": recovery_model_binding, "invocation_material": invocation_material}
+                   if recovery_model_binding else {}),
             )
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error
@@ -4232,6 +4309,7 @@ def _turn_invocation_material(
     workspace_ref: str | None,
     guidance_binding: FrozenGuidanceBinding | None = None,
     external_mcp_binding: dict[str, str] | None = None,
+    recovery_model_binding: dict[str, object] | None = None,
 ) -> dict[str, object]:
     material: dict[str, object] = {
         "schema_ref": "meta-research/harness-invocation/v1",
@@ -4252,6 +4330,7 @@ def _turn_invocation_material(
         ),
         "capability_binding_hash": admission.run.capability_binding_hash,
         "target_workspace_ref": workspace_ref,
+        **({"recovery_model_binding": recovery_model_binding} if recovery_model_binding else {}),
         **({} if external_mcp_binding is None else {"external_mcp": external_mcp_binding}),
         **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
     }

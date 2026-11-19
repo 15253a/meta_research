@@ -48,7 +48,7 @@ RG 冻结 Target 的 `experiment_keys`、目标、输入、cells、初始 implem
 
 一个 Target 可以有多个 Run、跨 Baseline 方法、交替评价或无评价工作。实际实施可先交接为待评价事实，只有真实评价才生成 EvaluationAttempt；失败评价不补造 MetricResult。定量、定性、理论或报告式评价按具体研究标准表达。
 
-沿用 `baseline_forward_contract`、`variant_recipe`、`evaluation_data`、`split`、`preprocessing` 等字段，不意味着必须计算建模；不适用项用有理由的非空对象表达。required Metric 可为数量、类别、布尔或允许的缺测，纯报告 Protocol 可无指标，结果和分析保存论证与局限。`result_schema` 初始实例形状是指导，Protocol 指标集合、合法 JSON、数值安全、身份及来源仍须有效。
+沿用 `baseline_forward_contract`、`variant_recipe`、`evaluation_data`、`split`、`preprocessing` 等字段，不意味着必须计算建模；对于非建模或纯报告工作，`measurement_contract.baseline_forward_contract` 同样须以 `baseline_ref` 声明复用，或以 `method_key`、`method_version` 和非空 `method_contract` 声明具名方法；其余不适用字段可用非空对象说明不适用理由。required Metric 可为数量、类别、布尔或允许的缺测，纯报告 Protocol 可无指标，结果和分析保存论证与局限。`result_schema` 初始实例形状是指导，Protocol 指标集合、合法 JSON、数值安全、身份及来源仍须有效。
 
 按[研究导航](../../references/research-navigation.md#baseline复用方法实施与评价)从相关命中或准确引用展开，复用前读完整相关方法。复用声明 `{"baseline_ref":"实际读取的引用"}`；新方法可声明 `{"method_key":"稳定名称","method_version":"1","method_contract":{"meaning":"方法含义","inputs":{},"outputs":{}}}`，输入输出按领域组织。方法实质改变才形成新版本或方法；换数据、上游 Commit 或备注不改变方法身份。相似候选只帮助发现，不自动合并。
 

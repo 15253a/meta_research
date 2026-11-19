@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from meta_research.root_resident_mcp import RootResidentMcpError
 
-from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
+from meta_research.research_guidance import (
+    BINDING_SKILLS_ROOT, SHARED_REFERENCE_PATHS, shared_reference_resources,
+    cycle_role_skill_text, prepare_cycle_role_resources, role_skill_source,
+)
 
 from meta_research.context_presentation import (
     STAGE_CONTEXT_DELIVERY_GUIDANCE, stage_context_json, stage_position_prompt,
@@ -560,8 +563,10 @@ def validate_bundle_target_batch_result(
             "rationale": result.rationale, "native_session_ref": result.native_session_ref,
             "adapter_kind": result.adapter_kind,
         })
-    if not isinstance(result.strategy_update, dict) or result.replan_basis is not None:
+    if not isinstance(result.strategy_update, dict):
         raise BundleSkillContractError("bundle_target_batch_invalid")
+    if result.replan_basis is not None:
+        raise BundleSkillContractError("bundle_propose_targets_replan_basis_not_null")
     current_state_document = {
         "schema_ref": ROLLING_STRATEGY_STATE_SCHEMA_REF,
         "completion_contract_hash": completion_contract_hash(completion),
@@ -1251,7 +1256,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
-                    "skill_instructions": _bundle_skill_instructions(resources),
+                    "skill_instructions": _bundle_skill_instructions(
+                        resources, binding_identity_root=BINDING_SKILLS_ROOT),
                     "adapter_source_hash": adapter_source_hash,
                     "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
@@ -1827,13 +1833,20 @@ def _bundle_skill_instruction_resources() -> dict[str, str]:
     return _bundle_skill_resources()
 
 
-def _bundle_skill_instructions(resources: dict[str, str] | None = None) -> str:
+def _bundle_skill_instructions(
+    resources: dict[str, str] | None = None,
+    *,
+    binding_identity_root: str | None = None,
+) -> str:
     # Load and bind the complete resource set even though the native Harness
     # maintains the role method and references are read only when needed.
+    # ``binding_identity_root`` yields the fixed logical package locator for
+    # execution identity; live prompts keep the real readable path.
     if resources is None:
         _bundle_skill_instruction_resources()
     return (
-        "Role skill source: " + str(Path(__file__).with_name("skills") / "bundle_stage" / "SKILL.md")
+        "Role skill source: " + role_skill_source(
+            "bundle_stage", binding_identity_root=binding_identity_root)
         + "\n角色方法由 Harness 指令维持；按当前工作读取所需合同及 Owner 操作参考。"
         "Resolve role reference links relative to this source directory."
     )

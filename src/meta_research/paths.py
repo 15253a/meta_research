@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -249,6 +250,21 @@ class DataRoot:
         if mismatched_installs:
             raise DataRootError(f"requested Codex version {version} is not installed")
         return self.codex_cli_executable.absolute()
+
+    def deployment_codex_cli_executable(self) -> Path:
+        """An explicitly upgraded deployment must run the selected binary before opening its database."""
+        from meta_research.codex_runtime import CODEX_LOCKED_VERSION, DEFAULT_CODEX_CLI_VERSION
+
+        executable = self.validated_codex_cli_executable(CODEX_LOCKED_VERSION)
+        if CODEX_LOCKED_VERSION != DEFAULT_CODEX_CLI_VERSION:
+            try:
+                result = subprocess.run([str(executable), "--version"], capture_output=True, text=True,
+                                        env={**os.environ, **self.codex_environment}, timeout=10, check=False)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise DataRootError("managed Codex executable version unavailable") from error
+            if result.returncode != 0 or result.stdout.strip() != f"codex-cli {CODEX_LOCKED_VERSION}":
+                raise DataRootError("managed Codex executable version mismatch")
+        return executable
 
     @property
     def codex_environment(self) -> dict[str, str]:

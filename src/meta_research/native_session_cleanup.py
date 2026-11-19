@@ -589,7 +589,10 @@ def _clean_spools(root, work, stage_spools, target_spools, dry_run, protected_pa
             if (scope.get("owner_invocation_hash") == owner_hash and scope.get("provider_operation_ref") == operation
                     and isinstance(digest, str) and re.fullmatch("[0-9a-f]{64}", digest)):
                 directory = base / "provider-operations" / digest[:2] / digest
-                records.extend(_prune_spool(directory, digest, dry_run, protected_paths))
+                # The signed original argv and its CLI version prove the terminal
+                # Target's identity even after the deployment selects a new binary.
+                records.extend(_prune_spool(directory, digest, dry_run,
+                    (*protected_paths, directory / "native-provider-argv.json")))
         except (OSError, ProviderSupervisorError, ValueError):
             continue
     return records

@@ -19,6 +19,7 @@ from referencing import Registry
 from referencing.exceptions import Unresolvable
 
 from meta_research.external_mcp_client import ExternalMcpClient, ExternalMcpClientError
+from meta_research.error_contract import error_contract_from_legacy
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.provider_supervisor import SupervisorFileLock, ensure_transport_key
 from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
@@ -150,6 +151,7 @@ class ExternalMcpAccess:
     url: str
     token: str
     binding_json: str
+    required: bool = True
 
     def binding(self) -> dict[str, str]:
         return json.loads(self.binding_json)
@@ -157,7 +159,7 @@ class ExternalMcpAccess:
     def codex_arguments(self) -> list[str]:
         return ["--config", f'mcp_servers.meta_research_external.url={json.dumps(self.url)}',
             "--config", 'mcp_servers.meta_research_external.bearer_token_env_var="META_RESEARCH_EXTERNAL_MCP_TOKEN"',
-            "--config", "mcp_servers.meta_research_external.required=true", "--config",
+            "--config", f"mcp_servers.meta_research_external.required={str(self.required).lower()}", "--config",
             'mcp_servers.meta_research_external.default_tools_approval_mode="approve"']
 
     def environment(self) -> dict[str, str]:
@@ -471,7 +473,13 @@ class ExternalMcpRuntime:
             if "error" in response:
                 error = response["error"]
                 details = error.get("data")
-                raise ExternalMcpError(details["code"] if details else error["message"], details)
+                code = (
+                    details.get("code")
+                    if isinstance(details, dict)
+                    else None
+                )
+                message = str(error.get("message", "external_mcp_error"))
+                raise ExternalMcpError(code or message.split("\n", 1)[0], details)
             return response["result"]
         finally:
             with self._lock:
@@ -542,6 +550,11 @@ class ExternalMcpRuntime:
         if self._endpoint is None:
             raise ExternalMcpError("external_mcp_endpoint_missing")
         def is_current() -> bool:
+            # An empty configured service set has no external capability to
+            # authorize. Keep the transport usable so an optional external
+            # channel cannot block a direct provider operation.
+            if not snapshot.services:
+                return True
             if resident_token is None:
                 return True
             if self._scope_authority is None:
@@ -552,7 +565,7 @@ class ExternalMcpRuntime:
         token = secrets.token_urlsafe(32)
         with self._lock:
             self._grants[token] = _ExternalGrant(snapshot, tools, is_current)
-        return ExternalMcpAccess(self._endpoint, token, canonical_json(snapshot.binding()))
+        return ExternalMcpAccess(self._endpoint, token, canonical_json(snapshot.binding()), bool(snapshot.services))
 
     def release(self, access: ExternalMcpAccess) -> None:
         with self._lock:
@@ -636,16 +649,42 @@ class ExternalMcpRuntime:
         with self._lock:
             grant = self._grants.get(token or "")
         if grant is None or not grant.is_current():
-            return 401, {"error": {"code": "external_mcp_authentication_required"}}, None
+            contract = error_contract_from_legacy(
+                "external_mcp_authentication_required",
+                {"recovery_owner": "operator"},
+                phase="authentication",
+                operation_id="external_mcp.authentication",
+            )
+            return 401, {"error": {
+                "code": "external_mcp_authentication_required",
+                "data": {"error_contract": contract.as_public_dict()},
+            }}, None
         if (not isinstance(message, dict) or message.get("jsonrpc") != "2.0"
                 or not isinstance(message.get("method"), str)):
-            return 400, {"error": {"code": "external_mcp_request_invalid"}}, None
+            contract = error_contract_from_legacy(
+                "external_mcp_request_invalid",
+                {"recovery_owner": "agent", "call_execution": "not_started"},
+                phase="input_validation",
+                operation_id="external_mcp.request",
+            )
+            return 400, {"error": {
+                "code": "external_mcp_request_invalid",
+                "data": {"error_contract": contract.as_public_dict()},
+            }}, None
         identifier, method = message.get("id"), message.get("method")
         def failure(code: int, reason: str, data: dict[str, Any] | None = None) -> tuple[int, dict[str, Any], None]:
             error = {"code": code, "message": reason}
             if data is not None:
                 error["data"] = {"code": reason, **data}
                 error["message"] += "\n" + canonical_json(data)
+            contract = error_contract_from_legacy(
+                reason,
+                data,
+                phase="external_mcp",
+                operation_id="external_mcp." + str(method),
+                effect=method == "tools/call",
+            )
+            error.setdefault("data", {})["error_contract"] = contract.as_public_dict()
             return 200, {"jsonrpc": "2.0", "id": identifier, "error": error}, None
         if method == "notifications/initialized":
             return 202, None, None

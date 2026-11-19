@@ -21,7 +21,8 @@ from test_deepfetch_adapter import DurableSegmentSequenceRunner, _request, _deep
     (CodexIdeaSkillAdapter, "idea"), (CodexPlanSkillAdapter, "plan"),
     (CodexBundleSkillAdapter, "bundle"), (CodexReasoningSkillAdapter, "reasoning"),
 ])
-def test_saved_model_changes_preserve_existing_binding_and_signed_operation(root, adapter_type, stage):
+@pytest.mark.parametrize("selected_model", ["gpt-5.6-sol", "gpt-6.2-sol"])
+def test_saved_model_changes_preserve_existing_binding_and_signed_operation(root, adapter_type, stage, selected_model):
     runner = _SignedRunner()
     workspace = root / (stage + "-provider")
     adapter = stage_provider(adapter_type(workspace, executable=sys.executable, process_runner=runner), quest_ref="quest-one")
@@ -41,7 +42,7 @@ def test_saved_model_changes_preserve_existing_binding_and_signed_operation(root
     original = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
     value = read_runtime_conditions(root, "quest-one")
     save_runtime_conditions(root, "quest-one", text=value["text"], expected_revision=value["revision"],
-                            stage_models={**value["stage_models"], stage: "gpt-5.6-sol"})
+                            stage_models={**value["stage_models"], stage: selected_model})
     assert adapter.runtime_binding() == frozen_binding
     reconstructed = adapter_type(workspace, executable=sys.executable, process_runner=runner)
     existing = stage_provider(reconstructed, model_ref=frozen_binding.model_ref)
@@ -54,11 +55,13 @@ def test_saved_model_changes_preserve_existing_binding_and_signed_operation(root
     assert len(runner.calls) == 1
     assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == original
     fresh = stage_provider(reconstructed, quest_ref="quest-one")
-    assert fresh.runtime_binding().model_ref == "gpt-5.6-sol"
+    assert fresh.runtime_binding().model_ref == selected_model
     call(fresh, "new-operation")
     assert len(runner.calls) == 2
+    argv, _ = runner.calls[-1]
+    assert argv[argv.index("--model") + 1] == selected_model
     invocation = workspace / "provider-operations" / canonical_hash({"job_ref": "new-operation"}) / "primary" / "invocation.json"
-    assert json.loads(invocation.read_text())["payload"]["model_ref"] == "gpt-5.6-sol"
+    assert json.loads(invocation.read_text())["payload"]["model_ref"] == selected_model
 
 
 def test_deepfetch_replays_saved_condition_source_and_refreshes_next_segment(root):

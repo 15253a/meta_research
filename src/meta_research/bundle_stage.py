@@ -3500,6 +3500,22 @@ class BundleStageWorker:
             if error.code != "runtime_provider_unit_not_found":
                 raise
 
+    def provider_transition(self, *, request_ref: str, model_ref: str,
+                            authorization_receipt_ref: str | None = None) -> dict[str, object]:
+        from meta_research.bundle_runtime_refresh import refresh_bundle_runtime
+        from meta_research.codex_runtime import SUPPORTED_CODEX_MODEL_REFS
+        run = self._agent_runtime.query_bundle_stage_run(request_ref)
+        if run is None or model_ref not in SUPPORTED_CODEX_MODEL_REFS:
+            raise OwnerConflict("bundle_provider_transition_not_ready")
+        provider = stage_provider(self._provider, model_ref=model_ref)
+        binding = self._current_runtime_binding(provider)
+        if binding is None or binding.model_ref != model_ref:
+            raise OwnerConflict("bundle_runtime_refresh_current_contract_invalid")
+        return refresh_bundle_runtime(self._agent_runtime, run_ref=run.run_ref, attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref, runtime_binding=binding, harness_authority=self._harnesses,
+            provider_transition_preview=authorization_receipt_ref is None,
+            authorization_receipt_ref=authorization_receipt_ref)
+
     def _current_runtime_binding(self, provider) -> BundleRuntimeBinding | None:
         if self._harnesses is None:
             self._observation = BundleObservation("failure", "bundle_harness_operation_binding_unavailable")

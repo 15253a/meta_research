@@ -15,7 +15,11 @@ from meta_research.codex_runtime import (
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, research_system_prompt
-from meta_research.research_guidance import shared_reference_bundle_hash, shared_reference_instructions, cycle_role_instructions, target_role_reference_hash
+from meta_research.research_guidance import (
+    BINDING_SKILLS_ROOT,
+    shared_reference_bundle_hash, shared_reference_instructions, cycle_role_instructions,
+    target_role_reference_hash,
+)
 from meta_research.resource_preparation import prepared_resource, resource_preparation
 
 
@@ -395,9 +399,14 @@ class RootCapabilityProfile:
 def _shared_reference_index_hash() -> str:
     # The capability floor is common to all roots; role-specific navigation is
     # part of that shared installation identity, not a new authorization.
+    # Identity uses the fixed logical package locator, so identical release
+    # copies under different real prefixes bind the same profile.  The model
+    # still receives the actual readable absolute path through codex_arguments.
     return canonical_hash({
-        "navigation": {kind: shared_reference_instructions(kind) for kind in ROOT_AGENT_KINDS},
-        "role_methods": {kind: cycle_role_instructions(kind) for kind in ROOT_AGENT_KINDS},
+        "navigation": {kind: shared_reference_instructions(
+            kind, binding_identity_root=BINDING_SKILLS_ROOT) for kind in ROOT_AGENT_KINDS},
+        "role_methods": {kind: cycle_role_instructions(
+            kind, binding_identity_root=BINDING_SKILLS_ROOT) for kind in ROOT_AGENT_KINDS},
         "target_references": target_role_reference_hash(),
     })
 

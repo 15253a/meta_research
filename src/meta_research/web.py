@@ -722,6 +722,13 @@ class OutputLanguagePreference(BaseModel):
     output_language: Literal["zh","en"]
 
 
+class BundleProviderTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_ref: str = Field(min_length=1, max_length=256)
+    model_ref: str = Field(min_length=1, max_length=128)
+    authorization_receipt_ref: str = Field(min_length=1, max_length=256)
+
+
 class RuntimeConditionsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=24000)
@@ -786,6 +793,19 @@ def create_app(
     }
     worker_health = {name: ReconciliationHealth() for name in worker_operations}
     worker_tasks: dict[str, asyncio.Task[None]] = {}
+    # During an operator-initiated provider cutover the ordinary HTTP control
+    # surface and conformance worker must be available before research resumes.
+    cutover_marker = runtime.data_root.run / "provider-cutover.hold"
+    cutover_pending = cutover_marker.exists()
+
+    async def after_provider_cutover(operation):
+        nonlocal cutover_pending
+        while cutover_pending:
+            if not cutover_marker.exists():
+                cutover_pending = False
+                break
+            await asyncio.sleep(0.5)
+        await operation()
     recorder = getattr(runtime, 'timeline_summaries', None)
     worker_health_updates = WorkerHealthUpdates()
     asset_intake_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_INTAKE_REQUESTS)
@@ -810,19 +830,19 @@ def create_app(
         )
         for name, operation in worker_operations.items():
             worker_tasks[name] = _start_background_worker(
-                lambda operation=operation, name=name: operation(
-                    runtime, worker_health[name], worker_health_updates.publish
+                lambda operation=operation, name=name: after_provider_cutover(
+                    lambda: operation(runtime, worker_health[name], worker_health_updates.publish)
                 )
             )
         # Display notes are independently retried and never gate research health.
         if recorder is not None:
             worker_tasks['research_recorder'] = _start_background_worker(
-                lambda: _process_background_operation(
+                lambda: after_provider_cutover(lambda: _process_background_operation(
                     recorder.process_once,
                     health=ReconciliationHealth(), worker_label='research recorder',
                     timeout_code='timeline_summary_timeout', timeout_seconds=None,
                     on_health_change=None, idle_delay=5.0, active_delay=1.0,
-                )
+                ))
             )
         try:
             yield
@@ -901,6 +921,8 @@ def create_app(
     )
 
     def worker_check(name: str) -> dict[str, object]:
+        if cutover_pending:
+            return {"name": name, "status": "unavailable", "reason": {"code": "provider_cutover_in_progress"}}
         task = worker_tasks.get(name)
         health = worker_health[name]
         running = task is not None and not task.done()
@@ -1158,30 +1180,73 @@ def create_app(
             "deepfetch_not_delivered",
         }:
             detail["status"] = "capability_unavailable"
-        return JSONResponse(status_code=status_code, content={"detail": detail})
+        return _contract_error(
+            status_code,
+            error.code,
+            details=detail,
+            operation_id="http.owner_conflict",
+            effect=bool(
+                detail.get("effect_id")
+                or (
+                    isinstance(detail.get("details"), dict)
+                    and detail["details"].get("effect_id")
+                )
+            ),
+        )
 
     @app.exception_handler(HarnessAdmissionError)
     async def harness_admission_error(
         _request: Request, error: HarnessAdmissionError
     ) -> JSONResponse:
-        return JSONResponse(
-            status_code=409,
-            content={"detail": {"code": error.code}},
+        return _contract_error(
+            409,
+            error.code,
+            details={"next_retry_at": error.next_retry_at}
+            if error.next_retry_at is not None
+            else None,
+            operation_id="http.harness_admission",
+            effect=True,
         )
 
     @app.exception_handler(SnapshotConsistencyUnavailable)
     async def snapshot_consistency_unavailable(
         _request: Request, _error: SnapshotConsistencyUnavailable
     ) -> JSONResponse:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": {
-                    "code": "snapshot_consistency_unavailable",
-                    "status": "capability_unavailable",
-                }
-            },
+        return _contract_error(
+            503,
+            "snapshot_consistency_unavailable",
+            details={"status": "capability_unavailable"},
+            operation_id="http.snapshot",
         )
+
+    @app.exception_handler(HTTPException)
+    async def http_exception(_request: Request, error: HTTPException) -> JSONResponse:
+        detail = error.detail
+        if isinstance(detail, dict) and "error_contract" in detail:
+            return JSONResponse(
+                status_code=error.status_code,
+                content={"detail": detail},
+                headers=error.headers,
+            )
+        if isinstance(detail, dict):
+            code = detail.get("code")
+            details = dict(detail)
+            if not isinstance(code, str) or not code:
+                code = "http_error"
+        elif isinstance(detail, str) and detail:
+            code, details = detail, None
+        else:
+            code, details = "http_error", None
+        response = _contract_error(
+            error.status_code,
+            code,
+            details=details,
+            operation_id="http",
+        )
+        if error.headers:
+            for name, value in error.headers.items():
+                response.headers[name] = value
+        return response
 
     @app.post("/internal/bootstrap-token")
     def issue_bootstrap_token() -> dict[str, str]:
@@ -1405,7 +1470,12 @@ def create_app(
             return saved.as_dict()
         except (ExternalMcpError, ValueError) as error:
             code = str(getattr(error, "code", "external_mcp_config_invalid"))
-            return _error(409 if code == "external_mcp_config_stale" else 422, code)
+            return _contract_error(
+                409 if code == "external_mcp_config_stale" else 422,
+                code,
+                details=getattr(error, "details", None),
+                operation_id="external_mcp.config",
+            )
 
     @app.post("/api/v1/external-mcp/test-connection")
     async def test_external_mcp_connection(request: Request):
@@ -1415,7 +1485,14 @@ def create_app(
                 raise ExternalMcpError("external_mcp_connection_invalid")
             connection = parse_connection(value["connection"])
         except (ExternalMcpError, ValueError) as error:
-            return _error(422, str(getattr(error, "code", "external_mcp_connection_invalid")))
+            code = str(getattr(error, "code", "external_mcp_connection_invalid"))
+            return _contract_error(
+                422,
+                code,
+                details=getattr(error, "details", None),
+                operation_id="external_mcp.test_connection",
+                effect=True,
+            )
         return await asyncio.to_thread(runtime.external_mcp.test_connection, connection)
 
     @app.post("/mcp/external")
@@ -3152,6 +3229,14 @@ def create_app(
     def query_current_bundle_stage() -> dict[str, object]:
         return runtime.bundle_stage.query_current()
 
+    @app.get("/api/v1/bundle-stage/provider-transition")
+    def preview_bundle_provider_transition(request_ref: str, model_ref: str) -> dict[str, object]:
+        return runtime.bundle_stage.provider_transition(request_ref=request_ref, model_ref=model_ref)
+
+    @app.post("/api/v1/bundle-stage/provider-transition")
+    def apply_bundle_provider_transition(command: BundleProviderTransitionRequest) -> dict[str, object]:
+        return runtime.bundle_stage.provider_transition(**command.model_dump())
+
     @app.get("/api/v1/reasoning-stage/current")
     def query_current_reasoning_stage() -> dict[str, object]:
         return runtime.reasoning_stage.query_current()
@@ -4307,7 +4392,35 @@ def _log_reconciliation_exit(task: asyncio.Task[None]) -> None:
 
 
 def _error(status_code: int, code: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"detail": {"code": code}})
+    return _contract_error(status_code, code)
+
+
+def _contract_error(
+    status_code: int,
+    code: str,
+    *,
+    details: dict[str, object] | None = None,
+    operation_id: str = "http",
+    effect: bool = False,
+) -> JSONResponse:
+    from meta_research.error_contract import error_contract_from_legacy
+
+    contract = error_contract_from_legacy(
+        code,
+        details,
+        phase="http",
+        operation_id=operation_id,
+        effect=effect,
+    )
+    legacy_detail: dict[str, object] = {"code": code}
+    for key, value in (details or {}).items():
+        if key != "code":
+            legacy_detail[key] = value
+    legacy_detail["error_contract"] = contract.as_public_dict()
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": legacy_detail},
+    )
 
 
 def _history_page(

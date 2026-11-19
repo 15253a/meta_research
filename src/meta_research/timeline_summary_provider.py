@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
+import tomllib
+from urllib.parse import urlsplit
 
 from meta_research.owners.common import canonical_hash
 from meta_research.quest_drafting import (
@@ -40,14 +43,53 @@ class _NodeValidationError(Exception):
         self.feedback = {"code": code, "source_refs": list(source_refs), "message": message}
 
 
+def _recorder_provider_configs(path: Path | None) -> tuple[str, ...]:
+    """Project the stage provider route while the recorder ignores user configuration."""
+    if path is None:
+        return ()
+    try:
+        with path.open("rb") as config_file:
+            config = tomllib.load(config_file)
+    except FileNotFoundError:
+        return ()
+    except (OSError, ValueError):
+        raise DraftingUnavailable("timeline_summary_provider_config_invalid") from None
+    try:
+        profile = config["profiles"][config["profile"]] if "profile" in config else {}
+        provider = profile.get("model_provider", config.get("model_provider"))
+        if provider is None:
+            return ()
+        if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
+            raise ValueError
+        result = ["model_provider=" + json.dumps(provider)]
+        definition = config.get("model_providers", {}).get(provider, {})
+        for field, value in definition.items():
+            # Durable argv is inspectable. Keep credentials in the native provider's
+            # environment and reject transport definitions that need inline secrets.
+            if field not in {"name", "wire_api", "base_url", "env_key"} or not isinstance(value, str):
+                raise ValueError
+            if field == "env_key" and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+                raise ValueError
+            if field == "base_url":
+                url = urlsplit(value)
+                if url.scheme not in {"http", "https"} or not url.hostname or url.username is not None or url.query or url.fragment:
+                    raise ValueError
+            result.append(f"model_providers.{provider}.{field}=" + json.dumps(value, ensure_ascii=False))
+        return tuple(result)
+    except (KeyError, AttributeError, TypeError, ValueError):
+        raise DraftingUnavailable("timeline_summary_provider_config_invalid") from None
+
+
 class CodexTimelineSummaryAdapter(CodexDraftingAdapter):
-    def __init__(self, *args, channels: RecorderChannels, **kwargs):
+    def __init__(self, *args, channels: RecorderChannels, stage_provider_config: Path | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.channels = channels
+        self._stage_provider_config = stage_provider_config
 
     def _provider_argv(self, *args, **kwargs):
         argv = super()._provider_argv(*args, **kwargs)
         configs = (
+            *_recorder_provider_configs(self._stage_provider_config),
             # Override the drafting catalog's base instructions for the recorder role.
             "model_instructions_file=" + json.dumps(str(_SKILL_PATH.resolve())),
             "developer_instructions=" + json.dumps(

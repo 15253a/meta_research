@@ -75,7 +75,10 @@ from meta_research.reasoning_contract import (
     validate_scientific_outcome,
     validate_scientific_evidence_selection,
 )
-from .research_guidance import SHARED_REFERENCE_PATHS, shared_reference_resources, cycle_role_skill_text, prepare_cycle_role_resources
+from .research_guidance import (
+    BINDING_SKILLS_ROOT, SHARED_REFERENCE_PATHS, shared_reference_resources,
+    cycle_role_skill_text, prepare_cycle_role_resources, role_skill_source,
+)
 from meta_research.semantic_mcp import (
     ROOT_AGENT_COMMON_OPERATION_IDS,
 )
@@ -1060,7 +1063,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
-                    "skill_instructions": _reasoning_skill_instructions(),
+                    "skill_instructions": _reasoning_skill_instructions(
+                        binding_identity_root=BINDING_SKILLS_ROOT),
                     "adapter_source_hash": adapter_source_hash,
                     "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
@@ -1568,8 +1572,13 @@ def _reasoning_skill_resources() -> dict[str, str]:
         ) from error
 
 
-def _reasoning_skill_instructions(request: ReasoningSkillRequest | None = None) -> str:
-    return ("Role skill source: " + str(Path(__file__).with_name("skills") / "reasoning_stage" / "SKILL.md")
+def _reasoning_skill_instructions(
+    request: ReasoningSkillRequest | None = None,
+    *,
+    binding_identity_root: str | None = None,
+) -> str:
+    return ("Role skill source: " + role_skill_source(
+        "reasoning_stage", binding_identity_root=binding_identity_root)
             + "\n角色方法由 Harness 持续提供；按本次研究需要读取相对该文件的合同与参考。")
 
 

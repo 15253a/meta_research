@@ -434,7 +434,9 @@ def reconcile_native_operation(directory):
                 "directory": str(directory), "prompt": parameters["input"][0]["text"]})):
         raise ValueError("native_reconciliation_start_invalid")
     original = read_transport_envelope(directory / "native-provider-argv.json", key)
-    if (set(original) != {"argv"} or not isinstance(original["argv"], list)
+    from meta_research.native_guidance import sealed_native_cli_version
+    sealed_native_cli_version(original)
+    if (not isinstance(original["argv"], list)
             or not all(isinstance(argument, str) for argument in original["argv"])):
         raise ValueError("native_provider_identity_invalid")
     _settings(original["argv"])
@@ -580,8 +582,9 @@ def _strict_exec(argv, args, key):
     if returncode != 1 or native is None or stdout_bytes or stderr_overflow or bytes(stderr) != expected:
         return returncode
     version = subprocess.run([command[0], "--version"], capture_output=True, text=True, timeout=10)
-    from meta_research.codex_runtime import CODEX_LOCKED_VERSION
-    if stopped or version.returncode != 0 or version.stdout.strip() != "codex-cli " + CODEX_LOCKED_VERSION:
+    from meta_research.native_guidance import sealed_native_cli_version
+    launch = read_transport_envelope(directory / "native-provider-argv.json", key)
+    if stopped or version.returncode != 0 or version.stdout.strip() != "codex-cli " + sealed_native_cli_version(launch):
         return returncode
     proof = {"source": "exec", "method": "thread/resume", "thread_id": native,
         "error": {"code": -32600, "message": "no rollout found for thread id " + native},
@@ -608,7 +611,15 @@ def main():
     args = parser.parse_args()
     try:
         _key_path, key = read_transport_key_for_operation(args.operation_directory)
-        argv = read_transport_envelope(args.provider_argv, key)["argv"]
+        launch = read_transport_envelope(args.provider_argv, key)
+        from meta_research.native_guidance import sealed_native_cli_version
+        from meta_research.codex_runtime import CODEX_LOCKED_VERSION, DEFAULT_CODEX_CLI_VERSION
+        version = sealed_native_cli_version(launch)
+        argv = launch["argv"]
+        if version != DEFAULT_CODEX_CLI_VERSION or CODEX_LOCKED_VERSION != DEFAULT_CODEX_CLI_VERSION:
+            observed = subprocess.run([argv[0], "--version"], capture_output=True, text=True, timeout=10)
+            if observed.returncode != 0 or observed.stdout.strip() != f"codex-cli {version}":
+                raise ValueError("native_provider_version_mismatch")
         if args.passthrough_exec:
             if args.reconcile_only:
                 raise ValueError("native_exec_reconcile_mode_invalid")

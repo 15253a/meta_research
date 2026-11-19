@@ -19,7 +19,11 @@ def test_runtime_hashes_and_prompts_with_the_same_prose_contract() -> None:
     resources = _bundle_skill_resources()
 
     assert tuple(resources) == (
-        "research-guidance.md",
+        "references/research-guidance.md",
+        "references/human-guidance.md",
+        "references/research-navigation.md",
+        "references/cycle-work.md",
+        "references/materials-and-custody.md",
         "SKILL.md",
         "references/contract.md",
         "references/owner-operations.md",
