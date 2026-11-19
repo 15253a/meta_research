@@ -10,6 +10,7 @@ from meta_research.composition import build_production_runtime
 from meta_research.codex_runtime import CODEX_LOCKED_VERSION
 from meta_research.harness_adapters import CodexHarnessAdapter, HarnessAdapterUnavailable, HarnessSupervisorTransport
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
+from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.provider_supervisor import read_supervisor_request
 from meta_research.semantic_mcp import SemanticCallContext
@@ -119,11 +120,18 @@ def test_real_idea_dispatch_native_initial_resume_and_public_plan_read(tmp_path,
                 foreign_context = _external_context(_scope(self.runtime,
                     run_ref="foreign-native-work", root_ref="foreign-native-root"))
                 foreign = self.runtime.root_workspaces.bind_runtime(foreign_context)
-                with pytest.raises(IdeaSkillUnavailable, match="codex_operation_spool_invalid"):
+                with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_identity_conflict$"):
                     adapter._invoke(operation_name="primary", prompt="Check native cwd.",
                         schema=_SCHEMA, native_session_ref="local-native-root",
                         job_ref="idea-native-1", workspace_binding=foreign)
                 assert not (foreign.directory / "native-marker.txt").exists()
+                invocation = (tmp_path / "transport" / "provider-operations"
+                    / canonical_hash({"job_ref": "idea-native-1"}) / "primary" / "invocation.json")
+                invocation.write_text("{}", encoding="utf-8")
+                with pytest.raises(IdeaSkillUnavailable, match="^codex_operation_spool_invalid$"):
+                    adapter._invoke(operation_name="primary", prompt="Check native cwd.",
+                        schema=_SCHEMA, native_session_ref="local-native-root",
+                        job_ref="idea-native-1", workspace_binding=binding)
             return super().generate_draft(request)
 
     writer = Writer()
@@ -165,8 +173,9 @@ def test_real_idea_dispatch_native_initial_resume_and_public_plan_read(tmp_path,
 
 
 def test_shared_companion_adapter_interleaves_roots_and_resumes_distinct_jobs(tmp_path):
+    from test_public_manual_question_lifecycle import _accept_root_question, _build_runtime
     from test_root_human_request_lifecycle import _open_arguments
-    runtime = _make(tmp_path / "runtime")
+    runtime = _build_runtime(tmp_path / "runtime")
     adapter = CodexCompanionAdapter(tmp_path / "companion-transport",
         executable=str(_native_executable(tmp_path / "local-codex")))
     adapter.bind_workspaces(runtime.root_workspaces)
@@ -174,8 +183,14 @@ def test_shared_companion_adapter_interleaves_roots_and_resumes_distinct_jobs(tm
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     original_cwd = Path.cwd()
     try:
-        a = _external_context(_scope(runtime, run_ref="native-a", root_ref="native-root-a"))
-        b = _external_context(_scope(runtime, run_ref="native-b", root_ref="native-root-b"))
+        def companion_context(key):
+            quest_ref, _ = _accept_root_question(runtime, key)
+            session = runtime.owners.human_collaboration.query_companion("quest:" + quest_ref)
+            return _external_context(_scope(runtime, quest_ref=quest_ref, run_ref=key,
+                root_ref=session["session_ref"]))
+
+        a = companion_context("native-a")
+        b = companion_context("native-b")
         locations = [runtime.root_workspaces.bind_runtime(context).location for context in (a, b)]
 
         def invoke(context, job, native=None):
@@ -207,7 +222,8 @@ def test_shared_companion_adapter_interleaves_roots_and_resumes_distinct_jobs(tm
         assert other_resumed["previous"] is True
         for context, location in zip((a, b), locations):
             native, = _directories(runtime, context)
-            assert native["work_ref"] == context.run_ref
+            assert native["work_ref"] == context.root_session_ref
+            assert native["request_ref"] == context.run_ref
             assert native["root_session_ref"] == context.root_session_ref
             assert (Path(native["directory"]) / "native-marker.txt").read_text() == (str(location.directory) + "\n") * 2
         assert locations[0].workspace_ref not in {d["workspace_ref"] for d in _directories(runtime, b)}
