@@ -1,5 +1,6 @@
 """A real unmeasured WorkProduct can supply a later, still-open experiment."""
 from dataclasses import replace
+from copy import deepcopy
 import hashlib
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from test_public_reasoning_stage import (_confirm_deepfetch_quest,
 from test_research_notes_and_call_observations import _SystemEvidenceReader
 from test_target_root_finalizer import _CurrentBindingBundleSkill, _root_finalizer_fixture
 from test_two_cycle_actual_work import _ready_existing, _finish_stage
+from test_root_workspace import _accepted, _call, _channel, _context
 
 
 class _Plan(_MultiRunPlanSkill):
@@ -50,6 +52,17 @@ class _Plan(_MultiRunPlanSkill):
             document["source_bindings"]["selected_evidence_bindings"] = [target_adoption_binding(self.entry)]
         if self.scientific_entry is not None:
             document["source_bindings"]["selected_evidence_bindings"].append(self.scientific_entry)
+            if self.explicit_reader_quest:
+                quest = request.context_pack["accepted_question_binding"]["quest_ref"]
+                channel = _channel(self.runtime, _context(request, "plan"))
+                selected = document["source_bindings"]["selected_evidence_bindings"]
+                for index, binding in enumerate(selected):
+                    reader = binding["reader"]
+                    args = {**reader["args"], "source_quest_ref": quest}
+                    page = _accepted(_call(self.runtime, channel, reader["operation"], **args))
+                    selected[index] = page["selected_evidence_binding"]
+                    assert selected[index]["reader"]["args"] == {**reader["args"], "source_quest_ref": quest}
+                self.scientific_entry = selected[-1]
         return _with_derived_answer_contract_hash(document, request)
 
 
@@ -90,6 +103,8 @@ def test_protected_workproduct_and_scientific_outcome_feed_the_next_plan(tmp_pat
         harness_adapters=(fixtures._FullConformanceAdapter("codex"),),
         power_inhibitor=fixtures._TogglePowerInhibitor())
     plan.page_reader = runtime.owners.research_graph.query_plan_evidence_page
+    plan.runtime = runtime
+    plan.explicit_reader_quest = input_kind == "asset_version_ref"
     try:
         quest = _confirm_deepfetch_quest(runtime)
         fixtures._finish_idea_stage(runtime)
@@ -178,6 +193,17 @@ def test_protected_workproduct_and_scientific_outcome_feed_the_next_plan(tmp_pat
         assert second_graph is not None
         accepted = request.accepted_formal_plan
         assert plan.scientific_entry in accepted.plan_document["source_bindings"]["selected_evidence_bindings"]
+        if plan.explicit_reader_quest:
+            for branch, field, value in (("args", "source_quest_ref", "another-quest"),
+                                         ("args", "limit", 64),
+                                         ("args", "version_ref", "another-version"),
+                                         ("source_binding", "owner_acceptance_receipt_ref", "another-receipt")):
+                forged = deepcopy(plan.scientific_entry)
+                part = forged["reader"]["args"] if branch == "args" else forged[branch]
+                part[field] = value
+                with pytest.raises(OwnerConflict, match="plan_evidence_source_invalid"):
+                    catalog.verify_plan_evidence_catalog(quest_ref=quest["quest_ref"], evidence_catalog=[forged],
+                                                        expected_reference_revision=1)
         assert accepted.plan_document["gap_set"] and accepted.plan_document["experiment_briefs"]
         leaves = graph.resolve_plan_evidence_reuse_leaves(quest_ref=quest["quest_ref"], accepted_formal_plan=accepted)
         assert len(leaves) == 1 and leaves[0].role == "WorkProduct"
