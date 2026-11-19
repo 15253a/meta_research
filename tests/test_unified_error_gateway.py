@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from meta_research.semantic_mcp import SemanticMcpError, SemanticMcpGateway, SemanticOperation
 
 
@@ -133,4 +135,19 @@ def test_audit_write_failure_routes_the_projection_to_operator() -> None:
     assert payload["details"]["audit_status"] == "unavailable"
     assert payload["details"]["operator_required"] is True
     assert payload["details"]["recovery_owner"] == "operator"
+
+
+def test_gateway_returns_the_receipt_selected_by_the_audit_store() -> None:
+    historical_ref = "error:historical-receipt"
+
+    class HistoricalAuditStore:
+        def record(self, contract):
+            assert contract.audit_ref != historical_ref
+            return SimpleNamespace(audit_ref=historical_ref)
+
+    gateway, token = _gateway(lambda _context, _arguments: {})
+    gateway._error_audit_store = HistoricalAuditStore()
+    details = _call(gateway, token, {})["details"]
+    assert details["audit_ref"] == historical_ref
+    assert details["next_action"] == "correct_input"
 

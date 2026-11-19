@@ -71,3 +71,42 @@ def test_error_audit_rejects_identity_reuse_with_changed_payload(tmp_path) -> No
         store.record(changed)
     database.close()
 
+
+def test_field_diagnostics_keep_distinct_receipts_and_replay_old_fact(tmp_path) -> None:
+    def diagnostic(field, expected, **details):
+        return error_contract_from_legacy(
+            "semantic_input_schema_mismatch",
+            {"field_path": [field], "expected": expected, **details},
+            phase="input_validation",
+            operation_id="research_memory.plan_evidence.read",
+            correlation_ref="plan-session",
+        )
+
+    path = tmp_path / "field-errors.sqlite3"
+    database = _database(path)
+    store = ErrorAuditStore(database)
+    legacy_ref = "error:b3f66188d7ca999efe7fa86c3b38a04b"
+    historical = store.record(diagnostic("target_commit_ref", "present", audit_ref=legacy_ref))
+    facts = [
+        diagnostic("target_commit_ref", "present"),
+        diagnostic("asset_version_ref", "present"),
+        diagnostic("asset_version_ref", "present", operator_required=True),
+        diagnostic("role_ref", {"reader": {"input": {"kind": "artifact"}}}),
+        diagnostic("role_ref", {"reader": {"input": {"kind": "metadata"}}}),
+        diagnostic("target_commit_ref", "present", audit_ref="error:caller-assigned"),
+    ]
+    recorded = [store.record(fact) for fact in facts]
+    assert recorded[0] == historical
+    assert recorded[-1].audit_ref == "error:caller-assigned"
+    assert len({item.audit_ref for item in recorded}) == len(facts)
+    database.close()
+
+    reopened = Database(path)
+    try:
+        store = ErrorAuditStore(reopened)
+        assert [store.record(fact) for fact in facts] == recorded
+        assert store.query(legacy_ref) == historical
+        assert store.query_correlation("plan-session") == tuple(recorded)
+    finally:
+        reopened.close()
+
