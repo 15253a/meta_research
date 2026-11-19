@@ -6,10 +6,15 @@ from meta_research.idea_skill import stage_operation_input, stage_replacement_pr
 from meta_research.context_presentation import stage_context_json, stage_position_prompt, STAGE_CONTEXT_DELIVERY_GUIDANCE
 
 from dataclasses import dataclass, replace
+import hashlib
 from importlib.resources import files
+import json
 from pathlib import Path
+import re
 import subprocess
 from typing import Callable, Protocol, cast
+
+from jsonschema import Draft202012Validator
 
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
@@ -22,6 +27,7 @@ from meta_research.idea_skill import (
     _DISABLED_CODEX_FEATURES,
     _CODEX_JSON_OBJECT_STRING_MARKER,
     _compile_codex_output_schema,
+    _decode_codex_provider_output,
     _codex_harness_manifest,
     _file_sha256,
     _shared_codex_adapter_source_hash,
@@ -44,6 +50,9 @@ from meta_research.plan_contract import (
     validate_plan_review,
 )
 from meta_research.provider_supervisor import transport_key_hash
+from meta_research.root_workspace import _read_bytes
+from meta_research.sealed_provider_operations import _reject_non_finite_json_constant, _write_exclusive
+from meta_research.semantic_mcp import SemanticMcpError
 from meta_research.root_capabilities import merge_root_capability_bindings
 from meta_research.quest_drafting import (
     PROVIDER_RESULT_MAX_BYTES,
@@ -372,7 +381,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         _key_path, transport_key = self._transport_key()
         output_contracts = {
             "plan-envelope-template": _plan_envelope_schema(
-                _schema_template_request()
+                _schema_template_request(), workspace_submission=self._workspaces is not None
             ),
         }
         output_contracts = {
@@ -503,11 +512,18 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"context_pack_ref={request.context_pack_ref}\n"
             "如缺少完成本次修正所需的材料，沿此冻结引用定向补读。\n"
         )
+        workspace_submission = request.job_ref is not None and self._workspaces is not None
+        if workspace_submission:
+            primary_prompt += (
+                '\n最终候选可以直接返回，也可将同一完整 {"plan": ...} JSON 按输出合同写入当前 Plan 工作区的 '
+                'plan_candidate.json。文件方式保留你写好的正文和准确收据。用 sha256sum plan_candidate.json '
+                '读取原始字节摘要，最终只返回 {"plan":{"file_sha256":"<64 位小写摘要>"}}；系统按摘要取原件并校验。'
+            )
         primary_output, primary_session, _primary_stdout = (
             self._invoke_root_operation(
             operation_name="primary",
             prompt=primary_prompt,
-            schema=_plan_envelope_schema(request),
+            schema=_plan_envelope_schema(request, workspace_submission=workspace_submission),
             native_session_ref=request.native_session_ref,
             job_ref=request.job_ref,
             run_ref=request.run_ref,
@@ -523,6 +539,15 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         # Collaboration trace is advisory provenance.  Acceptance is based on
         # the sealed PlanDocument and the Skill-defined domain validator.
         plan_value = primary_output.get("plan")
+        if isinstance(plan_value, dict) and set(plan_value) == {"file_sha256"}:
+            try:
+                plan_value = self._read_submitted_plan(request, plan_value["file_sha256"])
+            except PlanSkillContractError as error:
+                raise self._sealed_result_failure(
+                    job_ref=request.job_ref, operation_name="primary", native_session_ref=primary_session,
+                    failure_code="plan_primary_result_contract_invalid", detail_code=str(error),
+                    rejected_candidate=primary_output,
+                ) from error
         if not isinstance(plan_value, dict):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
@@ -539,6 +564,56 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             primary_session_ref=primary_session,
             adapter_kind="codex_cli",
         )
+
+    def _read_submitted_plan(self, request: PlanSkillRequest, digest: object) -> dict[str, object]:
+        if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
+            raise PlanSkillContractError("plan_candidate_file_sha256_invalid")
+        if not request.job_ref or self._workspaces is None:
+            raise PlanSkillContractError("plan_candidate_file_workspace_unavailable")
+        operation = self._workspace / "provider-operations" / canonical_hash({"job_ref": request.job_ref}) / "primary"
+        snapshot = operation / "submitted-plan.json"
+        if not snapshot.exists():
+            binding = self._workspace_binding(
+                run_ref=request.run_ref, attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref, runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
+            )
+            if binding is None:
+                raise PlanSkillContractError("plan_candidate_file_workspace_unavailable")
+            try:
+                content = _read_bytes(binding.directory, "plan_candidate.json")
+            except SemanticMcpError as error:
+                raise PlanSkillContractError("plan_candidate_file_" + error.code) from error
+            if len(content) > PROVIDER_RESULT_MAX_BYTES:
+                raise PlanSkillContractError("plan_candidate_file_too_large")
+            if hashlib.sha256(content).hexdigest() != digest:
+                raise PlanSkillContractError("plan_candidate_file_sha256_mismatch")
+            try:
+                _write_exclusive(snapshot, content.decode("utf-8"))
+            except UnicodeDecodeError as error:
+                raise PlanSkillContractError("plan_candidate_file_utf8_invalid") from error
+            except OSError as error:
+                raise PlanSkillUnavailable("codex_operation_spool_unavailable") from error
+        try:
+            content = _read_bytes(operation, snapshot.name)
+        except SemanticMcpError as error:
+            raise PlanSkillUnavailable("codex_operation_spool_invalid") from error
+        if len(content) > PROVIDER_RESULT_MAX_BYTES or hashlib.sha256(content).hexdigest() != digest:
+            raise PlanSkillUnavailable("codex_operation_spool_invalid")
+        schema = _plan_envelope_schema(request)
+        validator = Draft202012Validator(_compile_codex_output_schema(schema))
+        try:
+            value = json.loads(
+                content, object_pairs_hook=_unique_plan_fields,
+                parse_constant=_reject_non_finite_json_constant,
+            )
+            error = next(validator.iter_errors(value), None)
+            if error is not None:
+                raise PlanSkillContractError("plan_candidate_file_schema_invalid:" + error.json_path)
+            return cast(dict[str, object], _decode_codex_provider_output(value, schema)["plan"])
+        except PlanSkillContractError:
+            raise
+        except (ValueError, RecursionError, PlanSkillUnavailable) as error:
+            raise PlanSkillContractError("plan_candidate_file_encoding_invalid") from error
 
     @resource_preparation
     def finalize_draft(
@@ -673,13 +748,40 @@ def _schema_template_request() -> PlanSkillRequest:
     )
 
 
-def _plan_envelope_schema(request: PlanSkillRequest) -> dict[str, object]:
+def _plan_envelope_schema(
+    request: PlanSkillRequest, *, workspace_submission: bool = False,
+) -> dict[str, object]:
+    plan = _plan_document_schema(request)
+    if workspace_submission:
+        plan = {
+            "description": (
+                "Use null for progress. Submit the complete PlanDocument or the SHA-256 "
+                "of the complete Plan envelope in plan_candidate.json in the final answer."
+            ),
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["file_sha256"],
+                    "properties": {"file_sha256": {"type": "string", "minLength": 64, "maxLength": 64}},
+                },
+                plan,
+            ],
+        }
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"plan": _plan_document_schema(request)},
+        "properties": {"plan": plan},
         "required": ["plan"],
     }
+
+
+def _unique_plan_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate plan field")
+    return result
 
 
 

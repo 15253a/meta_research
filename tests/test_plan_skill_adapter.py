@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from importlib.resources import files
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -774,6 +775,56 @@ def test_durable_plan_primary_shape_failure_is_terminal_and_not_replayed(
             replace(request, runtime_binding=restarted.runtime_binding())
         )
     assert no_replay.calls == []
+
+
+def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path):
+    adapter = CodexPlanSkillAdapter(tmp_path, executable=str(_fake_codex(tmp_path / "codex")))
+    request = _request(runtime_binding=adapter.runtime_binding(), job_ref="job:workspace-plan")
+    workdir = tmp_path / "root"
+    workdir.mkdir()
+    adapter._workspaces = Mock()
+    adapter._workspaces.bind_runtime.return_value = SimpleNamespace(directory=workdir)
+    operation = tmp_path / "provider-operations" / canonical_hash({"job_ref": request.job_ref}) / "primary"
+    operation.mkdir(parents=True)
+    plan = _plan()
+    for derived in ("source_bindings", "idea_trace", "evidence_reuse_set", "gap_set", "bundle_disposition"):
+        plan.pop(derived)
+    plan["answer_contract"].pop("answer_contract_hash")
+    plan["experiment_briefs"][0]["reuse_material_refs"] = []
+    plan.update(notes="逐项复核后的候选", selected_evidence_bindings=[])
+    original = json.dumps({"plan": plan}, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    digest = hashlib.sha256(original).hexdigest()
+    source = workdir / "plan_candidate.json"
+    source.write_bytes(original)
+    snapshot = operation / "submitted-plan.json"
+
+    with pytest.raises(PlanSkillContractError, match="sha256_mismatch"):
+        adapter._read_submitted_plan(request, "0" * 64)
+    assert not snapshot.exists()
+    assert adapter._read_submitted_plan(request, digest) == plan
+    assert snapshot.read_bytes() == original
+    source.write_bytes(b"{}")
+    assert adapter._read_submitted_plan(request, digest) == plan
+    snapshot.write_bytes(b"null")
+    with pytest.raises(PlanSkillUnavailable, match="codex_operation_spool_invalid"):
+        adapter._read_submitted_plan(request, digest)
+
+
+@pytest.mark.parametrize(("content", "reason"), [
+    (b'{"plan":null}', "schema_invalid"),
+    (b'{"plan":{},"plan":{}}', "encoding_invalid"),
+    (b'{"plan":{"file_sha256":"../candidate"}}', "schema_invalid"),
+])
+def test_workspace_plan_submission_validates_the_full_wire_contract(tmp_path, content, reason):
+    adapter = CodexPlanSkillAdapter(tmp_path, executable=str(_fake_codex(tmp_path / "codex")))
+    request = _request(runtime_binding=adapter.runtime_binding(), job_ref="job:bad-plan")
+    adapter._workspaces = Mock()
+    adapter._workspaces.bind_runtime.return_value = SimpleNamespace(directory=tmp_path)
+    operation = tmp_path / "provider-operations" / canonical_hash({"job_ref": request.job_ref}) / "primary"
+    operation.mkdir(parents=True)
+    (tmp_path / "plan_candidate.json").write_bytes(content)
+    with pytest.raises(PlanSkillContractError, match=reason):
+        adapter._read_submitted_plan(request, hashlib.sha256(content).hexdigest())
 
 
 def test_durable_plan_primary_treats_collaboration_trace_as_diagnostic(
