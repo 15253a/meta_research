@@ -1074,7 +1074,7 @@ def _contract_tool_error(
             projected[key] = value
     if error_audit_store is not None:
         try:
-            error_audit_store.record(contract)
+            projected["audit_ref"] = error_audit_store.record(contract).audit_ref
         except Exception:
             # A missing audit fact is an operational failure. Keep the original
             # legacy code for callers, but route the projection to Operator.

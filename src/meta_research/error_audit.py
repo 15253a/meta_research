@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -56,11 +56,28 @@ class ErrorAuditStore:
         self, connection: Connection, contract: ErrorContract
     ) -> ErrorAuditRecord:
         payload = _payload_for(contract)
-        existing = self._find_in_connection(connection, contract.audit_ref)
-        if existing is not None:
-            if existing.payload_hash != payload["payload_hash"]:
-                raise ErrorAuditConflict("error_audit_idempotency_conflict")
-            return existing
+        if not isinstance(contract.audit_ref, str) or not contract.audit_ref:
+            raise ErrorAuditError("error_audit_identity_invalid")
+        rows = connection.execute(
+            text(
+                "SELECT revision, payload_json FROM durable_feed "
+                "WHERE event_type = :event_type "
+                "AND json_extract(payload_json, '$.audit_ref') IN (:current_ref, :old_ref) "
+                "ORDER BY json_extract(payload_json, '$.audit_ref') = :current_ref DESC, revision"
+            ),
+            {"event_type": ERROR_AUDIT_EVENT_TYPE, "current_ref": contract.audit_ref,
+             "old_ref": contract.legacy_generated_audit_ref},
+        )
+        for revision, encoded in rows:
+            record = _record_from_payload(revision, json.loads(encoded))
+            if record.audit_ref == contract.audit_ref:
+                if record.payload_hash != payload["payload_hash"]:
+                    raise ErrorAuditConflict("error_audit_idempotency_conflict")
+                return record
+            # The old key covered the operation, code and effect. Reuse it only for the same fact.
+            previous = _payload_for(replace(contract, audit_ref=record.audit_ref))
+            if record.payload_hash == previous["payload_hash"]:
+                return record
         revision = self._feed.record(connection, ERROR_AUDIT_EVENT_TYPE, payload)
         return _record_from_payload(revision, payload)
 
@@ -81,27 +98,6 @@ class ErrorAuditStore:
             for event in self._feed.read_event_type(ERROR_AUDIT_EVENT_TYPE)
             if event.payload.get("correlation_ref") == correlation_ref
         )
-
-    def _find_in_connection(
-        self, connection: Connection, audit_ref: str | None
-    ) -> ErrorAuditRecord | None:
-        if not isinstance(audit_ref, str) or not audit_ref:
-            raise ErrorAuditError("error_audit_identity_invalid")
-        rows = connection.execute(
-            text(
-                "SELECT revision, payload_json FROM durable_feed "
-                "WHERE event_type = :event_type ORDER BY revision"
-            ),
-            {"event_type": ERROR_AUDIT_EVENT_TYPE},
-        ).all()
-        for row in rows:
-            try:
-                payload = json.loads(row.payload_json)
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                raise ErrorAuditError("error_audit_record_invalid") from error
-            if isinstance(payload, dict) and payload.get("audit_ref") == audit_ref:
-                return _record_from_payload(int(row.revision), payload)
-        return None
 
 
 def _payload_for(contract: ErrorContract) -> dict[str, Any]:

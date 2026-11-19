@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping
 
@@ -80,9 +80,9 @@ def _safe(value: Any, *, depth: int = 0) -> Any:
     return f"<{type(value).__name__}>"
 
 
-def _digest(value: Mapping[str, Any]) -> str:
-    body = json.dumps(_safe(value), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+def _audit_identity(facts: Mapping[str, Any]) -> str:
+    body = json.dumps(facts, sort_keys=True, separators=(",", ":"))
+    return "error:" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
 
 
 def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
@@ -156,6 +156,7 @@ class ErrorContract:
     recovery_component: str = "semantic_mcp"
     audit_ref: str | None = None
     correlation_ref: str | None = None
+    legacy_generated_audit_ref: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.code or not self.phase or not self.operation_id:
@@ -290,8 +291,6 @@ def error_contract_from_legacy(
     ):
         correction = "Correct the indicated input or binding. This submission did not start an effect."
     audit_ref = raw.get("audit_ref") if isinstance(raw.get("audit_ref"), str) else None
-    if audit_ref is None:
-        audit_ref = "error:" + _digest({"code": code, "operation_id": operation_id, "effect_id": effect_id})[:32]
     default_retry = (
         status in {EffectStatus.NOT_STARTED, EffectStatus.WAITING}
         and not agent
@@ -305,7 +304,7 @@ def error_contract_from_legacy(
         EffectStatus.CANCELLED,
     } or agent or operator:
         retry_allowed = False
-    return ErrorContract(
+    contract = ErrorContract(
         code=code,
         legacy_code=code,
         phase=str(raw.get("phase") or phase),
@@ -329,6 +328,17 @@ def error_contract_from_legacy(
         recovery_component=str(raw.get("recovery_component") or "semantic_mcp"),
         audit_ref=audit_ref,
         correlation_ref=correlation_ref or (raw.get("correlation_ref") if isinstance(raw.get("correlation_ref"), str) else None),
+    )
+    if audit_ref is not None:
+        return contract
+    facts = contract.as_details()
+    del facts["audit_ref"]
+    return replace(
+        contract,
+        audit_ref=_audit_identity(facts),
+        legacy_generated_audit_ref=_audit_identity(
+            {"code": code, "operation_id": operation_id, "effect_id": effect_id}
+        ),
     )
 
 
