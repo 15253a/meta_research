@@ -783,7 +783,8 @@ def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(t
     workdir = tmp_path / "root"
     workdir.mkdir()
     adapter._workspaces = Mock()
-    adapter._workspaces.bind_runtime.return_value = SimpleNamespace(directory=workdir)
+    original_workspace = {"workspace_ref": "workspace:plan", "working_directory": str(workdir)}
+    adapter._workspaces.bind_runtime.return_value = SimpleNamespace(directory=workdir, seal=lambda: original_workspace)
     operation = tmp_path / "provider-operations" / canonical_hash({"job_ref": request.job_ref}) / "primary"
     operation.mkdir(parents=True)
     plan = _plan()
@@ -800,14 +801,37 @@ def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(t
 
     with pytest.raises(PlanSkillContractError, match="sha256_mismatch"):
         adapter._read_submitted_plan(request, "0" * 64)
+    with pytest.raises(PlanSkillUnavailable, match="codex_operation_identity_conflict"):
+        adapter._read_submitted_plan(request, digest, original_invocation={"workspace_binding": {}})
     assert not snapshot.exists()
-    assert adapter._read_submitted_plan(request, digest) == plan
+    assert adapter._read_submitted_plan(request, digest, original_invocation={"workspace_binding": original_workspace}) == plan
     assert snapshot.read_bytes() == original
     source.write_bytes(b"{}")
     assert adapter._read_submitted_plan(request, digest) == plan
     snapshot.write_bytes(b"null")
     with pytest.raises(PlanSkillUnavailable, match="codex_operation_spool_invalid"):
         adapter._read_submitted_plan(request, digest)
+
+
+def test_successor_reconciles_only_a_signed_reply_with_matching_owner_lineage(tmp_path):
+    runner = _SequenceRunner([{"plan": _plan()}])
+    adapter = CodexPlanSkillAdapter(tmp_path / "provider",
+        executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
+    prior = _request(runtime_binding=adapter.runtime_binding(), job_ref="original-plan-job",
+                     run_ref="plan-run", attempt_ref="prior-attempt", fence_ref="retired-fence")
+    draft = adapter.generate_draft(prior)
+    successor = replace(prior, attempt_ref="new-attempt", fence_ref="current-fence",
+                        submission_revision=2, replayable_primary_attempts=(
+                            (prior.attempt_ref, prior.fence_ref, prior.submission_revision),))
+    assert adapter.generate_draft(successor) == draft
+    for altered in (
+        replace(successor, owner_feedback=("A different requested revision",)),
+        replace(successor, root_session_ref="another-root"),
+        replace(successor, replayable_primary_attempts=(("foreign-attempt", prior.fence_ref, 1),)),
+    ):
+        with pytest.raises(PlanSkillUnavailable, match="codex_operation_identity_conflict"):
+            adapter.generate_draft(altered)
+    assert len(runner.calls) == 1
 
 
 @pytest.mark.parametrize(("content", "reason"), [

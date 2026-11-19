@@ -807,6 +807,7 @@ class IdeaStageRun:
     autonomous_checkpoint: ReasoningAutonomousCheckpoint | None = None
     predecessor_autonomous_checkpoint: ReasoningAutonomousCheckpoint | None = None
     checkpoint_rejection_receipt: AcceptanceReceipt | None = None
+    replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
 
     @property
     def attempt_execution_receipt(self) -> AcceptanceReceipt | None:
@@ -19006,6 +19007,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             primary_invocation, _ = _provider_invocations(
                 connection, run, attempt, fence
             )
+            replayable_primary_attempts = ()
+            if (expected_stage == "plan" and technical_replacement is not None
+                    and run.status == "running" and fence.status == "current"
+                    and primary_invocation.status == "prepared" and attempt.primary_draft_json is None):
+                replayable_primary_attempts = _plan_primary_replay_lineage(
+                    connection, run, attempt, primary_invocation
+                )
             autonomous_checkpoint = (
                 _reasoning_autonomous_checkpoint_with_completion_lineage(
                     connection,
@@ -19187,6 +19195,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             autonomous_checkpoint=autonomous_checkpoint,
             predecessor_autonomous_checkpoint=predecessor_autonomous_checkpoint,
             checkpoint_rejection_receipt=checkpoint_rejection_receipt,
+            replayable_primary_attempts=replayable_primary_attempts,
         )
 
     def record_idea_primary_draft(
@@ -24045,6 +24054,39 @@ def _insert_provider_invocations(
                 "prepared_at": prepared_at,
             },
         )
+
+
+def _plan_primary_replay_lineage(connection, run, attempt, invocation) -> tuple[tuple[str, str, int], ...]:
+    """Read the retired fences whose primary result the current Plan may reconcile."""
+    rows = connection.execute(text("""
+        WITH RECURSIVE lineage(attempt_ref, fence_ref, generation) AS (
+            VALUES (:current_attempt, :current_fence, :current_generation)
+            UNION ALL
+            SELECT a.attempt_ref, a.fence_ref, a.generation
+            FROM lineage AS child
+            JOIN ar_stage_attempt_replacements r
+              ON r.replacement_attempt_ref = child.attempt_ref AND r.run_ref = :run
+            JOIN ar_stage_attempts a
+              ON a.attempt_ref = r.retired_attempt_ref AND a.run_ref = r.run_ref
+            JOIN ar_execution_fences f
+              ON f.fence_ref = a.fence_ref AND f.attempt_ref = a.attempt_ref
+                 AND f.run_ref = a.run_ref AND f.generation = a.generation
+            JOIN ar_stage_provider_invocations i
+              ON i.attempt_ref = a.attempt_ref AND i.fence_ref = a.fence_ref AND i.run_ref = a.run_ref
+            WHERE r.reason_code = 'runtime_fence_replaced' AND a.generation = child.generation - 1
+              AND a.root_session_ref = :root AND f.status = 'rejected'
+              AND a.primary_draft_json IS NULL AND a.submission_ref IS NULL
+              AND i.phase = 'primary' AND i.status = 'prepared'
+              AND i.operation_ref = :operation AND i.runtime_binding_hash = :binding
+              AND NOT EXISTS (SELECT 1 FROM ar_stage_completion_rejections rejected
+                              WHERE rejected.attempt_ref = a.attempt_ref AND rejected.run_ref = a.run_ref)
+        )
+        SELECT attempt_ref, fence_ref, generation FROM lineage
+        WHERE generation < :current_generation ORDER BY generation DESC
+    """), {"current_attempt": attempt.attempt_ref, "current_fence": attempt.fence_ref,
+           "current_generation": attempt.generation, "run": run.run_ref, "root": run.root_session_ref,
+           "operation": invocation.operation_ref, "binding": invocation.runtime_binding_hash})
+    return tuple((row.attempt_ref, row.fence_ref, row.generation) for row in rows)
 
 
 def _provider_invocations(

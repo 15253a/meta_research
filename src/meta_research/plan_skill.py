@@ -51,7 +51,10 @@ from meta_research.plan_contract import (
 )
 from meta_research.provider_supervisor import transport_key_hash
 from meta_research.root_workspace import _read_bytes
-from meta_research.sealed_provider_operations import _reject_non_finite_json_constant, _write_exclusive
+from meta_research.sealed_provider_operations import (
+    _reject_non_finite_json_constant, _write_exclusive, operation_transport_limits,
+    read_business_input, read_completed_operation, read_sealed_invocation,
+)
 from meta_research.semantic_mcp import SemanticMcpError
 from meta_research.root_capabilities import merge_root_capability_bindings
 from meta_research.quest_drafting import (
@@ -92,6 +95,7 @@ class PlanSkillRequest:
     run_ref: str | None = None
     attempt_ref: str | None = None
     fence_ref: str | None = None
+    replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -519,21 +523,25 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 'plan_candidate.json。文件方式保留你写好的正文和准确收据。用 sha256sum plan_candidate.json '
                 '读取原始字节摘要，最终只返回 {"plan":{"file_sha256":"<64 位小写摘要>"}}；系统按摘要取原件并校验。'
             )
-        primary_output, primary_session, _primary_stdout = (
-            self._invoke_root_operation(
-            operation_name="primary",
-            prompt=primary_prompt,
-            schema=_plan_envelope_schema(request, workspace_submission=workspace_submission),
-            native_session_ref=request.native_session_ref,
-            job_ref=request.job_ref,
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding.as_dict(),
-            operation_input=stage_operation_input(request, "plan"),
+        schema = _plan_envelope_schema(request, workspace_submission=workspace_submission)
+        recovered = self._recover_replaced_primary(request, schema)
+        original_invocation = None
+        if recovered is None:
+            primary_output, primary_session, _primary_stdout = self._invoke_root_operation(
+                operation_name="primary",
+                prompt=primary_prompt,
+                schema=schema,
+                native_session_ref=request.native_session_ref,
+                job_ref=request.job_ref,
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                runtime_binding=request.runtime_binding.as_dict(),
+                operation_input=stage_operation_input(request, "plan"),
             )
-        )
+        else:
+            primary_output, primary_session, original_invocation = recovered
         if primary_session is None:
             raise PlanSkillUnavailable("codex_primary_session_missing")
         # Collaboration trace is advisory provenance.  Acceptance is based on
@@ -541,7 +549,9 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         plan_value = primary_output.get("plan")
         if isinstance(plan_value, dict) and set(plan_value) == {"file_sha256"}:
             try:
-                plan_value = self._read_submitted_plan(request, plan_value["file_sha256"])
+                plan_value = self._read_submitted_plan(
+                    request, plan_value["file_sha256"], original_invocation=original_invocation,
+                )
             except PlanSkillContractError as error:
                 raise self._sealed_result_failure(
                     job_ref=request.job_ref, operation_name="primary", native_session_ref=primary_session,
@@ -565,7 +575,48 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             adapter_kind="codex_cli",
         )
 
-    def _read_submitted_plan(self, request: PlanSkillRequest, digest: object) -> dict[str, object]:
+    def _recover_replaced_primary(
+        self, request: PlanSkillRequest, schema: dict[str, object],
+    ) -> tuple[dict[str, object], str | None, dict[str, object]] | None:
+        """Consume the old job's verified reply. The successor alone can record a draft."""
+        if not request.replayable_primary_attempts or request.job_ref is None:
+            return None
+        directory = self._workspace / "provider-operations" / canonical_hash({"job_ref": request.job_ref}) / "primary"
+        path = directory / "invocation.json"
+        if not path.exists():
+            return None
+        _, key = self._transport_key()
+        invocation = read_sealed_invocation(path, key=key)
+        limits = operation_transport_limits(invocation)
+        original = read_business_input(directory, invocation, limits)
+        original_hash = canonical_hash(original)
+        if original_hash == canonical_hash(stage_operation_input(request, "plan")):
+            return None
+        if (invocation.get("job_ref") != request.job_ref or invocation.get("operation_name") != "primary"
+                or invocation.get("native_session_ref") != request.native_session_ref
+                or invocation.get("output_schema_hash") != canonical_hash(_compile_codex_output_schema(schema))):
+            raise PlanSkillUnavailable("codex_operation_identity_conflict")
+        for old_attempt, old_fence, generation in request.replayable_primary_attempts:
+            predecessor = replace(request, attempt_ref=old_attempt, fence_ref=old_fence, submission_revision=generation)
+            if canonical_hash(stage_operation_input(predecessor, "plan")) == original_hash:
+                break
+        else:
+            raise PlanSkillUnavailable("codex_operation_identity_conflict")
+        output, session, _ = read_completed_operation(
+            directory, invocation_hash=canonical_hash(invocation),
+            native_session_ref=request.native_session_ref, transport_limits=limits,
+        )
+        try:
+            decoded = _decode_codex_provider_output(output, schema)
+        except PlanSkillUnavailable as error:
+            if error.code != "codex_json_object_transport_invalid":
+                raise
+            decoded = {}
+        return decoded, session, invocation
+
+    def _read_submitted_plan(
+        self, request: PlanSkillRequest, digest: object, *, original_invocation: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
             raise PlanSkillContractError("plan_candidate_file_sha256_invalid")
         if not request.job_ref or self._workspaces is None:
@@ -579,6 +630,8 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             )
             if binding is None:
                 raise PlanSkillContractError("plan_candidate_file_workspace_unavailable")
+            if original_invocation is not None and original_invocation.get("workspace_binding") != binding.seal():
+                raise PlanSkillUnavailable("codex_operation_identity_conflict")
             try:
                 content = _read_bytes(binding.directory, "plan_candidate.json")
             except SemanticMcpError as error:
@@ -606,9 +659,8 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 content, object_pairs_hook=_unique_plan_fields,
                 parse_constant=_reject_non_finite_json_constant,
             )
-            error = next(validator.iter_errors(value), None)
-            if error is not None:
-                raise PlanSkillContractError("plan_candidate_file_schema_invalid:" + error.json_path)
+            if not validator.is_valid(value):
+                raise PlanSkillContractError("plan_candidate_file_schema_invalid")
             return cast(dict[str, object], _decode_codex_provider_output(value, schema)["plan"])
         except PlanSkillContractError:
             raise
