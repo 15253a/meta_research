@@ -754,11 +754,12 @@ def _read_bytes(root: Path, path: str) -> bytes:
     if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
         raise SemanticMcpError("workspace_safe_reader_unavailable")
     descriptors = []
+    directory_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
-        fd = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(root.anchor, directory_flags)
         descriptors.append(fd)
         for part in (*root.parts[1:], *parts[:-1]):
-            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            fd = os.open(part, directory_flags, dir_fd=fd)
             descriptors.append(fd)
         fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         descriptors.append(fd)
