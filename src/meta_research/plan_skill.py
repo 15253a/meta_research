@@ -474,7 +474,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "在当前原根中连续完成研究、独立审阅和修订后再交回最终完整候选。"
             "自主委派原生子智能体读取完整草稿和必要依据，聚合其独立反馈并修订；"
             "由根负责最终判断，不为等待系统下一回合而提前交回草稿。"
-            "你是 Plan 主 Agent。只返回 {\"plan\": ...}，其中 plan 是完整、"
+            "你是 Plan 主 Agent。进展消息可用短句说明当前工作。只在最终答复中返回 {\"plan\": ...}，其中 plan 是完整、"
             "自洽且可由 Owner 验证的 PlanDocument 候选。必须从 accepted Question "
             "选择本 Cycle 承担的 AnswerContract obligations，逐已选 obligation 交代实际相关的 Idea 候选，只引用经过 Owner 核验的精确 EvidenceRef；按需读取 ContextPack "
             "中的精确 EvidenceRef，并且只为 gap 形成 ExperimentBrief。不得创建 "
