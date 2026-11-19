@@ -68,6 +68,27 @@ AnswerContract
 
 正式来源可以是有测量或无测量的真实 Target 工作产物、HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 等已支持类别。保留实际生产者、精确版本及接纳事实；来源种类不预设科学价值。目录卡片、路径、URL、摘要和排序供导航，不能替代所采用主张所需的正文与来源。
 
+写好 `plan_candidate.json` 后，可在工作目录运行这段 Python 核对草稿内的来源引用。它列出与本次所选绑定不一致的具体位置。需要修订时，回读对应材料的准确身份；科研支持范围和正式接纳仍由原有流程判断。
+
+```python
+import json
+from pathlib import Path
+
+candidate = json.loads(Path("plan_candidate.json").read_bytes())
+plan = candidate.get("plan", candidate)
+selected = {entry["evidence_ref"] for entry in plan["selected_evidence_bindings"]}
+unbound = {}
+for i, row in enumerate(plan["coverage"]):
+    for j, use in enumerate(row["evidence_uses"]):
+        if use["evidence_ref"] not in selected:
+            unbound[f"coverage[{i}].evidence_uses[{j}].evidence_ref"] = use["evidence_ref"]
+for i, brief in enumerate(plan["experiment_briefs"]):
+    for j, ref in enumerate(brief.get("reuse_material_refs", [])):
+        if ref not in selected:
+            unbound[f"experiment_briefs[{i}].reuse_material_refs[{j}]"] = ref
+print(json.dumps({"unbound": unbound}, ensure_ascii=False))
+```
+
 ```text
 EvidenceUse
   obligation_key

@@ -522,9 +522,10 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         workspace_submission = request.job_ref is not None and self._workspaces is not None
         if workspace_submission:
             primary_prompt += (
-                '\n最终候选可以直接返回，也可将同一完整 {"plan": ...} JSON 按输出合同写入当前 Plan 工作区的 '
-                'plan_candidate.json。文件方式保留你写好的正文和准确收据。用 sha256sum plan_candidate.json '
-                '读取原始字节摘要，最终只返回 {"plan":{"file_sha256":"<64 位小写摘要>"}}；系统按摘要取原件并校验。'
+                '\n最终候选可以直接按输出合同返回，也可将完整 PlanDocument 正文写入当前 Plan 工作区的 '
+                'plan_candidate.json。文件也接受 {"plan": <完整 PlanDocument>}。用 sha256sum plan_candidate.json '
+                '读取原始字节摘要，最终只返回 {"plan":{"file_sha256":"<64 位小写摘要>"}}。'
+                '交回前可用角色 references/contract.md 中的只读示例核对正文和 Brief 引用的来源。'
             )
         schema = _plan_envelope_schema(request, workspace_submission=workspace_submission)
         recovered = self._recover_replaced_primary(request, schema)
@@ -670,6 +671,8 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 content, object_pairs_hook=_unique_plan_fields,
                 parse_constant=_reject_non_finite_json_constant,
             )
+            if isinstance(value, dict) and value.get("kind") == "PlanDocument":
+                value = {"plan": value}
             if not validator.is_valid(value):
                 raise PlanSkillContractError("plan_candidate_file_schema_invalid")
             return cast(dict[str, object], _decode_codex_provider_output(value, schema)["plan"])
@@ -818,8 +821,8 @@ def _plan_envelope_schema(
     if workspace_submission:
         plan = {
             "description": (
-                "Use null for progress. Submit the complete PlanDocument or the SHA-256 "
-                "of the complete Plan envelope in plan_candidate.json in the final answer."
+                "Use null for progress. In the final answer, submit the complete PlanDocument "
+                "or file_sha256 for plan_candidate.json containing that document or its full Plan envelope."
             ),
             "anyOf": [
                 {"type": "null"},
