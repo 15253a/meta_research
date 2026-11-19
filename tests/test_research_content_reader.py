@@ -1,6 +1,8 @@
 import json
 import pytest
-from test_research_datasets import _runtime, _quest, _asset
+from test_public_manual_question_lifecycle import _build_runtime as _runtime
+from test_research_datasets import _asset
+from test_research_query_continuation import _quest
 from test_dataset_effect_scope_recovery import _scope
 from meta_research.owners.common import OwnerConflict
 from meta_research.owners.research_memory import AssetIntakeRequest

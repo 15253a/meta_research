@@ -144,9 +144,10 @@ def test_protected_workproduct_and_scientific_outcome_feed_the_next_plan(tmp_pat
             completion_ref=completed.completion_ref, target_commit_ref=completed.target_commit_ref)
         graph = runtime.owners.research_graph
         cleanup = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False)
-        assert len(cleanup) == 1 and cleanup[0]["action"] == "skipped", cleanup
-        assert cleanup[0]["reason"] == "cycle_incomplete"
-        assert cleanup[0]["bytes"] == 0 and workspace.exists()
+        protected, = [row for row in cleanup if row["workspace_ref"] == workspace_ref]
+        assert protected["root_kind"] == "target" and protected["path"] == str(workspace)
+        assert protected["action"] == "skipped" and protected["reason"] == "recent_cycle_window"
+        assert protected["bytes"] == 0 and workspace.exists()
         assert runtime.owners.research_memory.materialize_asset(retained.binding.version_ref).content == output
         facts = graph.query_target_formal_results(handle.target_ref)
         assert len(facts) == 1 and facts[0]["variant_run"]["status"] == "executed"

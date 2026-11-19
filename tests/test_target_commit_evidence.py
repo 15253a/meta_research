@@ -176,13 +176,28 @@ def test_v3_target_commit_evidence_uses_formal_measurement_roles() -> None:
         ),
     )
 
+    def evidence_candidates(**filters):
+        assert filters == {
+            "quest_ref": quest_ref,
+            "target_commit_refs": (commit.commit_ref,),
+            "current_only": False,
+            "role_refs": None,
+            "offset": 0,
+        }
+        return 1, ({
+            "target_commit_ref": commit.commit_ref,
+            "version_ref": evidence_version_ref,
+            "role_ref": evidence_role.role_ref,
+        },)
+
     graph = SimpleNamespace(
-        query_target_commits_for_quest=lambda value: (
-            (commit,) if value == quest_ref else ()
+        query_target_commit_evidence_candidates=evidence_candidates,
+        query_target_commits_for_quest=lambda value, *, target_commit_refs: (
+            (commit,) if value == quest_ref and target_commit_refs == (commit.commit_ref,) else ()
         ),
         query_asset_roles=lambda **values: (
             (evidence_role,)
-            if values == {"quest_ref": quest_ref, "role": "evidence"}
+            if values == {"quest_ref": quest_ref, "role": "evidence", "version_refs": (evidence_version_ref,)}
             else ()
         ),
         query_target_formal_metric_result=lambda value: (
