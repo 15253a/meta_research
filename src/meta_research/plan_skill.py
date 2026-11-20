@@ -664,7 +664,12 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         if len(content) > PROVIDER_RESULT_MAX_BYTES or hashlib.sha256(content).hexdigest() != digest:
             raise PlanSkillUnavailable("codex_operation_spool_invalid")
         schema = _plan_envelope_schema(request)
-        validator = Draft202012Validator(_compile_codex_output_schema(schema))
+        file_schema = _compile_codex_output_schema(schema)
+        # The provider requires all properties on the wire. A written Brief
+        # may omit its reuse list, which the Plan domain interprets as empty.
+        brief = file_schema["properties"]["plan"]["properties"]["experiment_briefs"]["items"]
+        brief["required"] = [name for name in brief["required"] if name != "reuse_material_refs"]
+        validator = Draft202012Validator(file_schema)
         try:
             value = json.loads(
                 content, object_pairs_hook=_unique_plan_fields,

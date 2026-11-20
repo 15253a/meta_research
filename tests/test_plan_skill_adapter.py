@@ -778,7 +778,8 @@ def test_durable_plan_primary_shape_failure_is_terminal_and_not_replayed(
 
 
 @pytest.mark.parametrize("envelope", [False, True], ids=["document", "envelope"])
-def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path, envelope):
+@pytest.mark.parametrize("include_reuse_list", [False, True], ids=["omitted-reuse", "explicit-reuse"])
+def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path, envelope, include_reuse_list):
     adapter = CodexPlanSkillAdapter(tmp_path, executable=str(_fake_codex(tmp_path / "codex")))
     request = _request(runtime_binding=adapter.runtime_binding(), job_ref="job:workspace-plan")
     workdir = tmp_path / "root"
@@ -792,7 +793,8 @@ def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(t
     for derived in ("source_bindings", "idea_trace", "evidence_reuse_set", "gap_set", "bundle_disposition"):
         plan.pop(derived)
     plan["answer_contract"].pop("answer_contract_hash")
-    plan["experiment_briefs"][0]["reuse_material_refs"] = []
+    if include_reuse_list:
+        plan["experiment_briefs"][0]["reuse_material_refs"] = []
     plan.update(notes="逐项复核后的候选", selected_evidence_bindings=[])
     original = json.dumps({"plan": plan} if envelope else plan, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     digest = hashlib.sha256(original).hexdigest()
