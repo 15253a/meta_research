@@ -2813,7 +2813,7 @@ def test_bundle_cannot_stage_commit_while_native_target_is_pending(
         runtime.close()
 
 
-def test_legacy_target_commit_is_rejected_before_receipt_or_fence_checks(
+def test_legacy_target_commit_paths_cannot_write_to_an_accepted_graph(
     tmp_path: Path,
 ) -> None:
     runtime = _bundle_runtime(tmp_path / "bundle-legacy-target-commit-rejected")
@@ -2836,19 +2836,14 @@ def test_legacy_target_commit_is_rejected_before_receipt_or_fence_checks(
         before = _target_commit_count(runtime)
         before_rg = runtime.owners.research_graph.query_snapshot()
         before_feed = runtime.feed.current_revision()
-        for fence_ref in ("stale-fence", "apparently-current-fence"):
-            with pytest.raises(
-                OwnerConflict, match="legacy_target_commit_write_forbidden"
-            ):
-                runtime.owners.research_graph.accept_target_commit(
-                    target_ref=target.target_ref,
-                    target_run_ref="legacy-target-run",
-                    execution_attempt_ref="legacy-target-attempt",
-                    fence_ref=fence_ref,
-                    execution_result_hash="0" * 64,
-                    execution_receipt=graph.head_receipt,
-                    result_content={"result_disposition": "negative"},
-                )
+        owner = runtime.owners.research_graph
+        assert not hasattr(owner, "accept_target_commit")
+        with pytest.raises(OwnerConflict, match="target_generic_measurement_shadow_write_forbidden"):
+            owner.accept_target_commit_from_generic_measurement_closure(
+                target_ref=target.target_ref,
+                target_execution_closure_ref="legacy-target-closure",
+                target_execution_closure_receipt=graph.head_receipt,
+            )
         assert _target_commit_count(runtime) == before
         assert runtime.owners.research_graph.query_snapshot() == before_rg
         assert runtime.feed.current_revision() == before_feed
