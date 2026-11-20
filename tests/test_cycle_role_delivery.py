@@ -90,9 +90,12 @@ def test_plan_delivers_methods_and_discloses_contracts_then_resumes_with_science
     assert result.primary_session_ref == first.primary_session_ref
     assert runner.calls[1][0][-3:] == ["resume", first.primary_session_ref, "-"]
     assert runner.calls[0][2] == runner.calls[1][2]
-    for _, user, _ in runner.calls:
-        assert "哪种约束保留稀有形态？" in user and "比较拓扑一致性与像素重建。" in user
-    assert "Correct the device comparison, preserve the frozen IdeaSet." in runner.calls[1][1]
+    initial, resumed = (user for _, user, _ in runner.calls)
+    assert "哪种约束保留稀有形态？" in initial and "比较拓扑一致性与像素重建。" in initial
+    assert "哪种约束保留稀有形态？" not in resumed and "比较拓扑一致性与像素重建。" not in resumed
+    assert f"stage_request_ref={request.stage_request_ref}" in resumed.splitlines()
+    assert f"context_pack_ref={request.context_pack_ref}" in resumed.splitlines()
+    assert "Correct the device comparison, preserve the frozen IdeaSet." in resumed
     assert len(runner.role_observations) == 2
 
 
@@ -109,8 +112,11 @@ def test_idea_continuation_keeps_methods_and_original_session(tmp_path):
         native_session_ref=first.primary_session_ref))
     assert continued.primary_session_ref == first.primary_session_ref
     assert runner.calls[1][0][-3:] == ["resume", first.primary_session_ref, "-"]
-    assert "accepted_question=" in runner.calls[0][1]
-    assert "accepted_question=" in runner.calls[1][1]
+    initial, resumed = (user for _, user, _ in runner.calls)
+    assert "accepted_question=" in initial and request.accepted_question_content["title"] in initial
+    assert "accepted_question=" not in resumed and request.accepted_question_content["title"] not in resumed
+    assert f"stage_request_ref={request.stage_request_ref}" in resumed.splitlines()
+    assert f"context_pack_ref={request.context_pack_ref}" in resumed.splitlines()
     assert runner.calls[0][2] == runner.calls[1][2]
     receipts = list((tmp_path / "provider" / "provider-operations").rglob("supervisor-exit.json"))
     assert len(receipts) == 2

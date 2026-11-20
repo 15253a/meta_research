@@ -1,10 +1,14 @@
 """Role guidance remains readable at the adapter's real provider boundary."""
 from dataclasses import replace
+import json
 from pathlib import Path
 import re
 
+import pytest
+
 from test_public_guidance_delivery import _developer
 from test_plan_skill_adapter import _fake_codex, _request, _plan, _SequenceRunner
+from meta_research.owners.common import canonical_hash
 from meta_research.plan_skill import CodexPlanSkillAdapter
 
 
@@ -71,3 +75,29 @@ def test_idea_delivers_method_without_forcing_optional_checklist(tmp_path):
     # Provider output transport must allow the same focused candidate as the domain contract.
     from jsonschema import Draft202012Validator
     Draft202012Validator(schema).validate(_provider_idea_message(outcome))
+
+
+@pytest.mark.parametrize("stage", ["idea", "plan"])
+def test_first_packet_omits_runtime_manifest_but_binds_the_signed_request(tmp_path, stage):
+    from meta_research.idea_skill import CodexIdeaSkillAdapter
+    from test_idea_skill_contract import _request as idea_request, _idea_set, _SequenceRunner as IdeaRunner
+
+    if stage == "idea":
+        adapter_type, make_request = CodexIdeaSkillAdapter, idea_request
+        runner = IdeaRunner([{"outcome": _idea_set()}])
+    else:
+        adapter_type, make_request = CodexPlanSkillAdapter, _request
+        runner = _SequenceRunner([{"plan": _plan()}])
+    provider = tmp_path / "provider"
+    adapter = adapter_type(provider, executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
+    binding = adapter.runtime_binding()
+    request = make_request(runtime_binding=binding, job_ref="first-packet")
+    adapter.generate_draft(request)
+
+    assert len(runner.calls) == 1
+    prompt = runner.calls[0][1]
+    assert "runtime_binding=" not in prompt
+    assert binding.packaged_skill_bundle_hash not in prompt
+    directory = provider / "provider-operations" / canonical_hash({"job_ref": request.job_ref}) / "primary"
+    business_input = json.loads((directory / "business-input.json").read_text(encoding="utf-8"))
+    assert business_input["request"]["runtime_binding_hash"] == canonical_hash(binding.as_dict())
