@@ -1476,9 +1476,18 @@ def _validate_outcome_scope_and_synthesis(
             raise ReasoningContractError("scientific_outcome_causal_interpretation_invalid")
     for field in ("claim_scope", "statement", "sufficiency_rationale"):
         _require_text(causal.get(field), "scientific_outcome_causal_interpretation_invalid")
-    attribution = set(cast(list[str], causal["attribution_basis_refs"]))
-    if not attribution.issubset(cited_refs):
-        raise ReasoningContractError("scientific_outcome_causal_interpretation_invalid")
+    attribution_refs = cast(list[str], causal["attribution_basis_refs"])
+    uncited_refs = [ref for ref in attribution_refs if ref not in cited_refs]
+    if uncited_refs:
+        raise ReasoningContractError(
+            "scientific_outcome_causal_interpretation_invalid",
+            feedback=(
+                f"scientific_outcome.causal_interpretation.attribution_basis_refs contains "
+                f"refs absent from scientific_outcome.evidence[].ref: {uncited_refs!r}. "
+                "Cite an eligible source with the finding it supports, or remove its ref "
+                "from the attribution."
+            ),
+        )
     frozen_causal = cast(dict[str, list[str]], expected_context["causal_context"])
     for field in ("target_commit_refs", "changed_axis_fact_refs", "held_fixed_fact_refs", "provenance_refs"):
         if causal[field] != frozen_causal[field]:
