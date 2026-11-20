@@ -24,11 +24,12 @@ from test_root_workspace import (
 )
 
 
-def _native_executable(path):
+def _native_executable(path, *, workspace_thread=False):
     path.write_text(
         f"#!{sys.executable}\n"
         "import json, os, sys\n"
         "from pathlib import Path\n"
+        f"thread_id = Path.cwd().name if {workspace_thread!r} else 'local-native-root'\n"
         "if '--version' in sys.argv:\n"
         f"    print('codex-cli {CODEX_LOCKED_VERSION}')\n"
         "    raise SystemExit(0)\n"
@@ -39,7 +40,7 @@ def _native_executable(path):
         "    for line in sys.stdin:\n"
         "        message = json.loads(line); method = message.get('method'); params = message.get('params', {})\n"
         "        if method == 'initialized': continue\n"
-        "        result = {'thread': {'id': 'local-native-root'}} if method in ('thread/start', 'thread/resume') else {}\n"
+        "        result = {'thread': {'id': thread_id}} if method in ('thread/start', 'thread/resume') else {}\n"
         "        if method == 'turn/start': result = {'turn': {'id': 'local-turn', 'status': 'inProgress'}}\n"
         "        print(json.dumps({'id': message['id'], 'result': result}), flush=True)\n"
         "        if method == 'turn/start':\n"
@@ -55,8 +56,8 @@ def _native_executable(path):
         "            else:\n"
         "                value = {'cwd': os.getcwd(), 'previous': bool(previous), 'human': [], 'reply': 'Checked pending observations.'}\n"
         "                schema = params.get('outputSchema', {}); value = {key: value[key] for key in schema.get('properties', value) if key in value}\n"
-        "            print(json.dumps({'method':'item/completed','params':{'threadId':'local-native-root','turnId':'local-turn','item':{'type':'agentMessage','id':'final','text':json.dumps(value)}}}), flush=True)\n"
-        "            print(json.dumps({'method':'turn/completed','params':{'threadId':'local-native-root','turn':{'id':'local-turn','status':'completed'}}}), flush=True)\n"
+        "            print(json.dumps({'method':'item/completed','params':{'threadId':thread_id,'turnId':'local-turn','item':{'type':'agentMessage','id':'final','text':json.dumps(value)}}}), flush=True)\n"
+        "            print(json.dumps({'method':'turn/completed','params':{'threadId':thread_id,'turn':{'id':'local-turn','status':'completed'}}}), flush=True)\n"
         "    raise SystemExit(0)\n"
         "prompt = sys.stdin.read()\n"
         "if 'Read the prior Idea marker' in prompt:\n"
@@ -82,9 +83,9 @@ def _native_executable(path):
         "    schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema')+1]).read_text())\n"
         "    value = {key: value[key] for key in schema['properties'] if key in value}\n"
         "    Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(json.dumps(value))\n"
-        "    print(json.dumps({'type': 'thread.started', 'thread_id': 'local-native-root'}))\n"
+        "    print(json.dumps({'type': 'thread.started', 'thread_id': thread_id}))\n"
         "else:\n"
-        "    print(json.dumps({'type': 'thread.started', 'thread_id': 'local-native-root'}))\n"
+        "    print(json.dumps({'type': 'thread.started', 'thread_id': thread_id}))\n"
         "    print(json.dumps({'type': 'turn.completed'}))\n",
         encoding="utf-8")
     path.chmod(0o700)

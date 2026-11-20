@@ -299,21 +299,42 @@ def test_actual_reasoning_transport_gets_guidance_before_provider_seal(tmp_path)
         runtime.close()
 
 
+def _admit_guidance_target(runtime, **kwargs):
+    target, candidate, plan, admission, handle = _admit_independent_target_root(runtime, **kwargs)
+    launch = runtime.owners.agent_runtime.query_admitted_target_launch(target.target_ref)
+    runtime.target_root_lifecycle.activate(
+        launch_ref=launch.launch_ref, handle=handle, candidate=candidate,
+        formal_plan=plan, idempotency_key="activate-guidance:" + target.target_ref,
+    )
+    return target, admission
+
+
+def _supervised_target(runtime, tmp_path):
+    from meta_research.harness_adapters import CodexHarnessAdapter, HarnessSupervisorTransport
+    from test_root_workspace_native import _native_executable
+    store = runtime.harnesses._target_raw_output_store
+    executable = _native_executable(tmp_path / "guidance-codex", workspace_thread=True)
+    adapter = CodexHarnessAdapter(store._workspace, executable=str(executable),
+        runner=HarnessSupervisorTransport(store._workspace, raw_output_store=store))
+    runtime.harnesses._adapters["codex"] = adapter
+    return adapter
+
+
 def test_actual_target_preparation_and_per_call_channel_preserve_admission_grant(tmp_path):
     runtime = _current_bundle_runtime(tmp_path / "runtime")
     runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
     try:
-        target, _, _, admission, _ = _admit_independent_target_root(runtime)
+        target, admission = _admit_guidance_target(runtime)
         launch = runtime.owners.agent_runtime.query_admitted_target_launch(target.target_ref)
         _submit(runtime, launch.quest_ref)
-        adapter = runtime.harnesses._adapters["codex"]
+        adapter = _supervised_target(runtime, tmp_path)
         invoke = adapter.invoke
         observed = []
         def read_then_invoke(invocation):
             if invocation.root_kind == "target":
                 assert invocation.mcp_token != admission.connection.token
                 inbox = _tool(runtime, invocation.mcp_token, "human_guidance.read")
-                observed.append(inbox)
+                observed.append((inbox, invocation.provider_operation_ref))
                 delivery, = inbox["deliveries"]
                 exact = _tool(runtime, invocation.mcp_token, "human_guidance.read",
                     delivery_ref=delivery["delivery_ref"], effect_id="target-read")
@@ -323,7 +344,8 @@ def test_actual_target_preparation_and_per_call_channel_preserve_admission_grant
         result = runtime.harnesses.run_or_resume_target_root(
             admission.run.request_ref, prompt="Continue the target audit.", mcp_base_url="http://127.0.0.1:8999")
         assert result.status == "executed"
-        assert observed[0]["binding"]["identity"]["operation_ref"] == adapter.invocations[-1].provider_operation_ref
+        (inbox, operation_ref), = observed
+        assert inbox["binding"]["identity"]["operation_ref"] == operation_ref
         assert admission.run.mcp_binding.guidance_binding is None
         status, payload = runtime.harnesses.dispatch_mcp(admission.connection.token, {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -381,21 +403,10 @@ def test_signed_target_operation_retains_note_then_stops_exact_work(tmp_path):
     runtime = _current_bundle_runtime(tmp_path / "runtime")
     runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
     try:
-        target, candidate, formal_plan, admission, handle = (
-            _admit_independent_target_root(runtime)
-        )
-        launch = runtime.owners.agent_runtime.query_admitted_target_launch(
-            target.target_ref
-        )
-        runtime.target_root_lifecycle.activate(
-            launch_ref=launch.launch_ref,
-            handle=handle,
-            candidate=candidate,
-            formal_plan=formal_plan,
-            idempotency_key="activate-goal-evolution-target",
-        )
+        target, admission = _admit_guidance_target(runtime)
+        launch = runtime.owners.agent_runtime.query_admitted_target_launch(target.target_ref)
         submitted = _submit(runtime, launch.quest_ref, strength=5)
-        adapter = runtime.harnesses._adapters["codex"]
+        adapter = _supervised_target(runtime, tmp_path)
         invoke = adapter.invoke
         observed = {}
 

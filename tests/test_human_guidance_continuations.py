@@ -8,13 +8,14 @@ from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.harness import HarnessAdmissionError
 from meta_research.human_guidance import GUIDANCE_OPERATION_IDS
 from test_human_guidance_providers import (
+    _admit_guidance_target, _supervised_target,
     _adapter, _BundleTransport, _ReasoningTransport, _reasoning_runtime,
     _bundle_runtime, _submit, _seals, _tool,
 )
 from test_human_guidance_inboxes import _InboxIdea, _run_idea, _finish
 from test_public_bundle_stage import _accept_real_target_root_commit, _ParallelTwoTargetBundleSkill
 from test_target_root_finalizer import (
-    _CurrentBindingBundleSkill, _current_bundle_runtime, _admit_independent_target_root,
+    _CurrentBindingBundleSkill, _current_bundle_runtime,
 )
 from test_public_autonomous_creation import (
     _AutonomousReasoningSkill, _reach_autonomous_checkpoint,
@@ -102,7 +103,7 @@ def test_two_active_target_roots_treat_independently_and_cannot_read_each_others
     runtime = _current_bundle_runtime(tmp_path / "runtime", bundle_skill=ParallelBundle())
     _configure(runtime)
     try:
-        first_target, _, _, first, _ = _admit_independent_target_root(runtime)
+        first_target, first = _admit_guidance_target(runtime)
         launch = runtime.owners.agent_runtime.query_admitted_target_launch(first_target.target_ref)
         guide = _submit(runtime, launch.quest_ref)
         for _ in range(12):
@@ -125,11 +126,12 @@ def test_two_active_target_roots_treat_independently_and_cannot_read_each_others
                     break
         else:
             raise AssertionError("Second independent Target did not become dispatchable")
-        _, _, _, second, _ = _admit_independent_target_root(runtime,
+        _, second = _admit_guidance_target(runtime,
             ready=(graph, second_target, run, second_decision, None), key_prefix="second-")
-        adapter = runtime.harnesses._adapters["codex"]
+        adapter = _supervised_target(runtime, tmp_path)
         original_invoke = adapter.invoke
         observed = []
+        native_sessions = []
         first_delivery = None
 
         def invoke(invocation):
@@ -156,12 +158,15 @@ def test_two_active_target_roots_treat_independently_and_cannot_read_each_others
             _tool(runtime, invocation.mcp_token, "human_guidance.feedback",
                 delivery_ref=delivery["delivery_ref"], effect_id="feedback", understanding="Audit devices independently.",
                 changes="Separate device evidence.", continuing_work="Continue this Target.", reasons="Device drift matters.", disposition="applied")
-            return original_invoke(invocation)
+            result = original_invoke(invocation)
+            native_sessions.append(result.native_session_ref)
+            return result
 
         adapter.invoke = invoke
         runtime.harnesses.run_or_resume_target_root(first.run.request_ref,
             prompt="Audit the first independent Target.", mcp_base_url="http://127.0.0.1:8999")
         assert len(observed) == 2
+        assert len(set(native_sessions)) == 2
         assert len({item["binding"]["identity"]["run_ref"] for item in observed}) == 2
         rows = runtime.owners.human_collaboration.query_guidance_deliveries(guide["constraint_ref"])
         assert len(rows) == 2
