@@ -1,8 +1,10 @@
 """The host supplies directories from Owner bindings, never a manifest of their contents."""
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from meta_research.root_workspace import RootWorkspaces, WorkspaceBinding, WorkspaceLocation
+from meta_research.runtime_conditions import resume_runtime_conditions
 
 
 def test_native_paths_follow_the_foregrounds_three_cycle_window(tmp_path):
@@ -36,3 +38,16 @@ def test_native_paths_follow_the_foregrounds_three_cycle_window(tmp_path):
     assert [item['work_ref'] for item in entries if item['access'] == 'read_write'] == [current.work_ref]
     assert all((Path(item['directory']) / 'observation').read_text() == item['cycle_ref'] for item in entries)
     assert not missing.directory.exists()
+
+    # A native session may still carry the full directory records from an earlier release.
+    previous = 'Work directories: ' + json.dumps(entries)
+    ae.query_recent_workspace_cycles = lambda quest: ('newer', 'now', 'previous1')
+    current_prompt = host.native_directory_prompt(current)
+    update = resume_runtime_conditions(current_prompt, (previous,), ordered=True)
+    changed = json.loads(update.split('=', 1)[1])
+    assert changed['removed_workspace_refs'] == [cycles['previous2'][1].workspace_ref]
+    assert {row['workspace_ref'] for row in changed['directories']} == {
+        item.workspace_ref for cycle in ('now', 'previous1') for item in cycles[cycle]}
+    assert all(set(row) == {'workspace_ref', 'work_ref', 'root_kind', 'quest_ref', 'cycle_ref',
+                            'directory', 'access'} for row in changed['directories'])
+    assert resume_runtime_conditions(current_prompt, (update, previous), ordered=True) == ''

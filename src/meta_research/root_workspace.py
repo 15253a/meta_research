@@ -510,6 +510,12 @@ class RootWorkspaces:
             if current.cycle_ref is not None else
             "This work follows its own workspace lifecycle, outside the three-Cycle window. "
         )
+        fields = ("workspace_ref", "work_ref", "root_kind", "quest_ref", "cycle_ref",
+                  "target_ref", "context_generation", "directory", "access")
+        directories = [
+            {key: entry[key] for key in fields if entry.get(key) is not None}
+            for entry in self._native_directories(current)
+        ]
         return ("\n\nUse native file or shell tools in these work directories. "
                 + scope
                 + "Unlisted paths are not granted and do not imply absent research history; "
@@ -517,7 +523,7 @@ class RootWorkspaces:
                 "Write only in your own read_write directory; other listed work is read-only. "
                 "Do not traverse parent directories, private spools or authority stores. "
                 "Presence does not admit a formal asset. Work directories: "
-                + canonical_json(self._native_directories(current)))
+                + canonical_json(directories))
 
     def list_companion_files(self, scope_ref: str, root_session_ref: str, *, offset=0, limit=50):
         """List the requested page for the human-facing Companion file panel."""
