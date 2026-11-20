@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from sqlalchemy import text
 
@@ -268,6 +269,16 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
         reader_source_quest_ref=reader_source_quest_ref)
     if value is not None:
         return {**exact_page(value),"source_ref":source_ref,"version_ref":version_ref}
+    if re.fullmatch(r"(?:bundle_report|formal_plan)_[0-9a-f]{32}", source_ref):
+        raise OwnerConflict("content_source_unbound", {
+            "recovery_owner": "agent",
+            "field_path": ["source_ref"],
+            "correction": (
+                "source_ref has the form of a stage outcome identifier. "
+                "For an authorized Quest, use research_graph.question_history.read and copy "
+                "the stage reader's source_ref and version_ref together."
+            ),
+        })
     raise OwnerConflict("content_source_unbound")
 
 
