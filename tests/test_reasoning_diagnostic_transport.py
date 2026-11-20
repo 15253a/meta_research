@@ -11,7 +11,7 @@ from test_reasoning_skill_adapter import (
 )
 
 
-@pytest.mark.parametrize("invalid_content", ["missing_parent", "evidence_kind"])
+@pytest.mark.parametrize("invalid_content", ["missing_parent", "evidence_kind", "catalog_ref"])
 def test_sealed_diagnostic_replays_after_adapter_restart_without_provider_call(tmp_path, invalid_content):
     request = _request()
     output = _stage_output()
@@ -28,13 +28,21 @@ def test_sealed_diagnostic_replays_after_adapter_restart_without_provider_call(t
             "scientific_outcome_research_synthesis_invalid:"
             "research_synthesis.parent_questions:missing_impact_for:" + parent
         )
-    else:
+    elif invalid_content == "evidence_kind":
         output["scientific_outcome"]["evidence"][0]["kind"] = "LogAsset"
         expected_code = "scientific_outcome_evidence_invalid"
         expected_diagnostic = (
             "$.scientific_outcome.evidence[0].kind does not match an authorized selected evidence leaf. "
             "Use the exact ref and kind supplied by the frozen closure or authorized content reader; "
             "catalog and container references do not substitute for a selected evidence leaf."
+        )
+    else:
+        output["scientific_outcome"]["evidence"][0]["ref"] = "evidence_catalog_example"
+        expected_code = "scientific_outcome_evidence_invalid"
+        expected_diagnostic = (
+            "For an EvidenceReuseLeaf in current_target_evidence_closure or "
+            "plan_evidence_input.evidence_reuse_closure, use its evidence_item_ref as ref "
+            "and its role as kind."
         )
 
     executable = _fake_codex(tmp_path / "codex")

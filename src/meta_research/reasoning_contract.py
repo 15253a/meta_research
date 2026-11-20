@@ -1282,6 +1282,12 @@ def validate_scientific_evidence_selection(
                 "Use the exact ref and kind supplied by the frozen closure or authorized content reader; "
                 "catalog and container references do not substitute for a selected evidence leaf."
             )
+            if frozen is None:
+                error.feedback += (
+                    " For an EvidenceReuseLeaf in current_target_evidence_closure or "
+                    "plan_evidence_input.evidence_reuse_closure, use its evidence_item_ref as ref "
+                    "and its role as kind. Other citations that already match can be retained."
+                )
             raise error
         cited_refs.add(evidence_ref)
 
