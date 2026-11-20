@@ -486,13 +486,14 @@ class SemanticMcpGateway:
                         "version": __version__,
                     },
                     "instructions": (
-                        "通过本服务的高层语义操作读取或改变 Owner 权威状态；其他研究工作按当前授予的原生工具和阶段规则进行。"
-                        "以对应 Owner 验证的接纳事实与真实回执确认结果；工具可见或普通执行成功不扩大授权，也不替代领域接纳。"
-                        "工具调用失败以 isError=true 和 structuredContent.code 为准，可选 details 保留具体诊断与原操作对账信息；正常 Owner status 仍是业务状态。"
-                        "沿本次 tools/list 提供的入口操作：有用途目录时用 tools.catalog.page 展开，再按需 tools.contracts.read；已知 reader 可直接调用，或用 tools.call(operation_id, arguments)，无需先发现。"
-                        "capability_unavailable 表示操作未注册、未获授或当前服务不可用；content_version_unbound 表示本次精确版本在当前范围未绑定，不表示全库不存在。"
-                        "近期 workspace 沿宿主提供的实际路径与读写范围使用原生文件/shell；外部 MCP 沿宿主当前提供的服务入口。\n"
-                        + json.dumps(self._overview(context), ensure_ascii=False)
+                        "按当前授权调用 Owner，正式接纳以其回执为准。已知 reader 可直接调用或经 tools.call 调用。"
+                        "有用途目录时，tools.catalog.page 按 purpose 展开，tools.contracts.read 按 operation_id 查合同。"
+                        "本服务的 content 文本与 structuredContent 是同一结果。在原生 JS 中可用 "
+                        "text({isError:r.isError,value:r.structuredContent ?? r.content}) 展示一次。"
+                        "isError=true 时查看 code 和 details，结果未知时沿原操作对账。"
+                        "capability_unavailable 可指未注册、未获授或服务不可用，content_version_unbound 指当前范围未绑定该版本。"
+                        "工作目录按宿主授予的路径和读写范围使用原生工具，外部 MCP 使用其实际入口。\n"
+                        + json.dumps(self._overview(context), ensure_ascii=False, separators=(",", ":"))
                     ),
                 },
             }
@@ -723,7 +724,12 @@ class SemanticMcpGateway:
         operations = self._available_operations(context)
         if not set(TOOL_DISCOVERY_OPERATION_IDS) <= {op.semantic_operation_id for op in operations}:
             return {}
-        return {"purposes": purpose_overview(operations), "common_operations": common_operations(operations)}
+        return {
+            "purposes": [{"purpose": item["purpose"], "summary": item["summary"]}
+                         for item in purpose_overview(operations)],
+            "common_operations": [{"operation_id": item["operation_id"], "summary": item["summary"]}
+                                  for item in common_operations(operations)],
+        }
 
     def _provider_tools(self, context: SemanticCallContext) -> list[dict[str, object]]:
         operations = self._available_operations(context)

@@ -1,4 +1,6 @@
 """The model can discover by research purpose or call an exact reader directly."""
+import json
+
 from meta_research.semantic_mcp import SemanticMcpGateway, SemanticOperation
 from test_tool_discovery_registry import call, make_channel
 
@@ -20,12 +22,16 @@ def test_provider_starts_with_purposes_and_loads_only_the_selected_contract():
     ))
     channel = make_channel(gateway, gateway.operation_ids)
     _, initialized = gateway.dispatch(channel.token, {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-    assert "RG" in initialized["result"]["instructions"]
+    first_packet = json.loads(initialized["result"]["instructions"].splitlines()[-1])
     _, listed = gateway.dispatch(channel.token, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     assert {tool["name"] for tool in listed["result"]["tools"]} == {
         "tools.catalog.page", "tools.contracts.read", "tools.call"}
     overview = call(gateway, channel, "tools.catalog.page")["structuredContent"]
     assert {item["purpose"] for item in overview["purposes"]} >= {"RG", "RM", "WF", "HC"}
+    assert first_packet["purposes"] == [
+        {"purpose": item["purpose"], "summary": item["summary"]} for item in overview["purposes"]]
+    assert first_packet["common_operations"] == [
+        {"operation_id": item["operation_id"], "summary": item["summary"]} for item in overview["items"]]
     assert len(overview["items"]) <= 3
     wf = call(gateway, channel, "tools.catalog.page", purpose="WF")["structuredContent"]
     assert {item["operation_id"] for item in wf["items"]} == {
@@ -37,10 +43,12 @@ def test_provider_starts_with_purposes_and_loads_only_the_selected_contract():
     # No preceding discovery or contract read is necessary for this exact operation.
     result = call(gateway, channel, "tools.call", operation_id="human_request.read", arguments={"ref": "reply"})
     assert result["structuredContent"] == {"operation": "human_request.read", "value": "reply"}
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
     failed = call(gateway, channel, "tools.call", operation_id="human_request.read", arguments={})
     assert failed["isError"] is True
     assert failed["structuredContent"]["code"] == "semantic_input_schema_mismatch"
     assert failed["structuredContent"]["details"]["operation_id"] == "human_request.read"
+    assert json.loads(failed["content"][0]["text"]) == failed["structuredContent"]
 
 
 def test_purpose_pages_and_direct_dispatch_follow_current_authority():
