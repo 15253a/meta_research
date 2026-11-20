@@ -1808,7 +1808,6 @@ class CodexIdeaSkillAdapter:
             f"question_ref={request.question_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
-            f"runtime_binding={canonical_json(request.runtime_binding.as_dict())}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"provider_context_view={stage_context_json('idea', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         ) if request.native_session_ref is None else (
