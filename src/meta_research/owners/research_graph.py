@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from meta_research.formal_entities import insert_variant_run, insert_evaluation_attempt, insert_metric_result
-from meta_research.target_content_issue import TargetContentIssue
+from meta_research.target_content_issue import TargetContentIssue, check_copied_target_identity
 
 from meta_research.context_presentation import HISTORY_LIMIT, scientific_handoff
 from meta_research.question_relations import QuestionRelationOwnerMixin
@@ -6924,16 +6924,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     "SELECT question_ref FROM ae_stage_run_requests WHERE request_ref = :ref"
                 ), {"ref": authority.stage_request_ref}).scalar_one()
         for field, expected in authoritative_fields.items():
-            if field in result_content and result_content[field] != expected:
-                conflict = TargetContentIssue("target_root_commit_domain_invalid")
-                conflict.feedback = (
-                    f"$.{field} supplied {result_content[field]!r}, but the accepted source "
-                    f"for Target {target.target_ref!r} records {expected!r}. Correct or omit "
-                    "that copied identity in the result document and finish another normal "
-                    "turn in this Root. The system carries the accepted identity; preserve "
-                    "the metrics, artifacts and actual work, which need no rerun for this conflict."
-                )
-                raise conflict
+            check_copied_target_identity(result_content, field, expected, target_ref=target.target_ref)
         if not metric_check.conforms:
             missing = list(metric_check.missing_keys)
             unexpected = list(metric_check.unexpected_keys)
