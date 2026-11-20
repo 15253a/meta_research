@@ -9386,6 +9386,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> dict[str, object] | None:
         """Project the predecessor's retained correction into its current Attempt."""
         from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
+        from meta_research.bundle_target_contract import METRIC_SET_REPAIR
         with self._database.read() as connection:
             control = connection.execute(text(
                 "SELECT * FROM ar_run_controls WHERE run_ref=:run AND attempt_ref=:attempt "
@@ -9485,6 +9486,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     + ". Reconcile original external effects before repeating them."
                     if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
+                    "protocol_metric_sets_overlap": METRIC_SET_REPAIR,
                     "bundle_propose_targets_replan_basis_not_null": (
                         "preserve strategy_update and set replan_basis=null when action=propose_targets"
                     ),

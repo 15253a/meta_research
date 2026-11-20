@@ -1046,6 +1046,48 @@ def _assert_public_bundle_execution(current: dict[str, object]) -> dict[str, obj
     return run
 
 
+def test_duplicate_protocol_metric_reaches_same_bundle_root_after_restart(tmp_path):
+    requests = []
+
+    class Provider(_DeterministicBundleSkill):
+        def generate_draft(self, request):
+            requests.append(request)
+            draft = super().generate_draft(request)
+            if request.owner_feedback:
+                return draft
+            protocol = draft.draft["initial_strategy_update"]["candidates"][0]["measurement_contract"]["protocol_version"]
+            protocol["optional_metrics"].append(deepcopy(protocol["required_metrics"][0]))
+            return draft
+
+    data_root = tmp_path / "metric-overlap"
+    runtime = _bundle_runtime(data_root, bundle_skill_provider=Provider())
+    try:
+        _prepare_bundle_request(runtime)
+        assert runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.process_once()
+        rejection = runtime.bundle_stage.query_current()["run"]["completion_rejection"]
+        assert rejection["reason"]["detail"] == "protocol_metric_sets_overlap"
+    finally:
+        runtime.close()
+    runtime = _bundle_runtime(data_root, bundle_skill_provider=Provider())
+    try:
+        for _ in range(8):
+            runtime.bundle_stage.process_once()
+            if len(requests) == 2:
+                break
+        first, second = requests
+        assert second.root_session_ref == first.root_session_ref
+        assert second.native_session_ref == "bundle-primary-1"
+        message, = second.owner_feedback
+        assert '"metric:effect"' in message
+        prefix = "$.target_plan.initial_strategy_update.candidates[0].measurement_contract.protocol_version."
+        assert prefix + "required_metrics[0].metric_key" in message
+        assert prefix + "optional_metrics[1].metric_key" in message
+        assert second.owner_rejection_receipt_ref
+    finally:
+        runtime.close()
+
+
 def _advance_to_public_bundle_execution(runtime) -> dict[str, object]:
     for _step in range(3):
         current = runtime.bundle_stage.query_current()
