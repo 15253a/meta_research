@@ -19,9 +19,13 @@ from meta_research.runtime_conditions import read_runtime_conditions, save_runti
 from test_human_guidance_providers import (
     _adapter, _bundle_runtime, _reasoning_runtime, _confirm_direct_quest,
     _confirm_deepfetch_quest, _finish_idea_stage, _finish_plan_stage,
-    _BundleTransport, _ReasoningTransport,
+    _BundleTransport,
 )
-from test_human_guidance_continuations import _configure
+from test_human_guidance_continuations import _AutonomousTransport, _configure
+from test_public_autonomous_creation import (
+    _drive_autonomous_creation_ready, _finish_reasoning_after_creation, _reach_autonomous_checkpoint,
+)
+from test_target_launch_admission import _ready_launch
 
 
 @pytest.mark.parametrize("repetitions", [180, 5000], ids=["preview-limit", "aggregate-limit"])
@@ -83,7 +87,7 @@ def test_first_stage_provider_receives_owner_frozen_goal_and_enduring_conditions
             worker.process_once()
             if runner.calls:
                 break
-        assert len(runner.calls) == 1, (worker.transient_error, worker.query_current())
+        assert len(runner.calls) == 1, worker.query_current()
         # A deliberately non-scientific controlled response ends the probe;
         # assertions concern the real first request, not model success.
         prompt = runner.calls[0][1]
@@ -102,7 +106,7 @@ def test_first_stage_provider_receives_owner_frozen_goal_and_enduring_conditions
 class _ReplayPrimary:
     def generate_draft(self, request):
         result = super().generate_draft(request)
-        self.call(request, "primary")
+        assert self.call(request, "primary") == result.primary_session_ref
         return result
 
 
@@ -110,7 +114,7 @@ class _ReplayingBundle(_ReplayPrimary, _BundleTransport):
     pass
 
 
-class _ReplayingReasoning(_ReplayPrimary, _ReasoningTransport):
+class _ReplayingReasoning(_ReplayPrimary, _AutonomousTransport):
     pass
 
 
@@ -125,23 +129,21 @@ def test_direction_is_frozen_for_replay_and_not_reinjected_on_same_root(tmp_path
     runner.runtime = runtime
     _configure(runtime)
     try:
-        quest = (_confirm_direct_quest(runtime) if stage == "bundle"
-                 else _confirm_deepfetch_quest(runtime))["quest_ref"]
-        original = read_runtime_conditions(root, quest)
-        def update_conditions(_):
+        def update_conditions(inbox):
+            quest = inbox["binding"]["quest_ref"]
+            original = read_runtime_conditions(root, quest)
             save_runtime_conditions(root, quest, text="Later condition: use device B only.",
                                     expected_revision=original["revision"])
         runner.after_first = update_conditions
-        _finish_idea_stage(runtime)
         if stage == "bundle":
-            _finish_plan_stage(runtime)
-        worker = runtime.bundle_stage if stage == "bundle" else runtime.reasoning_stage
-        for _ in range(16):
-            worker.process_once()
-            if len(runner.calls) == 2:
-                break
-        assert len(runner.calls) == 2, (worker.transient_error, worker.query_current())
-        first, resumed = (call[1] for call in runner.calls)
+            _ready_launch(runtime)
+        else:
+            _, _, checkpoint = _reach_autonomous_checkpoint(runtime)
+            _drive_autonomous_creation_ready(runtime, checkpoint, key="changed-runtime-conditions")
+            _finish_reasoning_after_creation(runtime)
+        assert len(runner.calls) >= 2
+        first, resumed = (call[1] for call in runner.calls[:2])
+        assert "resume" in runner.calls[1][0] and runner.native_session_ref in runner.calls[1][0]
         assert "current_goal_and_conditions=" in first
         assert "Later condition: use device B only." not in first
         assert "current_goal_and_conditions=" not in resumed

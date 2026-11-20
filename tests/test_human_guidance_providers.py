@@ -12,7 +12,7 @@ import pytest
 
 from meta_research.bundle_skill import CodexBundleSkillAdapter
 from meta_research.bundle_protocol import GoalWorkDisposition
-from meta_research.idea_skill import CodexIdeaSkillAdapter
+from meta_research.idea_skill import CodexIdeaSkillAdapter, stage_operation_input
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.reasoning_skill import CodexReasoningSkillAdapter
 from meta_research.owners.common import canonical_hash
@@ -148,7 +148,8 @@ class _BundleTransport(CodexBundleSkillAdapter):
             attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
             fence_ref=request.fence_ref, runtime_binding=request.runtime_binding,
             operation_name=name, prompt="Read and handle formal guidance.", schema=_SCHEMA,
-            native_session_ref=request.native_session_ref, job_ref=request.job_ref)
+            native_session_ref=request.native_session_ref, job_ref=request.job_ref,
+            operation_input=stage_operation_input(request, "bundle") if name == "primary" else None)
         assert value == {"ok": True}
         assert native
         return native
