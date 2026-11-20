@@ -116,6 +116,9 @@ def test_owner_pagination_details_survive_actual_reader_and_grant(tmp_path, read
         assert rejected["isError"] and failure["code"] == "research_query_changed"
         field = {"stage": "index_offset", "human": "guidance_offset"}.get(reader, "offset")
         assert failure["details"]["path"] == [field]
+        assert failure["details"]["recovery_owner"] == "agent"
+        assert failure["details"]["next_action"] == "correct_input"
+        assert failure["details"]["retry_allowed"] is False
         assert failure["details"]["message"] and failure["details"]["correction"]
         assert json.loads(rejected["content"][0]["text"]) == failure
         continued = _call(runtime, channel, operation, **arguments)
@@ -124,6 +127,8 @@ def test_owner_pagination_details_survive_actual_reader_and_grant(tmp_path, read
             required = _call(runtime, channel, operation, **arguments, index_offset=1)
             detail = required["structuredContent"]["details"]
             assert required["structuredContent"]["code"] == "research_query_revision_required"
+            assert detail["next_action"] == "correct_input"
+            assert detail["feedback_stage_agent"] is True
             assert detail["path"] == ["query_revision"]
             assert "index_offset=0" in detail["correction"] and "offset=0" in detail["correction"]
             revision = continued["structuredContent"]["index_page"]["query_revision"]
