@@ -30,6 +30,10 @@ class _CorrectingWireRunner(_GuidanceRunner):
             outcome = output["scientific_outcome"]
             if self.invalid_field == "attribution_basis_refs":
                 outcome["causal_interpretation"]["attribution_basis_refs"] = self.uncited_refs
+            elif self.invalid_field == "non_parent":
+                outcome["research_synthesis"]["parent_questions"].append({
+                    "question_ref": "question:other", "impact": "unknown", "statement": "This route remains uncertain.",
+                })
             else:
                 outcome["research_synthesis"]["parent_questions"] = []
         self.candidates.append(deepcopy(output))
@@ -43,6 +47,10 @@ def test_production_wire_receives_durable_parent_feedback_then_delivers_after_re
 
 def test_production_wire_returns_uncited_attribution_refs_after_restart(tmp_path):
     _check_resume_after_rejection(tmp_path, "attribution_basis_refs")
+
+
+def test_production_wire_returns_non_parent_feedback_after_restart(tmp_path):
+    _check_resume_after_rejection(tmp_path, "non_parent")
 
 
 def _check_resume_after_rejection(tmp_path, invalid_field):
@@ -80,6 +88,12 @@ def _check_resume_after_rejection(tmp_path, invalid_field):
             diagnostics = ["scientific_outcome_research_synthesis_invalid:"
                            "research_synthesis.parent_questions:missing_impact_for:" + parents[0]]
             assert len(diagnostics[0]) > 128
+        elif invalid_field == "non_parent":
+            assert rejection.detail_code == "scientific_outcome_authoritative_metadata_conflict"
+            assert rejection.candidate == {"phase": "primary", "result": runner.candidates[0]}
+            diagnostics = ["question:other", "parent_questions[1].question_ref",
+                           "graph_binding.parent_question_bindings", "supported by evidence you used",
+                           "research_synthesis.quest.impact"]
         else:
             assert rejection.detail_code == "scientific_outcome_causal_interpretation_invalid"
             diagnostics = ["scientific_outcome.causal_interpretation.attribution_basis_refs",

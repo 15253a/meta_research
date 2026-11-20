@@ -1119,16 +1119,30 @@ def assemble_reasoning_authoritative_metadata(
         raise ReasoningContractError("scientific_outcome_research_synthesis_invalid")
     parent_refs = cast(list[str], expected["parent_question_refs"])
     by_parent_ref: dict[str, dict[str, object]] = {}
-    for parent in parents:
+    for index, parent in enumerate(parents):
         if not isinstance(parent, dict):
             raise ReasoningContractError("scientific_outcome_research_synthesis_invalid")
         parent_ref = _require_text(
             parent.get("question_ref"), "scientific_outcome_research_synthesis_invalid"
         )
         if parent_ref not in parent_refs or parent_ref in by_parent_ref:
+            location = f"$.scientific_outcome.research_synthesis.parent_questions[{index}].question_ref"
+            if parent_ref in by_parent_ref:
+                feedback = f"{location} repeats a registered parent. Keep one impact statement for that parent."
+            else:
+                expected_parents = (
+                    "Use one entry per parent listed in graph_binding.parent_question_bindings."
+                    if parent_refs else "The frozen parent list is empty. Use parent_questions=[] for this submission."
+                )
+                feedback = (
+                    f"{location} is absent from this Question's frozen parent bindings. {expected_parents} "
+                    "If a comparison with another Question affects this Quest and is supported by evidence "
+                    "you used, explain its significance and limits in research_synthesis.quest.impact."
+                )
             raise ReasoningContractError(
                 "scientific_outcome_authoritative_metadata_conflict:"
-                f"research_synthesis.parent_questions.question_ref:{parent_ref}"
+                f"research_synthesis.parent_questions.question_ref:{parent_ref}",
+                feedback=feedback,
             )
         by_parent_ref[parent_ref] = parent
     if set(by_parent_ref) != set(parent_refs):
