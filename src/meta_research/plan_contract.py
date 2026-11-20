@@ -856,9 +856,12 @@ def _validate_receipt(
 
 def _material_value(value: object) -> object:
     if isinstance(value, dict):
+        normalized = dict(value)
+        if normalized.get("reuse_material_refs") == []:
+            normalized.pop("reuse_material_refs")
         return {
             key: _material_value(item)
-            for key, item in value.items()
+            for key, item in normalized.items()
             if key
             not in {
                 "context_pack_ref",

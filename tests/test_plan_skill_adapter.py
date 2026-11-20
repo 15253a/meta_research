@@ -353,12 +353,30 @@ def test_validator_accepts_exact_plan_and_owner_feedback_requires_material_chang
             predecessor_material_plan_hash=material_plan_hash(predecessor),
         )
 
+    representation_only = deepcopy(predecessor)
+    representation_only["experiment_briefs"][0]["reuse_material_refs"] = []
+    with pytest.raises(
+        PlanSkillContractError, match="owner_feedback_revision_not_material"
+    ):
+        validate_plan_skill_result(
+            request,
+            _result(draft=representation_only),
+            predecessor_material_plan_hash=material_plan_hash(predecessor),
+        )
+
     successor = _plan("在至少两种设备上比较形态召回。")
     validate_plan_skill_result(
         request,
         _result(draft=successor),
         predecessor_material_plan_hash=material_plan_hash(predecessor),
     )
+
+
+def test_owner_feedback_treats_omitted_and_empty_reuse_refs_as_same_material() -> None:
+    predecessor = _plan()
+    successor = deepcopy(predecessor)
+    successor["experiment_briefs"][0]["reuse_material_refs"] = []
+    assert material_plan_hash(predecessor) == material_plan_hash(successor)
 
 
 def test_large_legal_idea_set_keeps_actual_provider_schemas_within_budget() -> None:
