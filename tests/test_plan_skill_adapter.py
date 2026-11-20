@@ -779,7 +779,8 @@ def test_durable_plan_primary_shape_failure_is_terminal_and_not_replayed(
 
 @pytest.mark.parametrize("envelope", [False, True], ids=["document", "envelope"])
 @pytest.mark.parametrize("include_reuse_list", [False, True], ids=["omitted-reuse", "explicit-reuse"])
-def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path, envelope, include_reuse_list):
+@pytest.mark.parametrize("binding_objects", [False, True], ids=["wire-strings", "reader-objects"])
+def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path, envelope, include_reuse_list, binding_objects):
     adapter = CodexPlanSkillAdapter(tmp_path, executable=str(_fake_codex(tmp_path / "codex")))
     request = _request(runtime_binding=adapter.runtime_binding(), job_ref="job:workspace-plan")
     workdir = tmp_path / "root"
@@ -795,8 +796,18 @@ def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(t
     plan["answer_contract"].pop("answer_contract_hash")
     if include_reuse_list:
         plan["experiment_briefs"][0]["reuse_material_refs"] = []
-    plan.update(notes="逐项复核后的候选", selected_evidence_bindings=[])
-    original = json.dumps({"plan": plan} if envelope else plan, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    binding = {
+        "evidence_ref": "asset:1", "source_kind": "AssetVersion", "source_ref": "asset:1",
+        "source_binding": {"version_ref": "asset:1"},
+        "reader": {"operation": "research_memory.content.read", "args": {"version_ref": "asset:1"}},
+    }
+    plan.update(notes="逐项复核后的候选", selected_evidence_bindings=[binding])
+    file_plan = deepcopy(plan)
+    if not binding_objects:
+        selected = file_plan["selected_evidence_bindings"][0]
+        selected["source_binding"] = canonical_json(binding["source_binding"])
+        selected["reader"]["args"] = canonical_json(binding["reader"]["args"])
+    original = json.dumps({"plan": file_plan} if envelope else file_plan, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     digest = hashlib.sha256(original).hexdigest()
     source = workdir / "plan_candidate.json"
     source.write_bytes(original)

@@ -677,6 +677,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             )
             if isinstance(value, dict) and value.get("kind") == "PlanDocument":
                 value = {"plan": value}
+            _encode_file_binding_objects(value)
             if not validator.is_valid(value):
                 raise PlanSkillContractError("plan_candidate_file_schema_invalid")
             return cast(dict[str, object], _decode_codex_provider_output(value, schema)["plan"])
@@ -852,6 +853,22 @@ def _unique_plan_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     if len(result) != len(pairs):
         raise ValueError("duplicate plan field")
     return result
+
+
+def _encode_file_binding_objects(envelope: object) -> None:
+    """Let a Plan file use the binding objects returned by the content reader."""
+    plan = envelope.get("plan") if isinstance(envelope, dict) else None
+    bindings = plan.get("selected_evidence_bindings") if isinstance(plan, dict) else None
+    if not isinstance(bindings, list):
+        return
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        if isinstance(binding.get("source_binding"), dict):
+            binding["source_binding"] = canonical_json(binding["source_binding"])
+        reader = binding.get("reader")
+        if isinstance(reader, dict) and isinstance(reader.get("args"), dict):
+            reader["args"] = canonical_json(reader["args"])
 
 
 
