@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from creation_provider_support import synthesis_result
-from meta_research.creation_basis import FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult
+from meta_research.creation_basis import (
+    FirstQuestionSynthesisRequest,
+    FirstQuestionSynthesisResult,
+    empty_understanding,
+)
 
 import copy
 import json
@@ -827,6 +831,22 @@ class SnapshotAwareProposalDrafter:
         return synthesis_result(request, content=content, adapter_kind="test_drafter")
 
 
+class LiteratureCoverageProposalDrafter(SnapshotAwareProposalDrafter):
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
+        result = super().synthesize_first_question(request)
+        assert result.revision is not None
+        assert request.literature_snapshot is not None
+        understanding = empty_understanding()
+        understanding["coverage"] = [{
+            "material_key": request.literature_snapshot["source_snapshot"]["snapshot_ref"],
+            "kind": "partial",
+            "read_ranges": [],
+            "unread_description": "The accepted snapshot has no byte witness in the prepared basis.",
+        }]
+        revision = {**result.revision, "understanding": understanding}
+        return replace(result, revision=revision)
+
+
 class BindingOnlyProposalDrafter:
     def __init__(self) -> None:
         self.requests: list[FirstQuestionSynthesisRequest] = []
@@ -1217,6 +1237,36 @@ def test_deepfetch_prepares_one_exact_snapshot_then_returns_to_the_same_proposal
             "draft_hash": ready["quest_draft"]["hash"],
             "receipt": snapshot["receipt"],
         }
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_deepfetch_revision_drops_literature_only_coverage_from_material_basis(
+    tmp_path: Path,
+) -> None:
+    proposal_drafter = LiteratureCoverageProposalDrafter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "data"),
+        proposal_drafter=proposal_drafter,
+        deepfetch_provider=DeterministicDeepFetchProvider(),
+        acquisition_provider=RecordingAcquisitionProvider(),
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    try:
+        initialization_id, _queued = _open_and_queue_deepfetch(
+            client, write_headers, key_prefix="literature-only-coverage"
+        )
+        assert runtime.deepfetch.process_once()
+        assert runtime.owners.human_collaboration.process_drafting_once()
+        ready = client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        assert ready["status"] == "proposal_ready"
+        assert ready["proposal_generation"]["status"] == "succeeded"
+        assert ready["creation_basis"]["kind"] == "literature_revised"
+        assert ready["creation_basis"]["understanding"]["coverage"] == []
     finally:
         client.close()
         runtime.close()

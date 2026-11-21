@@ -257,6 +257,40 @@ def validate_understanding(value, manifest, read_witness) -> dict[str, object]:
     return value
 
 
+def _material_revision_understanding(value, manifest, literature_snapshot_ref):
+    """Keep literature-only coverage out of the original-material ledger.
+
+    A first-question provider can describe the accepted literature snapshot as a
+    partial entrance even when the prepared basis has no original materials.
+    The snapshot has its own durable binding and cannot supply byte witnesses
+    for ``validate_understanding``.  Preserve material coverage for validation
+    and reject any attempt to use the snapshot as a source or selection.
+    """
+    entries = {entry["material_key"] for entry in manifest["entries"]}
+    coverage = value["coverage"]
+    foreign = [item for item in coverage if item["material_key"] not in entries]
+    if not foreign:
+        return value
+    if not isinstance(literature_snapshot_ref, str) or not literature_snapshot_ref:
+        raise ValueError("coverage")
+    if any(item["material_key"] != literature_snapshot_ref for item in foreign):
+        raise ValueError("coverage")
+    if (
+        len(foreign) != 1
+        or foreign[0]["kind"] != "partial"
+        or foreign[0]["read_ranges"]
+        or not foreign[0]["unread_description"].strip()
+    ):
+        raise ValueError("coverage")
+    for field in UNDERSTANDING_FIELDS:
+        for statement in value[field]:
+            if any(citation["material_key"] == literature_snapshot_ref for citation in statement["sources"]):
+                raise ValueError("coverage source")
+    if any(item["material_key"] == literature_snapshot_ref for item in value["selection"]):
+        raise ValueError("selection")
+    return {**value, "coverage": [item for item in coverage if item["material_key"] in entries]}
+
+
 def validate_reference_understanding(value, inputs, identity, server_files, historical=(), inherited_selection=()):
     from jsonschema import Draft202012Validator
     try:
@@ -674,9 +708,11 @@ class CreationBasisMemory:
         from meta_research.creation_inputs import CreationInputIdentity, MaterialSet
         references = predecessor.get("input_identity") is not None
         identity = None
+        validated_understanding = None
         try:
             self.require_current(predecessor)
             Draft202012Validator(revision_schema(references=references)).validate(revision)
+            validated_understanding = revision["understanding"]
             if references:
                 identity = CreationInputIdentity.from_dict(predecessor["input_identity"])
                 if result is not None and result.input_identity is not None:
@@ -695,9 +731,11 @@ class CreationBasisMemory:
                     self.workspaces.server_files, historical,
                     tuple(item["source"] for item in predecessor["sources"] if item.get("inherited_from") is not None))
             else:
-                validate_understanding(revision["understanding"], predecessor["manifest"],
+                validated_understanding = _material_revision_understanding(
+                    revision["understanding"], predecessor["manifest"], snapshot.get("snapshot_ref"))
+                validate_understanding(validated_understanding, predecessor["manifest"],
                     lambda entry, offset, length: self.read_source(predecessor, entry["material_key"], offset, length)["content"])
-            if revision["understanding"]["selection"] != predecessor["understanding"]["selection"]:
+            if validated_understanding["selection"] != predecessor["understanding"]["selection"]:
                 raise ValueError("selection changed")
             metadata = self._owner.read_literature_snapshot_metadata(snapshot["snapshot_ref"])
             ledger = self._owner.read_literature_proposal_evidence(snapshot["snapshot_ref"])
@@ -725,7 +763,7 @@ class CreationBasisMemory:
         body = {key: value for key, value in predecessor.items() if key not in {"basis_ref", "basis_hash"}}
         body.update(kind="literature_revised", predecessor=self.reference(predecessor),
             literature_snapshot=snapshot, literature_original_binding=self.reference(predecessor),
-            understanding=revision["understanding"], corrections=revision["corrections"],
+            understanding=validated_understanding, corrections=revision["corrections"],
             sources=[{**source, "coverage": coverage.get(source["material_key"], source["coverage"])} for source in predecessor["sources"]],
             search_assessment={"assessment": revision["search_assessment"], "completion": metadata["completion"], "limitations": metadata["limitations"]})
         if identity is not None:

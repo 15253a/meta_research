@@ -2,7 +2,11 @@ import hashlib
 
 import pytest
 
-from meta_research.creation_basis import empty_understanding, validate_understanding
+from meta_research.creation_basis import (
+    _material_revision_understanding,
+    empty_understanding,
+    validate_understanding,
+)
 from meta_research.owners.common import OwnerConflict
 
 
@@ -38,6 +42,50 @@ def test_an_unread_source_can_be_selected_but_cannot_support_a_content_claim():
     value["work_already_done"] = [{"ref": "work", "text": "Calibration was verified.", "kind": "reported_work", "conditions": [], "sources": [witness]}]
     with pytest.raises(OwnerConflict, match="creation_understanding_invalid"):
         validate_understanding(value, manifest, lambda entry, offset, length: content[offset:offset + length])
+
+
+def test_literature_only_revision_coverage_is_kept_out_of_material_validation():
+    value = empty_understanding()
+    value["coverage"] = [{
+        "material_key": "literature_snapshot_1",
+        "kind": "partial",
+        "read_ranges": [],
+        "unread_description": "The snapshot has no byte witness in this basis.",
+    }]
+    accepted = _material_revision_understanding(
+        value, {"entries": []}, "literature_snapshot_1"
+    )
+    assert accepted["coverage"] == []
+
+
+@pytest.mark.parametrize(
+    "invalid", ["foreign_key", "snapshot_source", "snapshot_selection", "snapshot_read", "snapshot_without_limit"]
+)
+def test_literature_only_revision_rejects_unbound_evidence(invalid):
+    value = empty_understanding()
+    value["coverage"] = [{
+        "material_key": "literature_snapshot_1" if invalid != "foreign_key" else "literature_snapshot_2",
+        "kind": "read" if invalid == "snapshot_read" else "partial",
+        "read_ranges": [],
+        "unread_description": "" if invalid == "snapshot_without_limit" else "The snapshot has no byte witness in this basis.",
+    }]
+    if invalid == "snapshot_source":
+        value["claims_and_conditions"] = [{
+            "ref": "unsupported",
+            "text": "The snapshot supports this claim.",
+            "kind": "reported_work",
+            "conditions": [],
+            "sources": [{"material_key": "literature_snapshot_1"}],
+        }]
+    if invalid == "snapshot_selection":
+        value["selection"] = [{
+            "material_key": "literature_snapshot_1",
+            "reason": "Select the snapshot.",
+        }]
+    with pytest.raises(ValueError):
+        _material_revision_understanding(
+            value, {"entries": []}, "literature_snapshot_1"
+        )
 
 
 @pytest.mark.parametrize("field", ["work_already_done", "claims_and_conditions", "conflicts"])
