@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory() as temporary:
             assert entry['default_reasoning_level'] == 'max'
 assert StartHarnessConformanceRequest(codex_auth_profile_ref='test').codex_model_ref == CODEX_MODEL_REF
 assert StartHarnessConformanceRequest(codex_auth_profile_ref='test', codex_model_ref=CODEX_MODEL_REF).codex_model_ref == CODEX_MODEL_REF
-other = 'gpt-5.6-sol' if CODEX_MODEL_REF == 'gpt-6.1-sol' else 'gpt-6.1-sol'
+other = 'gpt-unmanaged'
 try:
     StartHarnessConformanceRequest(codex_auth_profile_ref='test', codex_model_ref=other)
 except ValidationError:
@@ -104,14 +104,18 @@ print(json.dumps({'model':CODEX_MODEL_REF, 'cli':CODEX_LOCKED_VERSION,
     ("gpt-6.1-sol", "codex_drafting_model_catalog.json", "591c4d314dec8c8f2ff0102ba193ae42478f7bf7f0e6e07f4e5180f49ba6af77"),
     ("gpt-5.6-sol", "codex_drafting_model_catalog_gpt_5_6_sol.json", "9d9b4936f927a6a855625bbbe0f52241d044d0d271c8fe2def611a7188cd5c9b"),
     ("gpt-6.2-sol", "codex_drafting_model_catalog_gpt_6_2_sol.json", None),
-], ids=["default", "6.1", "5.6", "6.2"])
+    ("gpt-6.2-astra", "generated", None),
+], ids=["default", "6.1", "5.6", "6.2", "6.2-astra"])
 def test_selected_model_reaches_all_roots_catalog_and_diagnostic(model, catalog_file, legacy_hash):
     result = _isolated_model_check(model)
     assert result.returncode == 0, result.stderr
     observed = json.loads(result.stdout)
     assert observed["model"] == (model or "gpt-6.1-sol")
     assert observed["cli"] == "0.159.0"
-    assert observed["catalog_file"] == catalog_file
+    if catalog_file == "generated":
+        assert observed["catalog_file"].startswith("gpt-6.2-astra-")
+    else:
+        assert observed["catalog_file"] == catalog_file
     if legacy_hash is not None:
         assert observed["catalog_sha256"] == legacy_hash
 

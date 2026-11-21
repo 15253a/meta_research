@@ -75,7 +75,7 @@ from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_LOCKED_VERSION,
     CODEX_REASONING_EFFORT_BINDING,
-    CODEX_ROOT_REASONING_PRESET_CONFIG,
+    codex_root_reasoning_preset_config,
 )
 from meta_research.idea_contract import (
     DISPOSITION_ACTIONS,
@@ -2622,7 +2622,7 @@ class CodexIdeaSkillAdapter:
             "--config",
             'approval_policy="never"',
             "--config",
-            CODEX_ROOT_REASONING_PRESET_CONFIG,
+            codex_root_reasoning_preset_config(model_ref),
             *(
                 value
                 for feature in _DISABLED_CODEX_FEATURES
