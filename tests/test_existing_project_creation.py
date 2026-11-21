@@ -429,6 +429,42 @@ def test_production_synthesis_prompt_and_spool_bind_actual_loaded_skill_and_fres
     assert "first-question-synthesis" in spool.read_text()
 
 
+def test_first_question_prompt_protects_creation_context_material_contract(tmp_path):
+    from meta_research.companion import CodexCompanionAdapter
+    from meta_research.creation_basis import FirstQuestionSynthesisRequest, first_creation_instructions
+
+    adapter = CodexCompanionAdapter(tmp_path / "transport")
+    revision = {
+        "understanding": empty_understanding(),
+        "corrections": [],
+        "search_assessment": "Honest empty search preserves the prior.",
+    }
+    captured = {}
+
+    def invoke(**kwargs):
+        captured.update(kwargs)
+        return {
+            "proposal_fork_native_session_ref": "fresh-child",
+            "result": {"content": QUESTION, "revision": revision},
+        }, "persistent-parent", ""
+
+    adapter._invoke = invoke
+    basis = {"basis_ref": "creation_basis_test", "basis_hash": "b" * 64, "kind": "prepared"}
+    adapter.synthesize_first_question(
+        FirstQuestionSynthesisRequest(
+            "init", 3, "a" * 64, {"goal": "Continue existing work"},
+            "first-generation", "creation-root", "persistent-parent", basis,
+            {"relative_root": "sealed/cache", "context_hash": "c" * 64, "manifest": []},
+            {"snapshot_ref": "exact-empty"},
+        )
+    )
+    prompt = captured["prompt"]
+    assert first_creation_instructions()["bundle_hash"] in prompt
+    assert "internal delivery artifacts" in prompt
+    assert "If that basis has no material entries, return coverage=[] and selection=[]." in prompt
+    assert "Never cite literature.json" in prompt
+
+
 def test_production_deepfetch_prompt_loads_creation_basis_without_replacing_v4_workflow(tmp_path):
     from dataclasses import replace
     from meta_research.deepfetch import CodexDeepFetchAdapter, _deepfetch_skill_root, _deepfetch_skill_bundle_hash, canonical_hash

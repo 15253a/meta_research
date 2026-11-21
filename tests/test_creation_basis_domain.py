@@ -59,14 +59,19 @@ def test_literature_only_revision_coverage_is_kept_out_of_material_validation():
 
 
 @pytest.mark.parametrize(
-    "invalid", ["foreign_key", "snapshot_source", "snapshot_selection", "snapshot_read", "snapshot_without_limit"]
+    "invalid", ["foreign_key", "creation_context", "snapshot_source", "snapshot_selection", "snapshot_read", "snapshot_without_limit"]
 )
 def test_literature_only_revision_rejects_unbound_evidence(invalid):
     value = empty_understanding()
+    material_key = (
+        "inbox/ctx/.creation-context/literature.json"
+        if invalid == "creation_context"
+        else "literature_snapshot_1" if invalid != "foreign_key" else "literature_snapshot_2"
+    )
     value["coverage"] = [{
-        "material_key": "literature_snapshot_1" if invalid != "foreign_key" else "literature_snapshot_2",
+        "material_key": material_key,
         "kind": "read" if invalid == "snapshot_read" else "partial",
-        "read_ranges": [],
+        "read_ranges": ([{"material_key": material_key}] if invalid == "creation_context" else []),
         "unread_description": "" if invalid == "snapshot_without_limit" else "The snapshot has no byte witness in this basis.",
     }]
     if invalid == "snapshot_source":
