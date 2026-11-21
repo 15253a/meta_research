@@ -103,13 +103,17 @@ root.with_suffix('.argv').write_text(json.dumps(sys.argv))
 assert 'exec' in sys.argv and 'app-server' not in sys.argv
 native=sys.argv[sys.argv.index('resume')+1]
 result=Path(sys.argv[sys.argv.index('--output-last-message')+1])
+def write_result(payload):
+ fd=os.open(result, os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0))
+ with os.fdopen(fd, 'w', encoding='utf-8') as dst:
+  dst.write(payload)
 if behavior=='timeout':time.sleep(30)
 if behavior.startswith('signal:'):os.kill(os.getpid(),int(behavior.split(':')[1]))
 if behavior=='normal':
- sys.stdin.read();result.write_text('{"ok":true}')
+ sys.stdin.read();write_result('{"ok":true}')
  print(json.dumps({'type':'thread.started','thread_id':native}));sys.exit(0)
 if behavior=='stdout':print(json.dumps({'type':'thread.started','thread_id':native}))
-if behavior=='result':result.write_text('{"ok":true}')
+if behavior=='result':write_result('{"ok":true}')
 if behavior=='wrong_thread':native='00000000-0000-4000-8000-000000000098'
 message='Error: thread/resume: thread/resume failed: no rollout found for thread id '+native+' (code -32600)\n'
 if behavior=='ordinary':message='Error: unrelated CLI failure\n'
@@ -142,8 +146,8 @@ def test_strict_exec_preserves_normal_stdout_policy_and_supervisor_result_fifo(t
     assert result == {'ok': True} and native == NATIVE
     assert json.loads(stdout)['thread_id'] == NATIVE
     argv = json.loads(provider.with_suffix('.argv').read_text())
-    destination = argv[argv.index('--output-last-message') + 1]
-    assert destination.startswith('/proc/') and '/fd/' in destination
+    destination = Path(argv[argv.index('--output-last-message') + 1])
+    assert destination.name == 'result' and destination.parent.name.startswith('.result-pipe-')
     assert '--ignore-user-config' in argv and '--ignore-rules' in argv
     assert argv[argv.index('--sandbox') + 1] == 'workspace-write'
     assert argv[argv.index('--add-dir') + 1] == str(tmp_path)
