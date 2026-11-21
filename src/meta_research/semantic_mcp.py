@@ -10,10 +10,18 @@ from typing import Callable, Literal
 from meta_research.human_guidance import FrozenGuidanceBinding
 from meta_research import __version__
 from meta_research.owners.common import canonical_hash, new_ref
-from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
+from meta_research.root_capabilities import (
+    ALL_ROOT_ROLE_OPERATION_IDS,
+    ROOT_AGENT_KINDS,
+    ROOT_ROLE_OPERATION_DELTAS,
+    RootAgentKind,
+)
 from meta_research.error_contract import error_contract_from_legacy
 from meta_research.error_audit import ErrorAuditStore
-from meta_research.work_material_contract import RUNTIME_MATERIAL_OPERATION_IDS
+from meta_research.work_material_contract import (
+    CREATION_MATERIAL_OPERATION_IDS,
+    RUNTIME_MATERIAL_OPERATION_IDS,
+)
 from meta_research.tool_navigation import (
     PURPOSES, call_tool, common_operations, operation_summary, purpose_overview, purpose_paths,
 )
@@ -59,6 +67,11 @@ TOOL_DISCOVERY_OPERATION_IDS = (
     "tools.catalog.page",
     "tools.contracts.read",
 )
+# These operations are represented as reads for contract compatibility, but
+# their handlers may perform an outbound provider call. Keep their role-owner
+# gate independent of the access-mode label until a durable reconcile contract
+# exists for the provider response.
+ROOT_OWNED_EXTERNAL_OPERATION_IDS = frozenset({"assistant.content.generate"})
 ROOT_AGENT_COMMON_OPERATION_IDS = (
     *TOOL_DISCOVERY_OPERATION_IDS,
     *RUNTIME_MATERIAL_OPERATION_IDS,
@@ -88,6 +101,16 @@ ROOT_AGENT_COMMON_OPERATION_IDS = (
     *ROOT_AGENT_ACQUISITION_OPERATION_IDS,
     *ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
 )
+
+_ROLE_ONLY_OPERATION_OWNERS: dict[str, frozenset[RootAgentKind]] = {
+    operation_id: frozenset(
+        root_kind
+        for root_kind, role_operations in ROOT_ROLE_OPERATION_DELTAS.items()
+        if operation_id in role_operations
+    )
+    for operation_id in ALL_ROOT_ROLE_OPERATION_IDS
+    if operation_id not in ROOT_AGENT_COMMON_OPERATION_IDS
+}
 
 
 class SemanticMcpError(RuntimeError):
@@ -667,6 +690,28 @@ class SemanticMcpGateway:
             return "not_registered"
         if operation_id not in context.authorized_operation_ids:
             return "not_granted"
+        # ProtectedCreation is a companion-owned, narrowly scoped runtime.
+        # Its material copy/read operations are the explicit exception to the
+        # general companion effect gate.  Keep the exception bound to the
+        # creation phase and the registered operation set so an ordinary
+        # companion call cannot acquire unrelated effect authority.
+        if (
+            context.root_kind == "companion"
+            and context.phase == "creation_materials"
+            and operation_id in CREATION_MATERIAL_OPERATION_IDS
+        ):
+            return None
+        owners = _ROLE_ONLY_OPERATION_OWNERS.get(operation_id)
+        if (
+            owners
+            and context.root_kind not in owners
+        ):
+            return "root_kind_not_owner"
+        if (
+            context.root_kind == "companion"
+            and operation.access_mode in {"effect", "reconcile"}
+        ):
+            return "root_kind_not_owner"
         if operation.unavailable_reason is not None:
             try:
                 return operation.unavailable_reason(replace(context, operation_id=operation_id))
@@ -699,8 +744,11 @@ class SemanticMcpGateway:
                 }},
                 {"type": "object", "required": ["items", "offset", "next_offset", "total", "catalog_hash"],
                  "properties": {"items": {"type": "array", "items": {"type": "object"}},
+                    "purposes": {"type": "array", "items": {"type": "object"}},
+                    "topics": {"type": "array", "items": {"type": "object"}},
                     "offset": {"type": "integer"}, "next_offset": {"type": ["integer", "null"]},
-                    "total": {"type": "integer"}, "catalog_hash": {"type": "string"}}},
+                    "total": {"type": "integer"}, "catalog_hash": {"type": "string"}},
+                 "additionalProperties": False},
                 return_description="The overview returns purposes with callable readers and a few common items, not all operations. A purpose/filter or view=operations returns compact operation summaries and related topics. next_offset=null ends that view; total counts available operations in the selected scope. Preserve all filters/view and catalog_hash on continuation.",
                 error_descriptions={"tool_catalog_changed": "A continuation omitted its hash or the grant, filters or available contracts changed. Restart from offset 0."}),
             SemanticOperation(
@@ -711,7 +759,24 @@ class SemanticMcpGateway:
                 self._contract_read,
                 {"type": "object", "additionalProperties": False, "required": ["operation_id"],
                  "properties": {"operation_id": {"type": "string", "minLength": 1, "maxLength": 256}}},
-                {"type": "object", "required": ["operation_id", "name", "inputSchema", "outputSchema", "returns", "errors"]},
+                {"type": "object", "required": [
+                    "operation_id", "name", "title", "description", "inputSchema",
+                    "outputSchema", "owning_module", "access_mode",
+                    "callable_in_current_session",
+                    "operation_contract_version", "reconciliation_operation_id",
+                    "returns", "errors",
+                ], "properties": {
+                    "operation_id": {"type": "string"}, "name": {"type": "string"},
+                    "title": {"type": "string"}, "description": {"type": "string"},
+                    "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"},
+                    "owning_module": {"type": "string"},
+                    "access_mode": {"type": "string"},
+                    "callable_in_current_session": {"type": "boolean"},
+                    "owner_root_kinds": {"type": "array", "items": {"type": "string"}},
+                    "operation_contract_version": {"type": "string"},
+                    "reconciliation_operation_id": {"type": ["string", "null"]},
+                    "returns": {"type": "string"}, "errors": {"type": "object"},
+                }, "additionalProperties": False},
                 return_description="Returns the registered operation's exact input/output schema and description plus ownership, mode, reconciliation, return and error documentation. Call its unchanged identity through tools.call or directly through MCP tools/call.",
                 error_descriptions={"capability_unavailable": "details.reason distinguishes not_registered, not_granted and the current service's unavailable reason; no hidden contract is returned."}),
         )
@@ -720,8 +785,34 @@ class SemanticMcpGateway:
         return [operation for name, operation in self._operations.items()
                 if self._unavailable_reason(name, context) is None]
 
+    def _catalog_operations(self, context: SemanticCallContext):
+        """Return granted operations whose contracts remain inspectable.
+
+        A role-owned effect is part of the session's registered MCP surface even
+        when this root cannot execute it. Service and configuration failures are
+        omitted so a catalog page does not promise an unavailable handler. A
+        static role-authorization failure remains visible because it describes
+        a registered contract that another session may own.
+        """
+        return [
+            operation
+            for name, operation in self._operations.items()
+            if name in context.authorized_operation_ids
+            and self._catalog_contract_visible_reason(
+                self._unavailable_reason(name, context)
+            )
+        ]
+
+    @staticmethod
+    def _catalog_contract_visible_reason(reason: str | None) -> bool:
+        return (
+            reason is None
+            or reason == "root_kind_not_owner"
+            or reason.endswith("_unauthorized")
+        )
+
     def _overview(self, context: SemanticCallContext) -> dict[str, object]:
-        operations = self._available_operations(context)
+        operations = self._catalog_operations(context)
         if not set(TOOL_DISCOVERY_OPERATION_IDS) <= {op.semantic_operation_id for op in operations}:
             return {}
         return {
@@ -744,7 +835,7 @@ class SemanticMcpGateway:
         query = str(arguments.get("query", "")).casefold()
         module = arguments.get("owning_module")
         purpose, topic = arguments.get("purpose"), arguments.get("topic")
-        available = self._available_operations(context)
+        available = self._catalog_operations(context)
         operations = [operation for operation in available
                       if (purpose is None or any(p == purpose for p, _ in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)))
                       and (topic is None or any(t == topic and (purpose is None or p == purpose)
@@ -767,20 +858,34 @@ class SemanticMcpGateway:
                     "offset": 0, "next_offset": None, "total": len(operations), "catalog_hash": catalog_hash}
         topics = sorted({t for operation in operations for p, t in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)
                          if p == purpose}) if purpose else []
-        return {"items": [operation_summary(operation) for operation in operations[offset:offset + limit]],
+        return {"items": [self._operation_summary(operation, context) for operation in operations[offset:offset + limit]],
                 "topics": [{"topic": value, "reader": {"operation": "tools.catalog.page", "arguments": {"purpose": purpose, "topic": value}}}
                            for value in topics],
                 "offset": offset, "next_offset": offset + limit if offset + limit < len(operations) else None,
                 "total": len(operations), "catalog_hash": catalog_hash}
 
+    def _operation_summary(
+        self, operation: SemanticOperation, context: SemanticCallContext
+    ) -> dict[str, object]:
+        reason = self._unavailable_reason(operation.semantic_operation_id, context)
+        owners = _ROLE_ONLY_OPERATION_OWNERS.get(operation.semantic_operation_id)
+        return {
+            **operation_summary(operation),
+            "callable_in_current_session": reason is None,
+            **({"owner_root_kinds": sorted(owners)} if owners else {}),
+        }
+
     def _contract_read(self, context: SemanticCallContext, arguments: dict[str, object]) -> dict[str, object]:
         operation_id = str(arguments["operation_id"])
         reason = self._unavailable_reason(operation_id, context)
-        if reason is not None:
+        if reason is not None and not self._catalog_contract_visible_reason(reason):
             raise SemanticMcpError("capability_unavailable", {"reason": reason})
         operation = self._operations[operation_id]
+        owners = _ROLE_ONLY_OPERATION_OWNERS.get(operation_id)
         return {**operation.tool(), "operation_id": operation_id,
                 "owning_module": operation.owning_module, "access_mode": operation.access_mode,
+                "callable_in_current_session": reason is None,
+                **({"owner_root_kinds": sorted(owners)} if owners else {}),
                 "operation_contract_version": operation.operation_contract_version,
                 "reconciliation_operation_id": operation.reconciliation_operation_id,
                 "returns": "Success: isError=false; structuredContent matches outputSchema. content contains the same JSON. "

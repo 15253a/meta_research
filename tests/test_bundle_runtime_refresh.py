@@ -163,6 +163,28 @@ def test_current_adapter_adopts_changed_shared_profile_and_tool_contract_after_r
         assert current.capability_bindings != frozen.capability_bindings
         assert current.mcp_bindings != frozen.mcp_bindings
         assert current.resource_bindings != frozen.resource_bindings
+        old_catalog = next(
+            item for item in frozen.mcp_bindings
+            if item.startswith("harness-operation-binding:semantic-mcp-catalog@sha256:")
+        )
+        new_catalog = next(
+            item for item in current.mcp_bindings
+            if item.startswith("harness-operation-binding:semantic-mcp-catalog@sha256:")
+        )
+        old_operations = next(
+            item for item in frozen.mcp_bindings
+            if item.startswith(
+                "harness-operation-binding:semantic-mcp-operation-bindings@sha256:"
+            )
+        )
+        new_operations = next(
+            item for item in current.mcp_bindings
+            if item.startswith(
+                "harness-operation-binding:semantic-mcp-operation-bindings@sha256:"
+            )
+        )
+        assert old_catalog != new_catalog
+        assert old_operations != new_operations
         assert runtime.bundle_stage.process_once()
         assert runtime.bundle_stage.process_once()
         owner = runtime.owners.agent_runtime

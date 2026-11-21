@@ -17,6 +17,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.read_snapshot_cache import snapshot_cached
+from meta_research.runtime_binding_compatibility import (
+    stage_bindings_mcp_rebind_compatible,
+)
 
 from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND,
@@ -139,6 +142,7 @@ from meta_research.idea_contract import (
 )
 from meta_research.plan_contract import (
     PLAN_REVIEW_SCHEMA_REF,
+    legacy_material_plan_hash,
     material_plan_hash,
 )
 from meta_research.reasoning_contract import (
@@ -8436,6 +8440,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 in {"completed", "launch_failed"}
             )
         )
+        # A first authenticated native terminal still gets one same-root
+        # continuation so the Agent can correct a malformed or incomplete
+        # result. A successor that returns the exact same native diagnostic
+        # has produced no new evidence that would justify another automatic
+        # correction. Route that repeated host/provider failure through the
+        # durable fence instead of creating an unbounded retry loop.
+        if recoverable_terminal and self._has_repeated_native_terminal_error(
+                run_ref=run_ref, provider_exit=provider_exit):
+            recoverable_terminal = False
         if recoverable_terminal:
             self._record_stage_provider_correction(
                 unit_ref=unit_ref,
@@ -8641,6 +8654,65 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
         except RuntimeProtectionUnavailable as error:
             raise OwnerConflict(error.code) from error
+
+    def _has_repeated_native_terminal_error(
+        self, *, run_ref: str, provider_exit: dict[str, object]
+    ) -> bool:
+        """Recognize a repeated native diagnostic within one logical Run."""
+
+        if provider_exit.get(
+            "schema_ref"
+        ) != "meta-research/provider-native-turn-terminal/v1":
+            return False
+        native_error = provider_exit.get("native_error")
+        native_turn_status = provider_exit.get("native_turn_status")
+        if not isinstance(native_error, dict) or not isinstance(native_turn_status, str):
+            return False
+        try:
+            fingerprint = canonical_hash({
+                "native_turn_status": native_turn_status,
+                "native_error": native_error,
+            })
+        except (TypeError, ValueError):
+            return False
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT checkpoint_json FROM ar_safe_points "
+                    "WHERE run_ref = :run_ref ORDER BY created_at DESC"
+                ),
+                {"run_ref": run_ref},
+            ).all()
+        for row in rows:
+            try:
+                checkpoint = decoded_object(row.checkpoint_json)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(checkpoint, dict) or checkpoint.get(
+                "action"
+            ) != "provider_result_correction":
+                continue
+            previous_exit = checkpoint.get("provider_exit")
+            if not isinstance(previous_exit, dict):
+                continue
+            if previous_exit.get(
+                "schema_ref"
+            ) != "meta-research/provider-native-turn-terminal/v1":
+                continue
+            previous_error = previous_exit.get("native_error")
+            previous_status = previous_exit.get("native_turn_status")
+            if not isinstance(previous_error, dict) or not isinstance(previous_status, str):
+                continue
+            try:
+                previous_fingerprint = canonical_hash({
+                    "native_turn_status": previous_status,
+                    "native_error": previous_error,
+                })
+            except (TypeError, ValueError):
+                continue
+            if previous_fingerprint == fingerprint:
+                return True
+        return False
 
     def reject_stage_completion_candidate(
         self, *,
@@ -9386,6 +9458,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> dict[str, object] | None:
         """Project the predecessor's retained correction into its current Attempt."""
         from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
+        from meta_research.bundle_target_contract import METRIC_SET_REPAIR
         with self._database.read() as connection:
             control = connection.execute(text(
                 "SELECT * FROM ar_run_controls WHERE run_ref=:run AND attempt_ref=:attempt "
@@ -9485,6 +9558,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     + ". Reconcile original external effects before repeating them."
                     if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
+                    "protocol_metric_sets_overlap": METRIC_SET_REPAIR,
                     "bundle_propose_targets_replan_basis_not_null": (
                         "preserve strategy_update and set replan_basis=null when action=propose_targets"
                     ),
@@ -9528,7 +9602,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         rolling_basis = None
         now = time.time()
         effect: RuntimeEffectIdentity | None = None
-        with self._database.write() as connection:
+        # Recovery-sensitive correction must acquire SQLite's writer before
+        # reading currentness. A second process can otherwise pass the
+        # attempt/fence checks while the first correction is still between
+        # its precheck and successor write.
+        with self._database.fenced_write() as connection:
             control = connection.execute(
                 text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
                 {"run_ref": run_ref},
@@ -18378,10 +18456,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         ),
                         {"cycle_ref": request.cycle_ref, "stage": expected_stage},
                     ).first()
-                    if resumable is not None and (
-                        resumable.runtime_binding_hash == runtime_binding_hash
-                        and request.epoch > int(resumable.epoch)
-                    ):
+                    # A changed binding is never accepted by ordinary stage
+                    # admission.  At this fenced boundary, an explicit Owner
+                    # request may carry the current semantic MCP catalog.  The
+                    # compatibility helper permits only that narrow refresh
+                    # after validating the persisted historical binding and
+                    # keeps all execution identities and capabilities exact.
+                    resumable_rebind_kind: str | None = None
+                    if resumable is not None and request.epoch > int(resumable.epoch):
+                        if resumable.runtime_binding_hash == runtime_binding_hash:
+                            resumable_rebind_kind = "exact"
+                        else:
+                            try:
+                                historical_binding = _runtime_binding_from_row(resumable)
+                            except OwnerConflict:
+                                historical_binding = None
+                            if historical_binding is not None and stage_bindings_mcp_rebind_compatible(
+                                historical_binding, runtime_binding
+                            ):
+                                resumable_rebind_kind = "semantic_mcp_catalog"
+                    if resumable is not None and resumable_rebind_kind is not None:
                         old_request_ref = resumable.request_ref
                         old_epoch = int(resumable.epoch)
                         reuse_checkpoint = (
@@ -18504,6 +18598,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                                 "epoch": request.epoch,
                                 "attempt_ref": replacement.attempt_ref,
                                 "fence_ref": replacement.fence_ref,
+                                "runtime_binding_migration": (
+                                    None
+                                    if resumable_rebind_kind == "exact"
+                                    else resumable_rebind_kind
+                                ),
+                                "old_runtime_binding_hash": resumable.runtime_binding_hash,
+                                "runtime_binding_hash": runtime_binding_hash,
                             },
                         )
                         replay_request_ref = request.request_ref
@@ -23388,6 +23489,17 @@ def _stage_material_hash(stage: str, outcome: dict[str, object]) -> str:
     raise OwnerConflict("stage_run_integrity_invalid")
 
 
+def _stage_material_hash_matches(
+    stage: str, outcome: dict[str, object], stored_hash: str | None
+) -> bool:
+    if not isinstance(stored_hash, str):
+        return False
+    hashes = {_stage_material_hash(stage, outcome)}
+    if stage == "plan":
+        hashes.add(legacy_material_plan_hash(outcome))
+    return stored_hash in hashes
+
+
 def _execution_bindings(row) -> dict[str, object]:
     return {
         "request_ref": row.request_ref,
@@ -23453,7 +23565,9 @@ def _verify_execution_row(
         or lineage_invalid
         or canonical_json(payload) != row.payload_json
         or canonical_hash(payload) != row.payload_hash
-        or _stage_material_hash(row.stage, outcome) != row.material_outcome_hash
+        or not _stage_material_hash_matches(
+            row.stage, outcome, row.material_outcome_hash
+        )
         or row.execution_receipt_hash
         != _owner_receipt_hash(
             _stage_execution_receipt_kind(row.stage),
@@ -24495,7 +24609,7 @@ def _successor_execution_lineage(
     predecessor_execution = _attempt_execution(run, predecessor, session)
     predecessor_outcome_hash = canonical_hash(predecessor_execution.outcome)
     predecessor_material_hash = predecessor_execution.material_outcome_hash
-    if _stage_material_hash(run.stage, outcome) == predecessor_material_hash:
+    if _stage_material_hash_matches(run.stage, outcome, predecessor_material_hash):
         raise OwnerConflict("attempt_successor_outcome_unchanged")
     receipt = AcceptanceReceipt(
         issuer="research_graph",
@@ -24577,10 +24691,12 @@ def _verify_persisted_successor_lineage(
         or predecessor.root_session_ref != row.root_session_ref
         or predecessor.native_session_ref != row.native_session_ref
         or canonical_hash(predecessor_outcome) != row.predecessor_outcome_hash
-        or _stage_material_hash(row.stage, predecessor_outcome)
-        != row.predecessor_material_outcome_hash
-        or _stage_material_hash(row.stage, outcome)
-        == row.predecessor_material_outcome_hash
+        or not _stage_material_hash_matches(
+            row.stage, predecessor_outcome, row.predecessor_material_outcome_hash
+        )
+        or _stage_material_hash_matches(
+            row.stage, outcome, row.predecessor_material_outcome_hash
+        )
         or predecessor.decision_receipt_ref != row.predecessor_rejection_receipt_ref
         or predecessor.decision_receipt_subject_ref
         != row.predecessor_rejection_receipt_subject_ref

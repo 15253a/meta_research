@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -63,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     assert process.stdout is not None
     assert process.stderr is not None
     stderr = bytearray()
+    stderr_limited = threading.Event()
     stdout_drain = threading.Thread(
         target=_copy_redacted,
         args=(process.stdout, sys.stdout.buffer, redactions),
@@ -70,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     stderr_drain = threading.Thread(
         target=_drain_bounded,
-        args=(process.stderr, stderr),
+        args=(process.stderr, stderr, stderr_limited),
         daemon=True,
     )
     stdout_drain.start()
@@ -81,6 +83,25 @@ def main(argv: list[str] | None = None) -> int:
     if stdout_drain.is_alive() or stderr_drain.is_alive():
         return 70
     _write_bridge_result(arguments.output_last_message, returncode)
+    stderr_observation = {
+        "schema_ref": "meta-research/provider-stderr-summary/v1",
+        "status": "available",
+        "observed_bytes": len(stderr),
+        "sha256": hashlib.sha256(stderr).hexdigest(),
+        "limited": stderr_limited.is_set(),
+        "exact_content_source": "provider stderr bytes retained by harness bridge",
+    }
+    if stderr:
+        # The outer durable supervisor captures this typed summary.  It never
+        # receives arbitrary Provider stderr, which may contain credentials or
+        # response bodies.  The hash and bounded count remain useful for Owner
+        # reconciliation without turning the sidecar into an Agent transcript.
+        sys.stderr.buffer.write(
+            (json.dumps(stderr_observation, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+        )
+        sys.stderr.buffer.flush()
     if returncode != 0:
         error_kind = (
             "auth_revoked"
@@ -94,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
                     "type": "meta_research.provider_error",
                     "family": arguments.family,
                     "error_kind": error_kind,
+                    "stderr_observation": stderr_observation,
                 },
                 separators=(",", ":"),
             )
@@ -103,12 +125,16 @@ def main(argv: list[str] | None = None) -> int:
     return returncode
 
 
-def _drain_bounded(stream, destination: bytearray) -> None:
+def _drain_bounded(
+    stream, destination: bytearray, limited: threading.Event | None = None
+) -> None:
     try:
         while chunk := stream.read(64 * 1024):
             remaining = _STDERR_LIMIT - len(destination)
             if remaining > 0:
                 destination.extend(chunk[:remaining])
+            if limited is not None and len(chunk) > remaining:
+                limited.set()
     finally:
         stream.close()
 

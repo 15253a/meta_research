@@ -2469,6 +2469,7 @@ class SQLiteAdvancementEngine(
             for binding in successor["prior_accepted_bindings"]
         ]
 
+    @snapshot_cached
     def _query_reasoning_successor_context(
         self, cycle_ref: str
     ) -> dict[str, object] | None:

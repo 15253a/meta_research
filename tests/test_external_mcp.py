@@ -12,6 +12,7 @@ import pytest
 
 from meta_research.external_mcp import ExternalMcpError, ExternalMcpOperationSnapshot, ExternalMcpRuntime, compose_external_mcp_prompt, exposed_tool_name, parse_connection, parse_services, split_external_mcp_prompt
 from meta_research.external_mcp_client import ExternalMcpClient
+from meta_research.root_capabilities import ROOT_AGENT_KINDS
 
 
 def connection(tmp_path):
@@ -29,6 +30,22 @@ def configured(tmp_path, **values):
     runtime.configure_endpoint("http://127.0.0.1:9999")
     runtime.save_config(services=parse_services([service(tmp_path, **values)]), expected_revision=runtime.read_config().revision)
     return runtime
+
+
+@pytest.mark.parametrize("root_kind", ROOT_AGENT_KINDS)
+def test_default_external_service_is_visible_to_every_root(tmp_path, root_kind):
+    runtime = configured(tmp_path)
+    snapshot = runtime.operation_snapshot(
+        operation_identity=f"all-roots-{root_kind}",
+        root_kind=root_kind,
+        task_prompt="Inspect the configured service",
+    )
+    context = json.loads(split_external_mcp_prompt(
+        compose_external_mcp_prompt("Inspect the configured service", snapshot)
+    )[0])
+    assert context["root_kind"] == root_kind
+    assert [service["service_id"] for service in context["services"]] == ["lab"]
+    assert snapshot.services[0].service.allowed_root_kinds == ROOT_AGENT_KINDS
 
 
 def request(method, **parameters):

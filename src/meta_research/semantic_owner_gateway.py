@@ -513,7 +513,17 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
                 "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "offset": {"type": "integer", "minimum": 0}}, "additionalProperties": False},
-            output_schema={"type": "object"},
+            output_schema={"type": "object", "properties": {
+                "items": {"type": "array", "items": {"type": "object"}},
+                "next_offset": {"type": ["integer", "null"], "minimum": 0},
+                "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "result_state": {"type": "string", "enum": ["matches", "page_pending", "exhausted", "no_match", "no_records"]},
+                "scan_complete": {"type": "boolean"},
+                "selection_required": {"type": "boolean"},
+                "automatic_merge": {"type": "boolean"},
+            }, "required": ["items", "next_offset", "query_revision", "result_state",
+                              "scan_complete", "selection_required", "automatic_merge"],
+               "additionalProperties": False},
             handler=lambda context, arguments: read(context, arguments, page=True)),
         SemanticOperation(
             semantic_operation_id="research_graph.baselines.read", owning_module="research_graph",
@@ -528,14 +538,22 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "offset": {"type": "integer", "minimum": 0}},
                 "required": ["baseline_ref"], "additionalProperties": False},
-            output_schema={"type": "object"},
+            output_schema={"type": "object", "properties": {
+                "status": {"type": "string", "enum": ["accepted", "not_found"]},
+                "result": {"type": ["object", "null"]},
+            }, "required": ["status", "result"], "additionalProperties": False},
             handler=lambda context, arguments: read(context, arguments, page=False)),
         SemanticOperation(
             semantic_operation_id="research_graph.target_formal_results.read", owning_module="research_graph",
             description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。implementation_artifacts 给出每个 Run 实际选择的已保管实现范围、精确父版本和 content.read reader；reader.selection_path 固定子范围，entry_path 相对于该范围，复用 Run 保留原实施的代码。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding、selection 与实际来源。登记子范围时将 selection 放入 selections，保留其原父 binding/path；implementation_snapshot 表示采用过的快照，不是作者证明。候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空；正式执行采用登记后返回的 selection_ref。",
             input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "target_ref": _string(max_length=1024)},
                 "required": ["target_ref"], "additionalProperties": False},
-            output_schema={"type": "object"},
+            output_schema={"type": "object", "properties": {
+                "items": {"type": "array", "items": {"type": "object"}},
+                "execution_registration": {"type": ["object", "null"]},
+                "resource_candidates": {"type": "object"},
+            }, "required": ["items", "execution_registration", "resource_candidates"],
+               "additionalProperties": False},
             handler=lambda context, arguments: _formal_results_read(research_graph, agent_runtime, context, arguments, human_collaboration)),
         SemanticOperation(
             semantic_operation_id="research_graph.artifact_roles.adjust", owning_module="research_graph",
@@ -566,7 +584,10 @@ def _baseline_operations(research_graph, agent_runtime, human_collaboration=None
             description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. Read one exact formal result by its bare ref (variant_run_, evaluation_attempt_ or metric_result_ prefix, including target-root refs) with its verified lineage: a metric result resolves to its evaluation attempt and variant run, a variant run to its Target context. implementation_artifacts exposes the retained code entries actually selected by that run, with exact versions and content.read readers; a run may select multiple archives, and a reused run retains its original code. Uses the same receipt-verified reads as target_formal_results.read.",
             input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256), "ref": _string(max_length=1024)},
                 "required": ["ref"], "additionalProperties": False},
-            output_schema={"type": "object"},
+            output_schema={"type": "object", "properties": {
+                "status": {"type": "string", "enum": ["accepted", "not_found"]},
+                "result": {"type": ["object", "null"]},
+            }, "required": ["status", "result"], "additionalProperties": False},
             handler=lambda context, arguments: _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments, human_collaboration)),
     )
 
@@ -723,7 +744,19 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
                 "query_revision": {"type":"string","pattern":"^[0-9a-f]{64}$"},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
-                "additionalProperties": False}, output_schema={"type": "object"},
+                "additionalProperties": False}, output_schema={"type": "object", "properties": {
+                    "kind": {"type": "string", "enum": ["register", "register_version", "reference", "derive"]},
+                    "items": {"type": "array", "items": {"type": "object"}},
+                    "total": {"type": "integer", "minimum": 0},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "next_offset": {"type": ["integer", "null"], "minimum": 0},
+                    "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "result_state": {"type": "string", "enum": ["matches", "page_pending", "exhausted", "no_match", "no_records"]},
+                    "scan_complete": {"type": "boolean"},
+                }, "required": ["kind", "items", "total", "offset", "limit", "next_offset",
+                                  "query_revision", "result_state", "scan_complete"],
+                   "additionalProperties": False},
             handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=True, human_collaboration=human_collaboration)),
         SemanticOperation(
             semantic_operation_id="research_graph.datasets.read", owning_module="research_graph",
@@ -731,7 +764,10 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
             input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256),
                 "dataset_ref": _string(max_length=1024), "dataset_version_ref": _string(max_length=1024),
                 "dataset_reference_ref": _string(max_length=1024), "dataset_derivation_ref": _string(max_length=1024)},
-                "additionalProperties": False}, output_schema={"type": "object"},
+                "additionalProperties": False}, output_schema={"type": "object", "properties": {
+                    "status": {"type": "string", "enum": ["accepted", "not_found"]},
+                    "result": {"type": ["object", "null"]},
+                }, "required": ["status", "result"], "additionalProperties": False},
             handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=False, human_collaboration=human_collaboration)),
     ))
     return tuple(result)

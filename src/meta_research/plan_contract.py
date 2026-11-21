@@ -29,6 +29,7 @@ _QUESTION_TRACE_FIELDS = {
 }
 _IDEA_ROLES = {"query_lens", "experiment_lens", "not_relevant"}
 _COVERAGE_DISPOSITIONS = {"covered", "gap"}
+_EVIDENCE_ACCOUNTING_STATUSES = {"adopted", "considered", "deferred", "not_used"}
 _BUNDLE_DISPOSITIONS = {
     "experiments_required",
     "no_new_experiment_required",
@@ -208,6 +209,113 @@ def selected_plan_evidence_catalog(
     return list(result.values())
 
 
+def _validate_evidence_accounting(
+    accounting: object,
+    *,
+    frozen_catalog: list[dict[str, object]],
+    selected_catalog: list[dict[str, object]],
+) -> None:
+    """Validate an optional, complete disposition ledger for Target evidence.
+
+    Older Plan documents predate this ledger and remain valid when the field is
+    absent. Once a Plan supplies it, every TargetCommit visible in the frozen
+    catalog or selected from a later evidence page must have exactly one
+    disposition and reason. This makes an explicit ``not_used`` decision
+    distinguishable from a missing handoff while retaining old-document
+    compatibility.
+    """
+    if not isinstance(accounting, list) or len(accounting) > MAX_PLAN_EVIDENCE_REFS:
+        raise PlanContractError("plan_evidence_accounting_invalid")
+
+    def target_commit_ref(evidence: dict[str, object]) -> str | None:
+        direct = evidence.get("target_commit_root_ref")
+        if isinstance(direct, str) and direct:
+            return direct
+        binding = evidence.get("source_binding")
+        if isinstance(binding, dict):
+            nested = binding.get("target_commit_root_ref")
+            if isinstance(nested, str) and nested:
+                return nested
+        return None
+
+    known: dict[str, dict[str, object]] = {}
+    for evidence in [*frozen_catalog, *selected_catalog]:
+        evidence_ref = evidence.get("evidence_ref")
+        if not isinstance(evidence_ref, str) or not evidence_ref:
+            raise PlanContractError("plan_evidence_accounting_invalid")
+        known.setdefault(evidence_ref, evidence)
+    target_refs = {
+        target_ref for evidence in known.values()
+        if (target_ref := target_commit_ref(evidence)) is not None
+    }
+    selected_refs = {
+        target_ref for evidence in selected_catalog
+        if (target_ref := target_commit_ref(evidence)) is not None
+    }
+    seen_target_refs: set[str] = set()
+    for raw in accounting:
+        entry = _object(raw, "plan_evidence_accounting_invalid")
+        _exact_keys(
+            entry,
+            {"evidence_ref", "target_commit_ref", "status", "reason"},
+            "plan_evidence_accounting_invalid",
+        )
+        evidence_ref = entry.get("evidence_ref")
+        target_ref_value = entry.get("target_commit_ref")
+        status = entry.get("status")
+        if (
+            not _text(evidence_ref)
+            or not isinstance(evidence_ref, str)
+            or not isinstance(target_ref_value, str)
+            or target_ref_value in seen_target_refs
+            or evidence_ref not in known
+            or not _text(target_ref_value)
+            or status not in _EVIDENCE_ACCOUNTING_STATUSES
+            or not _text(entry.get("reason"))
+        ):
+            raise PlanContractError("plan_evidence_accounting_invalid")
+        evidence = next(
+            (item for item in known.values()
+             if item.get("evidence_ref") == evidence_ref),
+            None,
+        )
+        if evidence is None or target_ref_value != target_commit_ref(evidence):
+            raise PlanContractError("plan_evidence_accounting_invalid")
+        if (status == "adopted") != (target_ref_value in selected_refs):
+            raise PlanContractError("plan_evidence_accounting_invalid")
+        seen_target_refs.add(cast(str, target_ref_value))
+    if seen_target_refs != target_refs:
+        raise PlanContractError("plan_evidence_accounting_incomplete")
+
+
+def validate_current_plan_evidence_accounting(
+    document: dict[str, object],
+    *,
+    current_catalog: list[dict[str, object]],
+    selected_catalog: list[dict[str, object]],
+) -> None:
+    """Require a new accounting ledger to cover the current TargetCommit set.
+
+    The Plan request may start with an empty frozen catalog and discover a later
+    evidence page during the model turn.  Formal acceptance still needs a
+    durable disposition for every TargetCommit current at that boundary, so a
+    source seen during discovery cannot disappear silently between stages.
+    Older Plan documents without ``evidence_accounting`` retain their existing
+    frozen-page compatibility. An explicitly empty field is still a claim that
+    the current TargetCommit set was considered, so it is rejected when that
+    set is non-empty.
+    """
+
+    accounting = document.get("evidence_accounting")
+    if "evidence_accounting" not in document:
+        return
+    _validate_evidence_accounting(
+        accounting,
+        frozen_catalog=current_catalog,
+        selected_catalog=selected_catalog,
+    )
+
+
 def _validate_selected_evidence_binding(entry: dict[str, object]) -> None:
     """Check submitted identity structure; accepting Owners establish authority."""
     code = "plan_selected_evidence_invalid"
@@ -266,7 +374,8 @@ def validate_plan_document(
             "idea_trace",
             "bundle_disposition",
             "source_bindings",
-        } | ({"notes"} if "notes" in document else set()),
+        } | ({"notes"} if "notes" in document else set())
+          | ({"evidence_accounting"} if "evidence_accounting" in document else set()),
         "plan_document_invalid",
     )
     if "notes" in document and not isinstance(document["notes"], str):
@@ -285,7 +394,17 @@ def validate_plan_document(
     ):
         raise PlanContractError("plan_document_source_invalid")
 
-    evidence_by_ref = {str(item["evidence_ref"]): item for item in selected_plan_evidence_catalog(document, list(evidence_by_ref.values()))}
+    frozen_evidence_by_ref = dict(evidence_by_ref)
+    selected_catalog = selected_plan_evidence_catalog(
+        document, list(frozen_evidence_by_ref.values())
+    )
+    if "evidence_accounting" in document:
+        _validate_evidence_accounting(
+            document["evidence_accounting"],
+            frozen_catalog=list(frozen_evidence_by_ref.values()),
+            selected_catalog=selected_catalog,
+        )
+    evidence_by_ref = {str(item["evidence_ref"]): item for item in selected_catalog}
 
     candidate_refs = _accepted_candidate_refs(
         accepted_idea_set,
@@ -437,6 +556,17 @@ def material_plan_hash(document: dict[str, object]) -> str:
     """Hash Plan meaning while ignoring invocation-only source identities."""
 
     return canonical_hash(_material_value(document))
+
+
+def legacy_material_plan_hash(document: dict[str, object]) -> str:
+    """Hash the representation used before empty reuse references were omitted.
+
+    Accepted Plan executions may predate the representation-only normalization
+    in :func:`material_plan_hash`. Their stored material hash remains valid
+    evidence and must continue to verify after a restart or handoff.
+    """
+
+    return canonical_hash(_legacy_material_value(document))
 
 
 def _validate_idea_set_binding(
@@ -856,9 +986,12 @@ def _validate_receipt(
 
 def _material_value(value: object) -> object:
     if isinstance(value, dict):
+        normalized = dict(value)
+        if normalized.get("reuse_material_refs") == []:
+            normalized.pop("reuse_material_refs")
         return {
             key: _material_value(item)
-            for key, item in value.items()
+            for key, item in normalized.items()
             if key
             not in {
                 "context_pack_ref",
@@ -868,6 +1001,25 @@ def _material_value(value: object) -> object:
         }
     if isinstance(value, list):
         return [_material_value(item) for item in value]
+    if isinstance(value, str):
+        return " ".join(value.split()).casefold()
+    return value
+
+
+def _legacy_material_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _legacy_material_value(item)
+            for key, item in value.items()
+            if key
+            not in {
+                "context_pack_ref",
+                "context_pack_hash",
+                "evidence_reference_revision",
+            }
+        }
+    if isinstance(value, list):
+        return [_legacy_material_value(item) for item in value]
     if isinstance(value, str):
         return " ".join(value.split()).casefold()
     return value

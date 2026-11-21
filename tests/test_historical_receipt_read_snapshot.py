@@ -153,7 +153,7 @@ def test_reasoning_read_rechecks_transitive_plan_file_in_same_cut(tmp_path):
 
 
 def test_successor_read_owns_a_fresh_cut_and_releases_it_on_failure(accepted_decision, monkeypatch):
-    runtime, _query, _verifier, _method, _path = accepted_decision
+    runtime, _query, _verifier, _method, content_path = accepted_decision
     database = runtime._database
     owner = runtime.owners.advancement_engine
     with database.read() as connection:
@@ -172,14 +172,30 @@ def test_successor_read_owns_a_fresh_cut_and_releases_it_on_failure(accepted_dec
     expected = owner.query_reasoning_successor_context(cycle_ref)
     assert owner.query_reasoning_successor_context(cycle_ref) == expected
     assert cuts[0] is not cuts[1]
+    verifier = owner._reasoning_outcome_verifier
+    verify_target = Mock(wraps=verifier.query_reasoning_next_cycle_target)
+    monkeypatch.setattr(verifier, 'query_reasoning_next_cycle_target', verify_target)
     with database.read_snapshot() as connection:
         cache = database._read_cache.get()
         first = owner.query_reasoning_successor_context(cycle_ref)
+        first_calls = verify_target.call_count
         if first is not None:
             first['caller_mutation'] = True
+            assert first_calls > 0
+            original_bytes = content_path.read_bytes()
+            try:
+                content_path.write_bytes(original_bytes + b'corrupt')
+                with pytest.raises(OwnerConflict, match='content_custody_unavailable'):
+                    owner.query_reasoning_successor_context(cycle_ref)
+            finally:
+                content_path.write_bytes(original_bytes)
         assert owner.query_reasoning_successor_context(cycle_ref) == expected
+        assert verify_target.call_count == first_calls
         assert cuts[-1] is cuts[-2] is cache
         assert database._read_cut.get() is connection
+    if expected is not None:
+        assert owner.query_reasoning_successor_context(cycle_ref) == expected
+        assert verify_target.call_count > first_calls
     write.assert_not_called()
     assert database._read_cut.get() is None and database._read_cache.get() is None
     monkeypatch.setattr(owner, '_query_reasoning_successor_context', Mock(side_effect=OwnerConflict('bad_successor')))

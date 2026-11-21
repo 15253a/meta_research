@@ -530,7 +530,8 @@ def cleanup_cycle_sessions(runtime, candidates, *, dry_run):
 # signed call usage, and formal readback. Only launch/replay scratch is unused.
 # Target provider-argv.json is read when recovering a historical human-wait receipt.
 _LAUNCH_SCRATCH = ("native-provider-argv.json", "supervisor-ready.json",
-                   "supervisor-stop.json", "supervisor.lock", ".last-message.supervisor.tmp")
+                   "supervisor-heartbeat.json", "supervisor-stop.json",
+                   "supervisor.lock", ".last-message.supervisor.tmp")
 
 
 def _prune_spool(directory, digest, dry_run, protected_paths):

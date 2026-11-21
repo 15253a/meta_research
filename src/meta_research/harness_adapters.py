@@ -37,6 +37,7 @@ from meta_research.provider_supervisor import (
     SUPERVISOR_EXIT_SCHEMA_V2,
     SUPERVISOR_REQUEST_SCHEMA_V2,
     ensure_transport_key,
+    _validated_request_paths,
     read_supervisor_request,
     read_transport_envelope,
     read_verified_exit_receipt,
@@ -102,6 +103,7 @@ _PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION_REF"
 _OWNER_INVOCATION_HASH_ENV = "META_RESEARCH_OWNER_INVOCATION_HASH"
 _HARNESS_EVIDENCE_SCOPE_ENV = "META_RESEARCH_HARNESS_EVIDENCE_SCOPE_REF"
 _HARNESS_OBSERVATION_SCOPE_ENV = "META_RESEARCH_HARNESS_OBSERVATION_SCOPE"
+_HARNESS_OPERATION_SCOPE_ENV = "META_RESEARCH_OPERATION_SCOPE"
 HARNESS_PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
 HARNESS_PROVIDER_RESULT_MAX_BYTES = 16 * 1024 * 1024
 _STREAM_LIMIT = HARNESS_PROVIDER_STREAM_MAX_BYTES
@@ -389,6 +391,16 @@ class _NativeCliHarnessAdapter:
         return recover(operation_ref, family=self.family, owner_invocation_hash=owner_invocation_hash)
 
     def _environment(self, invocation: HarnessInvocation) -> dict[str, str]:
+        operation_scope: dict[str, object] = {
+            "run_ref": invocation.run_ref,
+            "attempt_ref": invocation.attempt_ref,
+            "fence_ref": invocation.fence_ref,
+            "root_session_ref": invocation.root_session_ref,
+            "operation_ref": invocation.provider_operation_ref,
+            "model_ref": invocation.model_ref,
+        }
+        if invocation.root_kind is not None:
+            operation_scope["root_kind"] = invocation.root_kind
         return {
             **({} if invocation.external_mcp_access is None else invocation.external_mcp_access.environment()),
             _MCP_TOKEN_ENV: invocation.mcp_token,
@@ -410,6 +422,7 @@ class _NativeCliHarnessAdapter:
             _HARNESS_OBSERVATION_SCOPE_ENV: canonical_json(
                 _target_root_observation_scope(invocation)
             ),
+            _HARNESS_OPERATION_SCOPE_ENV: canonical_json(operation_scope),
             "NO_PROXY": _loopback_no_proxy(),
             "no_proxy": _loopback_no_proxy(),
         }
@@ -1310,6 +1323,16 @@ class HarnessSupervisorTransport:
         operation_ref = environment.get(_PROVIDER_OPERATION_ENV)
         if not operation_ref or len(operation_ref) > 128:
             raise OSError("provider operation identity unavailable")
+        operation_scope: dict[str, object] | None = None
+        scope_text = environment.get(_HARNESS_OPERATION_SCOPE_ENV)
+        if scope_text is not None:
+            try:
+                decoded_scope = json.loads(scope_text)
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise OSError("provider operation scope unavailable") from error
+            if not isinstance(decoded_scope, dict):
+                raise OSError("provider operation scope unavailable")
+            operation_scope = cast(dict[str, object], decoded_scope)
         invocation = {
             "schema_ref": "meta-research/harness-provider-operation/v1",
             "family": family,
@@ -1317,7 +1340,11 @@ class HarnessSupervisorTransport:
             "argv": argv,
             "prompt_hash": canonical_hash(prompt),
             "timeout_seconds": timeout,
-            "environment_names": sorted(environment),
+            "environment_names": sorted(
+                name
+                for name in environment
+                if name != _HARNESS_OPERATION_SCOPE_ENV
+            ),
         }
         invocation_hash = canonical_hash(invocation)
         directory = self._workspace / "provider-operations" / invocation_hash[:2] / invocation_hash
@@ -1389,7 +1416,28 @@ class HarnessSupervisorTransport:
             except (OSError, ValueError, ProviderSupervisorError) as error:
                 raise OSError("native_provider_spool_invalid") from error
         working_directory = provider_working_directory(argv, environment)
-        request = self._supervisor_request(directory, invocation_hash, family, timeout, working_directory)
+        request_scope = operation_scope
+        if terminal_replay:
+            try:
+                persisted_request = read_supervisor_request(
+                    request_path, self._transport_key
+                )
+            except ProviderSupervisorError as error:
+                raise OSError("supervisor request unavailable") from error
+            persisted_scope = persisted_request.get("operation_scope")
+            request_scope = (
+                cast(dict[str, object], persisted_scope)
+                if isinstance(persisted_scope, dict)
+                else None
+            )
+        request = self._supervisor_request(
+            directory,
+            invocation_hash,
+            family,
+            timeout,
+            working_directory,
+            request_scope,
+        )
         bridge_argv = cast(list[str], request["argv"])
         try:
             if terminal_replay:
@@ -1511,8 +1559,9 @@ class HarnessSupervisorTransport:
     def _supervisor_request(
         directory: Path, invocation_hash: str, family: str, timeout: float | None,
         working_directory: Path | None = None,
+        operation_scope: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        return {
+        request: dict[str, object] = {
             "schema_ref": SUPERVISOR_REQUEST_SCHEMA_V2,
             "invocation_hash": invocation_hash,
             **({"working_directory": str(working_directory)} if working_directory is not None else {}),
@@ -1536,11 +1585,15 @@ class HarnessSupervisorTransport:
             "receipt_path": str(directory / "supervisor-exit.json"),
             "stop_path": str(directory / "supervisor-stop.json"),
         }
+        if operation_scope is not None:
+            request["operation_scope"] = operation_scope
+        return request
 
     def _verify_terminal_request(
         self, request_path: Path, request: dict[str, object]
     ) -> None:
         persisted = read_supervisor_request(request_path, self._transport_key)
+        _validated_request_paths(request_path, persisted)
         persisted_argv = persisted.get("argv")
         if (
             not isinstance(persisted_argv, list)
@@ -1778,6 +1831,7 @@ class HarnessSupervisorTransport:
                 continue
             try:
                 request = read_supervisor_request(directory / "supervisor-request.json", self._transport_key)
+                _validated_request_paths(directory / "supervisor-request.json", request)
                 prompt_path = directory / "prompt.txt"
                 if digest is None:
                     if prompt_path.stat().st_size > _STREAM_LIMIT:
@@ -1803,9 +1857,25 @@ class HarnessSupervisorTransport:
                     if directory.name not in invocation_hashes:
                         continue
                 invocation_hash = directory.name
-                self._verify_terminal_request(directory / "supervisor-request.json",
-                    self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds"),
-                        Path(request["working_directory"]) if "working_directory" in request else None))
+                persisted_scope = request.get("operation_scope")
+                request_scope = (
+                    cast(dict[str, object], persisted_scope)
+                    if isinstance(persisted_scope, dict)
+                    else None
+                )
+                self._verify_terminal_request(
+                    directory / "supervisor-request.json",
+                    self._supervisor_request(
+                        directory,
+                        invocation_hash,
+                        family,
+                        request.get("timeout_seconds"),
+                        Path(request["working_directory"])
+                        if "working_directory" in request
+                        else None,
+                        request_scope,
+                    ),
+                )
                 if digest is not None and not receipt_path.exists():
                     if any(path.is_symlink() for path in (
                         operation_root, directory.parent, directory,

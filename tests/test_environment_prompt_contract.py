@@ -95,10 +95,7 @@ def test_every_root_launch_pairs_six_discovery_entries_with_actual_tools(root_ki
         "research_graph.environments.reference",
     ):
         assert operation in instructions
-        if root_kind == "companion":
-            assert operation not in available
-        else:
-            assert operation in available
+        assert operation in available
     assert "六入口" in instructions
 
 

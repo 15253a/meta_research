@@ -6,7 +6,10 @@ import pytest
 from meta_research.bundle_skill import BundleDispatchRequest, BundleSkillUnavailable, CodexBundleSkillAdapter
 from meta_research.bundle_stage import BundleStageWorker
 from meta_research.owners.common import canonical_hash
-from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
+from meta_research.runtime_binding_compatibility import (
+    bundle_bindings_compatible,
+    stage_bindings_mcp_rebind_compatible,
+)
 from test_bundle_skill_adapter import _FullConformanceAuthority, _SequenceRunner, _fake_codex, _inbox_checkpoint
 
 
@@ -85,3 +88,46 @@ def test_stage_reports_source_drift_without_changing_frozen_run(adapter):
     assert worker.observation == BundleObservation("failure", "bundle_runtime_binding_drift")
     assert old.as_dict() == value
     assert runner.calls == [] and authority.issued == []
+
+
+def test_fenced_rebind_allows_only_semantic_mcp_catalog_refresh(adapter):
+    provider, _runner, _authority = adapter
+    current = provider.runtime_binding()
+    old_mcp = tuple(
+        item.rsplit("@sha256:", 1)[0] + "@sha256:" + "a" * 64
+        for item in current.mcp_bindings
+    )
+    old_resources = tuple(
+        item.rsplit("@sha256:", 1)[0] + "@sha256:" + "b" * 64
+        if item.startswith("harness-artifact:operation-binding-")
+        else item
+        for item in current.resource_bindings
+    )
+    historical = replace(
+        current,
+        mcp_bindings=old_mcp,
+        resource_bindings=old_resources,
+    )
+
+    assert stage_bindings_mcp_rebind_compatible(historical, current)
+    assert stage_bindings_mcp_rebind_compatible(current, historical)
+
+    assert not stage_bindings_mcp_rebind_compatible(
+        replace(historical, model_ref="codex-cli/other-model"), current
+    )
+    assert not stage_bindings_mcp_rebind_compatible(
+        replace(historical, capability_bindings=historical.capability_bindings + ("unexpected",)),
+        current,
+    )
+    assert not stage_bindings_mcp_rebind_compatible(
+        replace(historical, resource_bindings=historical.resource_bindings + ("unexpected",)),
+        current,
+    )
+    assert not stage_bindings_mcp_rebind_compatible(
+        replace(
+            historical,
+            mcp_bindings=historical.mcp_bindings
+            + ("harness-operation-binding:semantic-mcp-unknown@sha256:" + "c" * 64,),
+        ),
+        current,
+    )

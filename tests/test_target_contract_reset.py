@@ -95,6 +95,7 @@ def test_prompt_contains_complete_frozen_contract_and_scope_checks(tmp_path, mon
     assert argv[1:4] == ["-m", "meta_research.target_execution_contract", "--check-result"]
     assert json.loads(argv[-1]) == {
         "protocol_version_ref": "protocol-a", "required_metric_keys": ["effect"], "optional_metric_keys": [],
+        "result_schema_ref": frozen["result_schema_ref"],
     }
 
     from meta_research.target_execution_contract import main
@@ -125,6 +126,31 @@ def test_prompt_contains_complete_frozen_contract_and_scope_checks(tmp_path, mon
     assert fixed["status"] == "keys_match"
     assert fixed["draft_sha256"] != hashlib.sha256(raw).hexdigest()
     assert json.loads(draft.read_bytes()) == value
+
+    schema_ref = frozen["result_schema_ref"]
+    value["schema_ref"] = "invented-result-identity"
+    draft.write_text(canonical_json(value))
+    assert main(argv[3:]) == 0
+    mismatch = json.loads(capsys.readouterr().out)
+    assert (mismatch["status"], mismatch["code"], mismatch["path"], mismatch["expected"], mismatch["supplied"]) == (
+        "copied_identity_mismatch", "target_root_commit_domain_invalid", "$.schema_ref", schema_ref, value["schema_ref"])
+    old_protocol = {k: v for k, v in json.loads(argv[-1]).items() if k != "result_schema_ref"}
+    assert main(["--check-result", canonical_json(old_protocol)]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "keys_match"
+    evaluation = value["formal_runs"][0]["evaluations"][0]
+    evaluation["metrics"] = {"extra": 0}
+    draft.write_text(canonical_json(value), encoding="utf-8")
+    assert main(argv[3:]) == 0
+    combined = json.loads(capsys.readouterr().out)
+    assert combined["path"] == "$.schema_ref"
+    assert combined["missing_metric_keys"] == ["effect"] and combined["unexpected_metric_keys"] == ["extra"]
+    evaluation["metrics"] = {"effect": None}
+    for supplied_schema in (schema_ref, None):
+        value["schema_ref"] = supplied_schema
+        value["additional_research_observation"] = {"unknown": None}
+        draft.write_text(canonical_json(value))
+        assert main(argv[3:]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "keys_match"
 
     value["formal_runs"][0]["evaluations"] = []
     draft.write_text(canonical_json(value), encoding="utf-8")

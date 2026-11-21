@@ -18,23 +18,27 @@ Call `tools.contracts.read` with an exact `operation_id`. The response includes
 the registered input/output schemas, ownership, access mode, reconciliation
 operation, and return/error explanations. The response describes that operation;
 it neither issues a grant nor freezes availability. Unregistered, ungranted and
-unavailable operations cannot be loaded as callable contracts. Runtime Owner
+service/configuration-unavailable operations cannot be loaded as callable
+contracts. A static role-authorization restriction remains contract-visible so
+another native Session can understand the registered operation. Runtime Owner
 checks still validate exact resource scope, versions, parameters and effects.
 
-The Harness checks the current root/attempt/fence before dispatch. A root waiting
-for a HumanRequest response only sees the operations permitted during that wait;
-resuming the same root restores its current execution scope. Revoked channels
-cannot read catalogs, load contracts or call previously discovered readers.
-Protected creation channels also grant discovery and contract reading alongside
-their existing material readers; they do not inherit the research root's effect
-operations.
+The Harness checks the current root/attempt/fence before dispatch. Every native
+Session receives one complete registered Semantic MCP catalog, so a successor
+can discover a reader or an operation introduced by another stage. A role-specific
+effect still passes its Owner and root-scope checks before it can run. A root
+waiting for a HumanRequest response only sees the operations permitted during
+that wait; resuming the same root restores its current execution scope. Revoked
+channels cannot read catalogs, load contracts or call previously discovered
+readers. Protected creation channels retain their read-only material boundary.
 
 ## Adding or changing an operation
 
 Keep the handler and input/output schemas in its existing `SemanticOperation`
-producer. Add it to the appropriate existing root grant composition; registering
-an operation does not grant it to every root. No separate discovery inventory is
-maintained. Removed registrations disappear from discovery automatically.
+producer. Registered operations enter the complete research-root catalog. The
+operation's Owner and currentness checks remain authoritative for effects and
+role-specific readers. No separate discovery inventory is maintained. Removed
+registrations disappear from discovery automatically.
 
 Use a concise `description` for the tool's purpose. Put detailed pagination,
 units, acceptance or return semantics in `return_description`, and known error

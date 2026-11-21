@@ -732,13 +732,22 @@ class _FixtureTargetCommitEvidenceAuthority:
         self.catalog = (evidence,)
 
     def query_plan_evidence_catalog(
-        self, *, quest_ref: str
+        self, *, quest_ref: str, target_commit_refs=None,
+        current_only: bool = True, role_refs=None,
     ) -> tuple[int, tuple[dict[str, object], ...]]:
         if self.quest_ref is None:
             return 0, ()
         if quest_ref != self.quest_ref:
             raise OwnerConflict("fixture_evidence_quest_invalid")
-        return len(self.catalog), self.catalog
+        if target_commit_refs is not None:
+            selected = tuple(
+                item
+                for item in self.catalog
+                if item.get("target_commit_root_ref") in target_commit_refs
+            )
+        else:
+            selected = self.catalog
+        return len(selected), selected
 
     def verify_plan_evidence_catalog(
         self,
@@ -1044,6 +1053,48 @@ def _assert_public_bundle_execution(current: dict[str, object]) -> dict[str, obj
     assert current["target_graph"]["status"] == "not_attempted"
     assert current["stage_commit"] is None
     return run
+
+
+def test_duplicate_protocol_metric_reaches_same_bundle_root_after_restart(tmp_path):
+    requests = []
+
+    class Provider(_DeterministicBundleSkill):
+        def generate_draft(self, request):
+            requests.append(request)
+            draft = super().generate_draft(request)
+            if request.owner_feedback:
+                return draft
+            protocol = draft.draft["initial_strategy_update"]["candidates"][0]["measurement_contract"]["protocol_version"]
+            protocol["optional_metrics"].append(deepcopy(protocol["required_metrics"][0]))
+            return draft
+
+    data_root = tmp_path / "metric-overlap"
+    runtime = _bundle_runtime(data_root, bundle_skill_provider=Provider())
+    try:
+        _prepare_bundle_request(runtime)
+        assert runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.process_once()
+        rejection = runtime.bundle_stage.query_current()["run"]["completion_rejection"]
+        assert rejection["reason"]["detail"] == "protocol_metric_sets_overlap"
+    finally:
+        runtime.close()
+    runtime = _bundle_runtime(data_root, bundle_skill_provider=Provider())
+    try:
+        for _ in range(8):
+            runtime.bundle_stage.process_once()
+            if len(requests) == 2:
+                break
+        first, second = requests
+        assert second.root_session_ref == first.root_session_ref
+        assert second.native_session_ref == "bundle-primary-1"
+        message, = second.owner_feedback
+        assert '"metric:effect"' in message
+        prefix = "$.target_plan.initial_strategy_update.candidates[0].measurement_contract.protocol_version."
+        assert prefix + "required_metrics[0].metric_key" in message
+        assert prefix + "optional_metrics[1].metric_key" in message
+        assert second.owner_rejection_receipt_ref
+    finally:
+        runtime.close()
 
 
 def _advance_to_public_bundle_execution(runtime) -> dict[str, object]:
@@ -2771,7 +2822,7 @@ def test_bundle_cannot_stage_commit_while_native_target_is_pending(
         runtime.close()
 
 
-def test_legacy_target_commit_is_rejected_before_receipt_or_fence_checks(
+def test_legacy_target_commit_paths_cannot_write_to_an_accepted_graph(
     tmp_path: Path,
 ) -> None:
     runtime = _bundle_runtime(tmp_path / "bundle-legacy-target-commit-rejected")
@@ -2794,19 +2845,14 @@ def test_legacy_target_commit_is_rejected_before_receipt_or_fence_checks(
         before = _target_commit_count(runtime)
         before_rg = runtime.owners.research_graph.query_snapshot()
         before_feed = runtime.feed.current_revision()
-        for fence_ref in ("stale-fence", "apparently-current-fence"):
-            with pytest.raises(
-                OwnerConflict, match="legacy_target_commit_write_forbidden"
-            ):
-                runtime.owners.research_graph.accept_target_commit(
-                    target_ref=target.target_ref,
-                    target_run_ref="legacy-target-run",
-                    execution_attempt_ref="legacy-target-attempt",
-                    fence_ref=fence_ref,
-                    execution_result_hash="0" * 64,
-                    execution_receipt=graph.head_receipt,
-                    result_content={"result_disposition": "negative"},
-                )
+        owner = runtime.owners.research_graph
+        assert not hasattr(owner, "accept_target_commit")
+        with pytest.raises(OwnerConflict, match="target_generic_measurement_shadow_write_forbidden"):
+            owner.accept_target_commit_from_generic_measurement_closure(
+                target_ref=target.target_ref,
+                target_execution_closure_ref="legacy-target-closure",
+                target_execution_closure_receipt=graph.head_receipt,
+            )
         assert _target_commit_count(runtime) == before
         assert runtime.owners.research_graph.query_snapshot() == before_rg
         assert runtime.feed.current_revision() == before_feed

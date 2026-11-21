@@ -73,6 +73,18 @@ def test_notes_free_real_admitted_launch_reaches_bound_target_root_prompt(
         prompt = captured[0][1]["prompt"]
         material = json.loads(prompt.split("Exact Owner context:\n", 1)[1])
         assert "execution_reading_tools" not in material
+        assert "上游材料是当前起点，不是证据边界" in prompt
+        assert "tools.catalog.page(view=overview)" in prompt
+        assert "research_graph 或 research_memory" in prompt
+        assert "只有确需核对完整授权目录时" in prompt
+        assert "next_offset" in prompt
+        assert "catalog_hash" in prompt
+        assert "目录发现不会授予额外权限" in prompt
+        assert "tools.contracts.read" in prompt
+        assert "research_graph/research_memory reader" in prompt
+        assert "精确 source_ref、version_ref、entry_path、offset" in prompt
+        assert "receipt 是证据元数据" in prompt
+        assert "保留未知" in prompt
         research = material["research_context"]
         position = json.loads(prompt.splitlines()[0].removeprefix("cycle_position="))
         handle = runtime.target_run_authorities.agent_runtime.query_current_target_work_handle(target.target_ref)

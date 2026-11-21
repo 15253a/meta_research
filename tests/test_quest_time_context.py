@@ -19,6 +19,18 @@ from test_idea_stage_recovery import _IdeaProvider, _runtime
 from test_runtime_conditions_provider_prompts import _SignedRunner
 
 
+def _research_time_from_conditions(conditions):
+    for line in reversed(conditions.splitlines()):
+        if line.startswith("当前运行条件更新="):
+            line = line.split("=", 1)[1]
+        elif not line.startswith("{"):
+            continue
+        value = json.loads(line)
+        if "research_time" in value:
+            return value["research_time"]
+    raise AssertionError("research_time snapshot missing from runtime conditions")
+
+
 def test_target_unknown_outcome_before_transport_keeps_first_budget_observation(request, monkeypatch):
     observations = ["Quest shared budget: used=10; remaining=50; observed_at=1000; revision=initial"]
     monkeypatch.setattr(
@@ -101,7 +113,7 @@ def test_research_provider_observes_shared_clock_at_new_operation_only(tmp_path,
         now[0] = 1060.0
         first = invoke("clock:first")
         first_conditions, business = split_runtime_prompt(runner.calls[0][1])
-        first_snapshot = json.loads(first_conditions.splitlines()[-1])["research_time"]
+        first_snapshot = _research_time_from_conditions(first_conditions)
         assert first_snapshot == ae.query_research_time(accepted["quest_ref"])
         assert first_snapshot["used_seconds"] == 60.0
         assert first_snapshot["remaining_seconds"] == 2591940.0
@@ -112,7 +124,7 @@ def test_research_provider_observes_shared_clock_at_new_operation_only(tmp_path,
         assert len(runner.calls) == 1
         invoke("clock:next", first[1])
         next_conditions, next_business = split_runtime_prompt(runner.calls[1][1])
-        next_snapshot = json.loads(next_conditions.splitlines()[-1])["research_time"]
+        next_snapshot = _research_time_from_conditions(next_conditions)
         assert next_snapshot["used_seconds"] == 120.0
         assert next_snapshot["remaining_seconds"] == 2591880.0
         assert next_snapshot["budget_revision"] == first_snapshot["budget_revision"]
@@ -162,7 +174,7 @@ def test_bundle_old_budget_prompt_reconciles_unchanged_then_new_resume_gets_advi
         invoke("new-budget-decision", first[1])
         assert len(runner.calls) == 2
         current, business = split_runtime_prompt(runner.calls[1][1])
-        assert json.loads(current.splitlines()[-1])["research_time"]["budget_policy"] == "advisory"
+        assert _research_time_from_conditions(current)["budget_policy"] == "advisory"
         assert "新决策使用当前建议预算语义" in current
         assert "1200 秒" in current
         assert "extension first" not in current

@@ -154,6 +154,16 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
     ),
 }
 
+# Every native Session receives one discoverable Semantic MCP catalog. Operation
+# handlers retain their Owner and scope checks, so visibility does not grant a
+# cross-stage effect. Companion therefore sees the same contracts while its
+# formal effects remain rejected by the gateway before a handler runs.
+ALL_ROOT_ROLE_OPERATION_IDS: tuple[str, ...] = tuple(dict.fromkeys(
+    operation_id
+    for root_kind in ROOT_AGENT_KINDS
+    for operation_id in ROOT_ROLE_OPERATION_DELTAS[root_kind]
+))
+
 
 @dataclass(frozen=True)
 class RootCapabilityProfile:
@@ -915,11 +925,12 @@ def root_operation_catalog(
     *,
     common_operation_ids: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Compose a Root grant from the common catalog and one role delta.
+    """Compose a Root grant from the common catalog and registered role tools.
 
+    Every native Session receives the complete registered role catalog.
     Registration and handler availability remain the live gateway's concern.
     Keeping the common tuple as an explicit input lets later effect tickets
-    activate their operations without duplicating the role-specific catalog.
+    activate their operations without duplicating the catalog composition.
     """
 
     if root_kind not in ROOT_AGENT_KINDS:
@@ -933,19 +944,11 @@ def root_operation_catalog(
         )
     ):
         raise ValueError("root_common_operation_catalog_invalid")
-    delta = ROOT_ROLE_OPERATION_DELTAS[root_kind]
-    if root_kind == "companion":
-        # Catalog membership is not a research-write grant. Native tools still
-        # write the assistant's own files; formal research actions belong to
-        # the user's reviewed submission or the responsible research root.
-        common_operation_ids = tuple(operation_id for operation_id in common_operation_ids
-            if operation_id.endswith(
-                (".read", ".page", ".discover", ".current", ".lifecycle")))
+    delta = ALL_ROOT_ROLE_OPERATION_IDS
     overlap = set(common_operation_ids) & set(delta)
     if overlap:
         raise ValueError("root_operation_catalog_overlap")
-    # Preserve the established role-specific ordering while giving every
-    # caller one common suffix seam to extend as effects are registered.
+    # Give every native Session one complete catalog and a common suffix seam.
     return (*delta, *common_operation_ids)
 
 
@@ -957,6 +960,7 @@ __all__ = [
     "ROOT_CAPABILITY_FLOOR",
     "ROOT_CAPABILITY_PROFILE_SCHEMA",
     "ROOT_ROLE_OPERATION_DELTAS",
+    "ALL_ROOT_ROLE_OPERATION_IDS",
     "RootAgentKind",
     "RootCapabilityEntryPath",
     "RootCapabilityProfile",

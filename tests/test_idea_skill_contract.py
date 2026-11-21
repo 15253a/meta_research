@@ -2634,6 +2634,10 @@ def test_durable_supervisor_recovers_a_prelaunch_daemon_loss(
     assert supervisor_request["prompt_max_bytes"] == PROVIDER_STREAM_MAX_BYTES
     assert supervisor_request["stream_max_bytes"] == PROVIDER_STREAM_MAX_BYTES
     assert supervisor_request["result_max_bytes"] == PROVIDER_RESULT_MAX_BYTES
+    model_arg = supervisor_request["argv"][
+        supervisor_request["argv"].index("--model") + 1
+    ]
+    assert supervisor_request["operation_scope"]["model_ref"] == model_arg
 
     restarted = CodexIdeaSkillAdapter(workspace, executable=str(executable))
     recovered = restarted.generate_draft(request)

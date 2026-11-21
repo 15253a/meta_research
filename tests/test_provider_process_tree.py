@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 from pathlib import Path
 import signal
 import subprocess
@@ -16,6 +17,7 @@ from meta_research.provider_supervisor import (
     read_transport_envelope,
     request_supervisor_stop,
     supervisor_request_never_started,
+    write_transport_envelope,
     write_supervisor_request,
     write_supervisor_stop_request,
 )
@@ -31,6 +33,9 @@ operation = Path(sys.argv[1])
 mode = sys.argv[2]
 with (operation / 'native-launches').open('a') as launches:
     launches.write('launched\n')
+os.write(2, b'provider diagnostic\n')
+if mode == 'stderr-overflow':
+    os.write(2, b'x' * 4096)
 sys.stdin.buffer.read()
 while not (operation / 'provider-started.json').exists():
     time.sleep(.005)
@@ -82,6 +87,8 @@ while True:
         sys.exit(0)
     if mode == 'output':
         print('output' * 1000, flush=True)
+    elif mode == 'stderr-output':
+        os.write(2, b'provider diagnostic ' * 1000)
     else:
         (operation / 'heartbeat').write_text(str(time.monotonic_ns()))
     time.sleep(.01)
@@ -136,7 +143,8 @@ def _finish(process, operation, key):
     ("direct", 23, "completed"), ("signal", -15, "completed"),
     ("detached", 23, "descendant_process"), ("old-fd", 23, "descendant_process"),
     ("reopen", 23, "descendant_process"), ("timeout", -15, "timeout"),
-    ("output", -15, "output_limit"), ("stop", -15, "stopped"),
+    ("output", -15, "output_limit"), ("stderr-output", -15, "output_limit"),
+    ("stop", -15, "stopped"),
 ])
 def test_linux_supervisor_proves_owned_tree_closed(tmp_path, mode, code, reason):
     process, operation, key = _launch(tmp_path, mode, timeout=.4 if mode == "timeout" else 4)
@@ -149,6 +157,20 @@ def test_linux_supervisor_proves_owned_tree_closed(tmp_path, mode, code, reason)
     assert receipt["termination_reason"] == reason
     assert receipt["process_tree"]["state"] == "closed"
     assert receipt["process_tree"]["mechanism"] == "linux-subreaper-echild"
+    stderr = (operation / "provider-stderr.log").read_bytes()
+    if mode == "stderr-output":
+        assert len(stderr) == 1024
+        observation = read_transport_envelope(operation / "call-observation.json", key)
+        assert observation["provider_stderr"]["limited"] is True
+        assert observation["limited"] is True
+        assert "provider diagnostic" not in json.dumps(observation)
+    else:
+        assert stderr == b"provider diagnostic\n"
+    heartbeat = read_transport_envelope(operation / "supervisor-heartbeat.json", key)
+    assert heartbeat["schema_ref"] == "meta-research/provider-supervisor-heartbeat/v1"
+    assert heartbeat["invocation_hash"] == "a" * 64
+    assert heartbeat["phase"] == "running"
+    assert isinstance(heartbeat["observed_at"], (int, float))
     if mode in {"detached", "old-fd", "reopen"}:
         time.sleep(1.1)
         target = operation / "late-write"
@@ -170,6 +192,63 @@ def test_cleanup_does_not_stop_parallel_operation(tmp_path):
     write_supervisor_stop_request(other_operation / "supervisor-stop.json",
                                   key=other_key, invocation_hash="a" * 64)
     assert _finish(other, other_operation, other_key)["termination_reason"] == "stopped"
+
+
+def test_supervisor_refreshes_running_heartbeat(tmp_path):
+    supervisor = """
+import sys
+import meta_research.provider_supervisor as provider_supervisor
+provider_supervisor.SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS = .05
+raise SystemExit(provider_supervisor.main([sys.argv[1]]))
+"""
+    process, operation, key = _launch(tmp_path, "heartbeat", supervisor=supervisor)
+    heartbeat_path = operation / "supervisor-heartbeat.json"
+    _wait_file(heartbeat_path)
+    first = read_transport_envelope(heartbeat_path, key)
+    deadline = time.monotonic() + 4
+    second = first
+    while second["observed_at"] <= first["observed_at"]:
+        assert time.monotonic() < deadline, "supervisor heartbeat did not refresh"
+        time.sleep(.02)
+        second = read_transport_envelope(heartbeat_path, key)
+    assert second["phase"] == "running"
+    assert second["observed_at"] > first["observed_at"]
+    assert isinstance(second["stdout_bytes"], int)
+    write_supervisor_stop_request(operation / "supervisor-stop.json",
+                                  key=key, invocation_hash="a" * 64)
+    assert _finish(process, operation, key)["termination_reason"] == "stopped"
+
+
+@pytest.mark.parametrize("phase", ["ready", "running"])
+def test_heartbeat_without_terminal_receipt_blocks_reentry(tmp_path, phase):
+    supervisor = """
+import sys
+import time
+from pathlib import Path
+import meta_research.provider_supervisor as provider_supervisor
+operation = Path(sys.argv[1]).parent
+while not (operation / "heartbeat-test-go").exists():
+    time.sleep(.01)
+raise SystemExit(provider_supervisor.main([sys.argv[1]]))
+"""
+    process, operation, key = _launch(tmp_path, "direct", supervisor=supervisor)
+    write_transport_envelope(operation / "supervisor-heartbeat.json", {
+        "schema_ref": "meta-research/provider-supervisor-heartbeat/v1",
+        "invocation_hash": "a" * 64,
+        "phase": phase,
+        "observed_at": time.time(),
+        "supervisor_process_id": 1234,
+        "supervisor_process_group": 1234,
+    }, key)
+    (operation / "heartbeat-test-go").write_text("go")
+    stdout, stderr = process.communicate(timeout=5)
+    assert (process.returncode, stdout, stderr) == (70, b"", b"")
+    assert not (operation / "supervisor-exit.json").exists()
+    assert not (operation / "native-launches").exists()
+    assert not supervisor_request_never_started(
+        operation, key=key, invocation_hash="a" * 64,
+        request_schema=SUPERVISOR_REQUEST_SCHEMA_V2,
+    )
 
 
 def test_unissued_stop_fences_a_delayed_supervisor(tmp_path):
@@ -194,6 +273,24 @@ def test_missing_request_does_not_prove_unissued_work(tmp_path):
                                                 invocation_hash="a" * 64,
                                                 request_schema=SUPERVISOR_REQUEST_SCHEMA_V2)
     assert not (operation / "supervisor-stop.json").exists()
+
+
+def test_orphan_stderr_sidecar_blocks_unissued_fence(tmp_path):
+    process, operation, key = _launch(tmp_path, "direct", supervisor="""
+import sys
+import time
+from meta_research.provider_supervisor import main
+time.sleep(.2)
+raise SystemExit(main([sys.argv[1]]))
+""")
+    (operation / "provider-stderr.log").write_bytes(b"orphan")
+    assert not supervisor_request_never_started(
+        operation, key=key, invocation_hash="a" * 64,
+        request_schema=SUPERVISOR_REQUEST_SCHEMA_V2,
+    )
+    stdout, stderr = process.communicate(timeout=5)
+    assert (process.returncode, stdout, stderr) == (70, b"", b"")
+    assert not (operation / "native-launches").exists()
 
 
 @pytest.mark.parametrize("failure", ["cleanup", "receipt"])

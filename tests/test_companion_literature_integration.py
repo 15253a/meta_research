@@ -44,11 +44,16 @@ def test_production_companion_reads_exact_other_quest_literature_but_cannot_writ
         assert {item["name"] for item in listing["result"]["tools"]} == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
         names = {item["operation_id"] for item in catalog_operations(runtime.harnesses.dispatch_mcp, companion.connection.token)}
         assert {"research_memory.literature.page", "research_memory.literature.read", "assistant.content.generate"} <= names
-        assert not {"research_memory.literature.register", "research_memory.literature.reference",
-            "research_memory.literature.register.reconcile", "research_memory.literature.reference.reconcile"} & names
+        assert {"research_memory.literature.register", "research_memory.literature.reference",
+            "research_memory.literature.register.reconcile", "research_memory.literature.reference.reconcile"} <= names
+        registered_contract = _accepted(_call(runtime, companion, "tools.contracts.read",
+            operation_id="research_memory.literature.register"))
+        assert registered_contract["access_mode"] == "effect"
+        assert registered_contract["reconciliation_operation_id"] == "research_memory.literature.register.reconcile"
         denied_write = _call(runtime, companion, "research_memory.literature.register", effect_id="forbidden",
             record_ref="doi:no", title="No", source="No", fulltext_status="missing")
         assert denied_write["isError"] and denied_write["structuredContent"]["code"] == "capability_unavailable"
+        assert denied_write["structuredContent"]["details"]["reason"] == "root_kind_not_owner"
 
         assert _accepted(_call(runtime, companion, "research_memory.literature.read", literature_ref=record["ref"]))["status"] == "not_found"
         page = _accepted(_call(runtime, companion, "research_memory.literature.page", source_quest_ref=other))

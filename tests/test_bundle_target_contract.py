@@ -622,8 +622,12 @@ def test_metric_definitions_are_ordered_complete_and_hash_bound() -> None:
     overlap = copy.deepcopy(original)
     protocol = overlap["measurement_contract"]["protocol_version"]
     protocol["optional_metrics"][0]["metric_key"] = "metric:zeta"
-    with pytest.raises(BundleTargetContractError, match="metric_sets_overlap"):
-        formal_target_candidate_from_dict(overlap, completion_contract=contract)
+    with pytest.raises(BundleTargetContractError, match="metric_sets_overlap") as rejected:
+        strategy_update_from_dict(_update(1, [original, overlap], complete=False), completion_contract=contract)
+    assert rejected.value.details == {
+        "candidate_index": 1, "metric_key": "metric:zeta",
+        "required_index": 0, "optional_index": 0, "overlap_count": 1,
+    }
 
 
 def test_protocol_parts_aggregation_and_stop_rules_are_exact_and_closed() -> None:
