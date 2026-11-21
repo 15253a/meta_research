@@ -1,8 +1,9 @@
 # Codex model selection
 
 In a Quest’s **修改配置** dialog, select the Codex model for Idea, Plan,
-Bundle, Target and Reasoning separately. Each stage defaults to
-`gpt-6.1-sol` and uses the model’s highest available reasoning preset. The
+Bundle, Target and Reasoning separately. By default, Idea and Reasoning use
+`gpt-6.2-astra`, while Plan, Bundle and Target use `gpt-6.1-sol`; every stage
+uses the model’s highest available reasoning preset. The
 standard models use Ultra (effective reasoning effort `max`), while Luna uses
 Max because that is its highest available preset. The selector lists the
 visible models supplied by the current Codex CLI, including `gpt-6.2-sol`,

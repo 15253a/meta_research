@@ -9,7 +9,7 @@ import time
 
 from sqlalchemy import text as sql_text
 
-from meta_research.codex_runtime import DEFAULT_STAGE_MODEL, RESEARCH_STAGES, SUPPORTED_CODEX_MODEL_REFS
+from meta_research.codex_runtime import DEFAULT_STAGE_MODELS, RESEARCH_STAGES, SUPPORTED_CODEX_MODEL_REFS
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.research_style import validate_research_style, render_research_style
 from meta_research.quest_research_time import read_quest_research_time_in_transaction
@@ -190,7 +190,7 @@ def _literature_configuration(value):
 
 def _stage_models(value):
     if value is None:
-        return dict.fromkeys(RESEARCH_STAGES, DEFAULT_STAGE_MODEL)
+        return dict(DEFAULT_STAGE_MODELS)
     if (not isinstance(value, dict) or set(value) != set(RESEARCH_STAGES)
             or any(model not in SUPPORTED_CODEX_MODEL_REFS for model in value.values())):
         raise OwnerConflict("stage_models_invalid")

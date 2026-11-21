@@ -19,6 +19,19 @@ SUPPORTED_CODEX_MODEL_REFS = (
 )
 RESEARCH_STAGES = ("idea", "plan", "bundle", "target", "reasoning")
 DEFAULT_STAGE_MODEL = "gpt-6.1-sol"
+DEFAULT_STAGE_MODELS: dict[str, str] = {
+    "idea": "gpt-6.2-astra",
+    "plan": DEFAULT_STAGE_MODEL,
+    "bundle": DEFAULT_STAGE_MODEL,
+    "target": DEFAULT_STAGE_MODEL,
+    "reasoning": "gpt-6.2-astra",
+}
+if set(DEFAULT_STAGE_MODELS) != set(RESEARCH_STAGES) or any(
+    model not in SUPPORTED_CODEX_MODEL_REFS for model in DEFAULT_STAGE_MODELS.values()
+):
+    raise ValueError(
+        "DEFAULT_STAGE_MODELS must map every research stage to a supported Codex model"
+    )
 CODEX_MODEL_REF = os.environ.get("META_RESEARCH_CODEX_MODEL", "gpt-6.1-sol")
 if CODEX_MODEL_REF not in SUPPORTED_CODEX_MODEL_REFS:
     raise ValueError(
