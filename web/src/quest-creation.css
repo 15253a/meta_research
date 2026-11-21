@@ -1144,9 +1144,9 @@
 .quest-deepfetch-live {
   min-width: 0;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.8);
-  border: 1px solid rgba(82, 80, 167, 0.16);
-  border-radius: 9px;
+  background: #ffffff;
+  border: 1px solid #e7e7f3;
+  border-radius: 10px;
 }
 
 .quest-deepfetch-live > header {
@@ -1154,101 +1154,109 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 7px 9px;
-  color: #66658e;
-  border-bottom: 1px solid rgba(82, 80, 167, 0.1);
-  font: 800 8px/1.2 var(--font-family);
-  letter-spacing: 0.07em;
+  padding: 9px 13px;
+  color: #4b516d;
+  background: #fafafe;
+  border-bottom: 1px solid #f0f0f7;
+  font: 600 12px/1.2 var(--font-family);
 }
 
 .quest-deepfetch-live > header span {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
 }
 
-.quest-deepfetch-live > header i {
-  width: 6px;
-  height: 6px;
-  background: #35a99c;
-  border-radius: 50%;
-  box-shadow: 0 0 0 3px rgba(53, 169, 156, 0.13);
-  animation: quest-deepfetch-live-pulse 1.8s ease-in-out infinite;
-}
-
-.quest-deepfetch-live > header code {
-  color: #8584a5;
-  font-size: 8px;
-  letter-spacing: 0;
+.quest-deepfetch-live-count {
+  color: #8b91a8;
+  font-size: 11.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
 }
 
 .quest-deepfetch-live-log {
-  max-height: 116px;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overflow-anchor: none;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #d7d8e8 transparent;
+  padding: 4px 6px;
+}
+
+.quest-deepfetch-live-log.has-stream {
+  height: 192px;
 }
 
 .quest-deepfetch-live-event {
-  display: grid;
-  grid-template-columns: 7px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 7px;
-  min-height: 27px;
-  padding: 5px 9px;
-  border-top: 1px solid rgba(82, 80, 167, 0.07);
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 8px;
+  border-bottom: 1px solid #f4f4fa;
+  border-radius: 6px;
+  transition: background-color 180ms ease;
 }
 
-.quest-deepfetch-live-event:first-child {
-  border-top: 0;
+.quest-deepfetch-live-event:last-child {
+  border-bottom: 0;
+}
+
+.quest-deepfetch-live-event.is-latest {
+  background: #f6f5ff;
 }
 
 .quest-deepfetch-live-event > i {
-  width: 5px;
-  height: 5px;
-  background: #7774d9;
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  margin-top: 6px;
+  background: #c2c0df;
   border-radius: 50%;
 }
 
-.quest-deepfetch-live-event.running > i {
-  background: #35a99c;
-  box-shadow: 0 0 0 3px rgba(53, 169, 156, 0.11);
+.quest-deepfetch-live-event.cat-web_search > i,
+.quest-deepfetch-live-event.cat-web_fetch > i {
+  background: #5cb7aa;
+}
+
+.quest-deepfetch-live-event.is-latest.running > i {
+  background: #625fe7;
+  box-shadow: 0 0 0 3px rgba(98, 95, 231, 0.15);
+}
+
+.quest-deepfetch-live-event.is-latest.cat-web_search > i,
+.quest-deepfetch-live-event.is-latest.cat-web_fetch > i {
+  background: #159987;
+  box-shadow: 0 0 0 3px rgba(21, 153, 135, 0.16);
 }
 
 .quest-deepfetch-live-event.failed > i {
-  background: #d26952;
+  background: #d86a52;
 }
 
 .quest-deepfetch-live-event > span {
   min-width: 0;
-  color: #4f526d;
-  font-size: 9px;
-  line-height: 1.35;
+  color: #464e68;
+  font-size: 12.5px;
+  line-height: 1.5;
   overflow-wrap: anywhere;
 }
 
-.quest-deepfetch-live-event > code {
-  color: #9392ad;
-  font-size: 7px;
-  white-space: nowrap;
+.quest-deepfetch-live-event.is-latest > span {
+  color: #39377a;
+}
+
+.quest-deepfetch-live-event.failed > span {
+  color: #a04d3b;
 }
 
 .quest-deepfetch-live-log > p {
   margin: 0;
-  padding: 11px 9px;
-  color: #85879c;
-  font: 500 8px/1.4 var(--font-family);
-}
-
-@keyframes quest-deepfetch-live-pulse {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-
-  50% {
-    opacity: 1;
-  }
+  padding: 13px 10px;
+  color: #8a90a6;
+  font: 400 12px/1.55 var(--font-family);
 }
 
 .quest-deepfetch-snapshot {
@@ -1995,7 +2003,912 @@
   }
 }
 .quest-material-actions { display: flex; gap: 0.5rem; margin: 0.75rem 0; }
-.quest-understanding h3 { font-size: 0.9rem; margin: 1rem 0 0.5rem; }
-.quest-understanding p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.4rem 0; }
-.quest-understanding small { display: block; color: var(--muted, #737b89); overflow-wrap: anywhere; }
-.quest-understanding details { margin-top: 1rem; }
+
+/* Cohesive typography, balanced spacing, and refined card rhythm inside the workspace modal. */
+.quest-dialog.workspace-modal .quest-window {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.quest-dialog.workspace-modal .quest-modal-header {
+  padding: 16px 24px;
+  gap: 14px;
+}
+
+.quest-dialog.workspace-modal .quest-modal-title h2 {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--quest-ink);
+}
+
+.quest-dialog.workspace-modal .quest-modal-title p {
+  margin-top: 3px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #5e6a82;
+}
+
+.quest-dialog.workspace-modal .quest-modal-meta {
+  align-items: center;
+  gap: 8px;
+}
+
+.quest-dialog.workspace-modal .quest-modal-chip {
+  min-height: 0;
+  padding: 5px 6px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.3;
+  color: #6d788e;
+  background: transparent;
+  border: 1px solid transparent;
+}
+
+.quest-dialog.workspace-modal .quest-modal-chip.current {
+  padding: 5px 11px;
+  color: #137e70;
+  background: #eaf8f5;
+  border-color: #bfe6dd;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-modal-layout {
+  grid-template-columns: minmax(0, 1fr) 344px;
+}
+
+.quest-dialog.workspace-modal .quest-continuous-form {
+  padding: 24px clamp(24px, 3vw, 40px) 44px;
+}
+
+.quest-dialog.workspace-modal .quest-stage-track {
+  margin-bottom: 24px;
+}
+
+.quest-dialog.workspace-modal .quest-stage-track > span {
+  font-size: 13px;
+  font-weight: 500;
+  padding-bottom: 10px;
+}
+
+.quest-dialog.workspace-modal .quest-stage-track [data-state="current"] {
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-journey-section + .quest-journey-section {
+  margin-top: 30px;
+  padding-top: 26px;
+  border-top: 1px solid #e5e9f2;
+}
+
+.quest-dialog.workspace-modal .quest-section-heading {
+  margin-bottom: 14px;
+}
+
+.quest-dialog.workspace-modal .quest-section-heading b {
+  font-size: 16.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--quest-ink);
+}
+
+.quest-dialog.workspace-modal .quest-section-heading small {
+  margin-top: 4px;
+  font-size: 12.5px;
+  font-weight: 400;
+  line-height: 1.55;
+  color: #66718a;
+}
+
+.quest-dialog.workspace-modal .quest-basis-card {
+  gap: 16px;
+}
+
+.quest-dialog.workspace-modal .quest-field {
+  gap: 7px;
+  align-content: start;
+}
+
+.quest-dialog.workspace-modal .quest-field > span,
+.quest-dialog.workspace-modal .quest-session-compose > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: #374358;
+}
+
+.quest-dialog.workspace-modal .quest-basis-card .quest-field > span {
+  color: #374358;
+}
+
+.quest-dialog.workspace-modal .quest-field em,
+.quest-dialog.workspace-modal .quest-basis-card .quest-field em {
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: #c25238;
+  background: #fff0ec;
+}
+
+.quest-dialog.workspace-modal .quest-field em.optional,
+.quest-dialog.workspace-modal .quest-basis-card .quest-field em.optional {
+  color: #69758c;
+  background: #f0f2f8;
+  font-weight: 500;
+}
+
+.quest-dialog.workspace-modal .quest-field input,
+.quest-dialog.workspace-modal .quest-field textarea,
+.quest-dialog.workspace-modal .quest-field select {
+  padding: 10px 12px;
+  border: 1px solid #d3dae8;
+  border-radius: 10px;
+  font-size: 13.5px;
+  font-weight: 400;
+  line-height: 1.65;
+  color: var(--quest-ink);
+}
+
+.quest-dialog.workspace-modal .quest-basis-card textarea {
+  min-height: 120px;
+}
+
+.quest-dialog.workspace-modal .quest-basis-card > label:nth-child(2) textarea {
+  min-height: 128px;
+}
+
+/* Balanced 2-column top row (style + budget) above a full-width compute card. */
+.quest-dialog.workspace-modal .quest-config-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.quest-dialog.workspace-modal .quest-research-style {
+  grid-column: auto;
+}
+
+.quest-dialog.workspace-modal .quest-research-style > small {
+  font-size: 12px;
+  line-height: 1.55;
+  color: #66718a;
+}
+
+.quest-dialog.workspace-modal .quest-time-budget.time-budget-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  align-self: start;
+}
+
+.quest-dialog.workspace-modal .quest-compute {
+  grid-column: 1 / -1;
+  padding: 16px 18px;
+  background: #f8f9fd;
+  border: 1px solid #dfe5f0;
+  border-radius: 14px;
+}
+
+.quest-dialog.workspace-modal .quest-compute-head b {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--quest-ink);
+}
+
+.quest-dialog.workspace-modal .quest-compute-head small {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #66718a;
+}
+
+.quest-dialog.workspace-modal .quest-compute-head button {
+  min-height: 38px;
+  padding: 0 15px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-compute-status {
+  margin: 12px 0;
+  padding: 10px 13px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.quest-dialog.workspace-modal .quest-device-list {
+  gap: 10px;
+  margin-bottom: 11px;
+}
+
+.quest-dialog.workspace-modal .quest-device {
+  min-height: 56px;
+  padding: 11px 13px;
+  border-radius: 11px;
+  transition: border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
+}
+
+.quest-dialog.workspace-modal .quest-device b {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.quest-dialog.workspace-modal .quest-device span {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: #69758c;
+}
+
+.quest-dialog.workspace-modal .quest-device[aria-pressed="true"] span {
+  color: #5b58b6;
+}
+
+.quest-dialog.workspace-modal .quest-compute-boundary {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #5c687f;
+}
+
+.quest-dialog.workspace-modal .quest-compute-boundary b {
+  color: #374358;
+  font-weight: 600;
+}
+
+/* Unified card framing for materials & route sections. */
+.quest-dialog.workspace-modal .quest-literature-card {
+  margin-top: 0;
+  padding: 18px;
+  border-radius: 14px;
+}
+
+.quest-dialog.workspace-modal .quest-material-card {
+  padding: 18px;
+  border: 1px solid #dfe4ee;
+  border-radius: 14px;
+  background: #fff;
+  gap: 13px;
+}
+
+.quest-dialog.workspace-modal .quest-material-intro {
+  font-size: 13px;
+  line-height: 1.6;
+  color: #5c687f;
+}
+
+.quest-dialog.workspace-modal .quest-route-card {
+  padding: 18px;
+  border: 1px solid #dfe4ee;
+  border-radius: 14px;
+}
+
+.quest-dialog.workspace-modal .quest-route-options {
+  gap: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-route-choice {
+  padding: 15px 16px;
+  border-radius: 12px;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--quest-ink);
+  transition: border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
+}
+
+.quest-dialog.workspace-modal .quest-route-choice:hover:not(:disabled) {
+  border-color: #b4b1ee;
+  background: #faf9ff;
+}
+
+.quest-dialog.workspace-modal .quest-route-choice b {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-route-choice small {
+  margin-top: 5px;
+  font-size: 12.5px;
+  font-weight: 400;
+  line-height: 1.55;
+  color: #636f86;
+}
+
+.quest-dialog.workspace-modal .quest-route-note {
+  margin-top: 12px;
+  padding: 10px 13px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #556178;
+  background: #f6f7fc;
+  border-left: 3px solid #a29fef;
+}
+
+/* Compact, structured card for CreationUnderstanding. */
+.quest-understanding-card {
+  padding: 18px;
+  border: 1px solid #dfe4ee;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.quest-understanding-stale {
+  margin: 0 0 14px;
+  padding: 10px 13px;
+  border-radius: 10px;
+  background: #fff6f2;
+  border: 1px solid #f0d2c8;
+  color: #93503f;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.quest-understanding-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.quest-understanding-item {
+  padding: 11px 13px;
+  border: 1px solid #e7ebf3;
+  border-radius: 10px;
+  background: #fafbfd;
+  min-width: 0;
+}
+
+.quest-understanding-item h3,
+.quest-understanding-block h3,
+.quest-understanding-subblock h3 {
+  margin: 0 0 5px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: #2f3b52;
+}
+
+.quest-understanding-item p,
+.quest-understanding-block p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #4f5c73;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.quest-understanding-item.is-empty {
+  background: #fbfcfe;
+  border-color: #edf0f6;
+}
+
+.quest-understanding-item.is-empty p {
+  color: #8b95a9;
+}
+
+.quest-understanding-list {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #4b5870;
+}
+
+.quest-understanding-block {
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #edf0f6;
+}
+
+.quest-understanding-block:last-child {
+  margin-bottom: 0;
+  margin-top: 14px;
+  padding-top: 12px;
+  padding-bottom: 0;
+  border-bottom: 0;
+  border-top: 1px solid #edf0f6;
+}
+
+.quest-understanding-subblock {
+  margin-top: 10px;
+}
+
+.quest-understanding-meta,
+.quest-understanding-card small {
+  display: block;
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #717c91;
+  overflow-wrap: anywhere;
+}
+
+.quest-understanding-details {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #edf0f6;
+  font-size: 12.5px;
+  color: #556178;
+}
+
+.quest-understanding-details > summary {
+  cursor: pointer;
+  font-weight: 500;
+  color: #4a566d;
+  width: fit-content;
+}
+
+.quest-understanding-empty-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #8b95a9;
+}
+
+/* Readable typography across DeepFetch runway, proposal card, and feedback banners. */
+.quest-dialog.workspace-modal .quest-deepfetch-runway {
+  padding: 13px 14px;
+  gap: 10px;
+  border-radius: 11px;
+  background: #f8f8fd;
+  border: 1px solid #e7e6f5;
+  box-shadow: none;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-runway.failed,
+.quest-dialog.workspace-modal .quest-deepfetch-runway.cancelled {
+  background: #fff8f6;
+  border-color: #f0d4cb;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-runway.succeeded {
+  background: #f4fbf8;
+  border-color: #d4eae2;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-head b {
+  margin-top: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #2f3754;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-runway.failed .quest-deepfetch-head b,
+.quest-dialog.workspace-modal .quest-deepfetch-runway.cancelled .quest-deepfetch-head b {
+  color: #9b4836;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-head > span {
+  padding: 4px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  border-color: #d9d8f4;
+  background: #ffffff;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-runway.failed .quest-deepfetch-head > span,
+.quest-dialog.workspace-modal .quest-deepfetch-runway.cancelled .quest-deepfetch-head > span {
+  color: #a64a37;
+  border-color: #ebc6bc;
+  background: #fffaf8;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-runway.succeeded .quest-deepfetch-head > span {
+  color: #197466;
+  border-color: #c5e3da;
+  background: #f8fdfb;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-live > header {
+  padding: 9px 13px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-live-log > p {
+  padding: 13px 10px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #8389a0;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-live-event {
+  padding: 8px 8px;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-live-event > span {
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.quest-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-snapshot {
+  padding: 10px 13px;
+  max-height: 132px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #c8ded7 transparent;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-snapshot p {
+  margin: 6px 0 0;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-snapshot b {
+  font-size: 12.5px;
+}
+
+.quest-dialog.workspace-modal .quest-deepfetch-snapshot small,
+.quest-dialog.workspace-modal .quest-deepfetch-snapshot p,
+.quest-dialog.workspace-modal .quest-deepfetch-snapshot li,
+.quest-dialog.workspace-modal .quest-deepfetch-failure {
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.quest-dialog.workspace-modal .quest-proposal {
+  padding: 18px;
+  border-radius: 14px;
+  border: 1px solid #dfe4ee;
+}
+
+.quest-dialog.workspace-modal .quest-question-sourcebar {
+  margin-bottom: 12px;
+  padding: 10px 13px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.quest-dialog.workspace-modal .quest-question-sourcebar b {
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-question-sourcebar small {
+  font-size: 12px;
+  color: #6b6b88;
+}
+
+.quest-dialog.workspace-modal .quest-proposal-state {
+  padding: 16px 18px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  gap: 14px;
+}
+
+.quest-dialog.workspace-modal .quest-proposal-state code {
+  font-size: 11.5px;
+}
+
+.quest-dialog.workspace-modal .quest-proposal-action {
+  min-height: 40px;
+  padding: 0 18px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--quest-violet);
+  border-color: var(--quest-violet);
+  box-shadow: 0 4px 12px rgba(98, 95, 231, 0.2);
+  white-space: nowrap;
+}
+
+.quest-dialog.workspace-modal .quest-proposal-action:hover:not(:disabled) {
+  background: #514ecb;
+  border-color: #514ecb;
+}
+
+.quest-dialog.workspace-modal .quest-proposal-action:disabled {
+  color: #8b94a7;
+  background: #eef0f6;
+  border-color: #dce1ec;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+.quest-dialog.workspace-modal .quest-inline-button {
+  min-height: 38px;
+  padding: 0 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-proposal-grid {
+  gap: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-question-fields .seed-field {
+  padding: 12px 14px;
+  border-radius: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-question-fields .seed-field-head {
+  margin-bottom: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #374358;
+}
+
+.quest-dialog.workspace-modal .quest-question-fields .seed-field-head em {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-question-fields .seed-field input,
+.quest-dialog.workspace-modal .quest-question-fields .seed-field textarea {
+  font-size: 13.5px;
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+.quest-dialog.workspace-modal .quest-proposal-validation {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-impact-summary {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-impact-summary > b {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-impact-columns small {
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-impact-columns p {
+  margin-top: 4px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.quest-dialog.workspace-modal .quest-technical-details {
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-technical-details summary {
+  min-height: 34px;
+  padding: 8px 0;
+  font-size: 12px;
+  color: #5f6b82;
+}
+
+.quest-dialog.workspace-modal .quest-error {
+  padding: 13px 15px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.quest-dialog.workspace-modal .quest-error code {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 11.5px;
+  opacity: 0.85;
+}
+
+/* Right sidebar: crisp summary card + comfortable assistant panel. */
+.quest-dialog.workspace-modal .quest-research-start {
+  padding: 20px 18px;
+  background: #f4f6fb;
+}
+
+.quest-dialog.workspace-modal .quest-start-readings {
+  padding: 15px 16px;
+  border: 1px solid #e2e6f2;
+  border-radius: 16px;
+  background: #fff;
+}
+
+.quest-dialog.workspace-modal .quest-start-readings h3 {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--quest-ink);
+}
+
+.quest-dialog.workspace-modal .quest-start-readings dl {
+  margin: 11px 0 0;
+  padding-top: 9px;
+  border-top: 1px solid #edf0f6;
+}
+
+.quest-dialog.workspace-modal .quest-start-readings dl > div {
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 10px;
+  margin: 8px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.quest-dialog.workspace-modal .quest-start-readings dl > div:last-child {
+  margin-bottom: 0;
+}
+
+.quest-dialog.workspace-modal .quest-start-readings dd {
+  color: #253046;
+  font-weight: 500;
+}
+
+.quest-dialog.workspace-modal .quest-research-start .quest-intent-session {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #e1dff1;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #f4f2ff, #fff 42%);
+}
+
+.quest-dialog.workspace-modal .quest-intent-header {
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 10px;
+  padding-bottom: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-intent-header .meta-trace {
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  padding: 5px;
+  border-radius: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-intent-header b {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--quest-ink);
+}
+
+.quest-dialog.workspace-modal .quest-intent-header small {
+  margin-top: 2px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.45;
+  color: #66718a;
+}
+
+.quest-dialog.workspace-modal .quest-native-session {
+  padding: 9px 2px;
+  font-size: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-native-session summary {
+  font-weight: 500;
+}
+
+.quest-dialog.workspace-modal .quest-intent-empty,
+.quest-dialog.workspace-modal .quest-intent-message {
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.quest-dialog.workspace-modal .quest-intent-message small {
+  font-size: 11px;
+}
+
+.quest-dialog.workspace-modal .quest-session-compose-row {
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 8px;
+}
+
+.quest-dialog.workspace-modal .quest-session-compose textarea {
+  padding: 9px 11px;
+  min-height: 68px;
+  font-size: 13px;
+  line-height: 1.55;
+  border-radius: 10px;
+}
+
+.quest-dialog.workspace-modal .quest-session-send {
+  width: 36px;
+  height: 36px;
+  flex-basis: 36px;
+  border-radius: 10px;
+  font-size: 15px;
+}
+
+.quest-dialog.workspace-modal .quest-compose-shortcut {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.quest-dialog.workspace-modal .quest-intent-status {
+  padding: 8px 0;
+  font-size: 11.5px;
+}
+
+.quest-dialog.workspace-modal .quest-intent-boundary {
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #5b677e;
+  background: #f7f8fc;
+  border-left: 3px solid #aba7ef;
+  border-radius: 0 9px 9px 0;
+}
+
+.quest-dialog.workspace-modal .quest-intent-boundary b {
+  color: #46439e;
+  font-weight: 600;
+}
+
+/* Footer: clear status + crisp action buttons. */
+.quest-dialog.workspace-modal .quest-footer {
+  padding: 14px 24px;
+  gap: 12px;
+}
+
+.quest-dialog.workspace-modal .quest-footer-note {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: #526078;
+}
+
+.quest-dialog.workspace-modal .quest-autosave-state {
+  margin-top: 2px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: #778299;
+}
+
+.quest-dialog.workspace-modal .quest-footer button {
+  min-height: 40px;
+  padding: 0 18px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.quest-dialog.workspace-modal .quest-footer .confirm {
+  min-width: 210px;
+}
+
+@media (max-width: 760px) {
+  .quest-dialog.workspace-modal .quest-modal-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .quest-dialog.workspace-modal .quest-config-grid,
+  .quest-understanding-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .quest-dialog.workspace-modal .quest-footer {
+    padding: 12px 14px max(12px, env(safe-area-inset-bottom));
+  }
+}

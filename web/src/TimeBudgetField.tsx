@@ -12,11 +12,13 @@ export function TimeBudgetField({ value, onChange, onBlur, disabled = false, cla
   }, [value, invalid]);
   return <div className={`time-budget-field ${className}`}>
     <label><span>时间预算（小时）</span><input aria-label="时间预算" type="number" min="0.01" step="0.01"
-      placeholder="输入小时数，例如 2.5" value={timeBudgetHours(value)} disabled={disabled || value === "open"}
+      placeholder="输入小时数，例如 24" value={timeBudgetHours(value)} disabled={disabled || value === "open"}
       aria-invalid={invalid || undefined} onChange={event => onChange(`${event.currentTarget.value}h`)} onBlur={onBlur} /></label>
-    <button type="button" className="time-budget-open" aria-pressed={value === "open"} disabled={disabled}
-      onClick={() => onChange(value === "open" ? previousHours.current : "open")}>不设总时长建议</button>
-    <small>规划参考，可按研究进展调整；超出预算不会自动停止研究。</small>
+    <div className="time-budget-meta">
+      <button type="button" className="time-budget-open" aria-pressed={value === "open"} disabled={disabled}
+        onClick={() => onChange(value === "open" ? previousHours.current : "open")}>不设总时长建议</button>
+      <small>规划参考，可随时调整，超出不会自动中止。</small>
+    </div>
     {invalid ? <small role="alert">请输入大于 0 的小时数，最多两位小数。</small> : null}
   </div>;
 }

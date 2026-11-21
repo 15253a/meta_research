@@ -39,6 +39,7 @@ import { MetaTrace } from "./MetaTrace";
 import "./quest-creation.css";
 import { FirstQuestionProgress, currentDeepFetch, currentProposalGeneration, preparationRetryBlocked, preparationReconciliationCopy } from "./FirstQuestionProgress";
 import { useReplyStream } from "./chatReplyStream";
+import { useSmoothFollowScroll } from "./useSmoothFollowScroll";
 
 type PendingIntentMessage = {
   content: string;
@@ -318,12 +319,16 @@ export function QuestCreationWorkbench({
     received: QuestCreationView,
     options: ApplyViewOptions = {},
   ): boolean => {
-    const next = normalizeQuestCreationView(received);
+    const normalized = normalizeQuestCreationView(received);
     const previous = creationRef.current;
-    if (previous && previous.initialization_id !== next.initialization_id) return false;
-    if (previous && viewIsOlder(previous, next)) return false;
-    creationRef.current = next;
-    setCreation(next);
+    if (previous && previous.initialization_id !== normalized.initialization_id) return false;
+    if (previous && viewIsOlder(previous, normalized)) return false;
+    const next = preserveMonotonicDeepFetchEvents(previous, normalized);
+    const unchangedView = previous !== null && JSON.stringify(previous) === JSON.stringify(next);
+    if (!unchangedView) {
+      creationRef.current = next;
+      setCreation(next);
+    }
     if (options.adoptDirtyDraftBasis && draftDirtyRef.current) {
       const nextDraft = cloneDraft(next.quest_draft.value);
       const mergedDraft = mergeServerManagedDraft(
@@ -1425,10 +1430,10 @@ export function QuestCreationWorkbench({
           <div className="quest-modal-title">
             <small>新建研究任务</small>
             <h2 id="quest-creation-title">创建 Quest，并决定第一个研究问题</h2>
-            <p>填写目标与边界后，系统会协助起草；最终创建需要你确认。</p>
+            <p>先填写研究目标与边界，系统会协助起草第一问；经你确认后才会正式创建。</p>
           </div>
           <div className="quest-modal-meta">
-            <span className="quest-modal-chip">关闭后保留本页面草稿</span>
+            <span className="quest-modal-chip">关闭自动保留草稿</span>
             <span className="quest-modal-chip current">{statusLabel}</span>
           </div>
           <button
@@ -1458,18 +1463,18 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="basis" aria-label="Quest 背景、目标与边界">
                 <div className="quest-section-heading">
                   <b>研究简报</b>
-                  <small>说明已有工作、希望改变的事情，以及这次研究的范围</small>
+                  <small>说明核心目标、已有背景，以及必须遵守的范围与约束</small>
                 </div>
                 <div className="quest-basis-card">
                   <label className="quest-field">
-                    <span>背景（可选）</span>
+                    <span>背景 <em className="optional">可选</em></span>
                     <textarea
                       aria-label="背景（可选）"
                       rows={4}
                       maxLength={12_000}
                       value={draft.background_and_initial_direction}
                       disabled={!creation || draftInteractionLocked}
-                      placeholder="已有事实、研究动机，以及希望第一问优先关注的方向。"
+                      placeholder="简述已有基础、研究动机，或希望第一问优先切入的方向。"
                       onChange={(event) => updateDraft({
                         ...draft,
                         background_and_initial_direction: event.target.value,
@@ -1486,7 +1491,7 @@ export function QuestCreationWorkbench({
                       maxLength={4000}
                       value={draft.goal}
                       disabled={!creation || draftInteractionLocked}
-                      placeholder="这项研究最终要回答什么、交付什么？"
+                      placeholder="说明这项研究最终要回答的核心问题，以及期望交付的成果或证据形态。"
                       onChange={(event) => updateDraft({ ...draft, goal: event.target.value })}
                       onBlur={() => void persistDraft()}
                     />
@@ -1499,7 +1504,7 @@ export function QuestCreationWorkbench({
                       maxLength={boundaryInputMaxLength(draft)}
                       value={boundaryText(draft)}
                       disabled={!creation || draftInteractionLocked}
-                      placeholder="怎样算完成？哪些范围、约束或排除项必须遵守？"
+                      placeholder="写明完成标准、不做的范围，以及数据、方法或实验上的硬约束。"
                       onChange={(event) => updateBoundary(event.target.value)}
                       onBlur={() => void persistDraft()}
                     />
@@ -1510,7 +1515,7 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="configuration" aria-labelledby="quest-config-title">
                 <div className="quest-section-heading">
                   <b id="quest-config-title">研究方式与资源</b>
-                  <small>按实际研究需要使用已选资源</small>
+                  <small>设定探索风格、时间预算参考与允许使用的计算设备</small>
                 </div>
                 <div className="quest-config-card">
                   <div className="quest-config-grid">
@@ -1523,10 +1528,10 @@ export function QuestCreationWorkbench({
                         {RESEARCH_STYLES.map(style => <option key={style.value} value={style.value}>{style.label}</option>)}
                       </select>
                       <small id="quest-research-style-help">
-                        {RESEARCH_STYLES.find(style => style.value === draft.research_style)?.description} 这是持续研究倾向，仍须遵循你明确保留的条件。
+                        {RESEARCH_STYLES.find(style => style.value === draft.research_style)?.description} 作为持续研究偏好，始终遵守你写明的边界条件。
                       </small>
                     </label>
-                    <TimeBudgetField className="quest-field" value={draft.time_budget}
+                    <TimeBudgetField className="quest-field quest-time-budget" value={draft.time_budget}
                       disabled={!creation || draftInteractionLocked}
                       onChange={time_budget => updateDraft({ ...draft, time_budget })}
                       onBlur={() => void persistDraft()} />
@@ -1534,7 +1539,7 @@ export function QuestCreationWorkbench({
                       <div className="quest-compute-head">
                         <div>
                           <b id="quest-compute-title">本机计算卡</b>
-                          <small>由运行研究的服务器检测</small>
+                          <small>从当前运行研究的服务器实时检测</small>
                         </div>
                         <button
                           ref={computeButtonRef}
@@ -1589,8 +1594,8 @@ export function QuestCreationWorkbench({
 
               <section className="quest-journey-section" data-journey-section="literature" aria-labelledby="quest-literature-title">
                 <div className="quest-section-heading">
-                  <b id="quest-literature-title">DeepFetch 配置</b>
-                  <small>设置文献如何下载，以及从哪里检索</small>
+                  <b id="quest-literature-title">文献检索与全文配置</b>
+                  <small>设置补充检索时的来源范围与论文全文下载方式</small>
                 </div>
                 <div className="quest-literature-card">
                   <div className="quest-fulltext-heading">
@@ -1673,7 +1678,7 @@ export function QuestCreationWorkbench({
                       </label>
                     </div>
                   ) : null}
-                  <p className="quest-fulltext-save-hint">设置随草稿自动保存。全文获取与下方搜索源选择分别保存。</p>
+                  <p className="quest-fulltext-save-hint">全文获取设置随草稿自动保存；下方检索来源勾选需单独保存。</p>
                   {draft.literature.mode !== "provided_only" && acquisitionSession ? <details className="quest-acquisition-details">
                     <summary>查看检测详情</summary>
                     <p>{acquisitionConfigPending ? "当前设置尚未保存，以下为上次检测记录。" : "检测用于确认获取环境，不表示文献已下载。"}</p>
@@ -1708,10 +1713,10 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="materials" aria-labelledby="quest-materials-title">
                 <div className="quest-section-heading">
                   <b id="quest-materials-title">研究材料 <em>可选</em></b>
-                  <small>从已有论文、数据或研究结果开始</small>
+                  <small>引入已有论文、数据集或前期结果作为起草参考</small>
                 </div>
                 <div className="quest-material-card">
-                  <p className="quest-material-intro">添加已有材料，供系统起草第一问时阅读和参考。保存后会显示读取与处理情况。</p>
+                  <p className="quest-material-intro">可关联服务器上的已有文件或目录，系统起草第一问时会优先阅读并展示处理情况。</p>
                   <WorkMaterialFields draft={referenceDraft} disabled={!creation || draftInteractionLocked} showReceipts={false}
                     onRetried={() => { void refreshMaterials(); }} />
                   {referenceDraft.selection ? <button type="button" className="quest-material-save" disabled={!creation || draftInteractionLocked || referenceDraft.busy || !!referenceDraft.pending || !referenceDraft.receiver}
@@ -1724,8 +1729,8 @@ export function QuestCreationWorkbench({
 
               <section className="quest-journey-section" data-journey-section="route" aria-labelledby="quest-route-title">
                 <div className="quest-section-heading">
-                  <b id="quest-route-title">生成第一问之前，要不要补充检索？</b>
-                  <small>选择第一问的准备方式，生成后仍可编辑和确认</small>
+                  <b id="quest-route-title">起草第一问的方式</b>
+                  <small>决定是否先补充检索相关文献；生成后仍可自由编辑并确认</small>
                 </div>
                 <div className="quest-route-card">
                   <div className="quest-route-options">
@@ -1738,7 +1743,7 @@ export function QuestCreationWorkbench({
                       onClick={() => updateDraft({ ...draft, route: "deepfetch" })}
                     >
                       <b>先运行 DeepFetch</b>
-                      <small>先检索相关研究、获取可用全文，再起草第一个问题。</small>
+                      <small>先联网检索相关研究并获取可用全文，再结合文献起草第一个问题。</small>
                     </button>
                     <button
                       className="quest-route-choice"
@@ -1749,13 +1754,13 @@ export function QuestCreationWorkbench({
                       onClick={() => updateDraft({ ...draft, route: "direct" })}
                     >
                       <b>直接根据目标生成</b>
-                      <small>根据当前目标、边界和已提供材料直接起草。</small>
+                      <small>不发起联网检索，直接根据当前目标、边界与已提供材料起草。</small>
                     </button>
                   </div>
                   <p className="quest-route-note">
                     {draft.route === "deepfetch"
-                      ? "将先整理检索结果，再生成第一问；你确认后才会创建研究任务。"
-                      : "将直接生成第一问，不启动补充检索；你确认后才会创建研究任务。"}
+                      ? "将先整理检索结果再生成第一问；经你确认后才会正式创建研究任务。"
+                      : "将直接生成第一问，不启动补充检索；经你确认后才会正式创建研究任务。"}
                   </p>
                 </div>
               </section>
@@ -1764,12 +1769,19 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="question-proposal" aria-labelledby="quest-proposal-title">
                 <div className="quest-section-heading">
                   <b id="quest-proposal-title">系统起草的第一个研究问题</b>
-                  <small>六字段持续可编辑</small>
+                  <small>六个字段支持逐项修改，确认前不会正式启动</small>
                 </div>
                 {creation ? <FirstQuestionProgress creation={creation} pending={inFlight.generating} enabled={dialogOpen}>
                   {deepfetch ? <div className={`quest-deepfetch-runway ${deepfetch.status}`} data-testid="deepfetch-runway" data-status={deepfetch.status}>
                     <div className="quest-deepfetch-head"><b>补充检索与资料阅读</b><span role="status">{deepfetchStatusLabel(deepfetch)}</span></div>
-                    <DeepFetchLiveEvents attemptRef={deepfetch.run?.attempt_ref ?? null} events={deepfetch.recent_events ?? []} />
+                    <DeepFetchLiveEvents
+                      requestRef={deepfetch.request_ref}
+                      attemptRef={deepfetch.run?.attempt_ref ?? null}
+                      events={deepfetch.recent_events ?? []}
+                      active={["queued", "running", "accepting"].includes(deepfetch.status)}
+                      status={deepfetch.status}
+                      dialogOpen={dialogOpen}
+                    />
                     {deepfetch.literature_snapshot ? <div className="quest-deepfetch-snapshot"><b>本轮保留 {deepfetch.literature_snapshot.paper_count} 篇论文，{deepfetch.literature_snapshot.fulltext_count} 篇有全文</b>
                       {deepfetch.literature_snapshot.limitations.map(limit => <p key={limit}>{limit}</p>)}</div> : null}
                     {deepfetch.failure ? <p className="quest-deepfetch-failure">{deepfetchFailureCopy(deepfetch)}</p> : null}
@@ -1793,8 +1805,7 @@ export function QuestCreationWorkbench({
                           ? "正在整理检索到的资料并起草第一个问题。你可以继续使用右侧助手。"
                           : "正在根据已保存的研究目标起草第一个问题。你可以继续使用右侧助手。"}
                       </span>
-                      <code>proposal_generating</code>
-                      <small>{deepfetch?.activity ?? generation?.status ?? "queued"}</small>
+                      <code className="quest-visually-hidden">proposal_generating</code>
                     </div>
                   ) : null}
                   {creation?.status === "proposal_stale" || creation?.proposal?.status === "stale" ? (
@@ -1956,7 +1967,7 @@ export function QuestCreationWorkbench({
             <aside className="quest-research-start" data-reading-position="sidebar" aria-label="研究路线与助手">
             <section className="quest-start-readings" aria-label="你的研究起点"><h3>你的研究起点</h3><dl>
               <div><dt>时间预算</dt><dd>{timeBudgetLabel(draft.time_budget)}</dd></div>
-              <div><dt>登记设备</dt><dd>{creation?.resource_envelope ? resourceEnvelopeCopy(creation) : "尚未检测并选择"}</dd></div>
+              <div><dt>登记设备</dt><dd>{creation?.resource_envelope ? sidebarDevicesCopy(creation) : "尚未检测并选择"}</dd></div>
               <div><dt>全文获取</dt><dd>{draft.literature.mode === "provided_only" ? "仅已提供材料" : draft.literature.mode === "oa_only" ? "仅开放全文" : "公开全文与可选图书馆下载"}</dd></div>
             </dl></section>
             <IntentDraftingSession
@@ -2050,7 +2061,7 @@ function IntentDraftingSession({
         <MetaTrace variant="assistant" />
         <div>
           <b>研究助手</b>
-          <small>一起确定研究起点与第一问</small>
+          <small>协助梳理目标与检索，打磨第一问</small>
           <span>{creation?.intent_session?.ref ?? "正在建立 pre-Quest session"}</span>
         </div>
       </header>
@@ -2065,7 +2076,7 @@ function IntentDraftingSession({
       <div className="quest-intent-transcript" data-reading-position="assistant" ref={transcriptRef} aria-live="polite">
         {!turns.length && !visiblePendingMessage ? (
           <p className="quest-intent-empty">
-            我会在这里解释配置、讨论是否需要 DeepFetch，并帮助缩小第一问；左侧字段仍只由你编辑。
+            可以在这里讨论研究目标、是否需要 DeepFetch，或一起打磨第一问；左侧表单内容始终由你编辑。
           </p>
         ) : turns.map((turn) => (
           <div key={turn.ref}>
@@ -2094,7 +2105,7 @@ function IntentDraftingSession({
         ) : null}
       </div>
       <div className="quest-session-compose">
-        <label htmlFor="quest-intent-message">继续讨论</label>
+        <label htmlFor="quest-intent-message">与助手讨论</label>
         <div className="quest-session-compose-row">
           <textarea
             id="quest-intent-message"
@@ -2102,7 +2113,7 @@ function IntentDraftingSession({
             rows={3}
             value={value}
             disabled={disabled}
-            placeholder="讨论第一问；/new 保留工作空间并更换会话……"
+            placeholder="输入想法或问题…（/new 开启新会话并保留草稿）"
             onChange={(event) => onChange(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && value.trim()) {
@@ -2121,14 +2132,14 @@ function IntentDraftingSession({
             ↑
           </button>
         </div>
-        <small className="quest-compose-shortcut">Enter 发送 · Shift+Enter 换行 · /new 开启新会话</small>
+        <small className="quest-compose-shortcut">Enter 发送 · Shift+Enter 换行 · /new 新会话</small>
       </div>
       <div className="quest-intent-status">
-        <span>{creation?.intent_session?.status ?? "opening"}</span>
-        <span>{creation ? `绑定 draft r${creation.quest_draft.revision}` : "等待 initialization"}</span>
+        <span>{intentSessionStatusLabel(creation?.intent_session?.status)}</span>
+        <span>{creation ? `绑定 draft r${creation.quest_draft.revision}` : "等待初始化"}</span>
       </div>
       <div className="quest-intent-boundary">
-        <b>在这里讨论研究想法。</b> 将选定的内容填入左侧草稿，核对后再确认创建。
+        <b>在这里讨论研究想法。</b> 采纳的建议可填入左侧草稿，核对后再确认创建。
       </div>
     </aside>
   );
@@ -2604,83 +2615,193 @@ function previewStatusRank(
   return ["current", "stale", "consumed"].indexOf(status);
 }
 
+const MAX_DEEPFETCH_DISPLAY_EVENTS = 60;
+
+type DeepFetchLedger = {
+  streamKey: string;
+  items: DeepFetchActivityEvent[];
+  entering: number[];
+};
+
+function normalizeDeepFetchEvents(events: DeepFetchActivityEvent[]): DeepFetchActivityEvent[] {
+  if (!events.length) return [];
+  const bySeq = new Map<number, DeepFetchActivityEvent>();
+  for (const event of events) bySeq.set(event.sequence, event);
+  return [...bySeq.values()].sort((a, b) => a.sequence - b.sequence).slice(-MAX_DEEPFETCH_DISPLAY_EVENTS);
+}
+
+function mergeDeepFetchLedger(
+  previous: DeepFetchLedger,
+  streamKey: string,
+  incoming: DeepFetchActivityEvent[],
+): DeepFetchLedger {
+  if (previous.streamKey !== streamKey) {
+    return {
+      streamKey,
+      items: normalizeDeepFetchEvents(incoming),
+      entering: [],
+    };
+  }
+  if (!incoming.length) return previous;
+  const bySeq = new Map<number, DeepFetchActivityEvent>();
+  for (const event of previous.items) bySeq.set(event.sequence, event);
+  let changed = false;
+  const added: number[] = [];
+  for (const event of incoming) {
+    const existing = bySeq.get(event.sequence);
+    if (!existing) {
+      bySeq.set(event.sequence, event);
+      added.push(event.sequence);
+      changed = true;
+    } else if (
+      existing.label !== event.label ||
+      existing.status !== event.status ||
+      existing.category !== event.category
+    ) {
+      bySeq.set(event.sequence, event);
+      changed = true;
+    }
+  }
+  if (!changed) return previous;
+  const merged = [...bySeq.values()]
+    .sort((a, b) => a.sequence - b.sequence)
+    .slice(-MAX_DEEPFETCH_DISPLAY_EVENTS);
+  const kept = new Set(merged.map((event) => event.sequence));
+  const entering = [
+    ...previous.entering.filter((sequence) => kept.has(sequence)),
+    ...added.filter((sequence) => kept.has(sequence)),
+  ];
+  return { streamKey, items: merged, entering };
+}
+
+function preserveMonotonicDeepFetchEvents(
+  previous: NormalizedQuestCreationView | null,
+  next: NormalizedQuestCreationView,
+): NormalizedQuestCreationView {
+  const prevFetch = previous?.deepfetch;
+  const nextFetch = next.deepfetch;
+  if (
+    !prevFetch ||
+    !nextFetch ||
+    prevFetch.request_ref !== nextFetch.request_ref ||
+    !prevFetch.run?.attempt_ref ||
+    prevFetch.run.attempt_ref !== nextFetch.run?.attempt_ref ||
+    !["queued", "running", "accepting"].includes(nextFetch.status)
+  ) {
+    return next;
+  }
+  const prevEvents = prevFetch.recent_events ?? [];
+  const nextEvents = nextFetch.recent_events ?? [];
+  if (!prevEvents.length) return next;
+  const prevLast = prevEvents.at(-1)?.sequence ?? -1;
+  const nextLast = nextEvents.at(-1)?.sequence ?? -1;
+  if (nextLast >= prevLast) return next;
+  return {
+    ...next,
+    deepfetch: {
+      ...nextFetch,
+      recent_events: prevEvents,
+    },
+  };
+}
+
 function DeepFetchLiveEvents({
+  requestRef,
   attemptRef,
   events,
+  active,
+  status,
+  dialogOpen,
 }: {
+  requestRef: string;
   attemptRef: string | null;
   events: DeepFetchActivityEvent[];
+  active: boolean;
+  status: string;
+  dialogOpen: boolean;
 }) {
   const logRef = useRef<HTMLDivElement>(null);
-  const pinnedRef = useRef(true);
-  const lastSequence = events.at(-1)?.sequence ?? null;
+  const streamKey = `${requestRef}:${attemptRef ?? ""}`;
+  const [ledger, setLedger] = useState<DeepFetchLedger>(() => ({
+    streamKey,
+    items: normalizeDeepFetchEvents(events),
+    entering: [],
+  }));
+  const currentLedger = mergeDeepFetchLedger(ledger, streamKey, events);
+  if (currentLedger !== ledger) setLedger(currentLedger);
+  const displayedEvents = currentLedger.items;
+  const enteringSet = useMemo(() => new Set(currentLedger.entering), [currentLedger.entering]);
+  const lastSequence = displayedEvents.at(-1)?.sequence ?? null;
 
-  // The backend event window slides once it is full: every new event drops the
-  // oldest row while appending the newest. Animating a scroll-to-bottom on each
-  // sequence change made the log lurch every few seconds, so anchor instantly
-  // and only while the viewer is still pinned at the bottom.
-  const handleLogScroll = () => {
-    const log = logRef.current;
-    if (!log) return;
-    pinnedRef.current =
-      log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
-  };
+  const { handleScroll, hasUnseen, jumpToLatest } = useSmoothFollowScroll({
+    logRef,
+    streamKey,
+    itemCount: displayedEvents.length,
+    lastKey: lastSequence,
+    enabled: dialogOpen,
+  });
 
-  useLayoutEffect(() => {
-    const log = logRef.current;
-    if (!log || lastSequence === null || !pinnedRef.current) return;
-    log.scrollTo({ top: log.scrollHeight });
-  }, [attemptRef, lastSequence]);
+  const dotTone = active
+    ? "is-live"
+    : status === "failed" || status === "cancelled"
+      ? "is-failed"
+      : status === "succeeded"
+        ? "is-done"
+        : "";
 
   return (
     <section
-      className="quest-deepfetch-live"
+      className={`quest-deepfetch-live ${active ? "is-live" : ""}`}
       data-testid="deepfetch-live-events"
       aria-label="DeepFetch 实时运行轨迹"
     >
       <header>
         <span>
-          <i aria-hidden="true" />
+          <i className={`first-question-live-dot ${dotTone}`} aria-hidden="true" />
           最近活动
         </span>
-        <code>{events.length ? `最近 ${events.length} 条` : "等待事件"}</code>
+        {displayedEvents.length ? (
+          <span className="quest-deepfetch-live-count">{displayedEvents.length} 条</span>
+        ) : null}
       </header>
-      <div
-        ref={logRef}
-        onScroll={handleLogScroll}
-        className="quest-deepfetch-live-log"
-        role="log"
-        aria-live="polite"
-        aria-relevant="additions"
-        aria-atomic="false"
-      >
-        {events.length ? events.map((event) => (
-          <div
-            key={`${attemptRef ?? "attempt"}:${event.sequence}`}
-            className={`quest-deepfetch-live-event ${event.status}`}
-            data-sequence={event.sequence}
-          >
-            <i aria-hidden="true" />
-            <span>{event.label}</span>
-            <code>{deepfetchEventCategory(event.category)}</code>
-          </div>
-        )) : (
-          <p>等待下一条运行活动，状态自动刷新中…</p>
-        )}
+      <div className="quest-deepfetch-live-body">
+        <div
+          ref={logRef}
+          onScroll={handleScroll}
+          className={`quest-deepfetch-live-log ${active || displayedEvents.length ? "has-stream" : ""}`}
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+          aria-atomic="false"
+        >
+          {displayedEvents.length ? displayedEvents.map((event, index) => (
+            <div
+              key={`${streamKey}:${event.sequence}`}
+              className={`quest-deepfetch-live-event ${event.status} cat-${event.category} ${active && index === displayedEvents.length - 1 ? "is-latest" : ""}`}
+              data-sequence={event.sequence}
+              data-entering={enteringSet.has(event.sequence) ? "true" : undefined}
+            >
+              <i aria-hidden="true" />
+              <span>{event.label}</span>
+            </div>
+          )) : (
+            <p>
+              {active
+                ? "正在启动检索活动…"
+                : status === "succeeded"
+                  ? "补充检索已完成。"
+                  : "本次运行未记录可展示的活动。"}
+            </p>
+          )}
+        </div>
+        {hasUnseen ? (
+          <button type="button" className="quest-activity-jump" onClick={jumpToLatest}>
+            查看最新 ↓
+          </button>
+        ) : null}
       </div>
     </section>
   );
-}
-
-function deepfetchEventCategory(
-  category: DeepFetchActivityEvent["category"],
-): string {
-  return {
-    session: "SESSION",
-    web_search: "WEB SEARCH",
-    web_fetch: "WEB FETCH",
-    analysis: "RESEARCH",
-  }[category];
 }
 
 function intentStatusRank(status: IntentSessionTurn["assistant_status"]): number {
@@ -2914,18 +3035,44 @@ function computeCopy(creation: QuestCreationView | null, selectedCount: number, 
   return `检测到 ${compute.devices.length} 张计算卡，${selection}。` + (editable ? "点击设备可更改选择。" : "");
 }
 
-function resourceEnvelopeCopy(creation: QuestCreationView): string {
+function intentSessionStatusLabel(status: string | undefined): string {
+  const labels: Record<string, string> = {
+    opening: "正在连接",
+    open: "会话就绪",
+    active: "对话中",
+    closed: "已结束",
+  };
+  return labels[status ?? "opening"] ?? status ?? "正在连接";
+}
+
+function formatSelectedDevices(creation: QuestCreationView): string {
   const envelope = creation.resource_envelope;
-  if (!envelope) return "请先检测并选择设备。";
+  if (!envelope || !envelope.selected_device_uuids.length) return "未选设备";
   const devicesByUuid = new Map(
     (creation.compute?.devices ?? []).map((device) => [device.uuid, device.name]),
   );
-  const devices = envelope.selected_device_uuids
-    .map((uuid) => devicesByUuid.get(uuid) ?? uuid)
+  const counts = new Map<string, number>();
+  for (const uuid of envelope.selected_device_uuids) {
+    const label = devicesByUuid.get(uuid) ?? uuid;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([label, count]) => (count > 1 ? `${count} × ${label}` : label))
     .join("、");
-  return `已绑定 ${envelope.selected_device_uuids.length} 张实际检测设备。` +
-    `建议时间预算 ${timeBudgetLabel(envelope.time_budget)} · ${devices || "未选设备"}；` +
-    `实际用时和偏差将在工作中记录，预算不作为自动截止时间。`;
+}
+
+function sidebarDevicesCopy(creation: QuestCreationView): string {
+  const envelope = creation.resource_envelope;
+  if (!envelope) return "尚未检测并选择";
+  if (!envelope.selected_device_uuids.length) return "已检测，尚未选择计算卡";
+  return formatSelectedDevices(creation);
+}
+
+function resourceEnvelopeCopy(creation: QuestCreationView): string {
+  const envelope = creation.resource_envelope;
+  if (!envelope) return "请先检测并选择设备。";
+  const devices = formatSelectedDevices(creation);
+  return `已选 ${envelope.selected_device_uuids.length} 张设备（${devices}），建议时间预算 ${timeBudgetLabel(envelope.time_budget)}；实际用时将在研究中记录，预算不作为自动截止时间。`;
 }
 
 function formatMemory(memoryTotalMib: number): string {
@@ -3004,6 +3151,7 @@ function messageFor(code: string): string {
     literature_snapshot_stale: "LiteratureSnapshot 与当前 DraftRevision 不一致；旧快照已保留但不会静默套用。",
     web_search_temporarily_unavailable: "真实 Web Search 暂不可用；可沿同一 correlation 重试，不会转成 direct waiver。",
     deepfetch_web_evidence_invalid: "DeepFetch 本次 Attempt 缺少可验证的 Web Search / Fetch 证据，已失败且未接纳结果。重试时会先执行短 Web Evidence Gate。",
+    codex_deepfetch_failed: "本次补充检索未能完成，当前草稿与已有材料已保留，可重新尝试。",
     codex_deepfetch_timeout: "研究资料准备超时。草稿与已有材料已保存；重试会先核对原调用的结果。",
     deepfetch_provider_stopped: "DeepFetch Provider 已停止；系统会按原 correlation 恢复，不会接纳晚到结果。",
     deepfetch_run_identity_conflict: "DeepFetch 的 durable Run 身份与当前执行记录冲突。",
