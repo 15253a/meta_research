@@ -19008,10 +19008,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 connection, run, attempt, fence
             )
             replayable_primary_attempts = ()
-            if (expected_stage == "plan" and technical_replacement is not None
+            if (expected_stage in {"plan", "bundle"} and technical_replacement is not None
                     and run.status == "running" and fence.status == "current"
                     and primary_invocation.status == "prepared" and attempt.primary_draft_json is None):
-                replayable_primary_attempts = _plan_primary_replay_lineage(
+                replayable_primary_attempts = _stage_primary_replay_lineage(
                     connection, run, attempt, primary_invocation
                 )
             autonomous_checkpoint = (
@@ -24056,8 +24056,8 @@ def _insert_provider_invocations(
         )
 
 
-def _plan_primary_replay_lineage(connection, run, attempt, invocation) -> tuple[tuple[str, str, int], ...]:
-    """Read the retired fences whose primary result the current Plan may reconcile."""
+def _stage_primary_replay_lineage(connection, run, attempt, invocation) -> tuple[tuple[str, str, int], ...]:
+    """Read retired fences whose primary result the current stage may reconcile."""
     rows = connection.execute(text("""
         WITH RECURSIVE lineage(attempt_ref, fence_ref, generation) AS (
             VALUES (:current_attempt, :current_fence, :current_generation)

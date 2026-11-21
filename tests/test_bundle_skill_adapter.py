@@ -1589,6 +1589,82 @@ def test_invalid_provider_transport_is_terminal_and_never_replayed(
     assert no_replay.calls == []
 
 
+def test_bundle_successor_reconciles_sealed_primary_without_provider_replay(
+    tmp_path: Path,
+) -> None:
+    plan = _plan_document()
+    context = {
+        "schema_ref": "meta-research/bundle-context-pack/v1",
+        "cycle_ref": "cycle:bundle-replay",
+        "cycle_position": {
+            "cycle_ref": "cycle:bundle-replay",
+            "round": 1,
+            "cycle_focus": "Audit frozen scientific inputs",
+            "focus_source": {"request_ref": "fixture-start"},
+        },
+        "accepted_question_binding": {
+            "question_ref": "question:bundle-1",
+            "content_hash": canonical_hash(_question_content()),
+        },
+        "accepted_formal_plan_binding": {
+            "formal_plan_ref": "formal-plan:bundle-1",
+            "plan_document": plan,
+            "plan_document_hash": canonical_hash(plan),
+            "answer_contract_hash": "a" * 64,
+        },
+    }
+    context_hash = canonical_hash(context)
+    target_plan = _target_plan(plan, context_hash)
+    runner = _SequenceRunner([{"target_plan": target_plan}])
+    adapter = CodexBundleSkillAdapter(
+        tmp_path / "bundle-replay-provider",
+        executable=str(_fake_codex(tmp_path / "codex-bundle-replay")),
+        process_runner=runner,
+    )
+    adapter.bind_full_conformance_authority(_FullConformanceAuthority())
+    adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+    request = BundleSkillRequest(
+        accepted_question_content=_question_content(),
+        stage_request_ref="stage-request:bundle-replay",
+        run_ref="bundle-run:replay",
+        attempt_ref="bundle-attempt:replay-1",
+        fence_ref="bundle-fence:replay-1",
+        cycle_ref="cycle:bundle-replay",
+        question_ref="question:bundle-1",
+        formal_plan_ref="formal-plan:bundle-1",
+        context_pack_ref="context-pack:bundle-1",
+        context_pack_hash=context_hash,
+        context_pack=context,
+        plan_document=plan,
+        root_session_ref="ar-session:bundle-replay",
+        runtime_binding=adapter.runtime_binding(),
+        inbox_checkpoint=_inbox_checkpoint(
+            run_ref="bundle-run:replay",
+            attempt_ref="bundle-attempt:replay-1",
+            fence_ref="bundle-fence:replay-1",
+        ),
+        job_ref="bundle-primary-replay-job",
+    )
+
+    original = adapter.generate_draft(request)
+    successor = replace(
+        request,
+        attempt_ref="bundle-attempt:replay-2",
+        fence_ref="bundle-fence:replay-2",
+        inbox_checkpoint=_inbox_checkpoint(
+            run_ref="bundle-run:replay",
+            attempt_ref="bundle-attempt:replay-2",
+            fence_ref="bundle-fence:replay-2",
+        ),
+        replayable_primary_attempts=(
+            (request.attempt_ref, request.fence_ref, 1),
+        ),
+    )
+
+    assert adapter.generate_draft(successor) == original
+    assert len(runner.calls) == 1
+
+
 def test_bundle_adapter_transports_a_legal_target_plan_larger_than_one_mib(
     tmp_path: Path,
 ) -> None:

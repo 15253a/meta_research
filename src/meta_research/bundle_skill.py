@@ -73,11 +73,15 @@ from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     ProviderTransportLimits,
     _CODEX_JSON_OBJECT_STRING_MARKER,
+    _CODEX_TRANSPORT_DECODE_FAILURE_KEY,
     _DISABLED_CODEX_FEATURES,
+    _SEALED_TRANSPORT_CONTRACT_FAILURES,
     _compile_codex_output_schema,
+    _decode_codex_provider_output,
     _codex_harness_manifest,
     _file_sha256,
     _shared_codex_adapter_source_hash,
+    _unwrap_codex_root_output,
 )
 from meta_research.harness import (
     FullConformanceBinding,
@@ -96,6 +100,12 @@ from meta_research.plan_contract import MAX_PLAN_EXPERIMENT_BRIEFS
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
 from meta_research.root_capabilities import merge_root_capability_bindings
+from meta_research.sealed_provider_operations import (
+    operation_transport_limits,
+    read_business_input,
+    read_completed_operation,
+    read_sealed_invocation,
+)
 BundleSkillContractError = BundleContractError
 BundleSkillUnavailable = IdeaSkillUnavailable
 
@@ -260,6 +270,7 @@ class BundleSkillRequest:
     owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
+    replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
     provider_feedback: dict[str, object] | None = None
 
 
@@ -1347,6 +1358,86 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             required_operation_ids=operation_ids,
         )
 
+    def _recover_replaced_primary(
+        self,
+        request: BundleSkillRequest,
+        schema: dict[str, object],
+    ) -> tuple[dict[str, object], str | None, dict[str, object]] | None:
+        """Reconcile a sealed primary from an authorized technical successor."""
+        if not request.replayable_primary_attempts or request.job_ref is None:
+            return None
+        directory = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": request.job_ref})
+            / "primary"
+        )
+        invocation_path = directory / "invocation.json"
+        if not invocation_path.exists():
+            return None
+        _, key = self._transport_key()
+        invocation = read_sealed_invocation(invocation_path, key=key)
+        limits = operation_transport_limits(invocation)
+        original_input = read_business_input(directory, invocation, limits)
+        original_hash = canonical_hash(original_input)
+        if original_hash == canonical_hash(stage_operation_input(request, "bundle")):
+            return None
+        if (
+            invocation.get("job_ref") != request.job_ref
+            or invocation.get("operation_name") != "primary"
+            or invocation.get("native_session_ref") != request.native_session_ref
+            or invocation.get("output_schema_hash")
+            != canonical_hash(_compile_codex_output_schema(schema))
+        ):
+            raise BundleSkillUnavailable("codex_operation_identity_conflict")
+        current_input = stage_operation_input(request, "bundle")
+        current_request = current_input.get("request")
+        original_request = original_input.get("request")
+        if (
+            not isinstance(current_request, dict)
+            or not isinstance(original_request, dict)
+        ):
+            raise BundleSkillUnavailable("codex_operation_identity_conflict")
+        for old_attempt, old_fence, _generation in request.replayable_primary_attempts:
+            predecessor_input = dict(current_input)
+            predecessor_request = dict(current_request)
+            predecessor_request["attempt_ref"] = old_attempt
+            predecessor_request["fence_ref"] = old_fence
+            if "inbox_checkpoint_hash" in original_request:
+                predecessor_request["inbox_checkpoint_hash"] = original_request[
+                    "inbox_checkpoint_hash"
+                ]
+            predecessor_input["request"] = predecessor_request
+            if canonical_hash(predecessor_input) == original_hash:
+                break
+        else:
+            raise BundleSkillUnavailable("codex_operation_identity_conflict")
+        try:
+            output, session, _ = read_completed_operation(
+                directory,
+                invocation_hash=canonical_hash(invocation),
+                native_session_ref=request.native_session_ref,
+                transport_limits=limits,
+            )
+        except BundleSkillUnavailable as error:
+            if error.code not in _SEALED_TRANSPORT_CONTRACT_FAILURES:
+                raise
+            raise self._sealed_transport_contract_failure(
+                directory=directory,
+                job_ref=request.job_ref,
+                operation_name="primary",
+                native_session_ref=request.native_session_ref,
+            ) from error
+        try:
+            decoded = _decode_codex_provider_output(
+                _unwrap_codex_root_output(output, schema), schema
+            )
+        except BundleSkillUnavailable as error:
+            if error.code != "codex_json_object_transport_invalid":
+                raise
+            decoded = {_CODEX_TRANSPORT_DECODE_FAILURE_KEY: error.code}
+        return decoded, session, invocation
+
     @resource_preparation
     def generate_draft(self, request: BundleSkillRequest) -> BundleSkillDraft:
         _validate_request(request)
@@ -1383,19 +1474,25 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"context_pack_ref={request.context_pack_ref}\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
         )
-        output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding,
-            operation_name="primary",
-            prompt=prompt,
-            schema=_target_plan_envelope_schema(request),
-            native_session_ref=request.native_session_ref,
-            job_ref=request.job_ref,
-            operation_input=stage_operation_input(request, "bundle"),
-        )
+        raw_schema = _target_plan_envelope_schema(request)
+        schema = self._operation_output_schema(raw_schema, request.job_ref, "primary")
+        recovered = self._recover_replaced_primary(request, schema)
+        if recovered is None:
+            output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                runtime_binding=request.runtime_binding,
+                operation_name="primary",
+                prompt=prompt,
+                schema=raw_schema,
+                native_session_ref=request.native_session_ref,
+                job_ref=request.job_ref,
+                operation_input=stage_operation_input(request, "bundle"),
+            )
+        else:
+            output, session_ref, _original_invocation = recovered
         if session_ref is None or type(output) is not dict:
             raise BundleSkillUnavailable("codex_bundle_primary_invalid")
         from meta_research.bundle_output_assembly import assemble_bundle_primary
