@@ -2042,6 +2042,7 @@ class CodexDeepFetchAdapter:
             traces: list[str] = []
             native_session_ref = expected_native_session_ref
             enforce_native = enforce_native_session_ref
+            historical_scope: dict[str, object] | None = None
             for index, directory in enumerate(directories):
                 segment_name = "initial" if index == 0 else f"resume-{index}"
                 invocation_path = directory / "invocation.json"
@@ -2139,7 +2140,7 @@ class CodexDeepFetchAdapter:
                 ):
                     raise ValueError("deepfetch reconciliation identity mismatch")
                 invocation_hash = canonical_hash(invocation)
-                self._verify_existing_supervisor_request(
+                persisted_scope = self._verify_existing_supervisor_request(
                     directory,
                     provider_job_ref=provider_job_ref,
                     invocation_hash=invocation_hash,
@@ -2149,7 +2150,24 @@ class CodexDeepFetchAdapter:
                     runtime_binding=request.runtime_binding,
                     literature_access_mode=request.literature_access_mode,
                     transport_key=transport_key,
+                    expected_operation_scope={
+                        "run_ref": request.run_ref,
+                        "attempt_ref": request.attempt_ref,
+                        "fence_ref": request.fence_ref,
+                        "root_session_ref": request.root_session_ref,
+                        "root_kind": "deepfetch",
+                        "operation_ref": provider_job_ref or request.request_ref,
+                        **({"job_ref": provider_job_ref}
+                           if provider_job_ref is not None else {}),
+                        "model_ref": request.runtime_binding.model_ref,
+                    },
+                    allow_historical_attempt_binding=request.reconcile_only,
                 )
+                if request.reconcile_only:
+                    if historical_scope is None:
+                        historical_scope = persisted_scope
+                    elif persisted_scope != historical_scope:
+                        raise ValueError("deepfetch reconciliation operation scope conflict")
                 if not (directory / "supervisor-exit.json").is_file():
                     if supervisor_request_never_started(
                         directory,
@@ -2243,7 +2261,9 @@ class CodexDeepFetchAdapter:
         runtime_binding: DeepFetchRuntimeBinding,
         literature_access_mode: str | None,
         transport_key: bytes,
-    ) -> None:
+        expected_operation_scope: dict[str, object],
+        allow_historical_attempt_binding: bool = False,
+    ) -> dict[str, object]:
         request_path = directory / "supervisor-request.json"
         if request_path.is_symlink() or not request_path.is_file():
             raise ValueError("deepfetch reconciliation supervisor request missing")
@@ -2265,9 +2285,7 @@ class CodexDeepFetchAdapter:
             and not isinstance(timeout_seconds, bool)
             and float(timeout_seconds) > 0
         )
-        if (
-            set(supervisor)
-            != {
+        expected_keys = {
                 "schema_ref",
                 "invocation_hash",
                 "argv",
@@ -2276,6 +2294,30 @@ class CodexDeepFetchAdapter:
                 "result_max_bytes",
                 *expected_paths,
             }
+        persisted_scope = supervisor.get("operation_scope")
+        if persisted_scope is not None:
+            expected_keys.add("operation_scope")
+        scope_matches = (
+            persisted_scope == expected_operation_scope
+            if not allow_historical_attempt_binding
+            else (
+                isinstance(persisted_scope, dict)
+                and set(persisted_scope) == set(expected_operation_scope)
+                and all(
+                    persisted_scope.get(key) == value
+                    for key, value in expected_operation_scope.items()
+                    if key not in {"attempt_ref", "fence_ref"}
+                )
+                and all(
+                    isinstance(persisted_scope.get(key), str)
+                    and bool(persisted_scope.get(key))
+                    for key in ("attempt_ref", "fence_ref")
+                )
+            )
+        )
+        if (
+            set(supervisor)
+            != expected_keys
             or supervisor.get("schema_ref") != SUPERVISOR_REQUEST_SCHEMA
             or supervisor.get("invocation_hash") != invocation_hash
             or any(
@@ -2289,6 +2331,10 @@ class CodexDeepFetchAdapter:
                 DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
             )
             or supervisor.get("result_max_bytes") != PROVIDER_RESULT_MAX_BYTES
+            or (
+                persisted_scope is not None
+                and not scope_matches
+            )
         ):
             raise ValueError("deepfetch reconciliation supervisor request invalid")
         argv = supervisor.get("argv")
@@ -2354,6 +2400,7 @@ class CodexDeepFetchAdapter:
             )
         ):
             raise ValueError("deepfetch reconciliation argv identity invalid")
+        return persisted_scope if isinstance(persisted_scope, dict) else {}
 
     def _verify_existing_mcp_invocation(
         self,
@@ -3427,6 +3474,16 @@ class CodexDeepFetchAdapter:
                         "started_path": str(directory / "provider-started.json"),
                         "receipt_path": str(receipt_path),
                         "stop_path": str(directory / "supervisor-stop.json"),
+                        "operation_scope": {
+                            "run_ref": request.run_ref,
+                            "attempt_ref": request.attempt_ref,
+                            "fence_ref": request.fence_ref,
+                            "root_session_ref": request.root_session_ref,
+                            "root_kind": "deepfetch",
+                            "operation_ref": job_ref or request.request_ref,
+                            **({"job_ref": job_ref} if job_ref is not None else {}),
+                            "model_ref": request.runtime_binding.model_ref,
+                        },
                     },
                     transport_key,
                 )

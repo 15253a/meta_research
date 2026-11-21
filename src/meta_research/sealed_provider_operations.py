@@ -297,6 +297,8 @@ def _write_local_exit_receipt(
     returncode: int,
     input_bytes: int,
     process_tree: dict[str, object],
+    codex_home: Path | None = None,
+    operation_scope: dict[str, object] | None = None,
 ) -> None:
     try:
         _key_path, transport_key = read_transport_key_for_operation(directory)
@@ -311,6 +313,8 @@ def _write_local_exit_receipt(
             returncode=returncode,
             input_bytes=input_bytes,
             process_tree=process_tree,
+            codex_home=codex_home,
+            operation_scope=operation_scope,
         )
     except (OSError, ProviderSupervisorError) as error:
         raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error

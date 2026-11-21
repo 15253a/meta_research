@@ -138,12 +138,15 @@ def _assert_role_denies_goal_writes(runtime, root_kind, scope, arguments):
         assert readable["isError"] is False, readable
         assert readable["structuredContent"]["items"]
         for operation in GOAL_OPERATION_IDS[1:]:
-            assert operation not in names
+            assert operation in names
             denied = dispatch("tools/call", {
                 "name": "tools.call", "arguments": {"operation_id": operation, "arguments": arguments},
             })
             assert denied["isError"] is True, denied
-            assert denied["structuredContent"] == {"code": "capability_unavailable"}
+            assert denied["structuredContent"]["code"] == "capability_unavailable"
+            details = denied["structuredContent"].get("details", {})
+            if details:
+                assert details["reason"] == "root_kind_not_owner"
     finally:
         runtime.harnesses.revoke_resident_mcp_channel(channel)
 

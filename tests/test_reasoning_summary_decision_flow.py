@@ -25,7 +25,8 @@ def final_output(checkpoint, anchor=None):
         "next_cycle_proposal": {"schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF, "kind": "NextCycleProposal",
         "cycle_focus": "Reassess the next research direction using the accepted evidence",
             "source_quest_ref": outcome["quest_ref"], "source_cycle_ref": outcome["cycle_ref"], "source_reasoning_stage_run_request_ref": outcome["stage_run_request_ref"], "source_scientific_outcome_ref": outcome["outcome_ref"], "source_question_ref": outcome["question_ref"], "source_foreground_epoch": outcome["foreground_epoch"],
-            "target_question_ref": outcome["question_ref"] if anchor is None else anchor["question_ref"], "target_question_anchor_ref": outcome["question_ref"] if anchor is None else anchor["ref"], "entry_stage": "reasoning" if anchor is None else "idea", "typed_skip_basis_refs_by_stage": {stage: [outcome["outcome_ref"]] for stage in ("idea", "plan", "bundle")} if anchor is None else {}, "is_authoritative": False}, "candidate_completion": None}
+            "target_question_ref": outcome["question_ref"] if anchor is None else anchor["question_ref"], "target_question_anchor_ref": outcome["question_ref"] if anchor is None else anchor["ref"], "entry_stage": "reasoning" if anchor is None else "idea", "typed_skip_basis_refs_by_stage": {stage: [outcome["outcome_ref"]] for stage in ("idea", "plan", "bundle")} if anchor is None else {}, "is_authoritative": False,
+            "research_time_basis": {"schema_ref": "meta-research/research-time-basis/v1", "quest_ref": outcome["quest_ref"], "budget_revision": "0" * 64, "observed_at": 1_735_000_000.0, "status": "running", "accuracy": "exact", "used_seconds": 120.0, "remaining_seconds": 480.0, "overrun_seconds": None, "unknown_intervals": [], "decision": "continue", "decision_rationale": "The remaining budget supports the next bounded comparison."}}, "candidate_completion": None}
 
 class SummarySkill:
     def __init__(self, action):

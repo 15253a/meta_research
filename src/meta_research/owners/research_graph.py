@@ -91,6 +91,7 @@ from meta_research.idea_contract import (
 from meta_research.plan_contract import (
     selected_plan_evidence_catalog,
     PlanContractError,
+    validate_current_plan_evidence_accounting,
     validate_plan_context_pack,
     validate_plan_document,
 )
@@ -3504,6 +3505,78 @@ class SQLiteResearchGraphReceiptVerifier:
             total=total, catalog=selected, scanned=len(selected), offset=offset,
             limit=limit, question_ref=question_ref, projections=[],
         ), selected
+
+    def _query_current_question_plan_evidence_catalog(
+        self, *, quest_ref: str, question_ref: str,
+    ) -> list[dict[str, object]]:
+        """Read the complete current-question Target evidence at Plan acceptance."""
+
+        authority = self._target_commit_evidence_authority
+        query = getattr(authority, "query_plan_evidence_catalog", None)
+        if not callable(query):
+            raise OwnerConflict("target_commit_evidence_authority_unavailable")
+        for attempt in range(2):
+            before_revision, target_commit_refs = (
+                self._current_question_target_commit_state(
+                    quest_ref=quest_ref, question_ref=question_ref
+                )
+            )
+            if len(target_commit_refs) > 256:
+                raise OwnerConflict("plan_evidence_accounting_invalid")
+            catalog_revision, catalog = query(
+                quest_ref=quest_ref,
+                target_commit_refs=target_commit_refs,
+                current_only=True,
+            )
+            after_revision, after_refs = self._current_question_target_commit_state(
+                quest_ref=quest_ref, question_ref=question_ref
+            )
+            if (before_revision, target_commit_refs) != (after_revision, after_refs):
+                if attempt == 0:
+                    continue
+                raise OwnerConflict("plan_evidence_accounting_changed")
+            if (
+                not isinstance(catalog_revision, int)
+                or isinstance(catalog_revision, bool)
+                or catalog_revision < 0
+                or not isinstance(catalog, tuple)
+                or not all(isinstance(item, dict) for item in catalog)
+            ):
+                raise OwnerConflict("plan_evidence_catalog_invalid")
+            if len({str(item.get("evidence_ref")) for item in catalog}) != len(catalog):
+                raise OwnerConflict("plan_evidence_catalog_invalid")
+            return list(catalog)
+        raise OwnerConflict("plan_evidence_accounting_changed")
+
+    def _current_question_target_commit_state(
+        self, *, quest_ref: str, question_ref: str,
+    ) -> tuple[int, tuple[str, ...]]:
+        """Read the graph revision and current-question TargetCommit refs together."""
+
+        with self._database.read_snapshot() as connection:
+            revision = int(
+                connection.execute(
+                    text(
+                        "SELECT revision FROM research_graph_state "
+                        "WHERE singleton = 'owner'"
+                    )
+                ).scalar_one()
+            )
+            rows = connection.execute(
+                text(
+                    "SELECT DISTINCT c.commit_ref "
+                    "FROM rg_target_commits c "
+                    "JOIN rg_targets t ON t.target_ref = c.target_ref "
+                    "JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref "
+                    "JOIN ae_cycles cycle ON cycle.cycle_ref = g.cycle_ref "
+                    "AND cycle.quest_ref = g.quest_ref "
+                    "WHERE g.quest_ref = :quest_ref "
+                    "AND cycle.question_ref = :question_ref "
+                    "ORDER BY c.commit_ref"
+                ),
+                {"quest_ref": quest_ref, "question_ref": question_ref},
+            ).all()
+        return revision, tuple(str(row.commit_ref) for row in rows)
 
     def query_evidence_state(self, quest_ref: str) -> tuple[int, tuple[str, ...]]:
         return self._query_evidence_state(quest_ref, current=True)
@@ -10276,6 +10349,13 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             quest_ref=quest_ref, question_ref=question_ref, offset=offset, limit=limit
         )
 
+    def _query_current_question_plan_evidence_catalog(
+        self, *, quest_ref: str, question_ref: str,
+    ) -> list[dict[str, object]]:
+        return self._receipt_verifier._query_current_question_plan_evidence_catalog(
+            quest_ref=quest_ref, question_ref=question_ref
+        )
+
     def resolve_plan_evidence_reuse_leaves(
         self,
         *,
@@ -12066,6 +12146,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             != verified_request.context_pack_hash
         ):
             raise OwnerConflict("formal_plan_request_lineage_invalid")
+        accounting_rejection: str | None = None
         try:
             evidence_by_ref = validate_plan_context_pack(
                 verified_request.context_pack,
@@ -12082,6 +12163,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 or isinstance(evidence_revision, bool)
             ):
                 raise PlanContractError("plan_evidence_catalog_invalid")
+            selected_catalog = selected_plan_evidence_catalog(
+                content.plan_document, evidence_catalog
+            )
             validated_plan_hash = validate_plan_document(
                 content.plan_document,
                 question_ref=accepted_question.question_ref,
@@ -12092,10 +12176,19 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 evidence_by_ref=evidence_by_ref,
                 evidence_reference_revision=evidence_revision,
             )
-        except PlanContractError as error:
-            raise OwnerConflict(str(error)) from error
-        try:
-            selected_catalog = selected_plan_evidence_catalog(content.plan_document, evidence_catalog)
+            if "evidence_accounting" in content.plan_document:
+                current_catalog = self._query_current_question_plan_evidence_catalog(
+                    quest_ref=accepted_question.quest_ref,
+                    question_ref=accepted_question.question_ref,
+                )
+                try:
+                    validate_current_plan_evidence_accounting(
+                        content.plan_document,
+                        current_catalog=current_catalog,
+                        selected_catalog=selected_catalog,
+                    )
+                except PlanContractError as error:
+                    accounting_rejection = str(error)
         except PlanContractError as error:
             raise OwnerConflict(str(error)) from error
         answer_contract = content.plan_document.get("answer_contract")
@@ -12134,10 +12227,20 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 "Papers from the same snapshot share one source binding.",
             )
         else:
-            decision, reason_code, feedback = _evaluate_formal_plan(
-                question_content,
-                content.plan_document,
-            )
+            if accounting_rejection is not None:
+                decision = "rejected"
+                reason_code = accounting_rejection
+                feedback = (
+                    "The current question has TargetCommit evidence without a "
+                    "disposition in evidence_accounting. Add one entry per "
+                    "current TargetCommit and explain whether it is adopted, "
+                    "considered, deferred or not_used before retrying.",
+                )
+            else:
+                decision, reason_code, feedback = _evaluate_formal_plan(
+                    question_content,
+                    content.plan_document,
+                )
         feedback_json = canonical_json(list(feedback))
         feedback_hash = canonical_hash(list(feedback))
         bundle_disposition = content.plan_document.get("bundle_disposition")

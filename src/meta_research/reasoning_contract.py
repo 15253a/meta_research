@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+import math
 from typing import cast
 
 from meta_research.owners.common import canonical_hash, OwnerConflict
@@ -140,6 +141,20 @@ _REASONING_SOURCE_FIELDS = {
     "source_question_ref",
     "source_foreground_epoch",
 }
+_RESEARCH_TIME_BASIS_FIELDS = {
+    "schema_ref",
+    "quest_ref",
+    "budget_revision",
+    "observed_at",
+    "status",
+    "accuracy",
+    "used_seconds",
+    "remaining_seconds",
+    "overrun_seconds",
+    "unknown_intervals",
+    "decision",
+    "decision_rationale",
+}
 _NEXT_CYCLE_PROPOSAL_FIELDS = _REASONING_SOURCE_FIELDS | {
     "cycle_focus",
     "schema_ref",
@@ -149,6 +164,7 @@ _NEXT_CYCLE_PROPOSAL_FIELDS = _REASONING_SOURCE_FIELDS | {
     "entry_stage",
     "typed_skip_basis_refs_by_stage",
     "is_authoritative",
+    "research_time_basis",
 }
 _CANDIDATE_COMPLETION_FIELDS = _REASONING_SOURCE_FIELDS | {
     "schema_ref",
@@ -158,6 +174,16 @@ _CANDIDATE_COMPLETION_FIELDS = _REASONING_SOURCE_FIELDS | {
     "completion_milestone_basis_refs",
     "rationale",
     "is_authoritative",
+    "research_time_basis",
+}
+_LEGACY_NEXT_CYCLE_PROPOSAL_FIELDS = _NEXT_CYCLE_PROPOSAL_FIELDS - {
+    "research_time_basis"
+}
+_LEGACY_CANDIDATE_COMPLETION_FIELDS = _CANDIDATE_COMPLETION_FIELDS - {
+    "research_time_basis"
+}
+_AUTONOMOUS_SCOPE_FIELDS_WITH_TIME = _AUTONOMOUS_SCOPE_FIELDS | {
+    "research_time_basis"
 }
 
 
@@ -188,6 +214,80 @@ def validate_new_reasoning_successor_entry(output: dict[str, object]) -> None:
             and route.get("entry_stage") not in REASONING_SUCCESSOR_ENTRY_STAGES
         ):
             raise ReasoningContractError("reasoning_next_cycle_entry_stage_forbidden")
+
+
+def _validate_research_time_basis(
+    value: object,
+    *,
+    quest_ref: str,
+) -> None:
+    """Validate a provider-returned budget observation and its decision use.
+
+    The field is required by the live Codex output schema.  Older deterministic
+    documents remain readable when the field is absent, while any present
+    observation must be complete and bound to the same Quest.
+    """
+
+    code = "reasoning_research_time_basis_invalid"
+    if not isinstance(value, dict) or set(value) != _RESEARCH_TIME_BASIS_FIELDS:
+        raise ReasoningContractError(code)
+    if (
+        value.get("schema_ref") != "meta-research/research-time-basis/v1"
+        or value.get("quest_ref") != quest_ref
+        or not isinstance(value.get("budget_revision"), str)
+        or len(cast(str, value["budget_revision"])) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in cast(str, value["budget_revision"])
+        )
+        or value.get("status")
+        not in {"not_started", "running", "paused", "stopped", "completed"}
+        or value.get("accuracy") not in {"exact", "unknown"}
+        or value.get("decision")
+        not in {"continue", "pause", "redirect", "ask_human", "complete", "undetermined"}
+    ):
+        raise ReasoningContractError(code)
+    observed_at = value.get("observed_at")
+    if (
+        not isinstance(observed_at, (int, float))
+        or isinstance(observed_at, bool)
+        or not math.isfinite(float(observed_at))
+        or observed_at < 0
+    ):
+        raise ReasoningContractError(code)
+    for field in ("used_seconds", "remaining_seconds", "overrun_seconds"):
+        seconds = value.get(field)
+        if seconds is not None and (
+            not isinstance(seconds, (int, float))
+            or isinstance(seconds, bool)
+            or not math.isfinite(float(seconds))
+            or seconds < 0
+        ):
+            raise ReasoningContractError(code)
+    intervals = value.get("unknown_intervals")
+    if not isinstance(intervals, list):
+        raise ReasoningContractError(code)
+    if value.get("accuracy") == "exact" and intervals:
+        raise ReasoningContractError(code)
+    for interval in intervals:
+        if (
+            not isinstance(interval, dict)
+            or set(interval) != {"start", "end", "reason"}
+            or not isinstance(interval.get("start"), (int, float))
+            or isinstance(interval.get("start"), bool)
+            or not isinstance(interval.get("end"), (int, float))
+            or isinstance(interval.get("end"), bool)
+            or not math.isfinite(float(interval["start"]))
+            or not math.isfinite(float(interval["end"]))
+            or interval["start"] < 0
+            or interval["end"] < interval["start"]
+            or not isinstance(interval.get("reason"), str)
+            or not interval["reason"].strip()
+        ):
+            raise ReasoningContractError(code)
+    for field in ("decision_rationale",):
+        if not isinstance(value.get(field), str) or not value[field].strip():
+            raise ReasoningContractError(code)
 
 
 @dataclass(frozen=True)
@@ -733,7 +833,9 @@ def validate_autonomous_question_scope(
 
     _exact_keys(
         scope,
-        _AUTONOMOUS_SCOPE_FIELDS,
+        _AUTONOMOUS_SCOPE_FIELDS_WITH_TIME
+        if "research_time_basis" in scope
+        else _AUTONOMOUS_SCOPE_FIELDS,
         "autonomous_question_scope_invalid",
     )
     if (
@@ -747,6 +849,11 @@ def validate_autonomous_question_scope(
     ):
         raise ReasoningContractError("autonomous_question_scope_invalid")
     _validate_reasoning_source_bindings(scope, source_outcome)
+    if "research_time_basis" in scope:
+        _validate_research_time_basis(
+            scope["research_time_basis"],
+            quest_ref=cast(str, source_outcome["quest_ref"]),
+        )
 
     blueprint = scope.get("question_blueprint")
     if not isinstance(blueprint, dict):
@@ -835,7 +942,9 @@ def validate_reasoning_transition(
     if next_cycle is not None:
         _exact_keys(
             next_cycle,
-            _NEXT_CYCLE_PROPOSAL_FIELDS,
+            _NEXT_CYCLE_PROPOSAL_FIELDS
+            if "research_time_basis" in next_cycle
+            else _LEGACY_NEXT_CYCLE_PROPOSAL_FIELDS,
             "next_cycle_proposal_invalid",
         )
         if (
@@ -857,12 +966,19 @@ def validate_reasoning_transition(
             invalid_code="next_cycle_proposal_invalid",
             skip_code="next_cycle_proposal_skip_basis_invalid",
         )
+        if "research_time_basis" in next_cycle:
+            _validate_research_time_basis(
+                next_cycle["research_time_basis"],
+                quest_ref=cast(str, source_outcome["quest_ref"]),
+            )
         return canonical_hash(next_cycle)
 
     completion = cast(dict[str, object], candidate_completion)
     _exact_keys(
         completion,
-        _CANDIDATE_COMPLETION_FIELDS,
+        _CANDIDATE_COMPLETION_FIELDS
+        if "research_time_basis" in completion
+        else _LEGACY_CANDIDATE_COMPLETION_FIELDS,
         "candidate_completion_invalid",
     )
     if (
@@ -887,6 +1003,11 @@ def validate_reasoning_transition(
         and tuple(basis_refs) != expected_completion_milestone_basis_refs
     ):
         raise ReasoningContractError("candidate_completion_basis_invalid")
+    if "research_time_basis" in completion:
+        _validate_research_time_basis(
+            completion["research_time_basis"],
+            quest_ref=cast(str, source_outcome["quest_ref"]),
+        )
     return canonical_hash(completion)
 
 

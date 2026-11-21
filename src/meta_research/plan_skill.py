@@ -483,6 +483,14 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "the source kind is TargetCommit, HumanInput, ScientificOutcome, AssetVersion or LiteratureSnapshot. "
             "Use its evidence_ref in coverage.evidence_uses with the supported claim and support boundary. "
             "Preserve human input scope and distinguish reported opinion from observation or assessment. "
+            "Before returning the final Plan, read the complete current-question evidence page at least once "
+            "with research_graph.plan_evidence.page and check each accepted TargetCommit closure. "
+            "For every accepted TargetCommit, either include the precise binding in selected_evidence_bindings "
+            "and evidence_reuse_set when it supports a current obligation, or explain in notes why it is not adopted "
+            "and which obligation or gap it does not support. "
+            "Also return evidence_accounting with one entry for every current-question TargetCommit you saw, "
+            "using {evidence_ref, target_commit_ref, status, reason}; status is adopted, considered, deferred or "
+            "not_used, and adopted must agree with selected_evidence_bindings. Keep a reason for every entry. "
             "The adapter preserves the complete set unchanged in source_bindings.selected_evidence_bindings. "
             "There is no adoption count tied to a discovery page. Briefs may leave documented gaps "
             "unarranged; explain the insufficiency, reason and limits without claiming them complete. "
@@ -1085,6 +1093,23 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             "properties": binding_properties, "required": list(binding_properties)},
     }
     schema["required"].append("selected_evidence_bindings")
+    schema["properties"]["evidence_accounting"] = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "evidence_ref": text,
+                "target_commit_ref": text,
+                "status": {"type": "string", "enum": [
+                    "adopted", "considered", "deferred", "not_used",
+                ]},
+                "reason": text,
+            },
+            "required": ["evidence_ref", "target_commit_ref", "status", "reason"],
+        },
+    }
+    schema["required"].append("evidence_accounting")
     return schema
 
 

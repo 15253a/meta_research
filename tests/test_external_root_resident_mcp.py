@@ -59,7 +59,7 @@ class _SequenceRunner:
             json.dumps(next(self._outputs), ensure_ascii=False),
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             argv,
             0,
             stdout=json.dumps(
@@ -67,6 +67,16 @@ class _SequenceRunner:
             ),
             stderr="",
         )
+        # The local non-supervisor path still seals a terminal process-tree
+        # proof. This runner represents a provider that never started a child.
+        completed.process_tree = {
+            "schema_ref": "meta-research/provider-process-tree/v1",
+            "state": "closed",
+            "mechanism": "not-started",
+            "boot_identity_hash": None,
+            "host_identity_hash": "0" * 64,
+        }
+        return completed
 
     def run_job(
         self,

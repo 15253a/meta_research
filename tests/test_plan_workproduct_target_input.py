@@ -63,6 +63,22 @@ class _Plan(_MultiRunPlanSkill):
                     selected[index] = page["selected_evidence_binding"]
                     assert selected[index]["reader"]["args"] == {**reader["args"], "source_quest_ref": quest}
                 self.scientific_entry = selected[-1]
+        document["evidence_accounting"] = [
+            {
+                "evidence_ref": binding["evidence_ref"],
+                "target_commit_ref": binding["source_binding"][
+                    "target_commit_root_ref"
+                ],
+                "status": "adopted",
+                "reason": "The retained TargetCommit supports the next comparison.",
+            }
+            for binding in document["source_bindings"].get(
+                "selected_evidence_bindings", []
+            )
+            if isinstance(binding, dict)
+            and isinstance(binding.get("source_binding"), dict)
+            and binding["source_binding"].get("target_commit_root_ref")
+        ]
         return _with_derived_answer_contract_hash(document, request)
 
 

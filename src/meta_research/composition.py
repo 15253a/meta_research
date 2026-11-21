@@ -1085,6 +1085,8 @@ def build_production_runtime(
         intent_drafting_provider,
         idea_skill_provider,
         plan_skill_provider,
+        bundle_skill_provider,
+        reasoning_skill_provider,
         deepfetch_provider,
         acquisition_provider,
     ):

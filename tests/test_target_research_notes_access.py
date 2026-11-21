@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.research_notes import query_target_input_research_notes, query_target_research_notes
 from meta_research.semantic_mcp import SemanticMcpGateway
+from meta_research.semantic_owner_gateway import TARGET_ROOT_SEMANTIC_OPERATION_IDS
 from meta_research.stage_context_access import stage_context_operations
 from meta_research.target_run_finalizer import TargetRunFinalizer
 from test_research_notes_and_call_observations import _SystemEvidenceReader
@@ -68,6 +69,97 @@ def test_current_target_reads_own_saved_note_through_real_mcp_without_stage_cont
         result = call({**args, "source": "research_note_body", "source_ref": note["version_ref"]})
         assert json.loads(result["structuredContent"]["text"])["body"] == body
         assert call({**args, "source": "research_note_body", "source_ref": "foreign-version"})["isError"]
+
+        # The production gateway used by Harness exposes discovery and the
+        # common RG/RM readers through the live Target grant.
+        full_gateway = runtime.harnesses._gateway
+        full_channel, _ = full_gateway.issue_channel(**{
+            **credentials,
+            "operation_ids": TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+        })
+        status, listed = full_gateway.dispatch(full_channel.token, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {},
+        })
+        assert status == 200
+        assert listed is not None
+        assert not listed["result"].get("isError")
+        tool_names = {item["name"] for item in listed["result"]["tools"]}
+        assert {"tools.catalog.page", "tools.contracts.read", "tools.call"} <= tool_names
+
+        def full_call(name, arguments, request_id=3):
+            status, response = full_gateway.dispatch(full_channel.token, {
+                "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            })
+            assert status == 200
+            assert response is not None
+            return response["result"]
+
+        catalog_page = full_call("tools.catalog.page", {
+            "view": "operations", "query": "research_", "offset": 0, "limit": 100,
+        })
+        assert not catalog_page.get("isError"), catalog_page
+        operation_names = {item["operation_id"] for item in catalog_page["structuredContent"]["items"]}
+        assert {"research_graph.questions.page", "research_graph.formal_results.read",
+                "research_memory.content.read", "research_memory.research_notes.read"} <= operation_names
+        for operation_id in ("research_graph.formal_results.read", "research_memory.content.read"):
+            contract = full_call("tools.contracts.read", {"operation_id": operation_id})
+            assert not contract.get("isError"), (operation_id, contract)
+        questions = full_call("research_graph.questions.page", {
+            "query": "", "offset": 0, "limit": 1,
+        })
+        assert not questions.get("isError"), questions
+        formal_results = full_call("research_graph.formal_results.read", {
+            "ref": handle.target_ref,
+        })
+        assert not formal_results.get("isError"), formal_results
+        notes = full_call("research_memory.research_notes.read", args)
+        assert not notes.get("isError"), notes
+
+        # Exercise the normal resident-channel adapter, including its MCP
+        # initialize/list/call path, instead of only the in-process gateway.
+        resident = runtime.harnesses.issue_resident_mcp_channel(
+            run_ref=handle.target_run_ref,
+            attempt_ref=handle.execution_attempt_ref,
+            root_session_ref=handle.root_session_ref,
+            fence_ref=handle.execution_fence_ref,
+            capability_binding_hash=binding_hash,
+            operation_ids=TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+            root_kind="target",
+            phase="target_root",
+            subject_policy="operation_tree",
+        )
+        try:
+            status, initialized, session_id = runtime.harnesses.dispatch_mcp_http(
+                resident.connection.token,
+                {"jsonrpc": "2.0", "id": 10, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": {"name": "target-test", "version": "1"}}},
+                mcp_session_id=None,
+            )
+            assert status == 200
+            assert initialized is not None and isinstance(session_id, str)
+            listed_status, listed_payload, _ = runtime.harnesses.dispatch_mcp_http(
+                resident.connection.token,
+                {"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}},
+                mcp_session_id=session_id,
+            )
+            assert listed_status == 200
+            listed_names = {item["name"] for item in listed_payload["result"]["tools"]}
+            assert {"tools.catalog.page", "tools.contracts.read", "tools.call"} <= listed_names
+            called_status, called_payload, _ = runtime.harnesses.dispatch_mcp_http(
+                resident.connection.token,
+                {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                 "params": {"name": "tools.call", "arguments": {
+                     "operation_id": "research_graph.questions.page",
+                     "arguments": {"query": "", "offset": 0, "limit": 1}}}},
+                mcp_session_id=session_id,
+            )
+            assert called_status == 200
+            assert called_payload is not None and not called_payload["result"].get("isError")
+        finally:
+            runtime.harnesses.revoke_resident_mcp_channel(resident)
+
         stale, _ = gateway.issue_channel(**{**credentials, "attempt_ref": "stale-attempt"})
         assert "semantic_call_scope_stale" in canonical_json(call(args, stale.token))
         reading = runtime.target_run_authorities.research_graph.query_target_reading_context(

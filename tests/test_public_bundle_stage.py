@@ -732,13 +732,22 @@ class _FixtureTargetCommitEvidenceAuthority:
         self.catalog = (evidence,)
 
     def query_plan_evidence_catalog(
-        self, *, quest_ref: str
+        self, *, quest_ref: str, target_commit_refs=None,
+        current_only: bool = True, role_refs=None,
     ) -> tuple[int, tuple[dict[str, object], ...]]:
         if self.quest_ref is None:
             return 0, ()
         if quest_ref != self.quest_ref:
             raise OwnerConflict("fixture_evidence_quest_invalid")
-        return len(self.catalog), self.catalog
+        if target_commit_refs is not None:
+            selected = tuple(
+                item
+                for item in self.catalog
+                if item.get("target_commit_root_ref") in target_commit_refs
+            )
+        else:
+            selected = self.catalog
+        return len(selected), selected
 
     def verify_plan_evidence_catalog(
         self,

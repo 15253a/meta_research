@@ -15,9 +15,12 @@ import pytest
 from provider_supervisor_support import closed_tree_fixture
 
 from meta_research.idea_skill import _compile_codex_output_schema
-from meta_research.owners.agent_runtime import PlanRuntimeBinding
+from meta_research.owners.agent_runtime import (
+    PlanRuntimeBinding,
+    _stage_material_hash_matches,
+)
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.plan_contract import material_plan_hash
+from meta_research.plan_contract import legacy_material_plan_hash, material_plan_hash
 from meta_research.plan_skill import (
     CodexPlanSkillAdapter,
     PlanSkillContractError,
@@ -244,6 +247,7 @@ def _plan(goal: str = "比较跨设备形态召回。") -> dict[str, object]:
             }
         ],
         "bundle_disposition": "experiments_required",
+        "evidence_accounting": [],
         "source_bindings": {
             "question_ref": "question:1",
             "idea_set_ref": "idea-set:1",
@@ -377,6 +381,26 @@ def test_owner_feedback_treats_omitted_and_empty_reuse_refs_as_same_material() -
     successor = deepcopy(predecessor)
     successor["experiment_briefs"][0]["reuse_material_refs"] = []
     assert material_plan_hash(predecessor) == material_plan_hash(successor)
+
+
+def test_legacy_plan_material_hash_remains_available_for_frozen_documents() -> None:
+    predecessor = _plan()
+    legacy = deepcopy(predecessor)
+    legacy["experiment_briefs"][0]["reuse_material_refs"] = []
+
+    assert material_plan_hash(legacy) == material_plan_hash(predecessor)
+    assert legacy_material_plan_hash(legacy) != material_plan_hash(legacy)
+
+
+def test_plan_stage_material_hash_compatibility_rejects_content_change() -> None:
+    legacy = deepcopy(_plan())
+    legacy["experiment_briefs"][0]["reuse_material_refs"] = []
+    stored_hash = legacy_material_plan_hash(legacy)
+    changed = deepcopy(legacy)
+    changed["experiment_briefs"][0]["goal"] += " 修改"
+
+    assert _stage_material_hash_matches("plan", legacy, stored_hash)
+    assert not _stage_material_hash_matches("plan", changed, stored_hash)
 
 
 def test_large_legal_idea_set_keeps_actual_provider_schemas_within_budget() -> None:
@@ -552,6 +576,9 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     assert "AcceptedQuestionBinding" in primary_prompt
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
+    assert "research_graph.plan_evidence.page" in primary_prompt
+    assert "accepted TargetCommit closure" in primary_prompt
+    assert "which obligation or gap it does not support" in primary_prompt
     assert primary_schema["properties"]["plan"]["properties"]["answer_contract"]
 
 

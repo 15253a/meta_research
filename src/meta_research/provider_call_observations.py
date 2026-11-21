@@ -90,6 +90,40 @@ def compaction_observation(event: dict) -> dict[str, object] | None:
             "exact_content_source": "stdout.jsonl event at source_byte_offset"}
 
 
+def provider_stderr_observation(
+    path: Path | None, *, limited: bool | None = None
+) -> dict[str, object]:
+    """Record bounded identity for diagnostics emitted outside provider stdout."""
+    if path is None:
+        return {"status": "unavailable", "reason": "stderr_path_not_provided"}
+    if not path.is_file():
+        return {"status": "unavailable", "reason": "stderr_file_missing"}
+    try:
+        with path.open("rb") as stream:
+            digest = hashlib.sha256()
+            observed = 0
+            prefix_limited = False
+            while chunk := stream.read(1024 * 1024):
+                if observed >= _NATIVE_PREFIX_LIMIT:
+                    prefix_limited = True
+                    break
+                accepted = chunk[:_NATIVE_PREFIX_LIMIT - observed]
+                digest.update(accepted)
+                observed += len(accepted)
+                if len(accepted) != len(chunk):
+                    prefix_limited = True
+                    break
+        return {
+            "status": "available",
+            "observed_bytes": observed,
+            "sha256": digest.hexdigest(),
+            "limited": prefix_limited if limited is None else bool(limited) or prefix_limited,
+            "exact_content_source": "provider-stderr.log bytes at provider operation",
+        }
+    except (OSError, UnicodeError):
+        return {"status": "unavailable", "reason": "stderr_observation_failed"}
+
+
 def _native_session_observation(codex_home: Path, session_id: str) -> dict[str, object]:
     """Sample one authenticated session prefix; never treat it as this turn's total."""
     identifier = UUID(session_id)
@@ -216,10 +250,160 @@ def _native_session_observation(codex_home: Path, session_id: str) -> dict[str, 
     return sample
 
 
-def observe_provider_files(prompt_path: Path, stdout_path: Path, *, codex_home: Path | None = None) -> dict[str, object]:
+def _session_usage_ledger(
+    prompt: dict[str, object], usage_events: list[dict[str, object]],
+    native: dict[str, object], operation_scope: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Project measured usage into explicit root-session accounting scopes.
+
+    Native rollout records model requests, while the durable operation owns the
+    exact prompt bytes. Keep those sources separate so a sampled native prefix
+    cannot be mistaken for a complete root session or a child session.
+    """
+    responses = native.get("model_responses") if isinstance(native, dict) else None
+    if not isinstance(responses, list):
+        responses = []
+    observed_responses = [row for row in responses if isinstance(row, dict)]
+    fallback = [row for row in usage_events if isinstance(row, dict)
+                and row.get("scope") == "provider_last_call_reported"]
+    calls = observed_responses or fallback
+    snapshots = native.get("last_token_usage_snapshots") if isinstance(native, dict) else None
+    if not isinstance(snapshots, list):
+        snapshots = []
+    observed_snapshots = [row for row in snapshots if isinstance(row, dict)]
+
+    def _values(name: str) -> list[int]:
+        return [row[name] for row in calls if type(row.get(name)) is int and row[name] >= 0]
+
+    input_values = _values("input_tokens")
+    output_values = _values("output_tokens")
+    cached_values = _values("cached_input_tokens")
+    snapshot_last = [row.get("last_token_usage") for row in observed_snapshots
+                     if isinstance(row.get("last_token_usage"), dict)]
+    snapshot_inputs = [item["input_tokens"] for item in snapshot_last
+                       if type(item.get("input_tokens")) is int and item["input_tokens"] >= 0]
+    snapshot_outputs = [item["output_tokens"] for item in snapshot_last
+                        if type(item.get("output_tokens")) is int and item["output_tokens"] >= 0]
+    snapshot_cached = [item.get("cached_input_tokens", item.get("cache_read_input_tokens"))
+                       for item in snapshot_last
+                       if type(item.get("cached_input_tokens", item.get("cache_read_input_tokens"))) is int
+                       and item.get("cached_input_tokens", item.get("cache_read_input_tokens")) >= 0]
+    latest_total = None
+    for row in observed_snapshots:
+        if isinstance(row.get("total_token_usage"), dict):
+            latest_total = row["total_token_usage"]
+    snapshot_total_input = latest_total.get("input_tokens") if latest_total else None
+    snapshot_total_output = latest_total.get("output_tokens") if latest_total else None
+    if type(snapshot_total_input) is not int or snapshot_total_input < 0:
+        snapshot_total_input = None
+    if type(snapshot_total_output) is not int or snapshot_total_output < 0:
+        snapshot_total_output = None
+    snapshot_source = not observed_responses and not fallback and bool(observed_snapshots)
+    if snapshot_source:
+        input_values, output_values, cached_values = snapshot_inputs, snapshot_outputs, snapshot_cached
+    model_source = (
+        "deduplicated_native_response_records" if observed_responses
+        else "provider_last_call_reported_fallback" if fallback
+        else "native_last_usage_snapshots" if observed_snapshots
+        else "unavailable"
+    )
+    native_status = native.get("status") if isinstance(native, dict) else "unavailable"
+    native_limited = bool(native.get("limited", False)) if isinstance(native, dict) else False
+    prefix_bytes = native.get("observed_prefix_bytes") if isinstance(native, dict) else None
+    prefix_hash = native.get("observed_prefix_sha256") if isinstance(native, dict) else None
+    compactions = native.get("compactions") if isinstance(native, dict) else []
+    context_windows = native.get("model_context_windows") if isinstance(native, dict) else []
+    if not isinstance(compactions, list):
+        compactions = []
+    if not isinstance(context_windows, list):
+        context_windows = []
+    binding = {}
+    if isinstance(operation_scope, dict):
+        for key in ("run_ref", "attempt_ref", "fence_ref", "root_session_ref", "root_kind",
+                    "operation_ref",
+                    "model_ref",
+                    "workspace_ref", "work_ref", "job_ref", "operation_name"):
+            value = operation_scope.get(key)
+            if isinstance(value, str) and value:
+                binding[key] = value
+    binding_status = (
+        "available" if binding.get("run_ref") and binding.get("root_session_ref")
+        else "partial" if binding else "unavailable"
+    )
+    return {
+        "schema_ref": "meta-research/session-usage-ledger/v1",
+        "scope": "root_session_observed_prefix",
+        "operation_binding": {
+            "status": binding_status,
+            "source": "signed_provider_operation_scope",
+            **binding,
+        },
+        "prompt": {
+            "current_operation_utf8_bytes": prompt.get("prompt_utf8_bytes"),
+            "current_operation_sha256": prompt.get("prompt_sha256"),
+            "first_business_prompt_utf8_bytes": None,
+            "first_business_prompt_status": "unknown_native_prompt_not_persisted",
+        },
+        "root_session": {
+            "native_session_ref": native.get("session_id") if isinstance(native, dict) else None,
+            "first_model_request_input_tokens": input_values[0] if input_values else None,
+            "peak_single_request_input_tokens": max(input_values) if input_values else None,
+            "cumulative_input_tokens_observed": (
+                snapshot_total_input if snapshot_source else sum(input_values) if input_values else None
+            ),
+            "cumulative_output_tokens_observed": (
+                snapshot_total_output if snapshot_source else sum(output_values) if output_values else None
+            ),
+            "peak_cached_prefix_tokens_observed": max(cached_values) if cached_values else None,
+            "model_context_windows_observed": list(context_windows),
+            "cached_prefix_counts_toward_context_window": True,
+            "model_request_count_observed": None if snapshot_source else len(calls),
+            "compactions": [
+                {key: item[key] for key in ("source_byte_offset", "source_sequence", "timestamp")
+                 if key in item}
+                for item in compactions if isinstance(item, dict)
+            ],
+        },
+        "child_sessions": {
+            "status": "unknown_child_usage_not_bound_to_call_observation",
+            "observed": [],
+        },
+        "coverage": {
+            "native_session_status": native_status,
+            "native_prefix_bytes": prefix_bytes,
+            "native_prefix_sha256": prefix_hash,
+            "native_prefix_limited": native_limited,
+            "model_usage_source": model_source,
+            "cumulative_scope": (
+                "latest_native_total_token_usage_snapshot"
+                if snapshot_source else
+                "sum_of_deduplicated_usage_records; provider_semantics_unverified"
+                if calls else "unavailable"
+            ),
+            "cumulative_semantics_verified": False,
+            "first_business_prompt_scope": "unknown_without_persisted_root_prompt_index",
+            "child_scope": "separate_child_observation_required",
+        },
+    }
+
+
+def observe_provider_files(
+    prompt_path: Path,
+    stdout_path: Path,
+    *,
+    stderr_path: Path | None = None,
+    stderr_limited: bool | None = None,
+    codex_home: Path | None = None,
+    operation_scope: dict[str, object] | None = None,
+) -> dict[str, object]:
+    stderr_observation = provider_stderr_observation(
+        stderr_path, limited=stderr_limited
+    )
     result = {"schema_ref": "meta-research/provider-call-observation/v1",
               **prompt_observation(prompt_path.read_bytes().decode("utf-8")),
-              "usage_events": [], "compactions": [], "limited": False,
+              "provider_stderr": stderr_observation,
+              "usage_events": [], "compactions": [],
+              "limited": bool(stderr_observation.get("limited", False)),
               "model_call_usage_available": False}
     offset, sequence = 0, 0
     session_ids = set()
@@ -268,4 +452,9 @@ def observe_provider_files(prompt_path: Path, stdout_path: Path, *, codex_home: 
     result["native_session"] = native
     result["model_call_usage_available"] |= bool(native.get("model_responses") or native.get("last_token_usage_snapshots"))
     result["limited"] |= native.get("limited", False)
+    result["limited"] |= result["provider_stderr"].get("limited", False)
+    result["session_usage_ledger"] = _session_usage_ledger(
+        {key: result[key] for key in ("prompt_utf8_bytes", "prompt_sha256")},
+        result["usage_events"], native, operation_scope,
+    )
     return result

@@ -4,6 +4,7 @@ export type RootOperation = {
   created_at: number | null; updated_at: number | null;
   reason?: string | null;
   terminal_proof_diagnostic?: { provider_operation_ref: string; reasons: string[] };
+  heartbeat?: { phase: "ready" | "running"; observed_at: number; age_seconds: number; stale: boolean; stdout_bytes?: number };
 };
 export type DelegatedChild = {
   session_ref: string; native_session_ref: string | null;
