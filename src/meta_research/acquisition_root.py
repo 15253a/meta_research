@@ -143,6 +143,27 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             result = AcquisitionPreflightResult(**raw)
         except TypeError as error:
             raise AcquisitionUnavailable("acquisition_root_result_invalid") from error
+        # Session preflight runs before DeepFetch has emitted its first
+        # acquisition effect.  OA-only and provided-only sessions therefore
+        # have no paper targets yet.  A native root may still apply its
+        # batch-level checklist and report that absence as unavailable.  Keep
+        # target identity validation at the batch boundary, where
+        # ``validate_batch_request`` already requires non-empty papers.
+        if (
+            request.mode in {"oa_only", "provided_only"}
+            and result.status == "unavailable"
+            and result.reason_code == "missing_paper_targets"
+            and isinstance(result.evidence, dict)
+        ):
+            result = AcquisitionPreflightResult(
+                status="ready",
+                browser_context_ref=None,
+                reason_code=None,
+                evidence={
+                    **result.evidence,
+                    "targetless_session_preflight": "accepted",
+                },
+            )
         return validate_preflight_result(request, result)
 
     def acquire(self, request: AcquisitionBatchRequest) -> tuple[AcquisitionItemResult, ...]:
