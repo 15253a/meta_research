@@ -108,6 +108,37 @@ def test_targetless_session_preflight_accepts_native_missing_paper_targets(
     assert len(runner.prompts) == 1
 
 
+def test_targetless_session_preflight_rejects_non_dict_evidence(tmp_path):
+    runner = _SequenceRunner(
+        [
+            {
+                "status": "unavailable",
+                "browser_context_ref": None,
+                "reason_code": "missing_paper_targets",
+                "evidence": None,
+            }
+        ]
+    )
+    adapter = CodexAcquisitionRootAdapter(
+        tmp_path / "provider",
+        _AcquisitionDelegate(),
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=runner,
+    )
+    request = AcquisitionPreflightRequest(
+        "preflight-session",
+        "initialization1",
+        1,
+        "a" * 64,
+        "oa_only",
+        "",
+        str(tmp_path / "private"),
+    )
+
+    with pytest.raises(AcquisitionUnavailable, match="acquisition_preflight_result_invalid"):
+        adapter.preflight(request)
+
+
 def test_initial_connection_failure_has_formal_receipt_and_original_effect_reconcile(tmp_path):
     from meta_research.composition import build_production_runtime
     from meta_research.paths import prepare_data_root

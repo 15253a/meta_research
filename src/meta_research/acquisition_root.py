@@ -153,6 +153,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             request.mode in {"oa_only", "provided_only"}
             and result.status == "unavailable"
             and result.reason_code == "missing_paper_targets"
+            and isinstance(result.evidence, dict)
         ):
             result = AcquisitionPreflightResult(
                 status="ready",
