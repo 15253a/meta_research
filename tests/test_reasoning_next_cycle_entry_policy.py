@@ -6,13 +6,14 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from meta_research.owners.agent_runtime import SQLiteAgentRuntime
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.reasoning_contract import validate_reasoning_stage_output
 from meta_research.reasoning_skill import (
     ReasoningSkillDraft,
     RecoverableReasoningSkillCandidateError,
     _next_cycle_proposal_schema,
     _reasoning_autonomous_checkpoint_schema,
+    _typed_skip_basis_candidates,
     validate_reasoning_skill_draft,
 )
 from test_reasoning_skill_adapter import _request, _stage_output
@@ -23,8 +24,14 @@ def _output(entry_stage):
     proposal = output["next_cycle_proposal"]
     proposal["entry_stage"] = entry_stage
     order = ("idea", "plan", "bundle", "reasoning")
+    typed_refs = {
+        "idea": "idea_outcome_48e40766007b43a381dacbaf1d906a92",
+        "plan": "formal_plan_48e40766007b43a381dacbaf1d906a92",
+        "bundle": proposal["source_scientific_outcome_ref"],
+        "reasoning": proposal["source_scientific_outcome_ref"],
+    }
     proposal["typed_skip_basis_refs_by_stage"] = {
-        stage: [proposal["source_scientific_outcome_ref"]]
+        stage: [typed_refs[stage]]
         for stage in order[:order.index(entry_stage)]
     }
     return output
@@ -81,6 +88,128 @@ def test_successor_schema_enums_frozen_idea_outcome_refs():
         "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
     ]
     assert not validator.is_valid(invalid)
+
+
+def test_successor_skill_rejects_stage_commit_without_candidates():
+    request = _request()
+    output = _output("plan")
+    output["next_cycle_proposal"]["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
+    ]
+    with pytest.raises(
+        RecoverableReasoningSkillCandidateError,
+        match="next_cycle_proposal_skip_basis_invalid",
+    ):
+        validate_reasoning_skill_draft(
+            request,
+            ReasoningSkillDraft(
+                draft=output,
+                primary_session_ref="native:reasoning",
+                adapter_kind="test",
+            ),
+        )
+
+
+def test_malformed_typed_skip_map_does_not_hide_binding_fallback():
+    request = _request()
+    idea_outcome_ref = "idea_outcome_48e40766007b43a381dacbaf1d906a92"
+    request.context_pack["accepted_idea_set_binding"] = {
+        "outcome_ref": idea_outcome_ref
+    }
+    request.context_pack["typed_skip_basis_refs_by_stage"] = {
+        "idea": ["stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"]
+    }
+    assert _typed_skip_basis_candidates(request) == {"idea": (idea_outcome_ref,)}
+
+
+def test_autonomous_checkpoint_schema_and_skill_enforce_frozen_idea_outcome_refs():
+    request = _request()
+    idea_outcome_ref = "idea_outcome_48e40766007b43a381dacbaf1d906a92"
+    request.context_pack["accepted_idea_set_binding"] = {
+        "outcome_ref": idea_outcome_ref
+    }
+    request = replace(
+        request,
+        context_pack_hash=canonical_hash(request.context_pack),
+    )
+    variants = _reasoning_autonomous_checkpoint_schema(request)[
+        "properties"
+    ]["autonomous_scope"]["anyOf"]
+    plan_variant = next(
+        item for item in variants if item["properties"]["entry_stage"]["const"] == "plan"
+    )
+    idea_items = plan_variant["properties"][
+        "typed_skip_basis_refs_by_stage"
+    ]["properties"]["idea"]["items"]
+    assert idea_items["enum"] == [idea_outcome_ref]
+
+    from test_public_reasoning_autonomous_checkpoint import _checkpoint
+
+    checkpoint = _checkpoint(
+        type(
+            "Request",
+            (),
+            {
+                "request_ref": request.stage_request_ref,
+                "context_pack": request.context_pack,
+                "cycle_ref": request.cycle_ref,
+                "epoch": request.foreground_epoch,
+                "accepted_question": type(
+                    "Question", (), {
+                        "question_ref": request.question_ref,
+                        "quest_ref": request.quest_ref,
+                    }
+                )(),
+            },
+        )(),
+        question_title="A literature-informed follow-up",
+    )
+    checkpoint["autonomous_scope"]["entry_stage"] = "plan"
+    checkpoint["autonomous_scope"]["typed_skip_basis_refs_by_stage"] = {
+        "idea": [idea_outcome_ref]
+    }
+    provider_checkpoint = deepcopy(checkpoint)
+    causal_interpretation = provider_checkpoint["scientific_outcome"][
+        "causal_interpretation"
+    ]
+    for field in (
+        "target_commit_refs",
+        "changed_axis_fact_refs",
+        "held_fixed_fact_refs",
+        "provenance_refs",
+    ):
+        causal_interpretation.pop(field)
+    provider_checkpoint["scientific_outcome"]["research_synthesis"][
+        "current_question"
+    ].pop("prior_accepted_outcome_refs")
+    provider_checkpoint["scientific_outcome"]["notes"] = ""
+    Draft202012Validator(_reasoning_autonomous_checkpoint_schema(request)).validate(
+        provider_checkpoint
+    )
+    validate_reasoning_skill_draft(
+        request,
+        ReasoningSkillDraft(
+            draft=checkpoint,
+            primary_session_ref="native:reasoning",
+            adapter_kind="test",
+        ),
+    )
+    invalid = deepcopy(checkpoint)
+    invalid["autonomous_scope"]["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
+    ]
+    with pytest.raises(
+        RecoverableReasoningSkillCandidateError,
+        match="autonomous_question_skip_basis_invalid",
+    ):
+        validate_reasoning_skill_draft(
+            request,
+            ReasoningSkillDraft(
+                draft=invalid,
+                primary_session_ref="native:reasoning",
+                adapter_kind="test",
+            ),
+        )
 
 
 def test_ar_refuses_direct_bundle_before_recording_new_execution():

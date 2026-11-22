@@ -340,6 +340,9 @@ def validate_reasoning_skill_draft(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                allowed_typed_skip_basis_refs_by_stage=(
+                    _typed_skip_basis_candidates(request)
+                ),
                 historical_resolver=request.historical_evidence_resolver,
             )
         return validate_reasoning_stage_output(
@@ -392,6 +395,9 @@ def validate_reasoning_autonomous_checkpoint_result(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                allowed_typed_skip_basis_refs_by_stage=(
+                    _typed_skip_basis_candidates(request)
+                ),
                 historical_resolver=request.historical_evidence_resolver,
             )
         )
@@ -401,6 +407,9 @@ def validate_reasoning_autonomous_checkpoint_result(
                 frozen_evidence_closure=list(request.frozen_evidence_closure),
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
+                ),
+                allowed_typed_skip_basis_refs_by_stage=(
+                    _typed_skip_basis_candidates(request)
                 ),
                 historical_resolver=request.historical_evidence_resolver,
             )
@@ -430,7 +439,15 @@ def validate_reasoning_deepfetch_decision(request: ReasoningSkillRequest, decisi
     if action == "create":
         if not facts.get("snapshot_ref"):
             raise ReasoningContractError("reasoning_deepfetch_summary_required")
-        validate_reasoning_autonomous_checkpoint(output, frozen_evidence_closure=list(request.frozen_evidence_closure), frozen_research_context=request.context_pack["research_context"], historical_resolver=request.historical_evidence_resolver)
+        validate_reasoning_autonomous_checkpoint(
+            output,
+            frozen_evidence_closure=list(request.frozen_evidence_closure),
+            frozen_research_context=request.context_pack["research_context"],
+            allowed_typed_skip_basis_refs_by_stage=(
+                _typed_skip_basis_candidates(request)
+            ),
+            historical_resolver=request.historical_evidence_resolver,
+        )
     else:
         validate_reasoning_stage_output(output, frozen_evidence_closure=list(request.frozen_evidence_closure), frozen_research_context=request.context_pack["research_context"], historical_resolver=request.historical_evidence_resolver, allowed_typed_skip_basis_refs_by_stage=_typed_skip_basis_candidates(request), expected_completion_milestone_basis_refs=_completion_basis_for_output(request, output))
 
@@ -464,6 +481,9 @@ def validate_reasoning_autonomous_resume_result(
             frozen_evidence_closure=list(request.frozen_evidence_closure),
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
+            ),
+            allowed_typed_skip_basis_refs_by_stage=(
+                _typed_skip_basis_candidates(request)
             ),
             historical_resolver=request.historical_evidence_resolver,
         )
@@ -1386,6 +1406,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                allowed_typed_skip_basis_refs_by_stage=(
+                    _typed_skip_basis_candidates(request)
+                ),
                 historical_resolver=request.historical_evidence_resolver,
             )
         except ReasoningContractError as error:
@@ -1743,6 +1766,7 @@ def _reasoning_autonomous_checkpoint_schema(
     request: ReasoningSkillRequest,
 ) -> dict[str, object]:
     text = {"type": "string", "minLength": 1}
+    typed_skip_candidates = _typed_skip_basis_candidates(request)
     question_properties = {
         field: {
             "type": "string",
@@ -1780,7 +1804,7 @@ def _reasoning_autonomous_checkpoint_schema(
                 **scope_base_properties,
                 "entry_stage": {"const": entry_stage},
                 "typed_skip_basis_refs_by_stage": _typed_skip_basis_schema(
-                    entry_stage, text
+                    entry_stage, text, typed_skip_candidates
                 ),
             },
             "required": [
@@ -2054,19 +2078,27 @@ def _typed_skip_basis_candidates(
     found: dict[str, set[str]] = {"idea": set(), "plan": set()}
     authoritative_stages: set[str] = set()
 
-    def add(stage: str, value: object, prefix: str) -> None:
+    def add(stage: str, value: object, prefix: str) -> bool:
         if isinstance(value, str) and value.startswith(prefix):
             found[stage].add(value)
+            return True
+        return False
 
     typed_skip = request.context_pack.get("typed_skip_basis_refs_by_stage")
     if isinstance(typed_skip, dict):
         idea_refs = typed_skip.get("idea")
         plan_refs = typed_skip.get("plan")
-        if isinstance(idea_refs, list) and len(idea_refs) == 1:
-            add("idea", idea_refs[0], "idea_outcome_")
+        if (
+            isinstance(idea_refs, list)
+            and len(idea_refs) == 1
+            and add("idea", idea_refs[0], "idea_outcome_")
+        ):
             authoritative_stages.add("idea")
-        if isinstance(plan_refs, list) and len(plan_refs) == 1:
-            add("plan", plan_refs[0], "formal_plan_")
+        if (
+            isinstance(plan_refs, list)
+            and len(plan_refs) == 1
+            and add("plan", plan_refs[0], "formal_plan_")
+        ):
             authoritative_stages.add("plan")
 
     closure = request.context_pack.get("upstream_stage_closure")

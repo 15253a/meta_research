@@ -798,13 +798,20 @@ def validate_autonomous_question_scope(
         if (
             allowed_typed_skip_basis_refs_by_stage is not None
             and entry_stage != "reasoning"
-            and stage in allowed_typed_skip_basis_refs_by_stage
-            and any(
-                ref not in allowed_typed_skip_basis_refs_by_stage[stage]
-                for ref in normalized
-            )
+            and stage in {"idea", "plan"}
         ):
-            raise ReasoningContractError("autonomous_question_skip_basis_invalid")
+            expected_prefix = f"{stage}_outcome_" if stage == "idea" else "formal_plan_"
+            if any(not ref.startswith(expected_prefix) for ref in normalized):
+                raise ReasoningContractError("autonomous_question_skip_basis_invalid")
+            if (
+                allowed_typed_skip_basis_refs_by_stage is not None
+                and stage in allowed_typed_skip_basis_refs_by_stage
+                and any(
+                    ref not in allowed_typed_skip_basis_refs_by_stage[stage]
+                    for ref in normalized
+                )
+            ):
+                raise ReasoningContractError("autonomous_question_skip_basis_invalid")
     return canonical_hash(scope)
 
 
@@ -1572,13 +1579,20 @@ def _validate_successor_route(
         if (
             allowed_skip_basis_refs_by_stage is not None
             and entry_stage != "reasoning"
-            and stage in allowed_skip_basis_refs_by_stage
-            and any(
-                ref not in allowed_skip_basis_refs_by_stage[stage]
-                for ref in normalized
-            )
+            and stage in {"idea", "plan"}
         ):
-            raise ReasoningContractError(skip_code)
+            expected_prefix = f"{stage}_outcome_" if stage == "idea" else "formal_plan_"
+            if any(not ref.startswith(expected_prefix) for ref in normalized):
+                raise ReasoningContractError(skip_code)
+            if (
+                allowed_skip_basis_refs_by_stage is not None
+                and stage in allowed_skip_basis_refs_by_stage
+                and any(
+                    ref not in allowed_skip_basis_refs_by_stage[stage]
+                    for ref in normalized
+                )
+            ):
+                raise ReasoningContractError(skip_code)
 
 
 def _require_text(value: object, code: str) -> str:

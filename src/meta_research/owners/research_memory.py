@@ -7459,6 +7459,9 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         historical_resolver = _historical_evidence_resolver(
             self._reference_reader, scientific_outcome.get("quest_ref")
         )
+        allowed_typed_skip_basis_refs_by_stage = context_pack.get(
+            "typed_skip_basis_refs_by_stage"
+        )
         try:
             checkpoint_hash, outcome_hash, autonomous_scope_hash = (
                 validate_reasoning_autonomous_checkpoint(
@@ -7467,12 +7470,24 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    allowed_typed_skip_basis_refs_by_stage=(
+                        allowed_typed_skip_basis_refs_by_stage
+                        if isinstance(
+                            allowed_typed_skip_basis_refs_by_stage, dict
+                        )
+                        else None
+                    ),
                     historical_resolver=historical_resolver,
                 )
             )
             if validate_autonomous_question_scope(
                 autonomous_scope,
                 source_outcome=scientific_outcome,
+                allowed_typed_skip_basis_refs_by_stage=(
+                    allowed_typed_skip_basis_refs_by_stage
+                    if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
+                    else None
+                ),
             ) != autonomous_scope_hash:
                 raise ReasoningContractError(
                     "autonomous_question_scope_invalid"
@@ -8184,6 +8199,9 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         ) != (scientific_candidate_domain_receipt is None):
             raise OwnerConflict("reasoning_scientific_candidate_binding_invalid")
         cited_outcome = outcome.get("scientific_outcome")
+        allowed_typed_skip_basis_refs_by_stage = context_pack.get(
+            "typed_skip_basis_refs_by_stage"
+        )
         # One Quest scope covers the final outcome and its reviewed draft:
         # both must bind to this pack's single frozen research context.
         historical_resolver = _historical_evidence_resolver(
@@ -8206,6 +8224,13 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    allowed_typed_skip_basis_refs_by_stage=(
+                        allowed_typed_skip_basis_refs_by_stage
+                        if isinstance(
+                            allowed_typed_skip_basis_refs_by_stage, dict
+                        )
+                        else None
+                    ),
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
@@ -8223,6 +8248,13 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    allowed_typed_skip_basis_refs_by_stage=(
+                        allowed_typed_skip_basis_refs_by_stage
+                        if isinstance(
+                            allowed_typed_skip_basis_refs_by_stage, dict
+                        )
+                        else None
+                    ),
                     historical_resolver=historical_resolver,
                 )
             else:
@@ -8235,6 +8267,13 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_evidence_closure=frozen_evidence_closure,
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
+                    ),
+                    allowed_typed_skip_basis_refs_by_stage=(
+                        allowed_typed_skip_basis_refs_by_stage
+                        if isinstance(
+                            allowed_typed_skip_basis_refs_by_stage, dict
+                        )
+                        else None
                     ),
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
@@ -13066,6 +13105,11 @@ def _verify_reasoning_scientific_candidate_payload(
         raise OwnerConflict("reasoning_scientific_candidate_invalid") from error
     if not isinstance(evidence_closure, list):
         raise OwnerConflict("reasoning_scientific_candidate_invalid")
+    allowed_typed_skip_basis_refs_by_stage = (
+        context_pack.get("typed_skip_basis_refs_by_stage")
+        if isinstance(context_pack, dict)
+        else None
+    )
     if (
         checkpoint
         != {
@@ -13114,12 +13158,22 @@ def _verify_reasoning_scientific_candidate_payload(
                 frozen_research_context=cast(
                     dict[str, object], context_pack["research_context"]
                 ),
+                allowed_typed_skip_basis_refs_by_stage=(
+                    allowed_typed_skip_basis_refs_by_stage
+                    if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
+                    else None
+                ),
                 historical_resolver=historical_resolver,
             )
         )
         if validate_autonomous_question_scope(
             autonomous_scope,
             source_outcome=scientific_outcome,
+            allowed_typed_skip_basis_refs_by_stage=(
+                allowed_typed_skip_basis_refs_by_stage
+                if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
+                else None
+            ),
         ) != scope_hash:
             raise ReasoningContractError("autonomous_question_scope_invalid")
         review_hash = _validate_reasoning_review(
@@ -13190,6 +13244,11 @@ def _verify_reasoning_payload(
         raise OwnerConflict("reasoning_content_invalid") from error
     if not isinstance(evidence_closure, list):
         raise OwnerConflict("reasoning_content_invalid")
+    allowed_typed_skip_basis_refs_by_stage = (
+        context_pack.get("typed_skip_basis_refs_by_stage")
+        if isinstance(context_pack, dict)
+        else None
+    )
     expected_transition = (
         outcome.get("next_cycle_proposal")
         if row.transition_kind == "next_cycle_proposal"
@@ -13261,6 +13320,11 @@ def _verify_reasoning_payload(
                 frozen_research_context=cast(
                     dict[str, object], context_pack["research_context"]
                 ),
+                allowed_typed_skip_basis_refs_by_stage=(
+                    allowed_typed_skip_basis_refs_by_stage
+                    if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
+                    else None
+                ),
                 expected_completion_milestone_basis_refs=(
                     expected_completion_basis
                 ),
@@ -13275,6 +13339,13 @@ def _verify_reasoning_payload(
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    allowed_typed_skip_basis_refs_by_stage=(
+                        allowed_typed_skip_basis_refs_by_stage
+                        if isinstance(
+                            allowed_typed_skip_basis_refs_by_stage, dict
+                        )
+                        else None
+                    ),
                     historical_resolver=historical_resolver,
                 )
             )
@@ -13285,6 +13356,13 @@ def _verify_reasoning_payload(
                     frozen_evidence_closure=evidence_closure,
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
+                    ),
+                    allowed_typed_skip_basis_refs_by_stage=(
+                        allowed_typed_skip_basis_refs_by_stage
+                        if isinstance(
+                            allowed_typed_skip_basis_refs_by_stage, dict
+                        )
+                        else None
                     ),
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis

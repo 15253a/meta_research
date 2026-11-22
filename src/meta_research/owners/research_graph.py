@@ -227,6 +227,7 @@ _REASONING_ROUTE_REJECTION_CODES = frozenset(
         "reasoning_next_cycle_bundle_basis_unavailable",
         "reasoning_next_cycle_bundle_basis_invalid",
         "reasoning_next_cycle_target_invalid",
+        "reasoning_next_cycle_asset_commit_invalid",
         "autonomous_successor_skip_basis_invalid",
         "autonomous_successor_asset_binding_invalid",
     }
