@@ -15919,11 +15919,14 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         # This local build starts after issuer and persisted-state verification.
         # The pre-write issuer/domain recheck below establishes its own work view.
         result_content = result_document.as_dict()
-        work = _declared_work(result_content)
-        reused_variant_binding = self._root_reused_primary_binding(result_document, work=work)
-        reused_evaluation_binding = self._root_reused_primary_binding(result_document, "evaluation_attempt", work=work)
-        reused_refs = primary_reused_references(result_content, work=work)
-        evaluation_status = primary_evaluation_status(result_content, work=work)
+        try:
+            work = _declared_work(result_content)
+            reused_variant_binding = self._root_reused_primary_binding(result_document, work=work)
+            reused_evaluation_binding = self._root_reused_primary_binding(result_document, "evaluation_attempt", work=work)
+            reused_refs = primary_reused_references(result_content, work=work)
+            evaluation_status = primary_evaluation_status(result_content, work=work)
+        except TargetContentIssue as error:
+            return reject_candidate(error)
         variant_run_ref = reused_variant_binding.subject_ref if reused_variant_binding else new_ref("target_root_variant_run")
         evaluation_attempt_ref = None if evaluation_status == "pending" else (reused_evaluation_binding.subject_ref if reused_evaluation_binding else new_ref("target_root_evaluation_attempt"))
         metric_result_ref = (reused_refs.get("metric_result_ref") or new_ref("target_root_metric_result")) if evaluation_status == "completed" else None
@@ -20709,7 +20712,8 @@ def _target_root_commit_material(
         )
         items = _root_work_items_from_declared(payload=measurement_payload,
                                 identities=authority.identities.as_public_dict(),
-                                work=work)
+                                work=work,
+                                declared_runs=result_content.get("formal_runs"))
         # A declared primary carries its own real method identity (registered
         # during entity persistence); the draft identity only constrains items
         # that did not declare one.  The payload inventory keeps the draft

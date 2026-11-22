@@ -173,15 +173,55 @@ def test_declaration_conflicts_with_explicit_variant_or_reused_run():
         result_document={"metrics": {"quality": 1.0},
                          "formal_runs": [run]},
     )
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as explicit_variant:
         resolve({"run_key": "primary", "baseline_forward_contract": NEW_METHOD_FORWARD,
                  "variant_recipe": NEW_RECIPE,
                  "variant_ref": "variant-1",
                  "evaluations": [{"attempt_key": "a", "metrics": {"quality": 1.0}}]})
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    assert "$.formal_runs[0]" in explicit_variant.value.feedback
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as reused_run:
         resolve({"run_key": "primary", "baseline_forward_contract": NEW_METHOD_FORWARD,
                  "variant_recipe": NEW_RECIPE, "variant_run_ref": "run-existing",
                  "evaluations": []})
+    assert "$.formal_runs[0]" in reused_run.value.feedback
+
+
+def test_variant_declaration_path_tracks_formal_runs_index_across_multiple_evaluations():
+    payload = {"measurement_ref": "m", "variant_run_ref": "run-primary",
+               "evaluation_attempt_ref": "attempt-primary", "metric_result_ref": "metric-primary"}
+    identities = {"variant_ref": "variant-1", "evaluation_ref": "evaluation-1"}
+    multi_eval_doc = {
+        "metrics": {},
+        "formal_runs": [
+            {"run_key": "primary", "evaluations": [
+                {"attempt_key": "eval-1", "metrics": {"quality": 1.0}},
+                {"attempt_key": "eval-2", "metrics": {"quality": 0.9}},
+            ]},
+            {"run_key": "audit-work",
+             "baseline_forward_contract": NEW_METHOD_FORWARD,
+             "evaluations": []},
+        ],
+    }
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as expanded:
+        root_work_items(payload=payload, identities=identities, result_document=multi_eval_doc)
+    assert "$.formal_runs[1]" in expanded.value.feedback
+    assert "$.formal_runs[2]" not in expanded.value.feedback
+
+    reordered_doc = {
+        "metrics": {},
+        "formal_runs": [
+            {"run_key": "unassessed-first",
+             "baseline_forward_contract": NEW_METHOD_FORWARD,
+             "evaluations": []},
+            {"run_key": "measured-second", "evaluations": [
+                {"attempt_key": "eval-1", "metrics": {"quality": 1.0}},
+            ]},
+        ],
+    }
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as reordered:
+        root_work_items(payload=payload, identities=identities, result_document=reordered_doc)
+    assert "$.formal_runs[0]" in reordered.value.feedback
+    assert "$.formal_runs[1]" not in reordered.value.feedback
 
 
 def test_declaration_requires_both_contract_and_recipe():
