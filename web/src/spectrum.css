@@ -62,6 +62,4 @@
 @media(max-width:420px){.spectrum-stages{grid-template-columns:1fr}.spectrum-stage-name{font-size:20px}.stage-root-sessions{margin-top:8px}.spectrum-stage-open{min-height:44px}.spectrum-chart{height:65px}}
 @media(prefers-reduced-motion:reduce){.research-spectrum *{animation:none!important;transition:none!important}}
 
-.stage-root-links button{display:inline-flex;align-items:baseline;flex-wrap:wrap;gap:4px;max-width:100%;min-height:30px;padding:4px 9px;border:1px solid var(--spectrum-line);border-radius:20px;background:#eef1f7;color:#45556d;font-family:inherit;font-size:12px;font-weight:500;line-height:1.6;cursor:pointer;text-align:left}
-
-.stage-root-links button[data-executing=true]>span::after{content:"";display:inline-block;vertical-align:middle;width:5px;height:5px;border-radius:50%;background:var(--stage-text);margin-left:5px}
+.stage-root-links button{display:inline-flex;align-items:center;flex-wrap:wrap;gap:5px;max-width:100%;min-height:30px;padding:4px 9px;border:1px solid var(--spectrum-line);border-radius:20px;background:#eef1f7;color:#45556d;font-family:inherit;font-size:12px;font-weight:500;line-height:1.6;cursor:pointer;text-align:left}

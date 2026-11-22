@@ -11,13 +11,13 @@ const source = readFileSync(resolve("src/ExecutionElapsed.tsx"), "utf8");
 const code = ts.transpileModule(source, { compilerOptions: {
   target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX,
 } }).outputText;
-function render(state: string, ended = false) {
+function render(state: string, ended = false, extra: Record<string, unknown> = {}) {
   const exports: Record<string, any> = {};
   runInNewContext(code, { exports, require: (name: string) => name === "react" ? {
     ...React, useEffect: () => {}, useState: () => [1_000, () => {}],
   } : jsxRuntime, Date, Math, performance: { now: () => 1_000 } });
   return renderToStaticMarkup(React.createElement(exports.ExecutionElapsed, {
-    sample: { sourceUpdatedAt: 1_700_000_000, observedAt: 1_700_000_581, receivedAt: 1_000 }, state, ended,
+    sample: { sourceUpdatedAt: 1_700_000_000, observedAt: 1_700_000_581, receivedAt: 1_000 }, state, ended, ...extra,
   }));
 }
 test("waiting and paused sessions show a stable last record instead of an apparent stalled clock", () => {
@@ -37,4 +37,14 @@ test("an executing session retains the real output age even while the service is
 test("terminal output remains ended even if its session has moved on", () => {
   expect(render("executing", true)).toContain("输出已结束");
   expect(render("executing", true)).not.toContain("581");
+});
+test("ended and executing runs show factual run duration when start/end bounds exist", () => {
+  const endedHtml = render("completed", true, { startedAt: 1_699_999_246, endedAt: 1_700_000_000 });
+  expect(endedHtml).toContain("输出已结束");
+  expect(endedHtml).toContain("上次运行 12 分 34 秒");
+  expect(endedHtml).toContain("最后记录于");
+  expect(endedHtml).not.toContain("581");
+  const liveHtml = render("executing", false, { startedAt: 1_699_999_900 });
+  expect(liveHtml).toContain("已运行 11 分 21 秒");
+  expect(liveHtml).toContain("距上次执行记录 <b>581</b> 秒");
 });

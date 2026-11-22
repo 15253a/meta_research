@@ -676,7 +676,9 @@ test("the persistent Quest Companion sends ordinary conversation without command
   await expect(companion).not.toContainText("capability_unavailable");
   await expect(companion).not.toContainText("REQUEST-ONLY");
 
-  await companion.getByRole("button", { name: "审阅操作草案" }).click();
+  const commandProposal = companion.locator(".lumen-proposal").filter({ hasText: "建议建立精确归档授权草案" });
+  await commandProposal.locator(":scope > .assistant-fold > summary").click();
+  await commandProposal.getByRole("button", { name: "审阅操作草案" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/agent-proposals/proposal-command-1/command-draft",
     body: {
@@ -685,6 +687,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
     },
   });
   const createdCommand = companion.locator(".lumen-command").filter({ hasText: "archive_export" });
+  await createdCommand.locator(":scope > .assistant-fold > summary").click();
   await expect(createdCommand).toContainText("来源 · proposal-command-1");
   await createdCommand.getByText("修改操作草案", { exact: true }).click();
   await createdCommand.getByLabel("Command intent-2 exact scope").fill(JSON.stringify({
@@ -710,7 +713,9 @@ test("the persistent Quest Companion sends ordinary conversation without command
     },
   });
 
-  await companion.getByRole("button", { name: "明确确认并交给研究" }).click();
+  const guidanceReview = companion.getByRole("article", { name: "确认研究指导" });
+  await guidanceReview.locator(":scope > .assistant-fold > summary").click();
+  await guidanceReview.getByRole("button", { name: "明确确认并交给研究" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/agent-proposals/proposal-1/soft-constraint",
     body: {
@@ -721,14 +726,16 @@ test("the persistent Quest Companion sends ordinary conversation without command
   });
   await expect(companion.locator(".lumen-constraint").filter({ hasText: "首轮只使用公开文献" }))
     .toContainText("source · proposal-1");
-  await companion.locator(".lumen-constraint").filter({ hasText: "优先使用可公开复核的材料" })
-    .getByRole("button", { name: "撤回指导" }).click();
+  const withdrawConstraint = companion.locator(".lumen-constraint").filter({ hasText: "优先使用可公开复核的材料" });
+  await withdrawConstraint.locator(":scope > .assistant-fold > summary").click();
+  await withdrawConstraint.getByRole("button", { name: "撤回指导" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/soft-constraints/constraint-1/withdrawals",
     body: { expected_revision: 1 },
   });
 
   const existingCommand = companion.locator(".lumen-command").filter({ hasText: "external_publish" });
+  await existingCommand.locator(":scope > .assistant-fold > summary").click();
   await existingCommand.getByRole("button", { name: "查看操作影响" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands/intent-1/previews",
@@ -916,6 +923,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
   const companion = page.getByRole("complementary", { name: "研究助手" });
   await expect(companion).toContainText("需要你 · 只影响相关任务");
   await expect(companion).toContainText("当前研究授权");
+  await companion.locator(".lumen-broad-authorization > .assistant-fold > summary").click();
   await companion.getByRole("button", { name: "申请撤销授权" }).click();
   await expect.poll(() => writes.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/commands",
@@ -933,6 +941,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
   });
   const commandCard = companion.locator('.lumen-command[data-command-ref="intent-broad-revoke"]');
   await expect(commandCard).toContainText("撤销权限 · broad_research");
+  await commandCard.locator(":scope > .assistant-fold > summary").click();
   await commandCard.getByRole("button", { name: "查看操作影响" }).click();
   await commandCard.getByText("查看操作与影响", { exact: true }).click();
   await commandCard.getByRole("button", { name: "确认当前草案与预览" }).click();
@@ -2322,6 +2331,7 @@ test("human guidance reviews original words and local scope through real Compani
   await sidebar.getByRole("button", { name: "发送消息", exact: true }).click();
   let review = sidebar.getByRole("article", { name: "确认研究指导" });
   await expect(review).toBeVisible({ timeout: 20_000 });
+  await review.locator(":scope > .assistant-fold > summary").click();
   await expect(review.getByLabel("指导原文", { exact: true })).toHaveValue(original);
   await expect(review).not.toContainText("Quest 全局目标更新待对齐");
   const preview = await (await page.request.get(product.baseUrl + "/api/v1/snapshot")).json();
