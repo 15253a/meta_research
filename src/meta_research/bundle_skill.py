@@ -350,6 +350,7 @@ class BundleTargetBatchRequest:
     job_ref: str | None = None
     provider_feedback: dict[str, object] | None = None
     native_replacement_context: dict[str, object] | None = None
+    quest_goal_revision: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -1644,6 +1645,12 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "formal_plan_ref": request.formal_plan_ref,
             "context_pack_ref": request.context_pack_ref,
             "context_pack_hash": request.context_pack_hash,
+            "goal_revision_ref": (
+                None
+                if request.quest_goal_revision is None
+                else request.quest_goal_revision.get("goal_revision_ref")
+            ),
+            "quest_goal_revision": request.quest_goal_revision,
             "base_generation": request.base_generation,
             "base_head_receipt": request.base_head_receipt,
             "inbox_checkpoint": request.inbox_checkpoint,
@@ -1702,7 +1709,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "known_current_targets 和 known_target_commit_refs 指向本会话已交付的未变正文；"
             "仅在确实缺失材料时用当前 context_pack_ref 定向补读。"
             "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
-            f"冻结 Quest Goal={canonical_json(request.context_pack.get('quest_goal_revision'))}\n"
+            f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
             f"{_bundle_output_assembly_prompt()}"
             "完成独立审阅与必要综合后交接，保留未解决事项，不重复已完成工作。\n"
             f"batch_context={canonical_json(reading_context)}"

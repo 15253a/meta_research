@@ -618,6 +618,10 @@ class BundleStageWorker:
                     inbox_checkpoint=inbox_checkpoint.as_public_dict(),
                     cycle_position=request.context_pack["cycle_position"],
                     native_replacement_context=replacement_context,
+                    quest_goal_revision=cast(
+                        dict[str, object] | None,
+                        request.context_pack.get("quest_goal_revision"),
+                    ),
                     job_ref=batch_operation_ref,
                     provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                         run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
