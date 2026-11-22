@@ -726,16 +726,19 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
             <TimelineSummary className="research-timeline-cycle-meta" nodeKey={`cycle:${cycle.cycle_ref}`} node={summaries.nodes[`cycle:${cycle.cycle_ref}`]} unavailable={summaries.error}
               acceptedResultNeedsReview={summaryNeedsAcceptedResultReview(summaries.nodes[`cycle:${cycle.cycle_ref}`], cycle, entries.flatMap(entry => entry.artifacts), summarySessions, summaries.observedAt)} />
             {isCurrent ? <i className="research-timeline-badge">当前轮</i> : null}
-          </>}>{() => <ol className="research-timeline-stages">{entries.map(({ stage, artifacts, latest }) => <li key={stage} className="research-timeline-stage" data-stage={stage} style={{ "--stage-accent": stageAccents[stage] } as CSSProperties}>
+          </>}>{() => <ol className="research-timeline-stages">{entries.map(({ stage, artifacts, latest }) => {
+              const stageRunning = isLiveQuest && isCurrent && foreground?.stage.toLowerCase() === stage
+                && currentStageStatus(stage, snapshot, rootConversations).state === "running";
+              return <li key={stage} className="research-timeline-stage" data-stage={stage} style={{ "--stage-accent": stageAccents[stage] } as CSSProperties}>
               <button type="button" className="research-timeline-stage-open" aria-label={`查看 ${stageTechnicalNames[stage]} 输出`}
                 aria-pressed={roots?.selectedTimelineKind === "stage" && roots.selectedCycleRef === cycle.cycle_ref && roots.selectedStage === stage}
                 onClick={() => { roots?.selectTimelineStage(stage, cycle.cycle_ref, cycle.question_ref); onOpenOutput(!isLiveQuest); }}>
-                <span className="research-timeline-stage-head"><b>{stageTechnicalNames[stage]}</b></span>
+                <span className="research-timeline-stage-head"><b>{stageRunning ? <i className="root-running-spinner" aria-hidden="true" /> : null}{stageTechnicalNames[stage]}</b></span>
                 <TimelineSummary className="research-timeline-stage-summary" nodeKey={`stage:${cycle.cycle_ref}:${stage}`} node={summaries.nodes[`stage:${cycle.cycle_ref}:${stage}`]} unavailable={summaries.error}
                   acceptedResultNeedsReview={summaryNeedsAcceptedResultReview(summaries.nodes[`stage:${cycle.cycle_ref}:${stage}`], cycle, artifacts, summarySessions, summaries.observedAt)} />
                 <small className="research-timeline-stage-state">{isCurrent && foreground?.stage.toLowerCase() === stage ? <><span>当前阶段</span><span>{currentStageStatus(stage, snapshot, rootConversations).label}</span></> : latest ? acceptedStatusNames[latest.status] : "尚无记录"}</small>
               </button>
-              <button type="button" className="overview-text-button research-timeline-stage-result" aria-label={`查看${stageNames[stage]}结果与历史`} title="结果与历史" onClick={() => setSelection({ cycleRef: cycle.cycle_ref, stage, epoch: latest?.epoch ?? null })}><MetaTrace variant="entry" working={isLiveQuest && isCurrent && currentStageStatus(stage, snapshot, rootConversations).state === "running" && foreground?.stage.toLowerCase() === stage} /></button>
+              <button type="button" className="overview-text-button research-timeline-stage-result" aria-label={`查看${stageNames[stage]}结果与历史`} title="结果与历史" onClick={() => setSelection({ cycleRef: cycle.cycle_ref, stage, epoch: latest?.epoch ?? null })}><MetaTrace variant="entry" working={stageRunning} /></button>
               {stage === "bundle" && (targets.length > 0 || isCurrent) ? <ul className="research-timeline-targets">
                 {targets.map(target => <li key={target.ref} className="research-timeline-target" data-target-ref={target.ref} data-executing={target.executing}>
                   <button className="research-timeline-target-open" type="button"
@@ -743,11 +746,12 @@ export function ResearchTimeline({ snapshot, overview, error, onRetry, rootConve
                     onClick={() => {
                     roots?.selectTimelineTarget(target.ref, cycle.cycle_ref, cycle.question_ref, target.session?.session_ref ?? null, target.runRef);
                     onOpenOutput(!isLiveQuest);
-                  }}><b>{target.label}</b><TimelineSummary className="research-timeline-target-summary" nodeKey={`target:${cycle.cycle_ref}:${target.ref}`} node={summaries.nodes[`target:${cycle.cycle_ref}:${target.ref}`]} unavailable={summaries.error} /><small className="research-timeline-target-state">{target.status}</small></button>
+                  }}><b>{target.executing ? <i className="root-running-spinner" aria-hidden="true" /> : null}{target.label}</b><TimelineSummary className="research-timeline-target-summary" nodeKey={`target:${cycle.cycle_ref}:${target.ref}`} node={summaries.nodes[`target:${cycle.cycle_ref}:${target.ref}`]} unavailable={summaries.error} /><small className="research-timeline-target-state">{target.status}</small></button>
                 </li>)}
                 {!targets.length ? <li className="research-timeline-target"><span className="research-timeline-target-summary">{sessionsUnavailable ? "Target 工作记录暂不可确认" : "尚无可展示的 Target 工作记录"}</span></li> : null}
               </ul> : null}
-            </li>)}</ol>}</BoundedDetails>
+            </li>;
+            })}</ol>}</BoundedDetails>
         </li>;
       })}</ol> : <p className="overview-readable-text">{questionItem?.summary || "正式问题已建立，尚未开始首轮研究。"}</p>}</BoundedDetails></li>;
       })}</ol></div>}
