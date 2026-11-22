@@ -281,7 +281,7 @@ def has_variant_declaration(result_document, run_key):
     return False
 
 
-def _variant_declaration(run):
+def _variant_declaration(run, *, path=None):
     """A run may carry its actual method identity instead of the bundle draft.
 
     ``baseline_forward_contract`` follows the same envelope the Bundle
@@ -294,7 +294,17 @@ def _variant_declaration(run):
     if forward is None and recipe is None:
         return None
     if not isinstance(forward, dict) or not isinstance(recipe, dict) or not recipe:
-        raise OwnerConflict('target_formal_variant_declaration_invalid')
+        error = TargetContentIssue('target_formal_variant_declaration_invalid')
+        run_key = run.get('run_key')
+        location = path or '$.formal_runs entry'
+        error.feedback = (
+            f"{location} (Run {run_key!r}) has an incomplete variant declaration. "
+            "baseline_forward_contract and variant_recipe must be supplied together. "
+            "baseline_forward_contract must be an object and variant_recipe must be a "
+            "nonempty object. Correct this formal_runs entry, preserve the actual "
+            "work and artifacts, and finish another normal turn in the same Root."
+        )
+        raise error
     return {'forward': forward, 'recipe': recipe}
 
 
@@ -413,7 +423,9 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
     for ordinal, run in enumerate(declared):
         if isinstance(run, dict) and run.get('run_key'):
             declarations[run['run_key']] = (
-                _variant_declaration(run), '$.formal_runs[' + str(ordinal) + ']')
+                _variant_declaration(
+                    run, path='$.formal_runs[' + str(ordinal) + ']'),
+                '$.formal_runs[' + str(ordinal) + ']')
     if not any(declaration is not None for declaration, _ in declarations.values()):
         return
     from meta_research.baseline_identity import resolve_baseline_method_identity
@@ -515,7 +527,8 @@ def _root_work_items_from_declared(*, work, payload, identities):
     items = []
     for ordinal, (run, attempt) in enumerate(work):
         run_key = run['run_key']
-        declaration = _variant_declaration(run)
+        declaration = _variant_declaration(
+            run, path='$.formal_runs[' + str(ordinal) + ']')
         if declaration is not None and (run.get('variant_ref') or run.get('variant_run_ref')):
             # A reused run keeps its original Variant; an explicit variant_ref
             # needs no separate declaration for the same fact.

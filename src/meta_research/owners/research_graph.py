@@ -15940,29 +15940,32 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         )
         commit_ref = new_ref("target_commit")
         commit_receipt_ref = new_ref("rg_target_commit_receipt")
-        material = _target_root_commit_material(
-            target=target,
-            authority=authority,
-            projection=projection,
-            candidate_projection=candidate_projection,
-            completion=completion,
-            manifest=manifest,
-            result_document=result_document,
-            measurement_ref=measurement_ref,
-            variant_run_ref=variant_run_ref,
-            evaluation_attempt_ref=evaluation_attempt_ref,
-            metric_result_ref=metric_result_ref,
-            variant_binding_ref=variant_binding_ref,
-            variant_binding_receipt_ref=variant_binding_receipt_ref,
-            evaluation_binding_ref=evaluation_binding_ref,
-            evaluation_binding_receipt_ref=evaluation_binding_receipt_ref,
-            measurement_receipt_ref=measurement_receipt_ref,
-            commit_ref=commit_ref,
-            commit_receipt_ref=commit_receipt_ref,
-            reused_variant_binding=reused_variant_binding,
-            reused_evaluation_binding=reused_evaluation_binding,
-            work=work,
-        )
+        try:
+            material = _target_root_commit_material(
+                target=target,
+                authority=authority,
+                projection=projection,
+                candidate_projection=candidate_projection,
+                completion=completion,
+                manifest=manifest,
+                result_document=result_document,
+                measurement_ref=measurement_ref,
+                variant_run_ref=variant_run_ref,
+                evaluation_attempt_ref=evaluation_attempt_ref,
+                metric_result_ref=metric_result_ref,
+                variant_binding_ref=variant_binding_ref,
+                variant_binding_receipt_ref=variant_binding_receipt_ref,
+                evaluation_binding_ref=evaluation_binding_ref,
+                evaluation_binding_receipt_ref=evaluation_binding_receipt_ref,
+                measurement_receipt_ref=measurement_receipt_ref,
+                commit_ref=commit_ref,
+                commit_receipt_ref=commit_receipt_ref,
+                reused_variant_binding=reused_variant_binding,
+                reused_evaluation_binding=reused_evaluation_binding,
+                work=work,
+            )
+        except TargetContentIssue as error:
+            return reject_candidate(error)
         receipt_bindings = {
             "target_ref": target.target_ref,
             "target_run_ref": completion.handle.target_run_ref,

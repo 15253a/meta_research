@@ -186,11 +186,55 @@ def test_declaration_conflicts_with_explicit_variant_or_reused_run():
 
 def test_declaration_requires_both_contract_and_recipe():
     assert _variant_declaration({"run_key": "a"}) is None
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as missing_recipe:
         _variant_declaration({"run_key": "a", "variant_recipe": NEW_RECIPE})
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    assert "baseline_forward_contract and variant_recipe" in missing_recipe.value.feedback
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid"):
         _variant_declaration({"run_key": "a", "baseline_forward_contract": NEW_METHOD_FORWARD,
                               "variant_recipe": {}})
+
+
+def test_malformed_variant_declaration_returns_revision_feedback(tmp_path: Path):
+    runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    try:
+        path = workspace / "outputs/result.json"
+        document = json.loads(path.read_text())
+        metrics = document["metrics"]
+        document["formal_runs"] = [
+            {"run_key": "primary", "evaluations": [
+                {"attempt_key": "main", "metrics": metrics}]},
+            {"run_key": "audit-work",
+             "baseline_forward_contract": NEW_METHOD_FORWARD,
+             "evaluations": []},
+        ]
+        document["metrics"] = {}
+        path.write_text(canonical_json(document))
+
+        finalizer = TargetRunFinalizer(
+            lifecycle=lifecycle, memory=memory,
+            workspace_resolver=runtime.target_run_authorities.agent_runtime,
+            evidence_reader=_EvidenceReader(evidence),
+            measurement_authority=runtime.owners.research_graph,
+            graph_authority=runtime.owners.research_graph,
+        )
+        rejected = finalizer.finalize(handle=handle, evidence=evidence)
+        assert rejected.status == "revision_required"
+        assert rejected.pending_code == "target_formal_variant_declaration_invalid"
+        assert rejected.rejection_issuer == "research_graph"
+        assert "$.formal_runs[1]" in rejected.rejection_feedback
+        assert "audit-work" in rejected.rejection_feedback
+        assert "variant_recipe" in rejected.rejection_feedback
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_root_measurements")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_commits")
+            ).scalar_one() == 0
+    finally:
+        runtime.close()
 
 
 CONFLICTING_CONTRACT = {
