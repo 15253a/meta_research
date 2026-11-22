@@ -1713,6 +1713,11 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             if request.quest_goal_revision is not None
             else "当前 Bundle target-batch context 未携带 Quest Goal revision。"
         )
+        goal_value_line = (
+            f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
+            if request.quest_goal_revision is not None
+            else ""
+        )
         prompt = (
             (position if request.native_session_ref is None else "") +
             stage_replacement_prompt(request) +
@@ -1722,8 +1727,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "known_current_targets 和 known_target_commit_refs 指向本会话已交付的未变正文；"
             "仅在确实缺失材料时用当前 context_pack_ref 定向补读。"
             + goal_guidance
-            + f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
-            f"{_bundle_output_assembly_prompt()}"
+            + goal_value_line
+            + f"{_bundle_output_assembly_prompt()}"
             "完成独立审阅与必要综合后交接，保留未解决事项，不重复已完成工作。\n"
             f"batch_context={canonical_json(reading_context)}"
         )

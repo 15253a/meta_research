@@ -1,6 +1,7 @@
 """Quest Goal is frozen at Stage admission and delivered as science input."""
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine, text
 
@@ -138,7 +139,7 @@ def test_plan_retry_returns_old_request_before_reading_new_goal():
 
     result = owner.ensure_plan_stage_request(
         cycle_ref="cycle:1",
-        accepted_question=None,
+        accepted_question=SimpleNamespace(quest_ref="quest:1"),
         accepted_idea_set=None,
         context_pack={},
         idempotency_key="stage-request:1",
