@@ -1493,6 +1493,7 @@ def test_source_current_later_stage_route_is_rejected_atomically_by_rg(
             current = _tick_reasoning(runtime)
         assert current["reasoning_acceptance"]["status"] == "awaiting_domain"
         before_graph = runtime.owners.research_graph.query_snapshot()
+        before_feed = runtime.feed.current_revision()
         before_foreground = runtime.owners.advancement_engine.query_foreground(
             str(quest["quest_ref"])
         )
@@ -1507,6 +1508,11 @@ def test_source_current_later_stage_route_is_rejected_atomically_by_rg(
         assert rejected.outcome_ref is None
         assert rejected.reason_code == "reasoning_transition_route_invalid"
         assert any(expected_error in item for item in rejected.feedback)
+        assert any(
+            event.event_type == "research_graph.reasoning_outcome_rejected"
+            and event.payload.get("submission_ref") == rejected.submission_ref
+            for event in runtime.feed.read_after(before_feed).events
+        )
 
         after_graph = runtime.owners.research_graph.query_snapshot()
         assert after_graph.revision == before_graph.revision + 1

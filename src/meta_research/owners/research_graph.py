@@ -11296,7 +11296,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             self._feed.record(
                 connection,
-                "research_graph.reasoning_outcome_accepted",
+                (
+                    "research_graph.reasoning_outcome_accepted"
+                    if decision == "accepted"
+                    else "research_graph.reasoning_outcome_rejected"
+                ),
                 {
                     "request_ref": content.request_ref,
                     "submission_ref": content.submission_ref,
