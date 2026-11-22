@@ -65,7 +65,7 @@ def test_frozen_goal_is_rendered_as_stage_science(stage):
     )
 
     assert view["sections"]["goal_revision_ref"] == GOAL["goal_revision_ref"]
-    assert view["required_material"]["quest_goal_revision"] == GOAL
+    assert view["sections"]["quest_goal_revision"] == GOAL
 
 
 def test_existing_stage_idempotency_row_is_read_before_goal_head():

@@ -4139,10 +4139,14 @@ class SQLiteAdvancementEngine(
         if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
             raise OwnerConflict("cycle_position_binding_invalid")
         context_pack = {**context_pack, "cycle_position": position}
+        epoch = self._current_stage_epoch(
+            cycle_ref, accepted_question.quest_ref, IDEA_STAGE
+        )
         replay_ref = self._query_stage_command_result(
             idempotency_key,
             "ensure_idea_stage_request",
             cycle_ref=cycle_ref,
+            epoch=epoch,
             accepted_question=accepted_question,
             context_pack=context_pack,
         )
@@ -4153,9 +4157,6 @@ class SQLiteAdvancementEngine(
         )
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
-        epoch = self._current_stage_epoch(
-            cycle_ref, accepted_question.quest_ref, IDEA_STAGE
-        )
         request_input = {
             "command": "ensure_idea_stage_request",
             "cycle_ref": cycle_ref,
@@ -4273,6 +4274,11 @@ class SQLiteAdvancementEngine(
             if replay_ref is not None:
                 result_ref = replay_ref
             else:
+                self._assert_stage_quest_goal_current(
+                    connection,
+                    quest_ref=accepted_question.quest_ref,
+                    goal_revision_ref=cast(str, context_pack["goal_revision_ref"]),
+                )
                 self._assert_stage_head_current(
                     connection,
                     cycle_ref=cycle_ref,
@@ -4441,10 +4447,14 @@ class SQLiteAdvancementEngine(
         if "prior_accepted_bindings" in context_pack and context_pack["prior_accepted_bindings"] != prior:
             raise OwnerConflict("plan_reasoning_handoff_invalid")
         context_pack = {**context_pack, "prior_accepted_bindings": prior}
+        epoch = self._current_stage_epoch(
+            cycle_ref, accepted_question.quest_ref, PLAN_STAGE
+        )
         replay_ref = self._query_stage_command_result(
             idempotency_key,
             "ensure_plan_stage_request",
             cycle_ref=cycle_ref,
+            epoch=epoch,
             accepted_question=accepted_question,
             accepted_idea_set=accepted_idea_set,
             context_pack=context_pack,
@@ -4456,9 +4466,6 @@ class SQLiteAdvancementEngine(
         )
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
-        epoch = self._current_stage_epoch(
-            cycle_ref, accepted_question.quest_ref, PLAN_STAGE
-        )
         command_kind = "ensure_plan_stage_request"
         request_input = {
             "command": command_kind,
@@ -4570,6 +4577,11 @@ class SQLiteAdvancementEngine(
             if replay_ref is not None:
                 result_ref = replay_ref
             else:
+                self._assert_stage_quest_goal_current(
+                    connection,
+                    quest_ref=accepted_question.quest_ref,
+                    goal_revision_ref=cast(str, context_pack["goal_revision_ref"]),
+                )
                 self._assert_stage_head_current(
                     connection,
                     cycle_ref=cycle_ref,
@@ -4729,10 +4741,14 @@ class SQLiteAdvancementEngine(
         if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
             raise OwnerConflict("cycle_position_binding_invalid")
         context_pack = {**context_pack, "cycle_position": position}
+        epoch = self._current_stage_epoch(
+            cycle_ref, accepted_question.quest_ref, BUNDLE_STAGE
+        )
         replay_ref = self._query_stage_command_result(
             idempotency_key,
             "ensure_bundle_stage_request",
             cycle_ref=cycle_ref,
+            epoch=epoch,
             accepted_question=accepted_question,
             accepted_formal_plan=accepted_formal_plan,
             accepted_idea_set=accepted_idea_set,
@@ -4745,9 +4761,6 @@ class SQLiteAdvancementEngine(
         )
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
-        epoch = self._current_stage_epoch(
-            cycle_ref, accepted_question.quest_ref, BUNDLE_STAGE
-        )
         command_kind = "ensure_bundle_stage_request"
         request_input = {
             "command": command_kind,
@@ -4798,6 +4811,11 @@ class SQLiteAdvancementEngine(
             if replay_ref is not None:
                 result_ref = replay_ref
             else:
+                self._assert_stage_quest_goal_current(
+                    connection,
+                    quest_ref=accepted_question.quest_ref,
+                    goal_revision_ref=cast(str, context_pack["goal_revision_ref"]),
+                )
                 self._assert_stage_head_current(
                     connection,
                     cycle_ref=cycle_ref,
@@ -4957,6 +4975,16 @@ class SQLiteAdvancementEngine(
         epoch = self._current_stage_epoch(
             cycle_ref, accepted_question.quest_ref, REASONING_STAGE
         )
+        command_kind = "ensure_reasoning_stage_request"
+        replay_ref = self._query_stage_command_result(
+            idempotency_key,
+            command_kind,
+            cycle_ref=cycle_ref,
+            epoch=epoch,
+            accepted_question=accepted_question,
+        )
+        if replay_ref is not None:
+            return self._query_stage_request_ref(replay_ref)
         question_literature_revision = None
         if self._question_literature_revision_verifier is not None:
             question_literature_revision = (
@@ -4992,7 +5020,6 @@ class SQLiteAdvancementEngine(
             reasoning_graph_context
         )
         prior = self._reasoning_prior_accepted_bindings(cycle_ref)
-        command_kind = "ensure_reasoning_stage_request"
 
         # Reject a globally reused key before AE creates the route-derived
         # skipped facts that are part of this command's atomic result.
@@ -5014,6 +5041,13 @@ class SQLiteAdvancementEngine(
                     "UPDATE advancement_engine_state SET revision = revision "
                     "WHERE singleton = 'owner'"
                 )
+            )
+            self._assert_stage_quest_goal_current(
+                connection,
+                quest_ref=accepted_question.quest_ref,
+                goal_revision_ref=cast(
+                    str, quest_goal_revision["goal_revision_ref"]
+                ),
             )
             self._assert_stage_head_current(
                 connection,
@@ -6285,12 +6319,26 @@ class SQLiteAdvancementEngine(
             "quest_goal_revision": current,
         }
 
+    def _assert_stage_quest_goal_current(
+        self, connection, *, quest_ref: str, goal_revision_ref: str
+    ) -> None:
+        current_ref = connection.execute(
+            text(
+                "SELECT current_revision_ref FROM rg_quest_goal_heads "
+                "WHERE quest_ref=:quest_ref"
+            ),
+            {"quest_ref": quest_ref},
+        ).scalar()
+        if current_ref != goal_revision_ref:
+            raise OwnerConflict("quest_goal_revision_stale")
+
     def _query_stage_command_result(
         self,
         idempotency_key: str,
         command_kind: str,
         *,
         cycle_ref: str | None = None,
+        epoch: int | None = None,
         accepted_question: AcceptedQuestionBinding | None = None,
         accepted_idea_set: AcceptedIdeaSetBinding | None = None,
         accepted_formal_plan: AcceptedFormalPlanBinding | None = None,
@@ -6324,13 +6372,15 @@ class SQLiteAdvancementEngine(
             raise OwnerConflict("idempotency_conflict")
         if cycle_ref is not None and row.cycle_ref != cycle_ref:
             raise OwnerConflict("idempotency_conflict")
-        if accepted_question is not None and (
-            row.quest_ref != accepted_question.quest_ref
-            or row.question_ref != accepted_question.question_ref
-            or row.content_ref != accepted_question.content_ref
-            or row.content_hash != accepted_question.content_hash
-        ):
+        if epoch is not None and row.epoch != epoch:
             raise OwnerConflict("idempotency_conflict")
+        if accepted_question is not None:
+            expected_question = _question_binding_columns(accepted_question)
+            if any(
+                getattr(row, field, None) != value
+                for field, value in expected_question.items()
+            ):
+                raise OwnerConflict("idempotency_conflict")
         try:
             stored_context = decoded_object(row.context_pack_json)
         except (TypeError, ValueError) as error:
