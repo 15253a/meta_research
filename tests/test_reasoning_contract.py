@@ -745,6 +745,30 @@ def test_conclusive_or_uncertain_outcome_accepts_a_formal_metric_result(
     assert len(outcome_hash) == 64
 
 
+def test_causal_attribution_failure_explains_selected_evidence_boundary() -> None:
+    outcome = _scientific_outcome()
+    outcome["causal_interpretation"]["attribution_basis_refs"] = [
+        "metric-result:unselected",
+    ]
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="scientific_outcome_causal_interpretation_invalid",
+    ) as caught:
+        validate_scientific_outcome(
+            outcome,
+            frozen_evidence_closure=_literature_closure(),
+            frozen_research_context=_research_context(),
+        )
+
+    assert (
+        "attribution_basis_refs must reference selected evidence refs"
+        in caught.value.feedback
+    )
+    assert "metric-result:unselected" in caught.value.feedback
+    assert "literature-record:1" in caught.value.feedback
+
+
 @pytest.mark.parametrize("kind", ["LogAsset", "AnalysisAsset", "CheckpointArtifact"])
 @pytest.mark.parametrize("finding", ["supporting", "negative", "partial"])
 def test_material_category_does_not_restrict_scientific_finding(

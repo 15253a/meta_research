@@ -499,15 +499,12 @@ class ReasoningStageWorker:
         if run.primary_draft is not None:
             # Finalize validates the frozen checkpoint against the revision
             # that was live when the owner accepted it.  A later human budget
-            # adjustment must not turn the persisted draft into stale output.
+            # adjustment must not turn the persisted draft into stale output,
+            # and a pre-upgrade persisted draft without research_time_basis
+            # skips revision comparison rather than wedging finalize.
             persisted_revision = persisted_research_time_budget_revision(
                 run.primary_draft.draft
             )
-            if (
-                not run.runtime_binding.harness_adapter_ref.startswith("test")
-                and persisted_revision is None
-            ):
-                persisted_revision = RESEARCH_TIME_BUDGET_UNKNOWN
             skill_request = replace(
                 skill_request,
                 research_time_budget_revision=persisted_revision,

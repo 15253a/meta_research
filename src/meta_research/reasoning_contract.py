@@ -1623,10 +1623,12 @@ def _validate_outcome_scope_and_synthesis(
         raise ReasoningContractError(
             "scientific_outcome_causal_interpretation_invalid",
             feedback=(
-                f"scientific_outcome.causal_interpretation.attribution_basis_refs contains "
-                f"refs absent from scientific_outcome.evidence[].ref: {uncited_refs!r}. "
-                "Cite an eligible source with the finding it supports, or remove its ref "
-                "from the attribution."
+                "scientific_outcome.causal_interpretation.attribution_basis_refs "
+                "must reference selected evidence refs. "
+                f"Unselected refs: {uncited_refs!r}. "
+                f"Selected evidence refs: {sorted(cited_refs)!r}. "
+                "Add each attribution ref to scientific_outcome.evidence[].ref with "
+                "its exact authorized kind and ref, or remove it."
             ),
         )
     frozen_causal = cast(dict[str, list[str]], expected_context["causal_context"])

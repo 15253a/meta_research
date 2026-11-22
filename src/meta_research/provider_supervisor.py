@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol, cast
 
 from meta_research.linux_provider_tree import LinuxProviderJob, ProviderTreeError
-from meta_research.paths import DataRoot, DataRootError
 
 
 TRANSPORT_KEY_BYTES = 32
@@ -1587,14 +1586,17 @@ def provider_result_argv(
         raise ProviderSupervisorError("provider_supervisor_request_invalid") from error
     selected_platform = platform_name or os.name
     if selected_platform == "posix":
-        if result_write_fd is None:
+        if result_path is not None:
+            provider_argv[result_index] = str(result_path)
+        elif result_write_fd is not None:
+            owner_pid = (
+                os.getpid()
+                if supervisor_process_id is None
+                else supervisor_process_id
+            )
+            provider_argv[result_index] = f"/proc/{owner_pid}/fd/{result_write_fd}"
+        else:
             raise ProviderSupervisorError("provider_supervisor_result_pipe_invalid")
-        owner_pid = (
-            os.getpid()
-            if supervisor_process_id is None
-            else supervisor_process_id
-        )
-        provider_argv[result_index] = f"/proc/{owner_pid}/fd/{result_write_fd}"
     elif selected_platform == "nt":
         if result_path is None:
             raise ProviderSupervisorError("provider_supervisor_result_path_invalid")
@@ -1602,40 +1604,6 @@ def provider_result_argv(
     else:
         raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
     return provider_argv
-
-
-def _recorder_requires_named_fifo(
-    argv: list[str], result_path: Path, invocation_hash: str,
-) -> bool:
-    directory = result_path.parent
-    if (
-        argv[1:2] != ["exec"]
-        or "--ignore-user-config" not in argv
-        or directory.name != "drafting"
-        or directory.parts[-5:-2] != ("research-recorder", "provider", "provider-operations")
-    ):
-        return False
-    # The signed request binds the durable invocation containing the version
-    # admitted by the recorder. The current service default can differ on replay.
-    try:
-        with (directory / "invocation.json").open("rb") as stream:
-            record = stream.read(64 * 1024 + 1)
-        if len(record) > 64 * 1024 or hashlib.sha256(record).hexdigest() != invocation_hash:
-            raise ValueError
-        invocation = json.loads(record)
-        job_ref = invocation["job_ref"]
-        if (
-            not job_ref.startswith("timeline-summary-")
-            or hashlib.sha256(job_ref.encode()).hexdigest() != directory.parent.name
-        ):
-            raise ValueError
-        if invocation["execution_contract"]["provider_version"] != "0.169.0":
-            return False
-        data_root = DataRoot(directory.parents[4])
-        executable = data_root.validated_codex_cli_executable("0.169.0")
-        return executable.is_file() and str(executable) == argv[0]
-    except (AttributeError, DataRootError, KeyError, OSError, TypeError, ValueError) as error:
-        raise ProviderSupervisorError("provider_supervisor_request_invalid") from error
 
 
 def _write_phase_marker(
@@ -1838,12 +1806,12 @@ def _supervise_locked(
     with ExitStack() as stack:
         # Cover setup failures too, before any stream or reader owns these FDs.
         stack.callback(close_result_pipe)
-        if selected_platform == "posix" and _recorder_requires_named_fifo(
-            argv, result_path, invocation_hash,
-        ):
-            # Codex 0.169 exec opens the last-message path with O_NOFOLLOW.
-            # Keep both ends on one private FIFO and reuse the bounded pipe drain.
-            fifo_dir = Path(tempfile.mkdtemp(prefix=".recorder-pipe-", dir=result_path.parent))
+        if selected_platform == "posix":
+            # Codex 0.169+ exec opens --output-last-message with O_NOFOLLOW,
+            # which rejects Linux /proc/<pid>/fd/<fd> symlinks with ELOOP.
+            # Keep every supervised POSIX provider on one private named FIFO
+            # under the operation directory and reuse the bounded pipe drain.
+            fifo_dir = Path(tempfile.mkdtemp(prefix=".result-pipe-", dir=result_path.parent))
             stack.callback(fifo_dir.rmdir)
             fifo = fifo_dir / "result"
             os.mkfifo(fifo, 0o600)
@@ -1858,14 +1826,10 @@ def _supervise_locked(
             ):
                 raise ProviderSupervisorError("provider_supervisor_result_pipe_invalid")
             os.set_blocking(result_read_fd, True)
-            provider_argv = list(argv)
-            provider_argv[provider_argv.index("--output-last-message") + 1] = str(fifo)
-        elif selected_platform == "posix":
-            result_read_fd, result_write_fd = os.pipe()
             provider_argv = provider_result_argv(
                 argv,
                 platform_name=selected_platform,
-                result_write_fd=result_write_fd,
+                result_path=fifo,
             )
         elif selected_platform == "nt":
             provider_argv = provider_result_argv(
@@ -2138,8 +2102,13 @@ def _supervise_locked(
             raise ProviderSupervisorError("provider_job_not_empty")
         os.fsync(stdout_stream.fileno())
         os.fsync(stderr_stream.fileno())
-        if fifo is not None and not os.path.samestat(fifo_identity, fifo.lstat()):
-            raise ProviderSupervisorError("provider_supervisor_result_pipe_invalid")
+        if fifo is not None:
+            try:
+                observed_fifo = fifo.lstat()
+            except OSError as error:
+                raise ProviderSupervisorError("provider_supervisor_result_pipe_invalid") from error
+            if not os.path.samestat(fifo_identity, observed_fifo):
+                raise ProviderSupervisorError("provider_supervisor_result_pipe_invalid")
         if result_stream is not None:
             os.fsync(result_stream.fileno())
         input_bytes = prompt_stream.tell()

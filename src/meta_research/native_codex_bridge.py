@@ -495,6 +495,51 @@ def reconcile_native_operation(directory):
                 "native_turn_status": status, "native_error": turn.get("error"),
                 "native_start_hash": canonical_hash(start), "native_reconciliation_hash": canonical_hash(recovered)})
     return recovered["last_message"], recovered["thread_id"], stdout
+def _valid_supervised_result_destination(
+    destination: Path,
+    directory: Path,
+    key: bytes,
+    *,
+    request: dict[str, object] | None = None,
+) -> bool:
+    original = directory / "last-message.json"
+    if destination in {original, directory / ".last-message.supervisor.tmp"}:
+        return True
+    pipe = re.fullmatch(r"/proc/([0-9]+)/fd/([0-9]+)", str(destination))
+    if pipe is not None:
+        ready = read_transport_envelope(directory / "supervisor-ready.json", key)
+        if request is None:
+            request = read_supervisor_request(directory / "supervisor-request.json", key)
+        return (
+            ready.get("supervisor_process_id") == int(pipe[1])
+            and ready.get("invocation_hash") == request.get("invocation_hash")
+            and int(pipe[2]) >= 3
+            and stat.S_ISFIFO(destination.stat().st_mode)
+        )
+    if (
+        destination.name == "result"
+        and destination.parent.name.startswith((".result-pipe-", ".recorder-pipe-"))
+        and destination.parent.parent.resolve() == directory.resolve()
+    ):
+        ready = read_transport_envelope(directory / "supervisor-ready.json", key)
+        if request is None:
+            request = read_supervisor_request(directory / "supervisor-request.json", key)
+        if ready.get("invocation_hash") != request.get("invocation_hash"):
+            return False
+        try:
+            parent_stat = destination.parent.lstat()
+            fifo_stat = destination.lstat()
+        except OSError:
+            return False
+        return (
+            stat.S_ISDIR(parent_stat.st_mode)
+            and stat.S_IMODE(parent_stat.st_mode) == 0o700
+            and stat.S_ISFIFO(fifo_stat.st_mode)
+            and stat.S_IMODE(fifo_stat.st_mode) == 0o600
+        )
+    return False
+
+
 def _strict_exec(argv, args, key):
     """Preserve exec policy; attest only its exact, output-free resume rejection."""
     if (len(argv) < 3 or argv[1] != "exec" or argv.count("--output-last-message") != 1
@@ -508,15 +553,8 @@ def _strict_exec(argv, args, key):
         or args.output_last_message is None):
         raise ValueError("native_result_path_conflict")
     destination = args.output_last_message
-    valid = destination in {directory / "last-message.json", directory / ".last-message.supervisor.tmp"}
-    pipe = re.fullmatch(r"/proc/([0-9]+)/fd/([0-9]+)", str(destination))
     request = read_supervisor_request(directory / "supervisor-request.json", key)
-    if pipe is not None:
-        ready = read_transport_envelope(directory / "supervisor-ready.json", key)
-        valid = (ready.get("supervisor_process_id") == int(pipe[1])
-            and ready.get("invocation_hash") == request.get("invocation_hash")
-            and int(pipe[2]) >= 3 and stat.S_ISFIFO(destination.stat().st_mode))
-    if not valid:
+    if not _valid_supervised_result_destination(destination, directory, key, request=request):
         raise ValueError("native_result_path_conflict")
     command = list(argv)
     command[command.index("--output-last-message") + 1] = str(destination)
@@ -629,18 +667,13 @@ def main():
             raise ValueError("native_schema_path_conflict")
         if args.output_last_message is not None:
             # The mature supervisor redirects its bound result to this private
-            # temporary file, then seals/publishes it. Honor that redirection;
-            # writing the original path would be replaced by its empty temp.
+            # FIFO or temporary file, then seals/publishes it. Honor that
+            # redirection; writing the original path would be replaced by its
+            # empty temp.
             original = args.operation_directory / "last-message.json"
-            allowed = {original, args.operation_directory / ".last-message.supervisor.tmp"}
-            valid_destination = args.output_last_message in allowed
-            pipe = re.fullmatch(r"/proc/([0-9]+)/fd/([0-9]+)", str(args.output_last_message))
-            if pipe is not None:
-                ready = read_transport_envelope(args.operation_directory / "supervisor-ready.json", key)
-                request = read_supervisor_request(args.operation_directory / "supervisor-request.json", key)
-                valid_destination = (ready.get("supervisor_process_id") == int(pipe[1])
-                    and ready.get("invocation_hash") == request.get("invocation_hash")
-                    and int(pipe[2]) >= 3 and stat.S_ISFIFO(args.output_last_message.stat().st_mode))
+            valid_destination = _valid_supervised_result_destination(
+                args.output_last_message, args.operation_directory, key
+            )
             if bridge.options.get("--output-last-message") != str(original) or not valid_destination:
                 raise ValueError("native_result_path_conflict")
             bridge.options["--output-last-message"] = str(args.output_last_message)

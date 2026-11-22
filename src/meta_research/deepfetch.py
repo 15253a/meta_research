@@ -32,7 +32,7 @@ from meta_research.runtime_conditions import (
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
-    CODEX_ROOT_REASONING_PRESET_CONFIG,
+    codex_root_reasoning_preset_config,
 )
 
 from meta_research.provider_supervisor import (
@@ -3146,7 +3146,7 @@ class CodexDeepFetchAdapter:
                     "--config",
                     'approval_policy="never"',
                     "--config",
-                    CODEX_ROOT_REASONING_PRESET_CONFIG,
+                    codex_root_reasoning_preset_config(self._model_ref),
                     *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
                     "--sandbox",
                     self._sandbox_mode,
@@ -3591,7 +3591,7 @@ class CodexDeepFetchAdapter:
             "--config",
             'approval_policy="never"',
             "--config",
-            CODEX_ROOT_REASONING_PRESET_CONFIG,
+            codex_root_reasoning_preset_config(self._model_ref),
             *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
             "--sandbox",
             self._sandbox_mode,

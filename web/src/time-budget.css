@@ -1,9 +1,12 @@
-.time-budget-field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.time-budget-field > label { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.time-budget-field > label > span { color: #66718a; font-size: 13px; }
-.time-budget-field input[type="number"] { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #cbd3e2; border-radius: 9px; color: #172033; background: #fff; font: inherit; }
-.time-budget-field input:disabled { color: #66718a; background: #f4f6fa; }
-.time-budget-field input:focus { outline: 2px solid #625fe7; outline-offset: 2px; }
-.time-budget-field > .time-budget-open { align-self: flex-start; padding: 3px 0; border: 0; background: transparent; color: #66718a; font: inherit; font-size: 12px; cursor: pointer; }
-.time-budget-field > .time-budget-open[aria-pressed="true"] { color: #625fe7; text-decoration: underline; }
-.time-budget-field > small[role="alert"] { color: #a32942; }
+.time-budget-field { display: flex; flex-direction: column; gap: 7px; min-width: 0; align-self: start; }
+.time-budget-field > label { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.time-budget-field > label > span { color: #374358; font-size: 13px; font-weight: 600; }
+.time-budget-field input[type="number"] { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #d3dae8; border-radius: 10px; color: #172033; background: #fff; font: inherit; font-size: 13.5px; line-height: 1.5; }
+.time-budget-field input:disabled { color: #6d788e; background: #f4f6fa; }
+.time-budget-field input:focus { outline: none; border-color: #625fe7; box-shadow: 0 0 0 3px rgba(98, 95, 231, 0.13); }
+.time-budget-meta { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.time-budget-meta > small { color: #6d788e; font-size: 12px; line-height: 1.55; }
+.time-budget-open { align-self: flex-start; padding: 3px 9px; border: 1px solid #dde2ee; border-radius: 999px; background: #f6f7fb; color: #546078; font: inherit; font-size: 11.5px; font-weight: 500; line-height: 1.4; cursor: pointer; transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease; }
+.time-budget-open:hover:not(:disabled) { background: #efeeff; border-color: #c5c2f4; color: #4d49b8; }
+.time-budget-open[aria-pressed="true"] { color: #4d49b8; background: #efeeff; border-color: #8f8ceb; font-weight: 600; }
+.time-budget-field > small[role="alert"] { color: #a32942; font-size: 12px; }

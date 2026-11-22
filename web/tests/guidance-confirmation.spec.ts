@@ -54,6 +54,9 @@ test("sidebar reviews understanding and scope before confirming the exact revise
   await sidebar.getByRole("button", { name: "发送消息", exact: true }).click();
   const review = sidebar.getByRole("article", { name: "确认研究指导" });
   await expect(review).toBeVisible();
+  await expect(review.locator(":scope > .assistant-fold")).not.toHaveAttribute("open", "");
+  await expect(review.getByLabel("指导原文", { exact: true })).toBeHidden();
+  await review.locator(":scope > .assistant-fold > summary").click();
   expect(writes[0].body.guidance_options).toEqual({ strength: 5, work_materials: null });
   expect(writes[0].body.message).toBe(request);
   await expect(review.getByLabel("指导原文", { exact: true })).toHaveValue(body.text);

@@ -10,8 +10,9 @@ from typing import Literal
 from meta_research.human_guidance import GUIDANCE_OPERATION_IDS
 from meta_research.quest_goal import GOAL_OPERATION_IDS
 from meta_research.codex_runtime import (
-    CODEX_MODEL_REF, CODEX_REASONING_EFFORT, CODEX_ROOT_REASONING_PRESET,
+    CODEX_MODEL_REF, CODEX_REASONING_EFFORT,
     CODEX_COLLABORATION_MODE, RESEARCH_STAGES, SUPPORTED_CODEX_MODEL_REFS,
+    codex_root_reasoning_preset,
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, research_system_prompt
@@ -188,7 +189,7 @@ class RootCapabilityProfile:
                 "index": _shared_reference_index_hash(),
             }),
             "model_ref": self.model_ref,
-            "cli_reasoning_preset": CODEX_ROOT_REASONING_PRESET,
+            "cli_reasoning_preset": codex_root_reasoning_preset(self.model_ref),
             "effective_reasoning_effort": CODEX_REASONING_EFFORT,
             "collaboration_mode": CODEX_COLLABORATION_MODE,
         }
@@ -236,7 +237,7 @@ class RootCapabilityProfile:
     def runtime_bindings(self) -> tuple[str, ...]:
         return (
             "root-capability-floor:v3",
-            f"codex-config:model_reasoning_effort={CODEX_ROOT_REASONING_PRESET}",
+            f"codex-config:model_reasoning_effort={codex_root_reasoning_preset(self.model_ref)}",
             f"codex-effective:reasoning.effort={CODEX_REASONING_EFFORT}",
             f"codex-collaboration-mode:{CODEX_COLLABORATION_MODE}",
             "root-capability-profile:sha256:" + self.digest,

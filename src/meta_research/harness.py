@@ -22,6 +22,7 @@ from meta_research.bundle_protocol import TargetWorkHandle
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT,
+    SUPPORTED_CODEX_MODEL_REFS,
 )
 from meta_research.harness_control import HarnessCancellationError
 from meta_research.harness_adapters import (
@@ -961,7 +962,7 @@ class HarnessRuntime:
     ) -> FullConformanceRunSet:
         """Admit one fixed full-contract Run for each production Adapter."""
 
-        if request.codex_model_ref != CODEX_MODEL_REF:
+        if request.codex_model_ref not in SUPPORTED_CODEX_MODEL_REFS:
             raise HarnessAdmissionError("codex_model_not_allowed")
         token = secrets.token_hex(8)
         conformance_ref = f"hfc_{token}"

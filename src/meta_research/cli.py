@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from meta_research import __version__
-from meta_research.codex_runtime import CODEX_MODEL_REF
+from meta_research.codex_runtime import CODEX_MODEL_REF, SUPPORTED_CODEX_MODEL_REFS
 from meta_research.daemon import DAEMON_STOP_DEADLINE_SECONDS
 from meta_research.paths import (
     DataRoot,
@@ -87,7 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_root(conformance_start_parser)
     conformance_start_parser.add_argument(
         "--codex-model",
-        choices=(CODEX_MODEL_REF,),
+        choices=SUPPORTED_CODEX_MODEL_REFS,
         default=CODEX_MODEL_REF,
     )
     conformance_start_parser.add_argument(

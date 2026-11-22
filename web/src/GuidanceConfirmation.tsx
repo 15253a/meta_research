@@ -19,6 +19,7 @@ export function GuidanceConfirmation({ proposal, onChanged }: { proposal: Compan
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
   const [confirmed, setConfirmed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const materialGeneration = useRef(0);
   const active = useRef(true);
@@ -69,32 +70,74 @@ export function GuidanceConfirmation({ proposal, onChanged }: { proposal: Compan
     } catch (caught) { if (active.current) setError(caught instanceof Error ? caught.message : "material_receiver_unavailable"); }
     finally { pendingRef.current = false; if (active.current) setPending(false); }
   };
-  if (!review) return <article className="lumen-proposal guidance-confirmation"><b>指导需要补充理解与作用范围</b><p>{String(proposal.proposal?.text ?? proposal.content ?? "")}</p><p>这份旧建议缺少完整确认依据。请向研究助手澄清，再审阅新的建议。</p></article>;
-  if (review.cancelled) return <article className="lumen-proposal guidance-confirmation"><p>已取消本次审阅；没有交给研究。</p><button type="button" onClick={() => setReview({ ...review, cancelled: false })}>继续审阅指导</button></article>;
-  return <article className="lumen-proposal guidance-confirmation" aria-label="确认研究指导">
-    <small>理解预览 · {confirmed ? "已确认" : "尚未交给研究"}</small>
-    <b>{proposal.title ?? "确认研究指导"}</b>
-    {proposal.summary ? <p>{proposal.summary}</p> : null}
-    <label>指导原文<textarea aria-label="指导原文" value={review.guidance.text} rows={3} disabled={pending || confirmed || !proposed} onChange={event => change({ text: event.target.value })} /></label>
-    <label>助手理解<textarea aria-label="助手理解" value={review.guidance.assistant_understanding} rows={3} disabled={pending || confirmed || !proposed} onChange={event => change({ assistant_understanding: event.target.value })} /></label>
-    <label>拟作用范围<textarea aria-label="拟作用范围" value={review.guidance.applies_to.join("\n")} rows={2} disabled={pending || confirmed || !proposed} onChange={event => change({ applies_to: lines(event.target.value) })} /></label>
-    {!scope ? <p role="alert">范围身份无效，请核对。</p> : null}
-    <details><summary>范围与版本详情</summary>
-      <dl><dt>接收研究范围</dt><dd>{scope ? `${scope.kind} · ${[scope.quest_ref, scope.question_ref, scope.cycle_ref, scope.target_ref].filter(Boolean).join(" · ")}` : "范围身份无效，请核对。"}</dd></dl>
-      <textarea aria-label="指导范围身份" value={review.scopeJson} rows={6} disabled={pending || confirmed || !proposed} onChange={event => setReview({ ...review, scopeJson: event.target.value })} />
-      <p>当前确认版本 · <code>{review.proposal.proposal_ref} · {review.proposal.proposal_hash}</code></p>
+  if (!review) {
+    const legacyText = String(proposal.proposal?.text ?? proposal.content ?? "");
+    return <article className="lumen-proposal guidance-confirmation">
+      <details className="assistant-fold" open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}>
+        <summary className="assistant-fold-summary">
+          <span className="assistant-fold-head">
+            <small>理解预览 · 待补充</small>
+            <b>指导需要补充理解与作用范围</b>
+          </span>
+          {legacyText ? <span className="assistant-fold-preview">{legacyText}</span> : null}
+        </summary>
+        <div className="assistant-fold-body">
+          {legacyText ? <p>{legacyText}</p> : null}
+          <p>这份旧建议缺少完整确认依据。请向研究助手澄清，再审阅新的建议。</p>
+        </div>
+      </details>
+    </article>;
+  }
+  if (review.cancelled) return <article className="lumen-proposal guidance-confirmation">
+    <details className="assistant-fold" open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}>
+      <summary className="assistant-fold-summary">
+        <span className="assistant-fold-head">
+          <small>理解预览 · 已取消审阅</small>
+          <b>{proposal.title ?? "确认研究指导"}</b>
+        </span>
+        <span className="assistant-fold-preview">已取消本次审阅；没有交给研究。</span>
+      </summary>
+      <div className="assistant-fold-body">
+        <p>已取消本次审阅；没有交给研究。</p>
+        <button type="button" onClick={() => { setExpanded(true); setReview({ ...review, cancelled: false }); }}>继续审阅指导</button>
+      </div>
     </details>
-    <label>确认指导力度<select aria-label="确认指导力度" value={review.guidance.strength} disabled={pending || confirmed || !proposed} onChange={event => change({ strength: Number(event.target.value) as GuidanceStrength })}>{["供参考", "有所倾向", "优先考虑", "强烈要求", "按我设定"].map((label, index) => <option key={index} value={index + 1}>{index + 1} · {label}</option>)}</select></label>
-    <label>保留限制<textarea aria-label="保留限制" value={review.guidance.preserve_conditions.join("\n")} rows={2} disabled={pending || confirmed || !proposed} onChange={event => change({ preserve_conditions: lines(event.target.value) })} /></label>
-    <details><summary>{review.guidance.work_materials ? "已附材料" : "添加材料（可选）"}</summary><ServerMaterialPicker value={review.guidance.work_materials?.selections[0] ?? null} onSelect={selection => void selectMaterial(selection)} disabled={pending || confirmed || !proposed} /></details>
-    {review.guidance.work_materials ? <ReceivingIdentity receiver={review.guidance.work_materials.receiver} /> : null}
-    {!materialScopeMatches ? <p role="alert">作用范围已变化，请重新选择材料以核对其精确接收位置。</p> : null}
-    {confirmed ? <p role="status">已确认保存。等待适用研究工作接续；送达、读取和实际影响以研究回执为准。</p> : proposed ? <div className="guidance-confirmation-actions">
-      {dirty ? <button type="button" disabled={pending || !valid} onClick={() => void save()}>保存修改并重新审阅</button> : null}
-      <button type="button" disabled={pending || dirty || !valid} onClick={() => void confirm()}>明确确认并交给研究</button>
-      <button type="button" disabled={pending} onClick={() => setReview({ ...review, cancelled: true })}>取消审阅</button>
-    </div> : <p role="status">这份建议已失效或已转换，请查看当前指导及回执。</p>}
-    {dirty && !confirmed ? <p role="status">内容已修改，旧确认依据已失效。保存后请重新审阅。</p> : null}
-    {error ? <p role="alert">{error} · 保留当前内容供核对；重试仍使用同一请求身份。</p> : null}
+  </article>;
+  const previewText = proposal.summary || review.guidance.assistant_understanding || review.guidance.text;
+  const statusLabel = confirmed ? "已确认" : proposed ? "尚未交给研究" : "已处理";
+  return <article className="lumen-proposal guidance-confirmation" aria-label="确认研究指导">
+    <details className="assistant-fold" open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}>
+      <summary className="assistant-fold-summary">
+        <span className="assistant-fold-head">
+          <small>理解预览 · {statusLabel}</small>
+          <b>{proposal.title ?? "确认研究指导"}</b>
+        </span>
+        {previewText ? <span className="assistant-fold-preview">{previewText}</span> : null}
+      </summary>
+      <div className="assistant-fold-body">
+        {proposal.summary ? <p>{proposal.summary}</p> : null}
+        <label>指导原文<textarea aria-label="指导原文" value={review.guidance.text} rows={3} disabled={pending || confirmed || !proposed} onChange={event => change({ text: event.target.value })} /></label>
+        <label>助手理解<textarea aria-label="助手理解" value={review.guidance.assistant_understanding} rows={3} disabled={pending || confirmed || !proposed} onChange={event => change({ assistant_understanding: event.target.value })} /></label>
+        <label>拟作用范围<textarea aria-label="拟作用范围" value={review.guidance.applies_to.join("\n")} rows={2} disabled={pending || confirmed || !proposed} onChange={event => change({ applies_to: lines(event.target.value) })} /></label>
+        {!scope ? <p role="alert">范围身份无效，请核对。</p> : null}
+        <details><summary>范围与版本详情</summary>
+          <dl><dt>接收研究范围</dt><dd>{scope ? `${scope.kind} · ${[scope.quest_ref, scope.question_ref, scope.cycle_ref, scope.target_ref].filter(Boolean).join(" · ")}` : "范围身份无效，请核对。"}</dd></dl>
+          <textarea aria-label="指导范围身份" value={review.scopeJson} rows={6} disabled={pending || confirmed || !proposed} onChange={event => setReview({ ...review, scopeJson: event.target.value })} />
+          <p>当前确认版本 · <code>{review.proposal.proposal_ref} · {review.proposal.proposal_hash}</code></p>
+        </details>
+        <label>确认指导力度<select aria-label="确认指导力度" value={review.guidance.strength} disabled={pending || confirmed || !proposed} onChange={event => change({ strength: Number(event.target.value) as GuidanceStrength })}>{["供参考", "有所倾向", "优先考虑", "强烈要求", "按我设定"].map((label, index) => <option key={index} value={index + 1}>{index + 1} · {label}</option>)}</select></label>
+        <label>保留限制<textarea aria-label="保留限制" value={review.guidance.preserve_conditions.join("\n")} rows={2} disabled={pending || confirmed || !proposed} onChange={event => change({ preserve_conditions: lines(event.target.value) })} /></label>
+        <details><summary>{review.guidance.work_materials ? "已附材料" : "添加材料（可选）"}</summary><ServerMaterialPicker value={review.guidance.work_materials?.selections[0] ?? null} onSelect={selection => void selectMaterial(selection)} disabled={pending || confirmed || !proposed} /></details>
+        {review.guidance.work_materials ? <ReceivingIdentity receiver={review.guidance.work_materials.receiver} /> : null}
+        {!materialScopeMatches ? <p role="alert">作用范围已变化，请重新选择材料以核对其精确接收位置。</p> : null}
+        {confirmed ? <p role="status">已确认保存。等待适用研究工作接续；送达、读取和实际影响以研究回执为准。</p> : proposed ? <div className="guidance-confirmation-actions">
+          {dirty ? <button type="button" disabled={pending || !valid} onClick={() => void save()}>保存修改并重新审阅</button> : null}
+          <button type="button" disabled={pending || dirty || !valid} onClick={() => void confirm()}>明确确认并交给研究</button>
+          <button type="button" disabled={pending} onClick={() => setReview({ ...review, cancelled: true })}>取消审阅</button>
+        </div> : <p role="status">这份建议已失效或已转换，请查看当前指导及回执。</p>}
+        {dirty && !confirmed ? <p role="status">内容已修改，旧确认依据已失效。保存后请重新审阅。</p> : null}
+        {error ? <p role="alert">{error} · 保留当前内容供核对；重试仍使用同一请求身份。</p> : null}
+      </div>
+    </details>
   </article>;
 }

@@ -67,11 +67,6 @@ TOOL_DISCOVERY_OPERATION_IDS = (
     "tools.catalog.page",
     "tools.contracts.read",
 )
-# These operations are represented as reads for contract compatibility, but
-# their handlers may perform an outbound provider call. Keep their role-owner
-# gate independent of the access-mode label until a durable reconcile contract
-# exists for the provider response.
-ROOT_OWNED_EXTERNAL_OPERATION_IDS = frozenset({"assistant.content.generate"})
 ROOT_AGENT_COMMON_OPERATION_IDS = (
     *TOOL_DISCOVERY_OPERATION_IDS,
     *RUNTIME_MATERIAL_OPERATION_IDS,
@@ -692,24 +687,23 @@ class SemanticMcpGateway:
             return "not_granted"
         # ProtectedCreation is a companion-owned, narrowly scoped runtime.
         # Its material copy/read operations are the explicit exception to the
-        # general companion effect gate.  Keep the exception bound to the
-        # creation phase and the registered operation set so an ordinary
-        # companion call cannot acquire unrelated effect authority.
-        if (
+        # general companion effect gate, while still honoring unavailable_reason.
+        creation_material_exception = (
             context.root_kind == "companion"
             and context.phase == "creation_materials"
             and operation_id in CREATION_MATERIAL_OPERATION_IDS
-        ):
-            return None
+        )
         owners = _ROLE_ONLY_OPERATION_OWNERS.get(operation_id)
         if (
             owners
             and context.root_kind not in owners
+            and not creation_material_exception
         ):
             return "root_kind_not_owner"
         if (
             context.root_kind == "companion"
             and operation.access_mode in {"effect", "reconcile"}
+            and not creation_material_exception
         ):
             return "root_kind_not_owner"
         if operation.unavailable_reason is not None:

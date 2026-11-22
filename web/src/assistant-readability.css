@@ -15,20 +15,56 @@
 .lumen-companion .companion-files { margin: 0; border: 0; border-bottom: 1px solid #e7e8f2; border-radius: 0; background: transparent; font-size: 13px; }
 .lumen-companion .companion-files > summary { padding: 9px 20px 12px; color: #657089; }
 .lumen-companion .companion-files > div { padding: 0 20px 14px; }
-.lumen-companion .lumen-chat { padding: 20px; gap: 18px; }
+.lumen-companion .lumen-chat { padding: 18px; gap: 12px; }
 .lumen-companion .lumen-chat > article { flex-shrink: 0; }
 .lumen-companion .lumen-chat > details { flex-shrink: 0; }
 .lumen-companion .lumen-message { padding: 14px 16px; font-size: 14px; line-height: 1.75; max-width: 100%; }
 .lumen-companion .lumen-message > small { font-size: 12px; font-weight: 500; letter-spacing: 0; color: #626780; }
 .lumen-companion .lumen-message.me > small { color: #f0efff; }
 .lumen-companion .lumen-message-state { font-size: 12px; }
-.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) { padding: 16px; border-radius: 12px; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint, .lumen-human-attention) { padding: 16px; border-radius: 12px; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint, .lumen-human-attention, .lumen-question-context, .lumen-system-message):has(> .assistant-fold) { display: block; padding: 0; border-radius: 12px; overflow: hidden; }
+.lumen-companion .lumen-constraint:has(> .assistant-fold) { border-radius: 6px 12px 12px 6px; }
+.lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint, .lumen-human-attention, .lumen-question-context, .lumen-system-message) > .assistant-fold { margin: 0; border: 0; }
+.lumen-companion .assistant-fold > .assistant-fold-summary { position: relative; display: grid; gap: 3px; min-height: 0; padding: 10px 34px 10px 14px; list-style: none; cursor: pointer; font-weight: 400; line-height: 1.45; transition: background 140ms ease; }
+.lumen-companion .assistant-fold > .assistant-fold-summary::-webkit-details-marker { display: none; }
+.lumen-companion .assistant-fold > .assistant-fold-summary::after { content: ""; position: absolute; right: 14px; top: 50%; width: 6px; height: 6px; border-right: 1.75px solid #75809a; border-bottom: 1.75px solid #75809a; transform: translateY(-50%) rotate(-45deg); transition: transform 150ms ease; }
+.lumen-companion .assistant-fold[open] > .assistant-fold-summary::after { transform: translateY(-65%) rotate(45deg); }
+.lumen-companion .assistant-fold > .assistant-fold-summary:hover { background: rgba(65, 73, 95, 0.04); }
+.lumen-companion .assistant-fold > .assistant-fold-summary:focus-visible { outline: 2px solid #8072bd; outline-offset: -2px; border-radius: 10px; }
+.lumen-companion .assistant-fold-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; }
+.lumen-companion .assistant-fold-head > small { display: inline; margin: 0; font-size: 11px; font-weight: 600; line-height: 1.4; letter-spacing: 0; }
+.lumen-companion .assistant-fold-head > b { display: inline; margin: 0; font-size: 13px; font-weight: 600; line-height: 1.45; color: #303b51; overflow-wrap: anywhere; }
+.lumen-companion .assistant-fold-tag { display: inline-block; padding: 1px 7px; border-radius: 999px; background: #dcedea; color: #2b675c; font-size: 11px; font-weight: 500; line-height: 1.5; }
+.lumen-companion .assistant-fold-preview { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; line-height: 1.45; color: #5b647b; }
+.lumen-companion .assistant-fold-body { display: grid; gap: 10px; padding: 12px 14px 14px; border-top: 1px solid rgba(98, 108, 134, 0.14); min-width: 0; }
+.lumen-companion .assistant-fold-body > p { margin: 0; }
+.lumen-companion .assistant-fold-body > details { margin: 0; border-top: 1px solid rgba(98, 108, 134, 0.14); padding-top: 8px; }
+.lumen-companion .assistant-fold-body > details:first-child { border-top: 0; padding-top: 0; }
+.lumen-companion .assistant-fold-body > details > summary { min-height: 0; padding: 4px 0; font-size: 13px; line-height: 1.5; font-weight: 500; cursor: pointer; }
+.lumen-companion .lumen-command .assistant-fold-body > details > summary { color: #6a5049; }
+.lumen-companion .lumen-command .assistant-fold-body > button { width: 100%; min-height: 36px; margin-top: 2px; border: 0; border-radius: 8px; color: #fff; background: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; }
+.lumen-companion .lumen-command .assistant-fold-body > button:disabled { opacity: 0.5; cursor: default; }
+.lumen-companion .lumen-broad-authorization .assistant-fold-body > button { width: auto; justify-self: start; border: 1px solid #bcd8cf; background: #fff; color: #305e52; font-weight: 600; }
+.lumen-companion .lumen-broad-authorization .assistant-fold-head > small { color: #287c6c; }
+.lumen-companion .lumen-proposal .assistant-fold-body > button,
+.lumen-companion .lumen-constraint .assistant-fold-body > button { width: auto; justify-self: start; min-height: 34px; margin-top: 2px; padding: 6px 12px; border: 1px solid #b8b5ef; border-radius: 8px; color: #4c48bb; background: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+.lumen-companion .lumen-constraint .assistant-fold-body > button { border-color: #9dcfc5; color: #167d70; }
+.lumen-companion .lumen-constraint .assistant-fold-body ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.lumen-companion .lumen-guidance-delivery { padding: 10px 12px; border: 1px solid #cfe7e1; border-radius: 8px; background: #fff; font-size: 13px; line-height: 1.6; }
+.lumen-companion .lumen-guidance-delivery > b { display: block; font-size: 13px; color: #2b5c52; margin-bottom: 4px; }
+.lumen-companion .lumen-guidance-delivery > p { margin: 2px 0; font-size: 12px; color: #546c67; }
+.lumen-companion .lumen-guidance-delivery dl { margin: 6px 0 0; display: grid; gap: 4px; font-size: 12px; }
+.lumen-companion .lumen-guidance-delivery dt { font-weight: 600; color: #3d635b; }
+.lumen-companion .lumen-guidance-delivery dd { margin: 0 0 4px; color: #445163; overflow-wrap: anywhere; }
+.lumen-companion .lumen-human-attention .assistant-fold-body > button { justify-self: start; padding: 6px 14px; font-size: 13px; cursor: pointer; }
+.lumen-companion .lumen-system-message { border: 1px solid #e2e6f0; background: #f8f9fd; }
 .lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) > b { font-size: 15px; line-height: 1.6; }
 .lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) p { font-size: 14px; line-height: 1.7; color: #4d546c; }
 .lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) small { font-size: 12px; line-height: 1.5; letter-spacing: 0; }
 .lumen-companion :is(.lumen-proposal, .lumen-command, .lumen-constraint) > button,
 .lumen-companion .guidance-confirmation-actions button { padding: 8px 12px; font-size: 13px; line-height: 1.5; }
-.lumen-companion .lumen-command > details > summary { min-height: 0; padding: 10px 0; font-size: 13px; line-height: 1.5; font-weight: 500; color: #6a5049; }
+.lumen-companion .lumen-command > details:not(.assistant-fold) > summary { min-height: 0; padding: 10px 0; font-size: 13px; line-height: 1.5; font-weight: 500; color: #6a5049; }
 .lumen-companion .lumen-command :is(code, pre) { font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .lumen-companion .lumen-command dl { font-size: 12px; line-height: 1.6; }
 .lumen-companion .lumen-command-identity { margin: 10px 0; }
@@ -58,17 +94,18 @@
 .lumen-companion .lumen-research-control > details > summary { font-size: 13px; font-weight: 500; }
 .lumen-companion .lumen-research-control-body :is(p, span, small, label, select, input, button) { font-size: 13px; line-height: 1.6; }
 .lumen-companion .lumen-research-control-body > b { font-size: 15px; }
-.lumen-companion .lumen-human-attention :is(p, button, small) { font-size: 13px; line-height: 1.6; }
+.lumen-companion .lumen-human-attention :is(p, button) { font-size: 13px; line-height: 1.6; }
 .lumen-companion .lumen-human-attention > b { font-size: 15px; }
 .lumen-companion .assistant-operation-history { min-width: 0; border-top: 1px solid #e4e7ef; color: #657089; }
-.lumen-companion .assistant-operation-history > summary { cursor: pointer; padding: 13px 0; font-size: 13px; line-height: 1.6; }
+.lumen-companion .assistant-operation-history > summary { cursor: pointer; padding: 11px 0; font-size: 13px; line-height: 1.6; }
 .lumen-companion .assistant-operation-history > summary > span:last-child { float: right; min-width: 24px; text-align: center; border-radius: 7px; background: #f0f2f7; color: #67718a; font-variant-numeric: tabular-nums; }
-.lumen-companion .assistant-operation-history > div { display: grid; gap: 12px; padding-bottom: 4px; }
+.lumen-companion .assistant-operation-history > div { display: grid; gap: 10px; padding-bottom: 4px; }
 .lumen-companion .lumen-command[data-command-resolved=true] { border-color: #e1e5ee; background: #fafbfd; }
-.lumen-companion .lumen-command[data-command-resolved=true] > small { color: #627486; }
-.lumen-companion .lumen-command[data-command-resolved=true] > details { border-color: #e1e5ee; }
-.lumen-companion .lumen-command[data-command-resolved=true] > details > summary,
-.lumen-companion .lumen-command > .lumen-command-receipts > summary { color: #657089; }
+.lumen-companion .lumen-command[data-command-resolved=true] > small,
+.lumen-companion .lumen-command[data-command-resolved=true] .assistant-fold-head > small { color: #627486; }
+.lumen-companion .lumen-command[data-command-resolved=true] .assistant-fold-body > details { border-color: #e1e5ee; }
+.lumen-companion .lumen-command[data-command-resolved=true] .assistant-fold-body > details > summary,
+.lumen-companion .lumen-command .lumen-command-receipts > summary { color: #657089; }
 .lumen-companion .lumen-command-receipts :is(.lumen-confirmed, .lumen-authorized) { margin-top: 8px; padding: 10px 0; border: 0; border-top: 1px solid #e4e7ef; background: transparent; }
 .lumen-companion .lumen-command-receipts :is(.lumen-confirmed, .lumen-authorized):first-of-type { margin-top: 0; border-top: 0; }
 .lumen-companion .lumen-command-receipts :is(.lumen-confirmed, .lumen-authorized) > details { margin-top: 6px; }

@@ -61,6 +61,25 @@ test("known scoped reasons affect their session or provider kind only", () => {
   assert.equal(rootSessionStatusUncertain(catalog, bundle), true);
 });
 
+test("provider-only child and list limits keep native stage and target status certain", () => {
+  for (const code of [
+    "child_session_observation_limited",
+    "child_session_observation_unavailable",
+    "root_session_list_limited",
+    "root_provider_sessions_limited",
+    "root_provider_sessions_unavailable",
+  ]) {
+    const { catalog, bundle, target, deepfetch } = fixture();
+    const acquisition = { session_ref: "acquisition", kind: "acquisition", status: "waiting", is_executing: false, operations: [] };
+    catalog.sessions.push(acquisition);
+    catalog.reasons = [{ code }];
+    assert.equal(rootSessionStatusUncertain(catalog, bundle), false, `${code} bundle`);
+    assert.equal(rootSessionStatusUncertain(catalog, target), false, `${code} target`);
+    assert.equal(rootSessionStatusUncertain(catalog, deepfetch), true, `${code} deepfetch`);
+    assert.equal(rootSessionStatusUncertain(catalog, acquisition), true, `${code} acquisition`);
+  }
+});
+
 test("a complete legacy observation remains usable and absent observations fail closed", () => {
   const { catalog, bundle } = fixture();
   catalog.limited = false;

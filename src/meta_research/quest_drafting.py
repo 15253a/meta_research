@@ -25,6 +25,7 @@ from meta_research.codex_runtime import (
     CODEX_LOCKED_VERSION,
     DEFAULT_CODEX_CLI_VERSION,
     CODEX_REASONING_EFFORT_CONFIG,
+    SUPPORTED_CODEX_MODEL_REFS,
 )
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
@@ -40,6 +41,17 @@ from meta_research.provider_supervisor import (
     write_supervisor_request,
     validated_working_directory,
 )
+
+
+class DraftingUnavailable(RuntimeError):
+    """A real drafting provider could not produce an auditable result."""
+
+    def __init__(
+        self, code: str, *, native_session_ref: str | None = None
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.native_session_ref = native_session_ref
 
 QUESTION_FIELD_MAX_LENGTHS = {
     "title": 500,
@@ -77,10 +89,61 @@ _DRAFTING_MODEL_CATALOG_SPECS = {
         "b751e15ada2e36a46a93e38f586d0e83ec05243d58ca0902ec9943b6450bdc03",
     ),
 }
-_drafting_catalog_name, _DRAFTING_MODEL_CATALOG_SHA256 = (
-    _DRAFTING_MODEL_CATALOG_SPECS[_DRAFTING_MODEL_REF]
+_DRAFTING_MODEL_CATALOG_TEMPLATE_PATH = Path(__file__).with_name(
+    "codex_drafting_model_catalog_gpt_6_2_sol.json"
 )
-_DRAFTING_MODEL_CATALOG_PATH = Path(__file__).with_name(_drafting_catalog_name)
+
+
+def _generated_drafting_catalog(model_ref: str) -> tuple[Path, str]:
+    """Materialize a safe schema-only catalog for a current Codex model."""
+    try:
+        template_payload = _DRAFTING_MODEL_CATALOG_TEMPLATE_PATH.read_bytes()
+        template_digest = hashlib.sha256(template_payload).hexdigest()
+        if template_digest != _DRAFTING_MODEL_CATALOG_SPECS["gpt-6.2-sol"][1]:
+            raise DraftingUnavailable("codex_model_catalog_invalid")
+        template = json.loads(template_payload.decode("utf-8"))
+        model = dict(template["models"][0])
+    except (OSError, KeyError, TypeError, ValueError, IndexError) as error:
+        raise DraftingUnavailable("codex_model_catalog_invalid") from error
+    model["slug"] = model_ref
+    model["display_name"] = f"{model_ref} Proposal Drafter"
+    payload = json.dumps(
+        {"models": [model]}, ensure_ascii=False, indent=2
+    ).encode("utf-8")
+    root = Path(tempfile.gettempdir()) / "meta-research-drafting-catalogs"
+    template_hash = template_digest[:16]
+    path = root / f"{model_ref}-{template_hash}.json"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            if path.read_bytes() != payload:
+                raise DraftingUnavailable("codex_model_catalog_invalid")
+        else:
+            temporary = path.with_name(
+                f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            temporary.write_bytes(payload)
+            temporary.replace(path)
+    except DraftingUnavailable:
+        raise
+    except OSError as error:
+        raise DraftingUnavailable("codex_model_catalog_invalid") from error
+    return path, hashlib.sha256(payload).hexdigest()
+
+
+def _drafting_catalog_spec(model_ref: str) -> tuple[Path, str]:
+    known = _DRAFTING_MODEL_CATALOG_SPECS.get(model_ref)
+    if known is not None:
+        name, digest = known
+        return Path(__file__).with_name(name), digest
+    if model_ref not in SUPPORTED_CODEX_MODEL_REFS:
+        raise DraftingUnavailable("codex_model_not_allowed")
+    return _generated_drafting_catalog(model_ref)
+
+
+_DRAFTING_MODEL_CATALOG_PATH, _DRAFTING_MODEL_CATALOG_SHA256 = (
+    _drafting_catalog_spec(_DRAFTING_MODEL_REF)
+)
 _DRAFTING_MODEL_CATALOG_MAX_BYTES = 64 * 1024
 _DISABLED_DRAFTING_CODEX_FEATURES = (
     "apps",
@@ -128,21 +191,6 @@ QUESTION_CONTENT_GUIDANCE = (
     "普通实施偏好不升级为题意硬约束。"
 )
 _PSEUDO_VALUES = {"unknown", "not_applicable", "not applicable", "n/a", "na"}
-
-
-class DraftingUnavailable(RuntimeError):
-    """A real drafting provider could not produce an auditable result."""
-
-    def __init__(
-        self, code: str, *, native_session_ref: str | None = None
-    ) -> None:
-        super().__init__(code)
-        self.code = code
-        self.native_session_ref = native_session_ref
-
-
-
-
 
 
 @dataclass(frozen=True)
@@ -776,16 +824,23 @@ class CodexDraftingAdapter:
         process_runner: ProcessRunner | None = None,
         version_runner: CommandRunner | None = None,
     ) -> None:
-        if model_ref != _DRAFTING_MODEL_REF:
-            raise DraftingUnavailable("codex_model_not_allowed")
+        if model_ref == _DRAFTING_MODEL_REF:
+            catalog_path, catalog_hash = (
+                _DRAFTING_MODEL_CATALOG_PATH,
+                _DRAFTING_MODEL_CATALOG_SHA256,
+            )
+        else:
+            catalog_path, catalog_hash = _drafting_catalog_spec(model_ref)
         try:
-            self._model_catalog_path = _DRAFTING_MODEL_CATALOG_PATH.resolve(
+            self._model_catalog_path = catalog_path.resolve(
                 strict=True
             )
         except OSError as error:
             raise DraftingUnavailable("codex_model_catalog_invalid") from error
         self._model_catalog_hash = _verified_drafting_model_catalog(
-            self._model_catalog_path, model_ref=model_ref
+            self._model_catalog_path,
+            model_ref=model_ref,
+            expected_hash=catalog_hash,
         )
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -1346,7 +1401,9 @@ def _drafting_argv_hash(argv: list[str]) -> str:
     return hashlib.sha256(_canonical_json(argv).encode("utf-8")).hexdigest()
 
 
-def _verified_drafting_model_catalog(path: Path, *, model_ref: str) -> str:
+def _verified_drafting_model_catalog(
+    path: Path, *, model_ref: str, expected_hash: str | None = None
+) -> str:
     try:
         if path.stat().st_size > _DRAFTING_MODEL_CATALOG_MAX_BYTES:
             raise DraftingUnavailable("codex_model_catalog_invalid")
@@ -1360,8 +1417,10 @@ def _verified_drafting_model_catalog(path: Path, *, model_ref: str) -> str:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise DraftingUnavailable("codex_model_catalog_invalid") from error
     models = catalog.get("models") if isinstance(catalog, dict) else None
+    if expected_hash is None:
+        expected_hash = _drafting_catalog_spec(model_ref)[1]
     if (
-        digest != _DRAFTING_MODEL_CATALOG_SHA256
+        digest != expected_hash
         or not isinstance(catalog, dict)
         or set(catalog) != {"models"}
         or not isinstance(models, list)
@@ -1372,8 +1431,8 @@ def _verified_drafting_model_catalog(path: Path, *, model_ref: str) -> str:
     model = cast(dict[str, object], models[0])
     messages = model.get("model_messages")
     if (
-        model_ref != _DRAFTING_MODEL_REF
-        or model.get("slug") != _DRAFTING_MODEL_REF
+        model_ref not in SUPPORTED_CODEX_MODEL_REFS
+        or model.get("slug") != model_ref
         or model.get("shell_type") != "disabled"
         or model.get("apply_patch_tool_type") is not None
         or model.get("include_skills_usage_instructions") is not False
@@ -1512,21 +1571,27 @@ def _validate_drafting_execution_contract_asset(
         # The verified request and terminal receipt bind the original argv,
         # version admission and catalog. Only that settled operation may be read.
         model = contract.get("model_ref")
-        spec = _DRAFTING_MODEL_CATALOG_SPECS.get(model) if isinstance(model, str) else None
-        if spec is None or spec[1] != contract.get("model_catalog_hash"):
+        if not isinstance(model, str):
+            raise DraftingUnavailable("codex_execution_contract_outdated")
+        try:
+            historical_spec = _drafting_catalog_spec(model)
+        except DraftingUnavailable as error:
+            raise DraftingUnavailable("codex_execution_contract_outdated") from error
+        if historical_spec[1] != contract.get("model_catalog_hash"):
             raise DraftingUnavailable("codex_execution_contract_outdated")
         try:
             historical_path = Path(str(contract["model_catalog_path"]))
             if (historical_path.stat().st_size > _DRAFTING_MODEL_CATALOG_MAX_BYTES
-                    or hashlib.sha256(historical_path.read_bytes()).hexdigest() != spec[1]):
+                    or hashlib.sha256(historical_path.read_bytes()).hexdigest() != historical_spec[1]):
                 raise DraftingUnavailable("codex_execution_contract_outdated")
         except OSError as error:
             raise DraftingUnavailable("codex_execution_contract_outdated") from error
         return
     try:
         current_path = _DRAFTING_MODEL_CATALOG_PATH.resolve(strict=True)
+        expected_hash = _DRAFTING_MODEL_CATALOG_SHA256
         current_hash = _verified_drafting_model_catalog(
-            current_path, model_ref=_DRAFTING_MODEL_REF
+            current_path, model_ref=_DRAFTING_MODEL_REF, expected_hash=expected_hash
         )
     except (OSError, DraftingUnavailable) as error:
         raise DraftingUnavailable(

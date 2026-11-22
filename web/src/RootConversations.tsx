@@ -203,6 +203,7 @@ export function StageRootSessions({ model, stage, onOpenOutput }: { model: Model
       aria-label={`${label}${ordinal} · ${scope} · ${model.error ? "上次记录" : rootSessionStatus(session, language)}`}
       title={`${session.title} · ${scope} · ${rootSessionStatus(session, language)}`}
       onClick={() => { model.selectStage(stage, session.session_ref); onOpenOutput?.(); }}>
+      {executing ? <i className="root-running-spinner" aria-hidden="true" /> : null}
       <span>{label}{ordinal}</span><small>{session.kind === "acquisition" ? "共享" : session.kind === "deepfetch" && !session.cycle_ref ? scope : history ? "历史" : ""}</small>
     </button>;
   });
@@ -257,9 +258,24 @@ export function RootConversations({ model, connected, polling = false, targetRet
     return { executing, label: executing ? rootSessionStatus(session) : "状态待确认" };
   };
   const selectedExecuting = Boolean(model.selected && !model.selectedUnavailable && sessionDisplay(model.selected).executing);
+  const activeExecutingSessions = choices.filter(session => sessionDisplay(session).executing);
   return <section className="research-flow root-conversations" id="research-activity" tabIndex={-1} aria-labelledby="research-trace-title">
     <header className="research-flow-heading"><div className="research-flow-title"><h2 id="research-trace-title">研究过程</h2>
       <span className="research-connection" data-connected={connected || polling}><i />{model.context.stale ? "状态待确认 · 保留记录" : connected ? "实时连接" : polling ? "定时更新" : "连接中断 · 保留记录"}</span></div>
+      {activeExecutingSessions.length ? <nav className="root-working-now" aria-label="当前正在工作的会话"><span>正在工作</span>{activeExecutingSessions.map(session => {
+        const name = session.short_title || session.title;
+        const sameName = choices.filter(choice => (choice.short_title || choice.title) === name);
+        const ordinal = sameName.length > 1 ? ` ${sameName.findIndex(choice => choice.session_ref === session.session_ref) + 1}` : "";
+        const { label } = sessionDisplay(session);
+        return <button key={session.session_ref} type="button" data-working-session-ref={session.session_ref}
+          title={`${session.title} · ${label}`}
+          aria-label={`切换到正在工作的 ${name}${ordinal}`}
+          aria-pressed={model.selected?.session_ref === session.session_ref}
+          onClick={() => select(session)}>
+          <i className="root-running-spinner" aria-hidden="true" />
+          <span>{name}{ordinal}</span>
+        </button>;
+      })}</nav> : null}
       {onHide ? <button type="button" className="research-panel-hide" aria-label="隐藏研究过程" aria-controls="research-output-panel" onClick={onHide}>−</button> : null}
     </header>
     <div className="root-session-controls" tabIndex={0} aria-label="会话选择与状态">
@@ -285,13 +301,18 @@ export function RootConversations({ model, connected, polling = false, targetRet
       const name = session.short_title || session.title;
       const sameName = targets.filter(target => (target.short_title || target.title) === name);
       const { executing, label } = sessionDisplay(session);
+      const known = sessionKnown(session);
+      const stateTag = !session.is_executing && session.status === "completed" ? { text: "已完成", cls: "root-target-completed" }
+        : !executing && known && session.status === "failed" ? { text: "受阻", cls: "root-target-failed" }
+        : !executing && known && session.status === "paused" ? { text: "已暂停", cls: "root-target-state" }
+        : null;
       return <button key={session.session_ref} type="button" data-session-ref={session.session_ref} data-executing={executing}
         title={`${session.title} · ${label}`}
         aria-label={`${name} · ${executing ? "正在执行" : label}`}
         aria-pressed={model.selected?.session_ref === session.session_ref} onClick={() => select(session)}>
         {executing ? <i className="root-running-spinner" aria-hidden="true" /> : null}
         <span>{name}{sameName.length > 1 ? ` · ${sameName.findIndex(target => target.session_ref === session.session_ref) + 1}` : ""}</span>
-        {!session.is_executing && session.status === "completed" ? <span className="root-target-completed">已完成</span> : null}
+        {stateTag ? <span className={stateTag.cls}>{stateTag.text}</span> : null}
       </button>;
     })}</nav> : null}
     {failure ? <div className="root-worker-notice" data-testid="research-current-worker-blocker">
@@ -418,7 +439,7 @@ function RootSessionTimeline({ questRef, session, scope, active, stale, readingC
   }, [cancelAutoScroll, clearReadingIntent, onOutput]);
   useEffect(onOutput, [onOutput, operations.length, follow]);
   return <section className="research-conversation root-session-conversation" aria-label={`${session.title} 会话`} data-session-ref={session.session_ref}>
-    <header className="root-session-heading"><div><b>{session.title}</b><small>{scope}{session.kind === "acquisition" ? " · 共享 Acquisition" : ""}</small></div><span data-executing={!stale && session.is_executing}>{stale ? `状态待确认 · 上次${rootSessionStatus(session, language)}` : rootSessionStatus(session, language)}</span></header>
+    <header className="root-session-heading"><div><b>{session.title}</b><small>{scope}{session.kind === "acquisition" ? " · 共享 Acquisition" : ""}</small></div><span data-executing={!stale && session.is_executing}>{!stale && session.is_executing ? <i className="root-running-spinner" aria-hidden="true" /> : null}{stale ? `状态待确认 · 上次${rootSessionStatus(session, language)}` : rootSessionStatus(session, language)}</span></header>
     {operations.length ? <div className="root-session-live-time" ref={setClockHost} /> : null}
     {children.length ? <section className="root-delegated-children" aria-label="委派子智能体">
       <h4>委派子智能体 <small>{children.length}</small></h4>
@@ -597,7 +618,8 @@ function RootOperationOutput({ questRef, sessionRef, operation, sessionState, or
       {typeof operation.heartbeat.stdout_bytes === "number" ? <span> · 已收集 {operation.heartbeat.stdout_bytes} 字节</span> : null}
     </div> : null}
     {clockHost ? createPortal(page ? <ExecutionElapsed sample={clock} ended={page.status === "terminal"}
-      state={error ? "unknown" : sessionState && sessionState !== "executing" ? sessionState : page.status === "waiting" ? "waiting" : "executing"} />
+      state={error ? "unknown" : sessionState && sessionState !== "executing" ? sessionState : page.status === "waiting" ? "waiting" : "executing"}
+      startedAt={operation.created_at} endedAt={operation.updated_at} />
       : <RootOutputTimestamp sourceUpdatedAt={null} />, clockHost) : null}
     {error ? <div className="root-session-warning" role="status">{page ? "记录暂时无法更新，已保留上次内容。" : "部分记录暂时无法读取，后续内容仍可继续查看。"}<button onClick={() => { retryRequested.current = true; setRetry(value => value + 1); }}>重试</button><details><summary>读取详情</summary><code>{error}</code></details></div> : null}
     {page ? <>{(chunks[0]?.offset ?? 0) > 0 && browseOffset === null ? <button type="button" className="root-load-earlier root-output-older" onClick={onShowHistory}>前文已收起 · 查看更早内容</button> : null}

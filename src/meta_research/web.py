@@ -32,7 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from meta_research.auth import AuthSession
 from meta_research.asset_download import AssetDownloadResponse
 from meta_research.companion_writing import WritingRequest
-from meta_research.codex_runtime import CODEX_MODEL_REF
+from meta_research.codex_runtime import CODEX_MODEL_REF, SUPPORTED_CODEX_MODEL_REFS
 from meta_research.codex_account import CodexAccountService
 from meta_research.time_budget import time_budget_seconds
 from meta_research.composition import ProductionRuntime
@@ -146,7 +146,7 @@ class StartHarnessConformanceRequest(BaseModel):
     @field_validator("codex_model_ref")
     @classmethod
     def configured_codex_model(cls, value: str) -> str:
-        if value != CODEX_MODEL_REF:
+        if value not in SUPPORTED_CODEX_MODEL_REFS:
             raise ValueError("codex_model_not_allowed")
         return value
 

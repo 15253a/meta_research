@@ -101,13 +101,22 @@ def root(tmp_path, monkeypatch):
 
 
 def test_stage_binding_uses_only_the_requested_stage_and_quest(root):
+    from meta_research.codex_runtime import DEFAULT_STAGE_MODELS
+
     initial = read_runtime_conditions(root, "quest-one")
+    assert initial["stage_models"] == {
+        "idea": "gpt-6.2-astra",
+        "plan": "gpt-6.1-sol",
+        "bundle": "gpt-6.1-sol",
+        "target": "gpt-6.1-sol",
+        "reasoning": "gpt-6.2-astra",
+    }
     selected = {**initial["stage_models"], "plan": "gpt-5.6-sol", "target": "gpt-5.6-sol"}
     save_runtime_conditions(root, "quest-one", expected_revision=initial["revision"],
                             text=initial["text"], stage_models=selected)
     for stage, model in selected.items():
         assert selected_stage_model(root, stage, run_ref="run-one", default="unused") == model
-        assert selected_stage_model(root, stage, run_ref="run-two", default="unused") == "gpt-6.1-sol"
+        assert selected_stage_model(root, stage, run_ref="run-two", default="unused") == DEFAULT_STAGE_MODELS[stage]
     assert selected_stage_model(root, "target", target_ref="target-one", default="unused") == selected["target"]
     assert selected_stage_model(root, "companion", run_ref="run-one", default="auxiliary-model") == "auxiliary-model"
 

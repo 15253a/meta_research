@@ -37,6 +37,36 @@ function generationFailureCopy(code: string) {
   return messages[code] ?? "本次准备未能完成，请根据运行记录和原因代码检查后再重试。";
 }
 
+function ElapsedBadge({
+  active,
+  preparationBlocked,
+  started,
+  ended,
+  resetKey,
+}: {
+  active: boolean;
+  preparationBlocked: boolean;
+  started: number | null;
+  ended: number | null;
+  resetKey?: string;
+}) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active, started, resetKey]);
+  const seconds = started === null ? null : Math.max(0, Math.floor((ended ?? now / 1000) - started));
+  const elapsed = seconds === null ? null : `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+  const label = elapsed
+    ? `${active ? "已用时" : preparationBlocked ? "已记录用时" : "本轮耗时"} ${elapsed}`
+    : active
+      ? "准备中"
+      : "";
+  return <span>{label}</span>;
+}
+
 export function FirstQuestionProgress({ creation, pending, enabled, children }: {
   creation: QuestCreationView; pending: boolean; enabled: boolean; children: ReactNode;
 }) {
@@ -76,27 +106,35 @@ export function FirstQuestionProgress({ creation, pending, enabled, children }: 
     .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   const started = starts.length ? Math.min(...starts) : null;
   const ended = !active && completions.length ? Math.max(...completions) : null;
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    if (!active) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [active, started, generation?.ref]);
-  const seconds = started === null ? null : Math.max(0, Math.floor((ended ?? now / 1000) - started));
-  const elapsed = seconds === null ? null : `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
   const title = stale ? "研究依据已变化，需要重新准备" : failed ? "本次准备未完成" : cancelled ? "本次准备已停止" : ready ? "第一个问题准备好了" : generation?.status === "succeeded" ? "问题草稿仍需补全" : pending && !generation && !deepfetch ? "正在保存目标并准备运行" : generation?.status === "queued" ? "等待开始准备第一问" : phase === "understanding" && !deepfetch?.run ? "正在理解已有资料" : deepfetch && !searchDone ? ({ queued: "正在准备检索", running: "正在检索与阅读资料", accepting: "正在保留可用文献" } as Record<string, string>)[deepfetch.status] ?? "正在准备第一问" : hasMaterials && !currentBasis && phase !== "drafting" ? "正在理解资料并准备第一问" : direct ? "正在起草第一个研究问题" : "正在整理研究依据与起草第一问";
+  const notice = preparationBlocked
+    ? preparationReconciliationCopy(deepfetch)
+    : failed
+      ? "本次运行已结束，目标、材料和已有草稿仍保留。可以重新生成第一问。"
+      : stale
+        ? "保留此前的活动记录；更新依据后重新生成第一问。"
+        : null;
   if (!pending && !generation && !deepfetch) return null;
-  return <section className={`first-question-progress ${active ? "is-active" : ""} ${failed ? "is-failed" : ""}`}
+  return <section className={`first-question-progress ${active ? "is-active" : ""} ${failed ? "is-failed" : ""} ${ready ? "is-ready" : ""}`}
     data-testid="first-question-progress" aria-label="第一问准备进度">
-    <header><div><small>第一问 · 研究现场</small><h3 role="status">{title}</h3></div>
-      <span>{elapsed ? `${active ? "已用时" : preparationBlocked ? "已记录用时" : "本轮耗时"} ${elapsed}` : active ? "状态自动更新" : "本次运行记录"}</span></header>
+    <header>
+      <h3 role="status">{title}</h3>
+      <ElapsedBadge active={active} preparationBlocked={preparationBlocked} started={started} ended={ended} resetKey={generation?.ref} />
+    </header>
     <div className="first-question-stage-meter" role="progressbar" aria-label="第一问流程位置" aria-valuemin={0} aria-valuemax={4}
       aria-valuenow={completed} aria-valuetext={failed || stale || cancelled ? title : ready ? "四个阶段已完成" : steps[firstGap]?.label}>
-      {steps.map((step, index) => <div key={step.label} data-state={step.done ? step.skipped ? "skipped" : "done" : active && index === firstGap ? "current" : "pending"}
-        aria-current={active && index === firstGap ? "step" : undefined}><i aria-hidden="true" /><b>{step.label}</b><small>{step.skipped ? "已跳过" : step.done ? "已就绪" : index === firstGap && active ? "进行中" : "待完成"}</small></div>)}
+      {steps.map((step, index) => {
+        const state = step.done ? (step.skipped ? "skipped" : "done") : active && index === firstGap ? "current" : "pending";
+        const stopped = failed && !step.done && index === firstGap;
+        return <div key={step.label} data-state={state} data-stopped={stopped ? "true" : undefined}
+          aria-current={state === "current" ? "step" : undefined}
+          title={step.skipped ? `${step.label}（已跳过）` : step.label}>
+          <i aria-hidden="true" data-step={index + 1} />
+          <b>{step.label}</b>
+        </div>;
+      })}
     </div>
-    <p>{preparationBlocked ? preparationReconciliationCopy(deepfetch) : failed ? "本次运行已结束，目标、材料和已有草稿仍保留。可以重新生成第一问。" : stale ? "保留此前的活动记录；更新依据后重新生成第一问。" : ready ? "检查下面的问题草稿，确认前仍可修改。" : "下面持续显示实际运行活动；没有新事件时会等待下一次输出。"}</p>
+    {notice ? <p className="first-question-notice">{notice}</p> : null}
     {generationFailure ? <div className="first-question-failure" role="alert">
       <p>{generationFailureCopy(generationFailure.code)}</p>
       <details key={`${generation?.ref}:${generationFailure.code}`}><summary>查看原因代码</summary><code>{generationFailure.code}</code></details>
