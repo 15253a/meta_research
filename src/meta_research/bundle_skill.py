@@ -1700,6 +1700,12 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         reading_context = continue_batch_reading_context(
             reading_context, self._delivered_bundle_records(request, operation_name))
         position = _rolling_position_prompt(request)
+        goal_guidance = (
+            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；"
+            "不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
+            if request.quest_goal_revision is not None
+            else "当前 Bundle target-batch context 未携带 Quest Goal revision。"
+        )
         prompt = (
             (position if request.native_session_ref is None else "") +
             stage_replacement_prompt(request) +
@@ -1708,8 +1714,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "继续当前 Bundle 根，根据本次新结果与反馈提交完整 FormalStrategyUpdate 或 replan_basis。"
             "known_current_targets 和 known_target_commit_refs 指向本会话已交付的未变正文；"
             "仅在确实缺失材料时用当前 context_pack_ref 定向补读。"
-            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
-            f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
+            + goal_guidance
+            + f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
             f"{_bundle_output_assembly_prompt()}"
             "完成独立审阅与必要综合后交接，保留未解决事项，不重复已完成工作。\n"
             f"batch_context={canonical_json(reading_context)}"
