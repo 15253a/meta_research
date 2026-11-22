@@ -15,8 +15,10 @@ from test_reasoning_summary_decision_flow import final_output, runtime_at
 class _CorrectingWireRunner(_GuidanceRunner):
     """Only model output is controlled; transport receipts and Owners are real."""
 
-    def __init__(self):
+    def __init__(self, invalid_field):
         super().__init__()
+        self.invalid_field = invalid_field
+        self.uncited_refs = ["target_commit_" + "a" * 32, "target_commit_" + "b" * 32]
         self.cycle_ref = None
         self.candidates = []
 
@@ -25,14 +27,34 @@ class _CorrectingWireRunner(_GuidanceRunner):
         output = final_output(_checkpoint(request, question_title="A bounded continuation"))
         output["next_cycle_proposal"].update(entry_stage="idea", typed_skip_basis_refs_by_stage={})
         if not self.calls:
-            output["scientific_outcome"]["research_synthesis"]["parent_questions"] = []
+            outcome = output["scientific_outcome"]
+            if self.invalid_field == "attribution_basis_refs":
+                outcome["causal_interpretation"]["attribution_basis_refs"] = self.uncited_refs
+            elif self.invalid_field == "non_parent":
+                outcome["research_synthesis"]["parent_questions"].append({
+                    "question_ref": "question:other", "impact": "unknown", "statement": "This route remains uncertain.",
+                })
+            else:
+                outcome["research_synthesis"]["parent_questions"] = []
         self.candidates.append(deepcopy(output))
         self.output = {"provider_output": output}
         return super().__call__(argv, prompt, timeout, environment)
 
 
 def test_production_wire_receives_durable_parent_feedback_then_delivers_after_restart(tmp_path):
-    runner = _CorrectingWireRunner()
+    _check_resume_after_rejection(tmp_path, "parent_questions")
+
+
+def test_production_wire_returns_uncited_attribution_refs_after_restart(tmp_path):
+    _check_resume_after_rejection(tmp_path, "attribution_basis_refs")
+
+
+def test_production_wire_returns_non_parent_feedback_after_restart(tmp_path):
+    _check_resume_after_rejection(tmp_path, "non_parent")
+
+
+def _check_resume_after_rejection(tmp_path, invalid_field):
+    runner = _CorrectingWireRunner(invalid_field)
     originating_session = runner.native_session_ref
     executable = _fake_codex(tmp_path / "codex")
 
@@ -59,16 +81,28 @@ def test_production_wire_receives_durable_parent_feedback_then_delivers_after_re
                 break
         rejection = run.completion_rejection
         assert rejection is not None
-        assert rejection.detail_code == "scientific_outcome_research_synthesis_invalid"
-        original_candidate = {"phase": "primary", "result": runner.candidates[0]}
-        assert rejection.candidate == original_candidate
-        assert rejection.candidate_hash == canonical_hash(original_candidate)
-        diagnostic = (
-            "scientific_outcome_research_synthesis_invalid:"
-            "research_synthesis.parent_questions:missing_impact_for:" + parents[0]
-        )
-        assert len(diagnostic) > 128
-        assert diagnostic in "\n".join(rejection.feedback)
+        if invalid_field == "parent_questions":
+            assert rejection.detail_code == "scientific_outcome_research_synthesis_invalid"
+            original_candidate = {"phase": "primary", "result": runner.candidates[0]}
+            assert rejection.candidate == original_candidate
+            diagnostics = ["scientific_outcome_research_synthesis_invalid:"
+                           "research_synthesis.parent_questions:missing_impact_for:" + parents[0]]
+            assert len(diagnostics[0]) > 128
+        elif invalid_field == "non_parent":
+            assert rejection.detail_code == "scientific_outcome_authoritative_metadata_conflict"
+            assert rejection.candidate == {"phase": "primary", "result": runner.candidates[0]}
+            diagnostics = ["question:other", "parent_questions[1].question_ref",
+                           "graph_binding.parent_question_bindings", "supported by evidence you used",
+                           "research_synthesis.quest.impact"]
+        else:
+            assert rejection.detail_code == "scientific_outcome_causal_interpretation_invalid"
+            diagnostics = ["scientific_outcome.causal_interpretation.attribution_basis_refs",
+                           "scientific_outcome.evidence[].ref", *runner.uncited_refs]
+            rejected = rejection.candidate["result"]["draft"]["scientific_outcome"]
+            assert rejected["causal_interpretation"]["attribution_basis_refs"] == runner.uncited_refs
+            assert rejected["evidence"] == runner.candidates[0]["scientific_outcome"]["evidence"]
+        assert rejection.candidate_hash == canonical_hash(rejection.candidate)
+        assert all(item in "\n".join(rejection.feedback) for item in diagnostics)
         assert rejection.native_session_ref == run.native_session_ref == originating_session
         assert run.attempt_ref == rejection.successor_attempt_ref
         assert run.fence_ref != rejection.fence_ref
@@ -91,7 +125,7 @@ def test_production_wire_receives_durable_parent_feedback_then_delivers_after_re
             if line.startswith("owner_feedback=")
         ))
         assert delivered == list(rejection.feedback)
-        assert diagnostic in "\n".join(delivered)
+        assert all(item in "\n".join(delivered) for item in diagnostics)
         assert rejection.candidate_ref in correction_prompt
         assert rejection.receipt.receipt_ref in correction_prompt
         assert "accepted_question=" not in correction_prompt
@@ -101,6 +135,8 @@ def test_production_wire_receives_durable_parent_feedback_then_delivers_after_re
         assert accepted.root_session_ref == rejection.root_session_ref
         assert accepted.native_session_ref == originating_session
         assert accepted.attempt_ref == rejection.successor_attempt_ref
+        if invalid_field == "attribution_basis_refs":
+            assert accepted.execution.outcome["scientific_outcome"]["causal_interpretation"]["attribution_basis_refs"] == []
         assert [item["question_ref"] for item in accepted.execution.outcome["scientific_outcome"]["research_synthesis"]["parent_questions"]] == parents
         assert runtime.owners.agent_runtime.query_stage_completion_rejection(rejection.attempt_ref) == rejection
         assert runtime.reasoning_stage.transient_error is None

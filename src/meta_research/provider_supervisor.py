@@ -34,6 +34,17 @@ PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION"
 SUPERVISOR_STOP_SCHEMA = "meta-research/codex-provider-supervisor-stop/v1"
 SUPERVISOR_REQUEST_SCHEMA_V2 = "meta-research/provider-supervisor-request/v2"
 SUPERVISOR_EXIT_SCHEMA_V2 = "meta-research/provider-supervisor-exit/v2"
+SUPERVISOR_HEARTBEAT_SCHEMA = "meta-research/provider-supervisor-heartbeat/v1"
+SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS = 15.0
+SUPERVISOR_HEARTBEAT_STALE_SECONDS = 45.0
+SUPERVISOR_HEARTBEAT_MAX_FUTURE_SKEW_SECONDS = 60.0
+SUPERVISOR_HEARTBEAT_REPLACE_RETRY_SECONDS = 1.0
+_OPERATION_SCOPE_FIELDS = frozenset({
+    "operation_name", "root_kind", "job_ref", "run_ref", "attempt_ref",
+    "fence_ref", "operation_ref", "model_ref",
+    "workspace_ref", "root_session_ref", "work_ref", "quest_ref",
+    "cycle_ref", "request_ref", "target_ref",
+})
 _SUPERVISOR_REQUEST_SCHEMAS = {
     SUPERVISOR_REQUEST_SCHEMA,
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
@@ -793,7 +804,8 @@ def supervisor_request_never_started(
         return False
     try:
         if any((operation_directory / name).exists() for name in (
-            "supervisor-ready.json", "provider-started.json", "supervisor-exit.json",
+            "supervisor-ready.json", "provider-started.json", "supervisor-heartbeat.json",
+            "provider-stderr.log", "supervisor-exit.json",
         )):
             return False
         write_supervisor_stop_request(operation_directory / "supervisor-stop.json",
@@ -808,6 +820,12 @@ def read_transport_key_for_operation(
 ) -> tuple[Path, bytes]:
     key_path = _operation_key_path(operation_directory)
     return key_path, _read_transport_key(key_path)
+
+
+def read_transport_key_for_workspace(workspace: Path) -> bytes:
+    """Read the shared provider-operation seal key without creating it."""
+
+    return _read_transport_key(workspace / "provider-operations" / ".transport-seal.key")
 
 
 def write_supervisor_request(
@@ -906,12 +924,15 @@ def write_exit_receipt(
     schema_path: Path,
     stdout_path: Path,
     result_path: Path,
+    stderr_path: Path | None = None,
     returncode: int | None,
     input_bytes: int,
     process_tree: dict[str, object],
     termination_reason: str = "completed",
     schema_ref: str = SUPERVISOR_EXIT_SCHEMA,
     codex_home: Path | None = None,
+    stderr_limited: bool | None = None,
+    operation_scope: dict[str, object] | None = None,
 ) -> None:
     if schema_ref not in _SUPERVISOR_EXIT_SCHEMAS:
         raise ProviderSupervisorError("provider_supervisor_exit_invalid")
@@ -939,17 +960,86 @@ def write_exit_receipt(
 
     # An observation cannot invalidate the signed execution receipt. Keep the
     # additional report separately so historical receipt schemas stay exact.
+    if stderr_path is None:
+        stderr_path = stdout_path.with_name("provider-stderr.log")
     try:
         from meta_research.provider_call_observations import observe_provider_files
-        observation = observe_provider_files(prompt_path, stdout_path, codex_home=codex_home)
+        observation = observe_provider_files(
+            prompt_path,
+            stdout_path,
+            stderr_path=stderr_path,
+            stderr_limited=stderr_limited,
+            codex_home=codex_home,
+            operation_scope=operation_scope,
+        )
         _write_signed_envelope(path.with_name("call-observation.json"), {
             **observation, "invocation_hash": invocation_hash,
             "output_schema_utf8_bytes": schema_path.stat().st_size,
             "stdout_file_hash": payload["stdout_file_hash"],
             "prompt_file_hash": payload["prompt_file_hash"],
         }, key)
-    except (OSError, ValueError, UnicodeError, ProviderSupervisorError):
-        pass
+        try:
+            from meta_research.root_session_usage import (
+                write_root_session_observation_index,
+            )
+
+            write_root_session_observation_index(
+                path.parent,
+                key=key,
+                invocation_hash=invocation_hash,
+                observation={
+                    **observation,
+                    "invocation_hash": invocation_hash,
+                    "output_schema_utf8_bytes": schema_path.stat().st_size,
+                    "stdout_file_hash": payload["stdout_file_hash"],
+                    "prompt_file_hash": payload["prompt_file_hash"],
+                },
+                operation_scope=operation_scope,
+            )
+        except Exception as error:
+            # The execution receipt and operation observation stay authoritative
+            # when the cross-operation pointer cannot be sealed.  Preserve a
+            # signed, actionable gap instead of silently claiming a root total.
+            try:
+                _write_signed_envelope(
+                    path.with_name("root-session-observation-gap.json"),
+                    {
+                        "schema_ref": "meta-research/root-session-observation-unavailable/v1",
+                        "invocation_hash": invocation_hash,
+                        "status": "unavailable",
+                        "failure_code": type(error).__name__ or "root_session_observation_failed",
+                        "owner": "harness",
+                        "next_action": "reconcile_root_session_observation_index_before_using_cross_operation_usage",
+                    },
+                    key,
+                )
+            except (OSError, ProviderSupervisorError, ValueError, TypeError):
+                pass
+    except (OSError, ValueError, UnicodeError, ProviderSupervisorError) as error:
+        # Keep the execution receipt authoritative, but leave a signed and
+        # actionable gap marker instead of making a missing sidecar look like
+        # an observation that was never attempted.
+        failure_code = {
+            OSError: "provider_observation_io_error",
+            ValueError: "provider_observation_value_error",
+            UnicodeError: "provider_observation_encoding_error",
+            ProviderSupervisorError: "provider_observation_seal_error",
+        }.get(type(error), "provider_observation_failed")
+        try:
+            _write_signed_envelope(path.with_name("call-observation.json"), {
+                "schema_ref": "meta-research/provider-call-observation-unavailable/v1",
+                "invocation_hash": invocation_hash,
+                "status": "unavailable",
+                "failure_code": failure_code,
+                "failure_stage": "observe_provider_files",
+                "owner": "harness",
+                "next_action": "preserve_exit_receipt_and_reconcile_observation_before_using_usage_evidence",
+            }, key)
+        except (OSError, ProviderSupervisorError, ValueError, TypeError):
+            # A second failure is itself outside the signed receipt path. The
+            # original execution result remains valid and can be reconciled by
+            # the operation owner using the durable paths and hashes.
+            pass
 
 
 def read_verified_exit_receipt(
@@ -1140,6 +1230,90 @@ def _publish_exclusive(path: Path, value: bytes) -> bool:
         temporary.unlink(missing_ok=True)
 
 
+def _write_signed_replacement(
+    path: Path,
+    payload: dict[str, object],
+    key: bytes,
+) -> None:
+    """Atomically replace one signed observer snapshot."""
+    envelope = {"payload": payload, "seal": _seal(payload, key)}
+    encoded = _canonical_json(envelope).encode("utf-8")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    try:
+        with temporary.open("xb") as destination:
+            _make_private(temporary, destination.fileno())
+            destination.write(encoded)
+            destination.flush()
+            os.fsync(destination.fileno())
+        deadline = time.monotonic() + SUPERVISOR_HEARTBEAT_REPLACE_RETRY_SECONDS
+        while True:
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                # Windows readers may hold the old snapshot without delete
+                # sharing. Retry the short observation race, then surface the
+                # gap to the existing heartbeat caller.
+                if os.name != "nt" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_supervisor_heartbeat(
+    path: Path,
+    *,
+    invocation_hash: str,
+    key: bytes,
+    phase: str,
+    process_platform: ProviderProcessPlatform,
+    provider_process: subprocess.Popen[bytes] | None = None,
+    operation_path: Path | None = None,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
+) -> None:
+    if phase not in {"ready", "running"}:
+        raise ProviderSupervisorError("provider_supervisor_heartbeat_invalid")
+    payload: dict[str, object] = {
+        "schema_ref": SUPERVISOR_HEARTBEAT_SCHEMA,
+        "invocation_hash": invocation_hash,
+        "phase": phase,
+        "observed_at": time.time(),
+        "supervisor_process_id": os.getpid(),
+        "supervisor_process_group": process_platform.current_process_group(),
+        **supervisor_host_identity(),
+    }
+    if provider_process is not None:
+        if operation_path is None:
+            raise ProviderSupervisorError("provider_process_identity_invalid")
+        payload.update(
+            {
+                "provider_process_id": provider_process.pid,
+                "provider_process_group": process_platform.process_group_for_pid(
+                    provider_process.pid
+                ),
+                "provider_operation_path": str(operation_path.resolve()),
+            }
+        )
+    if stdout_path is not None:
+        try:
+            payload["stdout_bytes"] = stdout_path.stat().st_size
+        except OSError:
+            # The stream may not be visible during an observer refresh. Omit
+            # this optional field rather than publishing an invalid marker.
+            pass
+    if stderr_path is not None:
+        try:
+            payload["stderr_bytes"] = stderr_path.stat().st_size
+        except OSError:
+            pass
+    _write_signed_replacement(path, payload, key)
+
+
 def _fsync_directory(path: Path) -> None:
     if os.name == "nt":
         # The file itself has been flushed. Python cannot portably open and
@@ -1179,6 +1353,8 @@ def _validated_request_paths(
         "receipt_path": directory / "supervisor-exit.json",
         "stop_path": directory / "supervisor-stop.json",
     }
+    stderr_path = directory / "provider-stderr.log"
+    heartbeat_path = directory / "supervisor-heartbeat.json"
     argv = payload.get("argv")
     timeout_seconds = payload.get("timeout_seconds")
     prompt_max_bytes = payload.get("prompt_max_bytes")
@@ -1199,6 +1375,22 @@ def _validated_request_paths(
     if "working_directory" in payload:
         expected_fields.add("working_directory")
         validated_working_directory(payload["working_directory"])
+    operation_scope = payload.get("operation_scope")
+    operation_scope_valid = True
+    if "operation_scope" in payload:
+        expected_fields.add("operation_scope")
+        operation_scope_valid = (
+            isinstance(operation_scope, dict)
+            and bool(operation_scope)
+            and set(operation_scope).issubset(_OPERATION_SCOPE_FIELDS)
+            and all(
+                isinstance(key, str)
+                and isinstance(value, str)
+                and bool(value)
+                and len(value.encode("utf-8")) <= 512
+                for key, value in operation_scope.items()
+            )
+        )
     # ``None`` is the normal long-running Provider policy: a valid operation
     # ends because the Provider exits, the Owner requests stop, or a bounded
     # output/process-integrity check fails.  A numeric wall-clock ceiling is an
@@ -1213,6 +1405,7 @@ def _validated_request_paths(
         )
     if (
         set(payload) != expected_fields
+        or not operation_scope_valid
         or not isinstance(argv, list)
         or not argv
         or not all(isinstance(value, str) and value for value in argv)
@@ -1257,7 +1450,7 @@ def _validated_request_paths(
         raise ProviderSupervisorError("provider_supervisor_request_invalid")
     return (
         typed_argv,
-        values,
+        {**values, "stderr_path": stderr_path, "heartbeat_path": heartbeat_path},
         None if timeout_seconds is None else float(timeout_seconds),
         stream_max_bytes,
         result_max_bytes,
@@ -1474,7 +1667,12 @@ def supervise(
     with SupervisorFileLock(paths["lock_path"]):
         if paths["receipt_path"].exists():
             return
-        if paths["started_path"].exists() or paths["ready_path"].exists():
+        if (
+            paths["started_path"].exists()
+            or paths["ready_path"].exists()
+            or paths["heartbeat_path"].exists()
+            or paths["stderr_path"].exists()
+        ):
             raise ProviderSupervisorError("provider_outcome_unknown")
         try:
             _supervise_locked(
@@ -1508,6 +1706,8 @@ def supervise(
                 provider_job_factory=provider_job_factory,
                 working_directory=(validated_working_directory(payload["working_directory"])
                     if "working_directory" in payload else None),
+                operation_scope=(payload.get("operation_scope")
+                    if isinstance(payload.get("operation_scope"), dict) else None),
             )
         except ProviderTreeError as error:
             raise ProviderSupervisorError(str(error)) from error
@@ -1529,22 +1729,28 @@ def _supervise_locked(
     process_platform: ProviderProcessPlatform,
     provider_job_factory: ProviderProcessJobFactory | None,
     working_directory: Path | None = None,
+    operation_scope: dict[str, object] | None = None,
 ) -> None:
     prompt_path = paths["prompt_path"]
     schema_path = paths["schema_path"]
     stdout_path = paths["stdout_path"]
+    stderr_path = paths["stderr_path"]
     result_path = paths["result_path"]
     receipt_path = paths["receipt_path"]
+    heartbeat_path = paths["heartbeat_path"]
     termination_reason = "completed"
     returncode: int | None = None
     native_started = False
     stdout_exceeded = threading.Event()
+    stderr_exceeded = threading.Event()
     result_exceeded = threading.Event()
     stdout_errors: list[BaseException] = []
+    stderr_errors: list[BaseException] = []
     result_errors: list[BaseException] = []
     result_temporary = result_path.with_name(".last-message.supervisor.tmp")
     if (
         stdout_path.exists()
+        or stderr_path.exists()
         or result_path.exists()
         or result_temporary.exists()
     ):
@@ -1566,7 +1772,29 @@ def _supervise_locked(
     fifo: Path | None = None
     fifo_identity: os.stat_result | None = None
     process: subprocess.Popen[bytes] | None = None
+
+    def write_heartbeat(
+        phase: str,
+        provider_process: subprocess.Popen[bytes] | None = None,
+    ) -> None:
+        # A lost heartbeat is an observation gap. It must not turn a provider
+        # result into an unknown outcome or authorize a retry.
+        try:
+            _write_supervisor_heartbeat(
+                heartbeat_path,
+                invocation_hash=invocation_hash,
+                key=key,
+                phase=phase,
+                process_platform=process_platform,
+                provider_process=provider_process,
+                operation_path=operation_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
+        except (OSError, ProviderSupervisorError):
+            return
     stdout_drainer: threading.Thread | None = None
+    stderr_drainer: threading.Thread | None = None
     result_drainer: threading.Thread | None = None
     result_source = None
 
@@ -1626,6 +1854,9 @@ def _supervise_locked(
         stdout_stream = stack.enter_context(
             stdout_path.open("xb", buffering=0)
         )
+        stderr_stream = stack.enter_context(
+            stderr_path.open("xb", buffering=0)
+        )
         result_stream = (
             stack.enter_context(result_temporary.open("xb", buffering=0))
             if selected_platform == "posix"
@@ -1644,7 +1875,7 @@ def _supervise_locked(
                 except (OSError, ProviderSupervisorError, ProviderTreeError, subprocess.SubprocessError):
                     pass  # Preserve the original error and the unsealed spool.
             close_result_pipe()
-            for drainer in (stdout_drainer, result_drainer):
+            for drainer in (stdout_drainer, stderr_drainer, result_drainer):
                 if drainer is not None and drainer.ident is not None:
                     drainer.join(timeout=1.0)
             if result_source is not None and (
@@ -1655,6 +1886,11 @@ def _supervise_locked(
                 stdout_drainer is None or stdout_drainer.ident is None
             ):
                 process.stdout.close()
+            provider_stderr = getattr(process, "stderr", None)
+            if provider_stderr is not None and (
+                stderr_drainer is None or stderr_drainer.ident is None
+            ):
+                provider_stderr.close()
 
         # Run before ExitStack closes the destination files. A surviving external
         # writer can still prevent EOF: daemon readers are only an error-path
@@ -1664,6 +1900,7 @@ def _supervise_locked(
             paths["ready_path"], schema_ref=ready_schema_ref,
             invocation_hash=invocation_hash, key=key, process_platform=process_platform,
         )
+        write_heartbeat("ready")
         if stop_requested():
             termination_reason = "stopped"
             close_result_pipe()
@@ -1674,7 +1911,7 @@ def _supervise_locked(
                 spawn_options: dict[str, object] = {
                     "stdin": prompt_stream,
                     "stdout": subprocess.PIPE,
-                    "stderr": subprocess.DEVNULL,
+                    "stderr": subprocess.PIPE,
                     "env": provider_environment,
                     "cwd": working_directory,
                     **process_platform.provider_spawn_options(),
@@ -1698,7 +1935,9 @@ def _supervise_locked(
                     operation_path=operation_path,
                     process_platform=process_platform,
                 )
+                write_heartbeat("running", process)
                 assert process.stdout is not None
+                provider_stderr = getattr(process, "stderr", None)
                 stdout_drainer = threading.Thread(
                     daemon=True,
                     target=_bounded_stdout_drain,
@@ -1710,6 +1949,18 @@ def _supervise_locked(
                         stdout_errors,
                     ),
                 )
+                if provider_stderr is not None:
+                    stderr_drainer = threading.Thread(
+                        daemon=True,
+                        target=_bounded_stdout_drain,
+                        args=(
+                            provider_stderr,
+                            stderr_stream,
+                            stream_max_bytes,
+                            stderr_exceeded,
+                            stderr_errors,
+                        ),
+                    )
                 if result_read_fd is not None:
                     result_source = os.fdopen(result_read_fd, "rb", buffering=0)
                     result_read_fd = None  # Ownership transferred to the reader.
@@ -1729,6 +1980,8 @@ def _supervise_locked(
                     else None
                 )
                 stdout_drainer.start()
+                if stderr_drainer is not None:
+                    stderr_drainer.start()
                 if result_drainer is not None:
                     result_drainer.start()
                 deadline = (
@@ -1736,6 +1989,7 @@ def _supervise_locked(
                     if timeout_seconds is None
                     else time.monotonic() + timeout_seconds
                 )
+                next_heartbeat_at = time.monotonic() + SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS
                 while process.poll() is None or (
                     provider_job is not None
                     and provider_job.active_process_count() > 0
@@ -1748,6 +2002,9 @@ def _supervise_locked(
                             provider_job=provider_job,
                         )
                         break
+                    if time.monotonic() >= next_heartbeat_at:
+                        write_heartbeat("running", process)
+                        next_heartbeat_at = time.monotonic() + SUPERVISOR_HEARTBEAT_INTERVAL_SECONDS
                     if deadline is not None and time.monotonic() >= deadline:
                         termination_reason = "timeout"
                         returncode = _terminate_provider(
@@ -1756,7 +2013,11 @@ def _supervise_locked(
                             provider_job=provider_job,
                         )
                         break
-                    if stdout_exceeded.is_set() or result_exceeded.is_set():
+                    if (
+                        stdout_exceeded.is_set()
+                        or stderr_exceeded.is_set()
+                        or result_exceeded.is_set()
+                    ):
                         termination_reason = "output_limit"
                         returncode = _terminate_provider(
                             process,
@@ -1792,9 +2053,13 @@ def _supervise_locked(
                         termination_reason = "descendant_process"
                 close_result_pipe()
                 stdout_drainer.join(timeout=1.0)
+                if stderr_drainer is not None:
+                    stderr_drainer.join(timeout=1.0)
                 if result_drainer is not None:
                     result_drainer.join(timeout=1.0)
                 if stdout_drainer.is_alive() or (
+                    stderr_drainer is not None and stderr_drainer.is_alive()
+                ) or (
                     result_drainer is not None and result_drainer.is_alive()
                 ):
                     if provider_job is not None:
@@ -1803,21 +2068,32 @@ def _supervise_locked(
                                 "provider_job_termination_failed"
                             )
                     stdout_drainer.join(timeout=1.0)
+                    if stderr_drainer is not None:
+                        stderr_drainer.join(timeout=1.0)
                     if result_drainer is not None:
                         result_drainer.join(timeout=1.0)
                 if (
                     stdout_drainer.is_alive()
                     or (
+                        stderr_drainer is not None
+                        and stderr_drainer.is_alive()
+                    )
+                    or (
                         result_drainer is not None
                         and result_drainer.is_alive()
                     )
                     or stdout_errors
+                    or stderr_errors
                     or result_errors
                 ):
                     raise ProviderSupervisorError(
                         "provider_stdout_capture_failed"
                     )
-                if stdout_exceeded.is_set() or result_exceeded.is_set():
+                if (
+                    stdout_exceeded.is_set()
+                    or stderr_exceeded.is_set()
+                    or result_exceeded.is_set()
+                ):
                     termination_reason = "output_limit"
         if (
             provider_job is not None
@@ -1825,6 +2101,7 @@ def _supervise_locked(
         ):
             raise ProviderSupervisorError("provider_job_not_empty")
         os.fsync(stdout_stream.fileno())
+        os.fsync(stderr_stream.fileno())
         if fifo is not None:
             try:
                 observed_fifo = fifo.lstat()
@@ -1847,6 +2124,7 @@ def _supervise_locked(
     _fsync_directory(result_path.parent)
     if (
         stdout_path.stat().st_size > stream_max_bytes
+        or stderr_path.stat().st_size > stream_max_bytes
         or result_path.stat().st_size > result_max_bytes
     ):
         termination_reason = "output_limit"
@@ -1857,6 +2135,8 @@ def _supervise_locked(
         prompt_path=prompt_path,
         schema_path=schema_path,
         stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        stderr_limited=stderr_exceeded.is_set(),
         result_path=result_path,
         returncode=returncode,
         input_bytes=input_bytes,
@@ -1869,6 +2149,7 @@ def _supervise_locked(
         termination_reason=termination_reason,
         schema_ref=exit_schema_ref,
         codex_home=invocation_codex_home,
+        operation_scope=operation_scope,
     )
 
 

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from meta_research.reasoning_skill import (
+    RESEARCH_TIME_BUDGET_UNKNOWN,
+    persisted_research_time_budget_revision,
+)
+
 from functools import partial
 
 from meta_research.stage_provider_failure import settle_stage_provider_failure
@@ -491,6 +496,19 @@ class ReasoningStageWorker:
             )[:64]
         )
         skill_request = self._skill_request(request, run, job_ref=job_ref)
+        if run.primary_draft is not None:
+            # Finalize validates the frozen checkpoint against the revision
+            # that was live when the owner accepted it.  A later human budget
+            # adjustment must not turn the persisted draft into stale output,
+            # and a pre-upgrade persisted draft without research_time_basis
+            # skips revision comparison rather than wedging finalize.
+            persisted_revision = persisted_research_time_budget_revision(
+                run.primary_draft.draft
+            )
+            skill_request = replace(
+                skill_request,
+                research_time_budget_revision=persisted_revision,
+            )
 
         if run.primary_draft is None:
             try:
@@ -513,6 +531,16 @@ class ReasoningStageWorker:
                     draft = replace(draft, draft=_assemble_provider_document(
                         skill_request, draft.draft,
                     ))
+                    # A provider turn can straddle a human budget update.  A
+                    # live provider result is accepted only against the
+                    # owner snapshot observed after that turn, so a genuine
+                    # revision change is reconciled while a forged revision
+                    # still fails the normal binding check.
+                    skill_request = _refresh_live_research_time_binding(
+                        skill_request,
+                        self._advancement_engine,
+                        request.accepted_question.quest_ref,
+                    )
                     draft_hash, _outcome_hash, _transition_hash = (
                         validate_reasoning_skill_draft(skill_request, draft)
                     )
@@ -780,6 +808,11 @@ class ReasoningStageWorker:
         accepted_content = self._research_memory.read_question_content(
             request.accepted_question.content_ref, request.accepted_question.content_hash
         )
+        research_time_budget_revision = _live_research_time_budget_revision(
+            run.runtime_binding.harness_adapter_ref,
+            self._advancement_engine,
+            request.accepted_question.quest_ref,
+        )
         return ReasoningSkillRequest(
             native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
                 run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),
@@ -812,6 +845,7 @@ class ReasoningStageWorker:
             owner_rejection_kind=owner_rejection_kind,
             owner_feedback=owner_feedback,
             job_ref=job_ref,
+            research_time_budget_revision=research_time_budget_revision,
         )
 
     def _owner_rejection_context(
@@ -1494,6 +1528,54 @@ class ReasoningStageWorker:
                 raise OwnerConflict("reasoning_cycle_index_invalid")
             candidates.append(_CurrentCycle(event.revision, cycle_ref, question))
         return None if not candidates else candidates[-1]
+
+
+def _live_research_time_budget_revision(
+    adapter_ref: str,
+    advancement_engine: object,
+    quest_ref: str,
+) -> str | None:
+    """Return the owner budget revision a live provider turn must echo.
+
+    Deterministic test providers use synthetic zero-filled revisions.  A live
+    turn that cannot obtain a revision keeps explicit unknown evidence rather
+    than falling back to an unverifiable value.
+    """
+
+    if adapter_ref.startswith("test"):
+        return None
+    reader = getattr(advancement_engine, "query_research_time", None)
+    if not callable(reader):
+        return RESEARCH_TIME_BUDGET_UNKNOWN
+    try:
+        snapshot = reader(quest_ref)
+    except Exception:
+        return RESEARCH_TIME_BUDGET_UNKNOWN
+    revision = (
+        snapshot.get("budget_revision") if isinstance(snapshot, dict) else None
+    )
+    if not isinstance(revision, str) or not revision:
+        return RESEARCH_TIME_BUDGET_UNKNOWN
+    return revision
+
+
+def _refresh_live_research_time_binding(
+    request: ReasoningSkillRequest,
+    advancement_engine: object,
+    quest_ref: str,
+) -> ReasoningSkillRequest:
+    """Rebind a live generated candidate to the post-turn owner snapshot."""
+
+    if request.research_time_budget_revision is None:
+        return request
+    return replace(
+        request,
+        research_time_budget_revision=_live_research_time_budget_revision(
+            request.runtime_binding.harness_adapter_ref,
+            advancement_engine,
+            quest_ref,
+        ),
+    )
 
 
 def _is_current_reasoning_foreground(

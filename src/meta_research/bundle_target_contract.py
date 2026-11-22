@@ -115,6 +115,34 @@ class BundleTargetContractError(BundleProtocolError):
     """The formal Target candidate or its completion contract is incomplete."""
 
 
+METRIC_SET_REPAIR = (
+    "Compare required_metrics and optional_metrics within the same measurement_contract.protocol_version. "
+    "When correcting a proposed candidate, declare each metric_key once according to the intended "
+    "measurement and preserve its definition."
+)
+
+
+def primary_metric_overlap_feedback(error: Exception) -> str:
+    """Locate the first conflict verified by the protocol validator in the submitted TargetPlan."""
+    cause: BaseException | None = error
+    while cause is not None:
+        if isinstance(cause, BundleTargetContractError) and str(cause) == "protocol_metric_sets_overlap":
+            details = cause.details or {}
+            if "candidate_index" in details:
+                path = (
+                    f"$.target_plan.initial_strategy_update.candidates[{details['candidate_index']}]"
+                    ".measurement_contract.protocol_version"
+                )
+                return (
+                    f"{json.dumps(details['metric_key'], ensure_ascii=False)} appears at both "
+                    f"{path}.required_metrics[{details['required_index']}].metric_key and "
+                    f"{path}.optional_metrics[{details['optional_index']}].metric_key. "
+                    f"This candidate has {details['overlap_count']} shared metric key(s). {METRIC_SET_REPAIR}"
+                )
+        cause = cause.__cause__
+    return METRIC_SET_REPAIR
+
+
 @dataclass(frozen=True, slots=True)
 class FrozenJsonObject:
     """Deeply immutable JSON object represented by canonical UTF-8 JSON."""
@@ -700,15 +728,17 @@ def strategy_update_from_dict(
         raise BundleTargetContractError("formal_strategy_update_schema_invalid")
     revision = _positive_int(document["revision"], "strategy revision")
     complete = _exact_bool(document["strategy_complete"], "strategy complete")
-    candidates = tuple(
-        formal_target_candidate_from_dict(
-            item,
-            completion_contract=completion_contract,
-        )
-        for item in _object_list(
-            document["candidates"], "formal_strategy_update_invalid"
-        )
-    )
+    parsed_candidates = []
+    items = _object_list(document["candidates"], "formal_strategy_update_invalid")
+    for index, item in enumerate(items):
+        try:
+            candidate = formal_target_candidate_from_dict(item, completion_contract=completion_contract)
+        except BundleTargetContractError as error:
+            if str(error) == "protocol_metric_sets_overlap" and error.details is not None:
+                error.details["candidate_index"] = index
+            raise
+        parsed_candidates.append(candidate)
+    candidates = tuple(parsed_candidates)
     required = _string_tuple(
         document["requires_accepted_labels"],
         "requires_accepted_labels",
@@ -1097,8 +1127,13 @@ def _validate_protocol_version(
         "optional_metrics",
         allow_empty=True,
     )
-    if set(required) & set(optional):
-        raise BundleTargetContractError("protocol_metric_sets_overlap")
+    overlap = set(required) & set(optional)
+    if overlap:
+        key = next(key for key in required if key in overlap)
+        raise BundleTargetContractError("protocol_metric_sets_overlap", {
+            "metric_key": key, "required_index": required.index(key),
+            "optional_index": optional.index(key), "overlap_count": len(overlap),
+        })
     parts = _canonical_string_tuple(
         protocol.internal_part_keys,
         "protocol internal part keys",

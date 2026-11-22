@@ -112,3 +112,16 @@ def test_field_diagnostics_keep_distinct_receipts_and_replay_old_fact(tmp_path) 
     finally:
         reopened.close()
 
+
+def test_provider_auth_failure_routes_to_operator_with_actionable_correction() -> None:
+    contract = error_contract_from_legacy(
+        "provider_auth_revoked",
+        operation_id="harness.admission",
+        effect=True,
+    )
+    details = contract.as_details()
+    assert details["recovery_owner"] == "operator"
+    assert details["operator_required"] is True
+    assert details["next_action"] == "escalate"
+    assert "Refresh the Provider authentication" in details["correction"]
+

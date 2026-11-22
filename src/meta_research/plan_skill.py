@@ -483,6 +483,14 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "the source kind is TargetCommit, HumanInput, ScientificOutcome, AssetVersion or LiteratureSnapshot. "
             "Use its evidence_ref in coverage.evidence_uses with the supported claim and support boundary. "
             "Preserve human input scope and distinguish reported opinion from observation or assessment. "
+            "Before returning the final Plan, read the complete current-question evidence page at least once "
+            "with research_graph.plan_evidence.page and check each accepted TargetCommit closure. "
+            "For every accepted TargetCommit, either include the precise binding in selected_evidence_bindings "
+            "and evidence_reuse_set when it supports a current obligation, or explain in notes why it is not adopted "
+            "and which obligation or gap it does not support. "
+            "Also return evidence_accounting with one entry for every current-question TargetCommit you saw, "
+            "using {evidence_ref, target_commit_ref, status, reason}; status is adopted, considered, deferred or "
+            "not_used, and adopted must agree with selected_evidence_bindings. Keep a reason for every entry. "
             "The adapter preserves the complete set unchanged in source_bindings.selected_evidence_bindings. "
             "There is no adoption count tied to a discovery page. Briefs may leave documented gaps "
             "unarranged; explain the insufficiency, reason and limits without claiming them complete. "
@@ -664,7 +672,12 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         if len(content) > PROVIDER_RESULT_MAX_BYTES or hashlib.sha256(content).hexdigest() != digest:
             raise PlanSkillUnavailable("codex_operation_spool_invalid")
         schema = _plan_envelope_schema(request)
-        validator = Draft202012Validator(_compile_codex_output_schema(schema))
+        file_schema = _compile_codex_output_schema(schema)
+        # The provider requires all properties on the wire. A written Brief
+        # may omit its reuse list, which the Plan domain interprets as empty.
+        brief = file_schema["properties"]["plan"]["properties"]["experiment_briefs"]["items"]
+        brief["required"] = [name for name in brief["required"] if name != "reuse_material_refs"]
+        validator = Draft202012Validator(file_schema)
         try:
             value = json.loads(
                 content, object_pairs_hook=_unique_plan_fields,
@@ -672,6 +685,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             )
             if isinstance(value, dict) and value.get("kind") == "PlanDocument":
                 value = {"plan": value}
+            _encode_file_binding_objects(value)
             if not validator.is_valid(value):
                 raise PlanSkillContractError("plan_candidate_file_schema_invalid")
             return cast(dict[str, object], _decode_codex_provider_output(value, schema)["plan"])
@@ -847,6 +861,22 @@ def _unique_plan_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     if len(result) != len(pairs):
         raise ValueError("duplicate plan field")
     return result
+
+
+def _encode_file_binding_objects(envelope: object) -> None:
+    """Let a Plan file use the binding objects returned by the content reader."""
+    plan = envelope.get("plan") if isinstance(envelope, dict) else None
+    bindings = plan.get("selected_evidence_bindings") if isinstance(plan, dict) else None
+    if not isinstance(bindings, list):
+        return
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        if isinstance(binding.get("source_binding"), dict):
+            binding["source_binding"] = canonical_json(binding["source_binding"])
+        reader = binding.get("reader")
+        if isinstance(reader, dict) and isinstance(reader.get("args"), dict):
+            reader["args"] = canonical_json(reader["args"])
 
 
 
@@ -1063,6 +1093,23 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             "properties": binding_properties, "required": list(binding_properties)},
     }
     schema["required"].append("selected_evidence_bindings")
+    schema["properties"]["evidence_accounting"] = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "evidence_ref": text,
+                "target_commit_ref": text,
+                "status": {"type": "string", "enum": [
+                    "adopted", "considered", "deferred", "not_used",
+                ]},
+                "reason": text,
+            },
+            "required": ["evidence_ref", "target_commit_ref", "status", "reason"],
+        },
+    }
+    schema["required"].append("evidence_accounting")
     return schema
 
 

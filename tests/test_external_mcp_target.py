@@ -1,15 +1,111 @@
 import json
+import subprocess
 
 import pytest
 
-from meta_research.external_mcp import ExternalMcpRuntime, parse_services
+from meta_research.external_mcp import (
+    ExternalMcpRuntime,
+    exposed_tool_name,
+    parse_services,
+)
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
-from meta_research.harness_adapters import CodexHarnessAdapter, HarnessAdapterUnavailable, HarnessSupervisorTransport
+from meta_research.harness_adapters import (
+    CODEX_LOCKED_VERSION,
+    CodexHarnessAdapter,
+    HarnessAdapterUnavailable,
+    HarnessSupervisorTransport,
+)
 from meta_research.target_raw_output import TargetRawOutputStore
-from test_external_mcp import service
+from test_external_mcp import configured, service
 from test_harness_frozen_terminal_recovery import _StoppedWithLostReply
 from test_harness_target_root import _Gateway, _WorkspaceResolver
 from test_harness_target_root_recovery import _owner_with_active_root
+
+
+class _ExternalCallRunner:
+    """Codex-shaped runner that exercises the Target external MCP channel."""
+
+    def __init__(self, external: ExternalMcpRuntime) -> None:
+        self.external = external
+        self.calls: list[str] = []
+        self._next_id = 0
+
+    def __call__(
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del prompt, timeout
+        if "--version" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, f"codex-cli {CODEX_LOCKED_VERSION}\n", ""
+            )
+        if argv[-2:] == ["features", "list"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "hooks stable true\nmulti_agent stable true\nplugins stable true\n"
+                "remote_plugin stable true\nshell_tool stable true\nskill_search stable true\n"
+                "unified_exec stable true\n",
+                "",
+            )
+        token = environment.get("META_RESEARCH_EXTERNAL_MCP_TOKEN")
+        assert token
+
+        def call(method: str, params: dict[str, object] | None = None) -> dict[str, object]:
+            self._next_id += 1
+            status, response, _session = self.external.dispatch_http(
+                token,
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id,
+                    "method": method,
+                    "params": {} if params is None else params,
+                },
+            )
+            assert status == 200 and response is not None and "error" not in response, response
+            return response["result"]
+
+        call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+        call("tools/list")
+        catalog = call(
+            "tools/call",
+            {"name": "external_tools_catalog", "arguments": {"service_id": "lab"}},
+        )
+        item = catalog["structuredContent"]["items"][0]
+        exposed = item["name"]
+        contract = call(
+            "tools/call",
+            {"name": "external_tools_contract", "arguments": {"name": exposed}},
+        )
+        assert contract["structuredContent"]["name"] == exposed
+        result = call(
+            "tools/call",
+            {
+                "name": "external_tools_call",
+                "arguments": {"name": exposed, "arguments": {"sensor": "target"}},
+            },
+        )
+        assert result["structuredContent"] == {
+            "sensor": "target",
+            "temperature": 23.75,
+        }
+        self.calls.append(exposed)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "\n".join(
+                json.dumps(item)
+                for item in (
+                    {"type": "thread.started", "thread_id": "target-external-root"},
+                    {"type": "turn.completed", "thread_id": "target-external-root"},
+                )
+            )
+            + "\n",
+            "",
+        )
 
 
 def test_target_snapshot_precedes_owner_intent_and_survives_crash_before_spool(tmp_path, monkeypatch):
@@ -78,4 +174,34 @@ def test_target_snapshot_precedes_owner_intent_and_survives_crash_before_spool(t
         assert runner.calls == 0 and runner.request_path is None
         assert not list((tmp_path / "supervisor").rglob("supervisor-request.json"))
     finally:
+        database.close()
+
+
+def test_target_provider_can_call_external_mcp_through_admitted_channel(tmp_path):
+    database, owner, request, _handle = _owner_with_active_root(
+        tmp_path / "external-call-owner.sqlite3"
+    )
+    external = configured(tmp_path)
+    runner = _ExternalCallRunner(external)
+    adapter = CodexHarnessAdapter(tmp_path / "adapter", runner=runner)
+    harness = HarnessRuntime(owner, _Gateway(), (adapter,))
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir()
+    harness.bind_target_workspace_resolver(_WorkspaceResolver(target_workspace))
+    harness.bind_external_mcp(external)
+    external.bind_scope_authority(harness)
+    try:
+        result = harness.run_or_resume_target_root(
+            request.request_ref,
+            prompt="Use the configured external sensor before deciding.",
+            mcp_base_url="http://127.0.0.1:8999",
+        )
+        assert result.status == "executed"
+        assert runner.calls == [exposed_tool_name("lab", "read_temperature")]
+        ledger = tmp_path / "calls.jsonl"
+        assert [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()] == [
+            {"name": "read_temperature", "sensor": "target"}
+        ]
+    finally:
+        external.close()
         database.close()

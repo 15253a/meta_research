@@ -609,6 +609,14 @@ function RootOperationOutput({ questRef, sessionRef, operation, sessionState, or
           ? operation.terminal_proof_diagnostic.reasons.map(reason => <p key={reason}><code>{reason}</code></p>) : <p>缺少可信的进程树终态证明。</p>}
       </details>
     </div> : null}
+    {operation.heartbeat ? <div className="root-worker-notice" role="status" data-testid="research-provider-heartbeat">
+      {operation.heartbeat.stale
+        ? "监督器心跳已陈旧，原操作仍保留并等待对账。"
+        : operation.status === "waiting" ? "监督器已停止或未绑定，原操作等待对账。"
+        : operation.heartbeat.phase === "ready" ? "监督器已准备，正在等待 Provider。" : "监督器仍在运行。"}
+      <span>最近观测 {Math.max(0, Math.round(operation.heartbeat.age_seconds))} 秒前</span>
+      {typeof operation.heartbeat.stdout_bytes === "number" ? <span> · 已收集 {operation.heartbeat.stdout_bytes} 字节</span> : null}
+    </div> : null}
     {clockHost ? createPortal(page ? <ExecutionElapsed sample={clock} ended={page.status === "terminal"}
       state={error ? "unknown" : sessionState && sessionState !== "executing" ? sessionState : page.status === "waiting" ? "waiting" : "executing"}
       startedAt={operation.created_at} endedAt={operation.updated_at} />

@@ -60,9 +60,11 @@ def _source_inputs(completion, manifest, target, authority, run, *, source_owner
     proofs = projection_plain_value(completion.handle.accepted_input_asset_proofs)
     from meta_research.formal_run_bindings import manifest_selection_entries, implementation_binding, resolve_local_inputs
     entries = manifest_selection_entries(manifest)
-    revision_ref, tree_hash = implementation_binding(entries, run.get('implementation_paths'),
-                                                    run.get('implementation_revision_ref'))
-    local_inputs, selected_local = resolve_local_inputs(manifest.result_document.as_dict(), entries, run)
+    document = manifest.result_document.as_dict()
+    revision_ref, tree_hash = implementation_binding(
+        entries, run.get('implementation_paths'), run.get('implementation_revision_ref'),
+        declared_runs=document.get('formal_runs', ()), run_key=run['run_key'])
+    local_inputs, selected_local = resolve_local_inputs(document, entries, run)
     defaults = list(dict.fromkeys([
         *completion.handle.accepted_input_target_commit_refs,
         *(proof["selection_ref"] or proof["asset_ref"] for proof in proofs), manifest.implementation_revision_ref,

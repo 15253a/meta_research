@@ -2543,6 +2543,20 @@ function HumanRequestView({
   hasNext: boolean;
 }) {
   const waiting = collaboration?.human_requests.waiting;
+  const categoryNav = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const nav = categoryNav.current;
+    const selected = nav?.querySelector<HTMLButtonElement>('[aria-current="page"]');
+    if (!nav || !selected) return;
+    const observer = new ResizeObserver(() => {
+      const viewport = nav.getBoundingClientRect();
+      const button = selected.getBoundingClientRect();
+      if (button.left < viewport.left) nav.scrollLeft += button.left - viewport.left;
+      else if (button.right > viewport.right) nav.scrollLeft += button.right - viewport.right;
+    });
+    observer.observe(nav);
+    return () => observer.disconnect();
+  }, [request.kind]);
   const workspace = useRef<HTMLDivElement>(null);
   usePageReadingPosition(`${request.request_ref}:${request.revision}`, workspace);
   const [reviewing, setReviewing] = useState(false);
@@ -2598,7 +2612,7 @@ function HumanRequestView({
           </div>
         )}
       </header>
-      <nav className="hc-kind-navigation" aria-label="求助类别">
+      <nav ref={categoryNav} className="hc-kind-navigation" aria-label="求助类别">
         {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助", "预算调整"] as const).map((label, index) => {
           const kind = (Object.keys(requestCopy) as HumanRequestItem["kind"][])[index];
           const sameKind = requests.filter(item => item.kind === kind);

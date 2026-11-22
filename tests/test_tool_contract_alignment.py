@@ -194,7 +194,7 @@ def test_public_content_keeps_three_distinct_pagination_endings_and_exact_errors
         runtime.close()
 
 
-def test_owner_rejection_details_and_original_effect_reconciliation_survive_error_wrapper(tmp_path):
+def test_companion_effect_is_rejected_before_owner_handler(tmp_path):
     runtime = _bundle_runtime(tmp_path / "effects")
     try:
         question = _question(runtime)
@@ -219,15 +219,8 @@ def test_owner_rejection_details_and_original_effect_reconciliation_survive_erro
         assert rejected["isError"] is True
         structured = rejected["structuredContent"]
         assert set(structured) == {"code", "details"}
-        assert structured["code"] == "asset_retirement_blocked"
-        assert structured["details"]["reasons"] == ["active_references"]
-        assert structured["details"]["active_reference_refs"]
-        assert structured["details"]["observed_reference_revision"] == lifecycle["reference_revision"]
-        reconciled = _call(gateway, channel, "research_memory.assets.retire.reconcile", arguments)
-        assert reconciled["isError"] is False
-        assert reconciled["structuredContent"] == {"status": "not_found", "result": None}
-        assert _call(gateway, channel, "research_memory.content.read", {
-            "source_ref": binding.version_ref, "version_ref": binding.version_ref})["isError"] is False
+        assert structured["code"] == "capability_unavailable"
+        assert structured["details"]["reason"] == "root_kind_not_owner"
     finally:
         runtime.close()
 

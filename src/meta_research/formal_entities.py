@@ -959,7 +959,8 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
             implementation_revision_ref = implementation_tree_hash = None
         else:
             implementation_revision_ref, implementation_tree_hash = implementation_binding(
-                entries, item.get('implementation_paths'), item.get('implementation_revision_ref'))
+                entries, item.get('implementation_paths'), item.get('implementation_revision_ref'),
+                declared_runs=result.get('formal_runs', ()), run_key=item['run_key'])
         inputs = {
             'schema_ref': 'meta-research/formal-execution-inputs/v1',
             'input_refs': input_refs, 'target_ref': root['target_ref'],

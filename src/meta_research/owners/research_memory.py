@@ -6419,40 +6419,60 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
     ) -> AcceptedQuestionContent:
         if canonical_hash(content) != content_hash:
             raise OwnerConflict("question_content_hash_mismatch")
+        # Rebuild the binding using the exact proposal version recorded by HC.
+        # V1 rows may include a creation basis without the V2 literature fields.
+        with self._database.read() as connection:
+            proposal_row = connection.execute(
+                text(
+                    "SELECT schema_ref, binding_schema_ref, "
+                    "literature_snapshot_ref, literature_snapshot_hash, "
+                    "creation_basis_ref, creation_basis_hash "
+                    "FROM hc_question_proposals WHERE proposal_ref = :ref"
+                ),
+                {"ref": quest.proposal_ref},
+            ).first()
+        if proposal_row is None:
+            raise OwnerConflict("question_content_proposal_mismatch")
         proposal_binding: dict[str, object] = {
-            "schema_ref": QUESTION_PROPOSAL_SCHEMA,
+            "schema_ref": proposal_row.schema_ref or QUESTION_PROPOSAL_SCHEMA,
             "basis_revision": quest.draft_revision,
             "basis_hash": quest.draft_hash,
             "content": content,
         }
         legacy_proposal_hash = canonical_hash(proposal_binding)
-        literature_snapshot = self.query_literature_snapshot_for_basis(
-            initialization_id,
-            quest.draft_revision,
-            quest.draft_hash,
-        )
-        proposal_binding.update(
-            {
-                "binding_schema_ref": (
-                    "meta-research/question-proposal-binding/v2"
-                ),
-                "literature_snapshot_ref": (
-                    None
-                    if literature_snapshot is None
-                    else literature_snapshot.snapshot_ref
-                ),
-                "literature_snapshot_hash": (
-                    None
-                    if literature_snapshot is None
-                    else literature_snapshot.snapshot_hash
-                ),
+        if proposal_row.binding_schema_ref is not None:
+            if proposal_row.binding_schema_ref != (
+                "meta-research/question-proposal-binding/v2"
+            ):
+                raise OwnerConflict("question_content_proposal_mismatch")
+            literature_snapshot = self.query_literature_snapshot_for_basis(
+                initialization_id,
+                quest.draft_revision,
+                quest.draft_hash,
+            )
+            proposal_binding.update(
+                {
+                    "binding_schema_ref": proposal_row.binding_schema_ref,
+                    "literature_snapshot_ref": (
+                        None
+                        if literature_snapshot is None
+                        else literature_snapshot.snapshot_ref
+                    ),
+                    "literature_snapshot_hash": (
+                        None
+                        if literature_snapshot is None
+                        else literature_snapshot.snapshot_hash
+                    ),
+                }
+            )
+        if proposal_row.creation_basis_ref is not None:
+            self.creation_bases.query(
+                proposal_row.creation_basis_ref, proposal_row.creation_basis_hash
+            )
+            proposal_binding["creation_basis"] = {
+                "basis_ref": proposal_row.creation_basis_ref,
+                "basis_hash": proposal_row.creation_basis_hash,
             }
-        )
-        with self._database.read() as connection:
-            basis_row = connection.execute(text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"), {"ref": quest.proposal_ref}).first()
-        if basis_row is not None and basis_row.creation_basis_ref is not None:
-            self.creation_bases.query(basis_row.creation_basis_ref, basis_row.creation_basis_hash)
-            proposal_binding["creation_basis"] = {"basis_ref": basis_row.creation_basis_ref, "basis_hash": basis_row.creation_basis_hash}
         if quest.proposal_hash not in {
             legacy_proposal_hash,
             canonical_hash(proposal_binding),

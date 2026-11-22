@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -239,6 +240,79 @@ def test_nonterminal_deepfetch_without_bound_process_is_waiting(setup):
     assert session["status"] == "waiting"
     assert not session["is_executing"]
     assert session["operations"][0]["status"] == "waiting"
+
+
+def test_signed_heartbeat_is_exposed_and_staleness_is_observational(setup, monkeypatch):
+    directory, material, key = deepfetch(setup)
+    write_transport_envelope(directory / "supervisor-heartbeat.json", {
+        "schema_ref": "meta-research/provider-supervisor-heartbeat/v1",
+        "invocation_hash": canonical_hash(material), "phase": "running",
+        "observed_at": time.time() - 60, "supervisor_process_id": 1234,
+        "supervisor_process_group": 1234, "stdout_bytes": 17,
+    }, key)
+    monkeypatch.setattr("meta_research.root_session_observations._process_is_bound", lambda *args: True)
+    operation = setup[2].query("q1")["sessions"][0]["operations"][0]
+    assert operation["status"] == "executing"
+    assert operation["heartbeat"]["phase"] == "running"
+    assert operation["heartbeat"]["stale"] is True
+    assert operation["heartbeat"]["stdout_bytes"] == 17
+
+
+def test_terminal_receipt_takes_priority_over_invalid_heartbeat(setup):
+    directory, material, key = deepfetch(setup)
+    path = directory / "stdout.jsonl"
+    write_transport_envelope(directory / "supervisor-exit.json", {
+        "invocation_hash": canonical_hash(material), "returncode": 0,
+        "termination_reason": "completed",
+        "stdout_file_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }, key)
+    (directory / "supervisor-heartbeat.json").write_text("invalid", encoding="utf-8")
+    operation = setup[2].query("q1")["sessions"][0]["operations"][0]
+    assert operation["status"] == "completed"
+    assert "heartbeat" not in operation
+
+
+def test_invalid_heartbeat_is_limited_without_exposing_the_operation(setup):
+    directory, material, key = deepfetch(setup)
+    write_transport_envelope(directory / "supervisor-heartbeat.json", {
+        "schema_ref": "meta-research/provider-supervisor-heartbeat/v1",
+        "invocation_hash": canonical_hash(material), "phase": "running",
+        "observed_at": time.time(), "supervisor_process_id": 1234,
+        "supervisor_process_group": 1234,
+    }, key)
+    marker = json.loads((directory / "supervisor-heartbeat.json").read_text())
+    marker["payload"]["invocation_hash"] = "f" * 64
+    (directory / "supervisor-heartbeat.json").write_text(json.dumps(marker), encoding="utf-8")
+    result = setup[2].query("q1")
+    assert result["limited"]
+    assert result["sessions"][0]["operations"] == []
+
+
+@pytest.mark.parametrize("observed_at", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_heartbeat_timestamp_is_limited_without_exposing_the_operation(setup, observed_at):
+    directory, material, key = deepfetch(setup)
+    write_transport_envelope(directory / "supervisor-heartbeat.json", {
+        "schema_ref": "meta-research/provider-supervisor-heartbeat/v1",
+        "invocation_hash": canonical_hash(material), "phase": "running",
+        "observed_at": observed_at, "supervisor_process_id": 1234,
+        "supervisor_process_group": 1234,
+    }, key)
+    result = setup[2].query("q1")
+    assert result["limited"]
+    assert result["sessions"][0]["operations"] == []
+
+
+def test_heartbeat_timestamp_too_far_in_future_is_limited_without_exposing_the_operation(setup):
+    directory, material, key = deepfetch(setup)
+    write_transport_envelope(directory / "supervisor-heartbeat.json", {
+        "schema_ref": "meta-research/provider-supervisor-heartbeat/v1",
+        "invocation_hash": canonical_hash(material), "phase": "running",
+        "observed_at": time.time() + 120, "supervisor_process_id": 1234,
+        "supervisor_process_group": 1234,
+    }, key)
+    result = setup[2].query("q1")
+    assert result["limited"]
+    assert result["sessions"][0]["operations"] == []
 
 
 def test_bound_deepfetch_partial_tail_is_pending_without_a_read_failure(setup, monkeypatch):

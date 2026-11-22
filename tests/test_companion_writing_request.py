@@ -62,15 +62,15 @@ def test_selected_model_receives_only_explicit_material_and_never_falls_back(tmp
     assert len(calls) == 2
 
 
-def test_assistant_catalog_does_not_grant_research_writes():
+def test_assistant_catalog_exposes_research_write_contracts_without_granting_execution():
     catalog = root_operation_catalog("companion", common_operation_ids=ROOT_AGENT_COMMON_OPERATION_IDS)
     assert "research_memory.content.read" in catalog
     assert "research_workspace.materials.read" in catalog
-    assert "research_graph.datasets.register" not in catalog
-    assert "research_memory.assets.intake" not in catalog
-    assert "research_memory.assets.retire" not in catalog
-    assert "research_graph.artifact_roles.adjust" not in catalog
-    assert "acquisition.request" not in catalog
+    assert "research_graph.datasets.register" in catalog
+    assert "research_memory.assets.intake" in catalog
+    assert "research_memory.assets.retire" in catalog
+    assert "research_graph.artifact_roles.adjust" in catalog
+    assert "agent_runtime.acquisition.request" in catalog
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
@@ -182,7 +182,7 @@ def test_configured_model_is_callable_through_the_actual_assistant_grant(tmp_pat
         assert "content_model_call_failed" in str(unavailable)
         details = unavailable["structuredContent"]["details"]
         assert details["reason_code"] == "service_unavailable"
-        assert details["category"] == "temporary_unavailable"
+        assert details["category"] == "system"
         assert details["message"] in unavailable["content"][0]["text"]
         assert details["correction"] in unavailable["content"][0]["text"]
         assert len(provider["calls"]) == 3  # No silent model retry or fallback.
