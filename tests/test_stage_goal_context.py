@@ -126,6 +126,7 @@ def test_existing_stage_idempotency_row_is_read_before_goal_head():
 def test_plan_retry_returns_old_request_before_reading_new_goal():
     owner = object.__new__(SQLiteAdvancementEngine)
     owner.query_cycle_position = lambda cycle_ref: {"cycle_ref": cycle_ref, "round": 1}
+    owner._current_stage_epoch = lambda *args: 1
     owner._reasoning_prior_accepted_bindings = lambda cycle_ref: []
     owner._query_stage_command_result = lambda *args, **kwargs: "request:old"
     owner._query_stage_request_ref = lambda request_ref: request_ref

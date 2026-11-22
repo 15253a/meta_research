@@ -6324,12 +6324,12 @@ class SQLiteAdvancementEngine(
     ) -> None:
         current_ref = connection.execute(
             text(
-                "SELECT current_revision_ref FROM rg_quest_goal_heads "
+                "SELECT current_revision_ref,status FROM rg_quest_goal_heads "
                 "WHERE quest_ref=:quest_ref"
             ),
             {"quest_ref": quest_ref},
-        ).scalar()
-        if current_ref != goal_revision_ref:
+        ).first()
+        if current_ref is None or current_ref.current_revision_ref != goal_revision_ref or current_ref.status != "open":
             raise OwnerConflict("quest_goal_revision_stale")
 
     def _query_stage_command_result(

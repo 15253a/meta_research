@@ -1206,6 +1206,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "the Owner checks actual cited record IDs, not preview membership."
         ) if request.native_session_ref is None else (
             "继续当前原生会话的 Reasoning 工作。处理本次反馈，交回完整候选。\n"
+            f"goal_revision_ref={request.goal_revision_ref}\n"
             f"{lineage}"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"

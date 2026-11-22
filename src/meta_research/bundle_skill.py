@@ -1354,6 +1354,12 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         lineage = _owner_rejection_prompt(request)
+        goal_guidance = (
+            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；"
+            "不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
+            if request.context_pack.get("quest_goal_revision") is not None
+            else "当前 Bundle context 未携带 Quest Goal revision。"
+        )
         prompt = (
             stage_position_prompt(request, "bundle") + stage_replacement_prompt(request) +
             f"{_bundle_skill_instructions()}\n\n"
@@ -1369,7 +1375,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"formal_plan_ref={request.formal_plan_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
-            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。\n"
+            + goal_guidance + "\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
             "predecessor_rejections_hash="
             f"{canonical_hash(list(request.predecessor_rejections))}\n"
@@ -1381,6 +1387,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         ) if request.native_session_ref is None else (
             "继续原 Bundle 根，处理本次反馈并按原合同返回完整 target_plan 或 exhaustion_assessment。"
             "仅在确实缺少材料时用 research_memory.stage_context.read 定向读取原冻结正文。\n"
+            + goal_guidance + "\n"
             f"{lineage}\n{_provider_correction_prompt(request.provider_feedback)}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
