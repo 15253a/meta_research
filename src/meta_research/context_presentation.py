@@ -29,7 +29,8 @@ _STAGE_SCIENTIFIC_INPUTS = {
     "plan": frozenset({"prior_accepted_bindings"}),  # The adapter supplies the exact IdeaSet once.
     "bundle": frozenset({"accepted_formal_plan_binding"}),
     "reasoning": frozenset({"prior_accepted_bindings", "plan_evidence_input", "upstream_stage_closure",
-                            "accepted_target_commit_closures", "current_target_evidence_closure"}),
+                            "typed_skip_basis_refs_by_stage", "accepted_target_commit_closures",
+                            "current_target_evidence_closure"}),
 }
 _REQUIRED_CURRENT_MATERIAL = frozenset({
     "execution_contract", "measurement_contract", "selected_input_manifest",
