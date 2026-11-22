@@ -10956,6 +10956,22 @@ def _reasoning_context_pack_from_rows(
         for stage in (IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE)
     )
     closure = [_reasoning_commit_document(commit) for commit in commits]
+    typed_skip_basis_refs_by_stage: dict[str, list[str]] = {}
+    for commit in commits:
+        outcome_ref = commit.outcome_ref
+        if outcome_ref is None and commit.disposition == SKIPPED_DISPOSITION:
+            source = connection.execute(
+                text(
+                    "SELECT outcome_ref FROM ae_stage_commits "
+                    "WHERE commit_ref = :commit_ref"
+                ),
+                {"commit_ref": commit.basis_ref},
+            ).first()
+            outcome_ref = None if source is None else source.outcome_ref
+        if commit.stage == IDEA_STAGE and isinstance(outcome_ref, str) and outcome_ref.startswith("idea_outcome_"):
+            typed_skip_basis_refs_by_stage[IDEA_STAGE] = [outcome_ref]
+        elif commit.stage == PLAN_STAGE and isinstance(outcome_ref, str) and outcome_ref.startswith("formal_plan_"):
+            typed_skip_basis_refs_by_stage[PLAN_STAGE] = [outcome_ref]
 
     question_literature_input = (
         {"kind": "none"}
@@ -11103,6 +11119,8 @@ def _reasoning_context_pack_from_rows(
             "upstream_stage_commit_refs": [commit.commit_ref for commit in commits],
         },
     }
+    if typed_skip_basis_refs_by_stage:
+        context_pack["typed_skip_basis_refs_by_stage"] = typed_skip_basis_refs_by_stage
     if prior_accepted_bindings is not None:
         context_pack["prior_accepted_bindings"] = prior_accepted_bindings
     _validate_reasoning_context_pack(
@@ -11168,7 +11186,7 @@ def _validate_reasoning_context_pack(
     epoch: int,
     accepted_question_binding: dict[str, object],
 ) -> None:
-    if set(context_pack) - {"prior_accepted_bindings"} != {
+    if set(context_pack) - {"prior_accepted_bindings", "typed_skip_basis_refs_by_stage"} != {
         "schema_ref",
         "cycle_position",
         "cycle_ref",
@@ -11189,6 +11207,21 @@ def _validate_reasoning_context_pack(
         != accepted_question_binding
     ):
         raise OwnerConflict("reasoning_context_pack_invalid")
+    typed_skip = context_pack.get("typed_skip_basis_refs_by_stage", {})
+    if (
+        not isinstance(typed_skip, dict)
+        or set(typed_skip) - {IDEA_STAGE, PLAN_STAGE}
+        or any(
+            not isinstance(refs, list)
+            or len(refs) != 1
+            or not isinstance(refs[0], str)
+            or not refs[0]
+            or (stage == IDEA_STAGE and not refs[0].startswith("idea_outcome_"))
+            or (stage == PLAN_STAGE and not refs[0].startswith("formal_plan_"))
+            for stage, refs in typed_skip.items()
+        )
+    ):
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
     if "prior_accepted_bindings" in context_pack:
         try:
             validate_reasoning_handoff_references(context_pack["prior_accepted_bindings"])

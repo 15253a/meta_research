@@ -1497,17 +1497,32 @@ def test_source_current_later_stage_route_is_rejected_atomically_by_rg(
             str(quest["quest_ref"])
         )
 
-        with pytest.raises(OwnerConflict, match=expected_error):
-            runtime.reasoning_stage.process_once()
+        assert runtime.reasoning_stage.process_once()
+
+        rejected = runtime.owners.research_graph.query_reasoning_outcome_decision(
+            str(current["run"]["submission_ref"])
+        )
+        assert rejected is not None
+        assert rejected.decision == "rejected"
+        assert rejected.outcome_ref is None
+        assert rejected.reason_code == "reasoning_transition_route_invalid"
+        assert any(expected_error in item for item in rejected.feedback)
 
         after_graph = runtime.owners.research_graph.query_snapshot()
-        assert after_graph.revision == before_graph.revision
+        assert after_graph.revision == before_graph.revision + 1
         assert after_graph.facts["reasoning_outcome_count"] == (
             before_graph.facts["reasoning_outcome_count"]
+        )
+        assert after_graph.facts["reasoning_rejection_count"] == (
+            before_graph.facts["reasoning_rejection_count"] + 1
         )
         assert after_graph.facts["graph_presence_fact_count"] == (
             before_graph.facts["graph_presence_fact_count"]
         )
+        assert runtime.owners.advancement_engine.query_foreground(
+            str(quest["quest_ref"])
+        ) == before_foreground
+        assert runtime.reasoning_stage.process_once()
         assert after_graph.facts["question_research_state_fact_count"] == (
             before_graph.facts["question_research_state_fact_count"]
         )

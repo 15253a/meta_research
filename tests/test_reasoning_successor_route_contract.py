@@ -81,3 +81,24 @@ def test_next_cycle_domain_validator_rejects_duplicate_skip_basis_after_decode()
             next_cycle=proposal,
             candidate_completion=None,
         )
+
+
+def test_next_cycle_rejects_stage_commit_when_frozen_idea_outcome_is_known() -> None:
+    outcome = _scientific_outcome()
+    proposal = _routed_next_cycle("plan")
+    proposal["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
+    ]
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="next_cycle_proposal_skip_basis_invalid",
+    ):
+        validate_reasoning_transition(
+            outcome,
+            next_cycle=proposal,
+            candidate_completion=None,
+            allowed_typed_skip_basis_refs_by_stage={
+                "idea": ("idea_outcome_48e40766007b43a381dacbaf1d906a92",)
+            },
+        )

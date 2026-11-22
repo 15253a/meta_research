@@ -627,6 +627,7 @@ def validate_reasoning_stage_output(
     frozen_evidence_closure: list[dict[str, object]],
     frozen_research_context: dict[str, object],
     expected_completion_milestone_basis_refs: tuple[str, ...] | None = None,
+    allowed_typed_skip_basis_refs_by_stage: dict[str, tuple[str, ...]] | None = None,
     historical_resolver: HistoricalEvidenceResolver | None = None,
 ) -> tuple[str, str, str]:
     """Validate the one closed execution document emitted by Reasoning.
@@ -670,6 +671,9 @@ def validate_reasoning_stage_output(
         expected_completion_milestone_basis_refs=(
             expected_completion_milestone_basis_refs
         ),
+        allowed_typed_skip_basis_refs_by_stage=(
+            allowed_typed_skip_basis_refs_by_stage
+        ),
     )
     return canonical_hash(output), outcome_hash, transition_hash
 
@@ -679,6 +683,7 @@ def validate_reasoning_autonomous_checkpoint(
     *,
     frozen_evidence_closure: list[dict[str, object]],
     frozen_research_context: dict[str, object],
+    allowed_typed_skip_basis_refs_by_stage: dict[str, tuple[str, ...]] | None = None,
     historical_resolver: HistoricalEvidenceResolver | None = None,
 ) -> tuple[str, str, str]:
     """Validate the non-terminal Reasoning checkpoint used by create_question.
@@ -713,6 +718,9 @@ def validate_reasoning_autonomous_checkpoint(
     scope_hash = validate_autonomous_question_scope(
         scope,
         source_outcome=outcome,
+        allowed_typed_skip_basis_refs_by_stage=(
+            allowed_typed_skip_basis_refs_by_stage
+        ),
     )
     return canonical_hash(checkpoint), outcome_hash, scope_hash
 
@@ -721,6 +729,7 @@ def validate_autonomous_question_scope(
     scope: dict[str, object],
     *,
     source_outcome: dict[str, object],
+    allowed_typed_skip_basis_refs_by_stage: dict[str, tuple[str, ...]] | None = None,
 ) -> str:
     """Validate Reasoning's internal, non-authoritative creation scope.
 
@@ -779,12 +788,22 @@ def validate_autonomous_question_scope(
     expected_skips = set(stage_order[: stage_order.index(entry_stage)])
     if set(skip_basis) != expected_skips:
         raise ReasoningContractError("autonomous_question_skip_basis_invalid")
-    for refs in skip_basis.values():
+    for stage, refs in skip_basis.items():
         normalized = _require_text_list(
             refs,
             "autonomous_question_skip_basis_invalid",
         )
         if not normalized or len(normalized) != len(set(normalized)):
+            raise ReasoningContractError("autonomous_question_skip_basis_invalid")
+        if (
+            allowed_typed_skip_basis_refs_by_stage is not None
+            and entry_stage != "reasoning"
+            and stage in allowed_typed_skip_basis_refs_by_stage
+            and any(
+                ref not in allowed_typed_skip_basis_refs_by_stage[stage]
+                for ref in normalized
+            )
+        ):
             raise ReasoningContractError("autonomous_question_skip_basis_invalid")
     return canonical_hash(scope)
 
@@ -821,6 +840,7 @@ def validate_reasoning_transition(
     next_cycle: dict[str, object] | None = None,
     candidate_completion: dict[str, object] | None = None,
     expected_completion_milestone_basis_refs: tuple[str, ...] | None = None,
+    allowed_typed_skip_basis_refs_by_stage: dict[str, tuple[str, ...]] | None = None,
 ) -> str:
     """Validate and hash exactly one non-authoritative Reasoning transition."""
 
@@ -856,6 +876,9 @@ def validate_reasoning_transition(
             next_cycle,
             invalid_code="next_cycle_proposal_invalid",
             skip_code="next_cycle_proposal_skip_basis_invalid",
+            allowed_skip_basis_refs_by_stage=(
+                allowed_typed_skip_basis_refs_by_stage
+            ),
         )
         return canonical_hash(next_cycle)
 
@@ -1532,6 +1555,7 @@ def _validate_successor_route(
     *,
     invalid_code: str,
     skip_code: str,
+    allowed_skip_basis_refs_by_stage: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
     stage_order = ("idea", "plan", "bundle", "reasoning")
     entry_stage = value.get("entry_stage")
@@ -1541,9 +1565,19 @@ def _validate_successor_route(
     expected_stages = set(stage_order[: stage_order.index(cast(str, entry_stage))])
     if set(skip_basis) != expected_stages:
         raise ReasoningContractError(skip_code)
-    for refs in skip_basis.values():
+    for stage, refs in skip_basis.items():
         normalized = _require_text_list(refs, skip_code)
         if not normalized or len(normalized) != len(set(normalized)):
+            raise ReasoningContractError(skip_code)
+        if (
+            allowed_skip_basis_refs_by_stage is not None
+            and entry_stage != "reasoning"
+            and stage in allowed_skip_basis_refs_by_stage
+            and any(
+                ref not in allowed_skip_basis_refs_by_stage[stage]
+                for ref in normalized
+            )
+        ):
             raise ReasoningContractError(skip_code)
 
 

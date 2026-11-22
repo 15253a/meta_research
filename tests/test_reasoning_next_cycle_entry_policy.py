@@ -64,6 +64,25 @@ def test_skill_rejects_direct_bundle_as_recoverable_candidate():
         ))
 
 
+def test_successor_schema_enums_frozen_idea_outcome_refs():
+    request = _request()
+    request.context_pack["accepted_idea_set_binding"] = {
+        "outcome_ref": "idea_outcome_48e40766007b43a381dacbaf1d906a92"
+    }
+    schema = _next_cycle_proposal_schema(request)
+    validator = Draft202012Validator(schema)
+    valid = _output("plan")["next_cycle_proposal"]
+    valid["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "idea_outcome_48e40766007b43a381dacbaf1d906a92"
+    ]
+    assert validator.is_valid(valid)
+    invalid = deepcopy(valid)
+    invalid["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
+    ]
+    assert not validator.is_valid(invalid)
+
+
 def test_ar_refuses_direct_bundle_before_recording_new_execution():
     # A direct Owner caller must not bypass the Skill output restriction.
     owner = object.__new__(SQLiteAgentRuntime)
