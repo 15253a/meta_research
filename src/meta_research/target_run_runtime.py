@@ -786,6 +786,7 @@ class TargetRunRuntime:
             STAGE_CONTEXT_DELIVERY_GUIDANCE +
             target_execution_skill_text() + "\n\n"
             "下列 research_context 与 execution_contract 携带本 Target 适用的 Owner 冻结科学正文与合同。"
+            "其中 Quest Goal 版本是本 Target 继承的冻结有效版本，可被证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
             "按角色方法在本次范围内实施或恢复，保留已成立的研究、来源和产物。"
             "最终交接前完成独立子智能体审阅，按 completion_binding 交付真实文件、结果及未完成事项。"
             "frozen_input_manifest_path 是实际冻结原件的只读绝对路径；inputs/manifest.json 只是指针。"

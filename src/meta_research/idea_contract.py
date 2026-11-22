@@ -204,6 +204,10 @@ def validate_idea_context_pack(
         except ValueError as error:
             raise IdeaContractError("idea_context_pack_invalid") from error
         expected_fields = expected_fields | {"cycle_position"}
+    goal_fields = {"goal_revision_ref", "quest_goal_revision"} & set(context_pack)
+    if goal_fields and goal_fields != {"goal_revision_ref", "quest_goal_revision"}:
+        raise IdeaContractError("idea_context_pack_invalid")
+    expected_fields = expected_fields | goal_fields
     if set(context_pack) != expected_fields:
         raise IdeaContractError("idea_context_pack_invalid")
     if (
@@ -735,7 +739,10 @@ def _validate_literature_reference(value, question_ref):
 
 
 def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
-    if set(pack) - {"cycle_position"} not in (_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}, _IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page", "creation_basis"}):
+    goal_fields = {"goal_revision_ref", "quest_goal_revision"} & set(pack)
+    if goal_fields and goal_fields != {"goal_revision_ref", "quest_goal_revision"}:
+        raise IdeaContractError("idea_context_pack_invalid")
+    if set(pack) - {"cycle_position", *goal_fields} not in (_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}, _IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page", "creation_basis"}):
         raise IdeaContractError("idea_context_pack_invalid")
     if "cycle_position" in pack:
         from meta_research.cycle_position import validate_cycle_position
@@ -746,7 +753,7 @@ def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
     creation=pack.get("creation_basis")
     if creation is not None and (not isinstance(creation,dict) or set(creation)!={"basis_ref","basis_hash","kind"} or not isinstance(creation["basis_ref"],str) or not _is_hash(creation["basis_hash"]) or creation["kind"] not in {"prepared","literature_revised"}):
         raise IdeaContractError("idea_context_pack_invalid")
-    legacy={k:v for k,v in pack.items() if k not in {"evidence_page", "creation_basis", "cycle_position"}}
+    legacy={k:v for k,v in pack.items() if k not in {"evidence_page", "creation_basis", "cycle_position", *goal_fields}}
     legacy.update(schema_ref=IDEA_CONTEXT_PACK_SCHEMA_V2_REF,literature_binding=None,prior_accepted_bindings=[])
     refs=validate_idea_context_pack(legacy,cycle_ref=cycle_ref,accepted_question_binding=accepted_question_binding)
     page=pack["evidence_page"]

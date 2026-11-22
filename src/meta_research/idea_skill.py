@@ -1808,6 +1808,7 @@ class CodexIdeaSkillAdapter:
             f"question_ref={request.question_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
+            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"provider_context_view={stage_context_json('idea', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         ) if request.native_session_ref is None else (

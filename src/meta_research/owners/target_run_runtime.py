@@ -2584,6 +2584,18 @@ class SQLiteTargetRunGraphAuthority:
             from meta_research.cycle_position import validate_cycle_position
             position = context["cycle_position"]
             validate_cycle_position(position, cycle_ref=graph.cycle_ref)
+            goal_revision_ref = context.get("goal_revision_ref")
+            quest_goal_revision = context.get("quest_goal_revision")
+            if (goal_revision_ref is None) != (quest_goal_revision is None):
+                raise ValueError("frozen quest goal binding")
+            if quest_goal_revision is not None and (
+                not isinstance(goal_revision_ref, str)
+                or not isinstance(quest_goal_revision, dict)
+                or quest_goal_revision.get("kind") != "QuestGoalRevision"
+                or quest_goal_revision.get("quest_ref") != graph.quest_ref
+                or quest_goal_revision.get("goal_revision_ref") != goal_revision_ref
+            ):
+                raise ValueError("frozen quest goal binding")
             if (canonical_hash(context) != row.context_pack_hash
                 or context["cycle_ref"] != graph.cycle_ref
                 or canonical_json(context) != row.context_pack_json
@@ -2645,6 +2657,8 @@ class SQLiteTargetRunGraphAuthority:
             "stage_request_ref": graph.request_ref,
             "cycle_position": position,
             "target_ref": target_ref, "question_ref": question_binding["question_ref"],
+            "goal_revision_ref": goal_revision_ref,
+            "quest_goal_revision": quest_goal_revision,
             "question_content_ref": question_binding["content_ref"],
             "question_content_hash": question_binding["content_hash"],
             "question": question, "formal_plan_ref": source.formal_plan_ref,

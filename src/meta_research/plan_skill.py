@@ -506,6 +506,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"idea_set_ref={request.idea_set_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
+            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。\n"
             "AcceptedQuestionBinding="
             f"{canonical_json(request.context_pack['accepted_question_binding'])}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"

@@ -64,9 +64,14 @@ def validate_plan_context_pack(
             "evidence_reference_revision",
         } | ({"evidence_catalog_page"} if "evidence_catalog_page" in context_pack else set())
           | ({"cycle_position"} if "cycle_position" in context_pack else set())
-          | ({"prior_accepted_bindings"} if "prior_accepted_bindings" in context_pack else set()),
+          | ({"prior_accepted_bindings"} if "prior_accepted_bindings" in context_pack else set())
+          | ({"goal_revision_ref", "quest_goal_revision"}
+             if "goal_revision_ref" in context_pack and "quest_goal_revision" in context_pack
+             else set()),
         "plan_context_pack_invalid",
     )
+    if ("goal_revision_ref" in context_pack) != ("quest_goal_revision" in context_pack):
+        raise PlanContractError("plan_context_pack_invalid")
     if (
         context_pack.get("schema_ref") != PLAN_CONTEXT_PACK_SCHEMA_REF
         or context_pack.get("cycle_ref") != cycle_ref

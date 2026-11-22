@@ -1194,6 +1194,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"question_ref={request.question_ref}\n"
             f"quest_ref={request.quest_ref}\n"
             f"goal_revision_ref={request.goal_revision_ref}\n"
+            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。\n"
             f"foreground_epoch={request.foreground_epoch}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
