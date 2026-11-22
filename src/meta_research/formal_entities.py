@@ -399,6 +399,48 @@ def _declared_method_content_conflict(connection, *, run_key, forward, error, se
     return issue
 
 
+def _declared_method_identity_issue(*, run_key, forward, error, selector):
+    """Turn a revisable method declaration error into root correction feedback.
+
+    ``resolve_baseline_method_identity`` also validates the identity envelope
+    before it can register a Baseline.  Those validation failures describe the
+    Target's declaration, so they must travel through the same durable root
+    rejection path as an immutable method-version conflict.  Integrity and
+    execution failures are intentionally left out by the caller.
+    """
+    from meta_research.baseline_identity import (
+        BASELINE_METHOD_REJECTION_FEEDBACK, _ENVELOPE_KEYS,
+    )
+
+    method_key = forward.get('method_key')
+    method_version = forward.get('method_version')
+    declared = ', '.join(part for part in (
+        f'method_key {method_key!r}' if method_key is not None else None,
+        f'method_version {method_version!r}' if method_version is not None else None,
+        f'baseline_ref {forward["baseline_ref"]!r}'
+        if 'baseline_ref' in forward else None,
+        'method_contract present' if 'method_contract' in forward else 'method_contract missing',
+    ) if part is not None)
+    unexpected = sorted(set(forward) - _ENVELOPE_KEYS)
+    if unexpected:
+        declared += f', unexpected fields {unexpected!r}'
+    issue = TargetContentIssue(error.code, {
+        'run_key': run_key,
+        'selector': selector,
+        'method_key': method_key,
+        'method_version': method_version,
+        'baseline_ref': forward.get('baseline_ref'),
+    })
+    issue.feedback = (
+        f"{selector} (Run {run_key!r}) declares {declared or 'no method identity'}. "
+        f"{BASELINE_METHOD_REJECTION_FEEDBACK[error.code]} "
+        "Correct this declaration and finish another normal turn in the same Root. "
+        "Preserve the valid artifacts and actual work; this declaration correction "
+        "does not require repeating the research."
+    )
+    return issue
+
+
 def _resolve_declared_variants(connection, *, items, result_document, root, accepted_at, verify_only):
     """Give declared work items their real Baseline/Variant identity.
 
@@ -416,7 +458,9 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
                 _variant_declaration(run), '$.formal_runs[' + str(ordinal) + ']')
     if not any(declaration is not None for declaration, _ in declarations.values()):
         return
-    from meta_research.baseline_identity import resolve_baseline_method_identity
+    from meta_research.baseline_identity import (
+        BASELINE_METHOD_REJECTION_FEEDBACK, resolve_baseline_method_identity,
+    )
     from meta_research.owners.research_graph import _get_or_create_target_measurement_identity
     quest_ref = connection.execute(text(
         'SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g ON g.graph_ref=t.graph_ref '
@@ -449,11 +493,15 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
             baseline_ref, _created = resolve_baseline_method_identity(
                 connection, forward=forward, quest_ref=quest_ref, accepted_at=accepted_at)
         except OwnerConflict as error:
-            if error.code != 'baseline_method_version_content_conflict':
-                raise
-            raise _declared_method_content_conflict(
-                connection, run_key=item['run_key'], forward=forward, error=error,
-                selector=selector) from None
+            if error.code == 'baseline_method_version_content_conflict':
+                raise _declared_method_content_conflict(
+                    connection, run_key=item['run_key'], forward=forward, error=error,
+                    selector=selector) from None
+            if error.code in BASELINE_METHOD_REJECTION_FEEDBACK:
+                raise _declared_method_identity_issue(
+                    run_key=item['run_key'], forward=forward, error=error,
+                    selector=selector) from None
+            raise
         variant_ref, _variant_created = _get_or_create_target_measurement_identity(
             connection, table='rg_experiment_variants', ref_column='variant_ref',
             ref_prefix='variant', natural={'baseline_ref': baseline_ref,
