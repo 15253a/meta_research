@@ -281,7 +281,7 @@ def has_variant_declaration(result_document, run_key):
     return False
 
 
-def _variant_declaration(run):
+def _variant_declaration(run, *, path=None):
     """A run may carry its actual method identity instead of the bundle draft.
 
     ``baseline_forward_contract`` follows the same envelope the Bundle
@@ -294,7 +294,17 @@ def _variant_declaration(run):
     if forward is None and recipe is None:
         return None
     if not isinstance(forward, dict) or not isinstance(recipe, dict) or not recipe:
-        raise OwnerConflict('target_formal_variant_declaration_invalid')
+        error = TargetContentIssue('target_formal_variant_declaration_invalid')
+        run_key = run.get('run_key')
+        location = path or '$.formal_runs entry'
+        error.feedback = (
+            f"{location} (Run {run_key!r}) has an incomplete variant declaration. "
+            "baseline_forward_contract and variant_recipe must be supplied together. "
+            "baseline_forward_contract must be an object and variant_recipe must be a "
+            "nonempty object. Correct this formal_runs entry, preserve the actual "
+            "work and artifacts, and finish another normal turn in the same Root."
+        )
+        raise error
     return {'forward': forward, 'recipe': recipe}
 
 
@@ -455,7 +465,9 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
     for ordinal, run in enumerate(declared):
         if isinstance(run, dict) and run.get('run_key'):
             declarations[run['run_key']] = (
-                _variant_declaration(run), '$.formal_runs[' + str(ordinal) + ']')
+                _variant_declaration(
+                    run, path='$.formal_runs[' + str(ordinal) + ']'),
+                '$.formal_runs[' + str(ordinal) + ']')
     if not any(declaration is not None for declaration, _ in declarations.values()):
         return
     from meta_research.baseline_identity import (
@@ -554,20 +566,37 @@ def root_work_items(*, payload, identities, result_document):
     attempt or an unassessed execution is sufficient to finish this work unit.
     """
     return _root_work_items_from_declared(
-        work=_declared_work(result_document), payload=payload, identities=identities,
+        work=_declared_work(result_document),
+        payload=payload,
+        identities=identities,
+        declared_runs=result_document.get('formal_runs') if isinstance(result_document, dict) else None,
     )
 
 
-def _root_work_items_from_declared(*, work, payload, identities):
+def _root_work_items_from_declared(*, work, payload, identities, declared_runs=None):
     primary_key = work[0][0]['run_key']
+    run_paths = (
+        {id(run): '$.formal_runs[' + str(index) + ']' for index, run in enumerate(declared_runs)}
+        if isinstance(declared_runs, list) else {}
+    )
     items = []
     for ordinal, (run, attempt) in enumerate(work):
         run_key = run['run_key']
-        declaration = _variant_declaration(run)
+        run_path = run_paths.get(id(run))
+        declaration = _variant_declaration(run, path=run_path)
         if declaration is not None and (run.get('variant_ref') or run.get('variant_run_ref')):
             # A reused run keeps its original Variant; an explicit variant_ref
             # needs no separate declaration for the same fact.
-            raise OwnerConflict('target_formal_variant_declaration_invalid')
+            error = TargetContentIssue('target_formal_variant_declaration_invalid')
+            location = run_path or '$.formal_runs entry'
+            error.feedback = (
+                f"{location} (Run {run_key!r}) combines an inline variant declaration "
+                "(baseline_forward_contract/variant_recipe) with an explicit variant_ref or "
+                "variant_run_ref. Supply either the explicit reference or the inline declaration, "
+                "not both. Correct this formal_runs entry, preserve the actual work and artifacts, "
+                "and finish another normal turn in the same Root."
+            )
+            raise error
         run_ref = run.get('variant_run_ref') or (payload['variant_run_ref'] if run_key == primary_key
             else _ref('variant_run', payload['measurement_ref'], run_key))
         status = 'pending' if attempt is None else ('failed' if attempt.get('status') == 'failed' else 'completed')
@@ -1684,7 +1713,8 @@ def verify_retained_products(document, entries, *, work=None):
     items = _root_work_items_from_declared(work=work,
         payload={'measurement_ref': 'inventory', 'variant_run_ref': primary.get('variant_run_ref', 'primary'),
         'evaluation_attempt_ref': 'assessment', 'metric_result_ref': 'result'},
-        identities={'variant_ref': 'inventory', 'evaluation_ref': 'inventory'})
+        identities={'variant_ref': 'inventory', 'evaluation_ref': 'inventory'},
+        declared_runs=document.get('formal_runs') if isinstance(document, dict) else None)
     _verify_declared_subject_artifact_bindings(work, entries)
     assigned = set()
     for item in items:
