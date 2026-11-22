@@ -1478,7 +1478,19 @@ def _validate_outcome_scope_and_synthesis(
         _require_text(causal.get(field), "scientific_outcome_causal_interpretation_invalid")
     attribution = set(cast(list[str], causal["attribution_basis_refs"]))
     if not attribution.issubset(cited_refs):
-        raise ReasoningContractError("scientific_outcome_causal_interpretation_invalid")
+        missing = sorted(attribution - cited_refs)
+        error = ReasoningContractError(
+            "scientific_outcome_causal_interpretation_invalid",
+            feedback=(
+                "scientific_outcome.causal_interpretation.attribution_basis_refs "
+                "must reference selected evidence refs. "
+                f"Unselected refs: {missing!r}. "
+                f"Selected evidence refs: {sorted(cited_refs)!r}. "
+                "Add each attribution ref to scientific_outcome.evidence with "
+                "its exact authorized kind and ref, or remove it."
+            ),
+        )
+        raise error
     frozen_causal = cast(dict[str, list[str]], expected_context["causal_context"])
     for field in ("target_commit_refs", "changed_axis_fact_refs", "held_fixed_fact_refs", "provenance_refs"):
         if causal[field] != frozen_causal[field]:
