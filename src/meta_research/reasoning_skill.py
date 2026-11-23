@@ -366,6 +366,7 @@ def validate_reasoning_skill_draft(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
+            enforce_typed_skip_prefixes=True,
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, result.draft)
             ),
@@ -445,9 +446,21 @@ def validate_reasoning_deepfetch_decision(request: ReasoningSkillRequest, decisi
     if action == "create":
         if not facts.get("snapshot_ref"):
             raise ReasoningContractError("reasoning_deepfetch_summary_required")
-        validate_reasoning_autonomous_checkpoint(output, frozen_evidence_closure=list(request.frozen_evidence_closure), frozen_research_context=request.context_pack["research_context"], historical_resolver=request.historical_evidence_resolver)
+        validate_reasoning_autonomous_checkpoint(
+            output,
+            frozen_evidence_closure=list(request.frozen_evidence_closure),
+            frozen_research_context=request.context_pack["research_context"],
+            historical_resolver=request.historical_evidence_resolver,
+        )
     else:
-        validate_reasoning_stage_output(output, frozen_evidence_closure=list(request.frozen_evidence_closure), frozen_research_context=request.context_pack["research_context"], historical_resolver=request.historical_evidence_resolver, expected_completion_milestone_basis_refs=_completion_basis_for_output(request, output))
+        validate_reasoning_stage_output(
+            output,
+            frozen_evidence_closure=list(request.frozen_evidence_closure),
+            frozen_research_context=request.context_pack["research_context"],
+            enforce_typed_skip_prefixes=True,
+            historical_resolver=request.historical_evidence_resolver,
+            expected_completion_milestone_basis_refs=_completion_basis_for_output(request, output),
+        )
 
 
 def validate_reasoning_autonomous_resume_result(
@@ -497,6 +510,7 @@ def validate_reasoning_autonomous_resume_result(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
+            enforce_typed_skip_prefixes=True,
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, final_output)
             ),
@@ -577,6 +591,7 @@ def validate_reasoning_skill_result(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                enforce_typed_skip_prefixes=True,
                 expected_completion_milestone_basis_refs=(
                     _completion_basis_for_output(request, result.reviewed_draft)
                 ),
@@ -591,6 +606,7 @@ def validate_reasoning_skill_result(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
+            enforce_typed_skip_prefixes=True,
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, final_output)
             ),
@@ -1244,6 +1260,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "source-current root/manual Question 的稳定 anchor ref 是其 question_ref，"
             "但 present/open 仍由 RG 独立接纳。进入 reasoning 时三个 skip basis 均为来源 "
             "ScientificOutcome；进入 plan 的 IdeaSet basis 不得用 ScientificOutcome 冒充。"
+            f"{_typed_skip_basis_prompt(request)}"
             "不得自称接纳内容、领域语义、创建 Question/Cycle、结束 "
             "Quest 或形成 StageCommit。科研证据的判断与引用按上述 Skill 完成。"
             "Provider 是此 managed root Session 内的研究执行角色，不得创建第二个顶层 "
@@ -1839,7 +1856,7 @@ def _reasoning_autonomous_checkpoint_schema(
                 **scope_base_properties,
                 "entry_stage": {"const": entry_stage},
                 "typed_skip_basis_refs_by_stage": _typed_skip_basis_schema(
-                    entry_stage, text
+                    entry_stage, text, enforce_stage_asset_patterns=False
                 ),
             },
             "required": [
@@ -2059,7 +2076,7 @@ def _next_cycle_proposal_schema(
                     **base_properties,
                     "entry_stage": {"const": entry_stage},
                     "typed_skip_basis_refs_by_stage": _typed_skip_basis_schema(
-                        entry_stage, text
+                        entry_stage, text, enforce_stage_asset_patterns=True
                     ),
                 },
                 "required": [
@@ -2073,9 +2090,17 @@ def _next_cycle_proposal_schema(
     }
 
 
+_TYPED_SKIP_STAGE_PATTERNS = {
+    "idea": "^idea_outcome_[A-Za-z0-9_-]+$",
+    "plan": "^formal_plan_[A-Za-z0-9_-]+$",
+}
+
+
 def _typed_skip_basis_schema(
     entry_stage: str,
     text_schema: dict[str, object],
+    *,
+    enforce_stage_asset_patterns: bool = False,
 ) -> dict[str, object]:
     stage_order = ("idea", "plan", "bundle", "reasoning")
     skipped_stages = stage_order[: stage_order.index(entry_stage)]
@@ -2084,7 +2109,16 @@ def _typed_skip_basis_schema(
             "type": "array",
             "minItems": 1,
             "uniqueItems": True,
-            "items": text_schema,
+            "items": {
+                **text_schema,
+                **(
+                    {"pattern": _TYPED_SKIP_STAGE_PATTERNS[stage]}
+                    if enforce_stage_asset_patterns
+                    and entry_stage != "reasoning"
+                    and stage in _TYPED_SKIP_STAGE_PATTERNS
+                    else {}
+                ),
+            },
         }
         for stage in skipped_stages
     }
@@ -2094,6 +2128,86 @@ def _typed_skip_basis_schema(
         "properties": properties,
         "required": list(properties),
     }
+
+
+def _typed_skip_basis_candidates(
+    request: ReasoningSkillRequest,
+) -> dict[str, tuple[str, ...]]:
+    """Collect exact reusable IdeaSet and FormalPlan refs from the frozen pack."""
+
+    found: dict[str, set[str]] = {"idea": set(), "plan": set()}
+    authoritative_stages: set[str] = set()
+
+    def add(stage: str, value: object, prefix: str) -> bool:
+        if isinstance(value, str) and value.startswith(prefix):
+            found[stage].add(value)
+            return True
+        return False
+
+    typed_skip = request.context_pack.get("typed_skip_basis_refs_by_stage")
+    if isinstance(typed_skip, dict):
+        idea_refs = typed_skip.get("idea")
+        plan_refs = typed_skip.get("plan")
+        if (
+            isinstance(idea_refs, list)
+            and len(idea_refs) == 1
+            and add("idea", idea_refs[0], "idea_outcome_")
+        ):
+            authoritative_stages.add("idea")
+        if (
+            isinstance(plan_refs, list)
+            and len(plan_refs) == 1
+            and add("plan", plan_refs[0], "formal_plan_")
+        ):
+            authoritative_stages.add("plan")
+
+    closure = request.context_pack.get("upstream_stage_closure")
+    if isinstance(closure, list):
+        for item in closure:
+            if not isinstance(item, dict):
+                continue
+            stage = item.get("stage")
+            if isinstance(stage, str):
+                stage = stage.lower()
+            disposition = item.get("disposition")
+            if isinstance(disposition, str):
+                disposition = disposition.lower()
+            if stage == "idea" and disposition == "completed" and stage not in authoritative_stages:
+                add("idea", item.get("outcome_ref"), "idea_outcome_")
+            elif stage == "plan" and disposition == "completed" and stage not in authoritative_stages:
+                add("plan", item.get("outcome_ref"), "formal_plan_")
+
+    accepted_idea = request.context_pack.get("accepted_idea_set_binding")
+    if isinstance(accepted_idea, dict) and "idea" not in authoritative_stages:
+        add("idea", accepted_idea.get("outcome_ref"), "idea_outcome_")
+    plan_input = request.context_pack.get("plan_evidence_input")
+    if isinstance(plan_input, dict):
+        formal_plan = plan_input.get("formal_plan_binding")
+        if isinstance(formal_plan, dict) and "plan" not in authoritative_stages:
+            add("plan", formal_plan.get("formal_plan_ref"), "formal_plan_")
+
+    return {
+        stage: tuple(sorted(refs))
+        for stage, refs in found.items()
+        if refs
+    }
+
+
+def _typed_skip_basis_prompt(request: ReasoningSkillRequest) -> str:
+    candidates = _typed_skip_basis_candidates(request)
+    if not candidates:
+        return (
+            "typed_skip_basis_refs_by_stage 必须使用阶段结果的类型化引用。"
+            "进入 plan 的 idea 依据只能是 idea_outcome_*，进入 bundle 的 plan 依据只能是 formal_plan_*，"
+            "不得改填 StageCommit 或 ScientificOutcome 引用。\n"
+        )
+    return (
+        "当前 Cycle 已冻结的 typed skip basis 候选如下（复用当前 Question 本轮资产时逐字使用，"
+        "切勿改填 StageCommit 引用；若路由到其他已有 Question 或更早 Cycle，须填写目标 Question 对应的 "
+        "idea_outcome_* / formal_plan_*）："
+        + canonical_json(candidates)
+        + "\n"
+    )
 
 
 def _candidate_completion_schema(

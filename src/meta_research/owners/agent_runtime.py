@@ -1449,6 +1449,16 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, submission_ref: str
     ) -> AttemptExecution | None: ...
 
+    def continue_after_reasoning_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> ReasoningStageRun: ...
+
     def complete_reasoning_run(
         self,
         *,
@@ -21155,6 +21165,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             decision_receipt=decision_receipt,
             idempotency_key=idempotency_key,
             expected_stage="plan",
+        )
+
+    def continue_after_reasoning_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> ReasoningStageRun:
+        return self._continue_after_stage_rejection(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="reasoning",
         )
 
     def _verify_reasoning_checkpoint_rejection(

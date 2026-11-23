@@ -727,6 +727,7 @@ def validate_reasoning_stage_output(
     frozen_evidence_closure: list[dict[str, object]],
     frozen_research_context: dict[str, object],
     expected_completion_milestone_basis_refs: tuple[str, ...] | None = None,
+    enforce_typed_skip_prefixes: bool = False,
     historical_resolver: HistoricalEvidenceResolver | None = None,
 ) -> tuple[str, str, str]:
     """Validate the one closed execution document emitted by Reasoning.
@@ -770,6 +771,7 @@ def validate_reasoning_stage_output(
         expected_completion_milestone_basis_refs=(
             expected_completion_milestone_basis_refs
         ),
+        enforce_typed_skip_prefixes=enforce_typed_skip_prefixes,
     )
     return canonical_hash(output), outcome_hash, transition_hash
 
@@ -886,13 +888,21 @@ def validate_autonomous_question_scope(
     expected_skips = set(stage_order[: stage_order.index(entry_stage)])
     if set(skip_basis) != expected_skips:
         raise ReasoningContractError("autonomous_question_skip_basis_invalid")
+    expected_outcome = cast(str, source_outcome["outcome_ref"])
     for refs in skip_basis.values():
         normalized = _require_text_list(
             refs,
             "autonomous_question_skip_basis_invalid",
         )
-        if not normalized or len(normalized) != len(set(normalized)):
-            raise ReasoningContractError("autonomous_question_skip_basis_invalid")
+        if normalized != [expected_outcome]:
+            raise ReasoningContractError(
+                "autonomous_question_skip_basis_invalid",
+                feedback=(
+                    "autonomous_scope.typed_skip_basis_refs_by_stage creates a new Question "
+                    "that owns no prior IdeaSet or FormalPlan; every skipped stage must "
+                    f"reference the checkpoint outcome [{expected_outcome!r}]."
+                ),
+            )
     return canonical_hash(scope)
 
 
@@ -928,6 +938,7 @@ def validate_reasoning_transition(
     next_cycle: dict[str, object] | None = None,
     candidate_completion: dict[str, object] | None = None,
     expected_completion_milestone_basis_refs: tuple[str, ...] | None = None,
+    enforce_typed_skip_prefixes: bool = False,
 ) -> str:
     """Validate and hash exactly one non-authoritative Reasoning transition."""
 
@@ -965,6 +976,7 @@ def validate_reasoning_transition(
             next_cycle,
             invalid_code="next_cycle_proposal_invalid",
             skip_code="next_cycle_proposal_skip_basis_invalid",
+            enforce_typed_skip_prefixes=enforce_typed_skip_prefixes,
         )
         if "research_time_basis" in next_cycle:
             _validate_research_time_basis(
@@ -1684,6 +1696,7 @@ def _validate_successor_route(
     *,
     invalid_code: str,
     skip_code: str,
+    enforce_typed_skip_prefixes: bool = False,
 ) -> None:
     stage_order = ("idea", "plan", "bundle", "reasoning")
     entry_stage = value.get("entry_stage")
@@ -1693,10 +1706,25 @@ def _validate_successor_route(
     expected_stages = set(stage_order[: stage_order.index(cast(str, entry_stage))])
     if set(skip_basis) != expected_stages:
         raise ReasoningContractError(skip_code)
-    for refs in skip_basis.values():
+    for stage, refs in skip_basis.items():
         normalized = _require_text_list(refs, skip_code)
         if not normalized or len(normalized) != len(set(normalized)):
             raise ReasoningContractError(skip_code)
+        if (
+            enforce_typed_skip_prefixes
+            and entry_stage != "reasoning"
+            and stage in {"idea", "plan"}
+        ):
+            expected_prefix = "idea_outcome_" if stage == "idea" else "formal_plan_"
+            if any(not ref.startswith(expected_prefix) for ref in normalized):
+                raise ReasoningContractError(
+                    skip_code,
+                    feedback=(
+                        f"next_cycle_proposal.typed_skip_basis_refs_by_stage[{stage!r}] "
+                        f"must contain typed {expected_prefix}* references for entry_stage={entry_stage!r}, "
+                        "not stage_commit_* or reasoning_outcome_* references."
+                    ),
+                )
 
 
 def _require_text(value: object, code: str) -> str:

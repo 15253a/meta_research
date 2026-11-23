@@ -81,3 +81,35 @@ def test_next_cycle_domain_validator_rejects_duplicate_skip_basis_after_decode()
             next_cycle=proposal,
             candidate_completion=None,
         )
+
+
+def test_next_cycle_rejects_stage_commit_and_allows_cross_question_typed_refs() -> None:
+    outcome = _scientific_outcome()
+    proposal = _routed_next_cycle("plan")
+    proposal["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
+    ]
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="next_cycle_proposal_skip_basis_invalid",
+    ):
+        validate_reasoning_transition(
+            outcome,
+            next_cycle=proposal,
+            candidate_completion=None,
+            enforce_typed_skip_prefixes=True,
+        )
+
+    cross_question = deepcopy(proposal)
+    cross_question["target_question_ref"] = "question:other"
+    cross_question["target_question_anchor_ref"] = "question:other"
+    cross_question["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "idea_outcome_other_question_prior_cycle"
+    ]
+    assert validate_reasoning_transition(
+        outcome,
+        next_cycle=cross_question,
+        candidate_completion=None,
+        enforce_typed_skip_prefixes=True,
+    )

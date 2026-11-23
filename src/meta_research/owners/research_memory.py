@@ -8226,6 +8226,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    enforce_typed_skip_prefixes=True,
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
@@ -8256,6 +8257,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    enforce_typed_skip_prefixes=True,
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
@@ -13281,6 +13283,7 @@ def _verify_reasoning_payload(
                 frozen_research_context=cast(
                     dict[str, object], context_pack["research_context"]
                 ),
+                enforce_typed_skip_prefixes=True,
                 expected_completion_milestone_basis_refs=(
                     expected_completion_basis
                 ),
@@ -13306,6 +13309,7 @@ def _verify_reasoning_payload(
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    enforce_typed_skip_prefixes=True,
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),

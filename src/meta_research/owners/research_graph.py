@@ -222,6 +222,18 @@ FORMAL_PLAN_REJECTED_RECEIPT_KIND = "formal_plan_rejected"
 FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND = "formal_plan_content_accepted"
 REASONING_ACCEPTED_RECEIPT_KIND = "reasoning_outcome_accepted"
 REASONING_REJECTED_RECEIPT_KIND = "reasoning_outcome_rejected"
+_REASONING_ROUTE_REJECTION_CODES = frozenset(
+    {
+        "reasoning_next_cycle_route_invalid",
+        "reasoning_next_cycle_plan_basis_unavailable",
+        "reasoning_next_cycle_bundle_basis_unavailable",
+        "reasoning_next_cycle_bundle_basis_invalid",
+        "reasoning_next_cycle_target_invalid",
+        "reasoning_next_cycle_asset_commit_invalid",
+        "autonomous_successor_skip_basis_invalid",
+        "autonomous_successor_asset_binding_invalid",
+    }
+)
 REASONING_SCIENTIFIC_ACCEPTED_RECEIPT_KIND = (
     "reasoning_scientific_candidate_accepted"
 )
@@ -11154,25 +11166,36 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         source_current_question_kind = None
         prevalidated_target: dict[str, object] | None = None
         if content.transition_kind == "next_cycle_proposal":
-            self._receipt_verifier.validate_reasoning_transition_route(
-                outcome_ref=scientific_outcome_ref,
-                transition=content.transition,
-            )
-            source_current_question_kind = (
-                self._source_current_reasoning_question_kind(
-                    scientific_outcome=scientific_outcome,
-                    transition=content.transition,
-                )
-            )
-            if source_current_question_kind is None:
-                prevalidated_target = (
-                    self._receipt_verifier._reasoning_next_cycle_target_document(
+            try:
+                self._receipt_verifier.validate_reasoning_transition_route(
                     outcome_ref=scientific_outcome_ref,
                     transition=content.transition,
                 )
+                source_current_question_kind = (
+                    self._source_current_reasoning_question_kind(
+                        scientific_outcome=scientific_outcome,
+                        transition=content.transition,
+                    )
                 )
-                if prevalidated_target is None:
-                    raise OwnerConflict("reasoning_next_cycle_target_invalid")
+                if source_current_question_kind is None:
+                    prevalidated_target = (
+                        self._receipt_verifier._reasoning_next_cycle_target_document(
+                            outcome_ref=scientific_outcome_ref,
+                            transition=content.transition,
+                        )
+                    )
+                    if prevalidated_target is None:
+                        raise OwnerConflict("reasoning_next_cycle_target_invalid")
+            except OwnerConflict as error:
+                route_code = str(error)
+                if route_code not in _REASONING_ROUTE_REJECTION_CODES:
+                    raise
+                decision = "rejected"
+                reason_code = "reasoning_transition_route_invalid"
+                feedback = (
+                    "修正下一 Cycle 的入口和 typed skip basis 引用后重新提交。"
+                    f" Owner route check: {route_code}",
+                )
         feedback_json = canonical_json(list(feedback))
         feedback_hash = canonical_hash(list(feedback))
         transition_json = canonical_json(content.transition)
@@ -11259,9 +11282,15 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 else canonical_hash(target_aggregate)
             )
             decision_ref = new_ref("reasoning_decision")
-            outcome_ref = scientific_outcome_ref
+            outcome_ref = (
+                scientific_outcome_ref if decision == "accepted" else None
+            )
             receipt_ref = new_ref("rg_reasoning_decision_receipt")
-            receipt_kind = REASONING_ACCEPTED_RECEIPT_KIND
+            receipt_kind = (
+                REASONING_ACCEPTED_RECEIPT_KIND
+                if decision == "accepted"
+                else REASONING_REJECTED_RECEIPT_KIND
+            )
             subject_ref = outcome_ref or decision_ref
             receipt_bindings = {
                 **bindings,
@@ -11327,7 +11356,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     "decided_at": now,
                 },
             )
-            counter = "reasoning_outcome_count = reasoning_outcome_count + 1"
+            counter = (
+                "reasoning_outcome_count = reasoning_outcome_count + 1"
+                if decision == "accepted"
+                else "reasoning_rejection_count = reasoning_rejection_count + 1"
+            )
             connection.execute(
                 text(
                     "UPDATE research_graph_state SET revision = revision + 1, "
@@ -11341,7 +11374,11 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             self._feed.record(
                 connection,
-                "research_graph.reasoning_outcome_accepted",
+                (
+                    "research_graph.reasoning_outcome_accepted"
+                    if decision == "accepted"
+                    else "research_graph.reasoning_outcome_rejected"
+                ),
                 {
                     "request_ref": content.request_ref,
                     "submission_ref": content.submission_ref,

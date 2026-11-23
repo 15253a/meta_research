@@ -1484,7 +1484,10 @@ def test_source_current_later_stage_route_is_rejected_atomically_by_rg(
 ) -> None:
     runtime = _reasoning_runtime(
         tmp_path / f"reasoning-source-current-{entry_stage}-rejected",
-        reasoning_skill=_DeterministicReasoningSkill(entry_stage=entry_stage),
+        reasoning_skill=_AcceptedAssetRouteReasoningSkill(
+            entry_stage=entry_stage,
+            typed_basis_refs={"idea": ["idea_outcome_missing_from_target"]},
+        ),
     )
     try:
         quest = _confirm_deepfetch_quest(runtime)
@@ -1493,30 +1496,60 @@ def test_source_current_later_stage_route_is_rejected_atomically_by_rg(
             current = _tick_reasoning(runtime)
         assert current["reasoning_acceptance"]["status"] == "awaiting_domain"
         before_graph = runtime.owners.research_graph.query_snapshot()
+        before_feed = runtime.feed.current_revision()
         before_foreground = runtime.owners.advancement_engine.query_foreground(
             str(quest["quest_ref"])
         )
 
-        with pytest.raises(OwnerConflict, match=expected_error):
-            runtime.reasoning_stage.process_once()
+        assert runtime.reasoning_stage.process_once()
+
+        rejected = runtime.owners.research_graph.query_reasoning_outcome_decision(
+            str(current["run"]["submission_ref"])
+        )
+        assert rejected is not None
+        assert rejected.decision == "rejected"
+        assert rejected.outcome_ref is None
+        assert rejected.reason_code == "reasoning_transition_route_invalid"
+        assert rejected.receipt.subject_ref == rejected.decision_ref
+        runtime.owners.research_graph.verify_reasoning_outcome_decision(
+            rejected.request_ref,
+            rejected.submission_ref,
+            "rejected",
+            None,
+            rejected.receipt,
+        )
+        assert any(expected_error in item for item in rejected.feedback)
+        assert any(
+            event.event_type == "research_graph.reasoning_outcome_rejected"
+            and event.payload.get("submission_ref") == rejected.submission_ref
+            for event in runtime.feed.read_after(before_feed).events
+        )
 
         after_graph = runtime.owners.research_graph.query_snapshot()
-        assert after_graph.revision == before_graph.revision
+        assert after_graph.revision == before_graph.revision + 1
         assert after_graph.facts["reasoning_outcome_count"] == (
             before_graph.facts["reasoning_outcome_count"]
+        )
+        assert after_graph.facts["reasoning_rejection_count"] == (
+            before_graph.facts["reasoning_rejection_count"] + 1
         )
         assert after_graph.facts["graph_presence_fact_count"] == (
             before_graph.facts["graph_presence_fact_count"]
         )
+        assert runtime.owners.advancement_engine.query_foreground(
+            str(quest["quest_ref"])
+        ) == before_foreground
+        assert runtime.reasoning_stage.process_once()
         assert after_graph.facts["question_research_state_fact_count"] == (
             before_graph.facts["question_research_state_fact_count"]
         )
         assert runtime.owners.advancement_engine.query_foreground(
             str(quest["quest_ref"])
         ) == before_foreground
-        blocked = runtime.reasoning_stage.query_current()
-        assert blocked["reasoning_acceptance"]["status"] == "awaiting_domain"
-        assert blocked["run"]["completion_receipt"] is None
-        assert blocked["stage_commit"] is None
+        reopened = runtime.reasoning_stage.query_current()
+        assert reopened["reasoning_acceptance"]["status"] == "rejected"
+        assert reopened["run"]["attempt_ref"] != current["run"]["attempt_ref"]
+        assert reopened["run"]["completion_receipt"] is None
+        assert reopened["stage_commit"] is None
     finally:
         runtime.close()
