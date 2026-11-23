@@ -322,7 +322,7 @@ class ReasoningStageWorker:
         if continuation["decision"]["action"] == "decline":
             output = continuation["decision"]["final_output"]
             review = {"schema_ref": "meta-research/reasoning-review/v1", "reviewed_draft_hash": checkpoint.checkpoint_hash, "final_output_hash": canonical_hash(output)}
-            self._agent_runtime.record_reasoning_attempt_execution(run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, submission_ref="reasoning_submission_" + canonical_hash(output)[:32], native_session_ref=run.native_session_ref, runtime_binding=run.runtime_binding, outcome=output, reviewed_draft=checkpoint.checkpoint, review=review, idempotency_key=_operation_key("reasoning-declined-creation", run.run_ref, checkpoint.checkpoint_ref))
+            self._agent_runtime.record_reasoning_attempt_execution(run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, submission_ref="reasoning_submission_" + canonical_hash(output)[:32], native_session_ref=run.native_session_ref, runtime_binding=run.runtime_binding, outcome=output, reviewed_draft=checkpoint.checkpoint, review=review, idempotency_key=_operation_key("reasoning-declined-creation", run.run_ref, run.attempt_ref, checkpoint.checkpoint_ref))
             return _CycleStep(True)
         revised_checkpoint = continuation["decision"]["final_output"]
         candidate, decision = self._accepted_checkpoint_facts(checkpoint.checkpoint_ref)
@@ -454,7 +454,13 @@ class ReasoningStageWorker:
                 self._agent_runtime.acknowledge_provider_safe_point(unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref)
 
     def _continuation_skill_request(self, request, run, *, phase: str, base_job_ref: str):
-        rejected = self._agent_runtime.query_reasoning_continuation_rejections(run.autonomous_checkpoint.checkpoint_ref, phase)
+        rejected = tuple(
+            item
+            for item in self._agent_runtime.query_reasoning_continuation_rejections(
+                run.autonomous_checkpoint.checkpoint_ref, phase
+            )
+            if item.get("attempt_ref") == run.attempt_ref
+        )
         operation_ref = "reasoning-continuation_" + canonical_hash({"base_job_ref": base_job_ref, "phase": phase, "revision": len(rejected)})
         job_ref = self._agent_runtime.root_provider_continuation_job_ref(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, root_session_ref=run.root_session_ref, base_job_ref=operation_ref)
         feedback_by_rejection = tuple(
@@ -545,11 +551,6 @@ class ReasoningStageWorker:
                     draft = replace(draft, draft=_assemble_provider_document(
                         skill_request, draft.draft,
                     ))
-                    # A provider turn can straddle a human budget update.  A
-                    # live provider result is accepted only against the
-                    # owner snapshot observed after that turn, so a genuine
-                    # revision change is reconciled while a forged revision
-                    # still fails the normal binding check.
                     skill_request = _refresh_live_research_time_binding(
                         skill_request,
                         self._advancement_engine,
@@ -858,6 +859,9 @@ class ReasoningStageWorker:
             owner_rejection_receipt_ref=owner_rejection_receipt_ref,
             owner_rejection_kind=owner_rejection_kind,
             owner_feedback=owner_feedback,
+            predecessor_material_outcome_hash=(
+                None if run.predecessor_execution is None else run.predecessor_execution.material_outcome_hash
+            ),
             job_ref=job_ref,
             research_time_budget_revision=research_time_budget_revision,
         )

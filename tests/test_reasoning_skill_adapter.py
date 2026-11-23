@@ -258,7 +258,7 @@ def test_public_draft_seam_validates_one_closed_reasoning_output() -> None:
     )
 
 
-def test_live_reasoning_rejects_stale_research_time_budget_revision() -> None:
+def test_live_reasoning_accepts_stale_research_time_budget_revision() -> None:
     request = replace(_request(), research_time_budget_revision="1" * 64)
     output = _stage_output()
     result = ReasoningSkillDraft(
@@ -267,11 +267,11 @@ def test_live_reasoning_rejects_stale_research_time_budget_revision() -> None:
         adapter_kind="deterministic-test",
     )
 
-    with pytest.raises(
-        ReasoningContractError,
-        match="reasoning_research_time_budget_stale",
-    ):
-        validate_reasoning_skill_draft(request, result)
+    assert validate_reasoning_skill_draft(request, result) == (
+        canonical_hash(output),
+        canonical_hash(output["scientific_outcome"]),
+        canonical_hash(output["next_cycle_proposal"]),
+    )
 
 
 def test_live_reasoning_rejects_missing_research_time_basis() -> None:
@@ -322,7 +322,7 @@ def test_live_generation_rebinds_to_post_turn_owner_revision() -> None:
     )
 
 
-def test_live_generation_rejects_forged_revision_after_owner_refresh() -> None:
+def test_live_generation_accepts_budget_revision_drift_after_owner_refresh() -> None:
     request = replace(
         _request(),
         research_time_budget_revision="1" * 64,
@@ -340,21 +340,21 @@ def test_live_generation_rejects_forged_revision_after_owner_refresh() -> None:
         request, owner, "quest:1"
     )
 
-    with pytest.raises(
-        ReasoningContractError,
-        match="reasoning_research_time_budget_stale",
-    ):
-        validate_reasoning_skill_draft(
-            rebound,
-            ReasoningSkillDraft(
-                draft=output,
-                primary_session_ref="provider-session:1",
-                adapter_kind="codex_cli",
-            ),
-        )
+    assert validate_reasoning_skill_draft(
+        rebound,
+        ReasoningSkillDraft(
+            draft=output,
+            primary_session_ref="provider-session:1",
+            adapter_kind="codex_cli",
+        ),
+    ) == (
+        canonical_hash(output),
+        canonical_hash(output["scientific_outcome"]),
+        canonical_hash(output["next_cycle_proposal"]),
+    )
 
 
-def test_live_generation_fails_closed_when_owner_revision_is_unknown() -> None:
+def test_live_generation_is_nonblocking_when_owner_revision_is_unknown() -> None:
     request = replace(
         _request(),
         research_time_budget_revision="1" * 64,
@@ -377,18 +377,19 @@ def test_live_generation_fails_closed_when_owner_revision_is_unknown() -> None:
     rebound = _refresh_live_research_time_binding(
         request, owner, "quest:1"
     )
-    with pytest.raises(
-        ReasoningContractError,
-        match="reasoning_research_time_budget_unknown",
-    ):
-        validate_reasoning_skill_draft(
-            rebound,
-            ReasoningSkillDraft(
-                draft=_stage_output(),
-                primary_session_ref="provider-session:1",
-                adapter_kind="codex_cli",
-            ),
-        )
+    output = _stage_output()
+    assert validate_reasoning_skill_draft(
+        rebound,
+        ReasoningSkillDraft(
+            draft=output,
+            primary_session_ref="provider-session:1",
+            adapter_kind="codex_cli",
+        ),
+    ) == (
+        canonical_hash(output),
+        canonical_hash(output["scientific_outcome"]),
+        canonical_hash(output["next_cycle_proposal"]),
+    )
 
 
 def test_reasoning_successor_request_carries_owner_rejection_feedback() -> None:

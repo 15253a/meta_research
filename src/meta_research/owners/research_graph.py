@@ -231,6 +231,9 @@ _REASONING_ROUTE_REJECTION_CODES = frozenset(
         "reasoning_next_cycle_bundle_basis_invalid",
         "reasoning_next_cycle_target_invalid",
         "reasoning_next_cycle_asset_commit_invalid",
+        "reasoning_next_cycle_selection_facts_unavailable",
+        "reasoning_next_cycle_selection_facts_invalid",
+        "reasoning_next_cycle_source_invalid",
         "autonomous_successor_skip_basis_invalid",
         "autonomous_successor_asset_binding_invalid",
     }
@@ -4392,11 +4395,11 @@ class SQLiteResearchGraphReceiptVerifier:
                 ),
                 {"quest_ref": binding["quest_ref"]},
             ).first()
-        if (
-            head is None
-            or head.status != "open"
-            or head.current_revision_ref != binding["goal_revision_ref"]
-        ):
+        if head is None:
+            raise OwnerConflict("quest_goal_revision_stale")
+        if head.status != "open":
+            raise OwnerConflict("quest_goal_closed")
+        if head.current_revision_ref != binding["goal_revision_ref"]:
             raise OwnerConflict("quest_goal_revision_stale")
 
     def query_reasoning_research_context(
@@ -10905,6 +10908,19 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 "graph_version": int(head.graph_version),
             }
         )[:32]
+        entry_stage, normalized_skip = (
+            self._receipt_verifier.validate_reasoning_transition_route(
+                outcome_ref=str(scientific_outcome["outcome_ref"]),
+                transition=transition,
+            )
+        )
+        accepted_idea_set, accepted_formal_plan = (
+            self._receipt_verifier._reasoning_transition_assets(
+                transition=transition,
+                entry_stage=entry_stage,
+                normalized_skip=normalized_skip,
+            )
+        )
         existing = connection.execute(
             text(
                 "SELECT * FROM rg_question_selection_facts WHERE question_ref = "
@@ -11008,19 +11024,6 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         research_state = public.get("QuestionResearchStateFact")
         if presence is None or research_state is None:
             raise OwnerConflict("reasoning_next_cycle_selection_facts_invalid")
-        entry_stage, normalized_skip = (
-            self._receipt_verifier.validate_reasoning_transition_route(
-                outcome_ref=str(scientific_outcome["outcome_ref"]),
-                transition=transition,
-            )
-        )
-        accepted_idea_set, accepted_formal_plan = (
-            self._receipt_verifier._reasoning_transition_assets(
-                transition=transition,
-                entry_stage=entry_stage,
-                normalized_skip=normalized_skip,
-            )
-        )
         target = {
             "accepted_question_binding": accepted.as_binding().as_dict(),
             "question_anchor": (
@@ -11175,44 +11178,8 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             not in {"affirmed", "denied", "uncertain", "insufficient_evidence"}
         ):
             raise OwnerConflict("reasoning_outcome_content_invalid")
-        decision, reason_code, feedback = "accepted", None, ()
-        source_current_question_kind = None
-        prevalidated_target: dict[str, object] | None = None
-        if content.transition_kind == "next_cycle_proposal":
-            try:
-                self._receipt_verifier.validate_reasoning_transition_route(
-                    outcome_ref=scientific_outcome_ref,
-                    transition=content.transition,
-                )
-                source_current_question_kind = (
-                    self._source_current_reasoning_question_kind(
-                        scientific_outcome=scientific_outcome,
-                        transition=content.transition,
-                    )
-                )
-                if source_current_question_kind is None:
-                    prevalidated_target = (
-                        self._receipt_verifier._reasoning_next_cycle_target_document(
-                            outcome_ref=scientific_outcome_ref,
-                            transition=content.transition,
-                        )
-                    )
-                    if prevalidated_target is None:
-                        raise OwnerConflict("reasoning_next_cycle_target_invalid")
-            except OwnerConflict as error:
-                route_code = str(error)
-                if route_code not in _REASONING_ROUTE_REJECTION_CODES:
-                    raise
-                decision = "rejected"
-                reason_code = "reasoning_transition_route_invalid"
-                feedback = (
-                    "修正下一 Cycle 的入口和 typed skip basis 引用后重新提交。"
-                    f" Owner route check: {route_code}",
-                )
-        feedback_json = canonical_json(list(feedback))
-        feedback_hash = canonical_hash(list(feedback))
         transition_json = canonical_json(content.transition)
-        bindings = {
+        content_bindings = {
             "request_ref": content.request_ref,
             "submission_ref": content.submission_ref,
             "run_ref": content.run_ref,
@@ -11245,10 +11212,21 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             "scientific_candidate_domain_receipt_hash": (
                 scientific_candidate_domain_receipt_hash
             ),
-            "decision": decision,
-            "reason_code": reason_code,
-            "feedback_hash": feedback_hash,
         }
+        if content.transition_kind == "next_cycle_proposal":
+            source_question_ref = scientific_outcome.get("question_ref")
+            if not isinstance(source_question_ref, str) or not source_question_ref:
+                raise OwnerConflict("reasoning_next_cycle_selection_facts_unavailable")
+            with self._database.read() as connection:
+                _source_kind, source_row = _query_question_record(
+                    connection, source_question_ref
+                )
+            if (
+                source_row is None
+                or source_row.quest_ref != scientific_outcome.get("quest_ref")
+            ):
+                raise OwnerConflict("reasoning_next_cycle_selection_facts_unavailable")
+
         with self._database.write() as connection:
             existing = connection.execute(
                 text(
@@ -11260,7 +11238,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             if existing is not None:
                 if any(
                     getattr(existing, key) != value
-                    for key, value in bindings.items()
+                    for key, value in content_bindings.items()
                 ):
                     raise OwnerConflict("reasoning_outcome_decision_conflict")
                 return _reasoning_decision(existing)
@@ -11274,16 +11252,59 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             ).first()
             if accepted is not None:
                 raise OwnerConflict("reasoning_outcome_already_accepted")
+            decision, reason_code, feedback = "accepted", None, ()
             selection_facts_inserted = False
-            target_aggregate = prevalidated_target
-            if source_current_question_kind is not None:
-                selection_facts_inserted, target_aggregate = (
-                    self._ensure_source_current_reasoning_selection(
-                        connection,
-                        content=content,
-                        question_kind=source_current_question_kind,
+            target_aggregate: dict[str, object] | None = None
+            if content.transition_kind == "next_cycle_proposal":
+                try:
+                    with connection.begin_nested():
+                        self._receipt_verifier.validate_reasoning_transition_route(
+                            outcome_ref=scientific_outcome_ref,
+                            transition=content.transition,
+                        )
+                        source_current_question_kind = (
+                            self._source_current_reasoning_question_kind(
+                                scientific_outcome=scientific_outcome,
+                                transition=content.transition,
+                            )
+                        )
+                        if source_current_question_kind is not None:
+                            selection_facts_inserted, target_aggregate = (
+                                self._ensure_source_current_reasoning_selection(
+                                    connection,
+                                    content=content,
+                                    question_kind=source_current_question_kind,
+                                )
+                            )
+                        else:
+                            target_aggregate = (
+                                self._receipt_verifier._reasoning_next_cycle_target_document(
+                                    outcome_ref=scientific_outcome_ref,
+                                    transition=content.transition,
+                                )
+                            )
+                            if target_aggregate is None:
+                                raise OwnerConflict("reasoning_next_cycle_target_invalid")
+                except OwnerConflict as error:
+                    route_code = str(error)
+                    if route_code not in _REASONING_ROUTE_REJECTION_CODES:
+                        raise
+                    decision = "rejected"
+                    reason_code = "reasoning_transition_route_invalid"
+                    feedback = (
+                        "修正下一 Cycle 的入口和 typed skip basis 引用后重新提交。"
+                        f" Owner route check: {route_code}",
                     )
-                )
+                    selection_facts_inserted = False
+                    target_aggregate = None
+            feedback_json = canonical_json(list(feedback))
+            feedback_hash = canonical_hash(list(feedback))
+            bindings = {
+                **content_bindings,
+                "decision": decision,
+                "reason_code": reason_code,
+                "feedback_hash": feedback_hash,
+            }
             target_aggregate_json = (
                 None
                 if target_aggregate is None

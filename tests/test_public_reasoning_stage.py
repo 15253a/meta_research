@@ -1454,18 +1454,20 @@ def test_reasoning_rejects_pruned_target_before_domain_acceptance(
         )
         assert runtime.owners.research_graph.query_question_by_ref(target_ref) is None
 
-        with pytest.raises(
-            OwnerConflict,
-            match="reasoning_next_cycle_selection_facts_unavailable",
-        ):
-            runtime.owners.research_graph.decide_reasoning_outcome(
-                content=accepted_content
-            )
+        rejected = runtime.owners.research_graph.decide_reasoning_outcome(
+            content=accepted_content
+        )
+        assert rejected.decision == "rejected"
+        assert rejected.reason_code == "reasoning_transition_route_invalid"
+        assert any(
+            "reasoning_next_cycle_selection_facts_unavailable" in item
+            for item in rejected.feedback
+        )
         assert (
             runtime.owners.research_graph.query_reasoning_outcome_decision(
                 accepted_content.submission_ref
             )
-            is None
+            == rejected
         )
     finally:
         runtime.close()

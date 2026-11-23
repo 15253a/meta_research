@@ -49,6 +49,12 @@ def _service(connection):
     )).mappings().first()
 
 
+def _ordered_interval(start: float, end: float, reason: str) -> dict[str, object]:
+    ordered_start = min(float(start), float(end))
+    ordered_end = max(float(start), float(end))
+    return {"start": ordered_start, "end": ordered_end, "reason": reason}
+
+
 def _unmeasured_quest(connection, quest_ref, now):
     quest = connection.execute(text(
         "SELECT goal_json,draft_hash FROM rg_quests WHERE quest_ref=:quest"
@@ -63,7 +69,11 @@ def _unmeasured_quest(connection, quest_ref, now):
         "SELECT activated_at FROM ae_initial_cycles WHERE quest_ref=:quest"
     ), {"quest": quest_ref}).mappings().first()
     started = None if initial is None else initial["activated_at"]
-    unknown = [] if started is None else [{"start": started, "end": now, "reason": "historical_time_evidence_missing"}]
+    unknown = (
+        []
+        if started is None
+        else [_ordered_interval(started, now, "historical_time_evidence_missing")]
+    )
     return {"quest_ref": quest_ref, "budget_revision": canonical_hash({"quest_ref": quest_ref, "initial_approved_seconds": seconds}),
             "approved_seconds": seconds, "used_seconds": 0.0 if started is None else None,
             "confirmed_used_seconds": 0.0, "remaining_seconds": seconds if started is None else None,
@@ -94,7 +104,7 @@ def _seed_unmeasured_quests(connection, now):
             "paused": row["status"] == "abandoned" or row["suspension_reason"] in {
                 "human_paused", "human_cancelled", "question_pruned", "question_restored_revalidation_required"},
             "completed": row["status"] == "completed", "unknown": json.dumps([
-                {"start": row["activated_at"], "end": now, "reason": "historical_time_evidence_missing"}])})
+                _ordered_interval(row["activated_at"], now, "historical_time_evidence_missing")])})
 
 
 def _checkpoint(connection, now):
@@ -154,8 +164,8 @@ class QuestResearchTimeMixin:
                         "WHERE paused=0 AND completed=0"
                     )).mappings():
                         unknown = json.loads(row["unknown_intervals_json"])
-                        unknown.append({"start": row["checkpoint_at"], "end": now,
-                                        "reason": "service_stop_unobserved"})
+                        unknown.append(_ordered_interval(row["checkpoint_at"], now,
+                                                         "service_stop_unobserved"))
                         connection.execute(text(
                             "UPDATE ae_quest_time_budgets SET unknown_intervals_json=:unknown WHERE quest_ref=:quest"
                         ), {"unknown": json.dumps(unknown), "quest": row["quest_ref"]})
@@ -217,9 +227,9 @@ def query_quest_research_time_in_transaction(connection, quest_ref, *, database_
     unknown = json.loads(row["unknown_intervals_json"])
     if not row["paused"] and not row["completed"]:
         if not live and service and service["status"] == "active" and now > row["checkpoint_at"]:
-            unknown = [*unknown, {"start": row["checkpoint_at"], "end": now, "reason": "service_liveness_unobserved"}]
-        elif live and now < row["checkpoint_at"]:
-            interval = {"start": now, "end": row["checkpoint_at"], "reason": "wall_clock_regressed"}
+            unknown = [*unknown, _ordered_interval(row["checkpoint_at"], now, "service_liveness_unobserved")]
+        elif now < row["checkpoint_at"]:
+            interval = _ordered_interval(now, row["checkpoint_at"], "wall_clock_regressed")
             if interval not in unknown:
                 unknown = [*unknown, interval]
     corrections = json.loads(row["accounting_corrections_json"])
