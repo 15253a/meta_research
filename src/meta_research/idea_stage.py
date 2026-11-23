@@ -812,7 +812,13 @@ class IdeaStageWorker:
             frozen=successor.get("idea_context_pack")
             if successor.get("cycle_ref")!=current.cycle_ref or successor.get("target_question_ref")!=current.question.question_ref or successor.get("entry_stage")!="idea" or not isinstance(frozen,dict):
                 raise OwnerConflict("reasoning_successor_context_invalid")
-            return dict(frozen)
+            # The successor carries prior scientific inputs, while the new
+            # Stage admission must rebind the mutable Quest Goal head.
+            return {
+                key: value
+                for key, value in frozen.items()
+                if key not in {"goal_revision_ref", "quest_goal_revision"}
+            }
         position = self._advancement_engine.query_cycle_position(current.cycle_ref)
         page, refs = None, ()
         literature=self._research_memory.query_current_question_literature_revision(current.question.question_ref)

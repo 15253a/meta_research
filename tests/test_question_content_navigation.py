@@ -85,6 +85,16 @@ def test_question_entry_reaches_idea_plan_and_bundle_exact_content(committed_tar
                 assert _exact_json(runtime, channel, basis["content_reader"], quest)
     assert bodies["bundle"]["closure"]["bundle_report_ref"] == report.report_ref
     assert bodies["bundle"]["closure"]["bundle_report_hash"] == report.report_hash
+    for name in ("plan", "bundle"):
+        stage = stages[name]
+        wrong = {**_arguments(stage["reader"]), "source_ref": stage["outcome_ref"]}
+        rejection = _call(runtime, channel, "research_memory.content.read", **wrong)
+        assert rejection["isError"]
+        assert rejection["structuredContent"]["code"] == "content_source_unbound"
+        details = rejection["structuredContent"]["details"]
+        assert (details["recovery_owner"], details["next_action"]) == ("agent", "correct_input")
+        assert details["field_path"] == ["source_ref"]
+        assert "research_graph.question_history.read" in details["correction"]
     print("QUESTION_NAVIGATION idea+plan+bundle+source_selector+exact_byte_pages passed")
 
 

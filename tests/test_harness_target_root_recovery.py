@@ -42,6 +42,7 @@ from meta_research.provider_supervisor import (
 )
 from meta_research.semantic_owner_gateway import TARGET_ROOT_SEMANTIC_OPERATION_IDS
 from meta_research.semantic_mcp import (
+    ROOT_AGENT_COMMON_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
     SemanticMcpError,
 )
@@ -533,6 +534,67 @@ def _owner_with_active_root(
             },
         )
     return database, owner, request, handle
+
+
+def test_resume_target_run_reopens_persisted_binding_after_runtime_restart(
+    tmp_path: Path,
+) -> None:
+    database, owner, request, handle = _owner_with_active_root(
+        tmp_path / "target-run-resume.sqlite3"
+    )
+    initial = owner.query_run(request.request_ref)
+    assert initial is not None
+    identity = (
+        initial.run_ref,
+        initial.attempt_ref,
+        initial.root_session_ref,
+        initial.fence_ref,
+    )
+    database.close()
+
+    restarted_database = Database(tmp_path / "target-run-resume.sqlite3")
+    restarted_owner = SQLiteAgentRuntimeHarness(
+        restarted_database,
+        DurableFeed(restarted_database),
+    )
+    restarted = HarnessRuntime(
+        restarted_owner,
+        _Gateway(),
+        (_TargetRootAdapter("codex"),),
+    )
+    try:
+        admission = restarted.resume_target_run(handle.target_run_ref)
+        assert (
+            admission.run.run_ref,
+            admission.run.attempt_ref,
+            admission.run.root_session_ref,
+            admission.run.fence_ref,
+        ) == identity
+        resumed_operation_ids = tuple(
+            binding["semantic_operation_id"]
+            for binding in admission.run.mcp_binding.operation_bindings
+        )
+        assert resumed_operation_ids == request.required_operation_ids
+
+        operation_id = ROOT_AGENT_COMMON_OPERATION_IDS[0]
+        status, payload, _ = restarted.dispatch_mcp_http(
+            admission.connection.token,
+            {
+                "jsonrpc": "2.0",
+                "id": "target-rg-reader",
+                "method": "tools/call",
+                "params": {"name": operation_id, "arguments": {}},
+            },
+            mcp_session_id=None,
+        )
+        assert status == 200
+        assert payload is not None
+        result = payload["result"]
+        assert isinstance(result, dict)
+        assert result["isError"] is False
+        assert result["structuredContent"]["operation_id"] == operation_id
+    finally:
+        restarted_database.close()
 
 
 def test_recovery_preserves_human_request_suspension_without_session_checkpoint(

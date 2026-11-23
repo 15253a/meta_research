@@ -8,6 +8,16 @@ const providerReasonKinds = new Map<string, RootSession["kind"]>([
   ["acquisition_session_chain_invalid", "acquisition"],
 ]);
 
+// Emitted only by provider-root observation paths (DeepFetch / Acquisition),
+// never by native stage or target observation queries.
+const providerOnlyReasons = new Set<string>([
+  "child_session_observation_limited",
+  "child_session_observation_unavailable",
+  "root_session_list_limited",
+  "root_provider_sessions_limited",
+  "root_provider_sessions_unavailable",
+]);
+
 /** Completeness of the whole index is separate from a particular observed state. */
 export function rootSessionStatusUncertain(catalog: RootSessions | null | undefined, session: RootSession | null | undefined): boolean {
   if (!catalog || !session || typeof catalog.limited !== "boolean"
@@ -27,10 +37,12 @@ export function rootSessionStatusUncertain(catalog: RootSessions | null | undefi
     const { code, session_ref: reasonSession } = reason as Record<string, unknown>;
     if (typeof code !== "string" || reasonSession !== undefined && (typeof reasonSession !== "string" || !reasonSession)) return true;
     const providerKind = providerReasonKinds.get(code);
+    const providerOnly = providerOnlyReasons.has(code);
     // Unknown/index-wide failures cannot be narrowed by guessing from a name.
-    if (!providerKind && code !== "root_session_operations_limited") return true;
+    if (!providerKind && !providerOnly && code !== "root_session_operations_limited") return true;
     if (reasonSession !== undefined && reasonSession !== session.session_ref) return false;
     if (providerKind) return session.kind === providerKind;
+    if (providerOnly) return !nativeRoot;
     // The native producer emits this aggregate code for per-session `limited`.
     // Provider roots do not expose that flag, so their missing history stays unknown.
     return !(executionObserved || nativeRoot && reasonSession === undefined && session.limited === false);

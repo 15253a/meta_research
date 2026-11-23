@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from meta_research.formal_entities import insert_variant_run, insert_evaluation_attempt, insert_metric_result
-from meta_research.target_content_issue import TargetContentIssue
+from meta_research.target_content_issue import TargetContentIssue, check_copied_target_identity
 
 from meta_research.context_presentation import HISTORY_LIMIT, scientific_handoff
 from meta_research.question_relations import QuestionRelationOwnerMixin
@@ -89,8 +89,10 @@ from meta_research.idea_contract import (
     validate_idea_context_pack,
 )
 from meta_research.plan_contract import (
+    MAX_PLAN_EVIDENCE_REFS,
     selected_plan_evidence_catalog,
     PlanContractError,
+    validate_current_plan_evidence_accounting,
     validate_plan_context_pack,
     validate_plan_document,
 )
@@ -3517,6 +3519,84 @@ class SQLiteResearchGraphReceiptVerifier:
             limit=limit, question_ref=question_ref, projections=[],
         ), selected
 
+    def _query_current_question_plan_evidence_catalog(
+        self, *, quest_ref: str, question_ref: str,
+    ) -> list[dict[str, object]]:
+        """Read the complete current-question Target evidence at Plan acceptance."""
+
+        authority = self._target_commit_evidence_authority
+        query = getattr(authority, "query_plan_evidence_catalog", None)
+        if not callable(query):
+            raise OwnerConflict("target_commit_evidence_authority_unavailable")
+        for attempt in range(2):
+            before_revision, target_commit_refs = (
+                self._current_question_target_commit_state(
+                    quest_ref=quest_ref, question_ref=question_ref
+                )
+            )
+            if len(target_commit_refs) > MAX_PLAN_EVIDENCE_REFS:
+                raise OwnerConflict(
+                    "plan_evidence_capacity_exceeded",
+                    {
+                        "target_commit_count": len(target_commit_refs),
+                        "limit": MAX_PLAN_EVIDENCE_REFS,
+                    },
+                )
+            catalog_revision, catalog = query(
+                quest_ref=quest_ref,
+                target_commit_refs=target_commit_refs,
+                current_only=True,
+            )
+            after_revision, after_refs = self._current_question_target_commit_state(
+                quest_ref=quest_ref, question_ref=question_ref
+            )
+            if (before_revision, target_commit_refs) != (after_revision, after_refs):
+                if attempt == 0:
+                    continue
+                raise OwnerConflict("plan_evidence_accounting_changed")
+            if (
+                not isinstance(catalog_revision, int)
+                or isinstance(catalog_revision, bool)
+                or catalog_revision < 0
+                or not isinstance(catalog, tuple)
+                or not all(isinstance(item, dict) for item in catalog)
+            ):
+                raise OwnerConflict("plan_evidence_catalog_invalid")
+            if len({str(item.get("evidence_ref")) for item in catalog}) != len(catalog):
+                raise OwnerConflict("plan_evidence_catalog_invalid")
+            return list(catalog)
+        raise OwnerConflict("plan_evidence_accounting_changed")
+
+    def _current_question_target_commit_state(
+        self, *, quest_ref: str, question_ref: str,
+    ) -> tuple[int, tuple[str, ...]]:
+        """Read the graph revision and current-question TargetCommit refs together."""
+
+        with self._database.read_snapshot() as connection:
+            revision = int(
+                connection.execute(
+                    text(
+                        "SELECT revision FROM research_graph_state "
+                        "WHERE singleton = 'owner'"
+                    )
+                ).scalar_one()
+            )
+            rows = connection.execute(
+                text(
+                    "SELECT DISTINCT c.commit_ref "
+                    "FROM rg_target_commits c "
+                    "JOIN rg_targets t ON t.target_ref = c.target_ref "
+                    "JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref "
+                    "JOIN ae_cycles cycle ON cycle.cycle_ref = g.cycle_ref "
+                    "AND cycle.quest_ref = g.quest_ref "
+                    "WHERE g.quest_ref = :quest_ref "
+                    "AND cycle.question_ref = :question_ref "
+                    "ORDER BY c.commit_ref"
+                ),
+                {"quest_ref": quest_ref, "question_ref": question_ref},
+            ).all()
+        return revision, tuple(str(row.commit_ref) for row in rows)
+
     def query_evidence_state(self, quest_ref: str) -> tuple[int, tuple[str, ...]]:
         return self._query_evidence_state(quest_ref, current=True)
 
@@ -6936,16 +7016,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     "SELECT question_ref FROM ae_stage_run_requests WHERE request_ref = :ref"
                 ), {"ref": authority.stage_request_ref}).scalar_one()
         for field, expected in authoritative_fields.items():
-            if field in result_content and result_content[field] != expected:
-                conflict = TargetContentIssue("target_root_commit_domain_invalid")
-                conflict.feedback = (
-                    f"$.{field} supplied {result_content[field]!r}, but the accepted source "
-                    f"for Target {target.target_ref!r} records {expected!r}. Correct or omit "
-                    "that copied identity in the result document and finish another normal "
-                    "turn in this Root. The system carries the accepted identity; preserve "
-                    "the metrics, artifacts and actual work, which need no rerun for this conflict."
-                )
-                raise conflict
+            check_copied_target_identity(result_content, field, expected, target_ref=target.target_ref)
         if not metric_check.conforms:
             missing = list(metric_check.missing_keys)
             unexpected = list(metric_check.unexpected_keys)
@@ -10297,6 +10368,13 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             quest_ref=quest_ref, question_ref=question_ref, offset=offset, limit=limit
         )
 
+    def _query_current_question_plan_evidence_catalog(
+        self, *, quest_ref: str, question_ref: str,
+    ) -> list[dict[str, object]]:
+        return self._receipt_verifier._query_current_question_plan_evidence_catalog(
+            quest_ref=quest_ref, question_ref=question_ref
+        )
+
     def resolve_plan_evidence_reuse_leaves(
         self,
         *,
@@ -11173,17 +11251,16 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 ):
                     raise OwnerConflict("reasoning_outcome_decision_conflict")
                 return _reasoning_decision(existing)
-            if decision == "accepted":
-                accepted = connection.execute(
-                    text(
-                        "SELECT submission_ref FROM "
-                        "rg_reasoning_outcome_decisions WHERE request_ref = "
-                        ":request_ref AND decision = 'accepted'"
-                    ),
-                    {"request_ref": content.request_ref},
-                ).first()
-                if accepted is not None:
-                    raise OwnerConflict("reasoning_outcome_already_accepted")
+            accepted = connection.execute(
+                text(
+                    "SELECT submission_ref FROM "
+                    "rg_reasoning_outcome_decisions WHERE request_ref = "
+                    ":request_ref AND decision = 'accepted'"
+                ),
+                {"request_ref": content.request_ref},
+            ).first()
+            if accepted is not None:
+                raise OwnerConflict("reasoning_outcome_already_accepted")
             selection_facts_inserted = False
             target_aggregate = prevalidated_target
             if source_current_question_kind is not None:
@@ -12113,6 +12190,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             != verified_request.context_pack_hash
         ):
             raise OwnerConflict("formal_plan_request_lineage_invalid")
+        accounting_rejection: str | None = None
         try:
             evidence_by_ref = validate_plan_context_pack(
                 verified_request.context_pack,
@@ -12129,6 +12207,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 or isinstance(evidence_revision, bool)
             ):
                 raise PlanContractError("plan_evidence_catalog_invalid")
+            selected_catalog = selected_plan_evidence_catalog(
+                content.plan_document, evidence_catalog
+            )
             validated_plan_hash = validate_plan_document(
                 content.plan_document,
                 question_ref=accepted_question.question_ref,
@@ -12139,10 +12220,19 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 evidence_by_ref=evidence_by_ref,
                 evidence_reference_revision=evidence_revision,
             )
-        except PlanContractError as error:
-            raise OwnerConflict(str(error)) from error
-        try:
-            selected_catalog = selected_plan_evidence_catalog(content.plan_document, evidence_catalog)
+            if "evidence_accounting" in content.plan_document:
+                current_catalog = self._query_current_question_plan_evidence_catalog(
+                    quest_ref=accepted_question.quest_ref,
+                    question_ref=accepted_question.question_ref,
+                )
+                try:
+                    validate_current_plan_evidence_accounting(
+                        content.plan_document,
+                        current_catalog=current_catalog,
+                        selected_catalog=selected_catalog,
+                    )
+                except PlanContractError as error:
+                    accounting_rejection = str(error)
         except PlanContractError as error:
             raise OwnerConflict(str(error)) from error
         answer_contract = content.plan_document.get("answer_contract")
@@ -12181,10 +12271,20 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 "Papers from the same snapshot share one source binding.",
             )
         else:
-            decision, reason_code, feedback = _evaluate_formal_plan(
-                question_content,
-                content.plan_document,
-            )
+            if accounting_rejection is not None:
+                decision = "rejected"
+                reason_code = accounting_rejection
+                feedback = (
+                    "The current question has TargetCommit evidence without a "
+                    "disposition in evidence_accounting. Add one entry per "
+                    "current TargetCommit and explain whether it is adopted, "
+                    "considered, deferred or not_used before retrying.",
+                )
+            else:
+                decision, reason_code, feedback = _evaluate_formal_plan(
+                    question_content,
+                    content.plan_document,
+                )
         feedback_json = canonical_json(list(feedback))
         feedback_hash = canonical_hash(list(feedback))
         bundle_disposition = content.plan_document.get("bundle_disposition")
@@ -15957,11 +16057,14 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         # This local build starts after issuer and persisted-state verification.
         # The pre-write issuer/domain recheck below establishes its own work view.
         result_content = result_document.as_dict()
-        work = _declared_work(result_content)
-        reused_variant_binding = self._root_reused_primary_binding(result_document, work=work)
-        reused_evaluation_binding = self._root_reused_primary_binding(result_document, "evaluation_attempt", work=work)
-        reused_refs = primary_reused_references(result_content, work=work)
-        evaluation_status = primary_evaluation_status(result_content, work=work)
+        try:
+            work = _declared_work(result_content)
+            reused_variant_binding = self._root_reused_primary_binding(result_document, work=work)
+            reused_evaluation_binding = self._root_reused_primary_binding(result_document, "evaluation_attempt", work=work)
+            reused_refs = primary_reused_references(result_content, work=work)
+            evaluation_status = primary_evaluation_status(result_content, work=work)
+        except TargetContentIssue as error:
+            return reject_candidate(error)
         variant_run_ref = reused_variant_binding.subject_ref if reused_variant_binding else new_ref("target_root_variant_run")
         evaluation_attempt_ref = None if evaluation_status == "pending" else (reused_evaluation_binding.subject_ref if reused_evaluation_binding else new_ref("target_root_evaluation_attempt"))
         metric_result_ref = (reused_refs.get("metric_result_ref") or new_ref("target_root_metric_result")) if evaluation_status == "completed" else None
@@ -15978,29 +16081,32 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         )
         commit_ref = new_ref("target_commit")
         commit_receipt_ref = new_ref("rg_target_commit_receipt")
-        material = _target_root_commit_material(
-            target=target,
-            authority=authority,
-            projection=projection,
-            candidate_projection=candidate_projection,
-            completion=completion,
-            manifest=manifest,
-            result_document=result_document,
-            measurement_ref=measurement_ref,
-            variant_run_ref=variant_run_ref,
-            evaluation_attempt_ref=evaluation_attempt_ref,
-            metric_result_ref=metric_result_ref,
-            variant_binding_ref=variant_binding_ref,
-            variant_binding_receipt_ref=variant_binding_receipt_ref,
-            evaluation_binding_ref=evaluation_binding_ref,
-            evaluation_binding_receipt_ref=evaluation_binding_receipt_ref,
-            measurement_receipt_ref=measurement_receipt_ref,
-            commit_ref=commit_ref,
-            commit_receipt_ref=commit_receipt_ref,
-            reused_variant_binding=reused_variant_binding,
-            reused_evaluation_binding=reused_evaluation_binding,
-            work=work,
-        )
+        try:
+            material = _target_root_commit_material(
+                target=target,
+                authority=authority,
+                projection=projection,
+                candidate_projection=candidate_projection,
+                completion=completion,
+                manifest=manifest,
+                result_document=result_document,
+                measurement_ref=measurement_ref,
+                variant_run_ref=variant_run_ref,
+                evaluation_attempt_ref=evaluation_attempt_ref,
+                metric_result_ref=metric_result_ref,
+                variant_binding_ref=variant_binding_ref,
+                variant_binding_receipt_ref=variant_binding_receipt_ref,
+                evaluation_binding_ref=evaluation_binding_ref,
+                evaluation_binding_receipt_ref=evaluation_binding_receipt_ref,
+                measurement_receipt_ref=measurement_receipt_ref,
+                commit_ref=commit_ref,
+                commit_receipt_ref=commit_receipt_ref,
+                reused_variant_binding=reused_variant_binding,
+                reused_evaluation_binding=reused_evaluation_binding,
+                work=work,
+            )
+        except TargetContentIssue as error:
+            return reject_candidate(error)
         receipt_bindings = {
             "target_ref": target.target_ref,
             "target_run_ref": completion.handle.target_run_ref,
@@ -20744,7 +20850,8 @@ def _target_root_commit_material(
         )
         items = _root_work_items_from_declared(payload=measurement_payload,
                                 identities=authority.identities.as_public_dict(),
-                                work=work)
+                                work=work,
+                                declared_runs=result_content.get("formal_runs"))
         # A declared primary carries its own real method identity (registered
         # during entity persistence); the draft identity only constrains items
         # that did not declare one.  The payload inventory keeps the draft

@@ -357,11 +357,10 @@ def test_actual_target_preparation_and_per_call_channel_preserve_admission_grant
         runtime.close()
 
 
-def test_guidance_catalog_is_available_only_to_the_five_working_roles(tmp_path):
+def test_guidance_catalog_is_available_to_every_native_session(tmp_path):
     for kind, operation_ids in ROOT_AGENT_SEMANTIC_OPERATION_IDS.items():
         available = set(operation_ids) & {"human_guidance.read", "human_guidance.feedback"}
-        assert available == ({"human_guidance.read", "human_guidance.feedback"}
-            if kind in {"idea", "plan", "bundle", "reasoning", "target"} else set())
+        assert available == {"human_guidance.read", "human_guidance.feedback"}
 
 
 def test_actual_empty_operation_retry_keeps_original_cut_after_late_submission(tmp_path):

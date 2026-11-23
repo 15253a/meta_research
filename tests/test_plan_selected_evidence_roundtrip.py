@@ -101,11 +101,212 @@ class _LaterPagePlanSkill(_DeterministicPlanSkill):
         self.selected_evidence_bindings = [target_adoption_binding(item) for item in catalog]
         document = super()._document(request)
         document['selected_evidence_bindings'] = deepcopy(self.selected_evidence_bindings)
+        selected = self.selected_evidence_bindings[0]
+        document['evidence_accounting'] = [{
+            'evidence_ref': selected['evidence_ref'],
+            'target_commit_ref': selected['source_binding']['target_commit_root_ref'],
+            'status': 'adopted',
+            'reason': 'The accepted TargetCommit supplies the current obligation evidence.',
+        }]
         document = _with_derived_answer_contract_hash(document, request)
         assert 'selected_evidence_bindings' not in document
         assert document['source_bindings']['selected_evidence_bindings'] == self.selected_evidence_bindings
         assert document['source_bindings']['context_pack_hash'] == request.context_pack_hash
         return document
+
+
+class _OmittedCurrentTargetPlanSkill(_DeterministicPlanSkill):
+    def __init__(self) -> None:
+        super().__init__(no_gap=True)
+
+    def _document(self, request):
+        document = super()._document(request)
+        selected = document["source_bindings"]["selected_evidence_bindings"]
+        selected_entry = selected[0]
+        document["evidence_accounting"] = [{
+            "evidence_ref": selected_entry["evidence_ref"],
+            "target_commit_ref": selected_entry["source_binding"][
+                "target_commit_root_ref"
+            ],
+            "status": "adopted",
+            "reason": "Adopted for the current obligation.",
+        }]
+        return _with_derived_answer_contract_hash(document, request)
+
+
+class _EmptyCurrentTargetAccountingPlanSkill(_DeterministicPlanSkill):
+    def __init__(self) -> None:
+        super().__init__(no_gap=False)
+
+    def _document(self, request):
+        document = super()._document(request)
+        document["evidence_accounting"] = []
+        return _with_derived_answer_contract_hash(document, request)
+
+
+def test_formal_plan_rejects_unaccounted_current_target_commit(tmp_path, monkeypatch):
+    """A new accounting ledger cannot silently omit a current TargetCommit."""
+
+    authority = _LaterPageAuthority()
+    plan = _OmittedCurrentTargetPlanSkill()
+    runtime = _runtime(
+        tmp_path / "current-target-accounting",
+        authority,
+        plan,
+        _LaterPageReasoningSkill(),
+    )
+    try:
+        quest = _confirm_direct_quest(runtime)
+        _install_fixture_plan_evidence(
+            runtime, authority, quest_ref=str(quest["quest_ref"])
+        )
+        plan.selected_evidence_bindings = [
+            target_adoption_binding(authority.catalog[0])
+        ]
+        second = deepcopy(authority.catalog[0])
+        second["evidence_ref"] = "evidence_target_commit_other"
+        second["target_commit_root_ref"] = "target_commit_other"
+        second["asset_version_ref"] = "asset_version_other"
+        second["asset_ref"] = "asset_other"
+        current_catalog = [authority.catalog[0], second]
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "_query_current_question_plan_evidence_catalog",
+            lambda **_values: current_catalog,
+        )
+        _finish_idea_stage(runtime)
+        decision = None
+        for _step in range(16):
+            runtime.plan_stage.process_once()
+            current = runtime.plan_stage.query_current()
+            acceptance = current["plan_acceptance"]
+            if acceptance["domain"]["status"] == "rejected":
+                decision = acceptance
+                break
+        assert decision is not None
+        assert decision["domain"]["reason"]["code"] == (
+            "plan_evidence_accounting_incomplete"
+        )
+        assert runtime.plan_stage.query_current()["stage_commit"] is None
+        assert runtime.bundle_stage.query_current()["stage_run_request"] is None
+    finally:
+        runtime.close()
+
+
+def test_formal_plan_rejects_empty_current_target_accounting(tmp_path, monkeypatch):
+    """An explicit empty ledger cannot hide a discovered TargetCommit."""
+
+    authority = _LaterPageAuthority()
+    plan = _EmptyCurrentTargetAccountingPlanSkill()
+    runtime = _runtime(
+        tmp_path / "empty-current-target-accounting",
+        authority,
+        plan,
+        _LaterPageReasoningSkill(),
+    )
+    try:
+        quest = _confirm_direct_quest(runtime)
+        _install_fixture_plan_evidence(
+            runtime, authority, quest_ref=str(quest["quest_ref"])
+        )
+        current_entry = authority.catalog[0]
+        authority.catalog = ()
+        runtime.plan_stage._provider.selected_evidence_bindings = []
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "_query_current_question_plan_evidence_catalog",
+            lambda **_values: [current_entry],
+        )
+        _finish_idea_stage(runtime)
+        decision = None
+        for _step in range(16):
+            runtime.plan_stage.process_once()
+            current = runtime.plan_stage.query_current()
+            acceptance = current["plan_acceptance"]
+            if acceptance["domain"]["status"] == "rejected":
+                decision = acceptance
+                break
+        assert decision is not None
+        assert decision["domain"]["reason"]["code"] == (
+            "plan_evidence_accounting_incomplete"
+        )
+        assert runtime.plan_stage.query_current()["stage_commit"] is None
+        assert runtime.bundle_stage.query_current()["stage_run_request"] is None
+    finally:
+        runtime.close()
+
+
+def test_current_target_accounting_retries_when_graph_changes(tmp_path, monkeypatch):
+    """A TargetCommit change during catalog resolution cannot be silently omitted."""
+
+    authority = _LaterPageAuthority()
+    runtime = _runtime(
+        tmp_path / "current-target-accounting-race",
+        authority,
+        _LaterPagePlanSkill(),
+        _LaterPageReasoningSkill(),
+    )
+    try:
+        verifier = runtime.owners.research_graph._receipt_verifier
+        stable = (2, ("target_commit_fixture",))
+        changing = iter([
+            (1, ("target_commit_fixture",)),
+            stable,
+            stable,
+            stable,
+        ])
+        monkeypatch.setattr(
+            verifier,
+            "_current_question_target_commit_state",
+            lambda **_values: next(changing),
+        )
+        authority.quest_ref = "quest:race"
+        authority.catalog = ({
+            "evidence_ref": "evidence-race",
+            "target_commit_root_ref": "target_commit_fixture",
+        },)
+        assert verifier._query_current_question_plan_evidence_catalog(
+            quest_ref="quest:race", question_ref="question:race"
+        ) == [{
+            "evidence_ref": "evidence-race",
+            "target_commit_root_ref": "target_commit_fixture",
+        }]
+    finally:
+        runtime.close()
+
+
+def test_current_target_accounting_fails_closed_on_repeated_graph_changes(tmp_path, monkeypatch):
+    authority = _LaterPageAuthority()
+    runtime = _runtime(
+        tmp_path / "current-target-accounting-unstable",
+        authority,
+        _LaterPagePlanSkill(),
+        _LaterPageReasoningSkill(),
+    )
+    try:
+        verifier = runtime.owners.research_graph._receipt_verifier
+        states = iter([
+            (1, ("target_commit_a",)),
+            (2, ("target_commit_b",)),
+            (3, ("target_commit_b",)),
+            (4, ("target_commit_c",)),
+        ])
+        monkeypatch.setattr(
+            verifier,
+            "_current_question_target_commit_state",
+            lambda **_values: next(states),
+        )
+        authority.quest_ref = "quest:race"
+        authority.catalog = ({
+            "evidence_ref": "evidence-race",
+            "target_commit_root_ref": "target_commit_a",
+        },)
+        with pytest.raises(OwnerConflict, match="plan_evidence_accounting_changed"):
+            verifier._query_current_question_plan_evidence_catalog(
+                quest_ref="quest:race", question_ref="question:race"
+            )
+    finally:
+        runtime.close()
 
 
 class _LaterPageReasoningSkill(_MetricReuseReasoningSkill):
@@ -165,6 +366,14 @@ def test_later_page_evidence_survives_formal_plan_memory_history_and_reasoning(t
         assert memory is not None
         assert memory.plan_document == accepted.plan_document
         assert memory.plan_document['source_bindings']['selected_evidence_bindings'] == selected
+        accounting = accepted.plan_document['evidence_accounting']
+        assert accounting == [{
+            'evidence_ref': selected[0]['evidence_ref'],
+            'target_commit_ref': selected[0]['source_binding']['target_commit_root_ref'],
+            'status': 'adopted',
+            'reason': 'The accepted TargetCommit supplies the current obligation evidence.',
+        }]
+        assert memory.plan_document['evidence_accounting'] == accounting
 
         leaves = runtime.owners.research_graph.resolve_plan_evidence_reuse_leaves(
             quest_ref=str(quest['quest_ref']), accepted_formal_plan=accepted,
@@ -183,6 +392,8 @@ def test_later_page_evidence_survives_formal_plan_memory_history_and_reasoning(t
         request = runtime.owners.advancement_engine.query_reasoning_stage_request(str(quest['cycle_ref']))
         assert request is not None
         frozen_leaves = request.context_pack['plan_evidence_input']['evidence_reuse_closure']
+        formal_binding = request.context_pack['plan_evidence_input']['formal_plan_binding']
+        assert formal_binding['plan_document']['evidence_accounting'] == accounting
         assert [leaf['role'] for leaf in frozen_leaves] == ['MetricResult', 'CheckpointArtifact', 'LogAsset', 'AnalysisAsset']
         assert {leaf['evidence_ref'] for leaf in frozen_leaves} == {selected[0]['evidence_ref']}
         for _ in range(8):
@@ -204,6 +415,7 @@ def test_later_page_evidence_survives_formal_plan_memory_history_and_reasoning(t
         recovered = restarted.owners.advancement_engine.query_reasoning_stage_request(str(quest['cycle_ref']))
         assert recovered is not None
         assert recovered.context_pack == request.context_pack
+        assert recovered.context_pack['plan_evidence_input']['formal_plan_binding']['plan_document']['evidence_accounting'] == accounting
         assert restarted.reasoning_stage.query_current()['reasoning_acceptance']['disposition'] == 'affirmed'
     finally:
         restarted.close()

@@ -71,7 +71,7 @@ def test_skill_rejects_direct_bundle_as_recoverable_candidate():
         ))
 
 
-def test_successor_schema_enums_frozen_idea_outcome_refs():
+def test_successor_schema_enforces_typed_prefixes_without_blocking_cross_question_refs():
     request = _request()
     request.context_pack["accepted_idea_set_binding"] = {
         "outcome_ref": "idea_outcome_48e40766007b43a381dacbaf1d906a92"
@@ -83,11 +83,23 @@ def test_successor_schema_enums_frozen_idea_outcome_refs():
         "idea_outcome_48e40766007b43a381dacbaf1d906a92"
     ]
     assert validator.is_valid(valid)
-    invalid = deepcopy(valid)
-    invalid["typed_skip_basis_refs_by_stage"]["idea"] = [
+    cross_question = deepcopy(valid)
+    cross_question["target_question_ref"] = "question:other"
+    cross_question["target_question_anchor_ref"] = "question:other"
+    cross_question["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "idea_outcome_other_question_prior_cycle"
+    ]
+    assert validator.is_valid(cross_question)
+    invalid_commit = deepcopy(valid)
+    invalid_commit["typed_skip_basis_refs_by_stage"]["idea"] = [
         "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
     ]
-    assert not validator.is_valid(invalid)
+    assert not validator.is_valid(invalid_commit)
+    invalid_outcome = deepcopy(valid)
+    invalid_outcome["typed_skip_basis_refs_by_stage"]["idea"] = [
+        str(valid["source_scientific_outcome_ref"])
+    ]
+    assert not validator.is_valid(invalid_outcome)
 
 
 def test_successor_skill_rejects_stage_commit_without_candidates():
@@ -122,7 +134,7 @@ def test_malformed_typed_skip_map_does_not_hide_binding_fallback():
     assert _typed_skip_basis_candidates(request) == {"idea": (idea_outcome_ref,)}
 
 
-def test_autonomous_checkpoint_schema_and_skill_enforce_frozen_idea_outcome_refs():
+def test_autonomous_checkpoint_skip_basis_matches_ae_source_outcome_contract():
     request = _request()
     idea_outcome_ref = "idea_outcome_48e40766007b43a381dacbaf1d906a92"
     request.context_pack["accepted_idea_set_binding"] = {
@@ -141,7 +153,8 @@ def test_autonomous_checkpoint_schema_and_skill_enforce_frozen_idea_outcome_refs
     idea_items = plan_variant["properties"][
         "typed_skip_basis_refs_by_stage"
     ]["properties"]["idea"]["items"]
-    assert idea_items["enum"] == [idea_outcome_ref]
+    assert "enum" not in idea_items
+    assert "pattern" not in idea_items
 
     from test_public_reasoning_autonomous_checkpoint import _checkpoint
 
@@ -164,9 +177,10 @@ def test_autonomous_checkpoint_schema_and_skill_enforce_frozen_idea_outcome_refs
         )(),
         question_title="A literature-informed follow-up",
     )
+    outcome_ref = str(checkpoint["scientific_outcome"]["outcome_ref"])
     checkpoint["autonomous_scope"]["entry_stage"] = "plan"
     checkpoint["autonomous_scope"]["typed_skip_basis_refs_by_stage"] = {
-        "idea": [idea_outcome_ref]
+        "idea": [outcome_ref]
     }
     provider_checkpoint = deepcopy(checkpoint)
     causal_interpretation = provider_checkpoint["scientific_outcome"][
@@ -194,22 +208,111 @@ def test_autonomous_checkpoint_schema_and_skill_enforce_frozen_idea_outcome_refs
             adapter_kind="test",
         ),
     )
-    invalid = deepcopy(checkpoint)
-    invalid["autonomous_scope"]["typed_skip_basis_refs_by_stage"]["idea"] = [
-        "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e"
-    ]
-    with pytest.raises(
-        RecoverableReasoningSkillCandidateError,
-        match="autonomous_question_skip_basis_invalid",
+    for bad_ref in (
+        "stage_commit_7cc9912b75374e7f9d24b788e0a1a24e",
+        idea_outcome_ref,
     ):
-        validate_reasoning_skill_draft(
-            request,
-            ReasoningSkillDraft(
-                draft=invalid,
-                primary_session_ref="native:reasoning",
-                adapter_kind="test",
-            ),
-        )
+        invalid = deepcopy(checkpoint)
+        invalid["autonomous_scope"]["typed_skip_basis_refs_by_stage"]["idea"] = [
+            bad_ref
+        ]
+        with pytest.raises(
+            RecoverableReasoningSkillCandidateError,
+            match="autonomous_question_skip_basis_invalid",
+        ):
+            validate_reasoning_skill_draft(
+                request,
+                ReasoningSkillDraft(
+                    draft=invalid,
+                    primary_session_ref="native:reasoning",
+                    adapter_kind="test",
+                ),
+            )
+
+
+def test_reasoning_stage_worker_dispatches_continue_after_reasoning_rejection():
+    from types import SimpleNamespace
+    from meta_research.owners.common import AcceptanceReceipt
+    from meta_research.reasoning_stage import ReasoningStageWorker
+
+    calls = []
+    receipt = AcceptanceReceipt(
+        issuer="research_graph",
+        kind="reasoning_outcome_rejected",
+        receipt_ref="rg_reasoning_decision_receipt_1",
+        subject_ref="reasoning_decision_1",
+        payload_hash="a" * 64,
+    )
+    decision = SimpleNamespace(
+        decision="rejected",
+        outcome_ref=None,
+        receipt=receipt,
+    )
+    execution = SimpleNamespace(
+        submission_ref="sub:1",
+        run_ref="run:1",
+        attempt_ref="attempt:1",
+        fence_ref="fence:1",
+    )
+    run = SimpleNamespace(
+        run_ref="run:1",
+        attempt_ref="attempt:1",
+        fence_ref="fence:1",
+        execution=execution,
+        autonomous_checkpoint=None,
+        completion=None,
+    )
+    request = SimpleNamespace(
+        request_ref="req:1",
+        cycle_ref="cycle:1",
+        epoch=1,
+    )
+    current = SimpleNamespace(
+        cycle_ref="cycle:1",
+        question=SimpleNamespace(quest_ref="quest:1", question_ref="question:1"),
+    )
+
+    worker = object.__new__(ReasoningStageWorker)
+    worker._advancement_engine = SimpleNamespace(
+        query_foreground=lambda _q: {
+            "status": "active",
+            "stage": "reasoning",
+            "cycle_ref": "cycle:1",
+            "epoch": 1,
+        },
+        query_reasoning_stage_request=lambda _c: request,
+        query_reasoning_stage_commit=lambda _r: None,
+    )
+    worker._assert_request_current = lambda *_a, **_kw: None
+    worker._agent_runtime = SimpleNamespace(
+        query_reasoning_stage_run=lambda _r: run,
+        query_managed_run=lambda _r: {"status": "running"},
+        continue_after_reasoning_rejection=lambda **kw: calls.append(kw),
+    )
+    worker._research_memory = SimpleNamespace(
+        query_reasoning_content=lambda _s: SimpleNamespace(submission_ref="sub:1")
+    )
+    worker._research_graph = SimpleNamespace(
+        query_reasoning_outcome_decision=lambda _s: decision
+    )
+
+    step = worker._process_cycle(current)
+    assert step.advanced is True
+    assert len(calls) == 1
+    assert calls[0]["run_ref"] == "run:1"
+    assert calls[0]["attempt_ref"] == "attempt:1"
+    assert calls[0]["fence_ref"] == "fence:1"
+    assert calls[0]["decision_receipt"] == receipt
+
+
+def test_rg_decide_reasoning_outcome_blocks_late_rejection_after_acceptance():
+    import inspect
+    from meta_research.owners.research_graph import SQLiteResearchGraph
+
+    src = inspect.getsource(SQLiteResearchGraph.decide_reasoning_outcome)
+    guard_idx = src.index('raise OwnerConflict("reasoning_outcome_already_accepted")')
+    prefix_block = src[max(0, guard_idx - 420) : guard_idx]
+    assert 'if decision == "accepted":' not in prefix_block
 
 
 def test_ar_refuses_direct_bundle_before_recording_new_execution():

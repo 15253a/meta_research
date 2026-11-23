@@ -30,6 +30,8 @@ from meta_research.semantic_owner_gateway import (
     BUNDLE_DAEMON_COMPLETION_BOUNDARIES,
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
     BUNDLE_TARGET_SEMANTIC_MISSING_MATRIX,
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
+    TARGET_ROOT_SEMANTIC_OPERATION_IDS,
     TARGET_RUN_DAEMON_BOUNDARIES,
     TARGET_RUN_SEMANTIC_OPERATION_IDS,
     create_semantic_owner_gateway,
@@ -344,7 +346,7 @@ def _gateway():
     return gateway, graph, memory, runtime
 
 
-def _issue(gateway, operation_ids):
+def _issue(gateway, operation_ids, *, root_kind="bundle"):
     connection, _binding = gateway.issue_channel(
         run_ref="bundle-run:1",
         attempt_ref="bundle-attempt:1",
@@ -352,7 +354,7 @@ def _issue(gateway, operation_ids):
         fence_ref="bundle-fence:1",
         capability_binding_hash="a" * 64,
         operation_ids=operation_ids,
-        root_kind="bundle",
+        root_kind=root_kind,
         phase="primary",
     )
     return connection
@@ -392,12 +394,176 @@ def test_bundle_and_target_catalogs_contain_only_registered_reconciled_operation
             assert by_id[reconcile_id]["access_mode"] == "reconcile"
 
 
+def test_every_research_root_catalog_is_registered_by_the_live_gateway():
+    gateway, _graph, _memory, _runtime = _gateway()
+    registered = set(gateway.operation_ids)
+    for root_kind, operation_ids in ROOT_AGENT_SEMANTIC_OPERATION_IDS.items():
+        missing = set(operation_ids) - registered
+        assert not missing, (root_kind, sorted(missing))
+
+
+@pytest.mark.parametrize("root_kind", tuple(ROOT_AGENT_SEMANTIC_OPERATION_IDS))
+def test_every_native_session_can_page_the_complete_live_catalog(root_kind):
+    gateway, _graph, _memory, _runtime = _gateway()
+    operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind]
+    connection = _issue(gateway, operation_ids, root_kind=root_kind)
+    offset = 0
+    catalog_hash = None
+    seen = set()
+    while True:
+        arguments = {"view": "operations", "offset": offset, "limit": 7}
+        if catalog_hash is not None:
+            arguments["catalog_hash"] = catalog_hash
+        page = _call(gateway, connection, "tools.catalog.page", arguments)
+        assert page["isError"] is False
+        payload = page["structuredContent"]
+        seen.update(item["operation_id"] for item in payload["items"])
+        catalog_hash = payload["catalog_hash"]
+        if payload["next_offset"] is None:
+            break
+        offset = payload["next_offset"]
+    expected = set(operation_ids)
+    # The complete role catalog contains the DeepFetch source operation, but
+    # this fixture intentionally has no SearchSourceRegistry. A service-level
+    # unavailable operation is omitted from the callable catalog page.
+    if root_kind == "deepfetch":
+        expected.remove("deepfetch_source_action")
+    assert seen == expected
+
+
+def test_live_bundle_channel_gates_other_role_effect_and_reconcile():
+    gateway, _graph, _memory, _runtime = _gateway()
+    connection = _issue(gateway, BUNDLE_ROOT_SEMANTIC_OPERATION_IDS)
+    for operation_id in (
+        "research_graph.question_relations.record",
+        "research_graph.question_relations.record.reconcile",
+    ):
+        result = _call(gateway, connection, operation_id, {})
+        assert result["isError"] is True
+        assert result["structuredContent"]["code"] == "capability_unavailable"
+        assert result["structuredContent"]["details"]["reason"] == "root_kind_not_owner"
+
+
+def test_external_content_generation_is_owner_gated_before_provider_call():
+    gateway, _graph, _memory, _runtime = _gateway()
+    connection = _issue(
+        gateway,
+        ROOT_AGENT_SEMANTIC_OPERATION_IDS["deepfetch"],
+        root_kind="deepfetch",
+    )
+    result = _call(
+        gateway,
+        connection,
+        "assistant.content.generate",
+        {"messages": [{"role": "user", "content": "should not run"}]},
+    )
+    assert result["isError"] is True
+    assert result["structuredContent"]["code"] == "capability_unavailable"
+    assert result["structuredContent"]["details"]["reason"] == "root_kind_not_owner"
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "owner_kinds"),
+    (
+        ("research_memory.stage_context.read", {"idea", "plan", "bundle", "reasoning"}),
+        ("research_graph.reasoning_context.read", {"reasoning"}),
+    ),
+)
+def test_role_only_readers_report_owner_scope_before_handler(
+    operation_id, owner_kinds
+):
+    gateway, _graph, _memory, _runtime = _gateway()
+    connection = _issue(
+        gateway,
+        TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+        root_kind="target",
+    )
+
+    contract = _call(
+        gateway,
+        connection,
+        "tools.contracts.read",
+        {"operation_id": operation_id},
+    )
+    contract = contract["structuredContent"]
+    assert contract["callable_in_current_session"] is False
+    assert set(contract["owner_root_kinds"]) == owner_kinds
+    for root_kind in owner_kinds:
+        owner_connection = _issue(
+            gateway,
+            TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+            root_kind=root_kind,
+        )
+        owner_contract = _call(
+            gateway,
+            owner_connection,
+            "tools.contracts.read",
+            {"operation_id": operation_id},
+        )
+        assert owner_contract["structuredContent"]["callable_in_current_session"] is True
+
+    listed = _call(
+        gateway,
+        connection,
+        "tools.catalog.page",
+        {"view": "operations", "query": operation_id},
+    )
+    item = next(item for item in listed["structuredContent"]["items"] if item["operation_id"] == operation_id)
+    assert item["callable_in_current_session"] is False
+
+    rejected = _call(gateway, connection, operation_id, {})
+    assert rejected["isError"] is True
+    assert rejected["structuredContent"]["code"] == "capability_unavailable"
+    assert rejected["structuredContent"]["details"]["reason"] == "root_kind_not_owner"
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "arguments", "expected_path"),
+    (
+        ("research_graph.baselines.page", {}, ["items"]),
+        ("research_graph.baselines.read", {"baseline_ref": "baseline:1"}, ["status"]),
+        ("research_graph.target_formal_results.read", {"target_ref": "target:1"}, ["items"]),
+        ("research_graph.formal_results.read", {"ref": "variant_run:1"}, ["status"]),
+        ("research_graph.datasets.page", {}, ["kind"]),
+        ("research_graph.datasets.read", {}, ["status"]),
+    ),
+)
+def test_rg_reader_output_contract_rejects_malformed_owner_return(
+    operation_id, arguments, expected_path
+):
+    from meta_research.semantic_mcp import SemanticMcpGateway
+    from meta_research.semantic_owner_gateway import (
+        _baseline_operations,
+        _dataset_operations,
+    )
+
+    gateway, graph, memory, runtime = _gateway()
+    operations = (
+        *_baseline_operations(graph, runtime),
+        *_dataset_operations(graph, runtime),
+    )
+    malformed = tuple(
+        replace(operation, handler=lambda _context, _arguments: {})
+        if operation.semantic_operation_id == operation_id else operation
+        for operation in operations
+    )
+    gateway = SemanticMcpGateway(malformed)
+    connection = _issue(gateway, (operation_id,))
+
+    result = _call(gateway, connection, operation_id, arguments)
+    assert result["isError"] is True
+    assert result["structuredContent"]["code"] == "semantic_output_schema_mismatch"
+    assert result["structuredContent"]["details"]["path"] == expected_path
+
+
 def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content():
     gateway, _graph, _memory, _runtime = _gateway()
-    operation_ids = (
-        *BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
-        *TARGET_RUN_SEMANTIC_OPERATION_IDS,
-    )
+    operation_ids = tuple(dict.fromkeys(
+        (
+            *BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+            *TARGET_RUN_SEMANTIC_OPERATION_IDS,
+        )
+    ))
     connection = _issue(gateway, operation_ids)
     status, response = gateway.dispatch(
         connection.token,
@@ -408,13 +574,20 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
 
     def assert_closed(schema: dict[str, object], opaque_paths=(), path=()) -> None:
         if path in opaque_paths:
-            assert schema["type"] == "object"
+            assert schema["type"] in ("object", ["object", "null"])
             return
-        if schema["type"] == "object":
+        schema_type = schema.get("type")
+        if schema_type == "object":
+            for variant_key in ("oneOf", "anyOf", "allOf"):
+                variants = schema.get(variant_key)
+                if isinstance(variants, list):
+                    for variant in variants:
+                        assert_closed(variant, opaque_paths, path)
+                    return
             assert schema.get("additionalProperties") is False
             for name, child in schema.get("properties", {}).items():
                 assert_closed(child, opaque_paths, (*path, name))
-        elif schema["type"] == "array" and "items" in schema:
+        elif schema_type == "array" and "items" in schema:
             assert_closed(schema["items"], opaque_paths, (*path, "items"))
 
     # These operations return Owner records or bounded research content directly.
@@ -433,23 +606,29 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
         "research_memory.stage_context.read",
         "research_memory.content.read",
         "research_memory.creation_basis.read",
+        "research_workspace.materials.acquire",
+        "research_workspace.materials.acquire.reconcile",
+        "research_workspace.materials.copy",
+        "research_workspace.materials.copy.reconcile",
+        "research_workspace.materials.feedback",
+        "research_workspace.materials.feedback.reconcile",
         "research_memory.literature.page",
         "research_graph.questions.page",
-        "research_graph.baselines.page",
-        "research_graph.baselines.read",
-        "research_graph.target_formal_results.read",
-        "research_graph.formal_results.read",
         "research_graph.question_history.read",
         "research_graph.question_relations.read",
+        "research_graph.question_relations.record",
+        "research_graph.question_relations.record.reconcile",
         "research_graph.artifact_roles.adjust",
         "research_graph.artifact_roles.adjust.reconcile",
         "agent_runtime.target_run.progress",
+        "assistant.content.generate",
+        "deepfetch_source_action",
         *("research_memory.assets." + action for action in (
             "page", "lifecycle", "current", "intake", "intake.reconcile",
             "retire", "retire.reconcile",
         )),
         *("research_graph.datasets." + action for action in (
-            "page", "read", "register", "register.reconcile", "register_version",
+            "register", "register.reconcile", "register_version",
             "register_version.reconcile", "reference", "reference.reconcile",
             "derive", "derive.reconcile",
         )),
@@ -467,18 +646,25 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
         "research_graph.datasets.register": (("metadata",),),
         "research_graph.datasets.register_version": (
             ("metadata",), ("asset_bindings", "items"),
+            ("selections", "items", "asset_binding"),
         ),
         "research_graph.environments.register": (
             ("metadata",), ("asset_bindings", "items"),
+            ("selections", "items", "asset_binding"),
         ),
         "research_memory.assets.intake": (
+            ("intake", "source"),
             ("intake", "provenance"),
             ("intake", "change", "evidence_bindings", "items"),
         ),
         "research_memory.assets.intake.reconcile": (
+            ("intake", "source"),
             ("intake", "provenance"),
             ("intake", "change", "evidence_bindings", "items"),
         ),
+        "research_workspace.materials.acquire": (("selection",),),
+        "research_workspace.materials.acquire.reconcile": (("selection",),),
+        "deepfetch_source_action": (("arguments",),),
     }
 
     for tool in catalog_tools(gateway.dispatch, connection.token):
@@ -504,9 +690,41 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
             else:
                 # HumanRequest has a fixed receipt/scope envelope around the
                 # human's open-ended resolution facts; keep checking that envelope.
-                opaque_output = (("resolution", "facts"),) if tool["name"] in {
+                dynamic_output_paths = {
+                    "research_graph.plan_evidence.page": (
+                        ("page",), ("evidence_catalog", "items"),
+                    ),
+                    "research_graph.baselines.page": (("items", "items"),),
+                    "research_graph.baselines.read": (("result",),),
+                    "research_graph.target_formal_results.read": (
+                        ("items", "items"), ("execution_registration",), ("resource_candidates",),
+                    ),
+                    "research_graph.formal_results.read": (("result",),),
+                    "research_graph.datasets.page": (("items", "items"),),
+                    "research_graph.datasets.read": (("result",),),
+                    "research_memory.plan_evidence.read": (
+                        ("source_binding",), ("selected_evidence_binding",),
+                    ),
+                    "research_graph.reasoning_context.read": (
+                        ("accepted_question_binding",),
+                        ("upstream_stage_closure", "items"),
+                        ("research_context",),
+                    ),
+                    "research_memory.reasoning_evidence.read": (
+                        ("question_literature_input",),
+                        ("plan_evidence_input",),
+                        ("accepted_target_commit_closures", "items"),
+                    ),
+                    "tools.catalog.page": (
+                        ("items", "items"), ("purposes", "items"), ("topics", "items"),
+                    ),
+                    "tools.contracts.read": (
+                        ("inputSchema",), ("outputSchema",), ("errors",),
+                    ),
+                }
+                opaque_output = (("resolution", "facts"), ("resolution", "time_budget_approval")) if tool["name"] in {
                     "human_request.open", "human_request.open.reconcile",
-                } else ()
+                } else dynamic_output_paths.get(tool["name"], ())
                 assert_closed(tool["outputSchema"], opaque_output)
         except AssertionError as error:
             raise AssertionError(tool["name"]) from error
@@ -695,7 +913,7 @@ def test_target_handler_rereads_frontier_and_rejects_a_stale_context_identity():
         current=True,
     )
     operation_ids = ("agent_runtime.target_run.observe",)
-    connection = _issue(gateway, operation_ids)
+    connection = _issue(gateway, operation_ids, root_kind="target")
     result = _call(
         gateway,
         connection,

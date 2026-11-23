@@ -83,7 +83,7 @@ def test_next_cycle_domain_validator_rejects_duplicate_skip_basis_after_decode()
         )
 
 
-def test_next_cycle_rejects_stage_commit_when_frozen_idea_outcome_is_known() -> None:
+def test_next_cycle_rejects_stage_commit_and_allows_cross_question_typed_refs() -> None:
     outcome = _scientific_outcome()
     proposal = _routed_next_cycle("plan")
     proposal["typed_skip_basis_refs_by_stage"]["idea"] = [
@@ -98,7 +98,18 @@ def test_next_cycle_rejects_stage_commit_when_frozen_idea_outcome_is_known() -> 
             outcome,
             next_cycle=proposal,
             candidate_completion=None,
-            allowed_typed_skip_basis_refs_by_stage={
-                "idea": ("idea_outcome_48e40766007b43a381dacbaf1d906a92",)
-            },
+            enforce_typed_skip_prefixes=True,
         )
+
+    cross_question = deepcopy(proposal)
+    cross_question["target_question_ref"] = "question:other"
+    cross_question["target_question_anchor_ref"] = "question:other"
+    cross_question["typed_skip_basis_refs_by_stage"]["idea"] = [
+        "idea_outcome_other_question_prior_cycle"
+    ]
+    assert validate_reasoning_transition(
+        outcome,
+        next_cycle=cross_question,
+        candidate_completion=None,
+        enforce_typed_skip_prefixes=True,
+    )

@@ -25,9 +25,9 @@ STAGE_CONTEXT_DELIVERY_GUIDANCE = (
     "需要这些缺省部分时，按对应精确 reader 补取，不能把预览当作完整原文。\n"
 )
 _STAGE_SCIENTIFIC_INPUTS = {
-    "idea": frozenset({"prior_accepted_bindings"}),
-    "plan": frozenset({"prior_accepted_bindings"}),  # The adapter supplies the exact IdeaSet once.
-    "bundle": frozenset({"accepted_formal_plan_binding"}),
+    "idea": frozenset({"prior_accepted_bindings", "goal_revision_ref", "quest_goal_revision"}),
+    "plan": frozenset({"prior_accepted_bindings", "goal_revision_ref", "quest_goal_revision"}),  # The adapter supplies the exact IdeaSet once.
+    "bundle": frozenset({"accepted_formal_plan_binding", "goal_revision_ref", "quest_goal_revision"}),
     "reasoning": frozenset({"prior_accepted_bindings", "plan_evidence_input", "upstream_stage_closure",
                             "typed_skip_basis_refs_by_stage", "accepted_target_commit_closures",
                             "current_target_evidence_closure"}),
@@ -129,7 +129,9 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                 "path": [str(key) for key in path], "offset": 0, "limit": 8192}
 
     def preview(value: object, path: list[str | int], depth: int = 0) -> object:
-        if stage == "reasoning" and path == ["research_context", "quest_goal_revision"]:
+        if path == ["quest_goal_revision"] or (
+            stage == "reasoning" and path == ["research_context", "quest_goal_revision"]
+        ):
             # Current direction is scientific input, even when its frozen
             # source sits alongside optional graph history. Keep one complete
             # copy outside both the field and aggregate preview budgets.

@@ -1,7 +1,8 @@
 from pathlib import Path
 from dataclasses import replace
 import pytest
-from meta_research.acquisition import AcquisitionBatchRequest, AcquisitionPaper, AcquisitionPreflightRequest, AcquisitionUnavailable
+from meta_research.acquisition import (AcquisitionBatchRequest, AcquisitionPaper,
+    AcquisitionPreflightRequest, AcquisitionUnavailable, validate_batch_request)
 from meta_research.acquisition_root import CodexAcquisitionRootAdapter
 from test_external_root_resident_mcp import _AcquisitionDelegate, _SequenceRunner as _ObservedSequenceRunner
 from role_delivery_process_support import controlled_codex as _fake_codex, run_observed_durable_result
@@ -50,6 +51,92 @@ def test_missing_mode_fails_before_any_provider_work(tmp_path):
     with pytest.raises(AcquisitionUnavailable, match="acquisition_provider_binding_invalid"):
         adapter.acquire(batch(tmp_path, session_mode=""))
     assert not runner.prompts
+
+
+def test_batch_validation_still_requires_paper_targets(tmp_path):
+    request = batch(tmp_path)
+
+    assert validate_batch_request(request)
+    with pytest.raises(AcquisitionUnavailable, match="acquisition_batch_request_invalid"):
+        validate_batch_request(replace(request, papers=()))
+
+
+@pytest.mark.parametrize("mode", ["oa_only", "provided_only"])
+def test_targetless_session_preflight_accepts_native_missing_paper_targets(
+    tmp_path, mode
+):
+    runner = _SequenceRunner(
+        [
+            {
+                "status": "unavailable",
+                "browser_context_ref": None,
+                "reason_code": "missing_paper_targets",
+                "evidence": {
+                    "authorized_resource": (
+                        "工作区与全局 acquisition session 均无论文条目、manifest 或正文产物"
+                    ),
+                    "browser_control": "未启动浏览器；oa_only 不进入机构路线",
+                    "configuration_health": (
+                        "已核实请求中缺少 title、paper_id、DOI、arXiv ID 与 source_urls"
+                    ),
+                },
+            }
+        ]
+    )
+    adapter = CodexAcquisitionRootAdapter(
+        tmp_path / "provider",
+        _AcquisitionDelegate(),
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=runner,
+    )
+    request = AcquisitionPreflightRequest(
+        "preflight-session",
+        "initialization1",
+        1,
+        "a" * 64,
+        mode,
+        "",
+        str(tmp_path / "private"),
+    )
+
+    result = adapter.preflight(request)
+
+    assert result.status == "ready"
+    assert result.browser_context_ref is None
+    assert result.reason_code is None
+    assert result.evidence["targetless_session_preflight"] == "accepted"
+    assert len(runner.prompts) == 1
+
+
+def test_targetless_session_preflight_rejects_non_dict_evidence(tmp_path):
+    runner = _SequenceRunner(
+        [
+            {
+                "status": "unavailable",
+                "browser_context_ref": None,
+                "reason_code": "missing_paper_targets",
+                "evidence": None,
+            }
+        ]
+    )
+    adapter = CodexAcquisitionRootAdapter(
+        tmp_path / "provider",
+        _AcquisitionDelegate(),
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=runner,
+    )
+    request = AcquisitionPreflightRequest(
+        "preflight-session",
+        "initialization1",
+        1,
+        "a" * 64,
+        "oa_only",
+        "",
+        str(tmp_path / "private"),
+    )
+
+    with pytest.raises(AcquisitionUnavailable, match="acquisition_preflight_result_invalid"):
+        adapter.preflight(request)
 
 
 def test_initial_connection_failure_has_formal_receipt_and_original_effect_reconcile(tmp_path):

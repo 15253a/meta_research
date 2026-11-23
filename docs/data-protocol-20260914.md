@@ -110,6 +110,37 @@ temporary stdout cleanup; encrypted replacement blocks are not readable summarie
 Missing native records retain the stdout fallback. SQL execution counts are not
 row counts.
 
+The same sidecar carries a signed `meta-research/session-usage-ledger/v1`
+projection. It keeps exact current-operation prompt bytes separate from the
+root Session's observed native prefix, reports the first and peak observed model
+input, deduplicated cumulative input/output, cached-prefix peak and compaction
+offsets, and labels the first business prompt and child-session usage unknown
+when their indexed evidence is absent. A bounded prefix reports only its
+observed interval. If the projection itself fails, a signed
+`meta-research/provider-call-observation-unavailable/v1` gap records the failure
+owner and reconciliation action.
+This ledger is operation-local evidence over one observed native prefix. It is
+not a cross-operation root or team total, and its operation-to-root binding
+still comes from the signed Owner index.
+The signed operation binding also records the model reference selected for the
+actual Provider argv. This preserves model identity after the transient
+invocation record is removed, without turning one operation observation into a
+cross-operation usage total.
+
+Each current durable supervised operation also captures the supervised child's
+stderr in a private `provider-stderr.log`, bounded by the request's
+`stream_max_bytes` and drained concurrently so a verbose child cannot block on
+its error stream. A Harness Codex call supervises `harness_cli_bridge`, so the
+sidecar contains the bridge's typed Provider-stderr summary. The summary carries
+the Provider stderr byte count and hash without returning its raw body, which may
+contain credentials or response data. Direct supervisor jobs retain the bounded
+child bytes for the same Owner-only observation path. The signed
+`call-observation.json` records only availability, observed byte count, SHA-256
+and `limited`. Older operations without this file report an unavailable stderr
+observation. This supplemental sidecar does not change the terminal receipt
+schema or replace the structured error contract that gives an Agent the issue,
+owner and next action.
+
 Deployment and real-data evidence are kept in the workspace's
 `data-protocol-8767-20260914` directory. Service 8767 and its current data root are
 the only active deployment target for this change.

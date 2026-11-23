@@ -218,6 +218,7 @@ def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool
             returncode=0, input_bytes=len(b"stage prompt"))
         scratch = directory / "native-provider-argv.json"
         scratch.write_bytes(b'x' * 2048)
+        (directory / "supervisor-heartbeat.json").write_bytes(b"")
         # Model the first history read after a restart, with no cached Target
         # binding/profile. The transport must reconstruct a signed receipt from
         # the still-readable argv, prompt, schema, result, and stdout.
@@ -301,7 +302,8 @@ def test_public_cleanup_reclaims_retired_cycle_and_companion_but_preserves_spool
         assert paths[current_recorder].is_file() and not paths[retired_recorder].exists()
         assert not paths[retired_stage].exists() and not paths[retired_companion].exists()
         assert paths[current].is_file()
-        assert not scratch.exists() and (directory / "stdout.jsonl").read_bytes() == raw
+        assert not scratch.exists() and not (directory / "supervisor-heartbeat.json").exists()
+        assert (directory / "stdout.jsonl").read_bytes() == raw
         assert runtime.query_stage_raw_output(run, phase="primary").text == raw.decode()
         assert any(r["root_kind"] == "provider_spool" and r["bytes"] == 2048 for r in report)
         with _server(exe, root) as call:

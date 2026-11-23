@@ -38,7 +38,7 @@ def db_manifest_selection_entries(manifest):
 
 
 
-def implementation_binding(entries, paths=None, asserted_revision=None):
+def implementation_binding(entries, paths=None, asserted_revision=None, *, declared_runs=(), run_key=None):
     available = [entry for entry in entries if entry['role'] == 'implementation']
     if paths is None:
         available = [entry for entry in available if entry.get('path') is None]
@@ -58,7 +58,21 @@ def implementation_binding(entries, paths=None, asserted_revision=None):
     tree_hash = implementation_set_hash(selected)
     revision = 'target_impl_' + tree_hash
     if asserted_revision is not None and asserted_revision != revision:
-        raise TargetContentIssue('target_formal_implementation_revision_mismatch')
+        error = TargetContentIssue('target_formal_implementation_revision_mismatch')
+        for index, run in enumerate(declared_runs):
+            if isinstance(run, dict) and run.get('run_key') == run_key:
+                field = f'$.formal_runs[{index}].implementation_revision_ref'
+                supplied = json.dumps(asserted_revision, ensure_ascii=False)
+                if len(supplied) > 256:
+                    supplied = f'a value of {len(asserted_revision)} characters'
+                error.feedback = (
+                    f'{field} asserts {supplied}. '
+                    f'The accepted implementation selection for this Run resolves to {revision}. '
+                    'Check implementation_paths against the code actually used by this Run. '
+                    'This revision assertion is optional: omit it to let the Owner bind the frozen '
+                    'selection, or provide its verified revision. Preserve the recorded work.')
+                break
+        raise error
     return revision, tree_hash
 
 

@@ -58,6 +58,21 @@ _PROVIDER_CEILING_FAILURE_CODES = frozenset(
 )
 
 
+_TARGET_RESEARCH_READ_GUIDANCE = (
+    "上游材料是当前起点，不是证据边界。你拥有本 Session 当前授权的 Semantic MCP 目录，"
+    "并可按当前授权主动读取 research_graph/research_memory reader。开始实施、恢复或判断缺口前，"
+    "先用 tools.catalog.page(view=overview) 查看当前 purpose，再按 research_graph 或 research_memory 的 purpose、topic 或 query 定向发现所需 reader。"
+    "只有确需核对完整授权目录时，才用 tools.catalog.page(view=operations) 从 offset=0 开始按 catalog_hash 续页到 next_offset=null。"
+    "目录发现不会授予额外权限。再用 tools.contracts.read 取得所需 reader 的当前合同，"
+    "按合同声明的精确 source_ref、version_ref、entry_path、offset 等参数读取原始观测、"
+    "历史证据、反证、已有结果和未完成项。research_memory.content.read 只接受其合同中的读取参数，"
+    "返回记录里的 receipt 是证据元数据，应随结果保存，不能作为该读取调用的额外参数。"
+    "不要用路径、标题或猜测代替 Owner reader。若目录续页返回 tool_catalog_changed，回到 offset=0。"
+    "若证据冲突、缺失或当前操作不可用，记录 operation_id、reader/ref、版本、错误 code/details 与缺口，"
+    "保留未知并继续可独立推进的授权工作。"
+)
+
+
 class TargetRunFinalizerInterface(Protocol):
     """Single deep post-root boundary; its internal saga is crash-replayable."""
 
@@ -693,10 +708,17 @@ class TargetRunRuntime:
             "target_run_ref": handle.target_run_ref,
         }
         if revision_request is None:
-            return "继续本 Target 尚未完成的工作，完成后按原交接合同提交。\n" + canonical_json(material)
+            return (
+                "继续本 Target 尚未完成的工作。你仍可主动使用本 Session 已授权的 "
+                "research_graph/research_memory reader，先核对当前证据和缺口，再按原交接合同提交。\n"
+                + _TARGET_RESEARCH_READ_GUIDANCE + "\n"
+                + canonical_json(material)
+            )
         return (
-            "本次交接未通过接纳。针对以下反馈修正 outputs/result.json 及实际受影响的工作，"
+            "本次交接未通过接纳。你仍可主动使用本 Session 已授权的 "
+            "research_graph/research_memory reader。针对以下反馈修正 outputs/result.json 及实际受影响的工作，"
             "保留已成立的研究、来源和产物，按原交接合同重新提交。\n"
+            + _TARGET_RESEARCH_READ_GUIDANCE + "\n"
             + canonical_json({**material, "owner_revision_request": revision_request})
         )
 
@@ -781,12 +803,20 @@ class TargetRunRuntime:
                 "root_final_text": "exact text and UTF-8 sha256",
             },
         }
+        goal_guidance = (
+            "其中 Quest Goal 版本是本 Target 继承的冻结有效版本，可被证据质疑；"
+            "不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
+            if isinstance(research.get("quest_goal_revision"), dict)
+            else "当前 Target context 未携带 Quest Goal revision。"
+        )
         return (
             "cycle_position=" + canonical_json({**position, "stage": "target"}) + "\n" +
             STAGE_CONTEXT_DELIVERY_GUIDANCE +
             target_execution_skill_text() + "\n\n"
+            + _TARGET_RESEARCH_READ_GUIDANCE + "\n\n"
             "下列 research_context 与 execution_contract 携带本 Target 适用的 Owner 冻结科学正文与合同。"
-            "按角色方法在本次范围内实施或恢复，保留已成立的研究、来源和产物。"
+            + goal_guidance
+            + "按角色方法在本次范围内实施或恢复，保留已成立的研究、来源和产物。"
             "最终交接前完成独立子智能体审阅，按 completion_binding 交付真实文件、结果及未完成事项。"
             "frozen_input_manifest_path 是实际冻结原件的只读绝对路径；inputs/manifest.json 只是指针。"
             "缺少必需依据时保留准确来源和阻塞，继续可独立推进的已授权工作。\n\n"

@@ -6419,40 +6419,60 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
     ) -> AcceptedQuestionContent:
         if canonical_hash(content) != content_hash:
             raise OwnerConflict("question_content_hash_mismatch")
+        # Rebuild the binding using the exact proposal version recorded by HC.
+        # V1 rows may include a creation basis without the V2 literature fields.
+        with self._database.read() as connection:
+            proposal_row = connection.execute(
+                text(
+                    "SELECT schema_ref, binding_schema_ref, "
+                    "literature_snapshot_ref, literature_snapshot_hash, "
+                    "creation_basis_ref, creation_basis_hash "
+                    "FROM hc_question_proposals WHERE proposal_ref = :ref"
+                ),
+                {"ref": quest.proposal_ref},
+            ).first()
+        if proposal_row is None:
+            raise OwnerConflict("question_content_proposal_mismatch")
         proposal_binding: dict[str, object] = {
-            "schema_ref": QUESTION_PROPOSAL_SCHEMA,
+            "schema_ref": proposal_row.schema_ref or QUESTION_PROPOSAL_SCHEMA,
             "basis_revision": quest.draft_revision,
             "basis_hash": quest.draft_hash,
             "content": content,
         }
         legacy_proposal_hash = canonical_hash(proposal_binding)
-        literature_snapshot = self.query_literature_snapshot_for_basis(
-            initialization_id,
-            quest.draft_revision,
-            quest.draft_hash,
-        )
-        proposal_binding.update(
-            {
-                "binding_schema_ref": (
-                    "meta-research/question-proposal-binding/v2"
-                ),
-                "literature_snapshot_ref": (
-                    None
-                    if literature_snapshot is None
-                    else literature_snapshot.snapshot_ref
-                ),
-                "literature_snapshot_hash": (
-                    None
-                    if literature_snapshot is None
-                    else literature_snapshot.snapshot_hash
-                ),
+        if proposal_row.binding_schema_ref is not None:
+            if proposal_row.binding_schema_ref != (
+                "meta-research/question-proposal-binding/v2"
+            ):
+                raise OwnerConflict("question_content_proposal_mismatch")
+            literature_snapshot = self.query_literature_snapshot_for_basis(
+                initialization_id,
+                quest.draft_revision,
+                quest.draft_hash,
+            )
+            proposal_binding.update(
+                {
+                    "binding_schema_ref": proposal_row.binding_schema_ref,
+                    "literature_snapshot_ref": (
+                        None
+                        if literature_snapshot is None
+                        else literature_snapshot.snapshot_ref
+                    ),
+                    "literature_snapshot_hash": (
+                        None
+                        if literature_snapshot is None
+                        else literature_snapshot.snapshot_hash
+                    ),
+                }
+            )
+        if proposal_row.creation_basis_ref is not None:
+            self.creation_bases.query(
+                proposal_row.creation_basis_ref, proposal_row.creation_basis_hash
+            )
+            proposal_binding["creation_basis"] = {
+                "basis_ref": proposal_row.creation_basis_ref,
+                "basis_hash": proposal_row.creation_basis_hash,
             }
-        )
-        with self._database.read() as connection:
-            basis_row = connection.execute(text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"), {"ref": quest.proposal_ref}).first()
-        if basis_row is not None and basis_row.creation_basis_ref is not None:
-            self.creation_bases.query(basis_row.creation_basis_ref, basis_row.creation_basis_hash)
-            proposal_binding["creation_basis"] = {"basis_ref": basis_row.creation_basis_ref, "basis_hash": basis_row.creation_basis_hash}
         if quest.proposal_hash not in {
             legacy_proposal_hash,
             canonical_hash(proposal_binding),
@@ -7459,9 +7479,6 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         historical_resolver = _historical_evidence_resolver(
             self._reference_reader, scientific_outcome.get("quest_ref")
         )
-        allowed_typed_skip_basis_refs_by_stage = context_pack.get(
-            "typed_skip_basis_refs_by_stage"
-        )
         try:
             checkpoint_hash, outcome_hash, autonomous_scope_hash = (
                 validate_reasoning_autonomous_checkpoint(
@@ -7470,24 +7487,12 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
-                    allowed_typed_skip_basis_refs_by_stage=(
-                        allowed_typed_skip_basis_refs_by_stage
-                        if isinstance(
-                            allowed_typed_skip_basis_refs_by_stage, dict
-                        )
-                        else None
-                    ),
                     historical_resolver=historical_resolver,
                 )
             )
             if validate_autonomous_question_scope(
                 autonomous_scope,
                 source_outcome=scientific_outcome,
-                allowed_typed_skip_basis_refs_by_stage=(
-                    allowed_typed_skip_basis_refs_by_stage
-                    if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
-                    else None
-                ),
             ) != autonomous_scope_hash:
                 raise ReasoningContractError(
                     "autonomous_question_scope_invalid"
@@ -8199,9 +8204,6 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         ) != (scientific_candidate_domain_receipt is None):
             raise OwnerConflict("reasoning_scientific_candidate_binding_invalid")
         cited_outcome = outcome.get("scientific_outcome")
-        allowed_typed_skip_basis_refs_by_stage = context_pack.get(
-            "typed_skip_basis_refs_by_stage"
-        )
         # One Quest scope covers the final outcome and its reviewed draft:
         # both must bind to this pack's single frozen research context.
         historical_resolver = _historical_evidence_resolver(
@@ -8224,13 +8226,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
-                    allowed_typed_skip_basis_refs_by_stage=(
-                        allowed_typed_skip_basis_refs_by_stage
-                        if isinstance(
-                            allowed_typed_skip_basis_refs_by_stage, dict
-                        )
-                        else None
-                    ),
+                    enforce_typed_skip_prefixes=True,
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
@@ -8248,13 +8244,6 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
-                    allowed_typed_skip_basis_refs_by_stage=(
-                        allowed_typed_skip_basis_refs_by_stage
-                        if isinstance(
-                            allowed_typed_skip_basis_refs_by_stage, dict
-                        )
-                        else None
-                    ),
                     historical_resolver=historical_resolver,
                 )
             else:
@@ -8268,13 +8257,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
-                    allowed_typed_skip_basis_refs_by_stage=(
-                        allowed_typed_skip_basis_refs_by_stage
-                        if isinstance(
-                            allowed_typed_skip_basis_refs_by_stage, dict
-                        )
-                        else None
-                    ),
+                    enforce_typed_skip_prefixes=True,
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
@@ -13105,11 +13088,6 @@ def _verify_reasoning_scientific_candidate_payload(
         raise OwnerConflict("reasoning_scientific_candidate_invalid") from error
     if not isinstance(evidence_closure, list):
         raise OwnerConflict("reasoning_scientific_candidate_invalid")
-    allowed_typed_skip_basis_refs_by_stage = (
-        context_pack.get("typed_skip_basis_refs_by_stage")
-        if isinstance(context_pack, dict)
-        else None
-    )
     if (
         checkpoint
         != {
@@ -13158,22 +13136,12 @@ def _verify_reasoning_scientific_candidate_payload(
                 frozen_research_context=cast(
                     dict[str, object], context_pack["research_context"]
                 ),
-                allowed_typed_skip_basis_refs_by_stage=(
-                    allowed_typed_skip_basis_refs_by_stage
-                    if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
-                    else None
-                ),
                 historical_resolver=historical_resolver,
             )
         )
         if validate_autonomous_question_scope(
             autonomous_scope,
             source_outcome=scientific_outcome,
-            allowed_typed_skip_basis_refs_by_stage=(
-                allowed_typed_skip_basis_refs_by_stage
-                if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
-                else None
-            ),
         ) != scope_hash:
             raise ReasoningContractError("autonomous_question_scope_invalid")
         review_hash = _validate_reasoning_review(
@@ -13244,11 +13212,6 @@ def _verify_reasoning_payload(
         raise OwnerConflict("reasoning_content_invalid") from error
     if not isinstance(evidence_closure, list):
         raise OwnerConflict("reasoning_content_invalid")
-    allowed_typed_skip_basis_refs_by_stage = (
-        context_pack.get("typed_skip_basis_refs_by_stage")
-        if isinstance(context_pack, dict)
-        else None
-    )
     expected_transition = (
         outcome.get("next_cycle_proposal")
         if row.transition_kind == "next_cycle_proposal"
@@ -13320,11 +13283,7 @@ def _verify_reasoning_payload(
                 frozen_research_context=cast(
                     dict[str, object], context_pack["research_context"]
                 ),
-                allowed_typed_skip_basis_refs_by_stage=(
-                    allowed_typed_skip_basis_refs_by_stage
-                    if isinstance(allowed_typed_skip_basis_refs_by_stage, dict)
-                    else None
-                ),
+                enforce_typed_skip_prefixes=True,
                 expected_completion_milestone_basis_refs=(
                     expected_completion_basis
                 ),
@@ -13339,13 +13298,6 @@ def _verify_reasoning_payload(
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
-                    allowed_typed_skip_basis_refs_by_stage=(
-                        allowed_typed_skip_basis_refs_by_stage
-                        if isinstance(
-                            allowed_typed_skip_basis_refs_by_stage, dict
-                        )
-                        else None
-                    ),
                     historical_resolver=historical_resolver,
                 )
             )
@@ -13357,13 +13309,7 @@ def _verify_reasoning_payload(
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
-                    allowed_typed_skip_basis_refs_by_stage=(
-                        allowed_typed_skip_basis_refs_by_stage
-                        if isinstance(
-                            allowed_typed_skip_basis_refs_by_stage, dict
-                        )
-                        else None
-                    ),
+                    enforce_typed_skip_prefixes=True,
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),

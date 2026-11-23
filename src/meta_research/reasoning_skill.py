@@ -125,6 +125,19 @@ _SCIENTIFIC_EVIDENCE_KINDS = frozenset(
 _DIAGNOSTIC_EVIDENCE_KINDS = frozenset(
     {"CheckpointArtifact", "LogAsset", "AnalysisAsset"}
 )
+RESEARCH_TIME_BUDGET_UNKNOWN = "unknown"
+
+
+_REASONING_RESEARCH_TIME_GUIDANCE = (
+    "在选择下一轮题目、入口或 cycle_focus 前，先按当前内容需要读取 "
+    "advancement_engine.research_time.read，并使用返回的 status、used_seconds、"
+    "remaining_seconds、overrun_seconds、accuracy 和 unknown_intervals 判断投入的"
+    "时间代价与可辨别信息。near、over、unknown 都是规划证据，不是硬门槛；"
+    "说明它们如何改变继续、暂缓、转向或求助的取舍，不能因预算超出或计量未知"
+    "擅自拒绝已授权工作、强制收口或先申请延期。若有人类预算调整，沿同一"
+    "research_time reader 核对当前 budget_revision 和正式回执，再把变化用于后继"
+    "安排并保留计量缺口。"
+)
 
 
 class ReasoningFullConformanceAuthority(Protocol):
@@ -231,6 +244,11 @@ class ReasoningSkillRequest:
     continuation_feedback: tuple[str, ...] = ()
     continuation_predecessor_job_ref: str | None = None
     current_continuation_feedback: tuple[str, ...] | None = None
+    # Captured by the stage owner immediately before a live provider turn.
+    # This is an internal binding for the existing research_time_basis field,
+    # not a new provider output field.  Older deterministic callers leave it
+    # unset and retain the legacy validation path.
+    research_time_budget_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -340,9 +358,6 @@ def validate_reasoning_skill_draft(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
-                allowed_typed_skip_basis_refs_by_stage=(
-                    _typed_skip_basis_candidates(request)
-                ),
                 historical_resolver=request.historical_evidence_resolver,
             )
         return validate_reasoning_stage_output(
@@ -351,9 +366,7 @@ def validate_reasoning_skill_draft(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
-            allowed_typed_skip_basis_refs_by_stage=(
-                _typed_skip_basis_candidates(request)
-            ),
+            enforce_typed_skip_prefixes=True,
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, result.draft)
             ),
@@ -395,9 +408,6 @@ def validate_reasoning_autonomous_checkpoint_result(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
-                allowed_typed_skip_basis_refs_by_stage=(
-                    _typed_skip_basis_candidates(request)
-                ),
                 historical_resolver=request.historical_evidence_resolver,
             )
         )
@@ -407,9 +417,6 @@ def validate_reasoning_autonomous_checkpoint_result(
                 frozen_evidence_closure=list(request.frozen_evidence_closure),
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
-                ),
-                allowed_typed_skip_basis_refs_by_stage=(
-                    _typed_skip_basis_candidates(request)
                 ),
                 historical_resolver=request.historical_evidence_resolver,
             )
@@ -443,13 +450,17 @@ def validate_reasoning_deepfetch_decision(request: ReasoningSkillRequest, decisi
             output,
             frozen_evidence_closure=list(request.frozen_evidence_closure),
             frozen_research_context=request.context_pack["research_context"],
-            allowed_typed_skip_basis_refs_by_stage=(
-                _typed_skip_basis_candidates(request)
-            ),
             historical_resolver=request.historical_evidence_resolver,
         )
     else:
-        validate_reasoning_stage_output(output, frozen_evidence_closure=list(request.frozen_evidence_closure), frozen_research_context=request.context_pack["research_context"], historical_resolver=request.historical_evidence_resolver, allowed_typed_skip_basis_refs_by_stage=_typed_skip_basis_candidates(request), expected_completion_milestone_basis_refs=_completion_basis_for_output(request, output))
+        validate_reasoning_stage_output(
+            output,
+            frozen_evidence_closure=list(request.frozen_evidence_closure),
+            frozen_research_context=request.context_pack["research_context"],
+            enforce_typed_skip_prefixes=True,
+            historical_resolver=request.historical_evidence_resolver,
+            expected_completion_milestone_basis_refs=_completion_basis_for_output(request, output),
+        )
 
 
 def validate_reasoning_autonomous_resume_result(
@@ -482,9 +493,6 @@ def validate_reasoning_autonomous_resume_result(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
-            allowed_typed_skip_basis_refs_by_stage=(
-                _typed_skip_basis_candidates(request)
-            ),
             historical_resolver=request.historical_evidence_resolver,
         )
     )
@@ -502,9 +510,7 @@ def validate_reasoning_autonomous_resume_result(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
-            allowed_typed_skip_basis_refs_by_stage=(
-                _typed_skip_basis_candidates(request)
-            ),
+            enforce_typed_skip_prefixes=True,
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, final_output)
             ),
@@ -585,9 +591,7 @@ def validate_reasoning_skill_result(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
-                allowed_typed_skip_basis_refs_by_stage=(
-                    _typed_skip_basis_candidates(request)
-                ),
+                enforce_typed_skip_prefixes=True,
                 expected_completion_milestone_basis_refs=(
                     _completion_basis_for_output(request, result.reviewed_draft)
                 ),
@@ -602,9 +606,7 @@ def validate_reasoning_skill_result(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
-            allowed_typed_skip_basis_refs_by_stage=(
-                _typed_skip_basis_candidates(request)
-            ),
+            enforce_typed_skip_prefixes=True,
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, final_output)
             ),
@@ -811,6 +813,46 @@ def _validate_output_bindings(
         )
     ):
         raise ReasoningContractError("reasoning_skill_output_binding_mismatch")
+    expected_revision = request.research_time_budget_revision
+    if expected_revision == RESEARCH_TIME_BUDGET_UNKNOWN:
+        # The owner could not read the live budget.  Neither a self-reported
+        # revision nor its absence can be verified, so fail explicitly instead
+        # of silently disabling the guard and accepting a forged revision.
+        raise ReasoningContractError("reasoning_research_time_budget_unknown")
+    if expected_revision is None:
+        return
+    for field in ("next_cycle_proposal", "candidate_completion", "autonomous_scope"):
+        transition = output.get(field)
+        if not isinstance(transition, dict):
+            continue
+        basis = transition.get("research_time_basis")
+        if not isinstance(basis, dict):
+            raise ReasoningContractError("reasoning_research_time_basis_invalid")
+        if basis.get("budget_revision") != expected_revision:
+            raise ReasoningContractError("reasoning_research_time_budget_stale")
+
+
+def persisted_research_time_budget_revision(
+    draft: dict[str, object],
+) -> str | None:
+    """Return the owner-validated revision frozen inside a primary draft.
+
+    The generation turn validates the provider's basis against the live owner
+    snapshot before the draft is persisted.  Finalize must therefore compare
+    the persisted draft with that same frozen revision, not with a budget a
+    human may have advanced after the checkpoint was written.
+    """
+
+    for field in ("next_cycle_proposal", "candidate_completion", "autonomous_scope"):
+        transition = draft.get(field)
+        if not isinstance(transition, dict):
+            continue
+        basis = transition.get("research_time_basis")
+        if isinstance(basis, dict):
+            revision = basis.get("budget_revision")
+            if isinstance(revision, str) and revision:
+                return revision
+    return None
 
 
 def _completion_basis_for_output(
@@ -1199,7 +1241,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "affirmed | denied | uncertain | insufficient_evidence 之一，并且恰有一个 "
             "NextCycleProposal | CandidateCompletion。按上述 Skill 评估 Bundle 统一交接的"
             "建题推荐，也可从本轮结果与历史自主形成候选；保留项不逐个升级为新题。"
-            "比较已有题覆盖范围与独立研究价值后，若保留"
+            f"{_REASONING_RESEARCH_TIME_GUIDANCE}"
+            "当 provider_context_view 的 graph_binding.active_question_refs 包含当前 Question 之外的有效题目时，"
+            "先沿 research_graph.question_relations.read 或 research_graph.question_history.read 核对至少一条最有据的竞争路线；"
+            "若没有可比较的有效路线，明确记录这一判断。把候选路线的依赖、剩余工作与时间成本、"
+            "可取得的区分信息、暂缓代价及其机会成本写入 notes 或 research_synthesis，说明这些比较如何决定是否建题、"
+            "进入哪个入口以及下一轮 focus。比较已有题覆盖范围与独立研究价值后，若保留"
             "新建或分解 Question 的候选，"
             "改为返回非终态 reasoning-autonomous-checkpoint：同一 scientific_outcome 加"
             "一个 internal AutonomousQuestionScope；它只包含 reviewed question blueprint、"
@@ -1227,6 +1274,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"question_ref={request.question_ref}\n"
             f"quest_ref={request.quest_ref}\n"
             f"goal_revision_ref={request.goal_revision_ref}\n"
+            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。\n"
             f"foreground_epoch={request.foreground_epoch}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
@@ -1238,6 +1286,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "the Owner checks actual cited record IDs, not preview membership."
         ) if request.native_session_ref is None else (
             "继续当前原生会话的 Reasoning 工作。处理本次反馈，交回完整候选。\n"
+            f"goal_revision_ref={request.goal_revision_ref}\n"
             f"{lineage}"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
@@ -1405,9 +1454,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 frozen_evidence_closure=list(request.frozen_evidence_closure),
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
-                ),
-                allowed_typed_skip_basis_refs_by_stage=(
-                    _typed_skip_basis_candidates(request)
                 ),
                 historical_resolver=request.historical_evidence_resolver,
             )
@@ -1766,7 +1812,6 @@ def _reasoning_autonomous_checkpoint_schema(
     request: ReasoningSkillRequest,
 ) -> dict[str, object]:
     text = {"type": "string", "minLength": 1}
-    typed_skip_candidates = _typed_skip_basis_candidates(request)
     question_properties = {
         field: {
             "type": "string",
@@ -1796,6 +1841,13 @@ def _reasoning_autonomous_checkpoint_schema(
         },
         "is_authoritative": {"const": False},
     }
+    if request.research_time_budget_revision is not None:
+        # The contract already accepts this existing evidence field. Require
+        # it only for a live owner-bound request so deterministic fixtures keep
+        # their legacy shape while live autonomous choices remain auditable.
+        scope_base_properties["research_time_basis"] = _research_time_basis_schema(
+            request
+        )
     scope_variants = [
         {
             "type": "object",
@@ -1804,7 +1856,7 @@ def _reasoning_autonomous_checkpoint_schema(
                 **scope_base_properties,
                 "entry_stage": {"const": entry_stage},
                 "typed_skip_basis_refs_by_stage": _typed_skip_basis_schema(
-                    entry_stage, text, typed_skip_candidates
+                    entry_stage, text, enforce_stage_asset_patterns=False
                 ),
             },
             "required": [
@@ -2005,7 +2057,6 @@ def _next_cycle_proposal_schema(
     request: ReasoningSkillRequest,
 ) -> dict[str, object]:
     text = {"type": "string", "minLength": 1}
-    typed_skip_candidates = _typed_skip_basis_candidates(request)
     base_properties = {
         "schema_ref": {"const": NEXT_CYCLE_PROPOSAL_SCHEMA_REF},
         "kind": {"const": "NextCycleProposal"},
@@ -2014,6 +2065,7 @@ def _next_cycle_proposal_schema(
         "target_question_ref": {"type": "string", "minLength": 1},
         "target_question_anchor_ref": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},
+        "research_time_basis": _research_time_basis_schema(request),
     }
     return {
         "anyOf": [
@@ -2024,7 +2076,7 @@ def _next_cycle_proposal_schema(
                     **base_properties,
                     "entry_stage": {"const": entry_stage},
                     "typed_skip_basis_refs_by_stage": _typed_skip_basis_schema(
-                        entry_stage, text, typed_skip_candidates
+                        entry_stage, text, enforce_stage_asset_patterns=True
                     ),
                 },
                 "required": [
@@ -2038,14 +2090,20 @@ def _next_cycle_proposal_schema(
     }
 
 
+_TYPED_SKIP_STAGE_PATTERNS = {
+    "idea": "^idea_outcome_[A-Za-z0-9_-]+$",
+    "plan": "^formal_plan_[A-Za-z0-9_-]+$",
+}
+
+
 def _typed_skip_basis_schema(
     entry_stage: str,
     text_schema: dict[str, object],
-    candidates_by_stage: dict[str, tuple[str, ...]] | None = None,
+    *,
+    enforce_stage_asset_patterns: bool = False,
 ) -> dict[str, object]:
     stage_order = ("idea", "plan", "bundle", "reasoning")
     skipped_stages = stage_order[: stage_order.index(entry_stage)]
-    candidates_by_stage = candidates_by_stage or {}
     properties = {
         stage: {
             "type": "array",
@@ -2054,8 +2112,10 @@ def _typed_skip_basis_schema(
             "items": {
                 **text_schema,
                 **(
-                    {"enum": list(candidates_by_stage[stage])}
-                    if entry_stage != "reasoning" and stage in candidates_by_stage
+                    {"pattern": _TYPED_SKIP_STAGE_PATTERNS[stage]}
+                    if enforce_stage_asset_patterns
+                    and entry_stage != "reasoning"
+                    and stage in _TYPED_SKIP_STAGE_PATTERNS
                     else {}
                 ),
             },
@@ -2138,11 +2198,13 @@ def _typed_skip_basis_prompt(request: ReasoningSkillRequest) -> str:
     if not candidates:
         return (
             "typed_skip_basis_refs_by_stage 必须使用阶段结果的类型化引用。"
-            "进入 plan 的 idea 依据只能是 idea_outcome_*，进入 bundle 的 plan 依据只能是 formal_plan_*。\n"
+            "进入 plan 的 idea 依据只能是 idea_outcome_*，进入 bundle 的 plan 依据只能是 formal_plan_*，"
+            "不得改填 StageCommit 或 ScientificOutcome 引用。\n"
         )
     return (
-        "本次冻结上下文中可用的 typed skip basis 候选如下，必须逐字使用这些值，"
-        "不能改填对应 StageCommit 引用："
+        "当前 Cycle 已冻结的 typed skip basis 候选如下（复用当前 Question 本轮资产时逐字使用，"
+        "切勿改填 StageCommit 引用；若路由到其他已有 Question 或更早 Cycle，须填写目标 Question 对应的 "
+        "idea_outcome_* / formal_plan_*）："
         + canonical_json(candidates)
         + "\n"
     )
@@ -2166,12 +2228,90 @@ def _candidate_completion_schema(
         },
         "rationale": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},
+        "research_time_basis": _research_time_basis_schema(request),
     }
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": properties,
         "required": list(properties),
+    }
+
+
+def _research_time_basis_schema(
+    request: ReasoningSkillRequest,
+) -> dict[str, object]:
+    """Require a structured budget snapshot on every live Reasoning route."""
+
+    text = {"type": "string", "minLength": 1}
+    nonnegative_number = {"type": "number", "minimum": 0}
+    nullable_seconds = {"anyOf": [nonnegative_number, {"type": "null"}]}
+    interval = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "start": nonnegative_number,
+            "end": nonnegative_number,
+            "reason": text,
+        },
+        "required": ["start", "end", "reason"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_ref": {"const": "meta-research/research-time-basis/v1"},
+            "quest_ref": {"const": request.quest_ref},
+            "budget_revision": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "observed_at": nonnegative_number,
+            "status": {
+                "type": "string",
+                "enum": [
+                    "not_started",
+                    "running",
+                    "paused",
+                    "stopped",
+                    "completed",
+                ],
+            },
+            "accuracy": {"type": "string", "enum": ["exact", "unknown"]},
+            "used_seconds": nullable_seconds,
+            "remaining_seconds": nullable_seconds,
+            "overrun_seconds": nullable_seconds,
+            "unknown_intervals": {
+                "type": "array",
+                "items": interval,
+            },
+            "decision": {
+                "type": "string",
+                "enum": [
+                    "continue",
+                    "pause",
+                    "redirect",
+                    "ask_human",
+                    "complete",
+                    "undetermined",
+                ],
+            },
+            "decision_rationale": text,
+        },
+        "required": [
+            "schema_ref",
+            "quest_ref",
+            "budget_revision",
+            "observed_at",
+            "status",
+            "accuracy",
+            "used_seconds",
+            "remaining_seconds",
+            "overrun_seconds",
+            "unknown_intervals",
+            "decision",
+            "decision_rationale",
+        ],
     }
 
 

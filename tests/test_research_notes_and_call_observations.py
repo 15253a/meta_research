@@ -53,11 +53,13 @@ def test_reported_usage_keeps_turn_and_last_call_scopes_distinct():
 def test_signed_call_observation_keeps_existing_receipt_and_exact_compaction_locator(tmp_path):
     directory = tmp_path / "run" / "proposal" / "job"
     directory.mkdir(parents=True)
-    prompt, schema, stdout, result = [directory / name for name in (
-        "prompt.txt", "output-schema.json", "stdout.jsonl", "result.json")]
+    prompt, schema, stdout, stderr, result = [directory / name for name in (
+        "prompt.txt", "output-schema.json", "stdout.jsonl", "provider-stderr.log", "result.json")]
     prompt.write_text("真实输入", encoding="utf-8")
     schema.write_text("{}")
     result.write_text("{}")
+    stderr.write_bytes(b"workspace routing discovery failed\n")
+    (directory / "supervisor-heartbeat.json").write_text("heartbeat", encoding="utf-8")
     events = [{"type": "thread.started", "thread_id": "native"},
               {"type": "context_compacted", "summary": "uncertain: missing independent cohort"},
               {"type": "turn.completed", "usage": {"input_tokens": 1000,
@@ -67,6 +69,7 @@ def test_signed_call_observation_keeps_existing_receipt_and_exact_compaction_loc
     receipt_path, key = directory / "supervisor-exit.json", b"k" * 32
     write_exit_receipt(receipt_path, process_tree=closed_tree_fixture(), key=key, invocation_hash="a" * 64,
         prompt_path=prompt, schema_path=schema, stdout_path=stdout, result_path=result,
+        stderr_path=stderr,
         returncode=0, input_bytes=len(prompt.read_bytes()))
     receipt, _ = read_verified_exit_receipt(receipt_path, key=key, invocation_hash="a" * 64,
         prompt_path=prompt, schema_path=schema, stdout_path=stdout, result_path=result)
@@ -74,6 +77,13 @@ def test_signed_call_observation_keeps_existing_receipt_and_exact_compaction_loc
     observation = read_transport_envelope(directory / "call-observation.json", key)
     assert observation["prompt_utf8_bytes"] == len(prompt.read_bytes())
     assert observation["model_call_usage_available"] is False
+    assert observation["provider_stderr"] == {
+        "status": "available",
+        "observed_bytes": len(stderr.read_bytes()),
+        "sha256": hashlib.sha256(stderr.read_bytes()).hexdigest(),
+        "limited": False,
+        "exact_content_source": "provider-stderr.log bytes at provider operation",
+    }
     assert observation["usage_events"][0]["input_tokens"] == 1000
     compacted = observation["compactions"][0]
     source = raw[compacted["source_byte_offset"]:][:compacted["source_line_bytes"]]
@@ -84,12 +94,41 @@ def test_signed_call_observation_keeps_existing_receipt_and_exact_compaction_loc
     # Harness summaries retain only metadata; only the durable sidecar keeps the event.
     assert "event" not in compaction_observation(events[1])
     _remove_durable_job(directory)
-    assert not stdout.exists() and not directory.exists()
+    assert not stdout.exists() and not (directory / "supervisor-heartbeat.json").exists()
+    assert not directory.exists()
     archived = read_transport_envelope(
         tmp_path / "provider-observations/proposal/job-call-observation.json", key)
     recovered = archived["compactions"][0]
     assert recovered["event"] == events[1]
     assert canonical_hash(recovered["event"]) == recovered["event_content_sha256"]
+
+
+def test_observation_failure_leaves_signed_actionable_gap(tmp_path, monkeypatch):
+    directory = tmp_path / "run" / "proposal" / "job"
+    directory.mkdir(parents=True)
+    prompt, schema, stdout, result = [directory / name for name in (
+        "prompt.txt", "output-schema.json", "stdout.jsonl", "result.json")]
+    prompt.write_text("observe", encoding="utf-8")
+    schema.write_text("{}", encoding="utf-8")
+    stdout.write_text("{}\n", encoding="utf-8")
+    result.write_text("{}", encoding="utf-8")
+    import meta_research.provider_call_observations as observations
+    monkeypatch.setattr(observations, "observe_provider_files",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("fixture")))
+    key = b"k" * 32
+    write_exit_receipt(directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key,
+        invocation_hash="b" * 64, prompt_path=prompt, schema_path=schema, stdout_path=stdout,
+        result_path=result, returncode=0, input_bytes=len(prompt.read_bytes()))
+    gap = read_transport_envelope(directory / "call-observation.json", key)
+    assert gap == {
+        "schema_ref": "meta-research/provider-call-observation-unavailable/v1",
+        "invocation_hash": "b" * 64,
+        "status": "unavailable",
+        "failure_code": "provider_observation_io_error",
+        "failure_stage": "observe_provider_files",
+        "owner": "harness",
+        "next_action": "preserve_exit_receipt_and_reconcile_observation_before_using_usage_evidence",
+    }
 
 
 def test_persisted_compaction_content_respects_event_and_line_limits(tmp_path):
@@ -105,6 +144,23 @@ def test_persisted_compaction_content_respects_event_and_line_limits(tmp_path):
         "summary": "x" * (8 * 1024 * 1024)}).encode() + b"\n")
     oversized = observe_provider_files(prompt, stdout)
     assert oversized["limited"] is True and oversized["compactions"] == []
+
+
+def test_provider_stderr_observation_keeps_binary_bytes_and_hash(tmp_path):
+    prompt, stdout, stderr = [tmp_path / name for name in (
+        "prompt.txt", "stdout.jsonl", "provider-stderr.log")]
+    prompt.write_text("observe the error stream")
+    stdout.write_bytes(b"{}\n")
+    raw = b"\xffroute\x00failed"
+    stderr.write_bytes(raw)
+    observation = observe_provider_files(prompt, stdout, stderr_path=stderr)
+    assert observation["provider_stderr"] == {
+        "status": "available",
+        "observed_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "limited": False,
+        "exact_content_source": "provider-stderr.log bytes at provider operation",
+    }
 
 
 def test_signed_native_session_sample_survives_append_and_proposal_cleanup(tmp_path):
@@ -137,9 +193,16 @@ def test_signed_native_session_sample_survives_append_and_proposal_cleanup(tmp_p
     key = b"k" * 32
     write_exit_receipt(directory / "supervisor-exit.json", process_tree=closed_tree_fixture(), key=key, invocation_hash="a" * 64,
         prompt_path=prompt, schema_path=schema, stdout_path=stdout, result_path=result,
-        returncode=0, input_bytes=len(prompt.read_bytes()), codex_home=tmp_path / "codex-home")
+        returncode=0, input_bytes=len(prompt.read_bytes()), codex_home=tmp_path / "codex-home",
+        operation_scope={"run_ref": "run-1", "root_session_ref": "root-1",
+                         "root_kind": "target", "job_ref": "job-1",
+                         "model_ref": "gpt-target-test"})
     observation = read_transport_envelope(directory / "call-observation.json", key)
     sample = observation["native_session"]
+    assert observation["provider_stderr"] == {
+        "status": "unavailable",
+        "reason": "stderr_file_missing",
+    }
     assert observation["model_call_usage_available"] is True
     assert sample["status"] == "available" and sample["session_id"] == session
     assert sample["observed_prefix_bytes"] == len(raw)
@@ -150,6 +213,31 @@ def test_signed_native_session_sample_survives_append_and_proposal_cleanup(tmp_p
     assert len(sample["last_token_usage_snapshots"]) == 1 and sample["duplicate_token_snapshots"] == 1
     assert sample["model_context_windows"] == [258400]
     assert sample["compactions"][0]["event"] == compacted
+    ledger = observation["session_usage_ledger"]
+    assert ledger["schema_ref"] == "meta-research/session-usage-ledger/v1"
+    assert ledger["prompt"]["current_operation_utf8_bytes"] == len(
+        "Research within the selected Target.".encode())
+    assert ledger["prompt"]["first_business_prompt_utf8_bytes"] is None
+    assert ledger["operation_binding"] == {
+        "status": "available",
+        "source": "signed_provider_operation_scope",
+        "run_ref": "run-1",
+        "root_session_ref": "root-1",
+        "root_kind": "target",
+        "job_ref": "job-1",
+        "model_ref": "gpt-target-test",
+    }
+    assert ledger["root_session"]["first_model_request_input_tokens"] == 241036
+    assert ledger["root_session"]["peak_single_request_input_tokens"] == 241036
+    assert ledger["root_session"]["cumulative_input_tokens_observed"] == 241036
+    assert ledger["root_session"]["cumulative_output_tokens_observed"] == 762
+    assert ledger["root_session"]["peak_cached_prefix_tokens_observed"] == 240000
+    assert ledger["root_session"]["model_context_windows_observed"] == [258400]
+    assert ledger["root_session"]["cached_prefix_counts_toward_context_window"] is True
+    assert ledger["root_session"]["compactions"][0]["source_sequence"] == 6
+    assert ledger["child_sessions"]["status"] == "unknown_child_usage_not_bound_to_call_observation"
+    assert ledger["coverage"]["cumulative_scope"] == (
+        "sum_of_deduplicated_usage_records; provider_semantics_unverified")
     native.write_bytes(raw + canonical_json({**response, "timestamp": "later"}).encode() + b"\n")
     _remove_durable_job(directory)
     archived = read_transport_envelope(tmp_path / "provider-observations/proposal/job-call-observation.json", key)
@@ -183,6 +271,35 @@ def test_native_session_authentication_and_bounded_sampling_keep_stdout_fallback
     assert prefix["compactions"] == []
     monkeypatch.setattr(observations, "_NATIVE_PREFIX_LIMIT", 5)
     assert observe_provider_files(prompt, stdout, codex_home=tmp_path / "codex-home")["native_session"]["status"] == "unavailable"
+
+
+def test_session_usage_ledger_uses_total_snapshot_without_response_records(tmp_path):
+    session = "01a09bb2-95ed-7931-bd38-3b8ebd2de28b"
+    native = tmp_path / "codex-home/sessions/2026/09/13" / (
+        "rollout-2026-09-13T16-56-07-" + session + ".jsonl")
+    native.parent.mkdir(parents=True)
+    last = {"input_tokens": 1500, "cached_input_tokens": 1200, "output_tokens": 60}
+    total = {"input_tokens": 3000, "cached_input_tokens": 2400, "output_tokens": 120}
+    events = [
+        {"type": "session_meta", "payload": {"id": session}},
+        {"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": last, "total_token_usage": total,
+            "model_context_window": 258400}}},
+    ]
+    native.write_bytes(b"".join(canonical_json(event).encode() + b"\n" for event in events))
+    prompt, stdout = tmp_path / "prompt", tmp_path / "stdout"
+    prompt.write_text("root prompt", encoding="utf-8")
+    stdout.write_text(canonical_json({"type": "thread.started", "thread_id": session}) + "\n",
+                      encoding="utf-8")
+    observation = observe_provider_files(prompt, stdout, codex_home=tmp_path / "codex-home")
+    ledger = observation["session_usage_ledger"]
+    assert ledger["coverage"]["model_usage_source"] == "native_last_usage_snapshots"
+    assert ledger["root_session"]["first_model_request_input_tokens"] == 1500
+    assert ledger["root_session"]["peak_single_request_input_tokens"] == 1500
+    assert ledger["root_session"]["cumulative_input_tokens_observed"] == 3000
+    assert ledger["root_session"]["cumulative_output_tokens_observed"] == 120
+    assert ledger["root_session"]["model_request_count_observed"] is None
+    assert ledger["coverage"]["cumulative_scope"] == "latest_native_total_token_usage_snapshot"
 
 
 def test_required_current_contract_and_selected_inputs_survive_context_budget(caplog):

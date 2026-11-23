@@ -249,6 +249,7 @@ class _DeterministicPlanSkill:
             "idea_set_ref": request.idea_set_ref,
             "context_pack_ref": request.context_pack_ref,
             "answer_contract": contract,
+            "evidence_accounting": [],
             "evidence_reuse_set": evidence_reuse_set,
             "coverage": [coverage],
             "gap_set": [] if self.no_gap else ["rare-morphology-comparison"],

@@ -30,7 +30,13 @@ class _SupervisedPlan(CodexPlanSkillAdapter):
     def generate_draft(self, request):
         self.primary_calls += 1
         draft = _DeterministicPlanSkill(no_gap=False).generate_draft(request)
-        (self.root / 'next-output.json').write_text(json.dumps({'plan':draft.draft}))
+        provider_plan = dict(draft.draft)
+        provider_plan['selected_evidence_bindings'] = getattr(
+            self, 'selected_evidence_bindings', []
+        )
+        (self.root / 'next-output.json').write_text(
+            json.dumps({'plan': provider_plan})
+        )
         return super().generate_draft(request)
 
 

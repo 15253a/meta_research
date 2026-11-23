@@ -132,6 +132,7 @@ def stopped_operation(tmp_path, monkeypatch):
         "bridge_arguments",
         "invocation_hash",
         "prompt_path",
+        "invalid_operation_scope",
         "unexpected_field",
         "missing_request",
     ),
@@ -158,6 +159,8 @@ def test_terminal_replay_rejects_untrusted_or_different_request(
             request["invocation_hash"] = "f" * 64
         elif damage == "prompt_path":
             request["prompt_path"] = str(request_path.with_name("other-prompt.txt"))
+        elif damage == "invalid_operation_scope":
+            request["operation_scope"] = {"unexpected_scope_field": "value"}
         else:
             request["unexpected_field"] = True
         request_path.unlink()

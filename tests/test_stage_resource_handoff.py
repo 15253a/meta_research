@@ -174,7 +174,7 @@ def test_bundle_registers_one_original_for_dataset_and_environment_and_successor
         successor, _ = gateway.issue_channel(run_ref=scope["run_ref"], attempt_ref=scope["attempt_ref"],
             root_session_ref=scope["root_session_ref"], fence_ref=scope["fence_ref"],
             capability_binding_hash=scope["runtime_binding_hash"], root_kind="companion", phase="primary",
-            operation_ids=ROOT_AGENT_SEMANTIC_OPERATION_IDS["companion"])
+                operation_ids=gateway.operation_ids)
 
         def read(operation, **arguments):
             _, response = gateway.dispatch(successor.token, {"jsonrpc": "2.0", "id": 1,

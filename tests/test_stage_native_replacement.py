@@ -1,6 +1,9 @@
 """A proven missing native session permits one fenced replacement, never replay."""
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
+import json
+import threading
 
 import pytest
 
@@ -179,6 +182,101 @@ def test_reconciled_terminal_native_turn_corrects_in_the_same_native_root(tmp_pa
                 {"ref": feedback["safe_point_ref"]}).scalar_one()
         import json
         assert json.loads(point)["provider_exit"] == proof
+    finally:
+        runtime.close()
+
+
+def test_repeated_native_terminal_diagnostic_fences_the_successor(tmp_path):
+    runtime, _, request, old, invocation, proof = _active_revision(tmp_path)
+    try:
+        owner = runtime.owners.agent_runtime
+        proof = {key: value for key, value in proof.items()
+            if key not in {"error_code", "error_response_hash"}}
+        proof.update(schema_ref="meta-research/provider-native-turn-terminal/v1",
+            result_file_hash=None,
+            supervisor_invocation_hash=proof["invocation_hash"],
+            native_start_hash="a" * 64, native_reconciliation_hash="b" * 64,
+            native_turn_ref="native-turn:first", native_turn_status="failed",
+            native_error={"message": "workspace routing discovery failed"})
+        owner.record_stage_provider_hard_ceiling(unit_ref=invocation.invocation_ref,
+            run_ref=old.run_ref, attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
+            failure_code="codex_operation_failed", provider_exit=proof)
+        successor = owner.query_idea_stage_run(request.request_ref)
+        successor_invocation = successor.primary_invocation
+        owner.begin_provider_unit(unit_ref=successor_invocation.invocation_ref,
+            operation_ref=successor_invocation.operation_ref, run_ref=successor.run_ref,
+            attempt_ref=successor.attempt_ref, fence_ref=successor.fence_ref,
+            unit_kind="idea_primary")
+        repeated = dict(proof, native_turn_ref="native-turn:second")
+        owner.record_stage_provider_hard_ceiling(
+            unit_ref=successor_invocation.invocation_ref,
+            run_ref=successor.run_ref, attempt_ref=successor.attempt_ref,
+            fence_ref=successor.fence_ref, failure_code="codex_operation_failed",
+            provider_exit=repeated)
+        current = owner.query_idea_stage_run(request.request_ref)
+        assert current.status == "suspended_fenced"
+        assert current.failure_code == "codex_operation_failed"
+        assert current.recovery_checkpoint is not None
+        checkpoint = current.recovery_checkpoint["checkpoint"]
+        assert checkpoint["action"] == "provider_hard_ceiling"
+        assert checkpoint["provider_operation_retry_permitted"] is False
+        assert checkpoint["provider_exit"] == repeated
+        assert current.attempt_ref == successor.attempt_ref
+    finally:
+        runtime.close()
+
+
+def test_concurrent_native_terminal_diagnostics_create_one_successor(tmp_path, monkeypatch):
+    runtime, _, request, old, invocation, proof = _active_revision(tmp_path)
+    try:
+        owner = runtime.owners.agent_runtime
+        proof = {key: value for key, value in proof.items()
+            if key not in {"error_code", "error_response_hash"}}
+        proof.update(schema_ref="meta-research/provider-native-turn-terminal/v1",
+            result_file_hash=None, supervisor_invocation_hash=proof["invocation_hash"],
+            native_start_hash="a" * 64, native_reconciliation_hash="b" * 64,
+            native_turn_ref="native-turn:concurrent", native_turn_status="failed",
+            native_error={"message": "workspace routing discovery failed"})
+        barrier = threading.Barrier(2)
+
+        def precheck(*, run_ref, provider_exit):
+            assert run_ref == old.run_ref
+            barrier.wait(timeout=10)
+            return False
+
+        monkeypatch.setattr(owner, "_has_repeated_native_terminal_error", precheck)
+
+        def record():
+            try:
+                owner.record_stage_provider_hard_ceiling(
+                    unit_ref=invocation.invocation_ref, run_ref=old.run_ref,
+                    attempt_ref=old.attempt_ref, fence_ref=old.fence_ref,
+                    failure_code="codex_operation_failed", provider_exit=proof)
+            except OwnerConflict as error:
+                return error.code
+            return None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _: record(), range(2)))
+
+        assert sorted(outcomes, key=lambda value: value or "") == [
+            None, "stage_provider_correction_stale"
+        ]
+        current = owner.query_idea_stage_run(request.request_ref)
+        assert current.attempt_ref != old.attempt_ref
+        from sqlalchemy import text
+        with runtime._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT checkpoint_json FROM ar_safe_points WHERE run_ref=:run"
+            ), {"run": old.run_ref}).all()
+            boundary_rows = connection.execute(text(
+                "SELECT boundary, owner_evidence_ref FROM ar_runtime_boundary_receipts "
+                "WHERE owner_evidence_ref LIKE 'stage_provider_correction_%'"
+            )).all()
+        actions = [json.loads(row[0])["action"] for row in rows]
+        assert actions.count("provider_result_correction") == 1
+        assert len(boundary_rows) == 1
+        assert boundary_rows[0][0] == "terminal"
     finally:
         runtime.close()
 
