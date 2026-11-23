@@ -86,6 +86,8 @@ def _audit_identity(facts: Mapping[str, Any]) -> str:
 
 
 def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
+    if code in {"provider_auth_revoked", "provider_authentication_required"}:
+        return RecoveryOwner.OPERATOR
     if code == "mcp_channel_authentication_required":
         return RecoveryOwner.OPERATOR
     if code == "capability_unavailable" and details.get("reason") in {"not_granted", "not_registered"}:
@@ -100,6 +102,8 @@ def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
 
 
 def _status_for(code: str, details: Mapping[str, Any], *, effect: bool) -> EffectStatus:
+    if code in {"provider_auth_revoked", "provider_authentication_required"}:
+        return EffectStatus.REJECTED
     if "fence_stale" in code or code in {"attempt_fence_stale", "stale_fence"}:
         return EffectStatus.STALE
     raw = details.get("effect_status")
@@ -292,6 +296,8 @@ def error_contract_from_legacy(
     ):
         next_action = NextAction(str(raw["next_action"]))
     correction = raw.get("correction") if isinstance(raw.get("correction"), str) else None
+    if code in {"provider_auth_revoked", "provider_authentication_required"} and correction is None:
+        correction = "Refresh the Provider authentication and rerun the failed operation after the Owner confirms the new credential."
     if status is EffectStatus.NOT_STARTED and agent and (
         correction is None or "unknown" in correction.lower()
     ):

@@ -362,6 +362,23 @@ def _candidate_completion() -> dict[str, object]:
     }
 
 
+def _research_time_basis() -> dict[str, object]:
+    return {
+        "schema_ref": "meta-research/research-time-basis/v1",
+        "quest_ref": "quest:1",
+        "budget_revision": "0" * 64,
+        "observed_at": 1_735_000_000.0,
+        "status": "running",
+        "accuracy": "exact",
+        "used_seconds": 120.0,
+        "remaining_seconds": 480.0,
+        "overrun_seconds": None,
+        "unknown_intervals": [],
+        "decision": "continue",
+        "decision_rationale": "The remaining budget supports the next bounded comparison.",
+    }
+
+
 def _stage_output(*, completion: bool = False) -> dict[str, object]:
     return {
         "schema_ref": REASONING_STAGE_OUTPUT_SCHEMA_REF,
@@ -728,6 +745,30 @@ def test_conclusive_or_uncertain_outcome_accepts_a_formal_metric_result(
     assert len(outcome_hash) == 64
 
 
+def test_causal_attribution_failure_explains_selected_evidence_boundary() -> None:
+    outcome = _scientific_outcome()
+    outcome["causal_interpretation"]["attribution_basis_refs"] = [
+        "metric-result:unselected",
+    ]
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="scientific_outcome_causal_interpretation_invalid",
+    ) as caught:
+        validate_scientific_outcome(
+            outcome,
+            frozen_evidence_closure=_literature_closure(),
+            frozen_research_context=_research_context(),
+        )
+
+    assert (
+        "attribution_basis_refs must reference selected evidence refs"
+        in caught.value.feedback
+    )
+    assert "metric-result:unselected" in caught.value.feedback
+    assert "literature-record:1" in caught.value.feedback
+
+
 @pytest.mark.parametrize("kind", ["LogAsset", "AnalysisAsset", "CheckpointArtifact"])
 @pytest.mark.parametrize("finding", ["supporting", "negative", "partial"])
 def test_material_category_does_not_restrict_scientific_finding(
@@ -913,6 +954,44 @@ def test_reasoning_transition_requires_exactly_one_candidate() -> None:
             next_cycle=next_cycle,
             candidate_completion=completion,
         )
+
+
+def test_reasoning_transition_accepts_a_bound_budget_basis() -> None:
+    proposal = _next_cycle_proposal()
+    proposal["research_time_basis"] = _research_time_basis()
+
+    assert len(validate_reasoning_transition(
+        _scientific_outcome(), next_cycle=proposal,
+    )) == 64
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda basis: basis.update({"quest_ref": "quest:other"}),
+        lambda basis: basis.update({"budget_revision": "G" * 64}),
+        lambda basis: basis.update({"observed_at": float("nan")}),
+        lambda basis: basis.update({
+            "unknown_intervals": [{"start": 3.0, "end": 2.0, "reason": "bad"}],
+        }),
+        lambda basis: basis.update({
+            "accuracy": "exact",
+            "unknown_intervals": [{"start": 1.0, "end": 2.0, "reason": "clock gap"}],
+        }),
+        lambda basis: basis.update({"decision_rationale": "  "}),
+    ],
+)
+def test_reasoning_transition_rejects_an_invalid_budget_basis(mutate) -> None:
+    proposal = _next_cycle_proposal()
+    basis = _research_time_basis()
+    mutate(basis)
+    proposal["research_time_basis"] = basis
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="reasoning_research_time_basis_invalid",
+    ):
+        validate_reasoning_transition(_scientific_outcome(), next_cycle=proposal)
 
 
 @pytest.mark.parametrize("completion", [False, True])

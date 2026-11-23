@@ -10,10 +10,12 @@ def bind_page(scope, revision, *, offset=0, query_revision=None):
     current = canonical_hash({'scope': scope, 'owner_revision': revision})
     if offset and query_revision is None:
         raise OwnerConflict('research_query_revision_required', {
+            'recovery_owner': 'agent',
             'path': ['query_revision'], 'message': 'A continuation needs the first page query_revision.',
             'correction': 'Keep that query_revision, filters and limit; otherwise restart at offset=0.'})
     if query_revision is not None and query_revision != current:
         raise OwnerConflict('research_query_changed', {
+            'recovery_owner': 'agent',
             'path': ['offset'], 'message': 'The query or source revision no longer matches.',
             'correction': 'Restart at offset=0 without query_revision; use the new page revision for continuation.'})
     return current

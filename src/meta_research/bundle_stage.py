@@ -60,6 +60,7 @@ from meta_research.bundle_skill import (
 from meta_research.bundle_target_contract import (
     BundleTargetContractError,
     normalized_completion_contract_from_dict,
+    primary_metric_overlap_feedback,
 )
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
@@ -3005,6 +3006,8 @@ class BundleStageWorker:
                         candidate=asdict(draft),
                         failure_code=failure_code,
                         detail_code=str(error),
+                        feedback=(primary_metric_overlap_feedback(error),)
+                        if str(error) == "protocol_metric_sets_overlap" else (),
                     )
                     provider_safe = False
                     self._observation = BundleObservation("failure", failure_code)
@@ -3227,6 +3230,7 @@ class BundleStageWorker:
         candidate: dict[str, object],
         failure_code: str,
         detail_code: str,
+        feedback: tuple[str, ...] = (),
     ) -> None:
         reject = (self._agent_runtime.reject_stage_local_candidate
                   if operation_name == "local" else self._agent_runtime.reject_stage_completion_candidate)
@@ -3242,7 +3246,7 @@ class BundleStageWorker:
             candidate={"phase": operation_name, "result": candidate},
             reason_code=failure_code,
             detail_code=detail_code,
-            feedback=(
+            feedback=feedback or (
                 "Return a corrected structured completion that satisfies "
                 f"{detail_code}, then resubmit it in this Root Session.",
             ),

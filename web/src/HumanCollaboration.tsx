@@ -463,9 +463,13 @@ export function QuestCompanion({
   const softConstraints = scopeRef
     ? companion?.soft_constraints.filter((item) => item.scope_ref === scopeRef) ?? []
     : [];
+  const activeConstraints = softConstraints.filter((item) => item.status === "active");
+  const withdrawnConstraints = softConstraints.filter((item) => item.status !== "active");
   const agentProposals = scopeRef
     ? companion?.agent_proposals.filter((item) => item.scope_ref === scopeRef && item.status !== "dismissed") ?? []
     : [];
+  const pendingProposals = agentProposals.filter((item) => item.status === "proposed");
+  const resolvedProposals = agentProposals.filter((item) => item.status !== "proposed");
   const commands = collaboration?.commands.items.filter((item) =>
     (item.scope_ref === scopeRef || item.scope_ref === "runtime:telemetry")
     && ["capability_authorization", "research_control"].includes(
@@ -480,6 +484,7 @@ export function QuestCompanion({
   const pendingCommands = commands.filter(command => !commandResolved(command));
   const completedCommands = commands.filter(commandResolved);
   const [operationHistoryOpen, setOperationHistoryOpen] = useState(false);
+  const [guidanceHistoryOpen, setGuidanceHistoryOpen] = useState(false);
   const broadAuthorizationHistory = scopeRef
     ? collaboration?.commands.authorizations.filter((item) =>
       item.scope_ref === scopeRef
@@ -498,6 +503,7 @@ export function QuestCompanion({
   useEffect(() => {
     setVisibleMessageCount(COMPANION_MESSAGE_PAGE_SIZE);
     setOperationHistoryOpen(false);
+    setGuidanceHistoryOpen(false);
   }, [scopeRef]);
 
   const newestMessageRef = visibleOptimisticMessages.at(-1)?.localRef
@@ -618,19 +624,36 @@ export function QuestCompanion({
             className="lumen-message lumen-question-context"
             data-testid="companion-question-context"
           >
-            <small>选中问题 · 只读上下文</small>
-            <b>{questionContext.title ?? questionContext.question_ref}</b>
-            <p>{questionContext.unknown_statement ?? "这个问题暂时没有更多说明。"}</p>
+            <details className="assistant-fold">
+              <summary className="assistant-fold-summary">
+                <span className="assistant-fold-head">
+                  <small>选中问题 · 只读上下文</small>
+                  <b>{questionContext.title ?? questionContext.question_ref}</b>
+                </span>
+              </summary>
+              <div className="assistant-fold-body">
+                <p>{questionContext.unknown_statement ?? "这个问题暂时没有更多说明。"}</p>
+              </div>
+            </details>
           </article>
         ) : null}
         {attention ? (
           <article className="lumen-human-attention">
-            <small>需要你 · {scopeLabel(attention)}</small>
-            <b>{requestCopy[attention.kind].list}需要你处理</b>
-            <p>{attention.obligation}</p>
-            <button type="button" onClick={() => onOpenRequest(attention.request_ref)}>
-              查看请求
-            </button>
+            <details className="assistant-fold">
+              <summary className="assistant-fold-summary">
+                <span className="assistant-fold-head">
+                  <small>需要你 · {scopeLabel(attention)}</small>
+                  <b>{requestCopy[attention.kind].list}需要你处理</b>
+                </span>
+                {attention.obligation ? <span className="assistant-fold-preview">{attention.obligation}</span> : null}
+              </summary>
+              <div className="assistant-fold-body">
+                <p>{attention.obligation}</p>
+                <button type="button" onClick={() => onOpenRequest(attention.request_ref)}>
+                  查看请求
+                </button>
+              </div>
+            </details>
           </article>
         ) : null}
         {hiddenMessageCount ? (
@@ -648,6 +671,28 @@ export function QuestCompanion({
           const pending = message.status === "queued"
             || message.status === "processing"
             || message.status === "running";
+          if (message.role === "system") {
+            const systemText = messageText(message);
+            return (
+              <article
+                key={message.message_ref ?? `system-${index}`}
+                className="lumen-message lumen-system-message"
+                data-message-status={message.status}
+              >
+                <details className="assistant-fold">
+                  <summary className="assistant-fold-summary">
+                    <span className="assistant-fold-head">
+                      <small>状态</small>
+                    </span>
+                    {systemText ? <span className="assistant-fold-preview">{systemText}</span> : null}
+                  </summary>
+                  <div className="assistant-fold-body">
+                    <CompanionHumanMessage message={message} />
+                  </div>
+                </details>
+              </article>
+            );
+          }
           return (
             <article
               key={message.message_ref ?? `${message.role}-${index}`}
@@ -657,9 +702,7 @@ export function QuestCompanion({
               <small>
                 {message.role === "user"
                   ? "你"
-                  : message.role === "system"
-                    ? "状态"
-                    : "研究助手"}
+                  : "研究助手"}
               </small>
               {message.role === "assistant" ? (
                 <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
@@ -700,30 +743,10 @@ export function QuestCompanion({
             <PendingCompanionReply message={message} onChanged={onChanged} />
           </article>
         ))}
-        {ready ? softConstraints.map((constraint, index) => (
-          <SoftConstraintCard
-            key={constraint.constraint_ref ?? `constraint-${index}`}
-            constraint={constraint}
-            onChanged={onChanged}
-            alignment={goalAlignment.find((item) =>
-              item.guide_ref.constraint_ref === constraint.constraint_ref
-              && item.guide_ref.revision === constraint.revision
-              && (!constraint.guidance_hash
-                || item.guide_ref.guidance_hash === constraint.guidance_hash)
-            ) ?? null}
-          />
-        )) : null}
-        {ready ? agentProposals.map((proposal, index) => (
+        {ready ? pendingProposals.map((proposal, index) => (
           <AgentProposalCard
             key={proposal.proposal_ref ?? `proposal-${index}`}
             proposal={proposal}
-            onChanged={onChanged}
-          />
-        )) : null}
-        {ready ? broadResearchAuthorizations.map((authorization) => (
-          <BroadResearchAuthorizationCard
-            key={authorization.authorization_ref}
-            authorization={authorization}
             onChanged={onChanged}
           />
         )) : null}
@@ -736,6 +759,54 @@ export function QuestCompanion({
             onResolved={() => setOperationHistoryOpen(true)}
           />
         )) : null}
+        {ready ? activeConstraints.map((constraint, index) => (
+          <SoftConstraintCard
+            key={constraint.constraint_ref ?? `constraint-${index}`}
+            constraint={constraint}
+            onChanged={onChanged}
+            alignment={goalAlignment.find((item) =>
+              item.guide_ref.constraint_ref === constraint.constraint_ref
+              && item.guide_ref.revision === constraint.revision
+              && (!constraint.guidance_hash
+                || item.guide_ref.guidance_hash === constraint.guidance_hash)
+            ) ?? null}
+          />
+        )) : null}
+        {ready ? broadResearchAuthorizations.map((authorization) => (
+          <BroadResearchAuthorizationCard
+            key={authorization.authorization_ref}
+            authorization={authorization}
+            onChanged={onChanged}
+          />
+        )) : null}
+        {ready && (resolvedProposals.length + withdrawnConstraints.length > 0) ? (
+          <details className="assistant-operation-history" open={guidanceHistoryOpen}
+            onToggle={event => setGuidanceHistoryOpen(event.currentTarget.open)}>
+            <summary><span>历史建议与已撤回指导</span><span>{resolvedProposals.length + withdrawnConstraints.length}</span></summary>
+            <div>
+              {resolvedProposals.map((proposal, index) => (
+                <AgentProposalCard
+                  key={proposal.proposal_ref ?? `resolved-proposal-${index}`}
+                  proposal={proposal}
+                  onChanged={onChanged}
+                />
+              ))}
+              {withdrawnConstraints.map((constraint, index) => (
+                <SoftConstraintCard
+                  key={constraint.constraint_ref ?? `withdrawn-constraint-${index}`}
+                  constraint={constraint}
+                  onChanged={onChanged}
+                  alignment={goalAlignment.find((item) =>
+                    item.guide_ref.constraint_ref === constraint.constraint_ref
+                    && item.guide_ref.revision === constraint.revision
+                    && (!constraint.guidance_hash
+                      || item.guide_ref.guidance_hash === constraint.guidance_hash)
+                  ) ?? null}
+                />
+              ))}
+            </div>
+          </details>
+        ) : null}
         {ready && completedCommands.length ? <details className="assistant-operation-history" open={operationHistoryOpen}
           onToggle={event => setOperationHistoryOpen(event.currentTarget.open)}>
           <summary><span>已处理操作</span><span>{completedCommands.length}</span></summary>
@@ -1661,20 +1732,28 @@ function BroadResearchAuthorizationCard({
   };
   return (
     <article className="lumen-command lumen-broad-authorization">
-      <small>当前研究授权</small>
-      <b>常规、可撤销的本地研究已授权</b>
-      <p>如需撤销，先查看影响并确认后才会生效。</p>
-      <details>
-        <summary>查看授权详情</summary>
-        <dl>
-          <div><dt>研究任务</dt><dd>{questRef}</dd></div>
-          <div><dt>授权凭证</dt><dd>{authorization.receipt_ref}</dd></div>
-        </dl>
+      <details className="assistant-fold">
+        <summary className="assistant-fold-summary">
+          <span className="assistant-fold-head">
+            <small>当前研究授权</small>
+            <b>常规、可撤销的本地研究已授权</b>
+          </span>
+        </summary>
+        <div className="assistant-fold-body">
+          <p>如需撤销，先查看影响并确认后才会生效。</p>
+          <details>
+            <summary>查看授权详情</summary>
+            <dl>
+              <div><dt>研究任务</dt><dd>{questRef}</dd></div>
+              <div><dt>授权凭证</dt><dd>{authorization.receipt_ref}</dd></div>
+            </dl>
+          </details>
+          <button type="button" disabled={pending || created} onClick={() => void createRevokeDraft()}>
+            {created ? "撤销草案已建立，请审阅" : pending ? "正在准备撤销草案…" : "申请撤销授权"}
+          </button>
+          {error ? <small role="alert">{error}</small> : null}
+        </div>
       </details>
-      <button type="button" disabled={pending || created} onClick={() => void createRevokeDraft()}>
-        {created ? "撤销草案已建立，请审阅" : pending ? "正在准备撤销草案…" : "申请撤销授权"}
-      </button>
-      {error ? <small role="alert">{error}</small> : null}
     </article>
   );
 }
@@ -1788,136 +1867,146 @@ function HumanCommandCard({
       },
     }));
   };
+  const statusText = authorization ? "权限操作已记录" : command.executed ? "已执行" : command.status === "cancelled" ? "已取消" : command.confirmation_receipt ? "已确认 · 待执行" : "待确认 · 尚未执行";
+  const titleText = controlCommand
+    ? researchControlLabels[controlCommand.payload.action]
+    : capabilityCommand
+      ? `${{ granted: "授予权限", denied: "拒绝权限", revoked: "撤销权限" }[capabilityCommand.payload.decision]} · ${capabilityCommand.payload.capability}`
+      : "操作草案";
+  const scopeSummary = controlCommand
+    ? `作用范围 · ${controlCommand.payload.target.target_question_ref ? "所选问题" : controlCommand.payload.target.target_scope === "run" ? "所选执行" : controlCommand.payload.target.target_scope === "stage" ? "所选阶段" : "所选轮次"}`
+    : null;
   return (
     <article className="lumen-command" data-command-status={command.status} data-command-resolved={resolved} data-command-ref={command.intent_id}>
-      <small>{authorization ? "权限操作已记录" : command.executed ? "已执行" : command.status === "cancelled" ? "已取消" : command.confirmation_receipt ? "已确认 · 待执行" : "待确认 · 尚未执行"}</small>
-      {controlCommand ? (
-        <>
-          <b>{researchControlLabels[controlCommand.payload.action]}</b>
-          <p>作用范围 · {controlCommand.payload.target.target_question_ref ? "所选问题" : controlCommand.payload.target.target_scope === "run" ? "所选执行" : controlCommand.payload.target.target_scope === "stage" ? "所选阶段" : "所选轮次"}</p>
-        </>
-      ) : capabilityCommand ? (
-        <>
-          <b>{{ granted: "授予权限", denied: "拒绝权限", revoked: "撤销权限" }[capabilityCommand.payload.decision]} · {capabilityCommand.payload.capability}</b>
-        </>
-      ) : null}
-      <details ref={previewDetailsRef} onToggle={(event) => {
-        if (event.currentTarget.open && currentPreview && preview) {
-          setReviewedPreviewRef(preview.preview_ref);
-        }
-      }}>
-        <summary>查看操作与影响</summary>
-        {controlCommand ? <p>{controlCommand.payload.reason}</p> : null}
-        <details className="lumen-command-identity"><summary>技术详情</summary>
-          <pre>{JSON.stringify(command.draft, null, 2)}</pre>
-          {command.source_proposal_ref ? <p>来源 · {command.source_proposal_ref}</p> : null}
-        <dl>
-          <Detail label="Intent" value={command.intent_id} />
-          <Detail label="Current draft" value={`r${command.draft_revision} · ${command.draft_hash}`} />
-          <Detail label="Executed" value={String(command.executed)} />
-        </dl>
-        </details>
-        {preview ? (
-          <div className="lumen-owner-previews">
-            {preview.owner_previews.map((owner) => (
-              <section key={owner.digest}>
-                <details><summary>接收方与范围</summary><p>{owner.source_owner}</p><code>{stringify(owner.target_assertion)}</code></details>
-                <b>会发生</b><p>{owner.will_happen.join("；")}</p>
-                <b>不会发生</b><p>{owner.will_not_happen.join("；")}</p>
-                <b>风险 / 陈旧条件</b><p>{[...owner.risks, ...owner.stale_conditions].join("；")}</p>
-              </section>
-            ))}
-          </div>
-        ) : null}
-      </details>
-      {!resolved && !command.confirmation_receipt && capabilityCommand ? (
-        <details className="lumen-command-revision">
-          <summary>修改操作草案</summary>
-          <form onSubmit={(event) => void revise(event)}>
-            <label>
-              Capability
-              <input
-                aria-label={`Command ${command.intent_id} capability`}
-                value={capabilityDraft}
-                onChange={(event) => setCapabilityDraft(event.target.value)}
-              />
-            </label>
-            <label>
-              Decision
-              <select
-                aria-label={`Command ${command.intent_id} decision`}
-                value={decisionDraft}
-                onChange={(event) => setDecisionDraft(
-                  event.target.value as HumanCapabilityCommandDraft["payload"]["decision"],
-                )}
-              >
-                <option value="granted">granted</option>
-                <option value="denied">denied</option>
-                <option value="revoked">revoked</option>
-              </select>
-            </label>
-            <label>
-              Exact scope · JSON object
-              <textarea
-                aria-label={`Command ${command.intent_id} exact scope`}
-                value={scopeDraft}
-                onChange={(event) => setScopeDraft(event.target.value)}
-              />
-            </label>
-            <button type="submit" disabled={pending || !capabilityDraft.trim()}>
-              保存修订并使旧 Preview 失效
+      <details className="assistant-fold">
+        <summary className="assistant-fold-summary">
+          <span className="assistant-fold-head">
+            <small>{statusText}</small>
+            <b>{titleText}</b>
+          </span>
+          {scopeSummary ? <span className="assistant-fold-preview">{scopeSummary}</span> : null}
+        </summary>
+        <div className="assistant-fold-body">
+          {scopeSummary ? <p>{scopeSummary}</p> : null}
+          <details ref={previewDetailsRef} onToggle={(event) => {
+            if (event.currentTarget.open && currentPreview && preview) {
+              setReviewedPreviewRef(preview.preview_ref);
+            }
+          }}>
+            <summary>查看操作与影响</summary>
+            {controlCommand ? <p>{controlCommand.payload.reason}</p> : null}
+            <details className="lumen-command-identity"><summary>技术详情</summary>
+              <pre>{JSON.stringify(command.draft, null, 2)}</pre>
+              {command.source_proposal_ref ? <p>来源 · {command.source_proposal_ref}</p> : null}
+            <dl>
+              <Detail label="Intent" value={command.intent_id} />
+              <Detail label="Current draft" value={`r${command.draft_revision} · ${command.draft_hash}`} />
+              <Detail label="Executed" value={String(command.executed)} />
+            </dl>
+            </details>
+            {preview ? (
+              <div className="lumen-owner-previews">
+                {preview.owner_previews.map((owner) => (
+                  <section key={owner.digest}>
+                    <details><summary>接收方与范围</summary><p>{owner.source_owner}</p><code>{stringify(owner.target_assertion)}</code></details>
+                    <b>会发生</b><p>{owner.will_happen.join("；")}</p>
+                    <b>不会发生</b><p>{owner.will_not_happen.join("；")}</p>
+                    <b>风险 / 陈旧条件</b><p>{[...owner.risks, ...owner.stale_conditions].join("；")}</p>
+                  </section>
+                ))}
+              </div>
+            ) : null}
+          </details>
+          {!resolved && !command.confirmation_receipt && capabilityCommand ? (
+            <details className="lumen-command-revision">
+              <summary>修改操作草案</summary>
+              <form onSubmit={(event) => void revise(event)}>
+                <label>
+                  Capability
+                  <input
+                    aria-label={`Command ${command.intent_id} capability`}
+                    value={capabilityDraft}
+                    onChange={(event) => setCapabilityDraft(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Decision
+                  <select
+                    aria-label={`Command ${command.intent_id} decision`}
+                    value={decisionDraft}
+                    onChange={(event) => setDecisionDraft(
+                      event.target.value as HumanCapabilityCommandDraft["payload"]["decision"],
+                    )}
+                  >
+                    <option value="granted">granted</option>
+                    <option value="denied">denied</option>
+                    <option value="revoked">revoked</option>
+                  </select>
+                </label>
+                <label>
+                  Exact scope · JSON object
+                  <textarea
+                    aria-label={`Command ${command.intent_id} exact scope`}
+                    value={scopeDraft}
+                    onChange={(event) => setScopeDraft(event.target.value)}
+                  />
+                </label>
+                <button type="submit" disabled={pending || !capabilityDraft.trim()}>
+                  保存修订并使旧 Preview 失效
+                </button>
+              </form>
+            </details>
+          ) : null}
+          {!resolved && !command.confirmation_receipt && !currentPreview ? (
+            <button type="button" disabled={pending} onClick={() => void act(() => previewHumanCommand(command))}>
+              查看操作影响
             </button>
-          </form>
-        </details>
-      ) : null}
-      {!resolved && !command.confirmation_receipt && !currentPreview ? (
-        <button type="button" disabled={pending} onClick={() => void act(() => previewHumanCommand(command))}>
-          查看操作影响
-        </button>
-      ) : null}
-      {!resolved && !command.confirmation_receipt && currentPreview ? (
-        <button
-          type="button"
-          disabled={pending || reviewedPreviewRef !== preview?.preview_ref}
-          onClick={() => void act(() => confirmHumanCommand(command))}
-        >
-          {reviewedPreviewRef === preview?.preview_ref
-            ? "确认当前草案与预览"
-            : "请先查看操作与影响"}
-        </button>
-      ) : null}
-      {command.confirmation_receipt && controlCommand && !resolved ? (
-        <button
-          type="button"
-          disabled={pending}
-          onClick={() => void act(() => executeHumanCommand(command))}
-        >
-          执行已确认控制
-        </button>
-      ) : null}
-      {command.confirmation_receipt && capabilityCommand && !resolved ? (
-        <button type="button" disabled={pending} onClick={() => void authorize()}>
-          执行已确认的权限操作
-        </button>
-      ) : null}
-      {command.confirmation_receipt || command.control_execution || authorization ? <details className="lumen-command-receipts">
-        <summary>操作回执</summary>
-        {command.confirmation_receipt ? <div className="lumen-confirmed">
-          <b>已记录你的确认</b>
-          <details><summary>确认回执</summary><code>{command.confirmation_receipt.receipt_ref}</code></details>
-          <p>{controlCommand ? command.executed ? "操作已执行，回执已保存。" : "确认已记录，控制尚未执行。"
-            : authorization ? "权限操作已记录，回执已保存。" : "尚未签发权限，请核对后执行。"}</p>
-        </div> : null}
-        {command.control_execution ? <div className="lumen-authorized lumen-control-executed">
-          <b>执行结果 · {command.control_execution.status === "completed" ? "已完成" : command.control_execution.status}</b>
-          <details><summary>执行回执</summary><code>{command.control_execution.receipt_ref}</code></details>
-        </div> : null}
-        {authorization ? <div className="lumen-authorized">
-          <b>权限状态 · {{ granted: "已授予", denied: "已拒绝", revoked: "已撤销" }[authorization.decision]}</b>
-          <details><summary>权限回执</summary><code>{authorization.receipt_ref}</code></details>
-        </div> : null}
-      </details> : null}
-      {error ? <em role="status">控制失败 · {error}</em> : null}
+          ) : null}
+          {!resolved && !command.confirmation_receipt && currentPreview ? (
+            <button
+              type="button"
+              disabled={pending || reviewedPreviewRef !== preview?.preview_ref}
+              onClick={() => void act(() => confirmHumanCommand(command))}
+            >
+              {reviewedPreviewRef === preview?.preview_ref
+                ? "确认当前草案与预览"
+                : "请先查看操作与影响"}
+            </button>
+          ) : null}
+          {command.confirmation_receipt && controlCommand && !resolved ? (
+            <button
+              type="button"
+              disabled={pending}
+              onClick={() => void act(() => executeHumanCommand(command))}
+            >
+              执行已确认控制
+            </button>
+          ) : null}
+          {command.confirmation_receipt && capabilityCommand && !resolved ? (
+            <button type="button" disabled={pending} onClick={() => void authorize()}>
+              执行已确认的权限操作
+            </button>
+          ) : null}
+          {command.confirmation_receipt || command.control_execution || authorization ? <details className="lumen-command-receipts">
+            <summary>操作回执</summary>
+            {command.confirmation_receipt ? <div className="lumen-confirmed">
+              <b>已记录你的确认</b>
+              <details><summary>确认回执</summary><code>{command.confirmation_receipt.receipt_ref}</code></details>
+              <p>{controlCommand ? command.executed ? "操作已执行，回执已保存。" : "确认已记录，控制尚未执行。"
+                : authorization ? "权限操作已记录，回执已保存。" : "尚未签发权限，请核对后执行。"}</p>
+            </div> : null}
+            {command.control_execution ? <div className="lumen-authorized lumen-control-executed">
+              <b>执行结果 · {command.control_execution.status === "completed" ? "已完成" : command.control_execution.status}</b>
+              <details><summary>执行回执</summary><code>{command.control_execution.receipt_ref}</code></details>
+            </div> : null}
+            {authorization ? <div className="lumen-authorized">
+              <b>权限状态 · {{ granted: "已授予", denied: "已拒绝", revoked: "已撤销" }[authorization.decision]}</b>
+              <details><summary>权限回执</summary><code>{authorization.receipt_ref}</code></details>
+            </div> : null}
+          </details> : null}
+          {error ? <em role="status">控制失败 · {error}</em> : null}
+        </div>
+      </details>
     </article>
   );
 }
@@ -1996,29 +2085,40 @@ function SoftConstraintCard({
       setPending(false);
     }
   };
+  const text = constraint.text ?? constraint.content ?? documentText(constraint.guidance, "text") ?? "";
+  const deliveryCount = constraint.deliveries?.length ?? 0;
   return (
     <article className={`lumen-constraint ${constraint.status}`}>
-      <small>人类指导 · {constraint.status === "active" ? "生效中" : "已撤回"}</small>
-      <p>{constraint.text ?? constraint.content ?? documentText(constraint.guidance, "text")}</p>
-      {documentText(constraint.guidance, "assistant_understanding") ? <p>确认时的理解 · {documentText(constraint.guidance, "assistant_understanding")}</p> : null}
-      {isRecord(constraint.guidance?.semantic_scope) ? <p>确认范围 · {Object.values(constraint.guidance.semantic_scope).join(" · ")}</p> : <p>历史指导 · 未记录范围确认</p>}
-      <WorkMaterialReferences receipts={constraint.work_materials ?? []} />
-      <span>力度 {constraint.strength ?? 3} · {guidanceStrengthLabels[constraint.strength ?? 3]}</span>
-      {alignment ? (
-        alignment?.status === "aligned"
-          ? <p>Quest 已在 {alignment.aligned_revision} 对齐；当前版本 {alignment.current_revision}。</p>
-          : <p>Quest 全局目标更新待对齐。</p>
-      ) : null}
-      {constraint.deliveries?.length ? (
-        <ul>{constraint.deliveries.map((delivery) => <GuidanceDeliveryCard key={delivery.delivery_ref} delivery={delivery} />)}</ul>
-      ) : <p>已保存，待适用研究工作接续；尚无读取或处理回执。</p>}
-      {constraint.source_proposal_ref ? (
-        <code className="lumen-source-proposal">source · {constraint.source_proposal_ref}</code>
-      ) : null}
-      {constraint.status === "active" && constraint.constraint_ref && constraint.revision !== undefined ? (
-        <button type="button" disabled={pending} onClick={() => void withdraw()}>撤回指导</button>
-      ) : null}
-      {error ? <em role="status">撤回失败 · {error}</em> : null}
+      <details className="assistant-fold">
+        <summary className="assistant-fold-summary">
+          <span className="assistant-fold-head">
+            <small>人类指导 · {constraint.status === "active" ? "生效中" : "已撤回"}{deliveryCount ? ` · ${deliveryCount} 条回执` : ""}</small>
+            <span className="assistant-fold-tag">力度 {constraint.strength ?? 3} · {guidanceStrengthLabels[constraint.strength ?? 3]}</span>
+          </span>
+          {text ? <span className="assistant-fold-preview">{text}</span> : null}
+        </summary>
+        <div className="assistant-fold-body">
+          <p>{text}</p>
+          {documentText(constraint.guidance, "assistant_understanding") ? <p>确认时的理解 · {documentText(constraint.guidance, "assistant_understanding")}</p> : null}
+          {isRecord(constraint.guidance?.semantic_scope) ? <p>确认范围 · {Object.values(constraint.guidance.semantic_scope).join(" · ")}</p> : <p>历史指导 · 未记录范围确认</p>}
+          <WorkMaterialReferences receipts={constraint.work_materials ?? []} />
+          {alignment ? (
+            alignment?.status === "aligned"
+              ? <p>Quest 已在 {alignment.aligned_revision} 对齐；当前版本 {alignment.current_revision}。</p>
+              : <p>Quest 全局目标更新待对齐。</p>
+          ) : null}
+          {constraint.deliveries?.length ? (
+            <ul>{constraint.deliveries.map((delivery) => <GuidanceDeliveryCard key={delivery.delivery_ref} delivery={delivery} />)}</ul>
+          ) : <p>已保存，待适用研究工作接续；尚无读取或处理回执。</p>}
+          {constraint.source_proposal_ref ? (
+            <code className="lumen-source-proposal">source · {constraint.source_proposal_ref}</code>
+          ) : null}
+          {constraint.status === "active" && constraint.constraint_ref && constraint.revision !== undefined ? (
+            <button type="button" disabled={pending} onClick={() => void withdraw()}>撤回指导</button>
+          ) : null}
+          {error ? <em role="status">撤回失败 · {error}</em> : null}
+        </div>
+      </details>
     </article>
   );
 }
@@ -2051,26 +2151,37 @@ function AgentProposalCard({
     }
   };
   if (proposalKind !== "command_draft") return <GuidanceConfirmation proposal={proposal} onChanged={onChanged} />;
+  const title = proposal.title ?? documentText(proposal.proposal, "title") ?? "Agent 建议";
+  const summaryText = proposal.summary ?? proposal.content ?? documentText(proposal.proposal, "summary", "description", "text") ?? "";
   return (
     <article className="lumen-proposal">
-      <small>操作建议 · 尚未执行</small>
-      <b>{proposal.title ?? documentText(proposal.proposal, "title") ?? "Agent 建议"}</b>
-      <p>{proposal.summary ?? proposal.content ?? documentText(proposal.proposal, "summary", "description", "text")}</p>
-      {proposal.impact_preview ? <ImpactPreview preview={proposal.impact_preview} /> : null}
-      {convertedTo ? (
-        <span role="status">
-          操作草案已建立，请查看并确认。
-        </span>
-      ) : null}
-      {!convertedTo && proposal.status === "proposed" && proposalKind === "command_draft" && proposal.scope_ref && proposal.proposal_ref && proposal.proposal_hash && proposedCommand ? (
-        <button type="button" disabled={pending} onClick={() => void createCommandDraft()}>
-          审阅操作草案
-        </button>
-      ) : null}
-      {proposal.status === "proposed" && !proposal.proposal_hash ? (
-        <em role="status">当前 Proposal 缺少 exact hash，已停止转换。</em>
-      ) : null}
-      {error ? <em role="status">记录失败 · {error}</em> : null}
+      <details className="assistant-fold">
+        <summary className="assistant-fold-summary">
+          <span className="assistant-fold-head">
+            <small>操作建议 · {convertedTo || proposal.status !== "proposed" ? "已建草案" : "尚未执行"}</small>
+            <b>{title}</b>
+          </span>
+          {summaryText ? <span className="assistant-fold-preview">{summaryText}</span> : null}
+        </summary>
+        <div className="assistant-fold-body">
+          {summaryText ? <p>{summaryText}</p> : null}
+          {proposal.impact_preview ? <ImpactPreview preview={proposal.impact_preview} /> : null}
+          {convertedTo ? (
+            <span role="status">
+              操作草案已建立，请查看并确认。
+            </span>
+          ) : null}
+          {!convertedTo && proposal.status === "proposed" && proposalKind === "command_draft" && proposal.scope_ref && proposal.proposal_ref && proposal.proposal_hash && proposedCommand ? (
+            <button type="button" disabled={pending} onClick={() => void createCommandDraft()}>
+              审阅操作草案
+            </button>
+          ) : null}
+          {proposal.status === "proposed" && !proposal.proposal_hash ? (
+            <em role="status">当前 Proposal 缺少 exact hash，已停止转换。</em>
+          ) : null}
+          {error ? <em role="status">记录失败 · {error}</em> : null}
+        </div>
+      </details>
     </article>
   );
 }
@@ -2432,6 +2543,20 @@ function HumanRequestView({
   hasNext: boolean;
 }) {
   const waiting = collaboration?.human_requests.waiting;
+  const categoryNav = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const nav = categoryNav.current;
+    const selected = nav?.querySelector<HTMLButtonElement>('[aria-current="page"]');
+    if (!nav || !selected) return;
+    const observer = new ResizeObserver(() => {
+      const viewport = nav.getBoundingClientRect();
+      const button = selected.getBoundingClientRect();
+      if (button.left < viewport.left) nav.scrollLeft += button.left - viewport.left;
+      else if (button.right > viewport.right) nav.scrollLeft += button.right - viewport.right;
+    });
+    observer.observe(nav);
+    return () => observer.disconnect();
+  }, [request.kind]);
   const workspace = useRef<HTMLDivElement>(null);
   usePageReadingPosition(`${request.request_ref}:${request.revision}`, workspace);
   const [reviewing, setReviewing] = useState(false);
@@ -2487,7 +2612,7 @@ function HumanRequestView({
           </div>
         )}
       </header>
-      <nav className="hc-kind-navigation" aria-label="求助类别">
+      <nav ref={categoryNav} className="hc-kind-navigation" aria-label="求助类别">
         {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助", "预算调整"] as const).map((label, index) => {
           const kind = (Object.keys(requestCopy) as HumanRequestItem["kind"][])[index];
           const sameKind = requests.filter(item => item.kind === kind);

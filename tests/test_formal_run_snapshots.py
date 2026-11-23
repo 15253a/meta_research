@@ -81,10 +81,12 @@ def test_two_real_snapshots_and_local_input_are_frozen_and_readable(tmp_path):
 
 
 @pytest.mark.parametrize('case, code', [('revision','implementation_revision_mismatch'),
+    ('second_revision','implementation_revision_mismatch'),
     ('cycle','local_input_order_invalid'), ('unowned','local_input_ownership_invalid')])
 def test_false_run_bindings_are_rejected_after_real_freezing(tmp_path, case, code):
     def mutate(doc):
         if case == 'revision': doc['formal_runs'][0]['implementation_revision_ref'] = 'invented'
+        elif case == 'second_revision': doc['formal_runs'][1]['implementation_revision_ref'] = '\x01' * 1024
         elif case == 'cycle': doc['formal_runs'][0]['local_inputs'] = [
             {'producer_run_key': 'second', 'artifact_path': 'outputs/data/run2.txt'}]
         else: doc['formal_runs'][1]['local_inputs'][0]['artifact_path'] = 'outputs/data/run2.txt'
@@ -97,6 +99,15 @@ def test_false_run_bindings_are_rejected_after_real_freezing(tmp_path, case, cod
             result_document=manifest.result_document, idempotency_key='false-run-binding')
         assert rejected.issuer == 'research_graph'
         assert code in rejected.code
+        if case in {'revision', 'second_revision'}:
+            from meta_research.formal_run_bindings import implementation_binding, manifest_selection_entries
+            index = 0 if case == 'revision' else 1
+            run = manifest.result_document.as_dict()['formal_runs'][index]
+            revision, _ = implementation_binding(manifest_selection_entries(manifest), run['implementation_paths'])
+            assert f'$.formal_runs[{index}].implementation_revision_ref' in rejected.feedback
+            assert ('"invented"' if index == 0 else '1024 characters') in rejected.feedback
+            assert revision in rejected.feedback and 'optional' in rejected.feedback
+            assert len(rejected.feedback) <= 4096
         with runtime._database.read() as connection:
             assert connection.execute(text('SELECT COUNT(*) FROM rg_variant_runs')).scalar_one() == 0
     finally:

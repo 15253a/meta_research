@@ -535,13 +535,22 @@ def test_web_composition_binds_all_root_resident_mcp_channels(tmp_path) -> None:
 
         assert set(new_root_channels) == {
             "acquisition",
+            "bundle",
             "companion",
             "deepfetch",
             "idea",
             "plan",
+            "reasoning",
         }
         assert all(
             channels._authority is runtime.harnesses
+            for channels in new_root_channels.values()
+        )
+
+        runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
+
+        assert all(
+            channels._base_url == "http://127.0.0.1:8766"
             for channels in new_root_channels.values()
         )
 

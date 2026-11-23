@@ -1558,17 +1558,21 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
+        dispatch_request = {
+            "generation": request.generation,
+            "frontier": list(request.frontier),
+            "state": request.state,
+            "inbox_checkpoint": request.inbox_checkpoint,
+        }
+        if request.quest_goal_revision is not None:
+            dispatch_request["goal_revision_ref"] = request.quest_goal_revision.get(
+                "goal_revision_ref"
+            )
+            dispatch_request["quest_goal_revision"] = request.quest_goal_revision
         operation_input = {
-            "kind": "bundle_dispatch", "identity": _rolling_operation_identity(request),
-            "request": {"generation": request.generation,
-                "frontier": list(request.frontier), "state": request.state,
-                "inbox_checkpoint": request.inbox_checkpoint,
-                "goal_revision_ref": (
-                    None
-                    if request.quest_goal_revision is None
-                    else request.quest_goal_revision.get("goal_revision_ref")
-                ),
-                "quest_goal_revision": request.quest_goal_revision},
+            "kind": "bundle_dispatch",
+            "identity": _rolling_operation_identity(request),
+            "request": dispatch_request,
         }
         from meta_research.bundle_batch_view import (
             bundle_record_hash, continued_target_record, target_reading_record,
@@ -1671,12 +1675,16 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "formal_plan_ref": request.formal_plan_ref,
             "context_pack_ref": request.context_pack_ref,
             "context_pack_hash": request.context_pack_hash,
-            "goal_revision_ref": (
-                None
-                if request.quest_goal_revision is None
-                else request.quest_goal_revision.get("goal_revision_ref")
+            **(
+                {
+                    "goal_revision_ref": request.quest_goal_revision.get(
+                        "goal_revision_ref"
+                    ),
+                    "quest_goal_revision": request.quest_goal_revision,
+                }
+                if request.quest_goal_revision is not None
+                else {}
             ),
-            "quest_goal_revision": request.quest_goal_revision,
             "base_generation": request.base_generation,
             "base_head_receipt": request.base_head_receipt,
             "inbox_checkpoint": request.inbox_checkpoint,
@@ -1744,8 +1752,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续当前 Bundle 根，根据本次新结果与反馈提交完整 FormalStrategyUpdate 或 replan_basis。"
             "known_current_targets 和 known_target_commit_refs 指向本会话已交付的未变正文；"
-            "仅在确实缺失材料时用当前 context_pack_ref 定向补读。"
-            + goal_guidance
+            "仅在确实缺失材料时用当前 context_pack_ref 定向补读。\n"
+            + goal_guidance + "\n"
             + goal_value_line
             + f"{_bundle_output_assembly_prompt()}"
             "完成独立审阅与必要综合后交接，保留未解决事项，不重复已完成工作。\n"

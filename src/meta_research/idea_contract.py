@@ -205,8 +205,22 @@ def validate_idea_context_pack(
             raise IdeaContractError("idea_context_pack_invalid") from error
         expected_fields = expected_fields | {"cycle_position"}
     goal_fields = {"goal_revision_ref", "quest_goal_revision"} & set(context_pack)
-    if goal_fields and goal_fields != {"goal_revision_ref", "quest_goal_revision"}:
-        raise IdeaContractError("idea_context_pack_invalid")
+    if goal_fields:
+        from meta_research.quest_goal import validate_stage_quest_goal_binding
+        expected_quest_ref = (
+            accepted_question_binding.get("quest_ref")
+            if isinstance(accepted_question_binding, dict)
+            else None
+        )
+        try:
+            validate_stage_quest_goal_binding(
+                context_pack,
+                expected_quest_ref=(
+                    expected_quest_ref if isinstance(expected_quest_ref, str) else None
+                ),
+            )
+        except ValueError as error:
+            raise IdeaContractError("idea_context_pack_invalid") from error
     expected_fields = expected_fields | goal_fields
     if set(context_pack) != expected_fields:
         raise IdeaContractError("idea_context_pack_invalid")
@@ -740,8 +754,22 @@ def _validate_literature_reference(value, question_ref):
 
 def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
     goal_fields = {"goal_revision_ref", "quest_goal_revision"} & set(pack)
-    if goal_fields and goal_fields != {"goal_revision_ref", "quest_goal_revision"}:
-        raise IdeaContractError("idea_context_pack_invalid")
+    if goal_fields:
+        from meta_research.quest_goal import validate_stage_quest_goal_binding
+        expected_quest_ref = (
+            accepted_question_binding.get("quest_ref")
+            if isinstance(accepted_question_binding, dict)
+            else None
+        )
+        try:
+            validate_stage_quest_goal_binding(
+                pack,
+                expected_quest_ref=(
+                    expected_quest_ref if isinstance(expected_quest_ref, str) else None
+                ),
+            )
+        except ValueError as error:
+            raise IdeaContractError("idea_context_pack_invalid") from error
     if set(pack) - {"cycle_position", *goal_fields} not in (_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}, _IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page", "creation_basis"}):
         raise IdeaContractError("idea_context_pack_invalid")
     if "cycle_position" in pack:

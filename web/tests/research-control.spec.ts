@@ -399,6 +399,7 @@ test("Foreground controls require draft preview confirmation and execution in th
   await composer.getByRole("button", { name: "查看操作草案" }).click();
 
   const card = companion.locator(".lumen-command").filter({ hasText: "强制切换" });
+  await card.locator(":scope > .assistant-fold > summary").click();
   await card.getByRole("button", { name: "查看操作影响" }).click();
   await card.getByText("查看操作与影响", { exact: true }).click();
   await expect(card).toContainText("durable Safe Point");
@@ -649,6 +650,7 @@ test("production control seam preserves Companion order, focus, and responsive g
     hasText: "暂停当前 Quest",
   });
   await expect(card).toBeVisible();
+  await card.locator(":scope > .assistant-fold > summary").click();
   await card.getByRole("button", { name: "查看操作影响" }).click();
   await expect(card.getByRole("button", {
     name: "请先查看操作与影响",

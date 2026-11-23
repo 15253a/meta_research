@@ -24,6 +24,7 @@ from meta_research.reasoning_contract import (
     ReasoningContractError,
 )
 from meta_research.reasoning_skill import (
+    RESEARCH_TIME_BUDGET_UNKNOWN,
     ReasoningSkillDraft,
     ReasoningSkillRequest,
     ReasoningSkillResult,
@@ -38,6 +39,10 @@ from meta_research.reasoning_skill import (
     _validate_request,
     validate_reasoning_skill_draft,
     validate_reasoning_skill_result,
+)
+from meta_research.reasoning_stage import (
+    _live_research_time_budget_revision,
+    _refresh_live_research_time_binding,
 )
 from meta_research.semantic_mcp import McpConnection, ResidentMcpBinding
 
@@ -218,6 +223,20 @@ def _stage_output() -> dict[str, object]:
             "entry_stage": "idea",
             "typed_skip_basis_refs_by_stage": {},
             "is_authoritative": False,
+            "research_time_basis": {
+                "schema_ref": "meta-research/research-time-basis/v1",
+                "quest_ref": "quest:1",
+                "budget_revision": "0" * 64,
+                "observed_at": 1_735_000_000.0,
+                "status": "running",
+                "accuracy": "exact",
+                "used_seconds": 120.0,
+                "remaining_seconds": 480.0,
+                "overrun_seconds": None,
+                "unknown_intervals": [],
+                "decision": "continue",
+                "decision_rationale": "The remaining budget supports the next bounded comparison.",
+            },
         },
         "candidate_completion": None,
     }
@@ -237,6 +256,139 @@ def test_public_draft_seam_validates_one_closed_reasoning_output() -> None:
         canonical_hash(output["scientific_outcome"]),
         canonical_hash(output["next_cycle_proposal"]),
     )
+
+
+def test_live_reasoning_rejects_stale_research_time_budget_revision() -> None:
+    request = replace(_request(), research_time_budget_revision="1" * 64)
+    output = _stage_output()
+    result = ReasoningSkillDraft(
+        draft=output,
+        primary_session_ref="provider-session:1",
+        adapter_kind="deterministic-test",
+    )
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="reasoning_research_time_budget_stale",
+    ):
+        validate_reasoning_skill_draft(request, result)
+
+
+def test_live_reasoning_rejects_missing_research_time_basis() -> None:
+    request = replace(_request(), research_time_budget_revision="0" * 64)
+    output = _stage_output()
+    transition = output["next_cycle_proposal"]
+    assert isinstance(transition, dict)
+    transition.pop("research_time_basis", None)
+    result = ReasoningSkillDraft(
+        draft=output,
+        primary_session_ref="provider-session:1",
+        adapter_kind="deterministic-test",
+    )
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="reasoning_research_time_basis_invalid",
+    ):
+        validate_reasoning_skill_draft(request, result)
+
+
+def test_live_generation_rebinds_to_post_turn_owner_revision() -> None:
+    request = replace(
+        _request(),
+        research_time_budget_revision="1" * 64,
+        runtime_binding=replace(
+            _request().runtime_binding,
+            harness_adapter_ref="codex-opus-5-5",
+        ),
+    )
+    output = _stage_output()
+    output["next_cycle_proposal"]["research_time_basis"]["budget_revision"] = "2" * 64
+    owner = SimpleNamespace(
+        query_research_time=lambda _quest_ref: {"budget_revision": "2" * 64}
+    )
+
+    rebound = _refresh_live_research_time_binding(
+        request, owner, "quest:1"
+    )
+    assert rebound.research_time_budget_revision == "2" * 64
+    validate_reasoning_skill_draft(
+        rebound,
+        ReasoningSkillDraft(
+            draft=output,
+            primary_session_ref="provider-session:1",
+            adapter_kind="codex_cli",
+        ),
+    )
+
+
+def test_live_generation_rejects_forged_revision_after_owner_refresh() -> None:
+    request = replace(
+        _request(),
+        research_time_budget_revision="1" * 64,
+        runtime_binding=replace(
+            _request().runtime_binding,
+            harness_adapter_ref="codex-opus-5-5",
+        ),
+    )
+    output = _stage_output()
+    output["next_cycle_proposal"]["research_time_basis"]["budget_revision"] = "1" * 64
+    owner = SimpleNamespace(
+        query_research_time=lambda _quest_ref: {"budget_revision": "2" * 64}
+    )
+    rebound = _refresh_live_research_time_binding(
+        request, owner, "quest:1"
+    )
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="reasoning_research_time_budget_stale",
+    ):
+        validate_reasoning_skill_draft(
+            rebound,
+            ReasoningSkillDraft(
+                draft=output,
+                primary_session_ref="provider-session:1",
+                adapter_kind="codex_cli",
+            ),
+        )
+
+
+def test_live_generation_fails_closed_when_owner_revision_is_unknown() -> None:
+    request = replace(
+        _request(),
+        research_time_budget_revision="1" * 64,
+        runtime_binding=replace(
+            _request().runtime_binding,
+            harness_adapter_ref="codex-opus-5-5",
+        ),
+    )
+    owner = SimpleNamespace(
+        query_research_time=lambda _quest_ref: (_ for _ in ()).throw(
+            RuntimeError("owner unavailable")
+        )
+    )
+    assert (
+        _live_research_time_budget_revision(
+            "codex-opus-5-5", owner, "quest:1"
+        )
+        == RESEARCH_TIME_BUDGET_UNKNOWN
+    )
+    rebound = _refresh_live_research_time_binding(
+        request, owner, "quest:1"
+    )
+    with pytest.raises(
+        ReasoningContractError,
+        match="reasoning_research_time_budget_unknown",
+    ):
+        validate_reasoning_skill_draft(
+            rebound,
+            ReasoningSkillDraft(
+                draft=_stage_output(),
+                primary_session_ref="provider-session:1",
+                adapter_kind="codex_cli",
+            ),
+        )
 
 
 def test_reasoning_successor_request_carries_owner_rejection_feedback() -> None:
@@ -333,6 +485,32 @@ def test_large_legal_graph_context_keeps_all_actual_schemas_within_budget() -> N
     _compile_codex_output_schema(
         _reasoning_review_response_schema(request, autonomous)
     )
+
+
+def test_live_reasoning_routes_require_research_time_basis() -> None:
+    request = _request()
+    closed = _reasoning_stage_output_schema(request)
+    for variant in closed["anyOf"]:
+        transition_key = (
+            "next_cycle_proposal"
+            if variant["properties"]["candidate_completion"].get("type") == "null"
+            else "candidate_completion"
+        )
+        transition_schema = variant["properties"][transition_key]
+        transition_variants = transition_schema.get("anyOf", [transition_schema])
+        for transition in transition_variants:
+            assert "research_time_basis" in transition["properties"]
+            assert "research_time_basis" in transition["required"]
+    legacy_autonomous = _reasoning_autonomous_checkpoint_schema(request)
+    for scope in legacy_autonomous["properties"]["autonomous_scope"]["anyOf"]:
+        assert "research_time_basis" not in scope["properties"]
+
+    live_request = replace(request, research_time_budget_revision="1" * 64)
+    live_autonomous = _reasoning_autonomous_checkpoint_schema(live_request)
+    for scope in live_autonomous["properties"]["autonomous_scope"]["anyOf"]:
+        assert "research_time_basis" in scope["properties"]
+        assert "research_time_basis" in scope["required"]
+
 
 
 @pytest.mark.parametrize("large_input", ["causal_ref", "milestone_ref"])
@@ -440,6 +618,20 @@ def test_public_draft_seam_rejects_completion_outside_frozen_milestone_basis(
         "completion_milestone_basis_refs": ["stage-commit:forged"],
         "rationale": "All current milestones are satisfied.",
         "is_authoritative": False,
+        "research_time_basis": {
+            "schema_ref": "meta-research/research-time-basis/v1",
+            "quest_ref": request.quest_ref,
+            "budget_revision": "0" * 64,
+            "observed_at": 1_735_000_000.0,
+            "status": "running",
+            "accuracy": "exact",
+            "used_seconds": 120.0,
+            "remaining_seconds": 480.0,
+            "overrun_seconds": None,
+            "unknown_intervals": [],
+            "decision": "complete",
+            "decision_rationale": "The current milestones are satisfied within the observed budget.",
+        },
     }
     result = ReasoningSkillDraft(
         draft=output,
@@ -865,6 +1057,15 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
         for item in binding.resource_bindings
     )
     assert len(runner.calls) == 1
+    primary_prompt = runner.calls[0][1]
+    assert "graph_binding.active_question_refs" in primary_prompt
+    assert "research_graph.question_relations.read" in primary_prompt
+    assert "research_graph.question_history.read" in primary_prompt
+    assert "机会成本" in primary_prompt
+    assert "暂缓代价" in primary_prompt
+    assert "advancement_engine.research_time.read" in primary_prompt
+    assert "near、over、unknown 都是规划证据，不是硬门槛" in primary_prompt
+    assert "budget_revision 和正式回执" in primary_prompt
     assert 'model_reasoning_effort="ultra"' in runner.calls[0][0]
     assert len(authority.issued) == 1
     assert len(authority.revoked) == 1

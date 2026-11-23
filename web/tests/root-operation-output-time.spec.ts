@@ -23,7 +23,7 @@ const javascript = ts.transpileModule(nodes.map(node => node.getText(parsed)).jo
 const outputTime = Date.parse("2026-09-29T06:51:28+08:00") / 1_000;
 const rescheduledTime = Date.parse("2026-09-29T12:41:30+08:00") / 1_000;
 const formatted = (time: number) => new Date(time * 1_000).toLocaleString("zh-CN", { hour12: false });
-function header(sourceUpdatedAt: number | null | undefined, createdAt = rescheduledTime) {
+function header(sourceUpdatedAt: number | null | undefined, createdAt = rescheduledTime, heartbeat?: RootOperation["heartbeat"], status: RootOperation["status"] = "completed") {
   const page: RootOutput | null = sourceUpdatedAt === undefined ? null : {
     schema_ref: "meta-research/root-session-output/v1", quest_ref: "quest", session_ref: "session", operation_ref: "operation",
     stream_ref: "stream", text: "已保存的公开输出", offset: 0, next_offset: 0, source_bytes: 0,
@@ -40,8 +40,9 @@ function header(sourceUpdatedAt: number | null | undefined, createdAt = reschedu
     RootOperationOutput: null as unknown as (props: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; onOutput: () => void; readingCache: Map<string, unknown>; detailsHost: object; clockHost: null; onShowHistory: () => void }) => React.ReactElement<{ children: React.ReactNode[] }>,
   };
   runInNewContext(javascript, sandbox, { filename: sourcePath });
-  const operation: RootOperation = { operation_ref: "operation", label: "Bundle", phase: null, status: "completed", created_at: createdAt, updated_at: createdAt };
+  const operation: RootOperation = { operation_ref: "operation", label: "Bundle", phase: null, status, created_at: createdAt, updated_at: createdAt, heartbeat };
   const article = sandbox.RootOperationOutput({ questRef: "quest", sessionRef: "session", operation, ordinal: 5, active: true, onOutput: () => {}, readingCache: new Map(), detailsHost: {}, clockHost: null, onShowHistory: () => {} });
+  if (heartbeat) return renderToStaticMarkup(article);
   const details = React.Children.toArray(article.props.children).find(child =>
     React.isValidElement<{ className?: string }>(child) && child.props.className === "root-operation-details");
   if (!React.isValidElement<{ children: React.ReactNode }>(details)) throw new Error("operation details must remain available");
@@ -72,4 +73,17 @@ test("missing or invalid output times never fall back to Owner scheduling", () =
     expect(header(time)).toContain("输出时间待确认");
     expect(header(time)).not.toContain(formatted(rescheduledTime));
   }
+});
+
+test("a stale provider heartbeat is visible without changing the saved output time", () => {
+  const rendered = header(outputTime, rescheduledTime, { phase: "running", observed_at: outputTime, age_seconds: 60, stale: true, stdout_bytes: 17 });
+  expect(rendered).toContain("监督器心跳已陈旧");
+  expect(rendered).toContain("已收集 17 字节");
+  expect(rendered).toContain(`输出更新 · ${formatted(outputTime)}`);
+});
+
+test("an unbound running heartbeat tells the researcher to reconcile", () => {
+  const rendered = header(outputTime, rescheduledTime, { phase: "running", observed_at: outputTime, age_seconds: 2, stale: false }, "waiting");
+  expect(rendered).toContain("监督器已停止或未绑定，原操作等待对账");
+  expect(rendered).not.toContain("监督器仍在运行");
 });

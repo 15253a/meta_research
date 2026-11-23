@@ -60,6 +60,7 @@ from meta_research.runtime_protection import (
 )
 from meta_research.root_capabilities import (
     ROOT_AGENT_KINDS,
+    ROOT_ROLE_OPERATION_DELTAS,
     RootAgentKind,
     root_capability_profile,
 )
@@ -70,6 +71,7 @@ from meta_research.root_operation_diagnostics import (
 from meta_research.semantic_mcp import (
     McpConnection,
     ROOT_AGENT_ACQUISITION_OPERATION_IDS,
+    ROOT_AGENT_COMMON_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
     ResidentMcpBinding,
     SemanticMcpError,
@@ -95,6 +97,12 @@ LOGGER = logging.getLogger(__name__)
 HarnessFamily = Literal["codex", "claude"]
 TargetTurnPhase = Literal["implementation_review", "execution", "result_review"]
 TARGET_ROOT_LIFECYCLE_PHASE = "target_root_lifecycle"
+# Target requests admitted before the shared role catalog was introduced keep
+# this exact operation tuple in durable Owner storage. It is a historical
+# binding, not a second live catalog for new admissions.
+LEGACY_TARGET_ROOT_SEMANTIC_OPERATION_IDS = tuple(
+    (*ROOT_ROLE_OPERATION_DELTAS["target"], *ROOT_AGENT_COMMON_OPERATION_IDS)
+)
 _AUTH_PROFILE_REF = re.compile(r"^harness-profile:[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _CONFORMANCE_TOKEN = re.compile(r"^[0-9a-f]{16}$")
 _PROVIDER_CEILING_CODES = frozenset(
@@ -1382,6 +1390,7 @@ class HarnessRuntime:
         request = self._request_from_value(
             record.request, record.idempotency_key, record
         )
+        self._verify_target_runtime_binding_is_current(request)
         previous = self._admissions_by_request.get(request_ref)
         try:
             mcp_connection, mcp_binding = self._gateway.issue_channel(
@@ -1440,6 +1449,86 @@ class HarnessRuntime:
         )
         self._admissions_by_request[request_ref] = admission
         return admission
+
+    def _verify_target_runtime_binding_is_current(
+        self, request: HarnessProbeRequest
+    ) -> None:
+        """Reject a persisted Target binding after a catalog refresh.
+
+        Target has no implicit request-rebind path.  A request carrying one of
+        the production binding contracts must still describe the current
+        operation authority before ``resume_probe`` can rotate its channel.
+        The explicit test-only contracts remain usable for isolated Harness
+        fixtures that do not model a live catalog authority.
+        """
+
+        if not isinstance(request, TargetHarnessRequest):
+            return
+        contract_ref = request.full_conformance_binding.get("contract_ref")
+        if isinstance(contract_ref, str) and contract_ref.startswith("test/"):
+            # Isolated Harness fixtures intentionally use a synthetic binding
+            # without a live Semantic MCP authority.
+            return
+        if contract_ref not in {
+            FULL_CONFORMANCE_V1,
+            FULL_CONFORMANCE_V2,
+            OPERATION_BINDING_V1,
+        }:
+            raise HarnessAdmissionError("target_harness_runtime_binding_invalid")
+        if contract_ref in {FULL_CONFORMANCE_V1, FULL_CONFORMANCE_V2}:
+            try:
+                current = self.require_full_conformance_binding()
+            except HarnessAdmissionError as error:
+                raise HarnessAdmissionError(
+                    "target_harness_runtime_binding_unavailable"
+                ) from error
+        else:
+            current = self.require_operation_binding(
+                harness_family=request.harness_family,
+                required_operation_ids=request.required_operation_ids,
+                required_capabilities=request.required_capabilities,
+            )
+        if request.full_conformance_binding_hash == current.binding_hash:
+            return
+        # A catalog refresh may add role contracts while leaving every
+        # operation binding used by an admitted Target unchanged. Preserve the
+        # old request's exact grant in that case. The persisted binding hash is
+        # allowed to differ only in its catalog hash, which records the larger
+        # current registry rather than the Target's executable grant.
+        stored = request.full_conformance_binding
+        stored_catalog_hash = stored.get("semantic_mcp_catalog_hash")
+        stored_contract_hash = stored.get("contract_hash")
+        stored_families = tuple(stored.get("required_families", ()))
+        stored_capabilities = tuple(stored.get("required_capabilities", ()))
+        legacy_contract_hash = canonical_hash(
+            {
+                "contract_ref": current.contract_ref,
+                "harness_family": current.required_families[0]
+                if current.required_families
+                else None,
+                "locked_version": self._adapters[current.required_families[0]].locked_version
+                if current.required_families
+                else None,
+                "required_capabilities": list(stored_capabilities),
+                "required_operation_bindings": list(
+                    self._gateway.required_bindings(request.required_operation_ids)
+                ),
+                "semantic_mcp_catalog_hash": stored_catalog_hash,
+            }
+        ) if isinstance(stored_catalog_hash, str) else None
+        if (
+            request.required_operation_ids == LEGACY_TARGET_ROOT_SEMANTIC_OPERATION_IDS
+            and set(request.required_operation_ids) <= set(TARGET_ROOT_SEMANTIC_OPERATION_IDS)
+            and stored.get("semantic_mcp_operation_bindings_hash")
+            == current.semantic_mcp_operation_bindings_hash
+            and stored.get("contract_ref") == current.contract_ref
+            and stored_contract_hash == legacy_contract_hash
+            and stored_families == current.required_families
+            and stored_capabilities == current.required_capabilities
+            and tuple(stored.get("profile_receipts", ())) == current.profile_receipts
+        ):
+            return
+        raise HarnessAdmissionError("target_harness_runtime_binding_drift")
 
     def execute_probe(
         self,
@@ -3644,7 +3733,11 @@ class HarnessRuntime:
                 != request.full_conformance_binding_hash
                 or len(request.full_conformance_binding_hash) != 64
                 or len(request.target_scope_binding_hash) != 64
-                or request.required_operation_ids != TARGET_ROOT_SEMANTIC_OPERATION_IDS
+                or request.required_operation_ids
+                not in {
+                    TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+                    LEGACY_TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+                }
                 or request.required_capabilities
                 not in {
                     _target_root_lifecycle_capabilities(resume=False),

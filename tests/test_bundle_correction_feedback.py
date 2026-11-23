@@ -29,6 +29,10 @@ from test_target_root_finalizer import _current_bundle_runtime
         ("propose_targets", "replan_basis", "null"),
     ),
     (
+        "protocol_metric_sets_overlap",
+        ("measurement_contract.protocol_version", "required_metrics", "optional_metrics", "metric_key"),
+    ),
+    (
         "strategy_consumed_unaccepted_result",
         ("requires_accepted_labels", "local_label", "commit_ref", "depends_on_labels"),
     ),

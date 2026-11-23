@@ -10,9 +10,13 @@ import pytest
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
 from meta_research.harness import (
+    FULL_CONFORMANCE_V1,
+    FULL_CONFORMANCE_V2,
+    FullConformanceBinding,
     TARGET_ROOT_LIFECYCLE_PHASE,
     HarnessAdmissionError,
     HarnessRuntime,
+    OPERATION_BINDING_V1,
     TargetHarnessRequest,
 )
 from meta_research.harness_adapters import (
@@ -22,6 +26,7 @@ from meta_research.harness_adapters import (
     HarnessTurnEvidence,
 )
 from meta_research.owners.agent_runtime_harness import (
+    SQLiteAgentRuntimeHarness,
     TARGET_ROOT_RECOVERY_PENDING_CODE,
     TARGET_ROOT_RECOVERY_READY_CODE,
     AgentRuntimeHarnessError,
@@ -42,11 +47,13 @@ from meta_research.runtime_protection import (
     RuntimeProtectionUnavailable,
 )
 from meta_research.root_capabilities import (
+    ROOT_ROLE_OPERATION_DELTAS,
     ROOT_AGENT_KINDS,
     RootAgentKind,
     root_capability_profile,
 )
 from meta_research.semantic_mcp import (
+    ROOT_AGENT_COMMON_OPERATION_IDS,
     McpConnection,
     ResidentMcpBinding,
     SemanticMcpError,
@@ -730,6 +737,221 @@ def _runtime(
     return runtime, owner, codex
 
 
+def test_target_admit_probe_requires_authoritative_target_launch(
+    tmp_path: Path,
+) -> None:
+    """A Target request cannot enter through the diagnostic probe API.
+
+    ``resume_probe`` keeps a test-only synthetic binding for isolated fixtures,
+    but durable admission must come through ``admit_target_run`` with an
+    Agent Runtime-owned TargetRun.  The owner rejects Target fields when the
+    admission does not carry that authoritative run reference.
+    """
+
+    request = _target_request()
+    database_path = tmp_path / "target-admission-binding.sqlite"
+    upgrade_database(database_path)
+    database = Database(database_path)
+    owner = SQLiteAgentRuntimeHarness(database, DurableFeed(database))
+    with pytest.raises(
+        AgentRuntimeHarnessError,
+        match="target_harness_admission_binding_invalid",
+    ):
+        owner.reserve_admission(
+            request=request.as_dict(),
+            idempotency_key="target-probe-bypass",
+            request_hash=canonical_hash(request.as_dict()),
+            capability_binding_hash="b" * 64,
+        )
+
+
+def test_target_request_from_pre_union_catalog_survives_catalog_extension(
+    tmp_path: Path,
+) -> None:
+    request = _target_request()
+    legacy_operation_ids = tuple(
+        dict.fromkeys(
+            (
+                *ROOT_ROLE_OPERATION_DELTAS["target"],
+                *ROOT_AGENT_COMMON_OPERATION_IDS,
+            )
+        )
+    )
+    assert legacy_operation_ids != TARGET_ROOT_SEMANTIC_OPERATION_IDS
+    legacy_request = replace(
+        request, required_operation_ids=legacy_operation_ids
+    )
+    owner = _Owner(legacy_request)
+    runtime = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (_TargetRootAdapter("codex"),),
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    runtime._validate_request(legacy_request, legacy_request.request_ref)
+
+
+def test_target_pre_union_binding_reuses_unchanged_operation_bindings(
+    tmp_path: Path,
+) -> None:
+    request = _target_request()
+    legacy_operation_ids = tuple(
+        dict.fromkeys(
+            (
+                *ROOT_ROLE_OPERATION_DELTAS["target"],
+                *ROOT_AGENT_COMMON_OPERATION_IDS,
+            )
+        )
+    )
+    gateway = _Gateway()
+    runtime = HarnessRuntime(
+        _Owner(request), gateway, (_TargetRootAdapter("codex"),)
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    operation_bindings = gateway.required_bindings(legacy_operation_ids)
+    old_catalog_hash = "b" * 64
+    contract_material = {
+        "contract_ref": OPERATION_BINDING_V1,
+        "harness_family": request.harness_family,
+        "locked_version": "test-harness-v1",
+        "required_capabilities": list(request.required_capabilities),
+        "required_operation_bindings": list(operation_bindings),
+        "semantic_mcp_catalog_hash": old_catalog_hash,
+    }
+    contract_hash = canonical_hash(contract_material)
+    binding = {
+        "contract_ref": OPERATION_BINDING_V1,
+        "contract_hash": contract_hash,
+        "conformance_ref": "operation_binding_" + contract_hash[:48],
+        "semantic_mcp_catalog_hash": old_catalog_hash,
+        "semantic_mcp_operation_bindings_hash": canonical_hash(
+            list(operation_bindings)
+        ),
+        "required_families": [request.harness_family],
+        "required_capabilities": list(request.required_capabilities),
+        "required_operation_ids": list(legacy_operation_ids),
+        "profile_receipts": [],
+    }
+    legacy_request = replace(
+        request,
+        required_operation_ids=legacy_operation_ids,
+        full_conformance_binding=binding,
+        full_conformance_binding_hash=canonical_hash(binding),
+    )
+    runtime._verify_target_runtime_binding_is_current(legacy_request)
+
+
+def test_target_resume_rejects_current_operation_binding_hash_drift(
+    tmp_path: Path,
+) -> None:
+    request = _target_request()
+    gateway = _Gateway()
+    operation_bindings = gateway.required_bindings(request.required_operation_ids)
+    contract_material = {
+        "contract_ref": OPERATION_BINDING_V1,
+        "harness_family": request.harness_family,
+        "locked_version": "test-harness-v1",
+        "required_capabilities": list(request.required_capabilities),
+        "required_operation_bindings": list(operation_bindings),
+        "semantic_mcp_catalog_hash": "a" * 64,
+    }
+    contract_hash = canonical_hash(contract_material)
+    full_binding = {
+        "contract_ref": OPERATION_BINDING_V1,
+        "contract_hash": contract_hash,
+        "conformance_ref": "operation_binding_" + contract_hash[:48],
+        "semantic_mcp_catalog_hash": "a" * 64,
+        "semantic_mcp_operation_bindings_hash": canonical_hash(
+            list(operation_bindings)
+        ),
+        "required_families": [request.harness_family],
+        "required_capabilities": list(request.required_capabilities),
+        "required_operation_ids": list(request.required_operation_ids),
+        "profile_receipts": [],
+    }
+    request = replace(
+        request,
+        full_conformance_binding=full_binding,
+        full_conformance_binding_hash=canonical_hash(full_binding),
+    )
+    owner = _Owner(request)
+    runtime = HarnessRuntime(
+        owner,
+        gateway,
+        (_TargetRootAdapter("codex"),),
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    runtime.resume_probe(request.request_ref)
+
+    gateway.query_status = lambda: {
+        "status": "ready",
+        "catalog_hash": "b" * 64,
+    }
+    with pytest.raises(
+        HarnessAdmissionError, match="target_harness_runtime_binding_drift"
+    ):
+        runtime.resume_probe(request.request_ref)
+
+
+@pytest.mark.parametrize("contract_ref", [FULL_CONFORMANCE_V1, FULL_CONFORMANCE_V2])
+def test_target_resume_keeps_legacy_full_conformance_binding_on_full_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contract_ref: str,
+) -> None:
+    request = _target_request()
+    binding = FullConformanceBinding(
+        contract_ref=contract_ref,
+        contract_hash="1" * 64,
+        conformance_ref="hfc:legacy-target",
+        semantic_mcp_catalog_hash="2" * 64,
+        semantic_mcp_operation_bindings_hash="3" * 64,
+        required_families=(request.harness_family,),
+        required_capabilities=request.required_capabilities,
+        required_operation_ids=request.required_operation_ids,
+        profile_receipts=(),
+    )
+    request = replace(
+        request,
+        full_conformance_binding=binding.as_dict(),
+        full_conformance_binding_hash=binding.binding_hash,
+    )
+    owner = _Owner(request)
+    runtime = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (_TargetRootAdapter("codex"),),
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    monkeypatch.setattr(runtime, "require_full_conformance_binding", lambda: binding)
+
+    runtime._verify_target_runtime_binding_is_current(request)
+
+
+def test_target_resume_rejects_unknown_production_binding_contract(
+    tmp_path: Path,
+) -> None:
+    request = _target_request()
+    request = replace(
+        request,
+        full_conformance_binding={"contract_ref": "foreign/runtime/v1"},
+        full_conformance_binding_hash=canonical_hash(
+            {"contract_ref": "foreign/runtime/v1"}
+        ),
+    )
+    owner = _Owner(request)
+    runtime = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (_TargetRootAdapter("codex"),),
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    with pytest.raises(
+        HarnessAdmissionError, match="target_harness_runtime_binding_invalid"
+    ):
+        runtime.resume_probe(request.request_ref)
+
+
 def test_resident_root_channel_rejects_catalog_selected_by_the_caller(
     tmp_path: Path,
 ) -> None:
@@ -1142,40 +1364,7 @@ def test_operation_tree_bearers_keep_exact_catalog_and_revocation_boundaries(
     assert list_operations(reasoning.connection.token, 2) == (
         REASONING_ROOT_SEMANTIC_OPERATION_IDS
     )
-
-    bundle_only = next(
-        item
-        for item in BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
-        if item not in REASONING_ROOT_SEMANTIC_OPERATION_IDS
-    )
-    reasoning_only = next(
-        item
-        for item in REASONING_ROOT_SEMANTIC_OPERATION_IDS
-        if item not in BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
-    )
-    for request_id, token, forbidden_operation in (
-        (3, bundle.connection.token, reasoning_only),
-        (4, reasoning.connection.token, bundle_only),
-    ):
-        status, payload, _ = runtime.dispatch_mcp_http(
-            token,
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "tools/call",
-                "params": {"name": forbidden_operation, "arguments": {}},
-            },
-            mcp_session_id="client-session",
-        )
-        assert status == 200
-        assert payload is not None
-        result = payload.get("result")
-        assert isinstance(result, dict)
-        assert result["isError"] is True
-        assert result["structuredContent"] == {
-            "status": "capability_unavailable",
-            "code": "capability_unavailable",
-        }
+    assert BUNDLE_ROOT_SEMANTIC_OPERATION_IDS == REASONING_ROOT_SEMANTIC_OPERATION_IDS
 
     runtime.revoke_resident_mcp_channel(bundle)
     revoked_status, revoked_payload, _ = runtime.dispatch_mcp_http(

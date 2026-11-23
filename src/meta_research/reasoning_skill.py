@@ -125,6 +125,19 @@ _SCIENTIFIC_EVIDENCE_KINDS = frozenset(
 _DIAGNOSTIC_EVIDENCE_KINDS = frozenset(
     {"CheckpointArtifact", "LogAsset", "AnalysisAsset"}
 )
+RESEARCH_TIME_BUDGET_UNKNOWN = "unknown"
+
+
+_REASONING_RESEARCH_TIME_GUIDANCE = (
+    "在选择下一轮题目、入口或 cycle_focus 前，先按当前内容需要读取 "
+    "advancement_engine.research_time.read，并使用返回的 status、used_seconds、"
+    "remaining_seconds、overrun_seconds、accuracy 和 unknown_intervals 判断投入的"
+    "时间代价与可辨别信息。near、over、unknown 都是规划证据，不是硬门槛；"
+    "说明它们如何改变继续、暂缓、转向或求助的取舍，不能因预算超出或计量未知"
+    "擅自拒绝已授权工作、强制收口或先申请延期。若有人类预算调整，沿同一"
+    "research_time reader 核对当前 budget_revision 和正式回执，再把变化用于后继"
+    "安排并保留计量缺口。"
+)
 
 
 class ReasoningFullConformanceAuthority(Protocol):
@@ -231,6 +244,11 @@ class ReasoningSkillRequest:
     continuation_feedback: tuple[str, ...] = ()
     continuation_predecessor_job_ref: str | None = None
     current_continuation_feedback: tuple[str, ...] | None = None
+    # Captured by the stage owner immediately before a live provider turn.
+    # This is an internal binding for the existing research_time_basis field,
+    # not a new provider output field.  Older deterministic callers leave it
+    # unset and retain the legacy validation path.
+    research_time_budget_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -779,6 +797,46 @@ def _validate_output_bindings(
         )
     ):
         raise ReasoningContractError("reasoning_skill_output_binding_mismatch")
+    expected_revision = request.research_time_budget_revision
+    if expected_revision == RESEARCH_TIME_BUDGET_UNKNOWN:
+        # The owner could not read the live budget.  Neither a self-reported
+        # revision nor its absence can be verified, so fail explicitly instead
+        # of silently disabling the guard and accepting a forged revision.
+        raise ReasoningContractError("reasoning_research_time_budget_unknown")
+    if expected_revision is None:
+        return
+    for field in ("next_cycle_proposal", "candidate_completion", "autonomous_scope"):
+        transition = output.get(field)
+        if not isinstance(transition, dict):
+            continue
+        basis = transition.get("research_time_basis")
+        if not isinstance(basis, dict):
+            raise ReasoningContractError("reasoning_research_time_basis_invalid")
+        if basis.get("budget_revision") != expected_revision:
+            raise ReasoningContractError("reasoning_research_time_budget_stale")
+
+
+def persisted_research_time_budget_revision(
+    draft: dict[str, object],
+) -> str | None:
+    """Return the owner-validated revision frozen inside a primary draft.
+
+    The generation turn validates the provider's basis against the live owner
+    snapshot before the draft is persisted.  Finalize must therefore compare
+    the persisted draft with that same frozen revision, not with a budget a
+    human may have advanced after the checkpoint was written.
+    """
+
+    for field in ("next_cycle_proposal", "candidate_completion", "autonomous_scope"):
+        transition = draft.get(field)
+        if not isinstance(transition, dict):
+            continue
+        basis = transition.get("research_time_basis")
+        if isinstance(basis, dict):
+            revision = basis.get("budget_revision")
+            if isinstance(revision, str) and revision:
+                return revision
+    return None
 
 
 def _completion_basis_for_output(
@@ -1167,7 +1225,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "affirmed | denied | uncertain | insufficient_evidence 之一，并且恰有一个 "
             "NextCycleProposal | CandidateCompletion。按上述 Skill 评估 Bundle 统一交接的"
             "建题推荐，也可从本轮结果与历史自主形成候选；保留项不逐个升级为新题。"
-            "比较已有题覆盖范围与独立研究价值后，若保留"
+            f"{_REASONING_RESEARCH_TIME_GUIDANCE}"
+            "当 provider_context_view 的 graph_binding.active_question_refs 包含当前 Question 之外的有效题目时，"
+            "先沿 research_graph.question_relations.read 或 research_graph.question_history.read 核对至少一条最有据的竞争路线；"
+            "若没有可比较的有效路线，明确记录这一判断。把候选路线的依赖、剩余工作与时间成本、"
+            "可取得的区分信息、暂缓代价及其机会成本写入 notes 或 research_synthesis，说明这些比较如何决定是否建题、"
+            "进入哪个入口以及下一轮 focus。比较已有题覆盖范围与独立研究价值后，若保留"
             "新建或分解 Question 的候选，"
             "改为返回非终态 reasoning-autonomous-checkpoint：同一 scientific_outcome 加"
             "一个 internal AutonomousQuestionScope；它只包含 reviewed question blueprint、"
@@ -1761,6 +1824,13 @@ def _reasoning_autonomous_checkpoint_schema(
         },
         "is_authoritative": {"const": False},
     }
+    if request.research_time_budget_revision is not None:
+        # The contract already accepts this existing evidence field. Require
+        # it only for a live owner-bound request so deterministic fixtures keep
+        # their legacy shape while live autonomous choices remain auditable.
+        scope_base_properties["research_time_basis"] = _research_time_basis_schema(
+            request
+        )
     scope_variants = [
         {
             "type": "object",
@@ -1978,6 +2048,7 @@ def _next_cycle_proposal_schema(
         "target_question_ref": {"type": "string", "minLength": 1},
         "target_question_anchor_ref": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},
+        "research_time_basis": _research_time_basis_schema(request),
     }
     return {
         "anyOf": [
@@ -2043,12 +2114,90 @@ def _candidate_completion_schema(
         },
         "rationale": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},
+        "research_time_basis": _research_time_basis_schema(request),
     }
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": properties,
         "required": list(properties),
+    }
+
+
+def _research_time_basis_schema(
+    request: ReasoningSkillRequest,
+) -> dict[str, object]:
+    """Require a structured budget snapshot on every live Reasoning route."""
+
+    text = {"type": "string", "minLength": 1}
+    nonnegative_number = {"type": "number", "minimum": 0}
+    nullable_seconds = {"anyOf": [nonnegative_number, {"type": "null"}]}
+    interval = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "start": nonnegative_number,
+            "end": nonnegative_number,
+            "reason": text,
+        },
+        "required": ["start", "end", "reason"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_ref": {"const": "meta-research/research-time-basis/v1"},
+            "quest_ref": {"const": request.quest_ref},
+            "budget_revision": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "observed_at": nonnegative_number,
+            "status": {
+                "type": "string",
+                "enum": [
+                    "not_started",
+                    "running",
+                    "paused",
+                    "stopped",
+                    "completed",
+                ],
+            },
+            "accuracy": {"type": "string", "enum": ["exact", "unknown"]},
+            "used_seconds": nullable_seconds,
+            "remaining_seconds": nullable_seconds,
+            "overrun_seconds": nullable_seconds,
+            "unknown_intervals": {
+                "type": "array",
+                "items": interval,
+            },
+            "decision": {
+                "type": "string",
+                "enum": [
+                    "continue",
+                    "pause",
+                    "redirect",
+                    "ask_human",
+                    "complete",
+                    "undetermined",
+                ],
+            },
+            "decision_rationale": text,
+        },
+        "required": [
+            "schema_ref",
+            "quest_ref",
+            "budget_revision",
+            "observed_at",
+            "status",
+            "accuracy",
+            "used_seconds",
+            "remaining_seconds",
+            "overrun_seconds",
+            "unknown_intervals",
+            "decision",
+            "decision_rationale",
+        ],
     }
 
 

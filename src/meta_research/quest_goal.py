@@ -736,3 +736,33 @@ def _parse_retention(value: object) -> dict[str, object]:
 def _bounded_text(value: object, _name: str, *, maximum: int) -> None:
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         raise OwnerConflict("goal_evolution_decision_invalid")
+
+
+def validate_stage_quest_goal_binding(
+    context_pack: dict[str, object],
+    *,
+    expected_quest_ref: str | None = None,
+) -> tuple[str | None, dict[str, object] | None]:
+    """Validate optional frozen Quest Goal fields symmetrically across Stages."""
+
+    has_ref = "goal_revision_ref" in context_pack
+    has_goal = "quest_goal_revision" in context_pack
+    if has_ref != has_goal:
+        raise ValueError("frozen quest goal binding")
+    if not has_ref:
+        return None, None
+    goal_revision_ref = context_pack.get("goal_revision_ref")
+    quest_goal_revision = context_pack.get("quest_goal_revision")
+    if (
+        not isinstance(goal_revision_ref, str)
+        or not goal_revision_ref
+        or not isinstance(quest_goal_revision, dict)
+        or quest_goal_revision.get("kind") != "QuestGoalRevision"
+        or quest_goal_revision.get("goal_revision_ref") != goal_revision_ref
+        or (
+            expected_quest_ref is not None
+            and quest_goal_revision.get("quest_ref") != expected_quest_ref
+        )
+    ):
+        raise ValueError("frozen quest goal binding")
+    return goal_revision_ref, quest_goal_revision

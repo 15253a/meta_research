@@ -1,9 +1,10 @@
-"""One small Semantic MCP view for a long-lived Target root Session.
+"""Target-specific Semantic MCP operations for a long-lived root Session.
 
-The Target root uses its native Harness tools to implement, train, inspect,
-revise, and retry.  Semantic MCP therefore exposes only the current
-issuer-verified Target context.  Execution, monitoring, review, and completion
-remain host boundaries and are deliberately not Agent-authored operations.
+The Target root uses native Harness tools to implement, train, inspect, revise,
+and retry.  The full resident gateway also grants the common RG/RM discovery
+and reader surface, while this module keeps only the current issuer-verified
+Target observations here.  Execution, review, and completion remain host
+boundaries and are not Agent-authored operations.
 """
 
 from __future__ import annotations

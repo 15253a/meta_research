@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import text
 
 from meta_research.bundle_protocol import AcceptedInputAssetProof, ReceiptProof
+from meta_research.formal_run_bindings import SELECTION_MANIFEST_SCHEMA
 from meta_research.owners.common import OwnerConflict, canonical_json
 from meta_research.run_only_registration import _source_inputs, _unassessed_inventory
 from meta_research.target_run_finalizer import TargetRunFinalizer
@@ -172,14 +173,18 @@ def test_exact_asset_version_can_be_selected_from_accepted_receipt():
     completion = SimpleNamespace(handle=SimpleNamespace(accepted_input_asset_proofs=(proof,),
         accepted_input_target_commit_refs=("upstream",), target_run_ref="target-run"),
         completion_ref="completion", payload_hash="completion-hash", receipt=receipt)
+    implementation = {'role': 'implementation', 'tree_hash': 'a' * 64, 'artifact_kind': 'directory',
+        'declared_relative_path': 'implementation', 'path': None, 'asset_binding': {'content_hash': 'b' * 64}}
     manifest = SimpleNamespace(implementation_revision_ref="implementation", implementation_tree_hash="tree-hash",
         manifest_ref="manifest", payload_hash="manifest-hash", receipt=receipt,
-        entries=(SimpleNamespace(as_dict=lambda: {'role': 'implementation', 'tree_hash': 'tree-hash',
-            'declared_relative_path': 'implementation'}),),
+        schema_ref=SELECTION_MANIFEST_SCHEMA, selections=(implementation,),
+        entries=(SimpleNamespace(as_dict=lambda: implementation),),
         result_document=SimpleNamespace(as_dict=lambda: {'formal_runs': [{'run_key': 'actual'}]}))
     target = SimpleNamespace(target_ref="target", spec_hash="spec-hash")
     authority = SimpleNamespace(authority_ref="authority", authority_hash="authority-hash")
     source_owner = SimpleNamespace(
+        query_bundle_input_asset_proof=lambda *, target_ref, asset_ref: proof
+            if (target_ref, asset_ref) == ("target", "asset") else None,
         query_target_input_asset_projection=lambda **kwargs: SimpleNamespace(
             target_ref="target", as_bundle_proof=lambda: proof,
             asset=SimpleNamespace(asset_ref="asset", version_ref="asset-version-7")),

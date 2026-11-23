@@ -18,6 +18,15 @@ from meta_research.quest_research_time import read_quest_research_time_in_transa
 _PREFIX = "[meta-research runtime conditions v1; characters="
 _LIMIT = 24000
 _INIT_PREFIX = "initialization:"
+_RESEARCH_TIME_GUIDANCE = (
+    "research_time 是 Quest 共用的当前计时观察，优先于正文中的初始总预算。安排新工作、长调用后及人类答复后，"
+    "按需用 advancement_engine.research_time.read 刷新，如实记录用时、偏差与计量不确定性。"
+    "Quest 时长、1200 秒环境准备窗口及 Agent 提出的阶段时限均为规划建议，写入或接纳 Plan 不使其成为硬要求。"
+    "达到、预计超出或暂不能准确核定建议预算时，根据研究价值调整安排并在已授权范围内继续；"
+    "不能仅因此拒绝调度、Target 接纳、成果交接或后继推进，也不强制停止、收口或先申请延期。"
+    "用户明确的停止指令、资源与权限边界、工具超时和进程控制仍按其本身含义执行。"
+    "已发出操作先沿原输入对账，历史 Plan、失败和已接纳成果保持原记录；新决策使用当前建议预算语义。\n"
+)
 
 
 def _data_root(workspace: Path) -> Path | None:
@@ -426,16 +435,7 @@ def render_runtime_conditions(workspace: Path, *, quest_ref=None, run_ref=None,
         "入口已配置不代表已登录、连接可用或全文已取得，应通过文献获取流程核实实际访问状态。\n"
         if "literature_configuration" in public else ""
     )
-    clock_guidance = (
-        "research_time 是 Quest 共用的当前计时观察，优先于正文中的初始总预算。安排新工作、长调用后及人类答复后，"
-        "按需用 advancement_engine.research_time.read 刷新，如实记录用时、偏差与计量不确定性。"
-        "Quest 时长、1200 秒环境准备窗口及 Agent 提出的阶段时限均为规划建议，写入或接纳 Plan 不使其成为硬要求。"
-        "达到、预计超出或暂不能准确核定建议预算时，根据研究价值调整安排并在已授权范围内继续；"
-        "不能仅因此拒绝调度、Target 接纳、成果交接或后继推进，也不强制停止、收口或先申请延期。"
-        "用户明确的停止指令、资源与权限边界、工具超时和进程控制仍按其本身含义执行。"
-        "已发出操作先沿原输入对账，历史 Plan、失败和已接纳成果保持原记录；新决策使用当前建议预算语义。\n"
-        if "research_time" in public else ""
-    )
+    clock_guidance = _RESEARCH_TIME_GUIDANCE if "research_time" in public else ""
     return (
         "本次调用的当前运行条件（由系统读取用户配置）：遵循下列最新条件，并传给委派的智能体。"
         "同类旧运行条件以本段为准；已经接纳的研究成果、精确输入与正式授权仍按原记录核验。\n"
@@ -475,6 +475,8 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
     lines = []
     if updates:
         lines.append("当前运行条件更新=" + json.dumps(updates, ensure_ascii=False, separators=(",", ":")))
+        if "research_time" in updates:
+            lines.append(_RESEARCH_TIME_GUIDANCE.rstrip())
         if "research_style" in updates:
             lines.append(render_research_style(updates["research_style"]))
     if current_directories is not None:

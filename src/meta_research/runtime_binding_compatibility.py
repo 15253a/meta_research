@@ -1,8 +1,10 @@
-"""Exact runtime identities, with the current Bundle policy prose exception.
+"""Exact runtime identities, with explicit, recorded refresh seams.
 
 Only SKILL.md and contract.md can change within the same execution identity.
-Historical deployments require their original installation; no release hash
-registry rewrites or extends an existing Run's grants.
+Historical deployments require their original installation unless an Owner
+creates a new stage request at a fenced suspend/rebind boundary.  That seam
+may adopt only a current Semantic MCP catalog and operation-binding hash.
+It does not authorize arbitrary resource, model, or capability changes.
 """
 from typing import TYPE_CHECKING
 
@@ -15,6 +17,8 @@ _RECOVERY_SOURCE = "adapter-source:meta_research.bundle_dispatch_recovery@sha256
 _POLICY_CONTRACT = "bundle-execution-contract:policy-refresh/v1"
 _POLICY_PACKAGE = "package:meta_research.skills.bundle_stage/"
 _POLICY_RESOURCES = ("SKILL.md", "references/contract.md")
+_MCP_BINDING_PREFIX = "harness-operation-binding:semantic-mcp-"
+_OPERATION_BINDING_RESOURCE_PREFIX = "harness-artifact:operation-binding-"
 
 
 def _single_resource(binding: "BundleRuntimeBinding", prefix: str) -> str | None:
@@ -25,6 +29,90 @@ def _single_resource(binding: "BundleRuntimeBinding", prefix: str) -> str | None
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(
         character in "0123456789abcdef" for character in value
+    )
+
+
+def _binding_hashes(values: tuple[str, ...]) -> tuple[str, str] | None:
+    selected: dict[str, str] = {}
+    for value in values:
+        if not value.startswith(_MCP_BINDING_PREFIX) or "@sha256:" not in value:
+            continue
+        name, digest = value.rsplit("@sha256:", 1)
+        if name not in {
+            _MCP_BINDING_PREFIX + "catalog",
+            _MCP_BINDING_PREFIX + "operation-bindings",
+        } or not _is_sha256(digest) or name in selected:
+            return None
+        selected[name] = value
+    if set(selected) != {
+        _MCP_BINDING_PREFIX + "catalog",
+        _MCP_BINDING_PREFIX + "operation-bindings",
+    }:
+        return None
+    return (
+        selected[_MCP_BINDING_PREFIX + "catalog"],
+        selected[_MCP_BINDING_PREFIX + "operation-bindings"],
+    )
+
+
+def stage_bindings_mcp_rebind_compatible(left, right) -> bool:
+    """Allow only a current MCP catalog refresh at a fenced stage rebind.
+
+    A new Owner stage request is the authorization for this comparison.  The
+    persisted binding remains exact until that request is accepted.  Every
+    execution identity, capability and non-MCP resource stays byte-for-byte
+    equal.  The only replaceable entries are the resident MCP hashes and the
+    operation-binding contract/set artifacts they describe.
+    """
+
+    if type(left) is not type(right):
+        return False
+    if left == right:
+        return True
+    if left.schema_ref != right.schema_ref:
+        return False
+    left_mcp = _binding_hashes(left.mcp_bindings)
+    right_mcp = _binding_hashes(right.mcp_bindings)
+    if left_mcp is None or right_mcp is None or left_mcp == right_mcp:
+        return False
+
+    def stable_resources(values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            value
+            for value in values
+            if not value.startswith(_OPERATION_BINDING_RESOURCE_PREFIX)
+        )
+
+    def operation_resources(values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                value
+                for value in values
+                if value.startswith(_OPERATION_BINDING_RESOURCE_PREFIX)
+            )
+        )
+
+    left_operation_resources = operation_resources(left.resource_bindings)
+    right_operation_resources = operation_resources(right.resource_bindings)
+    # The operation contract and set artifacts are derived from the same
+    # current authority as the two MCP hashes.  Require both artifact values
+    # to move with those hashes so a caller cannot smuggle an unrelated valid
+    # digest through this migration seam.
+    if (
+        len(left_operation_resources) != 2
+        or len(right_operation_resources) != 2
+        or left_operation_resources == right_operation_resources
+    ):
+        return False
+
+    return (
+        left.packaged_skill_bundle_hash == right.packaged_skill_bundle_hash
+        and left.instruction_set_hash == right.instruction_set_hash
+        and left.model_ref == right.model_ref
+        and left.harness_adapter_ref == right.harness_adapter_ref
+        and left.capability_bindings == right.capability_bindings
+        and stable_resources(left.resource_bindings)
+        == stable_resources(right.resource_bindings)
     )
 
 

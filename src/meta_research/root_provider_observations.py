@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -16,7 +17,9 @@ from sqlalchemy import text
 from meta_research.owners.common import canonical_hash
 from meta_research.child_session_observations import observe_child_sessions, append_child_sessions
 from meta_research.provider_supervisor import (
-    ProviderSupervisorError, provider_operation_ref, read_transport_envelope, read_verified_exit_receipt,
+    ProviderSupervisorError, SUPERVISOR_HEARTBEAT_MAX_FUTURE_SKEW_SECONDS,
+    SUPERVISOR_HEARTBEAT_SCHEMA, SUPERVISOR_HEARTBEAT_STALE_SECONDS,
+    provider_operation_ref, read_transport_envelope, read_verified_exit_receipt,
 )
 
 _MAX_RECORDS = 512
@@ -26,6 +29,15 @@ _MAX_PAGE_BYTES = 256 * 1024
 _REGISTRY_SCHEMA = "meta-research/deepfetch-provider-operation-registry/v1"
 _DF_SCHEMA = "meta-research/deepfetch-provider-operation/v3"
 _ACQ_SCHEMA = "meta-research/acquisition-root-session/v1"
+
+
+def _valid_heartbeat_observed_at(value: object) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return value >= 0 and math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 class ProviderRootObservations:
@@ -496,6 +508,7 @@ class ProviderRootObservations:
             source_mtime = max(source_mtime, path.stat().st_mtime)
         invocation_hash = canonical_hash(invocation)
         status, terminal_hash = default_status, None
+        heartbeat = None
         terminal = directory / "supervisor-exit.json"
         if terminal.exists():
             self._safe(terminal, file=True)
@@ -507,20 +520,75 @@ class ProviderRootObservations:
             if not isinstance(terminal_hash, str) or len(terminal_hash) != 64:
                 raise ValueError("root_session_exit_identity_invalid")
             source_mtime = max(source_mtime, terminal.stat().st_mtime)
-        elif status == "executing":
-            # Import lazily: the aggregate uses this reader through a lazy
-            # import too. Reuse its sealed PID + exact operation environment
-            # verification rather than interpreting a missing exit as activity.
-            from meta_research.root_session_observations import _process_is_bound
-            if not _process_is_bound(directory, invocation_hash):
-                status = "waiting"
+        else:
+            heartbeat_path = directory / "supervisor-heartbeat.json"
+            if heartbeat_path.exists():
+                self._safe(heartbeat_path, file=True)
+                marker = read_transport_envelope(heartbeat_path, key)
+                observed_at = marker.get("observed_at")
+                now = time.time()
+                provider_fields = (
+                    marker.get("provider_process_id"),
+                    marker.get("provider_process_group"),
+                    marker.get("provider_operation_path"),
+                )
+                if (
+                    marker.get("schema_ref") != SUPERVISOR_HEARTBEAT_SCHEMA
+                    or marker.get("invocation_hash") != invocation_hash
+                    or marker.get("phase") not in {"ready", "running"}
+                    or not _valid_heartbeat_observed_at(observed_at)
+                    or (
+                        _valid_heartbeat_observed_at(observed_at)
+                        and float(observed_at)
+                        > now + SUPERVISOR_HEARTBEAT_MAX_FUTURE_SKEW_SECONDS
+                    )
+                    or type(marker.get("supervisor_process_id")) is not int
+                    or marker.get("supervisor_process_id") <= 1
+                    or type(marker.get("supervisor_process_group")) is not int
+                    or marker.get("supervisor_process_group") <= 1
+                    or (
+                        any(value is not None for value in provider_fields)
+                        and (
+                            type(provider_fields[0]) is not int
+                            or provider_fields[0] <= 1
+                            or type(provider_fields[1]) is not int
+                            or provider_fields[1] <= 1
+                            or provider_fields[2]
+                            != str((directory / "supervisor-request.json").resolve())
+                        )
+                    )
+                ):
+                    raise ValueError("root_session_heartbeat_identity_invalid")
+                age_seconds = max(0.0, now - float(observed_at))
+                heartbeat = {
+                    "phase": marker["phase"],
+                    "observed_at": observed_at,
+                    "age_seconds": age_seconds,
+                    "stale": age_seconds > SUPERVISOR_HEARTBEAT_STALE_SECONDS,
+                }
+                if "stdout_bytes" in marker:
+                    stdout_bytes = marker["stdout_bytes"]
+                    if type(stdout_bytes) is not int or stdout_bytes < 0:
+                        raise ValueError("root_session_heartbeat_invalid")
+                    heartbeat["stdout_bytes"] = stdout_bytes
+                source_mtime = max(source_mtime, heartbeat_path.stat().st_mtime)
+            if status == "executing":
+                # Import lazily: the aggregate uses this reader through a lazy
+                # import too. Reuse its sealed PID + exact operation environment
+                # verification rather than interpreting a missing exit as activity.
+                from meta_research.root_session_observations import _process_is_bound
+                if not _process_is_bound(directory, invocation_hash):
+                    status = "waiting"
         operation_ref = "provider-root-operation:" + canonical_hash({
             "directory": str(directory.relative_to(self._root)), "invocation_hash": invocation_hash})
+        public = {"operation_ref": operation_ref, "label": f"{label} · {phase}",
+            "phase": phase, "status": status,
+            "created_at": invocation_path.stat().st_mtime, "updated_at": source_mtime}
+        if heartbeat is not None:
+            public["heartbeat"] = heartbeat
         return {"directory": directory, "native": observed_native, "native_rejected": native_rejected,
                 "invocation_hash": invocation_hash, "terminal_hash": terminal_hash,
-                "public": {"operation_ref": operation_ref, "label": f"{label} · {phase}",
-                    "phase": phase, "status": status,
-                    "created_at": invocation_path.stat().st_mtime, "updated_at": source_mtime}}
+                "public": public}
 
     def _key(self, workspace):
         path = workspace / "provider-operations" / ".transport-seal.key"

@@ -2284,6 +2284,8 @@ class CodexIdeaSkillAdapter:
                 ) as raw_directory:
                     invoked = self._invoke_once(
                         model_ref=model_ref,
+                        run_ref=run_ref,
+                        operation_name=operation_name,
                         execution_access_mode=execution_access_mode,
                         execution_write_root=execution_write_root,
                         directory=Path(raw_directory),
@@ -2514,6 +2516,8 @@ class CodexIdeaSkillAdapter:
         try:
             result = self._invoke_once(
                 model_ref=model_ref,
+                run_ref=run_ref,
+                operation_name=operation_name,
                 execution_access_mode=execution_access_mode,
                 execution_write_root=execution_write_root,
                 directory=directory,
@@ -2559,6 +2563,8 @@ class CodexIdeaSkillAdapter:
         self,
         *,
         model_ref: str,
+        run_ref: str | None = None,
+        operation_name: str = "primary",
         directory: Path,
         prompt: str,
         schema: dict[str, object],
@@ -2733,6 +2739,14 @@ class CodexIdeaSkillAdapter:
                         supervisor_payload["prompt_max_bytes"] = (
                             transport_limits.prompt_max_bytes
                         )
+                        supervisor_payload["operation_scope"] = _provider_operation_scope(
+                            run_ref=run_ref,
+                            workspace_binding=workspace_binding,
+                            job_ref=job_ref,
+                            operation_name=operation_name,
+                            root_kind=self._root_agent_kind,
+                            model_ref=model_ref,
+                        )
                         write_supervisor_request(
                             supervisor_request_path,
                             supervisor_payload,
@@ -2820,6 +2834,22 @@ class CodexIdeaSkillAdapter:
                         returncode=completed.returncode,
                         input_bytes=len(prompt.encode("utf-8")),
                         process_tree=getattr(completed, "process_tree", None),
+                        codex_home=(
+                            Path(str(environment["CODEX_HOME"]))
+                            if isinstance(environment, dict) and isinstance(environment.get("CODEX_HOME"), str)
+                            else Path(str(getattr(runner, "_protected_environment", {})["CODEX_HOME"]))
+                            if isinstance(getattr(runner, "_protected_environment", {}), dict)
+                            and isinstance(getattr(runner, "_protected_environment", {}).get("CODEX_HOME"), str)
+                            else None
+                        ),
+                        operation_scope=_provider_operation_scope(
+                            run_ref=run_ref,
+                            workspace_binding=workspace_binding,
+                            job_ref=job_ref,
+                            operation_name=operation_name,
+                            root_kind=self._root_agent_kind,
+                            model_ref=model_ref,
+                        ),
                     )
                 exit_marker = _write_exit_marker(
                     directory,
@@ -2917,6 +2947,33 @@ def _operation_workspace_fields(invocation: dict[str, object]) -> set[str]:
             or binding.get("working_directory") != directory)):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     return fields
+
+
+def _provider_operation_scope(
+    *, run_ref: str | None, workspace_binding: WorkspaceBinding | None,
+    job_ref: str | None, operation_name: str, root_kind: str,
+    model_ref: str,
+) -> dict[str, object]:
+    scope: dict[str, object] = {
+        "operation_name": operation_name,
+        "root_kind": root_kind,
+        "model_ref": model_ref,
+    }
+    if isinstance(job_ref, str) and job_ref:
+        scope["job_ref"] = job_ref
+        scope["operation_ref"] = job_ref
+    if isinstance(run_ref, str) and run_ref:
+        scope["run_ref"] = run_ref
+    if workspace_binding is not None:
+        location = workspace_binding.location
+        for key in (
+            "workspace_ref", "root_session_ref", "work_ref", "quest_ref",
+            "cycle_ref", "request_ref", "target_ref",
+        ):
+            value = getattr(location, key, None)
+            if isinstance(value, str) and value:
+                scope[key] = value
+    return scope
 
 
 def _loopback_no_proxy() -> str:

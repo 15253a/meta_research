@@ -15,9 +15,12 @@ import pytest
 from provider_supervisor_support import closed_tree_fixture
 
 from meta_research.idea_skill import _compile_codex_output_schema
-from meta_research.owners.agent_runtime import PlanRuntimeBinding
+from meta_research.owners.agent_runtime import (
+    PlanRuntimeBinding,
+    _stage_material_hash_matches,
+)
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.plan_contract import material_plan_hash
+from meta_research.plan_contract import legacy_material_plan_hash, material_plan_hash
 from meta_research.plan_skill import (
     CodexPlanSkillAdapter,
     PlanSkillContractError,
@@ -244,6 +247,7 @@ def _plan(goal: str = "比较跨设备形态召回。") -> dict[str, object]:
             }
         ],
         "bundle_disposition": "experiments_required",
+        "evidence_accounting": [],
         "source_bindings": {
             "question_ref": "question:1",
             "idea_set_ref": "idea-set:1",
@@ -353,12 +357,50 @@ def test_validator_accepts_exact_plan_and_owner_feedback_requires_material_chang
             predecessor_material_plan_hash=material_plan_hash(predecessor),
         )
 
+    representation_only = deepcopy(predecessor)
+    representation_only["experiment_briefs"][0]["reuse_material_refs"] = []
+    with pytest.raises(
+        PlanSkillContractError, match="owner_feedback_revision_not_material"
+    ):
+        validate_plan_skill_result(
+            request,
+            _result(draft=representation_only),
+            predecessor_material_plan_hash=material_plan_hash(predecessor),
+        )
+
     successor = _plan("在至少两种设备上比较形态召回。")
     validate_plan_skill_result(
         request,
         _result(draft=successor),
         predecessor_material_plan_hash=material_plan_hash(predecessor),
     )
+
+
+def test_owner_feedback_treats_omitted_and_empty_reuse_refs_as_same_material() -> None:
+    predecessor = _plan()
+    successor = deepcopy(predecessor)
+    successor["experiment_briefs"][0]["reuse_material_refs"] = []
+    assert material_plan_hash(predecessor) == material_plan_hash(successor)
+
+
+def test_legacy_plan_material_hash_remains_available_for_frozen_documents() -> None:
+    predecessor = _plan()
+    legacy = deepcopy(predecessor)
+    legacy["experiment_briefs"][0]["reuse_material_refs"] = []
+
+    assert material_plan_hash(legacy) == material_plan_hash(predecessor)
+    assert legacy_material_plan_hash(legacy) != material_plan_hash(legacy)
+
+
+def test_plan_stage_material_hash_compatibility_rejects_content_change() -> None:
+    legacy = deepcopy(_plan())
+    legacy["experiment_briefs"][0]["reuse_material_refs"] = []
+    stored_hash = legacy_material_plan_hash(legacy)
+    changed = deepcopy(legacy)
+    changed["experiment_briefs"][0]["goal"] += " 修改"
+
+    assert _stage_material_hash_matches("plan", legacy, stored_hash)
+    assert not _stage_material_hash_matches("plan", changed, stored_hash)
 
 
 def test_large_legal_idea_set_keeps_actual_provider_schemas_within_budget() -> None:
@@ -534,6 +576,9 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     assert "AcceptedQuestionBinding" in primary_prompt
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
+    assert "research_graph.plan_evidence.page" in primary_prompt
+    assert "accepted TargetCommit closure" in primary_prompt
+    assert "which obligation or gap it does not support" in primary_prompt
     assert primary_schema["properties"]["plan"]["properties"]["answer_contract"]
 
 
@@ -778,7 +823,9 @@ def test_durable_plan_primary_shape_failure_is_terminal_and_not_replayed(
 
 
 @pytest.mark.parametrize("envelope", [False, True], ids=["document", "envelope"])
-def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path, envelope):
+@pytest.mark.parametrize("include_reuse_list", [False, True], ids=["omitted-reuse", "explicit-reuse"])
+@pytest.mark.parametrize("binding_objects", [False, True], ids=["wire-strings", "reader-objects"])
+def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(tmp_path, envelope, include_reuse_list, binding_objects):
     adapter = CodexPlanSkillAdapter(tmp_path, executable=str(_fake_codex(tmp_path / "codex")))
     request = _request(runtime_binding=adapter.runtime_binding(), job_ref="job:workspace-plan")
     workdir = tmp_path / "root"
@@ -792,9 +839,20 @@ def test_workspace_plan_submission_pins_the_exact_bytes_and_rechecks_on_replay(t
     for derived in ("source_bindings", "idea_trace", "evidence_reuse_set", "gap_set", "bundle_disposition"):
         plan.pop(derived)
     plan["answer_contract"].pop("answer_contract_hash")
-    plan["experiment_briefs"][0]["reuse_material_refs"] = []
-    plan.update(notes="逐项复核后的候选", selected_evidence_bindings=[])
-    original = json.dumps({"plan": plan} if envelope else plan, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    if include_reuse_list:
+        plan["experiment_briefs"][0]["reuse_material_refs"] = []
+    binding = {
+        "evidence_ref": "asset:1", "source_kind": "AssetVersion", "source_ref": "asset:1",
+        "source_binding": {"version_ref": "asset:1"},
+        "reader": {"operation": "research_memory.content.read", "args": {"version_ref": "asset:1"}},
+    }
+    plan.update(notes="逐项复核后的候选", selected_evidence_bindings=[binding])
+    file_plan = deepcopy(plan)
+    if not binding_objects:
+        selected = file_plan["selected_evidence_bindings"][0]
+        selected["source_binding"] = canonical_json(binding["source_binding"])
+        selected["reader"]["args"] = canonical_json(binding["reader"]["args"])
+    original = json.dumps({"plan": file_plan} if envelope else file_plan, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     digest = hashlib.sha256(original).hexdigest()
     source = workdir / "plan_candidate.json"
     source.write_bytes(original)

@@ -12,6 +12,7 @@ from meta_research.bundle_protocol import (
 )
 from meta_research.bundle_target_contract import measurement_contract_to_dict
 from meta_research.owners.common import OwnerConflict, canonical_json
+from meta_research.target_content_issue import TargetContentIssue, check_copied_target_identity
 from meta_research.target_implementation_bundle import (
     IMPLEMENTATION_ENTRY_MAX_BYTES, IMPLEMENTATION_ENTRY_MAX_COUNT,
     IMPLEMENTATION_TOTAL_MAX_BYTES, IMPLEMENTATION_BUNDLE_MAX_BYTES,
@@ -57,6 +58,7 @@ def target_execution_context(*, authority: object, target_ref: str,
     protocol = authority.measurement_contract.protocol_version
     draft_check_protocol = {
         "protocol_version_ref": authority.identities.protocol_version_ref,
+        "result_schema_ref": authority.measurement_contract.result_schema_ref,
         "required_metric_keys": list(protocol.required_metric_keys),
         "optional_metric_keys": list(protocol.optional_metric_keys),
     }
@@ -68,8 +70,8 @@ def target_execution_context(*, authority: object, target_ref: str,
                 "--check-result", canonical_json(draft_check_protocol),
             ],
             "usage": (
-                "形成草稿后，可从本 Target 工作目录按此 argv 运行一次只读指标键检查。"
-                "按原参数使用当前冻结 Protocol，在输出中查看缺少或多出的正式评价指标键和草稿摘要。"
+                "形成草稿后，可从本 Target 工作目录按此 argv 检查草稿中填写的 schema_ref 和正式评价指标键。"
+                "使用当前冻结参数，按返回的字段与草稿摘要定位所需修正。"
                 "有确定冲突时修正对应声明并保留已有工作。正式接纳仍由 Owner 在结束后核验。"
             ),
         },
@@ -131,7 +133,7 @@ def target_execution_reading_prompt(prompt: str, workspace_directory: Path) -> s
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Check a Target result draft against its supplied primary Protocol keys.")
+    parser = argparse.ArgumentParser(description="Check a Target result draft against its frozen metric keys and result schema identity.")
     parser.add_argument("--check-result", required=True, metavar="PROTOCOL_JSON")
     args = parser.parse_args(argv)
     try:
@@ -140,7 +142,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--check-result needs the JSON from the Target execution contract")
     if (
         not isinstance(protocol, dict)
-        or set(protocol) != {"protocol_version_ref", "required_metric_keys", "optional_metric_keys"}
+        or set(protocol).difference({"result_schema_ref"}) != {"protocol_version_ref", "required_metric_keys", "optional_metric_keys"}
+        or ("result_schema_ref" in protocol and
+            (not isinstance(protocol["result_schema_ref"], str) or not protocol["result_schema_ref"]))
         or not isinstance(protocol["protocol_version_ref"], str)
         or not protocol["protocol_version_ref"]
         or any(
@@ -149,16 +153,18 @@ def main(argv: list[str] | None = None) -> int:
             for key in ("required_metric_keys", "optional_metric_keys")
         )
     ):
-        parser.error("--check-result needs the exact ProtocolVersion ref and its two key lists")
+        parser.error("--check-result needs the exact ProtocolVersion ref, its two key lists, and a valid result_schema_ref if supplied")
 
     from meta_research.formal_entities import check_primary_metric_keys
     from meta_research.target_run_finalizer import read_reserved_target_result_draft
 
     details: dict[str, object] = {"protocol_version_ref": protocol.pop("protocol_version_ref")}
+    expected_schema = protocol.pop("result_schema_ref", None)
     try:
         draft = read_reserved_target_result_draft(Path.cwd())
         details["draft_sha256"] = draft.raw_sha256
-        check = check_primary_metric_keys(draft.document.as_dict(), **protocol)
+        content = draft.document.as_dict()
+        check = check_primary_metric_keys(content, **protocol)
         status = "keys_match" if check.conforms else "metric_key_mismatch"
         details.update(
             status="no_completed_assessment" if check.run_only else status,
@@ -167,6 +173,12 @@ def main(argv: list[str] | None = None) -> int:
             missing_metric_keys=list(check.missing_keys),
             unexpected_metric_keys=list(check.unexpected_keys),
         )
+        if expected_schema is not None and draft.document.schema_ref is not None:
+            try:
+                check_copied_target_identity(content, "schema_ref", expected_schema)
+            except TargetContentIssue as conflict:
+                details.update(status="copied_identity_mismatch", code=conflict.code, path="$.schema_ref",
+                               expected=expected_schema, supplied=draft.document.schema_ref, feedback=conflict.feedback)
     except OwnerConflict as error:
         details.update(status="draft_unreadable", code=error.code)
         if feedback := getattr(error, "feedback", None):

@@ -9,6 +9,7 @@ from meta_research.plan_contract import (
     PLAN_CONTEXT_PACK_SCHEMA_REF,
     PLAN_DOCUMENT_SCHEMA_REF,
     PlanContractError,
+    validate_current_plan_evidence_accounting,
     validate_plan_context_pack,
     validate_plan_document,
 )
@@ -322,6 +323,80 @@ def test_valid_plan_accounts_for_every_obligation_and_idea() -> None:
 
     assert set(evidence_by_ref) == {"evidence_1"}
     assert plan_hash == canonical_hash(_plan_document())
+
+
+def test_plan_evidence_accounting_binds_target_commit_disposition() -> None:
+    document = _plan_document()
+    document["evidence_accounting"] = [{
+        "evidence_ref": "evidence_1",
+        "target_commit_ref": "asset_root_1",
+        "status": "adopted",
+        "reason": "支持 effect 义务，但只覆盖单一设备。",
+    }]
+
+    validate_plan_document(
+        document,
+        question_ref="question_1",
+        idea_set_ref="idea_set_1",
+        context_pack_ref="plan_context_1",
+        context_pack_hash="6" * 64,
+        accepted_idea_set=_IDEA_SET,
+        evidence_by_ref={"evidence_1": _EVIDENCE_REF},
+        evidence_reference_revision=1,
+    )
+
+
+def test_plan_evidence_accounting_rejects_silent_target_commit_omission() -> None:
+    document = _plan_document()
+    document["evidence_accounting"] = []
+
+    with pytest.raises(PlanContractError, match="plan_evidence_accounting_incomplete"):
+        validate_plan_document(
+            document,
+            question_ref="question_1",
+            idea_set_ref="idea_set_1",
+            context_pack_ref="plan_context_1",
+            context_pack_hash="6" * 64,
+            accepted_idea_set=_IDEA_SET,
+            evidence_by_ref={"evidence_1": _EVIDENCE_REF},
+            evidence_reference_revision=1,
+        )
+
+
+def test_plan_evidence_accounting_rejects_null() -> None:
+    document = _plan_document()
+    document["evidence_accounting"] = None
+
+    with pytest.raises(PlanContractError, match="plan_evidence_accounting_invalid"):
+        validate_plan_document(
+            document,
+            question_ref="question_1",
+            idea_set_ref="idea_set_1",
+            context_pack_ref="plan_context_1",
+            context_pack_hash="6" * 64,
+            accepted_idea_set=_IDEA_SET,
+            evidence_by_ref={"evidence_1": _EVIDENCE_REF},
+            evidence_reference_revision=1,
+        )
+
+
+def test_legacy_plan_without_accounting_skips_current_catalog_gate() -> None:
+    document = _plan_document()
+
+    validate_current_plan_evidence_accounting(
+        document,
+        current_catalog=[_EVIDENCE_REF],
+        selected_catalog=[_selected_binding(_EVIDENCE_REF)],
+    )
+
+
+def test_current_accounting_rejects_malformed_catalog_entry() -> None:
+    with pytest.raises(PlanContractError, match="plan_evidence_accounting_invalid"):
+        validate_current_plan_evidence_accounting(
+            {"evidence_accounting": []},
+            current_catalog=[{"target_commit_root_ref": "target_1"}],
+            selected_catalog=[],
+        )
 
 
 def test_plan_domain_validator_rejects_duplicate_question_trace_after_decode() -> None:

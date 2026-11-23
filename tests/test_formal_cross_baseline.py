@@ -173,24 +173,108 @@ def test_declaration_conflicts_with_explicit_variant_or_reused_run():
         result_document={"metrics": {"quality": 1.0},
                          "formal_runs": [run]},
     )
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as explicit_variant:
         resolve({"run_key": "primary", "baseline_forward_contract": NEW_METHOD_FORWARD,
                  "variant_recipe": NEW_RECIPE,
                  "variant_ref": "variant-1",
                  "evaluations": [{"attempt_key": "a", "metrics": {"quality": 1.0}}]})
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    assert "$.formal_runs[0]" in explicit_variant.value.feedback
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as reused_run:
         resolve({"run_key": "primary", "baseline_forward_contract": NEW_METHOD_FORWARD,
                  "variant_recipe": NEW_RECIPE, "variant_run_ref": "run-existing",
                  "evaluations": []})
+    assert "$.formal_runs[0]" in reused_run.value.feedback
+
+
+def test_variant_declaration_path_tracks_formal_runs_index_across_multiple_evaluations():
+    payload = {"measurement_ref": "m", "variant_run_ref": "run-primary",
+               "evaluation_attempt_ref": "attempt-primary", "metric_result_ref": "metric-primary"}
+    identities = {"variant_ref": "variant-1", "evaluation_ref": "evaluation-1"}
+    multi_eval_doc = {
+        "metrics": {},
+        "formal_runs": [
+            {"run_key": "primary", "evaluations": [
+                {"attempt_key": "eval-1", "metrics": {"quality": 1.0}},
+                {"attempt_key": "eval-2", "metrics": {"quality": 0.9}},
+            ]},
+            {"run_key": "audit-work",
+             "baseline_forward_contract": NEW_METHOD_FORWARD,
+             "evaluations": []},
+        ],
+    }
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as expanded:
+        root_work_items(payload=payload, identities=identities, result_document=multi_eval_doc)
+    assert "$.formal_runs[1]" in expanded.value.feedback
+    assert "$.formal_runs[2]" not in expanded.value.feedback
+
+    reordered_doc = {
+        "metrics": {},
+        "formal_runs": [
+            {"run_key": "unassessed-first",
+             "baseline_forward_contract": NEW_METHOD_FORWARD,
+             "evaluations": []},
+            {"run_key": "measured-second", "evaluations": [
+                {"attempt_key": "eval-1", "metrics": {"quality": 1.0}},
+            ]},
+        ],
+    }
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as reordered:
+        root_work_items(payload=payload, identities=identities, result_document=reordered_doc)
+    assert "$.formal_runs[0]" in reordered.value.feedback
+    assert "$.formal_runs[1]" not in reordered.value.feedback
 
 
 def test_declaration_requires_both_contract_and_recipe():
     assert _variant_declaration({"run_key": "a"}) is None
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid") as missing_recipe:
         _variant_declaration({"run_key": "a", "variant_recipe": NEW_RECIPE})
-    with pytest.raises(OwnerConflict, match="target_formal_variant_declaration_invalid"):
+    assert "baseline_forward_contract and variant_recipe" in missing_recipe.value.feedback
+    with pytest.raises(TargetContentIssue, match="target_formal_variant_declaration_invalid"):
         _variant_declaration({"run_key": "a", "baseline_forward_contract": NEW_METHOD_FORWARD,
                               "variant_recipe": {}})
+
+
+def test_malformed_variant_declaration_returns_revision_feedback(tmp_path: Path):
+    runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    try:
+        path = workspace / "outputs/result.json"
+        document = json.loads(path.read_text())
+        metrics = document["metrics"]
+        document["formal_runs"] = [
+            {"run_key": "primary", "evaluations": [
+                {"attempt_key": "main", "metrics": metrics}]},
+            {"run_key": "audit-work",
+             "baseline_forward_contract": NEW_METHOD_FORWARD,
+             "evaluations": []},
+        ]
+        document["metrics"] = {}
+        path.write_text(canonical_json(document))
+
+        finalizer = TargetRunFinalizer(
+            lifecycle=lifecycle, memory=memory,
+            workspace_resolver=runtime.target_run_authorities.agent_runtime,
+            evidence_reader=_EvidenceReader(evidence),
+            measurement_authority=runtime.owners.research_graph,
+            graph_authority=runtime.owners.research_graph,
+        )
+        rejected = finalizer.finalize(handle=handle, evidence=evidence)
+        assert rejected.status == "revision_required"
+        assert rejected.pending_code == "target_formal_variant_declaration_invalid"
+        assert rejected.rejection_issuer == "research_graph"
+        assert "$.formal_runs[1]" in rejected.rejection_feedback
+        assert "audit-work" in rejected.rejection_feedback
+        assert "variant_recipe" in rejected.rejection_feedback
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_root_measurements")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_commits")
+            ).scalar_one() == 0
+    finally:
+        runtime.close()
 
 
 CONFLICTING_CONTRACT = {
@@ -308,8 +392,8 @@ def test_declared_method_content_conflict_becomes_revision_required_after_rm(
         runtime.close()
 
 
-def test_only_the_content_conflict_is_a_target_content_issue(tmp_path):
-    """Integrity, other declaration faults and verification stay OwnerConflict."""
+def test_only_revisable_declaration_faults_are_target_content_issues(tmp_path):
+    """Integrity and verification faults stay OwnerConflict."""
     runtime, _lifecycle, _memory, _authority, handle, _workspace, _evidence = (
         _root_finalizer_fixture(tmp_path)
     )
@@ -337,14 +421,14 @@ def test_only_the_content_conflict_is_a_target_content_issue(tmp_path):
              "variant_recipe": NEW_RECIPE, "evaluations": []},
         ]}
         with runtime._database.write() as connection:
-            with pytest.raises(OwnerConflict) as caught:
+            with pytest.raises(TargetContentIssue) as caught:
                 _resolve_declared_variants(
                     connection, items=items, result_document=envelope_fault,
                     root={"target_ref": handle.target_ref}, accepted_at=2.0,
                     verify_only=False,
                 )
-        assert not isinstance(caught.value, TargetContentIssue)
         assert caught.value.code == "baseline_method_envelope_invalid"
+        assert "execution_binding" in caught.value.feedback
     finally:
         runtime.close()
 
@@ -408,5 +492,66 @@ def test_baseline_ref_only_declaration_names_its_registered_method(tmp_path):
         assert "method_version '1'" in caught.value.feedback
         assert canonical_hash(NEW_METHOD_FORWARD["method_contract"]) in caught.value.feedback
         assert canonical_hash(CONFLICTING_CONTRACT) in caught.value.feedback
+    finally:
+        runtime.close()
+
+
+def test_missing_method_contract_is_a_durable_root_correction(tmp_path):
+    """A malformed method envelope is rejected and can be corrected in place."""
+    runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    try:
+        path = workspace / "outputs/result.json"
+        document = json.loads(path.read_text())
+        metrics = document["metrics"]
+        _declared_run(document, metrics, contract=None)
+        document["formal_runs"][1]["baseline_forward_contract"].pop("method_contract")
+        path.write_text(canonical_json(document))
+
+        finalizer = TargetRunFinalizer(
+            lifecycle=lifecycle, memory=memory,
+            workspace_resolver=runtime.target_run_authorities.agent_runtime,
+            evidence_reader=_EvidenceReader(evidence),
+            measurement_authority=runtime.owners.research_graph,
+            graph_authority=runtime.owners.research_graph,
+        )
+        rejected = finalizer.finalize(handle=handle, evidence=evidence)
+
+        assert rejected.status == "revision_required"
+        assert rejected.pending_code == "baseline_method_contract_required"
+        assert rejected.target_commit_ref is None
+        assert "method_contract" in rejected.rejection_feedback
+        assert memory.query(rejected.manifest_ref) is not None
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_root_measurements")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_commits")
+            ).scalar_one() == 0
+
+        corrected = json.loads(path.read_text())
+        corrected["formal_runs"][1]["baseline_forward_contract"]["method_contract"] = (
+            NEW_METHOD_FORWARD["method_contract"])
+        path.write_text(canonical_json(corrected))
+        successor_evidence = _replace_completion_evidence(
+            workspace, evidence,
+            handoff=_completion_handoff(workspace, evidence),
+            operation_ref="harness_target_root_successor_turn_contract",
+            operation_generation=evidence.operation_generation + 1,
+            evidence_ref="harness_evidence_target_root_successor_turn_contract",
+            evidence_sequence=evidence.evidence_sequence + 10,
+            observed_at=evidence.observed_at + 1.0,
+        )
+        successor = TargetRunFinalizer(
+            lifecycle=lifecycle, memory=memory,
+            workspace_resolver=runtime.target_run_authorities.agent_runtime,
+            evidence_reader=_EvidenceReader(successor_evidence),
+            measurement_authority=runtime.owners.research_graph,
+            graph_authority=runtime.owners.research_graph,
+        ).finalize(handle=handle, evidence=successor_evidence)
+        assert successor.status == "completed"
+        assert successor.target_commit_ref is not None
     finally:
         runtime.close()
