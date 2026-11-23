@@ -4140,11 +4140,25 @@ class SQLiteAdvancementEngine(
         if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
             raise OwnerConflict("cycle_position_binding_invalid")
         context_pack = {**context_pack, "cycle_position": position}
-        context_pack_json = canonical_json(context_pack)
-        context_pack_hash = canonical_hash(context_pack)
         epoch = self._current_stage_epoch(
             cycle_ref, accepted_question.quest_ref, IDEA_STAGE
         )
+        replay_ref = self._query_stage_command_result(
+            idempotency_key,
+            "ensure_idea_stage_request",
+            stage=IDEA_STAGE,
+            cycle_ref=cycle_ref,
+            epoch=epoch,
+            accepted_question=accepted_question,
+            context_pack=context_pack,
+        )
+        if replay_ref is not None:
+            return self._query_stage_request_ref(replay_ref)
+        context_pack = self._freeze_stage_quest_goal(
+            context_pack, quest_ref=accepted_question.quest_ref
+        )
+        context_pack_json = canonical_json(context_pack)
+        context_pack_hash = canonical_hash(context_pack)
         request_input = {
             "command": "ensure_idea_stage_request",
             "cycle_ref": cycle_ref,
@@ -4262,6 +4276,11 @@ class SQLiteAdvancementEngine(
             if replay_ref is not None:
                 result_ref = replay_ref
             else:
+                self._assert_stage_quest_goal_current(
+                    connection,
+                    quest_ref=accepted_question.quest_ref,
+                    goal_revision_ref=cast(str, context_pack["goal_revision_ref"]),
+                )
                 self._assert_stage_head_current(
                     connection,
                     cycle_ref=cycle_ref,
@@ -4430,11 +4449,26 @@ class SQLiteAdvancementEngine(
         if "prior_accepted_bindings" in context_pack and context_pack["prior_accepted_bindings"] != prior:
             raise OwnerConflict("plan_reasoning_handoff_invalid")
         context_pack = {**context_pack, "prior_accepted_bindings": prior}
-        context_pack_json = canonical_json(context_pack)
-        context_pack_hash = canonical_hash(context_pack)
         epoch = self._current_stage_epoch(
             cycle_ref, accepted_question.quest_ref, PLAN_STAGE
         )
+        replay_ref = self._query_stage_command_result(
+            idempotency_key,
+            "ensure_plan_stage_request",
+            stage=PLAN_STAGE,
+            cycle_ref=cycle_ref,
+            epoch=epoch,
+            accepted_question=accepted_question,
+            accepted_idea_set=accepted_idea_set,
+            context_pack=context_pack,
+        )
+        if replay_ref is not None:
+            return self._query_stage_request_ref(replay_ref)
+        context_pack = self._freeze_stage_quest_goal(
+            context_pack, quest_ref=accepted_question.quest_ref
+        )
+        context_pack_json = canonical_json(context_pack)
+        context_pack_hash = canonical_hash(context_pack)
         command_kind = "ensure_plan_stage_request"
         request_input = {
             "command": command_kind,
@@ -4546,6 +4580,11 @@ class SQLiteAdvancementEngine(
             if replay_ref is not None:
                 result_ref = replay_ref
             else:
+                self._assert_stage_quest_goal_current(
+                    connection,
+                    quest_ref=accepted_question.quest_ref,
+                    goal_revision_ref=cast(str, context_pack["goal_revision_ref"]),
+                )
                 self._assert_stage_head_current(
                     connection,
                     cycle_ref=cycle_ref,
@@ -4705,11 +4744,27 @@ class SQLiteAdvancementEngine(
         if "cycle_position" in context_pack and context_pack["cycle_position"] != position:
             raise OwnerConflict("cycle_position_binding_invalid")
         context_pack = {**context_pack, "cycle_position": position}
-        context_pack_json = canonical_json(context_pack)
-        context_pack_hash = canonical_hash(context_pack)
         epoch = self._current_stage_epoch(
             cycle_ref, accepted_question.quest_ref, BUNDLE_STAGE
         )
+        replay_ref = self._query_stage_command_result(
+            idempotency_key,
+            "ensure_bundle_stage_request",
+            stage=BUNDLE_STAGE,
+            cycle_ref=cycle_ref,
+            epoch=epoch,
+            accepted_question=accepted_question,
+            accepted_formal_plan=accepted_formal_plan,
+            accepted_idea_set=accepted_idea_set,
+            context_pack=context_pack,
+        )
+        if replay_ref is not None:
+            return self._query_stage_request_ref(replay_ref)
+        context_pack = self._freeze_stage_quest_goal(
+            context_pack, quest_ref=accepted_question.quest_ref
+        )
+        context_pack_json = canonical_json(context_pack)
+        context_pack_hash = canonical_hash(context_pack)
         command_kind = "ensure_bundle_stage_request"
         request_input = {
             "command": command_kind,
@@ -4760,6 +4815,11 @@ class SQLiteAdvancementEngine(
             if replay_ref is not None:
                 result_ref = replay_ref
             else:
+                self._assert_stage_quest_goal_current(
+                    connection,
+                    quest_ref=accepted_question.quest_ref,
+                    goal_revision_ref=cast(str, context_pack["goal_revision_ref"]),
+                )
                 self._assert_stage_head_current(
                     connection,
                     cycle_ref=cycle_ref,
@@ -4919,6 +4979,7 @@ class SQLiteAdvancementEngine(
         epoch = self._current_stage_epoch(
             cycle_ref, accepted_question.quest_ref, REASONING_STAGE
         )
+        command_kind = "ensure_reasoning_stage_request"
         question_literature_revision = None
         if self._question_literature_revision_verifier is not None:
             question_literature_revision = (
@@ -4930,6 +4991,18 @@ class SQLiteAdvancementEngine(
                 self._question_literature_revision_verifier.verify_question_literature_revision(
                     question_literature_revision
                 )
+        replay_ref = self._query_stage_command_result(
+            idempotency_key,
+            command_kind,
+            stage=REASONING_STAGE,
+            cycle_ref=cycle_ref,
+            epoch=epoch,
+            accepted_question=accepted_question,
+            check_question_literature=True,
+            question_literature_revision=question_literature_revision,
+        )
+        if replay_ref is not None:
+            return self._query_stage_request_ref(replay_ref)
         if self._reasoning_outcome_verifier is None:
             raise OwnerConflict("quest_goal_revision_verifier_unavailable")
         quest_goal_revision = (
@@ -4954,7 +5027,6 @@ class SQLiteAdvancementEngine(
             reasoning_graph_context
         )
         prior = self._reasoning_prior_accepted_bindings(cycle_ref)
-        command_kind = "ensure_reasoning_stage_request"
 
         # Reject a globally reused key before AE creates the route-derived
         # skipped facts that are part of this command's atomic result.
@@ -4976,6 +5048,13 @@ class SQLiteAdvancementEngine(
                     "UPDATE advancement_engine_state SET revision = revision "
                     "WHERE singleton = 'owner'"
                 )
+            )
+            self._assert_stage_quest_goal_current(
+                connection,
+                quest_ref=accepted_question.quest_ref,
+                goal_revision_ref=cast(
+                    str, quest_goal_revision["goal_revision_ref"]
+                ),
             )
             self._assert_stage_head_current(
                 connection,
@@ -6213,6 +6292,166 @@ class SQLiteAdvancementEngine(
         self._accepted_question_verifier.verify_accepted_question_binding(
             accepted_question
         )
+
+    def _freeze_stage_quest_goal(
+        self, context_pack: dict[str, object], *, quest_ref: str
+    ) -> dict[str, object]:
+        """Bind a new Idea/Plan/Bundle request to the current Quest Goal.
+
+        The request row stores this returned mapping in its immutable context
+        pack.  A caller may provide the same binding when composing a pack,
+        but it must match the Owner's current head.  A later retry that reads
+        an already admitted request never enters this method because workers
+        first query the durable request, so recovery cannot silently follow a
+        newer goal revision.
+        """
+
+        verifier = self._reasoning_outcome_verifier
+        if verifier is None:
+            raise OwnerConflict("quest_goal_revision_verifier_unavailable")
+        current = verifier.query_current_quest_goal_revision(quest_ref)
+        if current is None:
+            raise OwnerConflict("quest_goal_revision_unavailable")
+        verifier.verify_current_quest_goal_revision(current)
+        existing_ref = context_pack.get("goal_revision_ref")
+        existing_goal = context_pack.get("quest_goal_revision")
+        if (
+            (existing_ref is not None and existing_ref != current.get("goal_revision_ref"))
+            or (existing_goal is not None and existing_goal != current)
+        ):
+            raise OwnerConflict("quest_goal_revision_stale")
+        return {
+            **context_pack,
+            "goal_revision_ref": current["goal_revision_ref"],
+            "quest_goal_revision": current,
+        }
+
+    def _assert_stage_quest_goal_current(
+        self, connection, *, quest_ref: str, goal_revision_ref: str
+    ) -> None:
+        # Same shared-DB rg_quest_goal_heads read pattern already used by
+        # query_goal_reasoning_reassessment (keeps admission atomic under write lock).
+        current_ref = connection.execute(
+            text(
+                "SELECT current_revision_ref,status FROM rg_quest_goal_heads "
+                "WHERE quest_ref=:quest_ref"
+            ),
+            {"quest_ref": quest_ref},
+        ).first()
+        if current_ref is None:
+            raise OwnerConflict("quest_goal_revision_stale")
+        if current_ref.status != "open":
+            raise OwnerConflict("quest_goal_closed")
+        if current_ref.current_revision_ref != goal_revision_ref:
+            raise OwnerConflict("quest_goal_revision_stale")
+
+    def _query_stage_command_result(
+        self,
+        idempotency_key: str,
+        command_kind: str,
+        *,
+        stage: str | None = None,
+        cycle_ref: str | None = None,
+        epoch: int | None = None,
+        accepted_question: AcceptedQuestionBinding | None = None,
+        accepted_idea_set: AcceptedIdeaSetBinding | None = None,
+        accepted_formal_plan: AcceptedFormalPlanBinding | None = None,
+        context_pack: dict[str, object] | None = None,
+        check_question_literature: bool = False,
+        question_literature_revision: dict[str, object] | None = None,
+    ) -> str | None:
+        """Return a durable retry before reading the mutable Goal head.
+
+        The immutable request identity is checked from its durable row.  Goal
+        fields omitted by a retrying worker are excluded from the context
+        comparison so a retry retains the original revision after a later goal
+        evolution, while literature revision drift on Reasoning still fails
+        closed with idempotency_conflict.
+        """
+
+        with self._database.read() as connection:
+            command = connection.execute(
+                text(
+                    "SELECT command_kind,result_ref FROM ae_stage_commands "
+                    "WHERE idempotency_key=:idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if command is None:
+                return None
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests "
+                    "WHERE request_ref=:request_ref"
+                ),
+                {"request_ref": command.result_ref},
+            ).first()
+        if command.command_kind != command_kind or row is None:
+            raise OwnerConflict("idempotency_conflict")
+        if stage is not None and getattr(row, "stage", None) != stage:
+            raise OwnerConflict("idempotency_conflict")
+        if cycle_ref is not None and row.cycle_ref != cycle_ref:
+            raise OwnerConflict("idempotency_conflict")
+        if epoch is not None and row.epoch != epoch:
+            raise OwnerConflict("idempotency_conflict")
+        if accepted_question is not None:
+            expected_question = _question_binding_columns(accepted_question)
+            if any(
+                getattr(row, field, None) != value
+                for field, value in expected_question.items()
+            ):
+                raise OwnerConflict("idempotency_conflict")
+        try:
+            stored_context = decoded_object(row.context_pack_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("idempotency_conflict") from error
+        if not isinstance(stored_context, dict):
+            raise OwnerConflict("idempotency_conflict")
+        if context_pack is not None:
+            goal_keys = {"goal_revision_ref", "quest_goal_revision"}
+            caller_context = {
+                key: value
+                for key, value in context_pack.items()
+                if key not in goal_keys
+            }
+            stored_non_goal_context = {
+                key: value
+                for key, value in stored_context.items()
+                if key not in goal_keys
+            }
+            if caller_context != stored_non_goal_context:
+                raise OwnerConflict("idempotency_conflict")
+            for goal_key in goal_keys:
+                if goal_key in context_pack and stored_context.get(goal_key) != context_pack[goal_key]:
+                    raise OwnerConflict("idempotency_conflict")
+        if check_question_literature:
+            stored_lit = stored_context.get("question_literature_input")
+            if not isinstance(stored_lit, dict):
+                raise OwnerConflict("idempotency_conflict")
+            if question_literature_revision is None:
+                if stored_lit.get("kind") != "none":
+                    raise OwnerConflict("idempotency_conflict")
+            elif (
+                stored_lit.get("kind") != "revision"
+                or stored_lit.get("revision_ref")
+                != question_literature_revision.get("revision_ref")
+            ):
+                raise OwnerConflict("idempotency_conflict")
+        if (
+            (accepted_idea_set is not None)
+            != ("accepted_idea_set_binding" in stored_context)
+            or (
+                accepted_idea_set is not None
+                and stored_context.get("accepted_idea_set_binding")
+                != accepted_idea_set.as_dict()
+            )
+        ):
+            raise OwnerConflict("idempotency_conflict")
+        if accepted_formal_plan is not None and stored_context.get(
+            "accepted_formal_plan_binding"
+        ) != accepted_formal_plan.as_dict():
+            raise OwnerConflict("idempotency_conflict")
+        return str(command.result_ref)
 
     def commit_idea_stage(
         self,

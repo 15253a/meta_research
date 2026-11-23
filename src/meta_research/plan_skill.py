@@ -467,6 +467,12 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         if request.runtime_binding != self.runtime_binding():
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         lineage = _plan_owner_rejection_prompt(request)
+        goal_guidance = (
+            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；"
+            "不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
+            if request.context_pack.get("quest_goal_revision") is not None
+            else "当前 Plan context 未携带 Quest Goal revision。"
+        )
         primary_prompt = (
             stage_position_prompt(request, "plan") + stage_replacement_prompt(request) + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             f"{_plan_skill_instructions()}\n\n"
@@ -514,6 +520,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"idea_set_ref={request.idea_set_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
+            + goal_guidance + "\n"
             "AcceptedQuestionBinding="
             f"{canonical_json(request.context_pack['accepted_question_binding'])}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
@@ -521,6 +528,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"provider_context_view={stage_context_json('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         ) if request.native_session_ref is None else (
             "继续当前原生会话的 Plan 工作。处理本次反馈，交回完整候选。\n"
+            + goal_guidance + "\n"
             f"{lineage}"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"

@@ -2584,6 +2584,10 @@ class SQLiteTargetRunGraphAuthority:
             from meta_research.cycle_position import validate_cycle_position
             position = context["cycle_position"]
             validate_cycle_position(position, cycle_ref=graph.cycle_ref)
+            from meta_research.quest_goal import validate_stage_quest_goal_binding
+            goal_revision_ref, quest_goal_revision = validate_stage_quest_goal_binding(
+                context, expected_quest_ref=graph.quest_ref
+            )
             if (canonical_hash(context) != row.context_pack_hash
                 or context["cycle_ref"] != graph.cycle_ref
                 or canonical_json(context) != row.context_pack_json
@@ -2645,6 +2649,8 @@ class SQLiteTargetRunGraphAuthority:
             "stage_request_ref": graph.request_ref,
             "cycle_position": position,
             "target_ref": target_ref, "question_ref": question_binding["question_ref"],
+            "goal_revision_ref": goal_revision_ref,
+            "quest_goal_revision": quest_goal_revision,
             "question_content_ref": question_binding["content_ref"],
             "question_content_hash": question_binding["content_hash"],
             "question": question, "formal_plan_ref": source.formal_plan_ref,

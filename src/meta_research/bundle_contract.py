@@ -172,6 +172,8 @@ def validate_bundle_context_pack(
         "accepted_question_binding",
         "accepted_formal_plan_binding",
     }
+    if "goal_revision_ref" in context_pack or "quest_goal_revision" in context_pack:
+        expected_keys.update({"goal_revision_ref", "quest_goal_revision"})
     if schema_ref == BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF:
         expected_keys.add("accepted_idea_set_binding")
     _exact_keys(
@@ -179,6 +181,22 @@ def validate_bundle_context_pack(
         expected_keys,
         "bundle_context_pack_invalid",
     )
+    if "goal_revision_ref" in context_pack or "quest_goal_revision" in context_pack:
+        from meta_research.quest_goal import validate_stage_quest_goal_binding
+        expected_quest_ref = (
+            accepted_question_binding.get("quest_ref")
+            if isinstance(accepted_question_binding, dict)
+            else None
+        )
+        try:
+            validate_stage_quest_goal_binding(
+                context_pack,
+                expected_quest_ref=(
+                    expected_quest_ref if isinstance(expected_quest_ref, str) else None
+                ),
+            )
+        except ValueError as error:
+            raise BundleContractError("bundle_context_pack_invalid") from error
     from meta_research.cycle_position import validate_cycle_position
     try:
         validate_cycle_position(context_pack.get("cycle_position"), cycle_ref=cycle_ref)
