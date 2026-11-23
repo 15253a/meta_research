@@ -1,4 +1,6 @@
 """Original-path protection and filesystem boundaries in isolated workspaces."""
+import os
+from pathlib import Path
 import pytest
 
 from meta_research.owners.common import OwnerConflict
@@ -114,9 +116,13 @@ def test_boundary_scan_rejects_external_symlink_without_traversing(tmp_path):
     assert sentinel.read_bytes() == b'external original'
 
 
-@pytest.mark.parametrize('locator', [None, '', 'relative/original.txt', 'missing'])
-def test_unknown_original_scope_is_rejected(tmp_path, locator):
-    if locator == 'missing':
-        locator = str(tmp_path / 'missing-original')
+@pytest.mark.parametrize('locator', [None, '', 'relative/original.txt'])
+def test_unknown_original_scope_is_rejected(locator):
     with pytest.raises(OwnerConflict, match='linked_local_locator_unavailable'):
         _protected_originals((locator,))
+
+
+def test_offline_missing_absolute_original_is_lexically_protected(tmp_path):
+    missing = str(tmp_path / 'missing-original')
+    protected = _protected_originals((missing,))
+    assert Path(os.path.normpath(missing)) in protected

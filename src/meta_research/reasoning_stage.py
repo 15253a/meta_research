@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from meta_research.reasoning_skill import (
     RESEARCH_TIME_BUDGET_UNKNOWN,
     persisted_research_time_budget_revision,
@@ -62,6 +64,7 @@ from meta_research.reasoning_skill import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
 _CYCLE_EVENT = "advancement_engine.initial_cycle_activated"
 _STAGE_REQUEST_EVENT = "advancement_engine.stage_run_requested"
 
@@ -126,9 +129,9 @@ class ReasoningStageWorker:
             unit_kinds=("reasoning_primary", "reasoning_review"),
         ):
             return True
-        transient_error: str | None = None
         self._transient_error = None
         cycles = list(self._discover_active_cycles())
+        transient_error: str | None = self._transient_error
         if self._provider_cursor_cycle_ref is not None:
             cursor = next(
                 (
@@ -141,7 +144,19 @@ class ReasoningStageWorker:
             if cursor is not None:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
-            step = self._process_cycle(current)
+            self._transient_error = None
+            try:
+                step = self._process_cycle(current)
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "reasoning_stage cycle isolated quest_ref=%s cycle_ref=%s error_code=%s",
+                    current.question.quest_ref,
+                    current.cycle_ref,
+                    error.code,
+                )
+                transient_error = transient_error or error.code
+                self._provider_cursor_cycle_ref = current.cycle_ref
+                continue
             if self._transient_error is not None:
                 transient_error = transient_error or self._transient_error
             if step.provider_boundary_attempted:
@@ -924,7 +939,9 @@ class ReasoningStageWorker:
                 or predecessor_checkpoint.request_ref != request.request_ref
                 or predecessor_checkpoint.run_ref != run.run_ref
                 or predecessor_checkpoint.native_session_ref != run.native_session_ref
-                or predecessor_checkpoint.runtime_binding != run.runtime_binding
+                or not reasoning_bindings_compatible(
+                    predecessor_checkpoint.runtime_binding, run.runtime_binding
+                )
                 or not decision.feedback
                 or run.native_session_ref is None
             ):
@@ -1477,11 +1494,21 @@ class ReasoningStageWorker:
         for foreground in self._advancement_engine.query_active_foregrounds(
             stage="reasoning"
         ):
-            question = self._research_graph.query_question_by_ref(
-                cast(str, foreground["question_ref"])
-            )
-            if question is None or question.quest_ref != foreground["quest_ref"]:
-                raise OwnerConflict("reasoning_cycle_index_invalid")
+            try:
+                question = self._research_graph.query_question_by_ref(
+                    cast(str, foreground["question_ref"])
+                )
+                if question is None or question.quest_ref != foreground["quest_ref"]:
+                    raise OwnerConflict("reasoning_cycle_index_invalid")
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "reasoning_stage discovery isolated quest_ref=%s cycle_ref=%s error_code=%s",
+                    foreground.get("quest_ref"),
+                    foreground.get("cycle_ref"),
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
+                continue
             values.append(
                 _CurrentCycle(
                     cast(int, foreground["epoch"]),

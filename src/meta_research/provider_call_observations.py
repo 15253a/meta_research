@@ -1,16 +1,23 @@
 """Measured provider inputs and reported usage; no character-to-token guesses."""
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import json
 import os
 import re
+import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
 _LINE_LIMIT = 8 * 1024 * 1024
 _NATIVE_PREFIX_LIMIT = 64 * 1024 * 1024
+_ROLLOUT_ANCHOR_BYTES = 1024
+_MAX_NATIVE_ROLLOUT_CACHE = 64
+_NATIVE_ROLLOUT_CACHE: OrderedDict[tuple[int, int, str], dict[str, object]] = OrderedDict()
+_NATIVE_ROLLOUT_LOCK = threading.Lock()
 
 
 def _encoded(value: object) -> bytes:
@@ -124,7 +131,147 @@ def provider_stderr_observation(
         return {"status": "unavailable", "reason": "stderr_observation_failed"}
 
 
-def _native_session_observation(codex_home: Path, session_id: str) -> dict[str, object]:
+def _rollout_cursor_path(rollout_cursor_dir: Path, session_id: str, path: Path) -> Path:
+    digest = hashlib.sha256((session_id + "\0" + str(path)).encode("utf-8")).hexdigest()
+    return rollout_cursor_dir / f"{digest}.json"
+
+
+def _write_rollout_cursor(cursor_path: Path, state: dict[str, object]) -> None:
+    cursor_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=".cursor-", suffix=".tmp", dir=cursor_path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(data)
+        os.replace(tmp_path, cursor_path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _read_stream_slice(stream, start: int, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    stream.seek(start)
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = stream.read(size - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _load_prior_rollout_state(
+    stream,
+    *,
+    stat_result: os.stat_result,
+    cutoff: int,
+    session_id: str,
+    path: Path,
+    rollout_cursor_dir: Path | None,
+) -> dict[str, object] | None:
+    cache_key = (stat_result.st_dev, stat_result.st_ino, str(path))
+    candidate: dict[str, object] | None = None
+    with _NATIVE_ROLLOUT_LOCK:
+        cached = _NATIVE_ROLLOUT_CACHE.get(cache_key)
+        if cached is not None:
+            _NATIVE_ROLLOUT_CACHE.move_to_end(cache_key)
+            candidate = dict(cached)
+    if candidate is None and rollout_cursor_dir is not None:
+        cursor_path = _rollout_cursor_path(rollout_cursor_dir, session_id, path)
+        try:
+            loaded = json.loads(cursor_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            candidate = loaded
+    if candidate is None:
+        return None
+    prev_offset = candidate.get("offset")
+    if (
+        candidate.get("session_id") != session_id
+        or candidate.get("st_dev") != stat_result.st_dev
+        or candidate.get("st_ino") != stat_result.st_ino
+        or candidate.get("metadata_verified") is not True
+        or candidate.get("limited") is not False
+        or candidate.get("prefix_limit") != _NATIVE_PREFIX_LIMIT
+        or candidate.get("line_limit") != _LINE_LIMIT
+        or type(prev_offset) is not int
+        or not 0 < prev_offset <= cutoff
+    ):
+        return None
+    for int_field in (
+        "sequence",
+        "duplicate_response_records",
+        "duplicate_token_snapshots",
+        "conflicting_response_records",
+    ):
+        value = candidate.get(int_field)
+        if type(value) is not int or value < 0:
+            return None
+    responses_val = candidate.get("responses")
+    if not isinstance(responses_val, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in responses_val.items()
+    ):
+        return None
+    snapshots_val = candidate.get("snapshots")
+    if not isinstance(snapshots_val, list) or not all(
+        isinstance(item, str) for item in snapshots_val
+    ):
+        return None
+    for list_field in ("model_responses", "last_token_usage_snapshots", "compactions"):
+        list_val = candidate.get(list_field)
+        if not isinstance(list_val, list) or not all(
+            isinstance(item, dict) for item in list_val
+        ):
+            return None
+    windows_val = candidate.get("model_context_windows")
+    if not isinstance(windows_val, list) or not all(
+        type(item) is int for item in windows_val
+    ):
+        return None
+    if not ("digest" in candidate and candidate.get("sha256_mode") == "raw"):
+        prefix_sha = candidate.get("prefix_sha256")
+        if not isinstance(prefix_sha, str):
+            return None
+        hex_part = prefix_sha.removeprefix("incremental:")
+        if len(hex_part) != 64 or not all(
+            character in "0123456789abcdef" for character in hex_part
+        ):
+            return None
+    head_hex = candidate.get("head_anchor_hex")
+    tail_hex = candidate.get("tail_anchor_hex")
+    if not isinstance(head_hex, str) or not isinstance(tail_hex, str):
+        return None
+    try:
+        expected_head = bytes.fromhex(head_hex)
+        expected_tail = bytes.fromhex(tail_hex)
+    except ValueError:
+        return None
+    anchor_len = min(prev_offset, _ROLLOUT_ANCHOR_BYTES)
+    if len(expected_head) != anchor_len or len(expected_tail) != anchor_len:
+        return None
+    if _read_stream_slice(stream, 0, anchor_len) != expected_head:
+        return None
+    if _read_stream_slice(stream, prev_offset - anchor_len, anchor_len) != expected_tail:
+        return None
+    return candidate
+
+
+def _native_session_observation(
+    codex_home: Path,
+    session_id: str,
+    *,
+    rollout_cursor_dir: Path | None = None,
+) -> dict[str, object]:
     """Sample one authenticated session prefix; never treat it as this turn's total."""
     identifier = UUID(session_id)
     if str(identifier) != session_id or identifier.version != 7:
@@ -155,6 +302,9 @@ def _native_session_observation(codex_home: Path, session_id: str) -> dict[str, 
               "limits": {"prefix_bytes": _NATIVE_PREFIX_LIMIT, "line_bytes": _LINE_LIMIT,
                          "model_responses": 512, "token_snapshots": 512, "compactions": 128}}
     digest = hashlib.sha256()
+    sha256_mode = "raw"
+    resumed_prefix_sha: str | None = None
+    delta_read = False
     offset, sequence = 0, 0
     responses, snapshots = {}, set()
     metadata_verified = False
@@ -163,11 +313,44 @@ def _native_session_observation(codex_home: Path, session_id: str) -> dict[str, 
         sample.update(source_size_at_start=stat.st_size, source_mtime_ns_at_start=stat.st_mtime_ns)
         cutoff = min(stat.st_size, _NATIVE_PREFIX_LIMIT)
         sample["limited"] = stat.st_size > cutoff
+        prior = _load_prior_rollout_state(
+            stream,
+            stat_result=stat,
+            cutoff=cutoff,
+            session_id=session_id,
+            path=path,
+            rollout_cursor_dir=rollout_cursor_dir,
+        )
+        if prior is not None:
+            offset = int(prior["offset"])
+            sequence = int(prior["sequence"])
+            responses = dict(prior["responses"])
+            snapshots = set(prior["snapshots"])
+            sample["model_responses"] = [dict(item) for item in prior["model_responses"]]
+            sample["last_token_usage_snapshots"] = [dict(item) for item in prior["last_token_usage_snapshots"]]
+            sample["compactions"] = [dict(item) for item in prior["compactions"]]
+            sample["model_context_windows"] = list(prior["model_context_windows"])
+            sample["duplicate_response_records"] = int(prior["duplicate_response_records"])
+            sample["duplicate_token_snapshots"] = int(prior["duplicate_token_snapshots"])
+            sample["conflicting_response_records"] = int(prior["conflicting_response_records"])
+            metadata_verified = True
+            if "digest" in prior and prior.get("sha256_mode") == "raw":
+                digest = prior["digest"].copy()
+                sha256_mode = "raw"
+            else:
+                sha256_mode = "incremental"
+                resumed_prefix_sha = str(prior["prefix_sha256"])
+                prev_hex = resumed_prefix_sha.removeprefix("incremental:")
+                digest = hashlib.sha256(bytes.fromhex(prev_hex))
+            stream.seek(offset)
+        else:
+            stream.seek(0)
         while offset < cutoff:
             line = stream.readline(min(_LINE_LIMIT + 1, cutoff - offset))
             if not line:
                 sample["limited"] = True
                 break
+            delta_read = True
             start, offset, sequence = offset, offset + len(line), sequence + 1
             digest.update(line)
             if len(line) > _LINE_LIMIT or not line.endswith(b"\n"):
@@ -243,9 +426,58 @@ def _native_session_observation(codex_home: Path, session_id: str) -> dict[str, 
                         "exact_content_source": "signed native_session compaction event; sampled prefix byte offset"})
                 else:
                     sample["limited"] = True
-    if not metadata_verified:
-        return {"status": "unavailable", "reason": "native_session_metadata_incomplete"}
-    sample.update(observed_prefix_bytes=offset, observed_prefix_sha256=digest.hexdigest(),
+        if not metadata_verified:
+            return {"status": "unavailable", "reason": "native_session_metadata_incomplete"}
+        if sha256_mode == "raw":
+            prefix_hash = digest.hexdigest()
+        elif not delta_read and resumed_prefix_sha is not None:
+            prefix_hash = resumed_prefix_sha
+        else:
+            prefix_hash = "incremental:" + digest.hexdigest()
+        if offset > 0 and not sample["limited"]:
+            anchor_len = min(offset, _ROLLOUT_ANCHOR_BYTES)
+            head_hex = _read_stream_slice(stream, 0, anchor_len).hex()
+            tail_hex = _read_stream_slice(stream, offset - anchor_len, anchor_len).hex()
+            disk_state = {
+                "session_id": session_id,
+                "st_dev": stat.st_dev,
+                "st_ino": stat.st_ino,
+                "offset": offset,
+                "sequence": sequence,
+                "metadata_verified": True,
+                "limited": False,
+                "prefix_limit": _NATIVE_PREFIX_LIMIT,
+                "line_limit": _LINE_LIMIT,
+                "head_anchor_hex": head_hex,
+                "tail_anchor_hex": tail_hex,
+                "prefix_sha256": prefix_hash,
+                "sha256_mode": sha256_mode,
+                "responses": dict(responses),
+                "snapshots": sorted(snapshots),
+                "model_responses": [dict(item) for item in sample["model_responses"]],
+                "last_token_usage_snapshots": [dict(item) for item in sample["last_token_usage_snapshots"]],
+                "compactions": [dict(item) for item in sample["compactions"]],
+                "model_context_windows": list(sample["model_context_windows"]),
+                "duplicate_response_records": sample["duplicate_response_records"],
+                "duplicate_token_snapshots": sample["duplicate_token_snapshots"],
+                "conflicting_response_records": sample["conflicting_response_records"],
+            }
+            cache_key = (stat.st_dev, stat.st_ino, str(path))
+            mem_state = {**disk_state, "digest": digest.copy()}
+            with _NATIVE_ROLLOUT_LOCK:
+                _NATIVE_ROLLOUT_CACHE[cache_key] = mem_state
+                _NATIVE_ROLLOUT_CACHE.move_to_end(cache_key)
+                while len(_NATIVE_ROLLOUT_CACHE) > _MAX_NATIVE_ROLLOUT_CACHE:
+                    _NATIVE_ROLLOUT_CACHE.popitem(last=False)
+            if rollout_cursor_dir is not None:
+                try:
+                    _write_rollout_cursor(
+                        _rollout_cursor_path(rollout_cursor_dir, session_id, path),
+                        disk_state,
+                    )
+                except OSError:
+                    pass
+    sample.update(observed_prefix_bytes=offset, observed_prefix_sha256=prefix_hash,
                   observed_source_line_count=sequence)
     return sample
 
@@ -395,6 +627,7 @@ def observe_provider_files(
     stderr_limited: bool | None = None,
     codex_home: Path | None = None,
     operation_scope: dict[str, object] | None = None,
+    rollout_cursor_dir: Path | None = None,
 ) -> dict[str, object]:
     stderr_observation = provider_stderr_observation(
         stderr_path, limited=stderr_limited
@@ -446,7 +679,11 @@ def observe_provider_files(
     native = {"status": "unavailable", "reason": "trusted_home_or_unique_native_session_not_provided"}
     if codex_home is not None and len(session_ids) == 1:
         try:
-            native = _native_session_observation(codex_home, next(iter(session_ids)))
+            native = _native_session_observation(
+                codex_home,
+                next(iter(session_ids)),
+                rollout_cursor_dir=rollout_cursor_dir,
+            )
         except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
             native = {"status": "unavailable", "reason": "native_session_sampling_failed"}
     result["native_session"] = native

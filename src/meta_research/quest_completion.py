@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol, cast
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.quest_goals import COMPLETION_CONDITION_SOURCE_FIELDS
 from meta_research.reasoning_contract import CANDIDATE_COMPLETION_SCHEMA_REF
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _extract_quest_ref(context: object, error: OwnerConflict) -> object:
+    if isinstance(error.details, dict) and error.details.get("quest_ref"):
+        return error.details["quest_ref"]
+    if isinstance(context, dict):
+        if context.get("quest_ref"):
+            return context["quest_ref"]
+        source = context.get("source")
+        if isinstance(source, dict) and source.get("quest_ref"):
+            return source["quest_ref"]
+    return None
 
 
 class QuestCompletionHumanCollaboration(Protocol):
@@ -131,6 +147,11 @@ class QuestCompletionService:
         self._research_graph = research_graph
         self._advancement_engine = advancement_engine
         self._scheduler_cursor: str | None = None
+        self._transient_error: str | None = None
+
+    @property
+    def transient_error(self) -> str | None:
+        return self._transient_error
 
     def start(
         self,
@@ -236,19 +257,43 @@ class QuestCompletionService:
     def process_once(self) -> bool:
         """Advance at most one durable HC, RG, or AE boundary."""
 
+        self._transient_error = None
         contexts = self._human_collaboration.query_quest_completion_contexts()
-        refs = [
-            _mapping_ref(
-                context, "context_ref", "quest_completion_context_invalid"
-            )
-            for context in contexts
-        ]
+        refs: list[str] = []
+        context_by_ref: dict[str, dict[str, object]] = {}
+        for context in contexts:
+            try:
+                ref = _mapping_ref(
+                    context, "context_ref", "quest_completion_context_invalid"
+                )
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "quest_completion context skipped quest_ref=%s error_code=%s",
+                    _extract_quest_ref(context, error),
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
+                continue
+            refs.append(ref)
+            if isinstance(context, dict):
+                context_by_ref[ref] = context
         if self._scheduler_cursor in refs:
             index = refs.index(cast(str, self._scheduler_cursor))
             refs = refs[index + 1 :] + refs[: index + 1]
         for context_ref in refs:
-            facts = self._query_facts(context_ref)
-            if facts is None or not self._process_facts_once(facts):
+            try:
+                facts = self._query_facts(context_ref)
+                if facts is None or not self._process_facts_once(facts):
+                    continue
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "quest_completion isolated quest_ref=%s context_ref=%s error_code=%s",
+                    _extract_quest_ref(context_by_ref.get(context_ref), error),
+                    context_ref,
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
+                self._scheduler_cursor = context_ref
                 continue
             self._scheduler_cursor = context_ref
             return True

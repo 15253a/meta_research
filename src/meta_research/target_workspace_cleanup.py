@@ -6,6 +6,7 @@ has its own eligibility checks; no research database transaction spans file IO.
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +18,20 @@ from meta_research.owners.advancement_engine import recent_workspace_cycles
 from meta_research.owners.common import OwnerConflict, canonical_hash
 
 _SAFE_RMTREE = getattr(shutil.rmtree, 'avoids_symlink_attacks', False)
+LOGGER = logging.getLogger(__name__)
+
+
+def _path_variants(locator: str | os.PathLike[str]) -> tuple[Path, ...]:
+    raw = os.fspath(locator)
+    variants = [Path(os.path.normpath(raw))]
+    try:
+        resolved = Path(raw).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        LOGGER.warning("linked_local resolution skipped path=%s error=%s", raw, error)
+    else:
+        if resolved not in variants:
+            variants.append(resolved)
+    return tuple(variants)
 
 
 def _workspace_bytes(path: Path, protected=()) -> int:
@@ -55,18 +70,12 @@ def _linked_locators(connection):
 
 
 def _protected_originals(locators):
-    """Resolve real originals after closing the short database snapshot."""
+    """Collect lexical and safely resolved original paths after closing DB snapshot."""
     paths = set()
     for locator in locators:
         if not isinstance(locator, str) or not locator or not Path(locator).is_absolute():
             raise OwnerConflict('linked_local_locator_unavailable')
-        try:
-            original = Path(locator).resolve(strict=True)
-            if not original.is_file() and not original.is_dir():
-                raise OwnerConflict('linked_local_locator_unavailable')
-            paths.add(original)
-        except (OSError, RuntimeError, ValueError) as error:
-            raise OwnerConflict('linked_local_locator_unavailable') from error
+        paths.update(_path_variants(locator))
     return tuple(paths)
 
 
@@ -175,7 +184,11 @@ def cleanup_completed_workspaces(runtime, *, dry_run=True, limit=10):
         native_report = cleanup_cycle_sessions(runtime, candidates, dry_run=dry_run)
     try:
         originals = _protected_originals(locators)
-        storage = tuple(Path(p).resolve(strict=False) for p in runtime._protected_storage_roots)
+        storage = tuple(
+            variant
+            for root_path in runtime._protected_storage_roots
+            for variant in _path_variants(root_path)
+        )
         protection_error = None
     except (OwnerConflict, OSError, RuntimeError, ValueError) as error:
         originals, storage = (), ()

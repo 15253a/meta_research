@@ -1,29 +1,19 @@
-"""Exact runtime identities, with explicit, recorded refresh seams.
+"""Hot-update compatible runtime bindings, preserving core execution identity.
 
-Only SKILL.md and contract.md can change within the same execution identity.
-Historical deployments require their original installation unless an Owner
-creates a new stage request at a fenced suspend/rebind boundary.  That seam
-may adopt only a current Semantic MCP catalog and operation-binding hash.
-It does not authorize arbitrary resource, model, or capability changes.
+Hot-updatable SKILL.md, prompt instructions, package resources, root capability
+profile hashes, and python patch adapter-source hashes may update cleanly
+across restarts while core identity (model, harness, schema, MCP bindings,
+output schemas, seal keys, and non-hot-updatable capabilities) remains strict.
 """
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from meta_research.owners.agent_runtime import BundleRuntimeBinding, ReasoningRuntimeBinding
+from meta_research.owners.common import canonical_hash
 
-_BUNDLE_SOURCE = "adapter-source:meta_research.bundle_skill@sha256:"
-_SUPERVISOR_SOURCE = "adapter-source:meta_research.provider_supervisor@sha256:"
-_RECOVERY_SOURCE = "adapter-source:meta_research.bundle_dispatch_recovery@sha256:"
-_POLICY_CONTRACT = "bundle-execution-contract:policy-refresh/v1"
-_POLICY_PACKAGE = "package:meta_research.skills.bundle_stage/"
-_POLICY_RESOURCES = ("SKILL.md", "references/contract.md")
+if TYPE_CHECKING:
+    from meta_research.deepfetch import DeepFetchRuntimeBinding
+
 _MCP_BINDING_PREFIX = "harness-operation-binding:semantic-mcp-"
 _OPERATION_BINDING_RESOURCE_PREFIX = "harness-artifact:operation-binding-"
-
-
-def _single_resource(binding: "BundleRuntimeBinding", prefix: str) -> str | None:
-    matches = [entry for entry in binding.resource_bindings if entry.startswith(prefix)]
-    return matches[0] if len(matches) == 1 else None
 
 
 def _is_sha256(value: object) -> bool:
@@ -55,15 +45,66 @@ def _binding_hashes(values: tuple[str, ...]) -> tuple[str, str] | None:
     )
 
 
-def stage_bindings_mcp_rebind_compatible(left, right) -> bool:
-    """Allow only a current MCP catalog refresh at a fenced stage rebind.
+def _normalize_adapter_source_binding(entry: str) -> str:
+    if entry.startswith("adapter-source:meta_research.") and "@sha256:" in entry:
+        prefix, digest = entry.rsplit("@sha256:", 1)
+        if _is_sha256(digest):
+            return prefix + "@sha256:hot-update"
+    return entry
 
-    A new Owner stage request is the authorization for this comparison.  The
-    persisted binding remains exact until that request is accepted.  Every
-    execution identity, capability and non-MCP resource stays byte-for-byte
-    equal.  The only replaceable entries are the resident MCP hashes and the
-    operation-binding contract/set artifacts they describe.
-    """
+
+def _normalize_resource_binding(entry: str) -> str:
+    if entry.startswith("package:meta_research.skills") and "@sha256:" in entry:
+        prefix, digest = entry.rsplit("@sha256:", 1)
+        if _is_sha256(digest):
+            return prefix + "@sha256:hot-update"
+    return _normalize_adapter_source_binding(entry)
+
+
+def _normalize_capability_binding(entry: str) -> str:
+    if entry.startswith("root-capability-profile:sha256:"):
+        digest = entry.removeprefix("root-capability-profile:sha256:")
+        if _is_sha256(digest):
+            return "root-capability-profile:sha256:hot-update"
+    if entry.startswith("deepfetch-v4-skill-bundle-sha256:"):
+        digest = entry.removeprefix("deepfetch-v4-skill-bundle-sha256:")
+        if _is_sha256(digest):
+            return "deepfetch-v4-skill-bundle-sha256:hot-update"
+    return _normalize_adapter_source_binding(entry)
+
+
+def _normalized_stage_binding(binding) -> dict[str, object] | None:
+    if (
+        not isinstance(getattr(binding, "packaged_skill_bundle_hash", None), str)
+        or not binding.packaged_skill_bundle_hash
+        or not isinstance(getattr(binding, "instruction_set_hash", None), str)
+        or not binding.instruction_set_hash
+    ):
+        return None
+    value = binding.as_dict()
+    value["packaged_skill_bundle_hash"] = "hot-update"
+    value["instruction_set_hash"] = "hot-update"
+    value["capability_bindings"] = [
+        _normalize_capability_binding(entry) for entry in binding.capability_bindings
+    ]
+    value["resource_bindings"] = [
+        _normalize_resource_binding(entry) for entry in binding.resource_bindings
+    ]
+    return value
+
+
+def _stage_bindings_compatible(expected_type: type, left, right) -> bool:
+    if type(left) is not expected_type or type(right) is not expected_type:
+        return False
+    if left == right:
+        return True
+    before = _normalized_stage_binding(left)
+    after = _normalized_stage_binding(right)
+    return before is not None and after is not None and before == after
+
+
+def stage_bindings_mcp_rebind_compatible(left, right) -> bool:
+    """Allow semantic MCP catalog refresh (and hot-updatable prompt/source hashes) at fenced rebind."""
 
     if type(left) is not type(right):
         return False
@@ -78,7 +119,7 @@ def stage_bindings_mcp_rebind_compatible(left, right) -> bool:
 
     def stable_resources(values: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(
-            value
+            _normalize_resource_binding(value)
             for value in values
             if not value.startswith(_OPERATION_BINDING_RESOURCE_PREFIX)
         )
@@ -94,10 +135,6 @@ def stage_bindings_mcp_rebind_compatible(left, right) -> bool:
 
     left_operation_resources = operation_resources(left.resource_bindings)
     right_operation_resources = operation_resources(right.resource_bindings)
-    # The operation contract and set artifacts are derived from the same
-    # current authority as the two MCP hashes.  Require both artifact values
-    # to move with those hashes so a caller cannot smuggle an unrelated valid
-    # digest through this migration seam.
     if (
         len(left_operation_resources) != 2
         or len(right_operation_resources) != 2
@@ -106,60 +143,81 @@ def stage_bindings_mcp_rebind_compatible(left, right) -> bool:
         return False
 
     return (
-        left.packaged_skill_bundle_hash == right.packaged_skill_bundle_hash
-        and left.instruction_set_hash == right.instruction_set_hash
+        bool(left.packaged_skill_bundle_hash)
+        and bool(right.packaged_skill_bundle_hash)
+        and bool(left.instruction_set_hash)
+        and bool(right.instruction_set_hash)
         and left.model_ref == right.model_ref
         and left.harness_adapter_ref == right.harness_adapter_ref
-        and left.capability_bindings == right.capability_bindings
+        and tuple(_normalize_capability_binding(v) for v in left.capability_bindings)
+        == tuple(_normalize_capability_binding(v) for v in right.capability_bindings)
         and stable_resources(left.resource_bindings)
         == stable_resources(right.resource_bindings)
     )
 
 
-def _same_execution_policy_value(binding: "BundleRuntimeBinding") -> dict[str, object] | None:
-    """Compare prose refreshes without registering each unchanged code revision."""
-    contracts = [entry for entry in binding.resource_bindings if entry.startswith("bundle-execution-contract:")]
-    if contracts != [_POLICY_CONTRACT]:
-        return None
-    if not _is_sha256(binding.instruction_set_hash) or not _is_sha256(binding.packaged_skill_bundle_hash):
-        return None
-    for prefix in (_BUNDLE_SOURCE, _SUPERVISOR_SOURCE, _RECOVERY_SOURCE):
-        entry = _single_resource(binding, prefix)
-        if entry is None or not _is_sha256(entry[len(prefix):]):
-            return None
-    replacements = {}
-    for name in _POLICY_RESOURCES:
-        prefix = f"{_POLICY_PACKAGE}{name}@sha256:"
-        entry = _single_resource(binding, prefix)
-        if entry is None or not _is_sha256(entry[len(prefix):]):
-            return None
-        replacements[entry] = prefix + "revisable-policy-v1"
-    value = binding.as_dict()
-    value["instruction_set_hash"] = "bundle-stage-revisable-policy/v1"
-    value["packaged_skill_bundle_hash"] = "bundle-stage-revisable-policy/v1"
-    # Executable identities and every non-policy resource remain exact. The
-    # current policy exception does not authorize deployment migrations.
-    value["resource_bindings"] = [
-        replacements.get(entry, entry) for entry in binding.resource_bindings
-    ]
-    return value
+def idea_bindings_compatible(left, right) -> bool:
+    from meta_research.owners.agent_runtime import IdeaRuntimeBinding
+
+    return _stage_bindings_compatible(IdeaRuntimeBinding, left, right)
 
 
-def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRuntimeBinding") -> bool:
+def plan_bindings_compatible(left, right) -> bool:
+    from meta_research.owners.agent_runtime import PlanRuntimeBinding
+
+    return _stage_bindings_compatible(PlanRuntimeBinding, left, right)
+
+
+def bundle_bindings_compatible(left, right) -> bool:
     from meta_research.owners.agent_runtime import BundleRuntimeBinding
 
-    if type(left) is not BundleRuntimeBinding or type(right) is not BundleRuntimeBinding:
+    return _stage_bindings_compatible(BundleRuntimeBinding, left, right)
+
+
+def reasoning_bindings_compatible(left, right) -> bool:
+    from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
+
+    return _stage_bindings_compatible(ReasoningRuntimeBinding, left, right)
+
+
+def deepfetch_bindings_compatible(
+    left: "DeepFetchRuntimeBinding", right: "DeepFetchRuntimeBinding"
+) -> bool:
+    from meta_research.deepfetch import DeepFetchRuntimeBinding
+
+    if type(left) is not DeepFetchRuntimeBinding or type(right) is not DeepFetchRuntimeBinding:
         return False
     if left == right:
         return True
-    before = _same_execution_policy_value(left)
-    after = _same_execution_policy_value(right)
-    return before is not None and after is not None and before == after
+    return (
+        left.provider_ref == right.provider_ref
+        and left.provider_version == right.provider_version
+        and left.model_ref == right.model_ref
+        and left.harness_ref == right.harness_ref
+        and tuple(_normalize_capability_binding(entry) for entry in left.capability_bindings)
+        == tuple(_normalize_capability_binding(entry) for entry in right.capability_bindings)
+    )
 
 
-def reasoning_bindings_compatible(
-    left: "ReasoningRuntimeBinding", right: "ReasoningRuntimeBinding"
+def root_capability_profile_compatible(
+    persisted_profile: object,
+    persisted_hash: object,
+    expected_profile: dict[str, object],
 ) -> bool:
-    from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
-
-    return type(left) is ReasoningRuntimeBinding and type(right) is ReasoningRuntimeBinding and left == right
+    if (
+        not isinstance(persisted_profile, dict)
+        or not _is_sha256(persisted_hash)
+        or canonical_hash(persisted_profile) != persisted_hash
+    ):
+        return False
+    if persisted_profile == expected_profile:
+        return True
+    if set(persisted_profile) != set(expected_profile):
+        return False
+    if not _is_sha256(persisted_profile.get("research_system_prompt_hash")):
+        return False
+    return all(
+        persisted_profile[key] == expected_profile[key]
+        for key in expected_profile
+        if key != "research_system_prompt_hash"
+    )

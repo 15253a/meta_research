@@ -59,12 +59,24 @@ def _root_index_directory(workspace: Path, root_session_ref: str) -> Path:
     return workspace / "provider-observations" / "root-sessions" / digest
 
 
-def _index_path(workspace: Path, root_session_ref: str, operation_ref: str,
-                invocation_hash: str) -> Path:
-    identity = hashlib.sha256(
+def _entry_identity(operation_ref: str, invocation_hash: str) -> str:
+    return hashlib.sha256(
         (operation_ref + "\0" + invocation_hash).encode("utf-8")
     ).hexdigest()
-    return _root_index_directory(workspace, root_session_ref) / (identity + ".json")
+
+
+def _index_path(workspace: Path, root_session_ref: str, operation_ref: str,
+                invocation_hash: str) -> Path:
+    return _root_index_directory(workspace, root_session_ref) / (
+        _entry_identity(operation_ref, invocation_hash) + ".json"
+    )
+
+
+def _gap_path(workspace: Path, root_session_ref: str, operation_ref: str,
+              invocation_hash: str) -> Path:
+    return _root_index_directory(workspace, root_session_ref) / (
+        _entry_identity(operation_ref, invocation_hash) + ".gap.json"
+    )
 
 
 def _relative_path(workspace: Path, path: Path) -> str:
@@ -109,6 +121,23 @@ def _observation_native_ref(observation: dict[str, object]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _scoped_root_target(
+    operation_scope: dict[str, object] | None,
+) -> tuple[str, str] | None:
+    if not isinstance(operation_scope, dict):
+        return None
+    root_session_ref = operation_scope.get("root_session_ref")
+    operation_ref = operation_scope.get("operation_ref") or operation_scope.get("job_ref")
+    if (
+        not isinstance(root_session_ref, str)
+        or not root_session_ref
+        or not isinstance(operation_ref, str)
+        or not operation_ref
+    ):
+        return None
+    return root_session_ref, operation_ref
+
+
 def write_root_session_observation_index(
     directory: Path,
     *,
@@ -124,32 +153,29 @@ def write_root_session_observation_index(
     guessed root identity.
     """
 
-    if not isinstance(operation_scope, dict):
+    scoped = _scoped_root_target(operation_scope)
+    if scoped is None:
         return None
-    root_session_ref = operation_scope.get("root_session_ref")
-    operation_ref = operation_scope.get("operation_ref") or operation_scope.get("job_ref")
-    if not isinstance(root_session_ref, str) or not root_session_ref:
-        return None
-    if not isinstance(operation_ref, str) or not operation_ref:
-        return None
+    root_session_ref, operation_ref = scoped
     if not isinstance(invocation_hash, str) or len(invocation_hash) != 64:
         raise RootSessionUsageError("root_session_invocation_hash_invalid")
     observation_path = directory / "call-observation.json"
     if not observation_path.is_file() or observation_path.is_symlink():
         raise RootSessionUsageError("root_session_observation_missing")
     workspace = _workspace_for_operation(directory)
+    scope = cast(dict[str, object], operation_scope)
     payload: dict[str, object] = {
         "schema_ref": ROOT_SESSION_OBSERVATION_SCHEMA,
         "root_session_ref": root_session_ref,
-        "run_ref": operation_scope.get("run_ref"),
-        "attempt_ref": operation_scope.get("attempt_ref"),
-        "fence_ref": operation_scope.get("fence_ref"),
+        "run_ref": scope.get("run_ref"),
+        "attempt_ref": scope.get("attempt_ref"),
+        "fence_ref": scope.get("fence_ref"),
         "operation_ref": operation_ref,
         "invocation_hash": invocation_hash,
         "observation_path": _relative_path(workspace, observation_path),
         "observation_sha256": transport_file_sha256(observation_path),
         "native_session_ref": _observation_native_ref(observation),
-        "model_ref": operation_scope.get("model_ref"),
+        "model_ref": scope.get("model_ref"),
         "prompt_utf8_bytes": observation.get("prompt_utf8_bytes"),
         "limited": bool(observation.get("limited", False)),
     }
@@ -159,12 +185,53 @@ def write_root_session_observation_index(
         write_transport_envelope(target, payload, key)
     except ProviderSupervisorError as error:
         raise RootSessionUsageError("root_session_observation_index_conflict") from error
+    _gap_path(workspace, root_session_ref, operation_ref, invocation_hash).unlink(missing_ok=True)
+    (directory / "root-session-observation-gap.json").unlink(missing_ok=True)
     return {
         "status": "available",
         "schema_ref": ROOT_SESSION_OBSERVATION_SCHEMA,
         "path": _relative_path(workspace, target),
         "sha256": transport_file_sha256(target),
     }
+
+
+def write_root_session_observation_gap(
+    directory: Path,
+    *,
+    key: bytes,
+    invocation_hash: str,
+    operation_scope: dict[str, object] | None,
+    failure_code: str,
+) -> Path:
+    """Record a signed root-session observation gap in the root index or operation dir."""
+
+    payload: dict[str, object] = {
+        "schema_ref": "meta-research/root-session-observation-unavailable/v1",
+        "invocation_hash": invocation_hash,
+        "status": "unavailable",
+        "failure_code": failure_code or "root_session_observation_failed",
+        "owner": "harness",
+        "next_action": "reconcile_root_session_observation_index_before_using_cross_operation_usage",
+    }
+    scoped = _scoped_root_target(operation_scope)
+    if scoped is not None and isinstance(invocation_hash, str) and len(invocation_hash) == 64:
+        root_session_ref, operation_ref = scoped
+        try:
+            workspace = _workspace_for_operation(directory)
+        except (RootSessionUsageError, OSError):
+            workspace = None
+        if workspace is not None:
+            target = _gap_path(workspace, root_session_ref, operation_ref, invocation_hash)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            write_transport_envelope(
+                target,
+                {**payload, "root_session_ref": root_session_ref, "operation_ref": operation_ref},
+                key,
+            )
+            return target
+    fallback = directory / "root-session-observation-gap.json"
+    write_transport_envelope(fallback, payload, key)
+    return fallback
 
 
 def _validate_pointer(pointer: dict[str, object], root_session_ref: str) -> tuple[str, str]:
@@ -193,7 +260,18 @@ def read_root_session_observations(
         return []
     if index_directory.is_symlink() or not index_directory.is_dir():
         raise RootSessionUsageError("root_session_observation_index_invalid")
-    paths = sorted(index_directory.glob("*.json"), key=lambda path: path.name)
+    gap_paths: list[Path] = []
+    paths: list[Path] = []
+    for path in sorted(index_directory.glob("*.json"), key=lambda entry: entry.name):
+        if path.name.endswith(".gap.json"):
+            gap_paths.append(path)
+        else:
+            paths.append(path)
+    if gap_paths:
+        for gap_path in gap_paths:
+            if gap_path.is_symlink() or not gap_path.is_file():
+                raise RootSessionUsageError("root_session_observation_index_invalid")
+        raise RootSessionUsageError("root_session_observation_unavailable")
     if len(paths) > _MAX_INDEX_ENTRIES:
         raise RootSessionUsageError("root_session_observation_index_limited")
     key = read_transport_key_for_workspace(workspace)
@@ -576,5 +654,6 @@ __all__ = [
     "RootSessionUsageError",
     "aggregate_root_session_usage",
     "read_root_session_observations",
+    "write_root_session_observation_gap",
     "write_root_session_observation_index",
 ]

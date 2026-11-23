@@ -143,7 +143,7 @@ def _finish(process, operation, key):
     ("direct", 23, "completed"), ("signal", -15, "completed"),
     ("detached", 23, "descendant_process"), ("old-fd", 23, "descendant_process"),
     ("reopen", 23, "descendant_process"), ("timeout", -15, "timeout"),
-    ("output", -15, "output_limit"), ("stderr-output", -15, "output_limit"),
+    ("output", -15, "output_limit"), ("stderr-output", -15, "timeout"),
     ("stop", -15, "stopped"),
 ])
 def test_linux_supervisor_proves_owned_tree_closed(tmp_path, mode, code, reason):

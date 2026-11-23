@@ -36,6 +36,7 @@ from meta_research.codex_runtime import (
 )
 
 from meta_research.provider_supervisor import (
+    _OPERATION_SCOPE_FIELDS,
     SUPERVISOR_REQUEST_SCHEMA,
     ProviderSupervisorError,
     ensure_transport_key,
@@ -77,6 +78,10 @@ from meta_research.root_resident_mcp import (
 )
 from meta_research.semantic_mcp import ROOT_AGENT_ACQUISITION_OPERATION_IDS
 from meta_research.owners.common import OwnerConflict
+from meta_research.runtime_binding_compatibility import (
+    deepfetch_bindings_compatible,
+    root_capability_profile_compatible,
+)
 
 if TYPE_CHECKING:
     from meta_research.owners.common import AcceptanceReceipt
@@ -1420,8 +1425,9 @@ class CodexDeepFetchAdapter:
         execution_key = self._provider_execution_key(root_job_ref)
         if (
             not request.reconcile_only
-            and request.runtime_binding.as_dict()
-            != self.runtime_binding().as_dict()
+            and not deepfetch_bindings_compatible(
+                request.runtime_binding, self.runtime_binding()
+            )
         ):
             # An operation admitted before these protocol boundaries existed
             # may only be inspected through the predecessor-binding
@@ -2122,10 +2128,11 @@ class CodexDeepFetchAdapter:
                     )
                     or invocation.get("model_ref")
                     != request.runtime_binding.model_ref
-                    or invocation.get("root_capability_profile")
-                    != capability_profile.as_dict()
-                    or invocation.get("root_capability_profile_hash")
-                    != capability_profile.digest
+                    or not root_capability_profile_compatible(
+                        invocation.get("root_capability_profile"),
+                        invocation.get("root_capability_profile_hash"),
+                        capability_profile.as_dict(),
+                    )
                     or schema_text not in {full_schema_text, gate_schema_text}
                     or gate_turn != expected_web_gate
                     or (
@@ -2165,9 +2172,15 @@ class CodexDeepFetchAdapter:
                 )
                 if request.reconcile_only:
                     if historical_scope is None:
-                        historical_scope = persisted_scope
-                    elif persisted_scope != historical_scope:
-                        raise ValueError("deepfetch reconciliation operation scope conflict")
+                        historical_scope = dict(persisted_scope)
+                    elif persisted_scope:
+                        if any(
+                            historical_scope[key] != value
+                            for key, value in persisted_scope.items()
+                            if key in historical_scope and key not in {"attempt_ref", "fence_ref"}
+                        ):
+                            raise ValueError("deepfetch reconciliation operation scope conflict")
+                        historical_scope = {**historical_scope, **persisted_scope}
                 if not (directory / "supervisor-exit.json").is_file():
                     if supervisor_request_never_started(
                         directory,
@@ -2297,21 +2310,32 @@ class CodexDeepFetchAdapter:
         persisted_scope = supervisor.get("operation_scope")
         if persisted_scope is not None:
             expected_keys.add("operation_scope")
+        core_scope_fields = ("run_ref", "root_session_ref", "root_kind", "operation_ref")
         scope_matches = (
             persisted_scope == expected_operation_scope
             if not allow_historical_attempt_binding
             else (
                 isinstance(persisted_scope, dict)
-                and set(persisted_scope) == set(expected_operation_scope)
+                and bool(persisted_scope)
+                and set(persisted_scope).issubset(_OPERATION_SCOPE_FIELDS)
                 and all(
-                    persisted_scope.get(key) == value
-                    for key, value in expected_operation_scope.items()
-                    if key not in {"attempt_ref", "fence_ref"}
+                    isinstance(value, str)
+                    and bool(value)
+                    and len(value.encode("utf-8")) <= 512
+                    for value in persisted_scope.values()
                 )
                 and all(
-                    isinstance(persisted_scope.get(key), str)
-                    and bool(persisted_scope.get(key))
-                    for key in ("attempt_ref", "fence_ref")
+                    key in persisted_scope
+                    and persisted_scope[key] == expected_operation_scope[key]
+                    for key in core_scope_fields
+                    if expected_operation_scope.get(key) is not None
+                )
+                and all(
+                    persisted_scope[key] == expected_operation_scope[key]
+                    for key in persisted_scope
+                    if key not in {"attempt_ref", "fence_ref"}
+                    and key in expected_operation_scope
+                    and expected_operation_scope[key] is not None
                 )
             )
         )

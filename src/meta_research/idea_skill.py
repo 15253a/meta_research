@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Callable, Protocol, cast
 
 from meta_research.system_prompt import read_output_language
+from meta_research.runtime_binding_compatibility import idea_bindings_compatible
 from meta_research.runtime_conditions import (
     compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt, selected_stage_model,
     resume_runtime_conditions,
@@ -1779,7 +1780,7 @@ class CodexIdeaSkillAdapter:
 
     @resource_preparation
     def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
-        if request.runtime_binding != self.runtime_binding():
+        if not idea_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         skill = _idea_skill_instructions()
         lineage = _idea_owner_rejection_prompt(request)
@@ -1870,7 +1871,7 @@ class CodexIdeaSkillAdapter:
         # Root policy organizes advisory review before returning a candidate.
         # This retained adapter seam validates/checkpoints that candidate; it
         # neither launches a review turn nor attests a review/approval event.
-        if request.runtime_binding != self.runtime_binding():
+        if not idea_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
             raise IdeaSkillUnavailable("codex_primary_session_changed")

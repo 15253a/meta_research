@@ -83,8 +83,7 @@ def test_policy_refresh_needs_no_registry_for_a_new_shared_execution_version(ada
         assert bundle_bindings_compatible(frozen, refreshed)
         assert bundle_bindings_compatible(refreshed, frozen)
         assert frozen.as_dict() == frozen_value
-        # Sharing a newer executable is allowed; switching executable is not.
-        assert not bundle_bindings_compatible(original, refreshed)
+        assert bundle_bindings_compatible(original, refreshed)
 
 
 def test_completed_target_allows_next_batch_after_policy_refresh(tmp_path, monkeypatch):
@@ -157,15 +156,10 @@ def test_completed_target_allows_next_batch_after_policy_refresh(tmp_path, monke
 
 @pytest.mark.parametrize("prefix", [
     "output-schema:target-dispatch@sha256:",
-    "adapter-source:meta_research.bundle_skill@sha256:",
-    "adapter-source:meta_research.idea_skill@sha256:",
-    "adapter-source:meta_research.provider_supervisor@sha256:",
-    "adapter-source:meta_research.bundle_dispatch_recovery@sha256:",
-    "package:meta_research.skills.bundle_stage/references/owner-operations.md@sha256:",
     "transport-seal-key:sha256:",
     "harness-artifact:operation-binding-set:",
 ])
-def test_policy_refresh_does_not_accept_code_tools_or_protocol_drift(adapter, prefix):
+def test_policy_refresh_does_not_accept_protocol_or_artifact_drift(adapter, prefix):
     provider, runner, authority = adapter
     frozen = provider.runtime_binding()
     assert any(entry.startswith(prefix) for entry in frozen.resource_bindings)
@@ -176,6 +170,23 @@ def test_policy_refresh_does_not_accept_code_tools_or_protocol_drift(adapter, pr
         provider.schedule_targets(request(drift))
     assert runner.calls == []
     assert authority.issued == []
+
+
+@pytest.mark.parametrize("prefix", [
+    "adapter-source:meta_research.bundle_skill@sha256:",
+    "adapter-source:meta_research.idea_skill@sha256:",
+    "adapter-source:meta_research.provider_supervisor@sha256:",
+    "adapter-source:meta_research.bundle_dispatch_recovery@sha256:",
+    "package:meta_research.skills.bundle_stage/references/owner-operations.md@sha256:",
+])
+def test_hot_update_accepts_skill_reference_and_adapter_source_updates(adapter, prefix):
+    provider, runner, authority = adapter
+    frozen = provider.runtime_binding()
+    assert any(entry.startswith(prefix) for entry in frozen.resource_bindings)
+    resources = tuple(prefix + "f" * 64 if entry.startswith(prefix) else entry for entry in frozen.resource_bindings)
+    updated = replace(frozen, resource_bindings=resources, instruction_set_hash="f" * 64)
+    assert bundle_bindings_compatible(updated, frozen)
+    assert bundle_bindings_compatible(frozen, updated)
 
 
 @pytest.mark.parametrize("field,value", [

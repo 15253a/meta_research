@@ -147,19 +147,41 @@ def native_human_input_history(workspace, native_session_ref, *, exclude_directo
                 if isinstance(error.__cause__, FileNotFoundError):
                     raise OwnerConflict("human_input_delivery_pending") from error
                 raise
-            turn = recovered["turn"]
-            found = (recovered["thread_id"] == native_session_ref and turn["id"] == sent["turn_id"]
-                and any(item.get("type") == "userMessage" and item.get("clientId") == sent["id"]
-                    and any(part.get("type") == "text" and part.get("text") == sent["text"]
-                            for part in item.get("content", [])) for item in turn.get("items", [])))
-            if not found:
+            turn = recovered.get("turn")
+            if (
+                recovered.get("thread_id") != native_session_ref
+                or not isinstance(turn, dict)
+                or turn.get("id") != sent["turn_id"]
+                or turn.get("status") not in {"completed", "failed", "interrupted"}
+                or not isinstance(turn.get("items"), list)
+            ):
                 raise OwnerConflict("human_input_delivery_pending")
-            write_transport_envelope(receipt_path, {**sent, "status": "accepted", "reconciled": True}, key)
+            found = any(
+                item.get("type") == "userMessage"
+                and item.get("clientId") == sent["id"]
+                and any(
+                    part.get("type") == "text" and part.get("text") == sent["text"]
+                    for part in item.get("content", [])
+                )
+                for item in turn["items"]
+            )
+            write_transport_envelope(
+                receipt_path,
+                {
+                    **sent,
+                    "status": "accepted" if found else "not_delivered",
+                    "reconciled": True,
+                },
+                key,
+            )
         receipt = read_transport_envelope(receipt_path, key)
-        if (receipt.get("status") != "accepted"
-                or any(receipt.get(name) != value for name, value in sent.items())):
+        if (
+            receipt.get("status") not in {"accepted", "not_delivered"}
+            or any(receipt.get(name) != value for name, value in sent.items())
+        ):
             raise OwnerConflict("native_guidance_receipt_invalid")
-        observed.append(sent["text"])
+        if receipt.get("status") == "accepted":
+            observed.append(sent["text"])
     return tuple(observed)
 
 
@@ -168,6 +190,7 @@ class _GuidancePump:
         self.authority, self.scope, self.binding = authority, scope, binding
         self.directory, self.key = directory, key
         self._stop = threading.Event()
+        self._written: set[str] = set()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -182,8 +205,11 @@ class _GuidancePump:
         while not self._stop.wait(delay):
             try:
                 messages = self.authority.prepare_live_guidance(scope=self.scope, binding=self.binding)
+                wrote_any = False
                 for message in messages:
                     identity = canonical_hash(message)
+                    if identity in self._written:
+                        continue
                     path = self.directory / "live-guidance" / (identity + ".json")
                     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     if not path.exists():
@@ -197,9 +223,12 @@ class _GuidancePump:
                             initial = start["parameters"]["input"][0]["text"]
                             if human_input_identities((live_guidance_prompt(message),)).issubset(
                                     human_input_identities((*prior, initial))):
+                                self._written.add(identity)
                                 continue
                         write_transport_envelope(path, {"id": identity, "message": message}, self.key)
-                delay = 0.1
+                        wrote_any = True
+                    self._written.add(identity)
+                delay = 0.1 if wrote_any else 0.15
             except OwnerConflict as error:
                 if error.code == "human_input_delivery_pending":
                     delay = 1
