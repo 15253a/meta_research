@@ -88,7 +88,7 @@ def test_workflow_reaches_the_original_cross_owner_reconciliation():
 
     name = "research_memory.assets.intake.reconcile"
     gateway = SemanticMcpGateway((replace(reader(name, "research_memory"), access_mode="reconcile"),))
-    channel = make_channel(gateway, gateway.operation_ids)
+    channel = make_channel(gateway, gateway.operation_ids, root_kind="plan")
     workflow = call(gateway, channel, "tools.catalog.page", purpose="WF",
                     topic="Unknown outcomes and recovery")["structuredContent"]
     custody = call(gateway, channel, "tools.catalog.page", purpose="RM")["structuredContent"]

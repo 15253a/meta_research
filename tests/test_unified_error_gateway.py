@@ -35,7 +35,7 @@ def _gateway(handler):
         fence_ref="fence-1",
         capability_binding_hash="a" * 64,
         operation_ids=tuple(item.semantic_operation_id for item in operations),
-        root_kind="target",
+        root_kind="bundle",
         phase="execution",
     )
     return gateway, connection.token

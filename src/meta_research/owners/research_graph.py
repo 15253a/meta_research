@@ -90,6 +90,7 @@ from meta_research.idea_contract import (
 )
 from meta_research.plan_contract import (
     MAX_PLAN_EVIDENCE_REFS,
+    _evidence_target_commit_ref,
     selected_plan_evidence_catalog,
     PlanContractError,
     validate_current_plan_evidence_accounting,
@@ -10375,6 +10376,18 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             quest_ref=quest_ref, question_ref=question_ref
         )
 
+    def _query_quest_plan_evidence_catalog_for_refs(
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...],
+    ) -> list[dict[str, object]]:
+        if not target_commit_refs:
+            return []
+        _, catalog = self.query_plan_evidence_catalog(
+            quest_ref=quest_ref,
+            target_commit_refs=target_commit_refs,
+            current_only=True,
+        )
+        return list(catalog)
+
     def resolve_plan_evidence_reuse_leaves(
         self,
         *,
@@ -12191,6 +12204,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         ):
             raise OwnerConflict("formal_plan_request_lineage_invalid")
         accounting_rejection: str | None = None
+        accounting_diagnostic: str | None = None
         try:
             evidence_by_ref = validate_plan_context_pack(
                 verified_request.context_pack,
@@ -12225,14 +12239,45 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     quest_ref=accepted_question.quest_ref,
                     question_ref=accepted_question.question_ref,
                 )
+                known_refs = {
+                    tc
+                    for item in (*current_catalog, *selected_catalog)
+                    if isinstance(item, dict)
+                    and (tc := _evidence_target_commit_ref(item)) is not None
+                }
+                raw_accounting = content.plan_document.get("evidence_accounting")
+                extra_refs = (
+                    tuple(
+                        dict.fromkeys(
+                            entry["target_commit_ref"]
+                            for entry in raw_accounting[:MAX_PLAN_EVIDENCE_REFS]
+                            if isinstance(entry, dict)
+                            and isinstance(entry.get("target_commit_ref"), str)
+                            and entry["target_commit_ref"].strip()
+                            and entry["target_commit_ref"] not in known_refs
+                        )
+                    )
+                    if isinstance(raw_accounting, list)
+                    else ()
+                )
+                additional_catalog = (
+                    self._query_quest_plan_evidence_catalog_for_refs(
+                        quest_ref=accepted_question.quest_ref,
+                        target_commit_refs=extra_refs,
+                    )
+                    if extra_refs
+                    else []
+                )
                 try:
                     validate_current_plan_evidence_accounting(
                         content.plan_document,
                         current_catalog=current_catalog,
                         selected_catalog=selected_catalog,
+                        additional_known_catalog=additional_catalog,
                     )
                 except PlanContractError as error:
                     accounting_rejection = str(error)
+                    accounting_diagnostic = error.diagnostic
         except PlanContractError as error:
             raise OwnerConflict(str(error)) from error
         answer_contract = content.plan_document.get("answer_contract")
@@ -12274,12 +12319,23 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             if accounting_rejection is not None:
                 decision = "rejected"
                 reason_code = accounting_rejection
-                feedback = (
-                    "The current question has TargetCommit evidence without a "
-                    "disposition in evidence_accounting. Add one entry per "
-                    "current TargetCommit and explain whether it is adopted, "
-                    "considered, deferred or not_used before retrying.",
-                )
+                if accounting_rejection == "plan_evidence_accounting_incomplete":
+                    feedback_items = [
+                        "The current question has TargetCommit evidence without a "
+                        "disposition in evidence_accounting. Add one entry per "
+                        "current TargetCommit and explain whether it is adopted, "
+                        "considered, deferred or not_used before retrying."
+                    ]
+                else:
+                    feedback_items = [
+                        "evidence_accounting contains an invalid, unknown, duplicate, or "
+                        "mismatched TargetCommit disposition. Verify evidence_ref, "
+                        "target_commit_ref, and status against current Quest TargetCommits "
+                        "and selected_evidence_bindings before retrying."
+                    ]
+                if accounting_diagnostic:
+                    feedback_items.append(accounting_diagnostic)
+                feedback = tuple(feedback_items)
             else:
                 decision, reason_code, feedback = _evaluate_formal_plan(
                     question_content,

@@ -999,6 +999,39 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
         )
         assert too_many_sources["isError"] is True
         assert too_many_sources["structuredContent"]["code"] == (
+            "semantic_input_schema_mismatch"
+        )
+        assert too_many_sources["structuredContent"]["details"]["path"] == [
+            "targets",
+            0,
+            "source_urls",
+        ]
+        assert too_many_sources["structuredContent"]["details"]["requirement"] == "maxItems"
+        assert too_many_sources["structuredContent"]["details"]["expected"] == 20
+        assert len(provider.batches) == 2
+
+        duplicate_target = call(
+            acquisition.connection.token,
+            6,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            {
+                "effect_id": "duplicate-paper-id",
+                "targets": [
+                    {
+                        "paper_id": "paper:dup",
+                        "title": "First duplicate paper",
+                        "source_urls": [],
+                    },
+                    {
+                        "paper_id": "paper:dup",
+                        "title": "Second duplicate paper",
+                        "source_urls": [],
+                    },
+                ],
+            },
+        )
+        assert duplicate_target["isError"] is True
+        assert duplicate_target["structuredContent"]["code"] == (
             "acquisition_batch_request_invalid"
         )
         assert len(provider.batches) == 2

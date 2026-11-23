@@ -85,13 +85,23 @@ def _audit_identity(facts: Mapping[str, Any]) -> str:
     return "error:" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
 
 
+def _is_unauthorized_capability_reason(reason: object) -> bool:
+    return isinstance(reason, str) and (
+        reason == "root_kind_not_owner" or reason.endswith("_unauthorized")
+    )
+
+
 def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
     if code in {"provider_auth_revoked", "provider_authentication_required"}:
         return RecoveryOwner.OPERATOR
     if code == "mcp_channel_authentication_required":
         return RecoveryOwner.OPERATOR
-    if code == "capability_unavailable" and details.get("reason") in {"not_granted", "not_registered"}:
-        return RecoveryOwner.OPERATOR
+    if code == "capability_unavailable":
+        reason = details.get("reason")
+        if reason in {"not_granted", "not_registered"}:
+            return RecoveryOwner.OPERATOR
+        if _is_unauthorized_capability_reason(reason):
+            return RecoveryOwner.AGENT
     if any(token in code for token in ("audit", "persistence", "invariant", "corrupt", "readback")):
         return RecoveryOwner.OPERATOR
     if any(token in code for token in ("schema", "input", "target_", "context", "authorization", "permission", "scope")):
@@ -116,12 +126,15 @@ def _status_for(code: str, details: Mapping[str, Any], *, effect: bool) -> Effec
         return EffectStatus(raw)
     if isinstance(raw, str) and raw in legacy_statuses:
         return legacy_statuses[raw]
-    if details.get("call_execution") == "not_started":
-        return EffectStatus.NOT_STARTED
     if code == "mcp_channel_authentication_required":
         return EffectStatus.REJECTED
-    if code == "capability_unavailable" and details.get("reason") in {"not_granted", "not_registered"}:
+    if code == "capability_unavailable" and (
+        details.get("reason") in {"not_granted", "not_registered"}
+        or _is_unauthorized_capability_reason(details.get("reason"))
+    ):
         return EffectStatus.REJECTED
+    if details.get("call_execution") == "not_started":
+        return EffectStatus.NOT_STARTED
     if "cancel" in code:
         return EffectStatus.CANCELLED
     if any(token in code for token in ("conflict", "already_exists", "authorization_denied", "permission_denied")):
@@ -282,7 +295,11 @@ def error_contract_from_legacy(
         if agent
         else NextAction.ESCALATE
         if operator
-        else NextAction.RECONCILE
+        else (
+            NextAction.REREAD_CURRENT_STATE
+            if (raw.get("call_execution") == "not_started" or phase == "admission")
+            else NextAction.RECONCILE
+        )
         if status is EffectStatus.REJECTED
         else NextAction.RETRY_SAFE
     )
@@ -298,6 +315,15 @@ def error_contract_from_legacy(
     correction = raw.get("correction") if isinstance(raw.get("correction"), str) else None
     if code in {"provider_auth_revoked", "provider_authentication_required"} and correction is None:
         correction = "Refresh the Provider authentication and rerun the failed operation after the Owner confirms the new credential."
+    if (
+        code == "capability_unavailable"
+        and _is_unauthorized_capability_reason(raw.get("reason"))
+        and correction is None
+    ):
+        correction = (
+            "This operation is not owned by the current root session and did not run. "
+            "Do not retry or reconcile it here; switch to an owning root operation or hand off to an owning root."
+        )
     if status is EffectStatus.NOT_STARTED and agent and (
         correction is None or "unknown" in correction.lower()
     ):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import Sequence, cast
 
 from meta_research.idea_contract import (
     DISPOSITION_ACTIONS,
@@ -38,6 +38,11 @@ _BUNDLE_DISPOSITIONS = {
 
 class PlanContractError(ValueError):
     """A Plan candidate or its frozen invocation closure is invalid."""
+
+    def __init__(self, code: str, *, diagnostic: str | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.diagnostic = diagnostic
 
 
 def adoption_binding_with_reader_quest(binding, quest_ref):
@@ -228,83 +233,215 @@ def selected_plan_evidence_catalog(
     return list(result.values())
 
 
+def _evidence_target_commit_ref(evidence: dict[str, object]) -> str | None:
+    direct = evidence.get("target_commit_root_ref")
+    if isinstance(direct, str) and direct:
+        return direct
+    binding = evidence.get("source_binding")
+    if isinstance(binding, dict):
+        nested = binding.get("target_commit_root_ref")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
+
+
 def _validate_evidence_accounting(
     accounting: object,
     *,
     frozen_catalog: list[dict[str, object]],
     selected_catalog: list[dict[str, object]],
+    additional_known_catalog: Sequence[dict[str, object]] = (),
+    require_known: bool = False,
 ) -> None:
-    """Validate an optional, complete disposition ledger for Target evidence.
+    """Validate an evidence_accounting ledger at the appropriate boundary.
 
-    Older Plan documents predate this ledger and remain valid when the field is
-    absent. Once a Plan supplies it, every TargetCommit visible in the frozen
-    catalog or selected from a later evidence page must have exactly one
-    disposition and reason. This makes an explicit ``not_used`` decision
-    distinguishable from a missing handoff while retaining old-document
-    compatibility.
+    At Skill/RM validation (`require_known=False`), the frozen catalog in
+    StageRunRequest is often empty because later TargetCommits are discovered
+    via `plan_evidence.page`. Skill/RM verifies shape, uniqueness, identity
+    consistency against `frozen_catalog` / `selected_catalog`, and `adopted`
+    parity with `selected_evidence_bindings`, leaving full live-catalog
+    completeness and unknown-ref checks (`require_known=True`) to RG.
     """
-    if not isinstance(accounting, list) or len(accounting) > MAX_PLAN_EVIDENCE_REFS:
-        raise PlanContractError("plan_evidence_accounting_invalid")
-
-    def target_commit_ref(evidence: dict[str, object]) -> str | None:
-        direct = evidence.get("target_commit_root_ref")
-        if isinstance(direct, str) and direct:
-            return direct
-        binding = evidence.get("source_binding")
-        if isinstance(binding, dict):
-            nested = binding.get("target_commit_root_ref")
-            if isinstance(nested, str) and nested:
-                return nested
-        return None
-
-    known: dict[str, dict[str, object]] = {}
-    for evidence in [*frozen_catalog, *selected_catalog]:
-        evidence_ref = evidence.get("evidence_ref")
-        if not isinstance(evidence_ref, str) or not evidence_ref:
-            raise PlanContractError("plan_evidence_accounting_invalid")
-        known.setdefault(evidence_ref, evidence)
-    target_refs = {
-        target_ref for evidence in known.values()
-        if (target_ref := target_commit_ref(evidence)) is not None
-    }
-    selected_refs = {
-        target_ref for evidence in selected_catalog
-        if (target_ref := target_commit_ref(evidence)) is not None
-    }
-    seen_target_refs: set[str] = set()
-    for raw in accounting:
-        entry = _object(raw, "plan_evidence_accounting_invalid")
-        _exact_keys(
-            entry,
-            {"evidence_ref", "target_commit_ref", "status", "reason"},
+    if not isinstance(accounting, list):
+        raise PlanContractError(
             "plan_evidence_accounting_invalid",
+            diagnostic="evidence_accounting must be a JSON array.",
         )
-        evidence_ref = entry.get("evidence_ref")
-        target_ref_value = entry.get("target_commit_ref")
-        status = entry.get("status")
-        if (
-            not _text(evidence_ref)
-            or not isinstance(evidence_ref, str)
-            or not isinstance(target_ref_value, str)
-            or target_ref_value in seen_target_refs
-            or evidence_ref not in known
-            or not _text(target_ref_value)
-            or status not in _EVIDENCE_ACCOUNTING_STATUSES
-            or not _text(entry.get("reason"))
-        ):
-            raise PlanContractError("plan_evidence_accounting_invalid")
-        evidence = next(
-            (item for item in known.values()
-             if item.get("evidence_ref") == evidence_ref),
-            None,
+    if len(accounting) > MAX_PLAN_EVIDENCE_REFS:
+        raise PlanContractError(
+            "plan_evidence_accounting_invalid",
+            diagnostic=f"evidence_accounting exceeds the limit of {MAX_PLAN_EVIDENCE_REFS} entries.",
         )
-        if evidence is None or target_ref_value != target_commit_ref(evidence):
-            raise PlanContractError("plan_evidence_accounting_invalid")
+
+    known_target_commits: dict[str, str] = {}
+    known_evidence_by_target: dict[str, str] = {}
+    known_non_target_evidence_refs: set[str] = set()
+
+    def register_catalog(
+        catalog: Sequence[dict[str, object]], *, required: bool
+    ) -> set[str]:
+        target_refs: set[str] = set()
+        for evidence in catalog:
+            evidence_ref = evidence.get("evidence_ref") if isinstance(evidence, dict) else None
+            if not isinstance(evidence_ref, str) or not evidence_ref:
+                raise PlanContractError(
+                    "plan_evidence_accounting_invalid",
+                    diagnostic="Evidence catalog contains an entry without a valid evidence_ref.",
+                )
+            tc_ref = _evidence_target_commit_ref(evidence)
+            if tc_ref is None:
+                if required:
+                    known_non_target_evidence_refs.add(evidence_ref)
+                continue
+            existing_tc = known_target_commits.get(evidence_ref)
+            if existing_tc is not None and existing_tc != tc_ref:
+                raise PlanContractError(
+                    "plan_evidence_accounting_invalid",
+                    diagnostic=f"Conflicting target_commit_ref mapping for evidence_ref={evidence_ref}.",
+                )
+            existing_ev = known_evidence_by_target.get(tc_ref)
+            if existing_ev is not None and existing_ev != evidence_ref:
+                raise PlanContractError(
+                    "plan_evidence_accounting_invalid",
+                    diagnostic=f"Conflicting evidence_ref mapping for target_commit_ref={tc_ref}.",
+                )
+            known_target_commits[evidence_ref] = tc_ref
+            known_evidence_by_target[tc_ref] = evidence_ref
+            if required:
+                target_refs.add(tc_ref)
+        return target_refs
+
+    required_target_refs = register_catalog(
+        [*frozen_catalog, *selected_catalog], required=True
+    )
+    register_catalog(additional_known_catalog, required=False)
+    selected_refs = {
+        tc_ref
+        for evidence in selected_catalog
+        if (tc_ref := _evidence_target_commit_ref(evidence)) is not None
+    }
+    required_keys = {"evidence_ref", "target_commit_ref", "status", "reason"}
+    seen_target_refs: set[str] = set()
+    seen_evidence_refs: set[str] = set()
+    for index, raw in enumerate(accounting):
+        if not isinstance(raw, dict):
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=f"evidence_accounting[{index}] must be an object.",
+            )
+        if set(raw) != required_keys:
+            missing = sorted(required_keys - set(raw))
+            extra = sorted(set(raw) - required_keys)
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}] keys mismatch: "
+                    f"missing={missing}, unexpected={extra}."
+                ),
+            )
+        evidence_ref = raw.get("evidence_ref")
+        target_ref_value = raw.get("target_commit_ref")
+        status = raw.get("status")
+        reason = raw.get("reason")
+        if not _text(evidence_ref) or not isinstance(evidence_ref, str):
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=f"evidence_accounting[{index}].evidence_ref must be a nonempty string.",
+            )
+        if not _text(target_ref_value) or not isinstance(target_ref_value, str):
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=f"evidence_accounting[{index}].target_commit_ref must be a nonempty string.",
+            )
+        if status not in _EVIDENCE_ACCOUNTING_STATUSES:
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}].status={status!r} must be one of "
+                    f"{sorted(_EVIDENCE_ACCOUNTING_STATUSES)}."
+                ),
+            )
+        if not _text(reason):
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}].reason for target_commit_ref="
+                    f"{target_ref_value} must be a nonempty string."
+                ),
+            )
+        if target_ref_value in seen_target_refs:
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=f"Duplicate evidence_accounting entry for target_commit_ref={target_ref_value}.",
+            )
+        if evidence_ref in seen_evidence_refs:
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=f"Duplicate evidence_accounting entry for evidence_ref={evidence_ref}.",
+            )
+        if evidence_ref in known_non_target_evidence_refs:
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}] references non-TargetCommit evidence_ref="
+                    f"{evidence_ref}; only TargetCommit sources belong in evidence_accounting."
+                ),
+            )
+        expected_tc = known_target_commits.get(evidence_ref)
+        expected_ev = known_evidence_by_target.get(target_ref_value)
+        if expected_tc is not None:
+            if target_ref_value != expected_tc:
+                raise PlanContractError(
+                    "plan_evidence_accounting_invalid",
+                    diagnostic=(
+                        f"evidence_accounting[{index}] pairs evidence_ref={evidence_ref} "
+                        f"with target_commit_ref={target_ref_value}, expected {expected_tc}."
+                    ),
+                )
+        elif expected_ev is not None:
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}] pairs target_commit_ref={target_ref_value} "
+                    f"with evidence_ref={evidence_ref}, expected {expected_ev}."
+                ),
+            )
+        elif status == "adopted":
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}] marks target_commit_ref={target_ref_value} "
+                    f"as 'adopted', but it is absent from selected_evidence_bindings."
+                ),
+            )
+        elif require_known:
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}] references unknown TargetCommit "
+                    f"target_commit_ref={target_ref_value} (evidence_ref={evidence_ref})."
+                ),
+            )
         if (status == "adopted") != (target_ref_value in selected_refs):
-            raise PlanContractError("plan_evidence_accounting_invalid")
-        seen_target_refs.add(cast(str, target_ref_value))
-    if seen_target_refs != target_refs:
-        raise PlanContractError("plan_evidence_accounting_incomplete")
+            raise PlanContractError(
+                "plan_evidence_accounting_invalid",
+                diagnostic=(
+                    f"evidence_accounting[{index}] status={status!r} for target_commit_ref="
+                    f"{target_ref_value} conflicts with selected_evidence_bindings."
+                ),
+            )
+        seen_target_refs.add(target_ref_value)
+        seen_evidence_refs.add(evidence_ref)
+    missing_target_refs = sorted(required_target_refs - seen_target_refs)
+    if missing_target_refs:
+        raise PlanContractError(
+            "plan_evidence_accounting_incomplete",
+            diagnostic=(
+                "Missing evidence_accounting disposition for TargetCommit(s): "
+                + ", ".join(missing_target_refs)
+                + "."
+            ),
+        )
 
 
 def validate_current_plan_evidence_accounting(
@@ -312,6 +449,7 @@ def validate_current_plan_evidence_accounting(
     *,
     current_catalog: list[dict[str, object]],
     selected_catalog: list[dict[str, object]],
+    additional_known_catalog: Sequence[dict[str, object]] = (),
 ) -> None:
     """Require a new accounting ledger to cover the current TargetCommit set.
 
@@ -332,6 +470,8 @@ def validate_current_plan_evidence_accounting(
         accounting,
         frozen_catalog=current_catalog,
         selected_catalog=selected_catalog,
+        additional_known_catalog=additional_known_catalog,
+        require_known=True,
     )
 
 
@@ -422,6 +562,7 @@ def validate_plan_document(
             document["evidence_accounting"],
             frozen_catalog=list(frozen_evidence_by_ref.values()),
             selected_catalog=selected_catalog,
+            require_known=False,
         )
     evidence_by_ref = {str(item["evidence_ref"]): item for item in selected_catalog}
 
