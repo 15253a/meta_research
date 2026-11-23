@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_json
 
-from meta_research.target_run_finalizer import TargetRunFinalizer
+from meta_research.target_run_finalizer import TargetRootOwnerRejection, TargetRunFinalizer
 from test_target_root_finalizer import _EvidenceReader, _root_finalizer_fixture
 
 
@@ -95,8 +95,10 @@ def test_invalid_extra_evaluation_rolls_back_entire_acceptance(tmp_path):
             {'attempt_key': 'valid', 'metrics': document['metrics']},
             {'attempt_key': 'invalid', 'evaluation_ref': 'does-not-exist', 'metrics': document['metrics']}]}]
         path.write_text(canonical_json(document))
-        with pytest.raises(OwnerConflict, match='evaluation_definition_invalid'):
-            _accept(runtime, lifecycle, memory, handle, evidence)
+        rejected, _manifest = _accept(runtime, lifecycle, memory, handle, evidence)
+        assert type(rejected) is TargetRootOwnerRejection
+        assert rejected.issuer == 'research_graph'
+        assert rejected.code == 'target_formal_evaluation_definition_invalid'
         with runtime._database.read() as connection:
             for table in ('rg_target_commits', 'rg_variant_runs', 'rg_evaluation_attempts', 'rg_metric_results', 'rg_target_root_measurements'):
                 assert connection.exec_driver_sql('SELECT count(*) FROM ' + table).scalar_one() == 0

@@ -173,10 +173,12 @@ def query_goal_revision_by_ref_in_transaction(
         return query_goal_revision_in_transaction(
             connection, quest_ref=row.quest_ref, revision_ref=revision_ref
         )
-    quests = connection.execute(text("SELECT * FROM rg_quests")).all()
-    for quest in quests:
-        if initial_goal_revision_ref(quest) == revision_ref:
-            return initial_goal_binding(quest)
+    quest = connection.execute(
+        text("SELECT * FROM rg_quests WHERE initial_goal_revision_ref=:revision_ref"),
+        {"revision_ref": revision_ref},
+    ).first()
+    if quest is not None and initial_goal_revision_ref(quest) == revision_ref:
+        return initial_goal_binding(quest)
     return None
 
 
@@ -475,6 +477,31 @@ class QuestGoalOwnerMixin:
                 "effect_id": effect_id,
             }
         )[:64]
+        preverified_assets: dict[str, tuple[object | None, OwnerConflict | None]] = {}
+        if not reconcile:
+            memory = getattr(self, "_quest_goal_research_memory", None)
+            if memory is not None:
+                version_refs = {
+                    asset["version_ref"]
+                    for item in decision.arrangements
+                    if item.kind == "stop" and item.retention.get("kind") == "selected"
+                    for asset in item.retention["assets"]
+                }
+                for version_ref in version_refs:
+                    accepted = memory.query_asset_version(version_ref)
+                    verify_error: OwnerConflict | None = None
+                    if accepted is not None:
+                        try:
+                            verifier = getattr(memory, "verify_managed_asset_content", None)
+                            if callable(verifier):
+                                verifier(version_ref)
+                            else:
+                                content = memory.read_asset_entry_text(version_ref)
+                                if hashlib.sha256(content.encode("utf-8")).hexdigest() != accepted.content_hash:
+                                    verify_error = OwnerConflict("goal_retained_asset_invalid")
+                        except OwnerConflict as error:
+                            verify_error = error
+                    preverified_assets[version_ref] = (accepted, verify_error)
         with self._database.fenced_write() as connection:
             replay = _goal_effect_replay(connection, effect_key, command)
             if replay is not None:
@@ -543,6 +570,7 @@ class QuestGoalOwnerMixin:
                 connection,
                 quest_ref=quest_ref,
                 decisions=tuple(decisions.values()),
+                preverified_assets=preverified_assets,
             )
             sequence = int(head.current_sequence) + 1
             decision_document = decision.as_dict()
@@ -1154,7 +1182,12 @@ class QuestGoalOwnerMixin:
         return tuple(result)
 
     def _verify_goal_retention_in_transaction(
-        self, connection, *, quest_ref: str, decisions
+        self,
+        connection,
+        *,
+        quest_ref: str,
+        decisions: tuple[WorkDecision, ...],
+        preverified_assets: dict[str, tuple[object | None, OwnerConflict | None]] | None = None,
     ) -> None:
         for item in decisions:
             if item.kind != "stop":
@@ -1172,15 +1205,18 @@ class QuestGoalOwnerMixin:
             target_run_agent = getattr(self, "_quest_goal_target_run_agent", None)
             if memory is None or target_run_agent is None:
                 raise OwnerConflict("goal_retention_verifier_unavailable")
-            locations = target_run_agent.read_target_workspace_locations(
-                item.work.run_ref
-            )
-            if not any(
-                workspace.workspace_ref == item.work.workspace_ref
-                and workspace.target_ref == item.work.target_ref
-                and workspace.target_run_ref == item.work.run_ref
-                for workspace, _path in locations
-            ):
+            workspace_row = connection.execute(
+                text(
+                    "SELECT 1 FROM ar_target_run_workspaces WHERE workspace_ref = :workspace_ref "
+                    "AND target_ref = :target_ref AND target_run_ref = :target_run_ref LIMIT 1"
+                ),
+                {
+                    "workspace_ref": item.work.workspace_ref,
+                    "target_ref": item.work.target_ref,
+                    "target_run_ref": item.work.run_ref,
+                },
+            ).first()
+            if workspace_row is None:
                 raise OwnerConflict("goal_retention_workspace_invalid")
             for asset in retention["assets"]:
                 row = connection.execute(
@@ -1206,18 +1242,38 @@ class QuestGoalOwnerMixin:
                 ):
                     raise OwnerConflict("goal_retained_asset_invalid")
                 provenance = decoded_object(row.provenance_json)
-                if (
-                    canonical_hash(provenance) != row.provenance_hash
-                    or provenance.get("schema_ref")
-                    != "meta-research/target-workspace-note/v1"
-                    or provenance.get("target_ref") != item.work.target_ref
-                    or provenance.get("target_run_ref") != item.work.run_ref
-                    or provenance.get("workspace_ref") != item.work.workspace_ref
-                    or provenance.get("source_content_hash") != row.content_hash
-                    or provenance.get("producer_kind") != "target_workspace"
-                ):
+                if canonical_hash(provenance) != row.provenance_hash:
                     raise OwnerConflict("goal_retained_asset_producer_invalid")
-                accepted = memory.query_asset_version(asset["version_ref"])
+                if (
+                    provenance.get("schema_ref") == "meta-research/target-workspace-note/v1"
+                    or provenance.get("producer_kind") == "target_workspace"
+                ):
+                    if (
+                        provenance.get("schema_ref") != "meta-research/target-workspace-note/v1"
+                        or provenance.get("target_ref") != item.work.target_ref
+                        or provenance.get("target_run_ref") != item.work.run_ref
+                        or provenance.get("workspace_ref") != item.work.workspace_ref
+                        or provenance.get("source_content_hash") != row.content_hash
+                        or provenance.get("producer_kind") != "target_workspace"
+                    ):
+                        raise OwnerConflict("goal_retained_asset_producer_invalid")
+                elif provenance.get("kind") == "workspace_selection":
+                    source = provenance.get("source")
+                    source_work = provenance.get("source_work")
+                    if (
+                        not isinstance(source, dict)
+                        or not isinstance(source_work, dict)
+                        or source.get("workspace_ref") != item.work.workspace_ref
+                        or source_work.get("workspace_ref") != item.work.workspace_ref
+                        or source_work.get("target_ref") != item.work.target_ref
+                        or source_work.get("work_ref") != item.work.run_ref
+                    ):
+                        raise OwnerConflict("goal_retained_asset_producer_invalid")
+                if preverified_assets is not None and asset["version_ref"] in preverified_assets:
+                    accepted, verify_error = preverified_assets[asset["version_ref"]]
+                else:
+                    accepted = memory.query_asset_version(asset["version_ref"])
+                    verify_error = None
                 if (
                     accepted is None
                     or accepted.asset_ref != asset["asset_ref"]
@@ -1225,12 +1281,8 @@ class QuestGoalOwnerMixin:
                     or accepted.manifest_hash != asset["manifest_hash"]
                     or accepted.receipt.as_public_dict() != asset["receipt"]
                     or "managed" not in accepted.custody_modes
+                    or verify_error is not None
                 ):
-                    raise OwnerConflict("goal_retained_asset_invalid")
-                content = memory.read_asset_entry_text(asset["version_ref"])
-                if hashlib.sha256(content.encode("utf-8")).hexdigest() != asset[
-                    "content_hash"
-                ]:
                     raise OwnerConflict("goal_retained_asset_invalid")
 
     def _quest_goal_work_intent_view(self, connection, row) -> dict[str, object]:

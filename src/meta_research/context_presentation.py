@@ -279,6 +279,19 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                       if k not in scientific_inputs
                       and not (isinstance(v, dict) and v.get("omitted_from_preview"))]
         if not candidates:
+            if view.get("current_handoff_notes"):
+                view["current_handoff_notes"] = [
+                    {
+                        **{k: v for k, v in item.items() if k != "preview"},
+                        "omitted_from_preview": True,
+                    }
+                    for item in view["current_handoff_notes"]
+                ]
+                view["section_delivery"]["current_handoff_notes"] = "omitted"
+                if optional_view_bytes() <= CONTEXT_VIEW_MAX_BYTES:
+                    break
+                view.pop("current_handoff_notes", None)
+                continue
             raise ValueError("context_presentation_identity_too_large")
         _, key = max(candidates)
         sections[key] = {"omitted_from_preview": True, "reader": reader([key])}
@@ -442,7 +455,9 @@ def reasoning_handoff_reference(binding: dict) -> dict[str, object]:
 
 def stage_position_prompt(request, stage: str) -> str:
     """Render only the immutable position bound to this exact request."""
-    from meta_research.cycle_position import validate_cycle_position
-    position = request.context_pack.get("cycle_position")
-    validate_cycle_position(position, cycle_ref=request.context_pack["cycle_ref"])
-    return "cycle_position=" + _json({**position, "stage": stage}) + "\n"
+    from meta_research.cycle_position import format_cycle_position_line
+    return format_cycle_position_line(
+        request.context_pack.get("cycle_position"),
+        stage=stage,
+        cycle_ref=request.context_pack["cycle_ref"],
+    )

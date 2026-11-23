@@ -752,7 +752,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             row = connection.execute(text(
                 "SELECT entries_json FROM rm_target_root_completion_manifests "
                 "WHERE target_ref=:target_ref AND completion_ref != :completion_ref "
-                "ORDER BY accepted_at DESC, manifest_ref DESC LIMIT 1"),
+                "ORDER BY accepted_at DESC, rowid DESC LIMIT 1"),
                 {"target_ref": completion.handle.target_ref,
                  "completion_ref": completion.completion_ref}).first()
         if row is None:
@@ -1290,26 +1290,76 @@ class TargetRunFinalizer:
                 # after that receipt can replay the identical inline and streamed snapshot.
                 frozen = _persist_frozen_sources(frozen,
                     completion or _CompletionCustody(handle, evidence_content_hash), pinned_workspace.path.parent)
-                completion = self._lifecycle.accept_completion(
-                    handle=handle,
-                    handoff=handoff,
-                    harness_operation_ref=evidence.operation_ref,
-                    evidence_ref=evidence.evidence_ref,
-                    evidence_content_hash=evidence_content_hash,
-                    workspace_ref=frozen.workspace_ref,
-                    implementation_revision_ref=frozen.implementation_revision_ref,
-                    implementation_tree_hash=frozen.implementation_tree_hash,
-                    result_document_hash=frozen.result_document_hash,
-                    artifact_snapshot_hash=frozen.artifact_snapshot_hash,
-                    idempotency_key="target-root-completion:"
-                    + canonical_hash(
-                        {
-                            "target_ref": handle.target_ref,
-                            "target_run_ref": handle.target_run_ref,
-                            "evidence_content_hash": evidence_content_hash,
-                        }
-                    ),
-                )
+                try:
+                    completion = self._lifecycle.accept_completion(
+                        handle=handle,
+                        handoff=handoff,
+                        harness_operation_ref=evidence.operation_ref,
+                        evidence_ref=evidence.evidence_ref,
+                        evidence_content_hash=evidence_content_hash,
+                        workspace_ref=frozen.workspace_ref,
+                        implementation_revision_ref=frozen.implementation_revision_ref,
+                        implementation_tree_hash=frozen.implementation_tree_hash,
+                        result_document_hash=frozen.result_document_hash,
+                        artifact_snapshot_hash=frozen.artifact_snapshot_hash,
+                        idempotency_key="target-root-completion:"
+                        + canonical_hash(
+                            {
+                                "target_ref": handle.target_ref,
+                                "target_run_ref": handle.target_run_ref,
+                                "evidence_content_hash": evidence_content_hash,
+                            }
+                        ),
+                    )
+                except OwnerConflict as error:
+                    details = error.details if isinstance(error.details, dict) else {}
+                    if (
+                        completion is not None
+                        or error.code != "target_root_completion_successor_unchanged"
+                        or details.get("reason") != "artifact_snapshot_unchanged"
+                    ):
+                        raise
+                    _remove_frozen_source_root(
+                        _frozen_sources_root(
+                            pinned_workspace.path.parent,
+                            _CompletionCustody(handle, evidence_content_hash),
+                        )
+                    )
+                    unchanged_feedback = (
+                        "Successor turn submitted the exact same workspace files and outputs/result.json "
+                        "as an already-rejected completion snapshot without fixing the prior rejection. "
+                        "Apply the requested correction (to outputs/result.json, research notes, or retained artifacts) "
+                        "before finishing another normal turn in this Root."
+                    )
+                    completion = self._lifecycle.accept_completion(
+                        handle=handle,
+                        handoff=handoff,
+                        harness_operation_ref=evidence.operation_ref,
+                        evidence_ref=evidence.evidence_ref,
+                        evidence_content_hash=evidence_content_hash,
+                        workspace_ref=workspace_ref,
+                        implementation_revision_ref=None,
+                        implementation_tree_hash=None,
+                        result_document_hash=None,
+                        artifact_snapshot_hash=None,
+                        candidate_rejection_code="target_root_completion_successor_unchanged",
+                        candidate_rejection_feedback=unchanged_feedback,
+                        idempotency_key="target-root-completion:"
+                        + canonical_hash(
+                            {
+                                "target_ref": handle.target_ref,
+                                "target_run_ref": handle.target_run_ref,
+                                "evidence_content_hash": evidence_content_hash,
+                            }
+                        ),
+                    )
+                    owner_rejection = self._memory.issue_candidate_rejection(completion)
+                    rejection = self._record_rejection(
+                        completion=completion,
+                        manifest_ref=None,
+                        rejection=owner_rejection,
+                    )
+                    return self._revision_result(rejection)
                 memory_result = None
                 try:
                     memory_result = self._memory.accept(
@@ -2139,7 +2189,7 @@ def _freeze_artifact(
                 return _freeze_streamed_artifact(descriptor, info, ordinal, role,
                                                 relative_path, staging_directory)
             content = _read_stable_regular_file(descriptor, info, result_document=role == "result",
-                relative_path=relative_path)
+                relative_path=relative_path, candidate_issue=True)
             content_hash = hashlib.sha256(content).hexdigest()
             return _FrozenArtifact(
                 ordinal=ordinal,
@@ -2435,6 +2485,8 @@ def _open_workspace_artifact(
                 missing_code="target_root_artifact_missing",
                 symlink_code="target_root_artifact_symlink_forbidden",
                 invalid_code="target_root_artifact_type_unsupported",
+                candidate_issue=True,
+                relative_path=relative_path,
             )
             os.close(descriptor)
             descriptor = next_descriptor
@@ -2455,6 +2507,8 @@ def _open_directory_component(
     missing_code: str,
     symlink_code: str,
     invalid_code: str,
+    candidate_issue: bool = False,
+    relative_path: str = "$artifact",
 ) -> int:
     try:
         descriptor = os.open(
@@ -2463,6 +2517,11 @@ def _open_directory_component(
             dir_fd=parent_descriptor,
         )
     except FileNotFoundError as error:
+        if candidate_issue:
+            raise DeclaredCandidateIssue(
+                missing_code, "$artifact", relative_path,
+                f"intermediate directory {name!r} is missing",
+            ) from error
         raise OwnerConflict(missing_code) from error
     except OSError as error:
         _raise_open_component_error(
@@ -2472,6 +2531,8 @@ def _open_directory_component(
             missing_code=missing_code,
             symlink_code=symlink_code,
             invalid_code=invalid_code,
+            candidate_issue=candidate_issue,
+            relative_path=relative_path,
         )
     try:
         opened = os.fstat(descriptor)
@@ -2480,6 +2541,11 @@ def _open_directory_component(
         raise OwnerConflict("target_root_artifact_unavailable") from error
     if not stat.S_ISDIR(opened.st_mode):
         os.close(descriptor)
+        if candidate_issue:
+            raise DeclaredCandidateIssue(
+                invalid_code, "$artifact", relative_path,
+                f"intermediate component {name!r} is not a directory",
+            )
         raise OwnerConflict(invalid_code)
     return descriptor
 
@@ -2542,29 +2608,51 @@ def _raise_open_component_error(
     missing_code: str,
     symlink_code: str,
     invalid_code: str,
+    candidate_issue: bool = False,
+    relative_path: str = "$artifact",
 ) -> None:
+    def _raise_candidate_or_conflict(code: str, detail: str) -> None:
+        if candidate_issue:
+            raise DeclaredCandidateIssue(code, "$artifact", relative_path, detail) from error
+        raise OwnerConflict(code) from error
+
     try:
         current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except FileNotFoundError as missing:
+        if candidate_issue:
+            raise DeclaredCandidateIssue(
+                missing_code, "$artifact", relative_path,
+                f"intermediate directory {name!r} is missing",
+            ) from missing
         raise OwnerConflict(missing_code) from missing
     except OSError as unavailable:
         raise OwnerConflict("target_root_artifact_unavailable") from unavailable
     if stat.S_ISLNK(current.st_mode):
-        raise OwnerConflict(symlink_code) from error
+        _raise_candidate_or_conflict(symlink_code, f"intermediate directory {name!r} is a symlink")
     if not stat.S_ISDIR(current.st_mode):
-        raise OwnerConflict(invalid_code) from error
+        _raise_candidate_or_conflict(invalid_code, f"intermediate component {name!r} is not a directory")
     raise OwnerConflict("target_root_artifact_unavailable") from error
 
 
 def _read_stable_regular_file(
     descriptor: int, before: os.stat_result, *, result_document: bool = False,
-    relative_path: str = '$artifact',
+    relative_path: str = '$artifact', candidate_issue: bool = False,
 ) -> bytes:
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        if candidate_issue:
+            raise DeclaredCandidateIssue(
+                "target_root_artifact_type_unsupported", "$artifact", relative_path,
+                "expected an unshared regular file (st_nlink == 1, no hardlinks or special files)",
+            )
         raise OwnerConflict("target_root_artifact_type_unsupported")
     if result_document and before.st_size > TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES:
         raise _result_capacity_issue('$.result_document', before.st_size, 'raw UTF-8 bytes')
     if before.st_size > MAX_ASSET_BYTES:
+        if candidate_issue:
+            raise DeclaredCandidateIssue(
+                "target_root_artifact_too_large", "$artifact", relative_path,
+                f"file size {before.st_size} exceeds limit {MAX_ASSET_BYTES}",
+            )
         raise OwnerConflict("target_root_artifact_too_large")
     try:
         chunks: list[bytes] = []
@@ -2638,7 +2726,7 @@ def _read_result_draft_bytes(root_descriptor: int) -> bytes:
             raise DeclaredCandidateIssue("target_root_result_document_invalid",
                 "$.result_document_path", path, "expected a regular JSON file")
         return _read_stable_regular_file(descriptor, info, result_document=True,
-                                         relative_path=path)
+                                         relative_path=path, candidate_issue=True)
     finally:
         os.close(descriptor)
 
@@ -2723,24 +2811,30 @@ def _parse_result_document_value(value: object) -> tuple[TargetRootResultDocumen
     except DeclaredCandidateIssue as error:
         issues.append(error)
     schema_ref = value.get("schema_ref")
+    if isinstance(schema_ref, str):
+        schema_ref = schema_ref.strip()
     metrics = value.get("metrics")
     disposition = value.get("result_disposition")
+    if isinstance(disposition, str):
+        disposition = disposition.strip()
     from meta_research.formal_entities import _declared_work
     explicit_work = False
+    formal_runs_had_error = False
     if value.get('formal_runs') is not None or isinstance(metrics, dict):
         try:
             _declared_work(value)
             explicit_work = isinstance(value.get('formal_runs'), list) and bool(value['formal_runs'])
         except OwnerConflict as error:
+            formal_runs_had_error = True
             issues.append(DeclaredCandidateIssue(error.code, '$.formal_runs', 'formal work declaration',
                 getattr(error, 'feedback', error.code)))
     for name, item in (('schema_ref', schema_ref), ('result_disposition', disposition)):
-        if item is not None and (type(item) is not str or not item or item != item.strip()
+        if item is not None and (type(item) is not str or not item
                 or _target_root_utf8_size(item, invalid_code='target_root_result_document_invalid') > 256):
             issues.append(DeclaredCandidateIssue('target_root_result_document_invalid', '$.' + name, item,
-                'expected a nonempty trimmed string of at most 256 UTF-8 bytes, or omission'))
+                'expected a nonempty string of at most 256 UTF-8 bytes, or omission'))
     if (('metrics' in value and type(metrics) is not dict)
-            or (not metrics and not explicit_work)):
+            or (not metrics and not explicit_work and not formal_runs_had_error)):
         issues.append(DeclaredCandidateIssue('target_root_result_document_invalid', '$.metrics', metrics,
             'expected a nonempty summary metric object unless valid explicit formal_runs provide the actual work; '
             'executed evaluations retain their ProtocolVersion metric requirements'))

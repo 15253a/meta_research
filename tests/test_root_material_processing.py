@@ -42,9 +42,17 @@ def test_original_request_root_records_actual_read_and_declared_influence_withou
             reference = _reply(client, runtime, source, opened)
             received = client.get(f"/api/v1/work-materials/{reference}").json()
             assert received["read_state"] == "not_read"
-            rejected = _call(runtime, channel, "research_workspace.materials.feedback",
-                **_feedback(reference, disposition="adopted"))
-            assert rejected.get("isError") and "material_root_read_required" in str(rejected)
+            tmp_backup = tmp_path / "reported-backup.txt"
+            source.rename(tmp_backup)
+            try:
+                rejected = _call(runtime, channel, "research_workspace.materials.feedback",
+                    **_feedback(reference, effect_id="adopt-missing", disposition="adopted"))
+                assert rejected.get("isError") and "material_root_read_required" in str(rejected)
+            finally:
+                tmp_backup.rename(source)
+            adopted_native = _accepted(_call(runtime, channel, "research_workspace.materials.feedback",
+                **_feedback(reference, effect_id="adopt-native-available", disposition="adopted")))
+            assert adopted_native["disposition"] == "adopted"
             page = _accepted(_call(runtime, channel, "research_workspace.materials.discover", reference_ref=reference))
             entry = page["entries"][0]
             read = _accepted(_call(runtime, channel, "research_workspace.materials.read", reference_ref=reference,
@@ -56,7 +64,7 @@ def test_original_request_root_records_actual_read_and_declared_influence_withou
                 effect_id="process-observation")) == treated
             public = client.get(f"/api/v1/work-materials/{reference}").json()
             assert public["read_ranges"][0]["actor"] == context.run_ref
-            assert public["treatments"] == [treated]
+            assert public["treatments"] == [adopted_native, treated]
             assert treated["processed_by"]["run_ref"] == context.run_ref
             assert treated["receiver"]["request_ref"] == opened["request_ref"]
             assert treated["declared_by_root"] is True
@@ -252,7 +260,10 @@ def test_receiving_research_root_chooses_custody_and_successor_reads_retained_us
         successor = _external_context(_scope(runtime, quest_ref=observed["quest"], run_ref="later-root", root_ref="later-session"))
         channel = _channel(runtime, successor)
         discovered = _accepted(_call(runtime, channel, "research_workspace.materials.discover"))
-        assert observed["reference"] not in [item["reference_ref"] for item in discovered["references"]]
+        if source_kind == "acquired":
+            assert observed["reference"] not in [item["reference_ref"] for item in discovered["references"]]
+        else:
+            assert observed["reference"] in [item["reference_ref"] for item in discovered["references"]]
         retained = [item for item in discovered["retained_treatments"] if item["reference_ref"] == observed["reference"]]
         assert len(retained) == (0 if choice == "neither" else 1)
         for selected in observed["treatment"]["selections"]:

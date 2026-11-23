@@ -1141,7 +1141,13 @@ class SQLiteTargetRootLifecycleAuthority:
                         "WHERE artifact_snapshot_hash = :snapshot LIMIT 1"
                     ), {"snapshot": artifact_snapshot_hash}).first()
                     if prior_snapshot is not None:
-                        raise OwnerConflict("target_root_completion_successor_unchanged")
+                        raise OwnerConflict(
+                            "target_root_completion_successor_unchanged",
+                            {
+                                "reason": "artifact_snapshot_unchanged",
+                                "artifact_snapshot_hash": artifact_snapshot_hash,
+                            },
+                        )
                     payload = {
                         "generation": generation,
                         "predecessor_completion_ref": predecessor_completion_ref,
@@ -2408,6 +2414,32 @@ class SQLiteTargetRootLifecycleAuthority:
         if rejected is None or rejected.rejection_ref != rejection_ref:
             raise OwnerConflict("target_root_completion_rejection_integrity_invalid")
         return rejected
+
+    def query_consecutive_candidate_rejections(
+        self, *, target_ref: str, target_run_ref: str,
+    ) -> tuple[int, float | None]:
+        """Count trailing candidate-rejected completions for this Target run."""
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT c.accepted_at, "
+                    "EXISTS (SELECT 1 FROM ar_target_root_completion_rejections r "
+                    "WHERE r.completion_ref = c.completion_ref) AS is_rejected "
+                    "FROM ar_target_root_completions c "
+                    "WHERE c.target_ref = :target_ref AND c.target_run_ref = :target_run_ref "
+                    "ORDER BY c.generation DESC"
+                ),
+                {"target_ref": target_ref, "target_run_ref": target_run_ref},
+            ).all()
+        count = 0
+        latest_at: float | None = None
+        for row in rows:
+            if not row.is_rejected:
+                break
+            count += 1
+            if latest_at is None and row.accepted_at is not None:
+                latest_at = float(row.accepted_at)
+        return count, latest_at
 
     def query_completion_rejection(
         self, completion_ref: str

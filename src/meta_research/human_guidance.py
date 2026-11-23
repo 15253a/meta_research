@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from typing import Literal
 
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json, decoded_object
@@ -159,12 +160,31 @@ def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True,
                 "constraint_ref": event["constraint_ref"], "revision": event["revision"],
                 "delivery_ref": item.delivery_ref,
             })
-    if (include_direction or include_body or not resident) and cut.direction_cut is not None:
-        direction = "current_goal_and_conditions=" + canonical_json({
-            "goal": cut.direction_cut["goal"], "conditions": cut.direction_cut["conditions"],
-        })
-        if not any(direction in prompt.splitlines() for prompt in previous_prompts):
-            rendered += "\n" + direction
+    if cut.direction_cut is not None:
+        prior_directions = [
+            line
+            for prompt in previous_prompts
+            for line in prompt.splitlines()
+            if line.startswith("current_goal_and_conditions=")
+        ]
+        goal_evolved = False
+        if prior_directions:
+            try:
+                last_payload = json.loads(
+                    prior_directions[-1].removeprefix("current_goal_and_conditions=")
+                )
+                goal_evolved = (
+                    isinstance(last_payload, dict)
+                    and last_payload.get("goal") != cut.direction_cut.get("goal")
+                )
+            except ValueError:
+                goal_evolved = False
+        if include_direction or include_body or not resident or goal_evolved:
+            direction = "current_goal_and_conditions=" + canonical_json({
+                "goal": cut.direction_cut["goal"], "conditions": cut.direction_cut["conditions"],
+            })
+            if direction not in prior_directions:
+                rendered += "\n" + direction
     return rendered
 
 

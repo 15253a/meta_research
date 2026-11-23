@@ -2778,6 +2778,55 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             launch_bindings,
         )
         now = time.time()
+        launch_goal_revision_ref = None
+        if (
+            connection.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='rg_quest_goal_heads'"
+                )
+            ).first()
+            is not None
+        ):
+            launch_goal_revision_ref = connection.execute(
+                text(
+                    "SELECT current_revision_ref FROM rg_quest_goal_heads "
+                    "WHERE quest_ref = :quest_ref"
+                ),
+                {"quest_ref": verification.quest_ref},
+            ).scalar_one_or_none()
+        if (
+            launch_goal_revision_ref is None
+            and connection.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='rg_quests'"
+                )
+            ).first()
+            is not None
+        ):
+            rg_quest_cols = {
+                str(r[1])
+                for r in connection.execute(
+                    text("PRAGMA table_info(rg_quests)")
+                ).all()
+            }
+            if "initial_goal_revision_ref" in rg_quest_cols:
+                launch_goal_revision_ref = connection.execute(
+                    text(
+                        "SELECT initial_goal_revision_ref FROM rg_quests "
+                        "WHERE quest_ref = :quest_ref"
+                    ),
+                    {"quest_ref": verification.quest_ref},
+                ).scalar_one_or_none()
+        launch_cols = {
+            str(r[1])
+            for r in connection.execute(
+                text("PRAGMA table_info(ar_target_launches)")
+            ).all()
+        }
+        launch_goal_col = "goal_revision_ref, " if "goal_revision_ref" in launch_cols else ""
+        launch_goal_param = ":goal_revision_ref, " if "goal_revision_ref" in launch_cols else ""
         connection.execute(
             text(
                 "INSERT INTO ar_target_launches (launch_ref, operation_ref, "
@@ -2799,7 +2848,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "dispatch_receipt_ref, dispatch_receipt_hash, "
                 "human_request_ref, human_waiter_ref, "
                 "human_waiter_generation, human_authorization_receipt_ref, "
-                "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                f"{launch_goal_col}idempotency_key, request_hash, "
+                "receipt_ref, receipt_hash, "
                 "admitted_at) VALUES (:launch_ref, :operation_ref, "
                 ":target_ref, :graph_ref, :stage_request_ref, :quest_ref, "
                 ":target_spec_content_hash_ref, :target_spec_receipt_ref, "
@@ -2815,8 +2865,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 ":dispatch_decision_ref, :dispatch_receipt_ref, "
                 ":dispatch_receipt_hash, :human_request_ref, "
                 ":human_waiter_ref, :human_waiter_generation, "
-                ":human_authorization_receipt_ref, :idempotency_key, "
-                ":request_hash, :receipt_ref, :receipt_hash, :admitted_at)"
+                f":human_authorization_receipt_ref, {launch_goal_param}"
+                ":idempotency_key, :request_hash, :receipt_ref, :receipt_hash, "
+                ":admitted_at)"
             ),
             {
                 **launch_bindings,
@@ -2833,6 +2884,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "accepted_input_asset_proofs_json": (
                     accepted_input_asset_proofs_json
                 ),
+                **({"goal_revision_ref": launch_goal_revision_ref} if "goal_revision_ref" in launch_cols else {}),
                 "idempotency_key": idempotency_key,
                 "request_hash": request_hash,
                 "receipt_ref": receipt_ref,
@@ -8350,6 +8402,50 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     )
             else:
                 _assert_provider_derivation_not_quiescing(connection, run_ref)
+                if unit_kind.endswith("_primary"):
+                    from meta_research.rejection_backoff import evaluate_rejection_backoff
+
+                    attempt_rows = connection.execute(
+                        text(
+                            "SELECT attempt_ref, status, closed_at FROM ar_stage_attempts "
+                            "WHERE run_ref = :run_ref ORDER BY generation DESC"
+                        ),
+                        {"run_ref": run_ref},
+                    ).all()
+                    consecutive_rejections = 0
+                    anchor_at: float | None = None
+                    for row in attempt_rows:
+                        if row.attempt_ref == attempt_ref:
+                            continue
+                        if row.status != "rejected":
+                            break
+                        consecutive_rejections += 1
+                        if anchor_at is None and row.closed_at is not None:
+                            anchor_at = float(row.closed_at)
+                    decision, next_retry_at = evaluate_rejection_backoff(
+                        consecutive_rejections=consecutive_rejections,
+                        anchor_at=now if anchor_at is None else anchor_at,
+                        now=now,
+                    )
+                    if decision == "limit_reached":
+                        raise OwnerConflict(
+                            "stage_rejection_limit_reached",
+                            {
+                                "run_ref": run_ref,
+                                "attempt_ref": attempt_ref,
+                                "consecutive_rejections": consecutive_rejections,
+                            },
+                        )
+                    if decision == "backoff_pending":
+                        raise OwnerConflict(
+                            "stage_rejection_backoff_pending",
+                            {
+                                "run_ref": run_ref,
+                                "attempt_ref": attempt_ref,
+                                "consecutive_rejections": consecutive_rejections,
+                                "next_retry_at": next_retry_at,
+                            },
+                        )
                 active = connection.execute(
                     text(
                         "SELECT unit_ref FROM ar_provider_units WHERE run_ref = "

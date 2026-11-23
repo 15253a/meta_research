@@ -85,6 +85,12 @@ def _audit_identity(facts: Mapping[str, Any]) -> str:
     return "error:" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
 
 
+def _is_business_unauthorized_code(code: str) -> bool:
+    return code.endswith("_unauthorized") and not code.endswith(
+        "_runtime_binding_unauthorized"
+    )
+
+
 def _is_unauthorized_capability_reason(reason: object) -> bool:
     return isinstance(reason, str) and (
         reason == "root_kind_not_owner" or reason.endswith("_unauthorized")
@@ -102,6 +108,8 @@ def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
             return RecoveryOwner.OPERATOR
         if _is_unauthorized_capability_reason(reason):
             return RecoveryOwner.AGENT
+    if _is_business_unauthorized_code(code):
+        return RecoveryOwner.AGENT
     if any(token in code for token in ("audit", "persistence", "invariant", "corrupt", "readback")):
         return RecoveryOwner.OPERATOR
     if any(token in code for token in ("schema", "input", "target_", "context", "authorization", "permission", "scope")):
@@ -116,6 +124,8 @@ def _status_for(code: str, details: Mapping[str, Any], *, effect: bool) -> Effec
         return EffectStatus.REJECTED
     if "fence_stale" in code or code in {"attempt_fence_stale", "stale_fence"}:
         return EffectStatus.STALE
+    if _is_business_unauthorized_code(code):
+        return EffectStatus.REJECTED
     raw = details.get("effect_status")
     legacy_statuses = {
         "not_applied": EffectStatus.NOT_STARTED,
@@ -323,6 +333,13 @@ def error_contract_from_legacy(
         correction = (
             "This operation is not owned by the current root session and did not run. "
             "Do not retry or reconcile it here; switch to an owning root operation or hand off to an owning root."
+        )
+    if _is_business_unauthorized_code(code) and (
+        correction is None or "reconcile" in correction.lower()
+    ):
+        correction = (
+            "This operation is not authorized for the current root or phase and did not start an effect. "
+            "Stop calling it from this root or hand off to an authorized root."
         )
     if status is EffectStatus.NOT_STARTED and agent and (
         correction is None or "unknown" in correction.lower()

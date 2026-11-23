@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from meta_research.asset_lifecycle_operations import _TARGET_NOTE_PATHS
 from meta_research.owners.common import OwnerConflict
 from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.server_materials import relative_parts
@@ -113,7 +114,7 @@ def resolve_intake_source(human, context, selector):
         if location is None:
             raise OwnerConflict("workspace_not_visible")
         # Target notes retain their dedicated, validated producer contract.
-        if location.root_kind == "target":
+        if location.root_kind == "target" and "/".join(parts) in _TARGET_NOTE_PATHS:
             raise OwnerConflict("target_note_selector_required")
         locator = str(location.directory.joinpath(*parts))
         provenance = {"kind": "workspace_selection", "source": dict(selector),

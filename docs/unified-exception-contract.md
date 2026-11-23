@@ -90,7 +90,7 @@ stateDiagram-v2
 | 系统自动恢复 | response loss、短暂 dependency failure、timeout、restart、native resume、RM/RG pending | System | 保留 unknown 或 waiting，使用同一 effect reconcile，禁止盲重试 |
 | 系统缺陷或运维 | old fence 被接受、状态机损坏、持久化读回失败、审计缺失、recovery proof 不足 | Operator | 不反馈 StageAgent，保留 operator_required 和 audit/correlation |
 
-权限错误按边界处理。未持有 MCP grant 的请求是 `rejected` 并要求 Operator。已经进入 operation 但被业务授权拒绝的请求保留 legacy code，并由 contract 判断 Agent 或 System 路由。
+权限错误按边界处理。未持有 MCP grant 的请求是 `rejected` 并要求 Operator。已经进入 operation 但被业务授权拒绝的请求（如业务级 `*_unauthorized`）保留 legacy code 并固定路由为 `recovery_owner="agent"`、`effect_status="rejected"`、`retry_allowed=false`，直接反馈给 StageAgent 而非按 `unknown` 要求 reconcile；涉及运行时绑定/安全的 `*_runtime_binding_unauthorized` 则继续保留系统侧路由。此外，只读 operation（`effect=false`）在参数校验和 handler 阶段失败时均跳过 `ErrorAuditStore` 写锁持久化（`audit_ref=null`、`audit_status="skipped_read_only"`），仅对 effect 写入及变更边界保留审计落盘，避免只读报错争抢 SQLite 写锁。
 
 ## Bundle 到 Target 再回到 Bundle 的实施计划
 

@@ -6,6 +6,21 @@ class TargetContentIssue(OwnerConflict):
     """A declaration error; host custody, evidence and receipt failures never use this type."""
 
 
+def target_content_issue(
+    code: str,
+    feedback: str | None = None,
+    *,
+    verify_only: bool = False,
+) -> OwnerConflict:
+    """Return TargetContentIssue on live writes, or plain OwnerConflict during verify_only."""
+    if verify_only:
+        return OwnerConflict(code)
+    conflict = TargetContentIssue(code)
+    if feedback:
+        conflict.feedback = feedback
+    return conflict
+
+
 def check_copied_target_identity(content: dict, field: str, expected: object, *,
                                  target_ref: str | None = None) -> None:
     """Omission inherits the accepted identity. Reject an explicit conflict."""

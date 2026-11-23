@@ -453,6 +453,11 @@ class _Utf8AssetText:
         return self._output.getvalue()
 
 
+class _ByteCounterSink:
+    def write(self, value: bytes) -> int:
+        return len(value)
+
+
 @dataclass(frozen=True)
 class AcceptedAssetCustody:
     version_ref: str
@@ -1019,6 +1024,8 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     def export_asset(self, memory_ref: str, destination: Path) -> ExportedAsset: ...
 
     def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str: ...
+
+    def verify_managed_asset_content(self, memory_ref: str) -> None: ...
 
     def export_asset_entry(self, memory_ref: str, destination: Path,
                            *, entry_path: str | None = None) -> Path: ...
@@ -1595,6 +1602,33 @@ class SQLiteResearchMemoryReceiptVerifier:
             except (OSError, OwnerConflict, UnicodeDecodeError):
                 continue
         raise OwnerConflict("asset_text_unavailable")
+
+    def verify_managed_asset_content(self, memory_ref: str) -> None:
+        """Verify managed asset bytes on disk for all entries without UTF-8 decode."""
+        _description, row, custodies, manifest = self._asset_export_source(memory_ref)
+        if "managed" not in {item.custody_mode for item in custodies}:
+            raise OwnerConflict("asset_custody_unavailable")
+        for entry in manifest["entries"]:
+            verified = False
+            for candidate in _asset_entry_sources(
+                self._object_store, row, custodies, manifest, entry
+            ):
+                sink = _ByteCounterSink()
+                try:
+                    _copy_exact_file(
+                        candidate,
+                        sink,
+                        int(entry["size"]),
+                        str(entry["sha256"]),
+                        unavailable_code="asset_custody_unavailable",
+                        mismatch_code="asset_custody_unavailable",
+                    )
+                    verified = True
+                    break
+                except (OSError, OwnerConflict):
+                    continue
+            if not verified:
+                raise OwnerConflict("asset_custody_unavailable")
 
     def export_asset_entry(self, memory_ref: str, destination: Path,
                            *, entry_path: str | None = None) -> Path:
@@ -4807,6 +4841,9 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
 
     def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str:
         return self._receipt_verifier.read_asset_entry_text(memory_ref, entry_path=entry_path)
+
+    def verify_managed_asset_content(self, memory_ref: str) -> None:
+        return self._receipt_verifier.verify_managed_asset_content(memory_ref)
 
     def export_asset_entry(self, memory_ref: str, destination: Path,
                            *, entry_path: str | None = None) -> Path:

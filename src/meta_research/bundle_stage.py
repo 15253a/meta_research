@@ -198,6 +198,17 @@ class BundleStageWorker:
         if callable(configure):
             configure(base_url)
 
+    def _live_quest_goal_revision(
+        self, request: StageRunRequest
+    ) -> dict[str, object] | None:
+        query = getattr(self._research_graph, "query_current_quest_goal_revision", None)
+        if callable(query):
+            current = query(request.accepted_question.quest_ref)
+            if isinstance(current, dict):
+                return current
+        fallback = request.context_pack.get("quest_goal_revision")
+        return fallback if isinstance(fallback, dict) else None
+
     def _recover_stopped_error(
         self, error: BundleSkillUnavailable, run_ref: str
     ) -> BundleSkillUnavailable:
@@ -619,10 +630,7 @@ class BundleStageWorker:
                     inbox_checkpoint=inbox_checkpoint.as_public_dict(),
                     cycle_position=request.context_pack["cycle_position"],
                     native_replacement_context=replacement_context,
-                    quest_goal_revision=cast(
-                        dict[str, object] | None,
-                        request.context_pack.get("quest_goal_revision"),
-                    ),
+                    quest_goal_revision=self._live_quest_goal_revision(request),
                     job_ref=batch_operation_ref,
                     provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                         run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
@@ -857,6 +865,14 @@ class BundleStageWorker:
             for target in frontier
         )
         dispatch_state = self._dispatch_state(graph, commits, run=run)
+        live_goal = self._live_quest_goal_revision(request)
+        frozen_goal_ref = request.context_pack.get("goal_revision_ref")
+        if (
+            isinstance(live_goal, dict)
+            and isinstance(live_goal.get("goal_revision_ref"), str)
+            and live_goal.get("goal_revision_ref") != frozen_goal_ref
+        ):
+            dispatch_state["goal_revision_ref"] = live_goal["goal_revision_ref"]
         inbox_checkpoint = self._drain_bundle_inbox(run)
         decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
         latest = decisions[-1] if decisions else None
@@ -955,10 +971,7 @@ class BundleStageWorker:
                 inbox_checkpoint=inbox_checkpoint.as_public_dict(),
                 cycle_position=request.context_pack["cycle_position"],
                 native_replacement_context=replacement_context,
-                quest_goal_revision=cast(
-                    dict[str, object] | None,
-                    request.context_pack.get("quest_goal_revision"),
-                ),
+                quest_goal_revision=live_goal,
                 job_ref=dispatch_operation_ref,
                 provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                     run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,

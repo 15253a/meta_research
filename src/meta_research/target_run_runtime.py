@@ -12,9 +12,11 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Protocol
 
 from meta_research.database import Database
+from meta_research.rejection_backoff import evaluate_rejection_backoff
 from meta_research.codex_runtime import DEFAULT_STAGE_MODEL
 from meta_research.runtime_conditions import selected_stage_model
 from meta_research.context_presentation import STAGE_CONTEXT_DELIVERY_GUIDANCE
@@ -540,7 +542,10 @@ class TargetRunRuntime:
             )
             return False
         if getattr(harness, "native_session_ref", None) is not None:
-            prompt = self._continuation_prompt(handle=handle)
+            prompt = self._continuation_prompt(
+                handle=handle,
+                cycle_position=self._target_cycle_position(handle.target_ref),
+            )
         else:
             prompt = self._root_prompt(
                 research_context=self._reading_research_context(handle.target_ref,
@@ -667,6 +672,35 @@ class TargetRunRuntime:
                 "target_run_mcp_endpoint_unavailable",
             )
             return False
+        query_rejections = getattr(
+            self._target_root_lifecycle, "query_consecutive_candidate_rejections", None
+        )
+        if callable(query_rejections):
+            consecutive_rejections, anchor_at = query_rejections(
+                target_ref=handle.target_ref,
+                target_run_ref=handle.target_run_ref,
+            )
+            now = time.time()
+            decision, next_retry_at = evaluate_rejection_backoff(
+                consecutive_rejections=consecutive_rejections,
+                anchor_at=now if anchor_at is None else anchor_at,
+                now=now,
+            )
+            if decision == "limit_reached":
+                self._set_status(
+                    handle.target_ref,
+                    "revision_paused",
+                    "target_rejection_limit_reached",
+                )
+                return False
+            if decision == "backoff_pending":
+                self._set_status(
+                    handle.target_ref,
+                    "revision_backoff_pending",
+                    getattr(revision, "pending_code", None),
+                    next_retry_at=next_retry_at,
+                )
+                return False
         revision_request = {
             "completion_generation": getattr(revision, "completion_generation"),
             "completion_ref": getattr(revision, "completion_ref"),
@@ -679,6 +713,7 @@ class TargetRunRuntime:
         prompt = self._continuation_prompt(
             handle=handle,
             revision_request=revision_request,
+            cycle_position=self._target_cycle_position(handle.target_ref),
         )
         try:
             self._harnesses.run_or_resume_target_root(
@@ -697,28 +732,49 @@ class TargetRunRuntime:
         self._set_status(handle.target_ref, "root_revision_turn_completed")
         return True
 
+    def _target_cycle_position(self, target_ref: str) -> dict[str, object] | None:
+        reader = getattr(self._target_graph, "query_target_research_context", None)
+        if not callable(reader):
+            return None
+        try:
+            context = reader(target_ref=target_ref)
+        except OwnerConflict:
+            return None
+        position = context.get("cycle_position") if isinstance(context, dict) else None
+        return position if isinstance(position, dict) else None
+
     @staticmethod
     def _continuation_prompt(
         *,
         handle: TargetWorkHandle,
         revision_request: dict[str, object] | None = None,
+        cycle_position: dict[str, object] | None = None,
     ) -> str:
+        prefix = ""
+        if isinstance(cycle_position, dict) and isinstance(cycle_position.get("cycle_ref"), str):
+            from meta_research.cycle_position import format_cycle_position_line
+
+            prefix = format_cycle_position_line(
+                cycle_position,
+                stage="target",
+                cycle_ref=str(cycle_position["cycle_ref"]),
+            )
         material = {
             "target_ref": handle.target_ref,
             "target_run_ref": handle.target_run_ref,
         }
         if revision_request is None:
             return (
-                "继续本 Target 尚未完成的工作。你仍可主动使用本 Session 已授权的 "
+                prefix
+                + "继续本 Target 尚未完成的工作。你仍可主动使用本 Session 已授权的 "
                 "research_graph/research_memory reader，先核对当前证据和缺口，再按原交接合同提交。\n"
-                + _TARGET_RESEARCH_READ_GUIDANCE + "\n"
                 + canonical_json(material)
             )
         return (
-            "本次交接未通过接纳。你仍可主动使用本 Session 已授权的 "
+            prefix
+            + "本次交接未通过接纳。你仍可主动使用本 Session 已授权的 "
             "research_graph/research_memory reader。针对以下反馈修正 outputs/result.json 及实际受影响的工作，"
             "保留已成立的研究、来源和产物，按原交接合同重新提交。\n"
-            + _TARGET_RESEARCH_READ_GUIDANCE + "\n"
             + canonical_json({**material, "owner_revision_request": revision_request})
         )
 
@@ -809,9 +865,12 @@ class TargetRunRuntime:
             if isinstance(research.get("quest_goal_revision"), dict)
             else "当前 Target context 未携带 Quest Goal revision。"
         )
+        from meta_research.cycle_position import format_cycle_position_line
         return (
-            "cycle_position=" + canonical_json({**position, "stage": "target"}) + "\n" +
-            STAGE_CONTEXT_DELIVERY_GUIDANCE +
+            format_cycle_position_line(
+                position, stage="target", cycle_ref=research["cycle_ref"]
+            )
+            + STAGE_CONTEXT_DELIVERY_GUIDANCE +
             target_execution_skill_text() + "\n\n"
             + _TARGET_RESEARCH_READ_GUIDANCE + "\n\n"
             "下列 research_context 与 execution_contract 携带本 Target 适用的 Owner 冻结科学正文与合同。"

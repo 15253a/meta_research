@@ -253,35 +253,39 @@ class HumanGuidanceMixin:
         if (type(offset) is not int or offset < 0 or type(limit) is not int
                 or not 1 <= limit <= GUIDANCE_DOCUMENT_MAX_BYTES):
             raise OwnerConflict("guidance_read_bounds_invalid")
-        with self._database.fenced_write() as connection:
-            cut = self._authorize_guidance(scope, binding, reconcile=reconcile)
-            if delivery_ref is None:
-                if reconcile or effect_id is not None or offset != 0:
-                    raise OwnerConflict("guidance_delivery_required", {
-                        "category": "arguments",
-                        "message": "delivery_ref is required with effect_id, offset or reconciliation.",
-                        "correction": "If previously submitted, reconcile the original arguments first. List without effect_id at offset=0, then select a delivery_ref.",
-                        "execution_stage": "before_effect_lookup", "call_execution": "not_started", "effect_status": "unknown",
-                    })
-                return {"binding": binding.as_dict(), "summary_only": True,
-                    "deliveries": [_summary(item) for item in cut.deliveries]}
-            delivery = _delivery(cut, delivery_ref)
-            guide = decoded_object(delivery.guide_json)
-            document = canonical_json(guide["guidance"]).encode("utf-8")
-            if offset >= len(document) or document[offset] & 0xC0 == 0x80:
-                raise OwnerConflict("guidance_read_bounds_invalid")
-            command = {"delivery_ref": delivery_ref, "offset": offset, "limit": limit}
-            key = _effect_key(binding, "read", effect_id)
+        cut = self._authorize_guidance(scope, binding, reconcile=reconcile)
+        if delivery_ref is None:
+            if reconcile or effect_id is not None or offset != 0:
+                raise OwnerConflict("guidance_delivery_required", {
+                    "category": "arguments",
+                    "message": "delivery_ref is required with effect_id, offset or reconciliation.",
+                    "correction": "If previously submitted, reconcile the original arguments first. List without effect_id at offset=0, then select a delivery_ref.",
+                    "execution_stage": "before_effect_lookup", "call_execution": "not_started", "effect_status": "unknown",
+                })
+            return {"binding": binding.as_dict(), "summary_only": True,
+                "deliveries": [_summary(item) for item in cut.deliveries]}
+        delivery = _delivery(cut, delivery_ref)
+        guide = decoded_object(delivery.guide_json)
+        document = canonical_json(guide["guidance"]).encode("utf-8")
+        if offset >= len(document) or document[offset] & 0xC0 == 0x80:
+            raise OwnerConflict("guidance_read_bounds_invalid")
+        command = {"delivery_ref": delivery_ref, "offset": offset, "limit": limit}
+        key = _effect_key(binding, "read", effect_id)
+        with self._database.read_snapshot() as connection:
             replay = _effect(connection, key, "read", command)
             if replay is not None:
                 return replay
             if reconcile:
                 raise OwnerConflict("guidance_effect_not_found")
-            end = min(len(document), offset + limit)
-            while end < len(document) and document[end] & 0xC0 == 0x80:
-                end -= 1
-            if end == offset:
-                raise OwnerConflict("guidance_read_bounds_invalid")
+        end = min(len(document), offset + limit)
+        while end < len(document) and document[end] & 0xC0 == 0x80:
+            end -= 1
+        if end == offset:
+            raise OwnerConflict("guidance_read_bounds_invalid")
+        with self._database.fenced_write() as connection:
+            replay = _effect(connection, key, "read", command)
+            if replay is not None:
+                return replay
             pages = connection.execute(text(
                 "SELECT start_offset,end_offset FROM hc_guidance_read_pages "
                 "WHERE delivery_ref=:delivery_ref ORDER BY start_offset"

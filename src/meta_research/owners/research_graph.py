@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from meta_research.formal_entities import insert_variant_run, insert_evaluation_attempt, insert_metric_result
-from meta_research.target_content_issue import TargetContentIssue, check_copied_target_identity
+from meta_research.target_content_issue import (
+    TargetContentIssue,
+    check_copied_target_identity,
+    target_content_issue,
+)
 
 from meta_research.context_presentation import HISTORY_LIMIT, scientific_handoff
 from meta_research.question_relations import QuestionRelationOwnerMixin
@@ -3264,6 +3268,72 @@ class SQLiteResearchGraphReceiptVerifier:
             require_complete=require_complete,
             selected_evidence_refs=selected_evidence_refs,
         )
+
+    def assert_evidence_catalog_current_in_transaction(
+        self,
+        *,
+        connection=None,
+        quest_ref: str,
+        evidence_catalog: list[dict[str, object]],
+        expected_reference_revision: int,
+        require_current: bool = True,
+        require_complete: bool = True,
+        selected_evidence_refs: frozenset[str] | None = None,
+    ) -> None:
+        if (
+            not isinstance(expected_reference_revision, int)
+            or isinstance(expected_reference_revision, bool)
+            or expected_reference_revision < 0
+            or not isinstance(evidence_catalog, list)
+            or (
+                selected_evidence_refs is not None
+                and not isinstance(selected_evidence_refs, frozenset)
+            )
+        ):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        if expected_reference_revision == 0 and not evidence_catalog and not selected_evidence_refs:
+            return
+        authority = self._target_commit_evidence_authority
+        if authority is None:
+            if (
+                expected_reference_revision != 0
+                or evidence_catalog
+                or selected_evidence_refs
+            ):
+                raise OwnerConflict("target_commit_evidence_authority_unavailable")
+            return
+        in_tx = getattr(authority, "assert_evidence_catalog_current_in_transaction", None)
+        if not callable(in_tx):
+            authority.verify_plan_evidence_catalog(
+                quest_ref=quest_ref,
+                evidence_catalog=evidence_catalog,
+                expected_reference_revision=expected_reference_revision,
+                require_current=require_current,
+                require_complete=require_complete,
+                selected_evidence_refs=selected_evidence_refs,
+            )
+            return
+        if connection is not None:
+            in_tx(
+                connection,
+                quest_ref=quest_ref,
+                evidence_catalog=evidence_catalog,
+                expected_reference_revision=expected_reference_revision,
+                require_current=require_current,
+                require_complete=require_complete,
+                selected_evidence_refs=selected_evidence_refs,
+            )
+            return
+        with self._database.read_snapshot() as snapshot_conn:
+            in_tx(
+                snapshot_conn,
+                quest_ref=quest_ref,
+                evidence_catalog=evidence_catalog,
+                expected_reference_revision=expected_reference_revision,
+                require_current=require_current,
+                require_complete=require_complete,
+                selected_evidence_refs=selected_evidence_refs,
+            )
 
     def resolve_plan_evidence_reuse_leaves(
         self,
@@ -7057,7 +7127,13 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             )
             or not valid_optional_result_disposition(result_document.result_disposition)
         ):
-            raise TargetContentIssue("target_root_commit_domain_invalid")
+            raise target_content_issue(
+                "target_root_commit_domain_invalid",
+                "outputs/result.json failed domain validation: ensure optional schema_ref matches "
+                f"{authority.measurement_contract.result_schema_ref!r}, all metric values are finite numbers or booleans, "
+                "and optional result_disposition is one of the permitted dispositions (positive, negative, inconclusive, "
+                "partial, not_reached, unexecuted).",
+            )
         _validate_target_result_schema(
             schema=authority.measurement_contract.result_schema.as_dict(),
             result_content=result_content,
@@ -7730,7 +7806,12 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 f"ON b.binding_ref=r.input_binding_ref WHERE r.{kind}_ref=:ref AND r.status IN (:status1,:status2)"),
                 {"ref": run_ref, "status1": statuses[0], "status2": statuses[1]}).first()
         if row is None:
-            raise OwnerConflict("target_formal_reused_run_invalid")
+            field_name = "variant_run_ref" if kind == "variant_run" else "evaluation_attempt_ref"
+            raise target_content_issue(
+                "target_formal_reused_run_invalid",
+                f"Declared {field_name}={run_ref!r} does not resolve to an accepted {kind} with valid status "
+                "in Research Graph. Supply an accepted ref in the same Quest or omit reuse to declare a new Run.",
+            )
         binding = _accepted_experiment_input_binding(row)
         return ExecutionInputBindingProof(binding_ref=binding.binding_ref, subject_ref=run_ref,
             input_refs=tuple(binding.inputs["input_refs"]),
@@ -9010,26 +9091,64 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 "confirmation_hash": confirmation.payload_hash,
             }
             receipt_hash = _receipt_hash(QUEST_RECEIPT_KIND, quest_ref, bindings)
-            connection.execute(
-                text(
-                    "INSERT INTO rg_quests (quest_ref, initialization_id, "
-                    "draft_revision, draft_hash, proposal_ref, proposal_hash, "
-                    "preview_ref, preview_hash, goal_json, confirmation_ref, "
-                    "confirmation_hash, receipt_ref, receipt_hash, accepted_at) "
-                    "VALUES (:quest_ref, :initialization_id, :draft_revision, "
-                    ":draft_hash, :proposal_ref, :proposal_hash, :preview_ref, "
-                    ":preview_hash, :goal_json, :confirmation_ref, "
-                    ":confirmation_hash, :receipt_ref, :receipt_hash, :accepted_at)"
-                ),
+            initial_goal_ref = "quest_goal_revision_" + canonical_hash(
                 {
-                    **bindings,
                     "quest_ref": quest_ref,
-                    "goal_json": canonical_json(draft),
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "accepted_at": time.time(),
-                },
-            )
+                    "draft_revision": draft_revision,
+                    "draft_hash": draft_hash,
+                }
+            )[:32]
+            rg_quest_cols = {
+                str(r[1])
+                for r in connection.execute(
+                    text("PRAGMA table_info(rg_quests)")
+                ).all()
+            }
+            if "initial_goal_revision_ref" in rg_quest_cols:
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_quests (quest_ref, initialization_id, "
+                        "draft_revision, draft_hash, proposal_ref, proposal_hash, "
+                        "preview_ref, preview_hash, goal_json, confirmation_ref, "
+                        "confirmation_hash, receipt_ref, receipt_hash, "
+                        "initial_goal_revision_ref, accepted_at) "
+                        "VALUES (:quest_ref, :initialization_id, :draft_revision, "
+                        ":draft_hash, :proposal_ref, :proposal_hash, :preview_ref, "
+                        ":preview_hash, :goal_json, :confirmation_ref, "
+                        ":confirmation_hash, :receipt_ref, :receipt_hash, "
+                        ":initial_goal_revision_ref, :accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "quest_ref": quest_ref,
+                        "goal_json": canonical_json(draft),
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "initial_goal_revision_ref": initial_goal_ref,
+                        "accepted_at": time.time(),
+                    },
+                )
+            else:
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_quests (quest_ref, initialization_id, "
+                        "draft_revision, draft_hash, proposal_ref, proposal_hash, "
+                        "preview_ref, preview_hash, goal_json, confirmation_ref, "
+                        "confirmation_hash, receipt_ref, receipt_hash, accepted_at) "
+                        "VALUES (:quest_ref, :initialization_id, :draft_revision, "
+                        ":draft_hash, :proposal_ref, :proposal_hash, :preview_ref, "
+                        ":preview_hash, :goal_json, :confirmation_ref, "
+                        ":confirmation_hash, :receipt_ref, :receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "quest_ref": quest_ref,
+                        "goal_json": canonical_json(draft),
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": time.time(),
+                    },
+                )
             connection.execute(
                 text(
                     "INSERT INTO rg_graph_heads (quest_ref, graph_version, "
@@ -9040,14 +9159,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
             seed_goal_head(
                 connection,
                 quest_ref=quest_ref,
-                revision_ref="quest_goal_revision_"
-                + canonical_hash(
-                    {
-                        "quest_ref": quest_ref,
-                        "draft_revision": draft_revision,
-                        "draft_hash": draft_hash,
-                    }
-                )[:32],
+                revision_ref=initial_goal_ref,
             )
             connection.execute(
                 text(
@@ -15804,30 +15916,71 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     subject_ref=graph_ref,
                     payload_hash=receipt_hash,
                 )
-                connection.execute(
-                    text(
-                        "INSERT INTO rg_target_graph_appends (append_ref, graph_ref, "
-                        "generation, predecessor_head_receipt_ref, "
-                        "predecessor_head_receipt_hash, proposal_ref, "
-                        "proposal_hash, proposal_receipt_ref, "
-                        "proposal_receipt_hash, target_refs_json, target_set_hash, "
-                        "coverage_hash, strategy_complete, receipt_ref, "
-                        "receipt_hash, accepted_at) VALUES (:append_ref, "
-                        ":graph_ref, :generation, :predecessor_head_receipt_ref, "
-                        ":predecessor_head_receipt_hash, :proposal_ref, "
-                        ":proposal_hash, :proposal_receipt_ref, "
-                        ":proposal_receipt_hash, :target_refs_json, "
-                        ":target_set_hash, :coverage_hash, :strategy_complete, "
-                        ":receipt_ref, :receipt_hash, :accepted_at)"
-                    ),
-                    {
-                        **append_bindings,
-                        "target_refs_json": canonical_json(list(target_refs)),
-                        "receipt_ref": receipt_ref,
-                        "receipt_hash": receipt_hash,
-                        "accepted_at": now,
-                    },
+                current_goal = query_goal_revision_in_transaction(
+                    connection, quest_ref=graph.quest_ref
                 )
+                append_goal_revision_ref = (
+                    None
+                    if current_goal is None
+                    else str(current_goal["goal_revision_ref"])
+                )
+                append_cols = {
+                    str(r[1])
+                    for r in connection.execute(
+                        text("PRAGMA table_info(rg_target_graph_appends)")
+                    ).all()
+                }
+                if "goal_revision_ref" in append_cols:
+                    connection.execute(
+                        text(
+                            "INSERT INTO rg_target_graph_appends (append_ref, graph_ref, "
+                            "generation, predecessor_head_receipt_ref, "
+                            "predecessor_head_receipt_hash, proposal_ref, "
+                            "proposal_hash, proposal_receipt_ref, "
+                            "proposal_receipt_hash, target_refs_json, target_set_hash, "
+                            "coverage_hash, strategy_complete, goal_revision_ref, "
+                            "receipt_ref, receipt_hash, accepted_at) VALUES (:append_ref, "
+                            ":graph_ref, :generation, :predecessor_head_receipt_ref, "
+                            ":predecessor_head_receipt_hash, :proposal_ref, "
+                            ":proposal_hash, :proposal_receipt_ref, "
+                            ":proposal_receipt_hash, :target_refs_json, "
+                            ":target_set_hash, :coverage_hash, :strategy_complete, "
+                            ":goal_revision_ref, :receipt_ref, :receipt_hash, :accepted_at)"
+                        ),
+                        {
+                            **append_bindings,
+                            "target_refs_json": canonical_json(list(target_refs)),
+                            "goal_revision_ref": append_goal_revision_ref,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "accepted_at": now,
+                        },
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            "INSERT INTO rg_target_graph_appends (append_ref, graph_ref, "
+                            "generation, predecessor_head_receipt_ref, "
+                            "predecessor_head_receipt_hash, proposal_ref, "
+                            "proposal_hash, proposal_receipt_ref, "
+                            "proposal_receipt_hash, target_refs_json, target_set_hash, "
+                            "coverage_hash, strategy_complete, "
+                            "receipt_ref, receipt_hash, accepted_at) VALUES (:append_ref, "
+                            ":graph_ref, :generation, :predecessor_head_receipt_ref, "
+                            ":predecessor_head_receipt_hash, :proposal_ref, "
+                            ":proposal_hash, :proposal_receipt_ref, "
+                            ":proposal_receipt_hash, :target_refs_json, "
+                            ":target_set_hash, :coverage_hash, :strategy_complete, "
+                            ":receipt_ref, :receipt_hash, :accepted_at)"
+                        ),
+                        {
+                            **append_bindings,
+                            "target_refs_json": canonical_json(list(target_refs)),
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "accepted_at": now,
+                        },
+                    )
                 formal_by_label = {
                     candidate.candidate.local_label: candidate
                     for candidate in update.candidates
@@ -20731,17 +20884,26 @@ def _native_target_commit_material(
 def _measurement_closure_conflict(code: str, error: Exception) -> OwnerConflict:
     """Keep Bundle capacity facts when crossing the RG Owner boundary."""
     details = getattr(error, "details", None)
-    conflict = OwnerConflict(code, dict(details) if isinstance(details, dict) else None)
-    if conflict.details and conflict.details.get("category") == "technical_capacity":
-        actual = conflict.details.get("actual_bytes")
-        qualifier = "at least " if conflict.details.get("actual_is_lower_bound") else ""
+    details_dict = dict(details) if isinstance(details, dict) else None
+    if details_dict and details_dict.get("category") == "technical_capacity":
+        conflict: OwnerConflict = TargetContentIssue(code, details_dict)
+        actual = details_dict.get("actual_bytes")
+        qualifier = "at least " if details_dict.get("actual_is_lower_bound") else ""
         conflict.feedback = (
-            f"{conflict.details.get('path', '$')}: technical capacity: {qualifier}{actual} "
-            f"serialized UTF-8 bytes; limit {conflict.details.get('limit')}. "
+            f"{details_dict.get('path', '$')}: technical capacity: {qualifier}{actual} "
+            f"serialized UTF-8 bytes; limit {details_dict.get('limit')}. "
             "Preserve the complete research results, original evidence and sources; "
             "report this host capacity limitation. Do not truncate results or rerun the experiment."
         )
-    return conflict
+        return conflict
+    if isinstance(error, BundleProtocolError) and (
+        "ref" in str(error) or "metric" in str(error) or "type" in str(error)
+    ):
+        return target_content_issue(
+            code,
+            f"Measurement closure validation failed ({error}). Check declared metrics and formal_runs types.",
+        )
+    return OwnerConflict(code, details_dict)
 
 
 def _target_root_commit_request_hash(
@@ -20938,7 +21100,13 @@ def _target_root_commit_material(
         if (not primary_declared and (
                 items[0]["variant_ref"] != authority.identities.variant_ref or
                 items[0]["evaluation_ref"] not in (None, authority.identities.evaluation_ref))):
-            raise OwnerConflict("target_formal_primary_definition_invalid")
+            raise target_content_issue(
+                "target_formal_primary_definition_invalid",
+                f"Primary formal run {items[0]['run_key']!r} resolved variant_ref={items[0]['variant_ref']!r} / "
+                f"evaluation_ref={items[0]['evaluation_ref']!r}, which differs from Target authority "
+                f"({authority.identities.variant_ref!r} / {authority.identities.evaluation_ref!r}). "
+                "Omit overrides on the primary run to inherit Target identities or add an inline variant declaration.",
+            )
         metrics = items[0]["metrics"] or {}
         measurement_payload["execution_status"] = items[0]["run_status"]
         measurement_payload["evaluation_status"] = items[0]["evaluation_status"]

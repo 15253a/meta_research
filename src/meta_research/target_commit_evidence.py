@@ -194,6 +194,150 @@ def evidence_catalog_page_metadata(
     }
 
 
+def verify_plan_evidence_catalog_current_in_transaction(
+    connection,
+    *,
+    quest_ref: str,
+    evidence_catalog: list[dict[str, object]],
+    expected_reference_revision: int,
+    require_current: bool = True,
+    require_complete: bool = True,
+    selected_evidence_refs: frozenset[str] | None = None,
+) -> None:
+    if (
+        not isinstance(expected_reference_revision, int)
+        or isinstance(expected_reference_revision, bool)
+        or expected_reference_revision < 0
+        or not isinstance(evidence_catalog, list)
+        or not all(isinstance(item, dict) for item in evidence_catalog)
+        or (
+            selected_evidence_refs is not None
+            and not isinstance(selected_evidence_refs, frozenset)
+        )
+        or len(evidence_catalog) != expected_reference_revision
+    ):
+        raise OwnerConflict("plan_evidence_catalog_invalid")
+    from sqlalchemy import text
+
+    supplied_refs: set[str] = set()
+    target_bindings: list[tuple[str, str, str, str, str, str]] = []
+    for item in evidence_catalog:
+        evidence_ref = item.get("evidence_ref")
+        if (
+            not isinstance(evidence_ref, str)
+            or not evidence_ref
+            or evidence_ref in supplied_refs
+        ):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        supplied_refs.add(evidence_ref)
+        if item.get("source_kind") in GENERIC_EVIDENCE_KINDS:
+            continue
+        binding = item.get("source_binding", item) if "source_kind" in item else item
+        if not isinstance(binding, dict):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        commit_ref = binding.get("target_commit_root_ref")
+        role_ref = binding.get("role_ref")
+        version_ref = binding.get("asset_version_ref")
+        asset_ref = binding.get("asset_ref")
+        content_hash = binding.get("content_hash")
+        manifest_hash = binding.get("manifest_hash")
+        if (
+            not isinstance(commit_ref, str)
+            or not commit_ref
+            or not isinstance(role_ref, str)
+            or not role_ref
+            or not isinstance(version_ref, str)
+            or not version_ref
+            or not isinstance(asset_ref, str)
+            or not asset_ref
+            or not isinstance(content_hash, str)
+            or not content_hash
+            or not isinstance(manifest_hash, str)
+            or not manifest_hash
+            or evidence_ref
+            != "evidence_" + canonical_hash({"target_commit_ref": commit_ref})[:32]
+        ):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        target_bindings.append(
+            (commit_ref, role_ref, version_ref, asset_ref, content_hash, manifest_hash)
+        )
+    if selected_evidence_refs is not None and not selected_evidence_refs.issubset(
+        supplied_refs
+    ):
+        raise OwnerConflict("plan_evidence_catalog_invalid")
+    if not target_bindings:
+        return
+    current_rows: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+    current_clause = ""
+    if require_current:
+        current_clause = """ AND (lifecycle.status = 'active' OR EXISTS (
+            SELECT 1 FROM rg_formal_plan_decisions d
+            JOIN rm_plan_documents p ON p.content_ref = d.plan_content_ref
+                AND p.plan_document_hash = d.plan_document_hash
+            JOIN rg_question_lifecycle shared ON shared.question_ref = d.question_ref
+                AND shared.quest_ref = d.quest_ref
+            JOIN json_each(p.plan_document_json, '$.source_bindings.selected_evidence_bindings') adopted
+            WHERE d.quest_ref = g.quest_ref AND d.decision = 'accepted'
+                AND shared.status = 'active'
+                AND json_extract(adopted.value, '$.source_kind') = 'TargetCommit'
+                AND json_extract(adopted.value, '$.source_binding.asset_version_ref') = r.version_ref
+                AND json_extract(adopted.value, '$.source_binding.target_commit_root_ref') = c.commit_ref
+        ))"""
+    for offset in range(0, len(target_bindings), 256):
+        batch = target_bindings[offset : offset + 256]
+        params: dict[str, object] = {
+            "quest_ref": quest_ref,
+            "media_type": TARGET_COMMIT_EVIDENCE_MEDIA_TYPE,
+        }
+        commit_phs = []
+        role_phs = []
+        for idx, entry in enumerate(batch):
+            params[f"commit_{idx}"] = entry[0]
+            params[f"role_{idx}"] = entry[1]
+            commit_phs.append(f":commit_{idx}")
+            role_phs.append(f":role_{idx}")
+        sql = (
+            "SELECT c.commit_ref, r.role_ref, r.version_ref, "
+            "r.asset_ref, r.asset_hash, r.manifest_hash, "
+            "a.asset_ref AS rm_asset_ref, a.content_hash AS rm_content_hash, "
+            "a.manifest_hash AS rm_manifest_hash "
+            "FROM rg_target_commits c "
+            "JOIN rg_targets t ON t.target_ref = c.target_ref "
+            "JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref "
+            "JOIN ae_cycles cycle ON cycle.cycle_ref = g.cycle_ref AND cycle.quest_ref = g.quest_ref "
+            "JOIN rg_question_lifecycle lifecycle ON lifecycle.question_ref = cycle.question_ref "
+            "AND lifecycle.quest_ref = g.quest_ref "
+            "JOIN rm_asset_versions a ON json_extract(a.provenance_json, '$.target_commit_root_ref') = c.commit_ref "
+            "JOIN rg_asset_roles r ON r.version_ref = a.version_ref "
+            "WHERE g.quest_ref = :quest_ref AND r.quest_ref = g.quest_ref "
+            "AND r.role = 'evidence' AND a.media_type = :media_type "
+            f"AND c.commit_ref IN ({', '.join(commit_phs)}) "
+            f"AND r.role_ref IN ({', '.join(role_phs)})"
+            + current_clause
+        )
+        for row in connection.execute(text(sql), params).mappings():
+            if (
+                row["asset_ref"] != row["rm_asset_ref"]
+                or row["asset_hash"] != row["rm_content_hash"]
+                or row["manifest_hash"] != row["rm_manifest_hash"]
+            ):
+                raise OwnerConflict("target_commit_evidence_binding_invalid")
+            current_rows[
+                (str(row["commit_ref"]), str(row["role_ref"]), str(row["version_ref"]))
+            ] = (
+                str(row["asset_ref"]),
+                str(row["asset_hash"]),
+                str(row["manifest_hash"]),
+            )
+    for commit_ref, role_ref, version_ref, asset_ref, content_hash, manifest_hash in target_bindings:
+        if current_rows.get((commit_ref, role_ref, version_ref)) != (
+            asset_ref,
+            content_hash,
+            manifest_hash,
+        ):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+
+
 class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
     """Expose only RM/RG evidence leaves rooted in real TargetCommits."""
 
@@ -462,6 +606,31 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             supplied_refs
         ):
             raise OwnerConflict("plan_evidence_catalog_invalid")
+
+    def assert_evidence_catalog_current_in_transaction(
+        self,
+        connection,
+        *,
+        quest_ref: str,
+        evidence_catalog: list[dict[str, object]],
+        expected_reference_revision: int,
+        require_current: bool = True,
+        require_complete: bool = True,
+        selected_evidence_refs: frozenset[str] | None = None,
+    ) -> None:
+        if isinstance(evidence_catalog, list):
+            for item in evidence_catalog:
+                if isinstance(item, dict) and item.get("source_kind") in GENERIC_EVIDENCE_KINDS:
+                    self._generic_plan_source(quest_ref, item)
+        verify_plan_evidence_catalog_current_in_transaction(
+            connection,
+            quest_ref=quest_ref,
+            evidence_catalog=evidence_catalog,
+            expected_reference_revision=expected_reference_revision,
+            require_current=require_current,
+            require_complete=require_complete,
+            selected_evidence_refs=selected_evidence_refs,
+        )
 
     def _generic_plan_source(self, quest_ref, item):
         from meta_research.research_content import adopted_source_binding

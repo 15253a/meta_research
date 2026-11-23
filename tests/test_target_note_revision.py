@@ -82,8 +82,10 @@ def test_same_root_note_revision_reaches_target_commit_and_bundle_exact_reader(
         unchanged_evidence = replace(evidence, operation_ref="unchanged-rg-rejection-retry",
             evidence_ref="unchanged-rg-rejection-evidence", operation_generation=2,
             evidence_sequence=11, observed_at=1.5)
-        with pytest.raises(OwnerConflict, match="^target_root_completion_successor_unchanged$"):
-            finalizer.finalize(handle=handle, evidence=unchanged_evidence)
+        unchanged_retry = finalizer.finalize(handle=handle, evidence=unchanged_evidence)
+        assert unchanged_retry.status == "revision_required"
+        assert unchanged_retry.pending_code == "target_root_completion_successor_unchanged"
+        assert unchanged_retry.completion_generation == 2
 
         revised_body = ("The input declaration is corrected; the same measured effect remains uncertain.\n"
                         if explanation_changes else first_body)
@@ -92,11 +94,11 @@ def test_same_root_note_revision_reaches_target_commit_and_bundle_exact_reader(
         document["formal_runs"][0]["input_refs"] = []
         result_path.write_text(canonical_json(document), encoding="utf-8")
         note_path.write_text(revised_body, encoding="utf-8")
-        successor = replace(evidence, operation_ref="same-root-note-revision", operation_generation=2,
+        successor = replace(evidence, operation_ref="same-root-note-revision", operation_generation=3,
             evidence_ref="same-root-note-revision-evidence", evidence_sequence=20, observed_at=2.0,
             final_text=revised_statement,
             final_text_sha256=hashlib.sha256(revised_statement.encode()).hexdigest())
-        predecessor_completion = first_completion
+        predecessor_completion = lifecycle.query_completion_by_ref(unchanged_retry.completion_ref)
         if failure_kind == "storage":
             original_replace = os.replace
 
@@ -111,7 +113,7 @@ def test_same_root_note_revision_reaches_target_commit_and_bundle_exact_reader(
                 with pytest.raises(OwnerConflict, match="^target_root_artifact_intake_unavailable$"):
                     finalizer.finalize(handle=handle, evidence=successor)
                 pending = lifecycle.query_completion(handle.target_ref)
-                assert pending.generation == 2 and pending.handle == handle
+                assert pending.generation == 3 and pending.handle == handle
                 assert lifecycle.query(handle.target_ref).status == "finalizing"
                 assert lifecycle.query_completion_rejection(pending.completion_ref) is None
                 assert memory.query_for_completion(pending.completion_ref) is None
@@ -170,18 +172,19 @@ def test_same_root_note_revision_reaches_target_commit_and_bundle_exact_reader(
             assert finalizer.finalize(handle=handle, evidence=successor) == missing_change
             # Once host construction is repaired, the original native root
             # resubmits the same scientific work; it does not rerun the assessment.
-            successor = replace(successor, operation_ref="same-root-host-repaired", operation_generation=3,
+            successor = replace(successor, operation_ref="same-root-host-repaired", operation_generation=4,
                 evidence_ref="same-root-host-repaired-evidence", evidence_sequence=30, observed_at=3.0)
             if failure_kind == "baseline-invalid-predecessor":
-                with pytest.raises(OwnerConflict, match="^target_root_completion_successor_unchanged$"):
-                    finalizer.finalize(handle=handle, evidence=successor)
-                assert lifecycle.query_completion_rejection(missing_change.completion_ref) == rejection
+                retry_unchanged = finalizer.finalize(handle=handle, evidence=successor)
+                assert retry_unchanged.status == "revision_required"
+                assert retry_unchanged.pending_code == "target_root_completion_successor_unchanged"
+                assert retry_unchanged.completion_generation == 4
                 assert memory.query(first_manifest.manifest_ref) == first_manifest
                 assert asset_memory.query_asset_lifecycle(first_notes["research_note"]["asset_ref"])["revision"] == 1
                 return
         completed = finalizer.finalize(handle=handle, evidence=successor)
         assert completed.status == "completed", completed
-        assert completed.completion_generation == (3 if failure_kind in {"host-request", "baseline-host-request"} else 2)
+        assert completed.completion_generation == (4 if failure_kind in {"host-request", "baseline-host-request"} else 3)
         if failure_kind in {"host-request", "baseline-host-request"}:
             assert lifecycle.query_completion_rejection(missing_change.completion_ref) == rejection
         if failure_kind == "storage":

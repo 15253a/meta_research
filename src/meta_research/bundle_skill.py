@@ -1481,6 +1481,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             + STAGE_CONTEXT_DELIVERY_GUIDANCE
             + f"provider_context_view={stage_context_json('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         ) if request.native_session_ref is None else (
+            stage_position_prompt(request, "bundle") +
             "继续原 Bundle 根，处理本次反馈并按原合同返回完整 target_plan 或 exhaustion_assessment。"
             "仅在确实缺少材料时用 research_memory.stage_context.read 定向读取原冻结正文。\n"
             f"{lineage}\n{_provider_correction_prompt(request.provider_feedback)}\n"
@@ -1684,7 +1685,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             absent_guidance="当前 Bundle dispatch context 未携带 Quest Goal revision。",
         )
         prompt = (
-            (position if request.native_session_ref is None else "") +
+            position +
             stage_replacement_prompt(request) +
             (f"{_bundle_skill_instructions()}\n\n" if request.native_session_ref is None else "") +
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
@@ -1830,7 +1831,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             absent_guidance="当前 Bundle target-batch context 未携带 Quest Goal revision。",
         )
         prompt = (
-            (position if request.native_session_ref is None else "") +
+            position +
             stage_replacement_prompt(request) +
             (f"{_bundle_skill_instructions()}\n\n" if request.native_session_ref is None else "") +
             f"{_provider_correction_prompt(request.provider_feedback)}\n"
@@ -2036,13 +2037,14 @@ def _rolling_native_result_matches(request, native_session_ref) -> bool:
 
 
 def _rolling_position_prompt(request: BundleDispatchRequest | BundleTargetBatchRequest) -> str:
-    from meta_research.cycle_position import validate_cycle_position
+    from meta_research.cycle_position import format_cycle_position_line
     position = request.cycle_position
     try:
-        validate_cycle_position(position, cycle_ref=request.cycle_ref)
+        return format_cycle_position_line(
+            position, stage="bundle", cycle_ref=request.cycle_ref
+        )
     except (TypeError, ValueError) as error:
         raise BundleSkillUnavailable("bundle_cycle_position_invalid") from error
-    return "cycle_position=" + canonical_json({**position, "stage": "bundle"}) + "\n"
 
 
 def _schema_template_request() -> BundleSkillRequest:

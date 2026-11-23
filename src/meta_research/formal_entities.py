@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
-from meta_research.target_content_issue import TargetContentIssue
+from meta_research.target_content_issue import TargetContentIssue, target_content_issue
 
 _REUSED_EVALUATION_SOURCES = ContextVar('reused_evaluation_sources', default=frozenset())
 
@@ -101,11 +101,15 @@ def explicit_unexecuted_root_evidence(result_document):
     }
 
 
-def _checkpoint_paths(value):
+def _checkpoint_paths(value, *, verify_only=False):
     if value is not None and (not isinstance(value, list)
             or any(not isinstance(path, str) or not path or path != path.strip() for path in value)
             or len(set(value)) != len(value)):
-        raise OwnerConflict('target_formal_checkpoint_paths_invalid')
+        raise target_content_issue(
+            'target_formal_checkpoint_paths_invalid',
+            'checkpoint_paths must be omitted or a list of distinct nonempty trimmed path/ref strings.',
+            verify_only=verify_only,
+        )
     return value
 
 
@@ -258,7 +262,11 @@ def _declared_work(result_document):
                 problem(attempt_path + '.metrics', metrics,
                     'must be an object for an executed assessment; a failed assessment may omit it')
             if status == 'failed' and (attempt.get('evaluation_attempt_ref') or attempt.get('metric_result_ref')):
-                raise OwnerConflict('target_formal_reused_evaluation_invalid')
+                raise target_content_issue(
+                    'target_formal_reused_evaluation_invalid',
+                    f"{attempt_path}: a failed evaluation must not specify evaluation_attempt_ref or metric_result_ref. "
+                    "Omit those reused refs or record status='executed' when reusing an accepted evaluation.",
+                )
             paths(attempt.get('checkpoint_paths'), attempt_path + '.checkpoint_paths', _checkpoint_paths)
             paths(attempt.get('artifact_paths'), attempt_path + '.artifact_paths', _artifact_paths)
             (measured if status == 'executed' else failed).append((run, attempt))
@@ -266,7 +274,11 @@ def _declared_work(result_document):
             unassessed.append((run, None))
     reject_problems()
     if not measured and not failed and not unassessed:
-        raise OwnerConflict('target_formal_work_has_no_executed_result')
+        raise target_content_issue(
+            'target_formal_work_has_no_executed_result',
+            '$.formal_runs contains no executed or failed Run (all declared entries were skipped). '
+            'Either mark the unexecuted work explicitly via unexecuted_root_evidence or include an executed Run.',
+        )
     return [*measured, *failed, *unassessed]
 
 
@@ -463,6 +475,8 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
         declared = []
     declarations = {}
     for ordinal, run in enumerate(declared):
+        if isinstance(run, dict) and run.get('status') in {'blocked', 'cancelled', 'not_executed'}:
+            continue
         if isinstance(run, dict) and run.get('run_key'):
             declarations[run['run_key']] = (
                 _variant_declaration(
@@ -487,7 +501,12 @@ def _resolve_declared_variants(connection, *, items, result_document, root, acce
         if declaration is None:
             continue
         if item['reuse_variant_run']:
-            raise OwnerConflict('target_formal_variant_declaration_invalid')
+            raise target_content_issue(
+                'target_formal_variant_declaration_invalid',
+                f"{selector} (Run {item['run_key']!r}) combines variant_run_ref reuse with an inline variant "
+                "declaration (baseline_forward_contract/variant_recipe). Remove the inline declaration when reusing a VariantRun.",
+                verify_only=verify_only,
+            )
         forward, recipe = declaration['forward'], declaration['recipe']
         if verify_only:
             # Verification only resolves what live acceptance registered;
@@ -604,7 +623,11 @@ def _root_work_items_from_declared(*, work, payload, identities, declared_runs=N
         reused_attempt = attempt.get('evaluation_attempt_ref') if attempt is not None else None
         reused_metric = attempt.get('metric_result_ref') if attempt is not None else None
         if bool(reused_attempt) != bool(reused_metric):
-            raise OwnerConflict('target_formal_reused_evaluation_invalid')
+            raise target_content_issue(
+                'target_formal_reused_evaluation_invalid',
+                f"Run {run_key!r}, Evaluation {attempt_key!r} must supply both evaluation_attempt_ref and "
+                "metric_result_ref together when reusing an accepted evaluation, or omit both.",
+            )
         items.append({
             'ordinal': ordinal, 'run_key': run_key, 'attempt_key': attempt_key,
             'run_status': run.get('status', 'executed'), 'evaluation_status': status,
@@ -790,7 +813,8 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
     _resolve_declared_variants(connection, items=items, result_document=result,
                                root=root, accepted_at=at, verify_only=verify_only)
     verify_formal_variant_scope(connection, target_ref=root['target_ref'],
-                                variant_refs=[item['variant_ref'] for item in items])
+                                variant_refs=[item['variant_ref'] for item in items],
+                                verify_only=verify_only)
     _derive_variant_evaluations(connection, items=items, identities=identities,
                                 root=root, accepted_at=at, verify_only=verify_only)
     variant_proof = json.loads(root['variant_input_binding_json'])
@@ -822,7 +846,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
     checkpoint_defaults = _default_checkpoint_paths(
         {item['variant_run_ref']: item.get('checkpoint_paths') for item in documented_items
          if not item['reuse_variant_run']}, checkpoint_entries,
-        require_explicit=not verify_only)
+        require_explicit=not verify_only, verify_only=verify_only)
     artifact_defaults = (_recorded_subject_artifacts(connection, documented_items, entries)
                          if verify_only else {})
     verified_artifact_rows = {}
@@ -888,8 +912,15 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
                 'JOIN rg_experiment_variants v USING (variant_ref) WHERE e.evaluation_ref=:ref'),
                 {'ref': item['evaluation_ref']}).mappings().first()
         if definition is None or definition['variant_ref'] != item['variant_ref']:
-            raise OwnerConflict('target_formal_variant_definition_invalid' if run_without_evaluation
-                                else 'target_formal_evaluation_definition_invalid')
+            code = ('target_formal_variant_definition_invalid' if run_without_evaluation
+                    else 'target_formal_evaluation_definition_invalid')
+            raise target_content_issue(
+                code,
+                f"Run {item['run_key']!r}: variant_ref={item['variant_ref']!r} or evaluation_ref={item['evaluation_ref']!r} "
+                "does not resolve to a matching accepted RG definition. Use a registered Variant/Evaluation ref for this Quest "
+                "or omit overrides to inherit the authority binding.",
+                verify_only=verify_only,
+            )
         # The Variant must resolve to a registered Baseline, but it does not
         # have to be the Bundle draft's Baseline: the Target may reuse or
         # register any real method for its actual work.
@@ -955,7 +986,12 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         input_refs = list(dict.fromkeys([*input_refs, *local_inputs]))
         if item['reuse_variant_run']:
             if item.get('implementation_paths') is not None or local_inputs:
-                raise OwnerConflict('target_formal_reused_run_input_mismatch')
+                raise target_content_issue(
+                    'target_formal_reused_run_input_mismatch',
+                    f"Run {item['run_key']!r} reuses variant_run_ref={run_ref!r} and must omit "
+                    "implementation_paths and local_inputs because a reused Run keeps its original frozen inputs.",
+                    verify_only=verify_only,
+                )
             implementation_revision_ref = implementation_tree_hash = None
         else:
             implementation_revision_ref, implementation_tree_hash = implementation_binding(
@@ -981,7 +1017,12 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         if item['reuse_variant_run']:
             old = connection.execute(text('SELECT variant_ref,status,input_binding_ref FROM rg_variant_runs WHERE variant_run_ref=:ref'), {'ref': run_ref}).mappings().first()
             if old is None or old['variant_ref'] != item['variant_ref'] or old['status'] != item['run_status']:
-                raise OwnerConflict('target_formal_reused_run_invalid')
+                raise target_content_issue(
+                    'target_formal_reused_run_invalid',
+                    f"Run {item['run_key']!r} reuses variant_run_ref={run_ref!r}, which does not exist or "
+                    f"differs in variant_ref ({item['variant_ref']!r}) or status ({item['run_status']!r}).",
+                    verify_only=verify_only,
+                )
             vb = old['input_binding_ref']
             from types import SimpleNamespace
             from meta_research.owners.research_graph import _accepted_experiment_input_binding
@@ -990,12 +1031,24 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
             if old_input is None:
                 raise OwnerConflict('target_formal_reused_run_invalid')
             accepted_input = _accepted_experiment_input_binding(SimpleNamespace(**old_input))
-            if (accepted_input.subject_kind != 'variant_run' or accepted_input.subject_ref != run_ref
-                    or item['input_refs'] is not None and item['input_refs'] != accepted_input.inputs.get('input_refs')):
-                raise OwnerConflict('target_formal_reused_run_input_mismatch')
+            if accepted_input.subject_kind != 'variant_run' or accepted_input.subject_ref != run_ref:
+                raise OwnerConflict('target_formal_reused_run_invalid')
+            if item['input_refs'] is not None and item['input_refs'] != accepted_input.inputs.get('input_refs'):
+                raise target_content_issue(
+                    'target_formal_reused_run_input_mismatch',
+                    f"Run {item['run_key']!r} reuses variant_run_ref={run_ref!r} with input_refs={item['input_refs']!r}, "
+                    f"which mismatches the frozen inputs {accepted_input.inputs.get('input_refs')!r}. Omit input_refs or match them.",
+                    verify_only=verify_only,
+                )
             if (item.get('implementation_revision_ref') is not None
                     and item['implementation_revision_ref'] != accepted_input.inputs.get('implementation_revision_ref')):
-                raise OwnerConflict('target_formal_implementation_revision_mismatch')
+                raise target_content_issue(
+                    'target_formal_implementation_revision_mismatch',
+                    f"Run {item['run_key']!r} reuses variant_run_ref={run_ref!r} with implementation_revision_ref="
+                    f"{item.get('implementation_revision_ref')!r}, which differs from frozen revision "
+                    f"{accepted_input.inputs.get('implementation_revision_ref')!r}. Omit implementation_revision_ref or match it.",
+                    verify_only=verify_only,
+                )
             if source_owner is not None:
                 from meta_research.run_only_registration import _verify_original_binding_source
                 _verify_original_binding_source(source_owner, accepted_input, run_ref)
@@ -1016,7 +1069,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         if artifact_key not in run_artifact_cache:
             _register_subject_artifacts(connection, ensure=ensure, subject_kind='variant_run',
                 subject_ref=run_ref, paths=run_paths, entries=entries,
-                accepted_at=at, reused=item['reuse_variant_run'])
+                accepted_at=at, reused=item['reuse_variant_run'], verify_only=verify_only)
             run_artifact_cache.add(artifact_key)
         if item['reuse_evaluation_attempt']:
             previous = connection.execute(text(
@@ -1029,7 +1082,13 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
                     or previous['metric_result_ref'] != item['metric_result_ref']
                     or previous['metrics_json'] != canonical_json(metrics)
                     or previous['metrics_hash'] != canonical_hash(metrics)):
-                raise OwnerConflict('target_formal_reused_evaluation_invalid')
+                raise target_content_issue(
+                    'target_formal_reused_evaluation_invalid',
+                    f"Run {item['run_key']!r}, Evaluation {item['attempt_key']!r} reused evaluation_attempt_ref="
+                    f"{attempt_ref!r} / metric_result_ref={item['metric_result_ref']!r} does not match accepted RG facts "
+                    "(variant_run_ref, evaluation_ref, metrics, or measurement_accepted status).",
+                    verify_only=verify_only,
+                )
             from types import SimpleNamespace
             from meta_research.owners.research_graph import _accepted_experiment_input_binding
             old_binding = connection.execute(text('SELECT * FROM rg_experiment_input_bindings WHERE binding_ref=:ref'),
@@ -1043,7 +1102,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
                 metric_ref=item['metric_result_ref'], binding=accepted_binding, source_owner=source_owner)
             _register_subject_artifacts(connection, ensure=ensure, subject_kind='evaluation_attempt',
                 subject_ref=attempt_ref, paths=item.get('evaluation_artifact_paths'), entries=entries,
-                accepted_at=at, reused=True)
+                accepted_at=at, reused=True, verify_only=verify_only)
             old_checkpoints = json.loads(previous['checkpoint_role_refs_json'])
             if canonical_hash(old_checkpoints) != previous['checkpoint_role_refs_hash']:
                 raise OwnerConflict('target_formal_reused_evaluation_invalid')
@@ -1052,11 +1111,18 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
                     'checkpoint_version_refs', 'evaluation_checkpoint_paths',
                     'evaluation_checkpoint_role_refs', 'evaluation_checkpoint_version_refs')):
                 available = _register_run_checkpoints(connection, ensure=ensure, item=item,
-                    entries=checkpoint_entries, accepted_at=at, default_paths=checkpoint_defaults)
+                    entries=checkpoint_entries, accepted_at=at, default_paths=checkpoint_defaults,
+                    verify_only=verify_only)
                 selected = _select_checkpoint_records(available, item.get('evaluation_checkpoint_paths'),
-                    item.get('evaluation_checkpoint_role_refs'), item.get('evaluation_checkpoint_version_refs'))
+                    item.get('evaluation_checkpoint_role_refs'), item.get('evaluation_checkpoint_version_refs'),
+                    verify_only=verify_only)
                 if [record['role_ref'] for record in selected] != old_checkpoints:
-                    raise OwnerConflict('target_formal_reused_evaluation_checkpoint_mismatch')
+                    raise target_content_issue(
+                        'target_formal_reused_evaluation_checkpoint_mismatch',
+                        f"Run {item['run_key']!r}, Evaluation {item['attempt_key']!r} checkpoint selection does not "
+                        f"match reused EvaluationAttempt frozen checkpoint roles {old_checkpoints!r}. Omit checkpoint overrides or match them.",
+                        verify_only=verify_only,
+                    )
             _ensure_link(ensure, root, item, commit_ref)
             continue
         if verify_only and item['reuse_variant_run'] and attempt_ref is not None:
@@ -1074,13 +1140,14 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         if checkpoint_cache_key not in run_checkpoint_cache:
             run_checkpoint_cache[checkpoint_cache_key] = _register_run_checkpoints(
                 connection, ensure=ensure, item=item, entries=checkpoint_entries, accepted_at=at,
-                default_paths=checkpoint_defaults)
+                default_paths=checkpoint_defaults, verify_only=verify_only)
         run_checkpoints = run_checkpoint_cache[checkpoint_cache_key]
         if run_without_evaluation:
             _ensure_link(ensure, root, item, commit_ref)
             continue
         selected_checkpoints = _select_checkpoint_records(run_checkpoints, item.get('evaluation_checkpoint_paths'),
-            item.get('evaluation_checkpoint_role_refs'), item.get('evaluation_checkpoint_version_refs'))
+            item.get('evaluation_checkpoint_role_refs'), item.get('evaluation_checkpoint_version_refs'),
+            verify_only=verify_only)
         checkpoint_roles = [entry['role_ref'] for entry in selected_checkpoints]
         evaluation_inputs = {'schema_ref': 'meta-research/formal-evaluation-inputs/v1',
                              'input_refs': [run_ref, definition['protocol_version_ref']],
@@ -1101,7 +1168,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         _register_subject_artifacts(connection, ensure=ensure, subject_kind='evaluation_attempt',
             subject_ref=attempt_ref, paths=(item.get('evaluation_artifact_paths') if item.get('evaluation_artifact_paths') is not None
                 else artifact_defaults.get(('evaluation_attempt', attempt_ref), [])), entries=entries,
-            accepted_at=at)
+            accepted_at=at, verify_only=verify_only)
         verified_checkpoints = None
         if verify_only:
             verified_checkpoints = dict(connection.execute(text(
@@ -1263,21 +1330,35 @@ def _verify_reused_root_source_rows(root, authority, manifest, completion, commi
         raise OwnerConflict('target_formal_reused_evaluation_source_invalid')
 
 
-def _select_checkpoint_records(records, paths, role_refs=None, version_refs=None):
+def _select_checkpoint_records(records, paths, role_refs=None, version_refs=None, *, verify_only=False):
     selected = records
     for key, values in (('role_ref', role_refs), ('version_ref', version_refs)):
         if values is None:
             continue
-        _checkpoint_paths(values)
+        _checkpoint_paths(values, verify_only=verify_only)
         if not set(values) <= {record.get(key) for record in selected}:
-            raise OwnerConflict('target_formal_checkpoint_reference_not_bound')
+            raise target_content_issue(
+                'target_formal_checkpoint_reference_not_bound',
+                f'Selected checkpoint {key}s {values!r} include references not bound to this Run.',
+                verify_only=verify_only,
+            )
         selected = [record for record in selected if record.get(key) in values]
     if paths is not None:
         available = {record['declared_relative_path'] for record in selected}
         if not set(paths) <= available:
-            raise OwnerConflict('target_formal_checkpoint_path_not_bound')
+            missing = [path for path in paths if path not in available]
+            raise target_content_issue(
+                'target_formal_checkpoint_path_not_bound',
+                f'Declared checkpoint_paths {missing!r} are not retained with role checkpoint for this Run.',
+                verify_only=verify_only,
+            )
         if any(sum(record['declared_relative_path'] == path for record in selected) > 1 for path in paths):
-            raise OwnerConflict('target_formal_checkpoint_path_ambiguous')
+            raise target_content_issue(
+                'target_formal_checkpoint_path_ambiguous',
+                f'Declared checkpoint_paths {paths!r} match multiple retained checkpoint records unambiguously; '
+                'select by exact role_ref or version_ref instead.',
+                verify_only=verify_only,
+            )
         selected = [record for record in selected if record['declared_relative_path'] in paths]
     return selected
 
@@ -1325,7 +1406,7 @@ def _existing_checkpoint_records(connection, run_ref, frozen_refs=None):
     return records
 
 
-def _default_checkpoint_paths(new_runs, entries, *, require_explicit=False):
+def _default_checkpoint_paths(new_runs, entries, *, require_explicit=False, verify_only=False):
     """New work declares production; historical replay can verify old defaults.
 
     Multiple producers declare actual ownership; once every retained state is
@@ -1335,18 +1416,25 @@ def _default_checkpoint_paths(new_runs, entries, *, require_explicit=False):
         return None
     assigned = {path for paths in new_runs.values() for path in paths or []}
     if any(entry['declared_relative_path'] not in assigned for entry in entries):
-        raise OwnerConflict('target_formal_checkpoint_assignment_required')
+        unassigned = [entry['declared_relative_path'] for entry in entries if entry['declared_relative_path'] not in assigned]
+        raise target_content_issue(
+            'target_formal_checkpoint_assignment_required',
+            f'Retained checkpoint paths {unassigned!r} are not assigned in $.formal_runs[*].checkpoint_paths. '
+            'Assign each retained checkpoint to the producing Run or declare checkpoint_paths: [] when none belong to a Run.',
+            verify_only=verify_only,
+        )
     return []
 
 
-def _register_run_checkpoints(connection, *, ensure, item, entries, accepted_at, default_paths=None):
+def _register_run_checkpoints(connection, *, ensure, item, entries, accepted_at, default_paths=None, verify_only=False):
     run_ref = item['variant_run_ref']
     if item['reuse_variant_run']:
         records = _existing_checkpoint_records(connection, run_ref, item.get('frozen_checkpoint_role_refs'))
         return _select_checkpoint_records(records, item.get('checkpoint_paths'),
-            item.get('checkpoint_role_refs'), item.get('checkpoint_version_refs'))
+            item.get('checkpoint_role_refs'), item.get('checkpoint_version_refs'),
+            verify_only=verify_only)
     paths = item.get('checkpoint_paths')
-    selected = _select_checkpoint_records(entries, default_paths if paths is None else paths)
+    selected = _select_checkpoint_records(entries, default_paths if paths is None else paths, verify_only=verify_only)
     records = []
     for ordinal, entry in enumerate(selected):
         binding = entry['binding']
@@ -1421,7 +1509,7 @@ def _artifact_role_ref(kind, subject, entry):
     return _ref('formal_artifact_parent_role', kind, subject, entry['role'], entry['binding']['version_ref'])
 
 def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref,
-                                paths, entries, accepted_at, reused=False):
+                                paths, entries, accepted_at, reused=False, verify_only=False):
     """Assign exact RM versions to the execution or assessment that produced them.
 
     Unassigned artifacts stay in the completion manifest. Reusing a subject
@@ -1450,7 +1538,7 @@ def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref
                 'WHERE manifest_ref=:ref'), {'ref': manifest_ref}).first()
             from meta_research.formal_run_bindings import db_manifest_selection_entries
             original_entries = db_manifest_selection_entries(manifest._mapping) if manifest else []
-            selected = _selected_subject_artifacts(original_entries, paths)
+            selected = _selected_subject_artifacts(original_entries, paths, verify_only=verify_only)
             # Current roles under this subject minus later corrections in both
             # directions: roles moved away and roles moved in by an Owner
             # adjustment no longer witness this original manifest selection.
@@ -1469,9 +1557,14 @@ def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref
                 entry['binding']['version_ref'] for entry in selected
                 if _artifact_role_ref(subject_kind, subject_ref, entry) not in excluded_refs}
             if selected_versions != remaining:
-                raise OwnerConflict('target_formal_reused_artifact_mismatch')
+                raise target_content_issue(
+                    'target_formal_reused_artifact_mismatch',
+                    f'Reused {subject_kind} {subject_ref!r} artifact_paths {paths!r} do not match its previously accepted '
+                    'retained artifacts. Omit artifact_paths override or declare the exact previously retained paths.',
+                    verify_only=verify_only,
+                )
         return
-    selected = _selected_subject_artifacts(entries, paths)
+    selected = _selected_subject_artifacts(entries, paths, verify_only=verify_only)
     ordinals, retained = {}, set()
     for entry in selected:
         binding = entry['binding']
@@ -1508,14 +1601,20 @@ def _register_subject_artifacts(connection, *, ensure, subject_kind, subject_ref
         raise OwnerConflict('target_formal_artifact_assignment_conflict')
 
 
-def _selected_subject_artifacts(entries, paths):
+def _selected_subject_artifacts(entries, paths, *, verify_only=False):
     eligible = [entry for entry in entries if entry['role'] in {'log', 'analysis', 'data'}
                 and entry['declared_relative_path'] != 'handoff/final-message.md']
     if paths is None:
         return []
     available = {entry['declared_relative_path']: entry for entry in eligible}
     if any(path not in available for path in paths):
-        raise OwnerConflict('target_formal_artifact_path_not_bound')
+        missing = [path for path in paths if path not in available]
+        raise target_content_issue(
+            'target_formal_artifact_path_not_bound',
+            f'Declared artifact_paths {missing!r} are not bound to retained log/analysis/data artifacts '
+            'in the completion manifest. Ensure those paths are retained or fix artifact_paths.',
+            verify_only=verify_only,
+        )
     return [available[path] for path in paths]
 
 
@@ -1819,7 +1918,7 @@ def _verify_reusable_candidates(document, entries, assigned):
             raise error
 
 
-def verify_formal_variant_scope(connection, *, target_ref, variant_refs):
+def verify_formal_variant_scope(connection, *, target_ref, variant_refs, verify_only=False):
     quest = connection.execute(text('SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g '
         'ON g.graph_ref=t.graph_ref WHERE t.target_ref=:ref'), {'ref': target_ref}).scalar_one_or_none()
     if quest is None:
@@ -1828,7 +1927,11 @@ def verify_formal_variant_scope(connection, *, target_ref, variant_refs):
         row = connection.execute(text('SELECT b.quest_ref FROM rg_experiment_variants v JOIN '
             'rg_experiment_baselines b USING(baseline_ref) WHERE v.variant_ref=:ref'), {'ref': ref}).first()
         if row is None:
-            raise OwnerConflict('target_formal_variant_definition_invalid')
+            raise target_content_issue(
+                'target_formal_variant_definition_invalid',
+                f'Declared variant_ref {ref!r} is not registered in Research Graph.',
+                verify_only=verify_only,
+            )
         if row.quest_ref != quest:
             raise OwnerConflict('target_formal_variant_scope_invalid')
 

@@ -18,7 +18,11 @@ from meta_research.root_capabilities import (
     ROOT_ROLE_OPERATION_DELTAS,
     RootAgentKind,
 )
-from meta_research.error_contract import RecoveryOwner, error_contract_from_legacy
+from meta_research.error_contract import (
+    RecoveryOwner,
+    _is_business_unauthorized_code,
+    error_contract_from_legacy,
+)
 from meta_research.error_audit import ErrorAuditStore
 from meta_research.work_material_contract import (
     CREATION_MATERIAL_OPERATION_IDS,
@@ -637,6 +641,13 @@ class SemanticMcpGateway:
                 ):
                     details["effect_status"] = "not_started"
                     details.setdefault("call_execution", "not_started")
+                elif _is_business_unauthorized_code(error.code):
+                    details["effect_status"] = "rejected"
+                    details.setdefault("call_execution", "not_started")
+                    details["correction"] = (
+                        "This operation is not authorized for the current root or phase and did not start an effect. "
+                        "Stop calling it from this root or hand off to an authorized root."
+                    )
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -1478,7 +1489,7 @@ def _contract_tool_error(
         if key not in projected or projected[key] is None:
             projected[key] = value
     if error_audit_store is not None:
-        if not effect and phase == "input_validation":
+        if not effect:
             projected["audit_ref"] = None
             projected["audit_status"] = "skipped_read_only"
         else:
