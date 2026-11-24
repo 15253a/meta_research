@@ -870,6 +870,12 @@ class BundleStageWorker:
         dispatch_state = self._dispatch_state(graph, commits, run=run)
         live_goal = self._live_quest_goal_revision(request)
         frozen_goal_ref = request.context_pack.get("goal_revision_ref")
+        if not isinstance(frozen_goal_ref, str) or not frozen_goal_ref:
+            frozen_goal_obj = request.context_pack.get("quest_goal_revision")
+            if isinstance(frozen_goal_obj, dict) and isinstance(
+                frozen_goal_obj.get("goal_revision_ref"), str
+            ):
+                frozen_goal_ref = frozen_goal_obj["goal_revision_ref"]
         if (
             isinstance(live_goal, dict)
             and isinstance(live_goal.get("goal_revision_ref"), str)

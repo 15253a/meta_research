@@ -394,6 +394,33 @@ def test_target_result_json_remaining_conflicts_route_to_revision_feedback_and_k
     assert type(cap_err) is OwnerConflict and not isinstance(cap_err, TargetContentIssue)
     assert cap_err.feedback and "Do not truncate results" in cap_err.feedback
 
+    def _invalid_bundle_entry(_runtime, _auth, _handle, workspace, _ev):
+        impl = workspace / "implementation" / "train.py"
+        if impl.exists():
+            impl.rename(workspace / "implementation" / " train.py")
+
+    r_bad_entry = _case("invalid-bundle-entry", _invalid_bundle_entry)
+    assert r_bad_entry.pending_code == "target_implementation_workspace_entry_unsupported"
+
+    def _empty_metrics_no_runs(_runtime, _auth, _handle, workspace, _ev):
+        p = workspace / "outputs/result.json"
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        doc["metrics"] = {}
+        doc["formal_runs"] = []
+        p.write_text(canonical_json(doc), encoding="utf-8")
+
+    r_empty_metrics = _case("empty-metrics-no-runs", _empty_metrics_no_runs)
+    assert r_empty_metrics.pending_code == "target_formal_work_inventory_invalid"
+
+    def _blank_schema_ref(_runtime, _auth, _handle, workspace, _ev):
+        p = workspace / "outputs/result.json"
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        doc["schema_ref"] = "   "
+        p.write_text(canonical_json(doc), encoding="utf-8")
+
+    r_blank_schema = _case("blank-schema-ref", _blank_schema_ref)
+    assert r_blank_schema.pending_code == "target_root_result_document_invalid"
+
 
 def test_target_reused_run_conflicts_route_to_revision_feedback(tmp_path: Path) -> None:
     runtime, lifecycle, _memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(
@@ -517,7 +544,7 @@ def test_target_reused_run_conflicts_route_to_revision_feedback(tmp_path: Path) 
 
 
 def test_target_completion_successor_unchanged_becomes_revisable_feedback_without_wedge(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(
         tmp_path / "successor-unchanged"
@@ -580,6 +607,48 @@ def test_target_completion_successor_unchanged_becomes_revisable_feedback_withou
         assert gen3.completion_generation == 3
     finally:
         runtime.close()
+
+    rt_s, lc_s, _m_s, _a_s, h_s, ws_s, ev_s = _root_finalizer_fixture(tmp_path / "successor-streamed")
+    try:
+        rp_s = ws_s / "outputs/result.json"
+        doc_s = json.loads(rp_s.read_text(encoding="utf-8"))
+        doc_s["formal_runs"][0]["input_refs"] = ["not-admitted-streamed"]
+        rp_s.write_text(canonical_json(doc_s), encoding="utf-8")
+
+        fin_s = TargetRunFinalizer(
+            lifecycle=lc_s,
+            memory=rt_s.target_run_finalizer._memory,
+            workspace_resolver=rt_s.target_run_authorities.agent_runtime,
+            evidence_reader=_FlexibleEvidenceReader(),
+            measurement_authority=rt_s.owners.research_graph,
+            graph_authority=rt_s.owners.research_graph,
+        )
+        with monkeypatch.context() as mp:
+            mp.setattr("meta_research.target_run_finalizer.TARGET_ROOT_INLINE_ARTIFACT_BYTES", 1)
+            sg1 = fin_s.finalize(handle=h_s, evidence=ev_s)
+            assert sg1.status == "revision_required" and sg1.completion_generation == 1
+
+            sg2_ev = replace(
+                ev_s,
+                operation_ref="streamed-unchanged-op",
+                operation_generation=2,
+                evidence_ref="streamed-unchanged-ev",
+                evidence_sequence=20,
+                observed_at=2.0,
+            )
+            sg2 = fin_s.finalize(handle=h_s, evidence=sg2_ev)
+            assert sg2.status == "revision_required"
+            assert sg2.pending_code == "target_root_completion_successor_unchanged"
+            assert sg2.completion_generation == 2
+
+            doc_s["formal_runs"][0]["input_refs"] = []
+            rp_s.write_text(canonical_json(doc_s), encoding="utf-8")
+            sg3_ev = _fresh_evidence(ws_s, ev_s, gen=3, text="Fixed streamed formal_runs.")
+            sg3 = fin_s.finalize(handle=h_s, evidence=sg3_ev)
+            assert sg3.status == "completed"
+            assert sg3.completion_generation == 3
+    finally:
+        rt_s.close()
 
 
 def test_provider_balance_and_auth_circuit_breaker_and_account_refresh_wake(
@@ -2208,3 +2277,17 @@ def test_acquisition_root_targetless_preflight_and_oa_then_institution_policy(
         AcquisitionPreflightRequest("s7", "init7", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv7"))
     )
     assert res_bad_browser.status == "unavailable" and res_bad_browser.browser_context_ref == "ctx-verified-4"
+
+    runner_no_errors = _AcqSequenceRunner([{
+        "status": "unavailable",
+        "browser_context_ref": None,
+        "reason_code": "no_targets",
+        "evidence": {"configuration_health": "no_errors", "browser_control": "skipped", "authorized_resource": "no_targets"},
+    }])
+    adapter_no_errors = CodexAcquisitionRootAdapter(
+        tmp_path / "acq-no-errors", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex-ne")), process_runner=runner_no_errors
+    )
+    res_no_errors = adapter_no_errors.preflight(
+        AcquisitionPreflightRequest("s8", "init8", 1, "a" * 64, "oa_only", "", str(tmp_path / "priv8"))
+    )
+    assert res_no_errors.status == "ready"

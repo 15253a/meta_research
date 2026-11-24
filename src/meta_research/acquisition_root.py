@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -46,11 +47,11 @@ _TARGETLESS_PREFLIGHT_REASONS = frozenset(
     }
 )
 _UNHEALTHY_PREFLIGHT_STATES = frozenset(
-    {"unavailable", "waiting", "broken", "invalid", "failed", "error", "missing"}
+    {"unavailable", "waiting", "broken", "invalid", "failed", "fail", "failure", "error", "errors", "missing"}
 )
-_BAD_HEALTH_TOKENS = ("broken", "invalid", "fail", "error", "unavail", "missing")
-_BAD_BROWSER_TOKENS = ("not_connected", "disconnected", "skipped", *_BAD_HEALTH_TOKENS)
-_BAD_RESOURCE_TOKENS = ("unverified", "login_required", "denied", "no_targets", *_BAD_HEALTH_TOKENS)
+_HEALTHY_EXPLICIT_STATES = frozenset({"ok", "ready", "healthy", "not_required", "no_error", "no_errors"})
+_BAD_BROWSER_EXACT = frozenset({"not_connected", "disconnected", "skipped", *_UNHEALTHY_PREFLIGHT_STATES})
+_BAD_RESOURCE_EXACT = frozenset({"unverified", "login_required", "denied", "no_targets", *_UNHEALTHY_PREFLIGHT_STATES})
 
 
 def _is_targetless_preflight_reason(reason_code: object) -> bool:
@@ -75,11 +76,28 @@ def _non_empty_lower(evidence: object, key: str) -> str | None:
     return val.strip().lower()
 
 
+def _tokens_for(normalized: str) -> set[str]:
+    return {tok for tok in re.split(r"[^a-z0-9]+", normalized) if tok}
+
+
+def _has_disallowed_state(normalized: str, bad_words: frozenset[str]) -> bool:
+    if normalized in _HEALTHY_EXPLICIT_STATES:
+        return False
+    if normalized in bad_words:
+        return True
+    tokens = _tokens_for(normalized)
+    if not tokens:
+        return True
+    if "no" in tokens:
+        tokens = tokens - {"no", "error", "errors"}
+    return bool(tokens & bad_words)
+
+
 def _configuration_health_ready(evidence: object) -> bool:
     normalized = _non_empty_lower(evidence, "configuration_health")
-    if normalized is None or normalized in _UNHEALTHY_PREFLIGHT_STATES:
+    if normalized is None:
         return False
-    return not any(token in normalized for token in _BAD_HEALTH_TOKENS)
+    return not _has_disallowed_state(normalized, _UNHEALTHY_PREFLIGHT_STATES)
 
 
 def _institution_evidence_ready(evidence: object) -> bool:
@@ -89,9 +107,9 @@ def _institution_evidence_ready(evidence: object) -> bool:
     resource = _non_empty_lower(evidence, "authorized_resource")
     if browser is None or resource is None:
         return False
-    if any(token in browser for token in _BAD_BROWSER_TOKENS):
+    if _has_disallowed_state(browser, _BAD_BROWSER_EXACT):
         return False
-    return not any(token in resource for token in _BAD_RESOURCE_TOKENS)
+    return not _has_disallowed_state(resource, _BAD_RESOURCE_EXACT)
 
 
 class CodexAcquisitionRootAdapter(AcquisitionProvider):
