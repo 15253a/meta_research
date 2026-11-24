@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import secrets
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -16,7 +18,7 @@ from meta_research.root_capabilities import (
     ROOT_ROLE_OPERATION_DELTAS,
     RootAgentKind,
 )
-from meta_research.error_contract import error_contract_from_legacy
+from meta_research.error_contract import RecoveryOwner, error_contract_from_legacy
 from meta_research.error_audit import ErrorAuditStore
 from meta_research.work_material_contract import (
     CREATION_MATERIAL_OPERATION_IDS,
@@ -554,7 +556,11 @@ class SemanticMcpGateway:
                     "id": request_id,
                     "result": _contract_tool_error(
                         "capability_unavailable",
-                        {"reason": "not_granted"},
+                        {
+                            "reason": "not_granted",
+                            "call_execution": "not_started",
+                            "current_root_kind": context.root_kind,
+                        },
                         context=replace(context, operation_id=operation_id),
                         operation=operation,
                         phase="admission",
@@ -569,12 +575,20 @@ class SemanticMcpGateway:
         unavailable = self._unavailable_reason(operation_id, context)
         if unavailable is not None:
             if operation.access_mode in {"effect", "reconcile"}:
+                owners = _ROLE_ONLY_OPERATION_OWNERS.get(operation_id)
+                admission_details: dict[str, object] = {
+                    "reason": unavailable,
+                    "call_execution": "not_started",
+                    "current_root_kind": context.root_kind,
+                }
+                if owners:
+                    admission_details["owner_root_kinds"] = sorted(owners)
                 return 200, {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": _contract_tool_error(
                         "capability_unavailable",
-                        {"reason": unavailable},
+                        admission_details,
                         context=replace(context, operation_id=operation_id),
                         operation=operation,
                         phase="admission",
@@ -740,6 +754,8 @@ class SemanticMcpGateway:
                  "properties": {"items": {"type": "array", "items": {"type": "object"}},
                     "purposes": {"type": "array", "items": {"type": "object"}},
                     "topics": {"type": "array", "items": {"type": "object"}},
+                    "current_root_kind": {"type": "string"},
+                    "callable_total": {"type": "integer"},
                     "offset": {"type": "integer"}, "next_offset": {"type": ["integer", "null"]},
                     "total": {"type": "integer"}, "catalog_hash": {"type": "string"}},
                  "additionalProperties": False},
@@ -848,8 +864,52 @@ class SemanticMcpGateway:
         if (offset > 0 and expected is None) or (expected is not None and expected != catalog_hash):
             raise SemanticMcpError("tool_catalog_changed", {"restart_offset": 0})
         if view == "overview":
-            return {"purposes": purpose_overview(operations), "items": common_operations(operations),
-                    "offset": 0, "next_offset": None, "total": len(operations), "catalog_hash": catalog_hash}
+            callable_ids = {
+                op.semantic_operation_id
+                for op in operations
+                if self._unavailable_reason(op.semantic_operation_id, context) is None
+            }
+            by_name = {op.semantic_operation_id: op for op in operations}
+            overview_items = [
+                self._operation_summary(by_name[item["operation_id"]], context)
+                for item in common_operations(operations)
+            ]
+            enriched_purposes = []
+            for entry in purpose_overview(operations):
+                purpose_name = entry["purpose"]
+                in_purpose = [
+                    op
+                    for op in operations
+                    if any(
+                        p == purpose_name
+                        for p, _ in purpose_paths(
+                            op.semantic_operation_id, op.owning_module, op.access_mode
+                        )
+                    )
+                ]
+                total_ops = len(in_purpose)
+                callable_ops = sum(
+                    1 for op in in_purpose if op.semantic_operation_id in callable_ids
+                )
+                enriched_purposes.append(
+                    {
+                        **entry,
+                        "total_operations": total_ops,
+                        "callable_operations": callable_ops,
+                        "inspectable_only_operations": total_ops - callable_ops,
+                        "callable_in_current_session": callable_ops > 0,
+                    }
+                )
+            return {
+                "purposes": enriched_purposes,
+                "items": overview_items,
+                "current_root_kind": context.root_kind,
+                "callable_total": len(callable_ids),
+                "offset": 0,
+                "next_offset": None,
+                "total": len(operations),
+                "catalog_hash": catalog_hash,
+            }
         topics = sorted({t for operation in operations for p, t in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)
                          if p == purpose}) if purpose else []
         return {"items": [self._operation_summary(operation, context) for operation in operations[offset:offset + limit]],
@@ -931,64 +991,139 @@ class SemanticMcpGateway:
                 raise SemanticMcpError("semantic_operation_schema_invalid")
 
 
-def _valid_schema_contract(schema: object) -> bool:
+_COMBINATOR_OR_VALUE_KEYS = frozenset(
+    {"const", "enum", "oneOf", "anyOf", "allOf", "if", "not"}
+)
+
+
+def _json_equal(left: object, right: object) -> bool:
+    """Compare decoded JSON values while distinguishing bool from int."""
+
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return set(left) == set(right) and all(
+            _json_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_equal(left_item, right_item) for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    return type(left) is type(right) and left == right
+
+
+def _is_non_negative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _valid_schema_contract(schema: object, *, allow_implicit_type: bool = False) -> bool:
     if not isinstance(schema, dict):
         return False
     schema_type = schema.get("type")
-    if isinstance(schema_type, list):
-        return bool(schema_type) and all(isinstance(member, str)
-            and _valid_schema_contract({**schema, "type": member}) for member in schema_type)
-    if schema_type not in {
-        "object",
-        "array",
-        "string",
-        "integer",
-        "number",
-        "boolean",
-        "null",
-    }:
-        return False
-    enum = schema.get("enum")
-    if enum is not None and (not isinstance(enum, list) or not enum):
-        return False
-    for key in ("minLength", "maxLength"):
-        value = schema.get(key)
-        if key in schema and (
-            not isinstance(value, int) or isinstance(value, bool) or value < 0
-        ):
+    if "type" in schema:
+        if isinstance(schema_type, list):
+            return bool(schema_type) and all(
+                isinstance(member, str)
+                and _valid_schema_contract({**schema, "type": member}, allow_implicit_type=allow_implicit_type)
+                for member in schema_type
+            )
+        if schema_type not in {
+            "object",
+            "array",
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "null",
+        }:
             return False
-    minimum_length = schema.get("minLength")
-    maximum_length = schema.get("maxLength")
+    elif not allow_implicit_type and not (_COMBINATOR_OR_VALUE_KEYS & set(schema)):
+        return False
+
+    enum = schema.get("enum")
+    if "enum" in schema and (not isinstance(enum, list) or not enum):
+        return False
+    if "pattern" in schema:
+        pattern = schema["pattern"]
+        if not isinstance(pattern, str):
+            return False
+        try:
+            re.compile(pattern)
+        except re.error:
+            return False
+    for key in ("minLength", "maxLength", "minItems", "maxItems"):
+        if key in schema and not _is_non_negative_int(schema[key]):
+            return False
     if (
-        isinstance(minimum_length, int)
-        and isinstance(maximum_length, int)
-        and minimum_length > maximum_length
+        "minLength" in schema
+        and "maxLength" in schema
+        and schema["minLength"] > schema["maxLength"]
     ):
         return False
-    for key in ("minimum", "maximum"):
-        if key in schema and (not isinstance(schema[key], (int, float)) or isinstance(schema[key], bool)):
+    if (
+        "minItems" in schema
+        and "maxItems" in schema
+        and schema["minItems"] > schema["maxItems"]
+    ):
+        return False
+    if "uniqueItems" in schema and not isinstance(schema["uniqueItems"], bool):
+        return False
+    for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+        if key in schema and not _is_finite_number(schema[key]):
             return False
     if "minimum" in schema and "maximum" in schema and schema["minimum"] > schema["maximum"]:
         return False
-    if schema_type == "object":
-        required = schema.get("required", [])
-        properties = schema.get("properties", {})
-        additional = schema.get("additionalProperties", True)
-        return (
-            isinstance(required, list)
-            and all(isinstance(item, str) and item for item in required)
-            and len(required) == len(set(required))
-            and isinstance(properties, dict)
-            and all(
-                isinstance(name, str)
-                and name
-                and _valid_schema_contract(property_schema)
-                for name, property_schema in properties.items()
-            )
-            and isinstance(additional, bool)
-        )
-    if schema_type == "array":
-        return "items" not in schema or _valid_schema_contract(schema["items"])
+    if (
+        "exclusiveMinimum" in schema
+        and "exclusiveMaximum" in schema
+        and schema["exclusiveMinimum"] >= schema["exclusiveMaximum"]
+    ):
+        return False
+    if "required" in schema:
+        required = schema["required"]
+        if (
+            not isinstance(required, list)
+            or not all(isinstance(item, str) and item for item in required)
+            or len(required) != len(set(required))
+        ):
+            return False
+    if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
+        return False
+    if "properties" in schema:
+        properties = schema["properties"]
+        if not isinstance(properties, dict) or not all(
+            isinstance(name, str)
+            and name
+            and _valid_schema_contract(property_schema, allow_implicit_type=allow_implicit_type)
+            for name, property_schema in properties.items()
+        ):
+            return False
+    if "items" in schema and not _valid_schema_contract(
+        schema["items"], allow_implicit_type=allow_implicit_type
+    ):
+        return False
+    for comb in ("oneOf", "anyOf", "allOf"):
+        if comb in schema:
+            branches = schema[comb]
+            if not isinstance(branches, list) or not branches or not all(
+                _valid_schema_contract(branch, allow_implicit_type=True) for branch in branches
+            ):
+                return False
+    for cond in ("if", "then", "else", "not"):
+        if cond in schema and not _valid_schema_contract(
+            schema[cond], allow_implicit_type=True
+        ):
+            return False
     return True
 
 
@@ -996,17 +1131,146 @@ def _matches_schema(value: object, schema: dict[str, object]) -> bool:
     return _schema_problem(value, schema) is None
 
 
+def _matches_json_type(value: object, schema_type: str) -> bool:
+    if schema_type == "object":
+        return isinstance(value, dict)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    return value is None
+
+
+def _not_expected_summary(not_schema: dict[str, object]) -> object:
+    if set(not_schema) == {"required"} and isinstance(not_schema["required"], list):
+        return {"forbidden_fields": list(not_schema["required"])}
+    return "must_not_match_disallowed_variant"
+
+
+def _branch_discriminator_values(branch: dict[str, object], key: str) -> list[object]:
+    props = branch.get("properties")
+    if not isinstance(props, dict):
+        return []
+    prop = props.get(key)
+    if not isinstance(prop, dict):
+        return []
+    if "const" in prop:
+        return [prop["const"]]
+    if isinstance(prop.get("enum"), list):
+        return list(prop["enum"])
+    return []
+
+
+def _best_branch_problem(
+    value: object,
+    branches: list[dict[str, object]],
+    failures: list[dict[str, object] | None],
+    path: tuple[str | int, ...],
+    keyword: str,
+) -> dict[str, object]:
+    if isinstance(value, dict):
+        # Detect single-field discriminator mismatch across all variants without echoing values.
+        prop_sets = [
+            set(branch["properties"])
+            for branch in branches
+            if isinstance(branch, dict) and isinstance(branch.get("properties"), dict)
+        ]
+        if prop_sets and len(prop_sets) == len(branches):
+            common_props = set.intersection(*prop_sets)
+            disc_candidates = []
+            for key in sorted(common_props):
+                per_branch = [_branch_discriminator_values(branch, key) for branch in branches]
+                if all(per_branch):
+                    disc_candidates.append((key, per_branch))
+            if len(disc_candidates) == 1:
+                disc_key, per_branch = disc_candidates[0]
+                if disc_key in value:
+                    submitted_val = value[disc_key]
+                    if not any(
+                        any(_json_equal(submitted_val, allowed) for allowed in opts)
+                        for opts in per_branch
+                    ):
+                        all_allowed: list[object] = []
+                        for opts in per_branch:
+                            for opt in opts:
+                                if not any(_json_equal(opt, seen) for seen in all_allowed):
+                                    all_allowed.append(opt)
+                        return {
+                            "path": [*path, disc_key],
+                            "requirement": "enum" if len(all_allowed) > 1 else "const",
+                            "expected": all_allowed if len(all_allowed) > 1 else all_allowed[0],
+                        }
+
+        scored: list[tuple[tuple[int, int, int, int], dict[str, object]]] = []
+        for idx, (branch, failure) in enumerate(zip(branches, failures)):
+            if failure is None or not isinstance(branch, dict):
+                continue
+            props = branch.get("properties")
+            disc_matches = 0
+            disc_mismatches = 0
+            if isinstance(props, dict):
+                for key, prop_schema in props.items():
+                    if not isinstance(prop_schema, dict) or key not in value:
+                        continue
+                    if "const" in prop_schema:
+                        if _json_equal(value[key], prop_schema["const"]):
+                            disc_matches += 1
+                        else:
+                            disc_mismatches += 1
+                    elif isinstance(prop_schema.get("enum"), list):
+                        if any(_json_equal(value[key], opt) for opt in prop_schema["enum"]):
+                            disc_matches += 1
+                        else:
+                            disc_mismatches += 1
+            req = branch.get("required")
+            req_present = (
+                sum(1 for key in req if key in value) if isinstance(req, list) else 0
+            )
+            failure_depth = max(0, len(failure["path"]) - len(path))
+            score = (
+                1 if disc_matches > 0 and disc_mismatches == 0 else 0,
+                disc_matches - disc_mismatches,
+                req_present + (1 if failure["requirement"] not in {"type", "const"} else 0),
+                failure_depth,
+                -idx,
+            )
+            scored.append((score, failure))
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+            best_score, best_failure = scored[0]
+            if best_score[0] > 0 or len(best_failure["path"]) > len(path):
+                return best_failure
+
+    deepest = [
+        failure
+        for failure in failures
+        if failure is not None and len(failure["path"]) > len(path)
+    ]
+    if deepest:
+        return max(deepest, key=lambda item: len(item["path"]))
+    return {"path": list(path), "requirement": keyword, "expected": "matching_variant"}
+
+
 def _schema_problem(
     value: object, schema: dict[str, object], path: tuple[str | int, ...] = (),
 ) -> dict[str, object] | None:
     """Explain the first failed contract check without echoing submitted values."""
+
     def problem(requirement: str, expected: object, at=path):
         return {"path": list(at), "requirement": requirement, "expected": expected}
 
+    if "const" in schema and not _json_equal(value, schema["const"]):
+        return problem("const", schema["const"])
     enum = schema.get("enum")
-    if isinstance(enum, list) and value not in enum:
+    if isinstance(enum, list) and not any(_json_equal(value, item) for item in enum):
         return problem("enum", enum)
-    schema_type = schema["type"]
+    schema_type = schema.get("type")
     if isinstance(schema_type, list):
         if any(_matches_schema(value, {**schema, "type": member}) for member in schema_type):
             return None
@@ -1016,9 +1280,10 @@ def _schema_problem(
             if candidate is not None and candidate["requirement"] != "type":
                 return candidate
         return problem("type", schema_type)
-    if schema_type == "object":
-        if not isinstance(value, dict):
-            return problem("type", "object")
+    if isinstance(schema_type, str) and not _matches_json_type(value, schema_type):
+        return problem("type", schema_type)
+
+    if isinstance(value, dict):
         properties = schema.get("properties", {})
         for name in schema.get("required", []):
             if name not in value:
@@ -1031,37 +1296,72 @@ def _schema_problem(
                 failure = _schema_problem(value[name], child, (*path, name))
                 if failure is not None:
                     return failure
-        return None
-    if schema_type == "array":
-        if not isinstance(value, list):
-            return problem("type", "array")
+    elif isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            return problem("minItems", schema["minItems"])
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            return problem("maxItems", schema["maxItems"])
+        if schema.get("uniqueItems") is True:
+            seen_items: list[object] = []
+            for item in value:
+                if any(_json_equal(item, prev) for prev in seen_items):
+                    return problem("uniqueItems", True)
+                seen_items.append(item)
         items = schema.get("items")
         if isinstance(items, dict):
             for index, item in enumerate(value):
                 failure = _schema_problem(item, items, (*path, index))
                 if failure is not None:
                     return failure
-        return None
-    if schema_type == "string":
-        if not isinstance(value, str):
-            return problem("type", "string")
-        for key, failed in (("minLength", len(value) < schema.get("minLength", 0)),
-                            ("maxLength", len(value) > schema.get("maxLength", len(value)))):
+    elif isinstance(value, str):
+        for key, failed in (
+            ("minLength", len(value) < schema.get("minLength", 0)),
+            ("maxLength", len(value) > schema.get("maxLength", len(value))),
+        ):
             if failed:
                 return problem(key, schema[key])
-        return None
-    if schema_type in {"integer", "number"}:
-        kinds = (int,) if schema_type == "integer" else (int, float)
-        if not isinstance(value, kinds) or isinstance(value, bool):
-            return problem("type", schema_type)
-        for key, failed in (("minimum", value < schema.get("minimum", value)),
-                            ("maximum", value > schema.get("maximum", value))):
+        if "pattern" in schema and re.search(schema["pattern"], value) is None:
+            return problem("pattern", schema["pattern"])
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        for key, failed in (
+            ("minimum", "minimum" in schema and value < schema["minimum"]),
+            ("maximum", "maximum" in schema and value > schema["maximum"]),
+            ("exclusiveMinimum", "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]),
+            ("exclusiveMaximum", "exclusiveMaximum" in schema and value >= schema["exclusiveMaximum"]),
+        ):
             if failed:
                 return problem(key, schema[key])
-        return None
-    if schema_type == "boolean":
-        return None if isinstance(value, bool) else problem("type", "boolean")
-    return None if value is None else problem("type", "null")
+
+    if "allOf" in schema:
+        for branch in schema["allOf"]:
+            failure = _schema_problem(value, branch, path)
+            if failure is not None:
+                return failure
+    if "if" in schema:
+        if _schema_problem(value, schema["if"], path) is None:
+            if "then" in schema:
+                failure = _schema_problem(value, schema["then"], path)
+                if failure is not None:
+                    return failure
+        elif "else" in schema:
+            failure = _schema_problem(value, schema["else"], path)
+            if failure is not None:
+                return failure
+    if "not" in schema and _schema_problem(value, schema["not"], path) is None:
+        return problem("not", _not_expected_summary(schema["not"]))
+    for keyword in ("oneOf", "anyOf"):
+        if keyword in schema:
+            branches = schema[keyword]
+            failures = [_schema_problem(value, branch, path) for branch in branches]
+            matched = sum(1 for item in failures if item is None)
+            if keyword == "oneOf":
+                if matched > 1:
+                    return problem("oneOf", "exactly_one_matching_variant")
+                if matched == 0:
+                    return _best_branch_problem(value, branches, failures, path, keyword)
+            elif matched == 0:
+                return _best_branch_problem(value, branches, failures, path, keyword)
+    return None
 
 
 def _post_handler_failure(
@@ -1178,19 +1478,27 @@ def _contract_tool_error(
         if key not in projected or projected[key] is None:
             projected[key] = value
     if error_audit_store is not None:
-        try:
-            projected["audit_ref"] = error_audit_store.record(contract).audit_ref
-        except Exception:
-            # A missing audit fact is an operational failure. Keep the original
-            # legacy code for callers, but route the projection to Operator.
-            projected.update({
-                "audit_status": "unavailable",
-                "audit_failure": "error_audit_write_failed",
-                "operator_required": True,
-                "recovery_owner": "operator",
-                "next_action": "escalate",
-                "category": "operator",
-            })
+        if not effect and phase == "input_validation":
+            projected["audit_ref"] = None
+            projected["audit_status"] = "skipped_read_only"
+        else:
+            try:
+                projected["audit_ref"] = error_audit_store.record(contract).audit_ref
+            except Exception:
+                projected.update({
+                    "audit_status": "unavailable",
+                    "audit_failure": "error_audit_write_failed",
+                })
+                if effect or contract.recovery_owner is not RecoveryOwner.AGENT:
+                    # A missing audit fact is an operational failure for effects or
+                    # non-agent errors. Keep the original legacy code for callers,
+                    # and route the projection to Operator.
+                    projected.update({
+                        "operator_required": True,
+                        "recovery_owner": "operator",
+                        "next_action": "escalate",
+                        "category": "operator",
+                    })
     return _tool_error(contract.legacy_code or contract.code, projected)
 
 

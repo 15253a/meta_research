@@ -606,6 +606,7 @@ class PlanStageWorker:
                         candidate=asdict(draft),
                         failure_code=failure_code,
                         detail_code=str(error),
+                        diagnostic=error.diagnostic,
                     )
                     provider_safe = False
                     self._transient_error = failure_code
@@ -687,6 +688,7 @@ class PlanStageWorker:
                 candidate=asdict(result),
                 failure_code=failure_code,
                 detail_code=str(error),
+                diagnostic=error.diagnostic,
             )
             self._transient_error = failure_code
             return _CycleStep(True, provider_boundary_attempted=False)
@@ -742,11 +744,18 @@ class PlanStageWorker:
         candidate: dict[str, object],
         failure_code: str,
         detail_code: str,
+        diagnostic: str | None = None,
     ) -> None:
         reject = (self._agent_runtime.reject_stage_local_candidate
                   if operation_name == "local" else self._agent_runtime.reject_stage_completion_candidate)
         source = ({"primary_draft_hash": run.primary_draft.draft_hash}
                   if operation_name == "local" else {})
+        feedback_items = [
+            "Return a corrected structured completion that satisfies "
+            f"{detail_code}, then resubmit it in this Root Session."
+        ]
+        if diagnostic:
+            feedback_items.append(diagnostic)
         reject(
             **source,
             unit_ref=run.primary_invocation.invocation_ref if operation_name == "local" else unit_ref,
@@ -757,10 +766,7 @@ class PlanStageWorker:
             candidate={"phase": operation_name, "result": candidate},
             reason_code=failure_code,
             detail_code=detail_code,
-            feedback=(
-                "Return a corrected structured completion that satisfies "
-                f"{detail_code}, then resubmit it in this Root Session.",
-            ),
+            feedback=tuple(feedback_items),
         )
 
     def _qualify(self, current: _CurrentCycle) -> _Qualification:

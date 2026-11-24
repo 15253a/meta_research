@@ -152,7 +152,9 @@ def validate_plan_skill_draft(
             evidence_revision=evidence_revision,
         )
     except PlanSkillContractError as error:
-        raise RecoverablePlanSkillCandidateError(str(error)) from error
+        raise RecoverablePlanSkillCandidateError(
+            str(error), diagnostic=error.diagnostic
+        ) from error
 
 
 def validate_plan_skill_result(
@@ -190,7 +192,9 @@ def validate_plan_skill_result(
             evidence_revision=evidence_revision,
         )
     except PlanSkillContractError as error:
-        raise RecoverablePlanSkillCandidateError(str(error)) from error
+        raise RecoverablePlanSkillCandidateError(
+            str(error), diagnostic=error.diagnostic
+        ) from error
 
     feedback_revision = request.owner_rejection_kind is not None
     if request.owner_rejection_kind not in {None, "domain", "completion"}:
@@ -224,7 +228,9 @@ def validate_plan_skill_result(
             final_plan_hash=final_hash,
         )
     except PlanSkillContractError as error:
-        raise RecoverablePlanSkillCandidateError(str(error)) from error
+        raise RecoverablePlanSkillCandidateError(
+            str(error), diagnostic=error.diagnostic
+        ) from error
     return draft_hash, final_hash, review_hash
 
 

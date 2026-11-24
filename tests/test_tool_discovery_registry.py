@@ -6,9 +6,9 @@ from meta_research.semantic_mcp import SemanticMcpGateway, SemanticOperation
 DISCOVERY = ("tools.catalog.page", "tools.contracts.read")
 
 
-def make_channel(gateway, operations):
+def make_channel(gateway, operations, *, root_kind="companion"):
     return gateway.issue_channel(run_ref="run", attempt_ref="attempt", root_session_ref="root",
-        fence_ref="fence", capability_binding_hash="a" * 64, root_kind="companion",
+        fence_ref="fence", capability_binding_hash="a" * 64, root_kind=root_kind,
         phase="primary", operation_ids=operations)[0]
 
 

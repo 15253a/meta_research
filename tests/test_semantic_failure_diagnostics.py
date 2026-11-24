@@ -86,7 +86,7 @@ def test_post_handler_failure_preserves_original_effect_for_reconciliation(failu
             inputs, outputs, access_mode="effect", reconciliation_operation_id="example.write.reconcile"),
         SemanticOperation("example.write.reconcile", "example", "Read original effect.", reconcile,
             inputs, outputs, access_mode="reconcile")))
-    channel = make_channel(gateway, gateway.operation_ids)
+    channel = make_channel(gateway, gateway.operation_ids, root_kind="plan")
     result = call(gateway, channel, "example.write", effect_id="original-effect")
     details = result["structuredContent"]["details"]
     assert details["execution_stage"] == ("handler" if failure == "exception" else "output_validation")
