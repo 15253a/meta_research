@@ -498,7 +498,9 @@ class _Owner:
         )
         return self.run
 
-    def reopen_failed_target_root(self, request_ref: str):
+    def reopen_failed_target_root(
+        self, request_ref: str, *, auth_refreshed_at: float | None = None
+    ):
         assert request_ref == self.run.request_ref
         replay = (
             self.run.failure_code

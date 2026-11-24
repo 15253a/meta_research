@@ -103,6 +103,7 @@ def recover_rejected_dispatch(
         original = replace(
             request, frontier=tuple(fields["frontier"]), state=fields["state"],
             inbox_checkpoint=fields["inbox_checkpoint"],
+            quest_goal_revision=fields.get("quest_goal_revision"),
         )
     except ProviderOperationUnavailable:
         raise
@@ -114,7 +115,8 @@ def recover_rejected_dispatch(
     except BundleSkillContractError as error:
         _correction(adapter, request, operation_name, str(error), session)
     if (original.frontier != request.frontier or original.state != request.state
-            or original.inbox_checkpoint != request.inbox_checkpoint):
+            or original.inbox_checkpoint != request.inbox_checkpoint
+            or original.quest_goal_revision != request.quest_goal_revision):
         _correction(adapter, request, operation_name, "bundle_operation_inputs_changed", session)
 
 
@@ -153,6 +155,7 @@ def recover_rejected_target_batch(
             request, current_targets=tuple(context["current_targets"]),
             target_commits=tuple(context["target_commits"]),
             inbox_checkpoint=context["inbox_checkpoint"],
+            quest_goal_revision=context.get("quest_goal_revision"),
         )
     except ProviderOperationUnavailable:
         raise
@@ -168,5 +171,6 @@ def recover_rejected_target_batch(
         _correction(adapter, request, operation_name, str(error), session)
     if (original.current_targets != request.current_targets
             or original.target_commits != request.target_commits
-            or original.inbox_checkpoint != request.inbox_checkpoint):
+            or original.inbox_checkpoint != request.inbox_checkpoint
+            or original.quest_goal_revision != request.quest_goal_revision):
         _correction(adapter, request, operation_name, "bundle_operation_inputs_changed", session)

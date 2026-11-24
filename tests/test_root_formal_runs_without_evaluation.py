@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from meta_research.formal_entities import formal_inventory, root_work_items
 from meta_research.owners.common import OwnerConflict, canonical_json
+from meta_research.target_run_finalizer import TargetRootOwnerRejection
 from test_root_formal_entities import _accept
 from test_target_root_finalizer import _root_finalizer_fixture
 
@@ -106,8 +107,10 @@ def test_unassessed_run_still_requires_a_real_variant_and_rolls_back_all_entitie
         document = json.loads(path.read_text())
         document['formal_runs'][0]['variant_ref'] = 'variant-does-not-exist'
         path.write_text(canonical_json(document))
-        with pytest.raises(OwnerConflict, match='target_formal_variant_definition_invalid'):
-            _accept(runtime, lifecycle, memory, handle, evidence)
+        rejected, _manifest = _accept(runtime, lifecycle, memory, handle, evidence)
+        assert type(rejected) is TargetRootOwnerRejection
+        assert rejected.issuer == 'research_graph'
+        assert rejected.code == 'target_formal_variant_definition_invalid'
         with runtime._database.read() as connection:
             for table in ('rg_variant_runs', 'rg_evaluation_attempts', 'rg_metric_results', 'rg_target_root_measurements', 'rg_target_commits'):
                 assert connection.exec_driver_sql('SELECT count(*) FROM ' + table).scalar_one() == 0

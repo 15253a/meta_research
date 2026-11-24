@@ -279,6 +279,43 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                       if k not in scientific_inputs
                       and not (isinstance(v, dict) and v.get("omitted_from_preview"))]
         if not candidates:
+            handoff_notes = view.get("current_handoff_notes")
+            if isinstance(handoff_notes, list) and handoff_notes:
+                if not all(
+                    isinstance(item, dict) and item.get("omitted_from_preview")
+                    for item in handoff_notes
+                ):
+                    view["current_handoff_notes"] = [
+                        {
+                            **{
+                                k: v
+                                for k, v in item.items()
+                                if k in ("stage", "source_commit_ref", "source_outcome_ref", "reader")
+                                and v is not None
+                            },
+                            "omitted_from_preview": True,
+                        }
+                        for item in handoff_notes
+                    ]
+                    view["section_delivery"]["current_handoff_notes"] = "omitted"
+                    continue
+                first_reader = (
+                    handoff_notes[0].get("reader")
+                    if isinstance(handoff_notes[0], dict)
+                    else None
+                )
+                fallback_reader = (
+                    reader(["upstream_stage_closure"])
+                    if "upstream_stage_closure" in context_pack
+                    else (first_reader if isinstance(first_reader, dict) else reader([]))
+                )
+                view["current_handoff_notes"] = {
+                    "omitted_from_preview": True,
+                    "count": len(handoff_notes),
+                    "reader": fallback_reader,
+                }
+                view["section_delivery"]["current_handoff_notes"] = "omitted"
+                continue
             raise ValueError("context_presentation_identity_too_large")
         _, key = max(candidates)
         sections[key] = {"omitted_from_preview": True, "reader": reader([key])}
@@ -442,7 +479,9 @@ def reasoning_handoff_reference(binding: dict) -> dict[str, object]:
 
 def stage_position_prompt(request, stage: str) -> str:
     """Render only the immutable position bound to this exact request."""
-    from meta_research.cycle_position import validate_cycle_position
-    position = request.context_pack.get("cycle_position")
-    validate_cycle_position(position, cycle_ref=request.context_pack["cycle_ref"])
-    return "cycle_position=" + _json({**position, "stage": stage}) + "\n"
+    from meta_research.cycle_position import format_cycle_position_line
+    return format_cycle_position_line(
+        request.context_pack.get("cycle_position"),
+        stage=stage,
+        cycle_ref=request.context_pack["cycle_ref"],
+    )

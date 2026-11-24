@@ -358,6 +358,8 @@ class ResearchMemoryTargetVerifier(Protocol):
 
     def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str: ...
 
+    def verify_managed_asset_content(self, memory_ref: str) -> None: ...
+
     def export_asset_entry(self, memory_ref: str, destination: Path,
                            *, entry_path: str | None = None) -> object: ...
 
@@ -611,6 +613,9 @@ class SQLiteTargetRunMemoryAuthority:
 
     def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str:
         return self._verifier.read_asset_entry_text(memory_ref, entry_path=entry_path)
+
+    def verify_managed_asset_content(self, memory_ref: str) -> None:
+        return self._verifier.verify_managed_asset_content(memory_ref)
 
     def export_asset_entry(self, memory_ref: str, destination: Path,
                            *, entry_path: str | None = None) -> object:
@@ -2545,6 +2550,52 @@ class SQLiteTargetRunGraphAuthority:
             self._verify_input_asset_version(target_ref=target_ref, selected=selected_input)
         return {ref: tuple(sorted(values)) for ref, values in sorted(selected.items())}
 
+    def _resolve_target_goal_revision_ref(
+        self, *, target_ref: str, append_ref: str | None, fallback_ref: str
+    ) -> str:
+        with self._database.read() as connection:
+            tables = {
+                str(r[0])
+                for r in connection.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table'")
+                ).all()
+            }
+            if "ar_target_launches" in tables:
+                launch_cols = {
+                    str(r[1])
+                    for r in connection.execute(
+                        text("PRAGMA table_info(ar_target_launches)")
+                    ).all()
+                }
+                if "goal_revision_ref" in launch_cols:
+                    launch_goal = connection.execute(
+                        text(
+                            "SELECT goal_revision_ref FROM ar_target_launches "
+                            "WHERE target_ref = :target_ref"
+                        ),
+                        {"target_ref": target_ref},
+                    ).scalar_one_or_none()
+                    if isinstance(launch_goal, str) and launch_goal:
+                        return launch_goal
+            if append_ref is not None and "rg_target_graph_appends" in tables:
+                append_cols = {
+                    str(r[1])
+                    for r in connection.execute(
+                        text("PRAGMA table_info(rg_target_graph_appends)")
+                    ).all()
+                }
+                if "goal_revision_ref" in append_cols:
+                    append_goal = connection.execute(
+                        text(
+                            "SELECT goal_revision_ref FROM rg_target_graph_appends "
+                            "WHERE append_ref = :append_ref"
+                        ),
+                        {"append_ref": append_ref},
+                    ).scalar_one_or_none()
+                    if isinstance(append_goal, str) and append_goal:
+                        return append_goal
+        return fallback_ref
+
     def query_target_reading_context(self, *, target_ref: str,
                                     research_note_directory: Path | None = None):
         return self.query_target_research_context(target_ref=target_ref,
@@ -2588,6 +2639,22 @@ class SQLiteTargetRunGraphAuthority:
             goal_revision_ref, quest_goal_revision = validate_stage_quest_goal_binding(
                 context, expected_quest_ref=graph.quest_ref
             )
+            effective_goal_ref = self._resolve_target_goal_revision_ref(
+                target_ref=target_ref,
+                append_ref=row.append_ref,
+                fallback_ref=goal_revision_ref,
+            )
+            if effective_goal_ref is not None and effective_goal_ref != goal_revision_ref:
+                from meta_research.owners.quest_goals import query_goal_revision_in_transaction
+                with self._database.read() as connection:
+                    evolved_goal = query_goal_revision_in_transaction(
+                        connection,
+                        quest_ref=graph.quest_ref,
+                        revision_ref=effective_goal_ref,
+                    )
+                if evolved_goal is not None:
+                    goal_revision_ref = effective_goal_ref
+                    quest_goal_revision = evolved_goal
             if (canonical_hash(context) != row.context_pack_hash
                 or context["cycle_ref"] != graph.cycle_ref
                 or canonical_json(context) != row.context_pack_json

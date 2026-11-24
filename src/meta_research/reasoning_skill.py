@@ -1319,6 +1319,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "to page the exact frozen revision and cite any verified record in that revision; "
             "the Owner checks actual cited record IDs, not preview membership."
         ) if request.native_session_ref is None else (
+            stage_position_prompt(request, "reasoning") +
             "继续当前原生会话的 Reasoning 工作。处理本次反馈，交回完整候选。\n"
             f"{lineage}"
             f"stage_request_ref={request.stage_request_ref}\n"

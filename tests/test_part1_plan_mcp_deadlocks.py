@@ -970,8 +970,6 @@ def test_readonly_bad_args_never_escalate_on_audit_failure_or_touch_audit_write_
             assert details["feedback_stage_agent"] is True
         assert broken_audit.record_calls == 0
 
-        # 2) Read-only handler agent-routed error still records audit attempt,
-        #    but audit failure must NOT escalate it to operator_required.
         _, ro_handler_resp = gateway.dispatch(
             conn.token,
             {
@@ -982,9 +980,9 @@ def test_readonly_bad_args_never_escalate_on_audit_failure_or_touch_audit_write_
             },
         )
         ro_details = ro_handler_resp["result"]["structuredContent"]["details"]
-        assert broken_audit.record_calls == 1
-        assert ro_details["audit_status"] == "unavailable"
-        assert ro_details["audit_failure"] == "error_audit_write_failed"
+        assert broken_audit.record_calls == 0
+        assert ro_details["audit_ref"] is None
+        assert ro_details["audit_status"] == "skipped_read_only"
         assert ro_details["operator_required"] is False
         assert ro_details["recovery_owner"] == "agent"
         assert ro_details["next_action"] == "correct_input"
@@ -1000,7 +998,7 @@ def test_readonly_bad_args_never_escalate_on_audit_failure_or_touch_audit_write_
             },
         )
         eff_details = eff_resp["result"]["structuredContent"]["details"]
-        assert broken_audit.record_calls == 2
+        assert broken_audit.record_calls == 1
         assert eff_details["audit_status"] == "unavailable"
         assert eff_details["operator_required"] is True
         assert eff_details["recovery_owner"] == "operator"

@@ -121,8 +121,8 @@ def test_stage_position_prefix_uses_frozen_focus_and_rejects_foreign_cycle():
                 "focus_source": {"outcome_ref": "previous-result", "transition_hash": "d" * 64}}
     request = SimpleNamespace(context_pack={"cycle_ref": "cycle", "cycle_position": position})
     prefix = stage_position_prompt(request, "idea")
-    assert prefix.startswith("cycle_position=")
-    assert json.loads(prefix.split("=", 1)[1])["cycle_focus"] == focus
+    assert prefix.startswith("当前你处于第 3 轮 Cycle（cycle）的 Idea 阶段。")
+    assert focus in prefix
     request.context_pack["cycle_ref"] = "foreign"
     with pytest.raises(ValueError, match="cycle_position_invalid"):
         stage_position_prompt(request, "idea")

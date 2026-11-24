@@ -61,7 +61,7 @@ def test_target_prompt_has_complete_selected_science_without_unrelated_briefs():
     assert 'UNRELATED_BRIEF_SENTINEL' not in prompt
     assert '中文'*6000 in prompt
     assert 'exact_context_path' not in prompt
-    assert prompt.startswith('cycle_position=')
+    assert prompt.startswith('当前你处于第 1 轮 Cycle（cycle:target）的 Target 阶段。当前 cycle focus 是：‘Audit patient split’。')
     assert '"execution_input_binding_receipt"' not in prompt
     assert 'Skill source:' in prompt
     context = json.loads(prompt.split('Exact Owner context:\n', 1)[1])

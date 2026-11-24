@@ -1819,6 +1819,7 @@ class CodexIdeaSkillAdapter:
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"provider_context_view={stage_context_json('idea', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         ) if request.native_session_ref is None else (
+            stage_position_prompt(request, "idea") +
             "继续当前原生会话的 Idea 工作。处理本次反馈，交回完整候选。\n"
             f"{lineage}"
             f"stage_request_ref={request.stage_request_ref}\n"
@@ -1967,6 +1968,7 @@ class CodexIdeaSkillAdapter:
             fence_ref=fence_ref, runtime_binding_hash=runtime_binding_hash,
             job_ref=job_ref, operation_name=operation_name, prompt=prompt,
             resident=self._root_resident_mcp.enabled,
+            include_direction=native_session_ref is None,
             native_session_ref=native_session_ref,
         )
         if not self._root_resident_mcp.enabled:
@@ -2878,8 +2880,25 @@ class CodexIdeaSkillAdapter:
                 native_session_ref=failed_native_session_ref,
             ) from error
         if effective_returncode != 0:
+            from meta_research.error_contract import PROVIDER_INSUFFICIENT_BALANCE
+            from meta_research.harness_adapters import (
+                _codex_turn_insufficient_balance,
+                _looks_like_auth_failure,
+                _parse_jsonl,
+                _stream_has_auth_failure,
+            )
+
+            events = _parse_jsonl(completed.stdout)
+            if _codex_turn_insufficient_balance(events):
+                failure_code = PROVIDER_INSUFFICIENT_BALANCE
+            elif _looks_like_auth_failure(completed.stderr) or _stream_has_auth_failure(
+                completed.stdout
+            ):
+                failure_code = "provider_auth_revoked"
+            else:
+                failure_code = "codex_cli_failed"
             raise IdeaSkillUnavailable(
-                "codex_cli_failed",
+                failure_code,
                 native_session_ref=failed_native_session_ref,
             )
         try:

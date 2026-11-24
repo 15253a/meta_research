@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import text
 
 from meta_research.bundle_contract import BundleContractError, validate_target_plan
+from meta_research.cycle_position import format_cycle_position_line
 from meta_research.owners.agent_runtime import AdmittedTargetLaunch
 from meta_research.owners.common import OwnerConflict
 from meta_research.target_run_runtime import TargetRunRuntime
@@ -86,7 +87,7 @@ def test_notes_free_real_admitted_launch_reaches_bound_target_root_prompt(
         assert "receipt 是证据元数据" in prompt
         assert "保留未知" in prompt
         research = material["research_context"]
-        position = json.loads(prompt.splitlines()[0].removeprefix("cycle_position="))
+        first_line = prompt.splitlines()[0]
         handle = runtime.target_run_authorities.agent_runtime.query_current_target_work_handle(target.target_ref)
         assert handle is not None
         with runtime._database.read() as connection:
@@ -97,8 +98,8 @@ def test_notes_free_real_admitted_launch_reaches_bound_target_root_prompt(
                 {"target": target.target_ref}).one()
         assert (launch.stage_request_ref, launch.graph_ref, launch.target_run_ref) == (
             persisted.stage_request_ref, persisted.graph_ref, persisted.target_run_ref)
-        assert position["cycle_ref"] == persisted.cycle_ref == graph.cycle_ref
-        assert position["stage"] == "target"
+        assert persisted.cycle_ref == graph.cycle_ref
+        assert f"（{graph.cycle_ref}）的 Target 阶段。" in first_line
         assert research["stage_request_ref"] == launch.stage_request_ref
         assert research["graph_ref"] == launch.graph_ref
         assert research["target_ref"] == handle.target_ref == launch.request.target_ref
@@ -115,7 +116,10 @@ def test_notes_free_real_admitted_launch_reaches_bound_target_root_prompt(
         original = runtime.target_run_authorities.research_graph.query_target_research_context(
             target_ref=target.target_ref)
         assert original["bundle_notes"] == research["bundle_notes"]
-        assert original["cycle_position"] == {key: value for key, value in position.items() if key != "stage"}
+        assert original["cycle_position"]["cycle_ref"] == persisted.cycle_ref == graph.cycle_ref
+        assert first_line == format_cycle_position_line(
+            original["cycle_position"], stage="target", cycle_ref=graph.cycle_ref
+        ).rstrip("\n")
         candidate = runtime.owners.research_graph.query_target_candidate_projection(
             target_ref=target.target_ref).candidate
         formal_plan = runtime.owners.research_graph.query_target_formal_plan_projection(

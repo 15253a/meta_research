@@ -85,6 +85,12 @@ def _audit_identity(facts: Mapping[str, Any]) -> str:
     return "error:" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
 
 
+def _is_business_unauthorized_code(code: str) -> bool:
+    return code.endswith("_unauthorized") and not code.endswith(
+        "_runtime_binding_unauthorized"
+    )
+
+
 def _is_unauthorized_capability_reason(reason: object) -> bool:
     return isinstance(reason, str) and (
         reason == "root_kind_not_owner" or reason.endswith("_unauthorized")
@@ -94,6 +100,10 @@ def _is_unauthorized_capability_reason(reason: object) -> bool:
 def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
     if code in {"provider_auth_revoked", "provider_authentication_required"}:
         return RecoveryOwner.OPERATOR
+    if code in {"stage_rejection_limit_reached", "target_rejection_limit_reached"}:
+        return RecoveryOwner.OPERATOR
+    if code in {"stage_rejection_backoff_pending", "target_rejection_backoff_pending"}:
+        return RecoveryOwner.SYSTEM
     if code == "mcp_channel_authentication_required":
         return RecoveryOwner.OPERATOR
     if code == "capability_unavailable":
@@ -102,9 +112,11 @@ def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
             return RecoveryOwner.OPERATOR
         if _is_unauthorized_capability_reason(reason):
             return RecoveryOwner.AGENT
+    if _is_business_unauthorized_code(code):
+        return RecoveryOwner.AGENT
     if any(token in code for token in ("audit", "persistence", "invariant", "corrupt", "readback")):
         return RecoveryOwner.OPERATOR
-    if any(token in code for token in ("schema", "input", "target_", "context", "authorization", "permission", "scope")):
+    if any(token in code for token in ("schema", "input", "target_", "context", "authorization", "permission", "scope", "research_query_")):
         return RecoveryOwner.AGENT
     if details.get("recovery_owner") in _ROUTING:
         return _ROUTING[str(details["recovery_owner"])]
@@ -114,8 +126,14 @@ def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
 def _status_for(code: str, details: Mapping[str, Any], *, effect: bool) -> EffectStatus:
     if code in {"provider_auth_revoked", "provider_authentication_required"}:
         return EffectStatus.REJECTED
+    if code in {"stage_rejection_limit_reached", "target_rejection_limit_reached"}:
+        return EffectStatus.REJECTED
+    if code in {"stage_rejection_backoff_pending", "target_rejection_backoff_pending"}:
+        return EffectStatus.WAITING
     if "fence_stale" in code or code in {"attempt_fence_stale", "stale_fence"}:
         return EffectStatus.STALE
+    if _is_business_unauthorized_code(code):
+        return EffectStatus.REJECTED
     raw = details.get("effect_status")
     legacy_statuses = {
         "not_applied": EffectStatus.NOT_STARTED,
@@ -256,10 +274,14 @@ def error_contract_from_legacy(
     """Map an existing code/details pair without changing Owner semantics."""
 
     raw = dict(details or {})
-    if code == PROVIDER_INSUFFICIENT_BALANCE and type(raw.get("next_retry_at")) in {int, float}:
+    if (
+        code in {PROVIDER_INSUFFICIENT_BALANCE, "stage_rejection_backoff_pending", "target_rejection_backoff_pending"}
+        and type(raw.get("next_retry_at")) in {int, float}
+    ):
         raw.setdefault("effect_status", "waiting")
         raw.setdefault("next_action", "wait")
-        raw.setdefault("recovery_component", "target_runtime")
+        if code == PROVIDER_INSUFFICIENT_BALANCE:
+            raw.setdefault("recovery_component", "target_runtime")
         raw.setdefault("handoff", {"next_retry_at": raw["next_retry_at"]})
     operation_id = str(raw.get("operation_id") or operation_id)
     effect_id = effect_id or (raw.get("effect_id") if isinstance(raw.get("effect_id"), str) else None)
@@ -315,6 +337,13 @@ def error_contract_from_legacy(
     correction = raw.get("correction") if isinstance(raw.get("correction"), str) else None
     if code in {"provider_auth_revoked", "provider_authentication_required"} and correction is None:
         correction = "Refresh the Provider authentication and rerun the failed operation after the Owner confirms the new credential."
+    if code in {"stage_rejection_limit_reached", "target_rejection_limit_reached"} and correction is None:
+        correction = (
+            "Consecutive owner rejections reached the configured limit. "
+            "Inspect rejection feedback and resume via operator acknowledgement "
+            "(acknowledge_stage_rejection_limit / acknowledge_target_rejection_limit) "
+            "or raise META_RESEARCH_REJECTION_MAX_CONSECUTIVE."
+        )
     if (
         code == "capability_unavailable"
         and _is_unauthorized_capability_reason(raw.get("reason"))
@@ -323,6 +352,13 @@ def error_contract_from_legacy(
         correction = (
             "This operation is not owned by the current root session and did not run. "
             "Do not retry or reconcile it here; switch to an owning root operation or hand off to an owning root."
+        )
+    if _is_business_unauthorized_code(code) and (
+        correction is None or "reconcile" in correction.lower()
+    ):
+        correction = (
+            "This operation is not authorized for the current root or phase and did not start an effect. "
+            "Stop calling it from this root or hand off to an authorized root."
         )
     if status is EffectStatus.NOT_STARTED and agent and (
         correction is None or "unknown" in correction.lower()

@@ -9,6 +9,7 @@ import pytest
 from alembic import command
 from sqlalchemy import create_engine, inspect, text
 
+from migration_support import schema_head
 import test_bundle_input_drift_recovery as bundle_drift_fixtures
 import test_bundle_skill_adapter as bundle_adapter_fixtures
 import test_idea_skill_contract as idea_fixtures
@@ -1547,7 +1548,7 @@ def test_migration_0090_preserves_reasoning_rows_and_enforces_cross_request_outc
     upgrade_database(db_path)
     after = _snapshot()
 
-    assert after["revision"] == "0090_reasoning_content_retry"
+    assert after["revision"] == schema_head()
     assert after["foreign_key_errors"] == []
     assert after["rows"] == before["rows"]
     assert after["foreign_keys"] == before["foreign_keys"]

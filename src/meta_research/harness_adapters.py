@@ -333,12 +333,14 @@ class _NativeCliHarnessAdapter:
         self._target_root_timeout_seconds = target_root_timeout_seconds
         self._cached_installation_profile: dict[str, object] | None = None
         self._diagnostic_incarnation_ref: str | None = None
+        self._codex_home: Path | None = None
         self._codex_child_ledger_reader = codex_child_ledger_reader
-        if self.family == "codex" and codex_child_ledger_reader is None:
+        if self.family == "codex":
             configured_codex_home = codex_home or (
                 Path(value) if (value := os.environ.get("CODEX_HOME")) else None
             )
-            if configured_codex_home is not None:
+            self._codex_home = configured_codex_home
+            if configured_codex_home is not None and codex_child_ledger_reader is None:
                 self._codex_child_ledger_reader = CodexHomeLedgerReader(
                     configured_codex_home
                 )

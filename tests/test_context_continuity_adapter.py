@@ -20,7 +20,7 @@ def test_root_finishes_independent_review_before_single_provider_return(tmp_path
     prompt = runner.calls[0][1]
     assert "独立" in prompt and "子智能体" in prompt
     assert "下一次 resumed review turn" not in prompt
-    assert prompt.startswith("cycle_position=")
+    assert prompt.startswith("当前你处于第 1 轮 Cycle（cycle:1）的 Plan 阶段。当前 cycle focus 是：‘Review the exact negative results’。")
     assert result.final_plan == result.reviewed_draft
 
 

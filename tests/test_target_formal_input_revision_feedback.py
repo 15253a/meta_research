@@ -99,15 +99,19 @@ def test_unrelated_formal_domain_error_still_rolls_back_entire_acceptance(tmp_pa
             evidence_reader=_EvidenceReader(evidence), measurement_authority=graph, graph_authority=graph)
         with runtime._database.read() as connection:
             graph_state = dict(connection.execute(text("SELECT * FROM research_graph_state")).mappings().one())
-        with pytest.raises(OwnerConflict, match="target_formal_evaluation_definition_invalid"):
-            finalizer.finalize(handle=handle, evidence=evidence)
+        rejected = finalizer.finalize(handle=handle, evidence=evidence)
+        assert rejected.status == "revision_required"
+        assert rejected.pending_code == "target_formal_evaluation_definition_invalid"
         with runtime._database.read() as connection:
             for table in ("rg_variant_runs", "rg_evaluation_attempts", "rg_metric_results",
-                          "rg_target_root_measurements", "rg_target_commits", "ar_target_root_completion_rejections"):
+                          "rg_target_root_measurements", "rg_target_commits"):
                 assert connection.execute(text("SELECT COUNT(*) FROM " + table)).scalar_one() == 0
+            assert connection.execute(text("SELECT COUNT(*) FROM ar_target_root_completion_rejections")).scalar_one() == 1
             assert dict(connection.execute(text("SELECT * FROM research_graph_state")).mappings().one()) == graph_state
         original = lifecycle.query_completion(handle.target_ref)
-        assert original is not None and lifecycle.query_completion_rejection(original.completion_ref) is None
+        assert original is not None
+        rejection = lifecycle.query_completion_rejection(original.completion_ref)
+        assert rejection is not None and rejection.code == "target_formal_evaluation_definition_invalid"
         assert memory.query_for_completion(original.completion_ref) is not None
     finally:
         runtime.close()

@@ -65,6 +65,6 @@ def test_confirmed_material_scope_is_readable_and_retained_without_rebinding_the
         retained = next(item for item in discovered["retained_treatments"] if item["reference_ref"] == observed["reference"])
         assert retained["source_guidance"] == observed["provenance"]
         assert retained["receiver"] == observed["receiver"]
-        assert observed["reference"] not in [item["reference_ref"] for item in discovered["references"]]
+        assert observed["reference"] in [item["reference_ref"] for item in discovered["references"]]
     finally:
         runtime.close()

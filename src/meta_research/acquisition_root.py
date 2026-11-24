@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -34,6 +35,81 @@ from meta_research.root_workspace import RootWorkspaces
 
 
 _ROOT_SESSION_RECEIPT_SCHEMA = "meta-research/acquisition-root-session/v1"
+_TARGETLESS_PREFLIGHT_REASONS = frozenset(
+    {
+        "missing_paper_targets",
+        "no_paper_targets",
+        "no_targets",
+        "empty_targets",
+        "targets_not_supplied",
+        "paper_targets_missing",
+        "targetless",
+    }
+)
+_UNHEALTHY_PREFLIGHT_STATES = frozenset(
+    {"unavailable", "waiting", "broken", "invalid", "failed", "fail", "failure", "error", "errors", "missing"}
+)
+_HEALTHY_EXPLICIT_STATES = frozenset({"ok", "ready", "healthy", "not_required", "no_error", "no_errors"})
+_BAD_BROWSER_EXACT = frozenset({"not_connected", "disconnected", "skipped", *_UNHEALTHY_PREFLIGHT_STATES})
+_BAD_RESOURCE_EXACT = frozenset({"unverified", "login_required", "denied", "no_targets", *_UNHEALTHY_PREFLIGHT_STATES})
+
+
+def _is_targetless_preflight_reason(reason_code: object) -> bool:
+    if not isinstance(reason_code, str) or not reason_code:
+        return False
+    normalized = reason_code.strip().lower()
+    if normalized in _TARGETLESS_PREFLIGHT_REASONS:
+        return True
+    if "institution" in normalized:
+        return False
+    return "paper_target" in normalized and any(
+        token in normalized for token in ("no_", "missing", "empty", "without")
+    )
+
+
+def _non_empty_lower(evidence: object, key: str) -> str | None:
+    if not isinstance(evidence, dict):
+        return None
+    val = evidence.get(key)
+    if not isinstance(val, str) or not val.strip():
+        return None
+    return val.strip().lower()
+
+
+def _tokens_for(normalized: str) -> set[str]:
+    return {tok for tok in re.split(r"[^a-z0-9]+", normalized) if tok}
+
+
+def _has_disallowed_state(normalized: str, bad_words: frozenset[str]) -> bool:
+    if normalized in _HEALTHY_EXPLICIT_STATES:
+        return False
+    if normalized in bad_words:
+        return True
+    tokens = _tokens_for(normalized)
+    if not tokens:
+        return True
+    if "no" in tokens:
+        tokens = tokens - {"no", "error", "errors"}
+    return bool(tokens & bad_words)
+
+
+def _configuration_health_ready(evidence: object) -> bool:
+    normalized = _non_empty_lower(evidence, "configuration_health")
+    if normalized is None:
+        return False
+    return not _has_disallowed_state(normalized, _UNHEALTHY_PREFLIGHT_STATES)
+
+
+def _institution_evidence_ready(evidence: object) -> bool:
+    if not _configuration_health_ready(evidence):
+        return False
+    browser = _non_empty_lower(evidence, "browser_control")
+    resource = _non_empty_lower(evidence, "authorized_resource")
+    if browser is None or resource is None:
+        return False
+    if _has_disallowed_state(browser, _BAD_BROWSER_EXACT):
+        return False
+    return not _has_disallowed_state(resource, _BAD_RESOURCE_EXACT)
 
 
 class CodexAcquisitionRootAdapter(AcquisitionProvider):
@@ -152,12 +228,29 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         if (
             request.mode in {"oa_only", "provided_only"}
             and result.status == "unavailable"
-            and result.reason_code == "missing_paper_targets"
-            and isinstance(result.evidence, dict)
+            and _is_targetless_preflight_reason(result.reason_code)
+            and _configuration_health_ready(result.evidence)
         ):
             result = AcquisitionPreflightResult(
                 status="ready",
                 browser_context_ref=None,
+                reason_code=None,
+                evidence={
+                    **result.evidence,
+                    "targetless_session_preflight": "accepted",
+                },
+            )
+        elif (
+            request.mode == "oa_then_institution"
+            and result.status == "unavailable"
+            and _is_targetless_preflight_reason(result.reason_code)
+            and isinstance(result.browser_context_ref, str)
+            and bool(result.browser_context_ref.strip())
+            and _institution_evidence_ready(result.evidence)
+        ):
+            result = AcquisitionPreflightResult(
+                status="ready",
+                browser_context_ref=result.browser_context_ref,
                 reason_code=None,
                 evidence={
                     **result.evidence,
@@ -330,11 +423,15 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
     def _prompt(phase, task, *, initial):
         provider_root = Path(__file__).with_name("skills") / "deepfetch_v4" / "providers" / "nature-downloader"
         skill_path = provider_root / "SKILL.md"
+        phase_instruction = (
+            "本阶段仅为预检（preflight）：检查配置目录、工具可用性及对应模式前置访问条件即可，此时尚无目标论文列表（targets），不得以无目标论文判为 unavailable；"
+            if phase == "preflight"
+            else "本阶段为批次获取（batch）：按本请求明确模式取得并核实指定论文，逐篇交回实际状态。先查看本工作区已有记录，复用有效快捷路径，失效时仅修相关环节；已完成文件不重新下载。"
+        )
         prompt = (
             "你是长期专用 Acquisition 下载 Session。按本请求明确模式自主使用真实工具，"
-            "取得并核实指定论文；逐篇交回实际状态。先查看本工作区已有记录，复用有效快捷路径，"
-            "失效时仅修相关环节。普通笔记保留路径、适用条件与失败弯路，凭据留受控配置；"
-            "笔记不建立跨账号授权。已完成文件不重新下载。\n"
+            + phase_instruction
+            + "\n普通笔记保留路径、适用条件与失败弯路，凭据留受控配置；笔记不建立跨账号授权。\n"
             "若需要人处理访问，调用 human_request.open 并核对正式回执；waiting_user"
             "或求助文本不代表已投递。收到回应先沿原 effect 调用 human_request.open.reconcile，"
             "读取回应并复验连接，再接续未完成项。未知效果先检查既有 manifest／产物／操作。\n"
@@ -342,7 +439,8 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             "脚本与相对链接均相对此目录；原生 shell/file 工具可直接运行脚本。"
             "压缩后若缺少获取规则，从该source重读完整Skill及触发的参考，保留同一工作区及现有产物。"
             "调用所有下载和配置脚本时将 LIT_DL_CONFIG_DIR 设为本请求 provider_state_dir/nature-downloader-config，"
-            "使用这份私有配置；本次 provided_only 仅核实已提供正文，oa_only 传 --no-institutional-access。\n"
+            "使用这份私有配置；provided_only 仅核实已提供正文，oa_only 传 --no-institutional-access，"
+            "oa_then_institution 先尝试公开 OA 获取、仅在 OA 无法获取正文时再启用机构访问（必要时通过 browser/人工求助）。\n"
             f"phase={phase}\nrequest={canonical_json(task)}"
         )
         if initial:

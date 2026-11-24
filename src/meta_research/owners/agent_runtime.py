@@ -99,6 +99,9 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
+from meta_research.error_audit import ERROR_AUDIT_EVENT_TYPE, ErrorAuditStore
+from meta_research.error_contract import error_contract_from_legacy
+from meta_research.rejection_backoff import evaluate_rejection_backoff
 from meta_research.root_capabilities import (
     RootAgentKind,
     root_capability_profile,
@@ -1039,6 +1042,13 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         fence_ref: str | None,
         unit_kind: str,
     ) -> None: ...
+
+    def acknowledge_stage_rejection_limit(
+        self,
+        *,
+        run_ref: str,
+        operator_note: str | None = None,
+    ) -> dict[str, object]: ...
 
 
     def acknowledge_provider_safe_point(
@@ -2778,6 +2788,55 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             launch_bindings,
         )
         now = time.time()
+        launch_goal_revision_ref = None
+        if (
+            connection.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='rg_quest_goal_heads'"
+                )
+            ).first()
+            is not None
+        ):
+            launch_goal_revision_ref = connection.execute(
+                text(
+                    "SELECT current_revision_ref FROM rg_quest_goal_heads "
+                    "WHERE quest_ref = :quest_ref"
+                ),
+                {"quest_ref": verification.quest_ref},
+            ).scalar_one_or_none()
+        if (
+            launch_goal_revision_ref is None
+            and connection.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='rg_quests'"
+                )
+            ).first()
+            is not None
+        ):
+            rg_quest_cols = {
+                str(r[1])
+                for r in connection.execute(
+                    text("PRAGMA table_info(rg_quests)")
+                ).all()
+            }
+            if "initial_goal_revision_ref" in rg_quest_cols:
+                launch_goal_revision_ref = connection.execute(
+                    text(
+                        "SELECT initial_goal_revision_ref FROM rg_quests "
+                        "WHERE quest_ref = :quest_ref"
+                    ),
+                    {"quest_ref": verification.quest_ref},
+                ).scalar_one_or_none()
+        launch_cols = {
+            str(r[1])
+            for r in connection.execute(
+                text("PRAGMA table_info(ar_target_launches)")
+            ).all()
+        }
+        launch_goal_col = "goal_revision_ref, " if "goal_revision_ref" in launch_cols else ""
+        launch_goal_param = ":goal_revision_ref, " if "goal_revision_ref" in launch_cols else ""
         connection.execute(
             text(
                 "INSERT INTO ar_target_launches (launch_ref, operation_ref, "
@@ -2799,7 +2858,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "dispatch_receipt_ref, dispatch_receipt_hash, "
                 "human_request_ref, human_waiter_ref, "
                 "human_waiter_generation, human_authorization_receipt_ref, "
-                "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                f"{launch_goal_col}idempotency_key, request_hash, "
+                "receipt_ref, receipt_hash, "
                 "admitted_at) VALUES (:launch_ref, :operation_ref, "
                 ":target_ref, :graph_ref, :stage_request_ref, :quest_ref, "
                 ":target_spec_content_hash_ref, :target_spec_receipt_ref, "
@@ -2815,8 +2875,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 ":dispatch_decision_ref, :dispatch_receipt_ref, "
                 ":dispatch_receipt_hash, :human_request_ref, "
                 ":human_waiter_ref, :human_waiter_generation, "
-                ":human_authorization_receipt_ref, :idempotency_key, "
-                ":request_hash, :receipt_ref, :receipt_hash, :admitted_at)"
+                f":human_authorization_receipt_ref, {launch_goal_param}"
+                ":idempotency_key, :request_hash, :receipt_ref, :receipt_hash, "
+                ":admitted_at)"
             ),
             {
                 **launch_bindings,
@@ -2833,6 +2894,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 "accepted_input_asset_proofs_json": (
                     accepted_input_asset_proofs_json
                 ),
+                **({"goal_revision_ref": launch_goal_revision_ref} if "goal_revision_ref" in launch_cols else {}),
                 "idempotency_key": idempotency_key,
                 "request_hash": request_hash,
                 "receipt_ref": receipt_ref,
@@ -8275,6 +8337,85 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         if not unit_ref or len(unit_ref) > 96:
             raise OwnerConflict("runtime_provider_unit_invalid")
         now = time.time()
+        if unit_kind.endswith("_primary"):
+            deferred_fast: tuple[str, float | None, str, int, int, str | None] | None = None
+            with self._database.read() as connection:
+                control = connection.execute(
+                    text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                    {"run_ref": run_ref},
+                ).first()
+                if (
+                    control is not None
+                    and control.run_kind == _PROVIDER_UNIT_RUN_KINDS[unit_kind]
+                    and control.attempt_ref == attempt_ref
+                    and control.fence_ref == fence_ref
+                ):
+                    existing = connection.execute(
+                        text("SELECT unit_ref FROM ar_provider_units WHERE unit_ref = :unit_ref"),
+                        {"unit_ref": unit_ref},
+                    ).first()
+                    if existing is None and not _provider_quiescence_requested(connection, run_ref):
+                        try:
+                            fast_op_ref: str | None = (
+                                operation_ref
+                                if operation_ref is not None
+                                else _provider_operation_for_unit(
+                                    connection, unit_ref=unit_ref, run_ref=run_ref
+                                )
+                            )
+                        except OwnerConflict:
+                            fast_op_ref = None
+                        if fast_op_ref and len(fast_op_ref) <= 128:
+                            fence_ok = True
+                            if fence_ref is not None:
+                                try:
+                                    _assert_runtime_control_allows(connection, run_ref, fence_ref)
+                                except OwnerConflict:
+                                    fence_ok = False
+                            if fence_ok:
+                                decision, next_retry_at, consecutive_rejections, ack_gen = (
+                                    _stage_rejection_backoff_state(
+                                        connection,
+                                        run_ref=run_ref,
+                                        attempt_ref=attempt_ref,
+                                        now=now,
+                                    )
+                                )
+                                if decision in {"limit_reached", "backoff_pending"}:
+                                    existing_audit_ref = (
+                                        _find_existing_rejection_audit_ref(
+                                            connection,
+                                            run_ref=run_ref,
+                                            attempt_ref=attempt_ref,
+                                            unit_kind=unit_kind,
+                                            operation_ref=fast_op_ref,
+                                            consecutive_rejections=consecutive_rejections,
+                                            ack_gen=ack_gen,
+                                        )
+                                        if decision == "limit_reached"
+                                        else None
+                                    )
+                                    deferred_fast = (
+                                        decision,
+                                        next_retry_at,
+                                        fast_op_ref,
+                                        consecutive_rejections,
+                                        ack_gen,
+                                        existing_audit_ref,
+                                    )
+            if deferred_fast is not None:
+                self._raise_stage_rejection_conflict(
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    unit_kind=unit_kind,
+                    decision=deferred_fast[0],
+                    next_retry_at=deferred_fast[1],
+                    operation_ref=deferred_fast[2],
+                    consecutive_rejections=deferred_fast[3],
+                    ack_gen=deferred_fast[4],
+                    existing_audit_ref=deferred_fast[5],
+                )
+        deferred_write: tuple[str, float | None, str, int, int, str | None] | None = None
         with self._database.write() as connection:
             control = connection.execute(
                 text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
@@ -8350,45 +8491,89 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     )
             else:
                 _assert_provider_derivation_not_quiescing(connection, run_ref)
-                active = connection.execute(
-                    text(
-                        "SELECT unit_ref FROM ar_provider_units WHERE run_ref = "
-                        ":run_ref AND status = 'active' LIMIT 1"
-                    ),
-                    {"run_ref": run_ref},
-                ).first()
-                if active is not None:
-                    raise OwnerConflict("runtime_provider_unit_busy")
-                connection.execute(
-                    text(
-                        "INSERT INTO ar_provider_units (unit_ref, operation_ref, "
-                        "run_ref, attempt_ref, fence_ref, unit_kind, status, "
-                        "started_at, completed_at) VALUES (:unit_ref, "
-                        ":operation_ref, :run_ref, :attempt_ref, :fence_ref, "
-                        ":unit_kind, 'active', :now, NULL)"
-                    ),
-                    {
-                        "unit_ref": unit_ref,
-                        "operation_ref": resolved_operation_ref,
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "fence_ref": fence_ref,
-                        "unit_kind": unit_kind,
-                        "now": now,
-                    },
-                )
-                claim_started_at = now
-                self._feed.record(
-                    connection,
-                    "agent_runtime.provider_unit_started",
-                    {
-                        "unit_ref": unit_ref,
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "fence_ref": fence_ref,
-                        "unit_kind": unit_kind,
-                    },
-                )
+                if unit_kind.endswith("_primary"):
+                    decision, next_retry_at, consecutive_rejections, ack_gen = (
+                        _stage_rejection_backoff_state(
+                            connection,
+                            run_ref=run_ref,
+                            attempt_ref=attempt_ref,
+                            now=now,
+                        )
+                    )
+                    if decision in {"limit_reached", "backoff_pending"}:
+                        existing_audit_ref = (
+                            _find_existing_rejection_audit_ref(
+                                connection,
+                                run_ref=run_ref,
+                                attempt_ref=attempt_ref,
+                                unit_kind=unit_kind,
+                                operation_ref=resolved_operation_ref,
+                                consecutive_rejections=consecutive_rejections,
+                                ack_gen=ack_gen,
+                            )
+                            if decision == "limit_reached"
+                            else None
+                        )
+                        deferred_write = (
+                            decision,
+                            next_retry_at,
+                            resolved_operation_ref,
+                            consecutive_rejections,
+                            ack_gen,
+                            existing_audit_ref,
+                        )
+                if deferred_write is None:
+                    active = connection.execute(
+                        text(
+                            "SELECT unit_ref FROM ar_provider_units WHERE run_ref = "
+                            ":run_ref AND status = 'active' LIMIT 1"
+                        ),
+                        {"run_ref": run_ref},
+                    ).first()
+                    if active is not None:
+                        raise OwnerConflict("runtime_provider_unit_busy")
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_provider_units (unit_ref, operation_ref, "
+                            "run_ref, attempt_ref, fence_ref, unit_kind, status, "
+                            "started_at, completed_at) VALUES (:unit_ref, "
+                            ":operation_ref, :run_ref, :attempt_ref, :fence_ref, "
+                            ":unit_kind, 'active', :now, NULL)"
+                        ),
+                        {
+                            "unit_ref": unit_ref,
+                            "operation_ref": resolved_operation_ref,
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                            "unit_kind": unit_kind,
+                            "now": now,
+                        },
+                    )
+                    claim_started_at = now
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.provider_unit_started",
+                        {
+                            "unit_ref": unit_ref,
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                            "unit_kind": unit_kind,
+                        },
+                    )
+        if deferred_write is not None:
+            self._raise_stage_rejection_conflict(
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                unit_kind=unit_kind,
+                decision=deferred_write[0],
+                next_retry_at=deferred_write[1],
+                operation_ref=deferred_write[2],
+                consecutive_rejections=deferred_write[3],
+                ack_gen=deferred_write[4],
+                existing_audit_ref=deferred_write[5],
+            )
         if self._runtime_protection is not None:
             try:
                 self._runtime_protection.acquire(
@@ -8404,6 +8589,97 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             except RuntimeProtectionUnavailable as error:
                 raise OwnerConflict(error.code) from error
 
+
+    def _raise_stage_rejection_conflict(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str | None,
+        unit_kind: str,
+        decision: str,
+        next_retry_at: float | None,
+        operation_ref: str,
+        consecutive_rejections: int,
+        ack_gen: int,
+        existing_audit_ref: str | None = None,
+    ) -> None:
+        if decision == "backoff_pending":
+            raise OwnerConflict(
+                "stage_rejection_backoff_pending",
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "consecutive_rejections": consecutive_rejections,
+                    "next_retry_at": next_retry_at,
+                },
+            )
+        contract = _stage_rejection_limit_contract(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            unit_kind=unit_kind,
+            operation_ref=operation_ref,
+            consecutive_rejections=consecutive_rejections,
+            ack_gen=ack_gen,
+        )
+        audit_ref = (
+            existing_audit_ref
+            if existing_audit_ref is not None
+            else ErrorAuditStore(self._database, self._feed).record(contract).audit_ref
+        )
+        raise OwnerConflict(
+            "stage_rejection_limit_reached",
+            {
+                **contract.as_details(),
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "consecutive_rejections": consecutive_rejections,
+                "acknowledged_up_to_generation": ack_gen,
+                "audit_ref": audit_ref,
+                "correlation_ref": contract.correlation_ref,
+                "operator_required": True,
+                "recovery_owner": "operator",
+            },
+        )
+
+    def acknowledge_stage_rejection_limit(
+        self,
+        *,
+        run_ref: str,
+        operator_note: str | None = None,
+    ) -> dict[str, object]:
+        """Record explicit operator acknowledgement to reset trailing rejection pause."""
+        now = time.time()
+        with self._database.fenced_write() as connection:
+            run_row = connection.execute(
+                text(
+                    "SELECT run_ref, stage, current_attempt_ref FROM ar_stage_runs "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            if run_row is None:
+                raise OwnerConflict("stage_run_not_found")
+            max_gen = connection.execute(
+                text(
+                    "SELECT COALESCE(MAX(generation), 0) FROM ar_stage_attempts "
+                    "WHERE run_ref = :run_ref AND status = 'rejected'"
+                ),
+                {"run_ref": run_ref},
+            ).scalar_one()
+            payload = {
+                "run_ref": run_ref,
+                "stage": str(run_row.stage),
+                "attempt_ref": run_row.current_attempt_ref,
+                "acknowledged_up_to_generation": int(max_gen or 0),
+                "acknowledged_at": now,
+                "operator_note": operator_note,
+            }
+            revision = self._feed.record(
+                connection,
+                STAGE_REJECTION_LIMIT_ACK_EVENT,
+                payload,
+            )
+        return {"revision": revision, **payload}
 
     def record_stage_provider_hard_ceiling(
         self,
@@ -30761,6 +31037,107 @@ def _runtime_quiescence_receipt(row) -> dict[str, object]:
             }
         ),
     }
+
+
+STAGE_REJECTION_LIMIT_ACK_EVENT = "agent_runtime.stage_rejection_limit_acknowledged"
+
+
+def _stage_rejection_limit_contract(
+    *,
+    run_ref: str,
+    attempt_ref: str | None,
+    unit_kind: str,
+    operation_ref: str,
+    consecutive_rejections: int,
+    ack_gen: int,
+):
+    del operation_ref
+    correlation_ref = f"stage_run:{run_ref}:attempt:{attempt_ref}"
+    return error_contract_from_legacy(
+        "stage_rejection_limit_reached",
+        {
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "unit_kind": unit_kind,
+            "consecutive_rejections": consecutive_rejections,
+            "acknowledged_up_to_generation": ack_gen,
+        },
+        phase="admission",
+        operation_id=f"agent_runtime.begin_provider_unit.{unit_kind}",
+        effect=False,
+        operation_ref=f"stage_rejection_limit:{run_ref}:{attempt_ref}:{ack_gen}",
+        correlation_ref=correlation_ref,
+    )
+
+
+def _find_existing_rejection_audit_ref(
+    connection,
+    *,
+    run_ref: str,
+    attempt_ref: str | None,
+    unit_kind: str,
+    operation_ref: str,
+    consecutive_rejections: int,
+    ack_gen: int,
+) -> str | None:
+    contract = _stage_rejection_limit_contract(
+        run_ref=run_ref,
+        attempt_ref=attempt_ref,
+        unit_kind=unit_kind,
+        operation_ref=operation_ref,
+        consecutive_rejections=consecutive_rejections,
+        ack_gen=ack_gen,
+    )
+    row = connection.execute(
+        text(
+            "SELECT 1 FROM durable_feed WHERE event_type = :event_type "
+            "AND json_extract(payload_json, '$.audit_ref') = :audit_ref LIMIT 1"
+        ),
+        {"event_type": ERROR_AUDIT_EVENT_TYPE, "audit_ref": contract.audit_ref},
+    ).first()
+    return contract.audit_ref if row is not None else None
+
+
+def _stage_rejection_backoff_state(
+    connection,
+    *,
+    run_ref: str,
+    attempt_ref: str | None,
+    now: float,
+) -> tuple[str | None, float | None, int, int]:
+    ack_row = connection.execute(
+        text(
+            "SELECT json_extract(payload_json, '$.acknowledged_up_to_generation') AS ack_gen "
+            "FROM durable_feed WHERE event_type = :event_type "
+            "AND json_extract(payload_json, '$.run_ref') = :run_ref "
+            "ORDER BY revision DESC LIMIT 1"
+        ),
+        {"event_type": STAGE_REJECTION_LIMIT_ACK_EVENT, "run_ref": run_ref},
+    ).first()
+    ack_gen = int(ack_row.ack_gen) if ack_row is not None and ack_row.ack_gen is not None else 0
+    attempt_rows = connection.execute(
+        text(
+            "SELECT generation, attempt_ref, status, closed_at FROM ar_stage_attempts "
+            "WHERE run_ref = :run_ref ORDER BY generation DESC"
+        ),
+        {"run_ref": run_ref},
+    ).all()
+    consecutive_rejections = 0
+    anchor_at: float | None = None
+    for row in attempt_rows:
+        if row.attempt_ref == attempt_ref:
+            continue
+        if row.status != "rejected" or int(row.generation) <= ack_gen:
+            break
+        consecutive_rejections += 1
+        if anchor_at is None and row.closed_at is not None:
+            anchor_at = float(row.closed_at)
+    decision, next_retry_at = evaluate_rejection_backoff(
+        consecutive_rejections=consecutive_rejections,
+        anchor_at=now if anchor_at is None else anchor_at,
+        now=now,
+    )
+    return decision, next_retry_at, consecutive_rejections, ack_gen
 
 
 def _assert_runtime_control_allows(connection, run_ref: str, fence_ref: str) -> None:

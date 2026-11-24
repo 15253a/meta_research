@@ -54,7 +54,7 @@ idea、plan、reasoning 共享 stage attempt and runtime binding。deepfetch 和
 
 `effect_status` 只有 `not_started`、`applied`、`waiting`、`rejected`、`unknown`、`stale`、`cancelled`。`unknown` 默认禁止重试并要求同一 effect reconcile。`stale` 禁止写入。Agent correction 从 `rejected` 回到 `not_started` 时要求新 effect identity。`unknown` 没有 terminal evidence 不能转为 `applied`。
 
-`SemanticMcpGateway` 现在把 schema mismatch、effect operation 的 capability rejection、Owner `SemanticMcpError`、unexpected handler failure 和 output mismatch 转换为该契约。未授权的只读 operation 和 channel auth 继续保持原有 wire shape，避免破坏现有 MCP callers。相同 code 在契约 registry 中仍按 Operator 路由。原有 code 保留在 `legacy_code`，原有 `details` 字段继续可读。`operation_ref` 和 `correlation_ref` 由 run、root session、phase、operation 和 effect identity 稳定派生。
+`SemanticMcpGateway` 现在把 schema mismatch、effect operation 的 capability rejection、Owner `SemanticMcpError`、unexpected handler failure 和 output mismatch 转换为该契约。未持有 MCP grant 的只读 capability rejection 和 channel auth 继续保持原有 wire shape，避免破坏现有 MCP callers；已进入 handler 的业务级 `*_unauthorized` 见下文三类异常路由规则。相同 code 在契约 registry 中仍按 Operator 路由。原有 code 保留在 `legacy_code`，原有 `details` 字段继续可读。`operation_ref` 和 `correlation_ref` 由 run、root session、phase、operation 和 effect identity 稳定派生。
 
 旧 stage adapter 如果返回 `not_applied` 或 `not_recorded`，会保留旧的 `effect_status`，并额外提供 canonical `normalized_effect_status`。Target-work vertical slice 直接输出 canonical `effect_status`。
 
@@ -90,7 +90,7 @@ stateDiagram-v2
 | 系统自动恢复 | response loss、短暂 dependency failure、timeout、restart、native resume、RM/RG pending | System | 保留 unknown 或 waiting，使用同一 effect reconcile，禁止盲重试 |
 | 系统缺陷或运维 | old fence 被接受、状态机损坏、持久化读回失败、审计缺失、recovery proof 不足 | Operator | 不反馈 StageAgent，保留 operator_required 和 audit/correlation |
 
-权限错误按边界处理。未持有 MCP grant 的请求是 `rejected` 并要求 Operator。已经进入 operation 但被业务授权拒绝的请求保留 legacy code，并由 contract 判断 Agent 或 System 路由。
+权限错误按边界处理。未持有 MCP grant 的请求是 `rejected` 并要求 Operator。已经进入 operation 但被业务授权拒绝的请求（如业务级 `*_unauthorized`）保留 legacy code 并固定路由为 `recovery_owner="agent"`、`effect_status="rejected"`、`retry_allowed=false`，直接反馈给 StageAgent 而非按 `unknown` 要求 reconcile；涉及运行时绑定/安全的 `*_runtime_binding_unauthorized` 则继续保留系统侧路由。此外，只读 operation（`effect=false`）在 Agent 可修复错误（参数校验与 Agent 侧 handler 报错）时跳过 `ErrorAuditStore` 写锁持久化（`audit_ref=null`、`audit_status="skipped_read_only"`），而只读 Operator 运维/损坏级报错与 effect 写入边界均保留 `ErrorAuditStore` 审计落盘。
 
 ## Bundle 到 Target 再回到 Bundle 的实施计划
 

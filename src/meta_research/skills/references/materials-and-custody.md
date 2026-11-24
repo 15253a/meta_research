@@ -92,7 +92,7 @@ HumanRequest 答复的绑定与恢复接续见[当前工作目录与回复材料
 
 先用 `research_workspace.materials.discover` 发现可见 reference_ref，按需要展开目录，再以 observation_ref 调 `research_workspace.materials.read`，沿字节范围继续。未读、只读局部、缺失或权限失败均如实说明。需要修改或轻量试跑时，用共同 `research_workspace.materials.copy` 按需取得单个独立可写副本；返回的 working_path 可用本根原生工具处理，重试用同一 effect_id 或 `.copy.reconcile`，不会覆盖已编辑副本。运行根副本在 `.work-materials/`，临时结果也可放此处；不要把未选材料移入 Target 的常规 outputs 目录。原件保持完整，不递归复制或预读整个目录。
 
-由接收根先完成当前可做的初读、判断和处理，用 `research_workspace.materials.feedback` 声明 understanding、disposition（adopted／considered／deferred／not_used）、changes、continuing_work、reasons 和 limitations。采用必须有该根实际读取记录；反馈仍是根的声明，不是科学支持、目标完成或独立核验证明。说明对当前安排或判断的实际影响、依据与未采用理由，保留未读范围和未决事项。可分次补充，以不同稳定 effect_id 表达真实后续处理；未知结果先 `.feedback.reconcile`。
+由接收根先完成当前可做的初读、判断和处理，用 `research_workspace.materials.feedback` 声明 understanding、disposition（adopted／considered／deferred／not_used）、changes、continuing_work、reasons 和 limitations。采用需有该根通过 MCP 实际读取记录，或原件在宿主本地直接可读可供本根以原生文件/Shell 能力核验（缺失或不可读原件仍以 `material_root_read_required` 拒收）；反馈仍是根的声明，不是科学支持、目标完成或独立核验证明。说明对当前安排或判断的实际影响、依据与未采用理由，保留未读范围和未决事项。可分次补充，以不同稳定 effect_id 表达真实后续处理；未知结果先 `.feedback.reconcile`。
 
 selections 按研究价值选择原件、处理结果、两者或 `[]` 均不保管。每项写实际 purpose 和 managed／linked_local custody：原件 source 为 `{kind:"original_file",path,observation_ref}`；处理结果按宿主提供的工作目录定位文件，核对其 SHA-256 后填写 `{kind:"workspace_file",workspace_ref,path,expected_sha256}`。选中项沿既有 RM 内容接纳及 RG source-material 用途关系保存，返回 asset_binding、role_ref 和精确 reader。linked_local 留在实际位置，后续来源变化如实报告漂移；未选副本与输出不会因反馈或 Target 收尾自动入库。真实 Target 实施、评价和产物仍沿正式结果交接，不由材料反馈虚构 Run、MetricResult、Evidence、Dataset 或 Environment。
 

@@ -63,15 +63,19 @@ def test_quest_goal_migration_seeds_only_heads_and_preserves_source_rows(tmp_pat
             "INSERT INTO rg_quests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             values,
         )
+        before_columns = [
+            row[1]
+            for row in connection.execute("PRAGMA table_info(rg_quests)").fetchall()
+        ]
         before = connection.execute(
-            "SELECT * FROM rg_quests WHERE quest_ref='quest-existing'"
+            f"SELECT {', '.join(before_columns)} FROM rg_quests WHERE quest_ref='quest-existing'"
         ).fetchone()
 
     upgrade_database(database)
 
     with sqlite3.connect(database) as connection:
         assert connection.execute(
-            "SELECT * FROM rg_quests WHERE quest_ref='quest-existing'"
+            f"SELECT {', '.join(before_columns)} FROM rg_quests WHERE quest_ref='quest-existing'"
         ).fetchone() == before
         expected_ref = "quest_goal_revision_" + canonical_hash(
             {

@@ -4546,13 +4546,38 @@ class SQLiteAdvancementEngine(
                         quest_ref=accepted_question.quest_ref,
                         goal_revision_ref=cast(str, context_pack["goal_revision_ref"]),
                     )
-                    self._evidence_verifier.verify_plan_evidence_catalog(
-                        quest_ref=accepted_question.quest_ref,
-                        evidence_catalog=evidence_catalog,
-                        expected_reference_revision=reference_revision,
-                        require_current=True,
-                        require_complete=True,
+                    in_tx_verifier = getattr(
+                        self._evidence_verifier,
+                        "assert_evidence_catalog_current_in_transaction",
+                        None,
                     )
+                    if callable(in_tx_verifier):
+                        verifier_db = getattr(self._evidence_verifier, "_database", None)
+                        shared_connection = (
+                            connection
+                            if (
+                                verifier_db is self._database
+                                or getattr(verifier_db, "path", None)
+                                == self._database.path
+                            )
+                            else None
+                        )
+                        in_tx_verifier(
+                            connection=shared_connection,
+                            quest_ref=accepted_question.quest_ref,
+                            evidence_catalog=evidence_catalog,
+                            expected_reference_revision=reference_revision,
+                            require_current=True,
+                            require_complete=True,
+                        )
+                    else:
+                        self._evidence_verifier.verify_plan_evidence_catalog(
+                            quest_ref=accepted_question.quest_ref,
+                            evidence_catalog=evidence_catalog,
+                            expected_reference_revision=reference_revision,
+                            require_current=True,
+                            require_complete=True,
+                        )
                     request_ref = new_ref("stage_request")
                     context_pack_ref = new_ref("context_pack")
                     receipt_ref = new_ref("ae_stage_request_receipt")
@@ -5017,6 +5042,32 @@ class SQLiteAdvancementEngine(
         if prior_command is not None and prior_command.command_kind != command_kind:
             raise OwnerConflict("idempotency_conflict")
 
+        with self._database.read() as read_conn:
+            pre_by_stage, pre_key = _reasoning_route_cache_key(
+                read_conn, cycle_ref=cycle_ref, epoch=epoch
+            )
+            pre_computed = False
+            pre_reuse: tuple[EvidenceReuseLeaf, ...] = ()
+            pre_target: tuple[EvidenceReuseLeaf, ...] = ()
+            pre_error: OwnerConflict | None = None
+            if set(pre_by_stage) == {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE}:
+                pre_computed = True
+                try:
+                    pre_reuse = self._resolve_reasoning_plan_evidence_reuse(
+                        read_conn,
+                        cycle_ref=cycle_ref,
+                        epoch=epoch,
+                        accepted_question=accepted_question,
+                    )
+                    pre_target = self._resolve_reasoning_current_target_evidence(
+                        read_conn,
+                        cycle_ref=cycle_ref,
+                        epoch=epoch,
+                        quest_ref=accepted_question.quest_ref,
+                    )
+                except OwnerConflict as error:
+                    pre_error = error
+
         result_ref: str | None = None
         with self._database.write() as connection:
             connection.execute(
@@ -5086,22 +5137,31 @@ class SQLiteAdvancementEngine(
                         quest_ref=accepted_question.quest_ref,
                         epoch=epoch,
                     )
-                    evidence_reuse_closure = (
-                        self._resolve_reasoning_plan_evidence_reuse(
-                            connection,
-                            cycle_ref=cycle_ref,
-                            epoch=epoch,
-                            accepted_question=accepted_question,
-                        )
+                    _post_by_stage, post_key = _reasoning_route_cache_key(
+                        connection, cycle_ref=cycle_ref, epoch=epoch
                     )
-                    current_target_evidence_closure = (
-                        self._resolve_reasoning_current_target_evidence(
-                            connection,
-                            cycle_ref=cycle_ref,
-                            epoch=epoch,
-                            quest_ref=accepted_question.quest_ref,
+                    if pre_computed and post_key == pre_key:
+                        if pre_error is not None:
+                            raise pre_error
+                        evidence_reuse_closure = pre_reuse
+                        current_target_evidence_closure = pre_target
+                    else:
+                        evidence_reuse_closure = (
+                            self._resolve_reasoning_plan_evidence_reuse(
+                                connection,
+                                cycle_ref=cycle_ref,
+                                epoch=epoch,
+                                accepted_question=accepted_question,
+                            )
                         )
-                    )
+                        current_target_evidence_closure = (
+                            self._resolve_reasoning_current_target_evidence(
+                                connection,
+                                cycle_ref=cycle_ref,
+                                epoch=epoch,
+                                quest_ref=accepted_question.quest_ref,
+                            )
+                        )
                     context_pack = _reasoning_context_pack_from_rows(
                         connection,
                         cycle_ref=cycle_ref,
@@ -11545,6 +11605,39 @@ def _reasoning_context_pack_from_rows(
         accepted_question_binding=accepted_question.as_dict(),
     )
     return context_pack
+
+
+def _reasoning_route_cache_key(
+    connection, *, cycle_ref: str, epoch: int
+) -> tuple[dict[str, object], tuple[object, ...]]:
+    rows = _reasoning_route_rows_for_epoch(
+        connection, cycle_ref=cycle_ref, epoch=epoch
+    )
+    by_stage = {str(r.stage): r for r in rows}
+    present = {
+        str(r[0])
+        for r in connection.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('research_graph_state', 'research_memory_state')"
+            )
+        ).all()
+    }
+    state_revs = tuple(
+        connection.execute(
+            text(f"SELECT revision FROM {table} WHERE singleton = 'owner'")
+        ).scalar_one_or_none()
+        if table in present
+        else None
+        for table in ("research_graph_state", "research_memory_state")
+    )
+    return by_stage, (
+        tuple(
+            None if by_stage.get(s) is None else str(by_stage[s].commit_ref)
+            for s in (IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE)
+        )
+        + state_revs
+    )
 
 
 def _reasoning_route_rows_for_epoch(

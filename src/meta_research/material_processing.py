@@ -96,7 +96,11 @@ class MaterialProcessingMixin:
             raise OwnerConflict("material_feedback_invalid")
         reference = self.query_work_material(reference_ref)
         self._authorize_material(reference, context)
-        if disposition == "adopted" and not any(item.get("actor") == context.run_ref for item in reference["read_ranges"]):
+        if (
+            disposition == "adopted"
+            and not any(item.get("actor") == context.run_ref for item in reference["read_ranges"])
+            and not _locally_readable_source(reference)
+        ):
             raise OwnerConflict("material_root_read_required")
         location = self._root_workspaces.bind_runtime(context).location
         validated = [self._selected_material_source(context, reference, selected) for selected in selections]
@@ -263,6 +267,25 @@ class RuntimeMaterialWork:
                 raise OwnerConflict("workspace_content_changed")
 
 
+def _locally_readable_source(reference: dict[str, object]) -> bool:
+    source = reference.get("source")
+    if not isinstance(source, dict):
+        return False
+    raw_path = source.get("absolute_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    path = Path(raw_path)
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        return False
+    return os.access(path, os.R_OK)
+
+
 def material_processing_operations(human):
     strings = {key: {"type": "string", "minLength": 1, "maxLength": 8192}
         for key in ("understanding", "changes", "continuing_work", "reasons", "limitations")}
@@ -292,7 +315,7 @@ def material_processing_operations(human):
             "Choose original_file (relative path plus observation_ref) and/or workspace_file (workspace_ref,path,expected_sha256) "
             "with custody managed or linked_local and actual purpose. Selected content passes existing RM intake and RG source-material "
             "role acceptance; the receipt supplies exact content readers and use. An empty list retains neither. "
-            "Adopted requires this root's actual read; the declaration itself proves no conclusion. Retry unchanged effect_id or reconcile.",
+            "Adopted accepts either an MCP read receipt or locally verified source availability; the declaration itself proves no conclusion. Retry unchanged effect_id or reconcile.",
             call, {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False},
             {"type": "object"}, "effect", PROCESSING_OPERATION_IDS[1]),
         SemanticOperation(PROCESSING_OPERATION_IDS[1], "human_collaboration",

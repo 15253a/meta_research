@@ -1671,8 +1671,21 @@ class HarnessRuntime:
         """
 
         self._require_target_request(request_ref)
+        auth_refreshed_at: float | None = None
+        codex_adapter = self._adapters.get("codex")
+        codex_home = getattr(codex_adapter, "_codex_home", None)
+        if codex_home is not None:
+            try:
+                auth_refreshed_at = (Path(codex_home) / "account-state.json").stat().st_mtime
+            except OSError:
+                auth_refreshed_at = None
         try:
-            recovery = self._owner.reopen_failed_target_root(request_ref)
+            if auth_refreshed_at is not None:
+                recovery = self._owner.reopen_failed_target_root(
+                    request_ref, auth_refreshed_at=auth_refreshed_at,
+                )
+            else:
+                recovery = self._owner.reopen_failed_target_root(request_ref)
         except AgentRuntimeHarnessRetryLater as error:
             raise HarnessAdmissionError(
                 error.code,
@@ -2304,7 +2317,11 @@ class HarnessRuntime:
             scope = GuidanceRuntimeScope("target", admission.run.run_ref, admission.run.attempt_ref,
                 admission.run.root_session_ref, admission.run.fence_ref, admission.run.capability_binding_hash)
             prompt += human_response_prompt(self._human_guidance_authority, scope, prior)
-            prompt += guidance_prompt(cut, previous_prompts=prior)
+            prompt += guidance_prompt(
+                cut,
+                include_direction=not resume,
+                previous_prompts=prior,
+            )
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )
@@ -2471,7 +2488,7 @@ class HarnessRuntime:
             except Exception as error:
                 raise HarnessAdmissionError(str(getattr(error, "code", "guidance_snapshot_missing"))) from error
             guidance_binding = cut.binding
-            prompt += guidance_prompt(cut)
+            prompt += guidance_prompt(cut, include_direction=not resume)
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )

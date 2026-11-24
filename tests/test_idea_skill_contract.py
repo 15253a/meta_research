@@ -1467,7 +1467,7 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     from meta_research.research_guidance import shared_reference_resources
     assert all(body not in primary_prompt for body in shared_reference_resources().values())
     assert any("Shared reference root:" in value for value in primary_argv)
-    assert primary_prompt.startswith("cycle_position=")
+    assert primary_prompt.startswith("当前你处于第 1 轮 Cycle（") and "Idea 阶段。" in primary_prompt.splitlines()[0]
     assert "accepted_question=" in primary_prompt
     assert "context_pack_hash=" + request.context_pack_hash in primary_prompt
     assert "不得创建 Question、Plan、Run、receipt" in primary_prompt

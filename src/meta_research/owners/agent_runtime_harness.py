@@ -38,6 +38,14 @@ TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE = "human_request_wait"
 _TARGET_ROOT_RETRY_BASE_SECONDS = 1.0
 _TARGET_ROOT_RETRY_MAX_SECONDS = 60.0
 _TARGET_BALANCE_RETRY_SECONDS = 300.0
+_TARGET_AUTH_CIRCUIT_MAX_SECONDS = 3600.0
+_AUTH_CIRCUIT_CODES = frozenset(
+    {
+        PROVIDER_INSUFFICIENT_BALANCE,
+        "provider_auth_revoked",
+        "provider_authentication_required",
+    }
+)
 _PROVIDER_CEILING_CODES = frozenset(
     {
         "provider_timeout",
@@ -103,6 +111,7 @@ class AgentRuntimeHarnessRetry:
     consecutive_failures: int
     failed_at: float
     next_retry_at: float
+    circuit_open: bool = False
 
 
 class AgentRuntimeHarnessRetryLater(AgentRuntimeHarnessError):
@@ -360,7 +369,7 @@ class AgentRuntimeHarnessInterface(Protocol):
     ) -> AgentRuntimeHarnessRun | None: ...
 
     def reopen_failed_target_root(
-        self, request_ref: str
+        self, request_ref: str, *, auth_refreshed_at: float | None = None,
     ) -> AgentRuntimeHarnessRecovery: ...
 
     def reserve_target_successor(
@@ -1215,7 +1224,7 @@ class SQLiteAgentRuntimeHarness:
         return run
 
     def reopen_failed_target_root(
-        self, request_ref: str
+        self, request_ref: str, *, auth_refreshed_at: float | None = None,
     ) -> AgentRuntimeHarnessRecovery:
         """Reopen one deterministically drained Target root on its same handle.
 
@@ -1348,7 +1357,12 @@ class SQLiteAgentRuntimeHarness:
                     latest_operation=latest_operation,
                     anchor_at=run.updated_at,
                 )
-                if now < retry.next_retry_at:
+                auth_unlatched = (
+                    auth_refreshed_at is not None
+                    and retry.failure_code in _AUTH_CIRCUIT_CODES
+                    and auth_refreshed_at > retry.failed_at
+                )
+                if now < retry.next_retry_at and not auth_unlatched:
                     raise AgentRuntimeHarnessRetryLater(retry)
                 lease = connection.execute(
                     text(
@@ -1393,7 +1407,8 @@ class SQLiteAgentRuntimeHarness:
                     next_retry_at=(
                         now
                         + _target_root_retry_delay(
-                            retry.consecutive_failures
+                            retry.consecutive_failures,
+                            failure_code=retry.failure_code,
                         )
                     ),
                 )
@@ -1443,7 +1458,12 @@ class SQLiteAgentRuntimeHarness:
                 latest_operation=latest_operation,
                 anchor_at=float(row.completed_at),
             )
-            if now < retry.next_retry_at:
+            auth_unlatched = (
+                auth_refreshed_at is not None
+                and retry.failure_code in _AUTH_CIRCUIT_CODES
+                and auth_refreshed_at > retry.failed_at
+            )
+            if now < retry.next_retry_at and not auth_unlatched:
                 raise AgentRuntimeHarnessRetryLater(retry)
 
             connection.execute(
@@ -3474,6 +3494,7 @@ class SQLiteAgentRuntimeHarness:
                     operation_generation=int(row.generation),
                     failure_code=code,
                     consecutive_failures=consecutive_failures,
+                    circuit_open=(code in _AUTH_CIRCUIT_CODES and consecutive_failures >= 2),
                     failed_at=now,
                     next_retry_at=(
                         now
@@ -4688,8 +4709,11 @@ def _target_root_retry(
         next_retry_at=(
             anchor_at + _target_root_retry_delay(
                 consecutive_failures,
-                failure_code=failure_code if run.status == "failed" else None,
+                failure_code=failure_code,
             )
+        ),
+        circuit_open=(
+            failure_code in _AUTH_CIRCUIT_CODES and consecutive_failures >= 2
         ),
     )
 
@@ -4699,8 +4723,12 @@ def _target_root_retry_delay(
 ) -> float:
     if consecutive_failures < 1:
         raise AgentRuntimeHarnessError("target_root_failure_recovery_unsafe")
-    if failure_code == PROVIDER_INSUFFICIENT_BALANCE:
-        return _TARGET_BALANCE_RETRY_SECONDS
+    if failure_code in _AUTH_CIRCUIT_CODES:
+        return min(
+            _TARGET_BALANCE_RETRY_SECONDS
+            * (2 ** min(consecutive_failures - 1, 30)),
+            _TARGET_AUTH_CIRCUIT_MAX_SECONDS,
+        )
     return min(
         _TARGET_ROOT_RETRY_BASE_SECONDS
         * (2 ** min(consecutive_failures - 1, 30)),

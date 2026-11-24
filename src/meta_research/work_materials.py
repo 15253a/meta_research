@@ -334,7 +334,7 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
                 "SELECT r.reference_ref FROM hc_work_material_references r "
                 "JOIN hc_work_material_submissions s USING(submission_ref) "
                 "WHERE s.state='ready' AND s.anchor_kind IN ('creation','manual','guidance','input','request') "
-                "AND json_extract(r.selection_json,'$.kind')='directory' AND ("
+                "AND json_extract(r.selection_json,'$.kind') IN ('directory','file') AND ("
                 "json_extract(s.receiver_json,'$.quest_ref')=:quest OR "
                 "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
                 "WHERE json_extract(root.value,'$.quest_ref')=:quest) OR "
