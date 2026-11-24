@@ -13,7 +13,7 @@
 | 选中的 Target 证据正文 | `research_memory.plan_evidence.read` 的准确身份取工具返回值，按返回的 next_offset 继续。返回的 `selected_evidence_binding` 原样用于采用集合。该专用 reader 的正文偏移按其 `total_characters` 字符范围处理，不套用通用 reader 的 UTF-8 字节规则。 |
 | 问题及已有综合 | `research_graph.questions.page`、`research_graph.question_history.read`、`research_graph.question_relations.read`，按返回的范围和分页展开历史 Cycle、阶段及问题关系，再沿准确 reader 读取阶段正文与交接。 |
 | 方法、方案、运行及评价 | `research_graph.baselines.page` 按研究线索发现方法及其执行、产物记录；`research_graph.baselines.read` 可按 relation 独立展开 Variant、Run、Evaluation、Attempt、Metric、Artifact。正式结果沿返回的 `research_graph.formal_results.read`／`research_graph.target_formal_results.read` 等准确 reader 读取。 |
-| 文献 | `research_memory.literature.page` 与返回的准确修订 reader。当前目录依据 Question 文献修订，不代表全部历史全文或任意取得材料已入索引；空 items 仍检查 next_offset。已知旧修订按精确 reader 读取。 |
+| 文献 | `research_graph.literature.page` 与返回的准确修订 reader。当前目录依据 Question 文献修订，不代表全部历史全文或任意取得材料已入索引；空 items 仍检查 next_offset。已知旧修订按精确 reader 读取。 |
 | Dataset／Environment | `research_graph.datasets.page`／`.read` 与 `research_graph.environments.page`／`.read`，按各自 schema 选择一种查询身份或过滤方式；登记、版本、用途和派生使用本次获授的对应写入及 reconcile 操作。数字原件沿 asset binding 的准确 reader 取得。 |
 | 人类协作与指导 | `human_request.read` 发现当前 Quest 的历史请求、回复、主动材料及正式指导，沿返回 reader 准确读回；当前指导的读取与处理使用 `human_guidance.read`／`human_guidance.feedback`。历史查询不产生指导已读或处理回执。 |
 

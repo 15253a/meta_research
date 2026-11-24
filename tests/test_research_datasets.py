@@ -152,8 +152,9 @@ def test_dataset_idempotency_semantic_replay_and_reconcile(runtime):
     assert graph.reconcile_dataset_operation(operation="register", idempotency_key="missing") is None
     with pytest.raises(OwnerConflict, match="dataset_idempotency_conflict"):
         graph.register_dataset(**{**args, "meaning": "changed"}, idempotency_key="observations")
-    with pytest.raises(OwnerConflict, match="dataset_semantic_identity_conflict"):
-        graph.register_dataset(**{**args, "meaning": "changed"}, idempotency_key="new-meaning")
+    revised = graph.register_dataset(**{**args, "meaning": "changed"}, idempotency_key="new-meaning")
+    assert revised["dataset_ref"] != dataset["dataset_ref"]
+    assert revised["semantic_key"] == dataset["semantic_key"]
     with pytest.raises(OwnerConflict, match="dataset_idempotency_conflict"):
         graph.reconcile_dataset_operation(operation="reference", idempotency_key="observations")
 
@@ -242,8 +243,8 @@ def test_dataset_mcp_effect_read_reconcile_and_stale_scope(runtime):
     assert not first.get("isError")
     accepted = first["structuredContent"]["result"]
     assert call("register.reconcile", {"effect_id": "register"})["structuredContent"]["result"] == accepted
-    # Unreferenced registry identities are not global discovery results.
-    assert call("page", {"query": "observations"})["structuredContent"]["total"] == 0
+    # Own Quest immediately discovers its registered identity even before referencing.
+    assert call("page", {"query": "observations"})["structuredContent"]["items"] == [accepted]
     binding = _asset(runtime)
     graph.accept_asset_role(binding=binding, role="evidence", quest_ref=question.quest_ref, idempotency_key="mcp-origin")
     version = call("register_version", {"effect_id": "version", "dataset_ref": accepted["dataset_ref"],
@@ -258,7 +259,7 @@ def test_dataset_mcp_effect_read_reconcile_and_stale_scope(runtime):
     assert call("page", {"question_ref": question.question_ref})["structuredContent"]["items"] == [usage]
     state["valid"] = False
     assert call("register", {**args, "effect_id": "stale"})["isError"]
-    assert state["checks"] == 11
+    assert state["checks"] == 14
 
 
 def test_dataset_mcp_rejects_cross_quest_reference(runtime):

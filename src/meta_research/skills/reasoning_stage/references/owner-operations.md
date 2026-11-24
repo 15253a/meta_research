@@ -26,13 +26,13 @@
 
 `cycle_focus` 已由 Reasoning 的输出 schema、原接纳及后继装配接通；正文随 transition 保存与读取，各根沿实际前驱或首轮来源取得同一重心。恢复仍在原根、原目录和准确冻结输入上进行。按[语义契约](contract.md)修正缺失或冲突，不能补造首轮前驱。
 
-Target 文献整理继承共享材料保管与导航合同。DeepFetch → LiteratureSnapshot → QuestionLiteratureRevision 保持；普通文献沿 research_memory.literature.register 保存外部来源和已接纳原件 binding，再用 .reference 关联 Question、research_ref、用途和真实 research_notes binding。用 .read 查回记录、content.read 取得原件与分析，文献原作与本次阅读各自保留来源。未取得全文如实登记 missing／waiting_user，不虚构 DeepFetch Run 或专用 literature_candidates。接口不可用、部分失败和未完成按实际步骤交接，不当成无候选；空候选或无保留价值可不登记。
+Target 文献整理继承共享材料保管与导航合同。DeepFetch → LiteratureSnapshot → QuestionLiteratureRevision 保持；普通文献沿 research_graph.literature.register 保存外部来源和已接纳原件 binding，再用 .reference 关联 Question、research_ref、用途和真实 research_notes binding。用 .read 查回记录、content.read 取得原件与分析，文献原作与本次阅读各自保留来源。未取得全文如实登记 missing／waiting_user，不虚构 DeepFetch Run 或专用 literature_candidates。接口不可用、部分失败和未完成按实际步骤交接，不当成无候选；空候选或无保留价值可不登记。
 
 历史按 Question／Cycle 关系及准确 reader 追溯，工作目录按本次获授路径使用。需要保管选定材料时调用 `research_memory.assets.intake`，以返回的准确版本和 reader 接续；需要查明可用操作或参数时，沿[当前获授工具与准确入口](../../references/research-navigation.md#当前获授工具与准确入口)读取本根合同。权限不足、原件不可读或结果未知时，按实际失败与对账入口处理。
 
 ## 写入权限与资源登记
 
-Reasoning 阶段专用写入是 `research_graph.question_relations.record`；共享 catalog 还授予 Dataset 的 register、register_version、reference、derive 和 Environment 的 register、reference 及各自 reconcile。按实际研究与当前 scope 使用；执行前核实 currentness，绑定数字材料时核实原件已正式接纳，未知效果用原 `effect_id` 对账。资源整理的完成条件和时序以[主 Skill 的交接前整理步骤](../SKILL.md)为准，阶段名称不额外增加等待 ScientificOutcome 的条件。
+Idea、Plan、Bundle 与 Reasoning 阶段均可写入 `research_graph.question_relations.record`；共享 catalog 还授予 Dataset 的 register、register_version、reference、derive 和 Environment 的 register、reference 及各自 reconcile。按实际研究与当前 scope 使用；执行前核实 currentness，绑定数字材料时核实原件已正式接纳，未知效果用原 `effect_id` 对账。资源整理的完成条件和时序以[主 Skill 的交接前整理步骤](../SKILL.md)为准，阶段名称不额外增加等待 ScientificOutcome 的条件。
 
 可委派明确范围的资源登记任务，根按主 Skill 的完成条件独立读回核验。数字材料沿用已有保管与版本，登记不代替正式执行输入绑定，也不形成新的科学测量。
 

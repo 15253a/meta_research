@@ -75,13 +75,14 @@ def test_retired_root_cannot_commit_any_dataset_effect(runtime, monkeypatch, act
 
 def test_recovery_attempt_can_reconcile_and_replay_the_original_dataset_effect(runtime):
     graph, agent = runtime.owners.research_graph, runtime.owners.agent_runtime
-    scope = _scope(runtime)
+    question = _quest(runtime, "recovery")
+    scope = _scope(runtime, quest_ref=question.quest_ref)
     gateway = SemanticMcpGateway(_dataset_operations(graph, agent))
     old = _channel(gateway, scope)
     arguments = dict(effect_id="lost-response", semantic_key="scope:ack", name="ack", meaning="An immutable accepted Dataset")
     created = _call(gateway, old, "register", **arguments)
     assert not created.get("isError"), created
-    next_scope = _scope(runtime, generation=2)
+    next_scope = _scope(runtime, quest_ref=question.quest_ref, generation=2)
     current = _channel(gateway, next_scope)
     assert _call(gateway, old, "register.reconcile", effect_id="lost-response").get("isError")
     reconciled = _call(gateway, current, "register.reconcile", effect_id="lost-response")
@@ -90,7 +91,7 @@ def test_recovery_attempt_can_reconcile_and_replay_the_original_dataset_effect(r
     assert graph.query_datasets(query="scope:ack")["total"] == 1
     changed = _call(gateway, current, "register", **{**arguments, "meaning": "A different request"})
     assert changed.get("isError") and "dataset_idempotency_conflict" in str(changed)
-    another_scope = _scope(runtime, run_ref="another-companion", root_ref="another-root")
+    another_scope = _scope(runtime, quest_ref=question.quest_ref, run_ref="another-companion", root_ref="another-root")
     unrelated = _call(gateway, _channel(gateway, another_scope), "register.reconcile", effect_id="lost-response")
     assert unrelated["structuredContent"]["status"] == "not_found"
 

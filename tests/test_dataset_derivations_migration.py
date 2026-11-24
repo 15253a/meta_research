@@ -2,6 +2,7 @@
 import sqlite3
 
 from meta_research.migration import upgrade_database
+from migration_support import schema_head
 from test_migration_recovery import _upgrade_to_revision
 
 
@@ -14,11 +15,17 @@ def test_dataset_derivations_migration_preserves_existing_facts_and_is_repeatabl
             "receipt_ref, receipt_hash, accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("dataset_existing", "study:existing", '{"notes":"Keep original collected observations"}',
              "a" * 64, "receipt_existing", "b" * 64, 123.0))
-        before = connection.execute("SELECT * FROM rg_datasets").fetchall()
+        before = connection.execute(
+            "SELECT dataset_ref, semantic_key, payload_json, payload_hash, "
+            "receipt_ref, receipt_hash, accepted_at FROM rg_datasets"
+        ).fetchall()
     upgrade_database(database)
     upgrade_database(database)
     with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT * FROM rg_datasets").fetchall() == before
+        assert connection.execute(
+            "SELECT dataset_ref, semantic_key, payload_json, payload_hash, "
+            "receipt_ref, receipt_hash, accepted_at FROM rg_datasets"
+        ).fetchall() == before
         assert connection.execute("SELECT COUNT(*) FROM rg_dataset_derivations").fetchone() == (0,)
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("0052_artifact_data_role",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (schema_head(),)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

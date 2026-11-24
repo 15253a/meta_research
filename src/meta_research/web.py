@@ -2647,27 +2647,42 @@ def create_app(
         result=graph.query_formal_result_by_ref(ref,quest_ref=quest_ref)
         if result is None:raise OwnerConflict("formal_result_quest_scope_invalid")
         items=[]
-        for artifact in result.get("run_artifacts",[])+result.get("evaluation_artifacts",[]):
+        artifacts=(result.get("implementation_artifacts",[])
+                   +result.get("run_artifacts",[])
+                   +result.get("evaluation_artifacts",[]))
+        for artifact in artifacts:
             version=artifact.get("version_ref") or artifact.get("asset_version_ref")
             if version:
-                items.append({"ref":artifact.get("role_ref"),"name":artifact.get("role","Research product"),
-                              "summary":artifact.get("declared_relative_path",artifact.get("relative_path","")),
-                              "reader":{"source_ref":version,"version_ref":version},"details":artifact})
+                rel_path=artifact.get("declared_relative_path",artifact.get("relative_path",""))
+                reader: dict[str,object]={"source_ref":version,"version_ref":version}
+                selection=artifact.get("selection")
+                if isinstance(selection,dict) and "path" in selection:
+                    reader["selection_path"]=selection["path"]
+                items.append({
+                    "ref":artifact.get("role_ref") or f"{artifact.get('role','artifact')}:{version}:{rel_path}",
+                    "name":artifact.get("role","Research product"),
+                    "summary":rel_path,
+                    "reader":reader,
+                    "details":artifact,
+                })
         return {"result":result,"items":items,"next_offset":None}
 
     @app.get("/api/v1/research-content")
-    def read_research_content(quest_ref: str,source_ref: str,version_ref: str,
+    def read_research_content(request: Request,quest_ref: str,source_ref: str,version_ref: str,
             offset: int=Query(default=0,ge=0),limit: int=Query(default=8192,ge=1,le=65536),
-            entry_path: str|None=None) -> dict[str, object]:
-        from meta_research.research_content import read_content
+            entry_path: str|None=None,selection_path: str|None=None) -> dict[str, object]:
+        from meta_research.research_content import _UNSELECTED, read_content
+        selected=((None if selection_path in {None,""} else selection_path)
+                  if "selection_path" in request.query_params else _UNSELECTED)
         return read_content(runtime.owners.research_graph,runtime.owners.research_memory,
             quest_ref=quest_ref,source_ref=source_ref,version_ref=version_ref,offset=offset,limit=limit,
-            entry_path=entry_path,human_collaboration=runtime.owners.human_collaboration)
+            entry_path=entry_path,selection_path=selected,human_collaboration=runtime.owners.human_collaboration)
 
     @app.get("/api/v1/research-library/{entry}")
     def query_research_library(entry: str,quest_ref: str,query: str="",offset: int=Query(default=0,ge=0),
             limit: int=Query(default=12,ge=1,le=100),dataset_ref: str|None=None,environment_ref: str|None=None,
             baseline_ref: str|None=None,variant_ref: str|None=None,question_ref: str|None=None,
+            relation: str|None=None,view: str|None=None,
             query_revision: str|None=Query(default=None,pattern="^[0-9a-f]{64}$"),
             request_cursor: str|None=Query(default=None,max_length=512),
             request_ref: str|None=Query(default=None,min_length=1,max_length=256),
@@ -2675,29 +2690,136 @@ def create_app(
             version_ref: str|None=Query(default=None,min_length=1,max_length=256),
             guidance_offset: int|None=Query(default=None,ge=0),
             guidance_query_revision: str|None=Query(default=None,pattern="^[0-9a-f]{64}$")) -> dict[str,object]:
+        from meta_research.historical_research import discover_question_cycles
+        from meta_research.question_relations import question_creation_basis_descriptor
         from meta_research.research_content import discover_questions,discover_literature
         graph=runtime.owners.research_graph;memory=runtime.owners.research_memory
         if graph.query_quest_by_ref(quest_ref) is None:raise OwnerConflict("research_library_quest_invalid")
         args={"quest_ref":quest_ref,"query":query,"offset":offset,"limit":limit,"query_revision":query_revision}
         if entry=="questions":
+            if view=="relations":
+                page=graph.query_question_relations(quest_ref=quest_ref,question_ref=question_ref,
+                                                    offset=offset,query_revision=query_revision)
+                page["items"]=[{
+                    **rel,
+                    "ref":rel["relation_ref"],
+                    "relation_kind":rel["kind"],
+                    "name":f"{rel['kind']} · {rel['left_question_ref']} -> {rel['right_question_ref']}",
+                    "summary":rel["notes"],
+                } for rel in page["items"]]
+                return page
             if question_ref:
                 question=graph.query_question_history_by_ref(question_ref)
                 if question is None or question.quest_ref!=quest_ref:
                     raise OwnerConflict("research_history_source_unbound")
-                page=graph.query_question_research_history(quest_ref=quest_ref,question_ref=question_ref,
-                                                          offset=offset,limit=min(limit,12),query_revision=query_revision)
-                page["items"]=[{**item,"ref":item["source_ref"],"name":question_ref,
-                    "summary":item.get("claim",{}).get("text",""),
-                    "reader":{"source_ref":item["source_ref"],"version_ref":item["source_ref"]}}
-                    for item in page["items"]]
-                return page
-            return discover_questions(graph,memory,**args)
-        if entry=="literature":return discover_literature(graph,memory,**args)
+                page=discover_question_cycles(graph,quest_ref=quest_ref,question_ref=question_ref,
+                                              offset=offset,limit=min(limit,12),query_revision=query_revision)
+                items=[]
+                for cycle in page["items"]:
+                    for stage in cycle["stages"]:
+                        entry_item={**stage,"cycle_ref":cycle["cycle_ref"],"cycle_status":cycle["status"],
+                                    "question_ref":question_ref,"name":f"{cycle['cycle_ref']} · {stage['stage']}"}
+                        if stage.get("disposition")=="completed" and stage.get("stage")=="reasoning" and stage.get("outcome_ref"):
+                            outcome_ref=stage["outcome_ref"]
+                            source=graph.read_question_scientific_outcome(
+                                quest_ref=quest_ref,question_ref=question_ref,outcome_ref=outcome_ref)
+                            claim=source.get("claim")
+                            summary=claim.get("text") if isinstance(claim,dict) else claim
+                            entry_item["ref"]=outcome_ref
+                            entry_item["source_ref"]=outcome_ref
+                            entry_item["summary"]=str(summary or "")
+                            entry_item["reader"]={"source_ref":outcome_ref,"version_ref":outcome_ref}
+                        else:
+                            reader=stage.get("reader")
+                            entry_item["ref"]=(stage.get("commit_ref") or stage.get("request_ref")
+                                               or f"{cycle['cycle_ref']}:{stage['stage']}:{stage['epoch']}")
+                            if isinstance(reader,dict) and reader.get("source_ref"):
+                                entry_item["source_ref"]=reader["source_ref"]
+                            entry_item["summary"]=f"{stage['stage']} · {stage.get('disposition','')}"
+                        items.append(entry_item)
+                cb=question_creation_basis_descriptor(graph,memory,quest_ref=quest_ref,question_ref=question_ref)
+                result={**page,"cycles":page["items"],"items":items}
+                if cb is not None:
+                    result["creation_basis"]=cb
+                    result["creation_basis_reader"]={"source_ref":cb["basis_ref"],"version_ref":cb["basis_hash"]}
+                return result
+            page=discover_questions(graph,memory,**args)
+            for item in page["items"]:
+                cb=item.get("creation_basis")
+                if isinstance(cb,dict) and cb.get("basis_ref") and cb.get("basis_hash"):
+                    item["creation_basis_reader"]={"source_ref":cb["basis_ref"],"version_ref":cb["basis_hash"]}
+            return page
+        if entry=="literature":
+            page=discover_literature(graph,memory,**args)
+            for item in page["items"]:
+                readers=list(item.get("readers") or [])
+                deepfetch_reader=item.get("deepfetch_reader")
+                if not (isinstance(item.get("reader"),dict) and item["reader"].get("source_ref")):
+                    if readers:
+                        item["reader"]=dict(readers[0])
+                    elif isinstance(deepfetch_reader,dict) and deepfetch_reader.get("source_ref"):
+                        item["reader"]=dict(deepfetch_reader)
+                    elif item.get("literature_ref") and item.get("literature_payload_hash"):
+                        item["reader"]={"source_ref":item["literature_ref"],"version_ref":item["literature_payload_hash"]}
+                    else:
+                        item["reader"]=None
+                if isinstance(deepfetch_reader,dict) and deepfetch_reader.get("source_ref") and readers:
+                    if not any(r.get("source_ref")==deepfetch_reader.get("source_ref")
+                               and r.get("version_ref")==deepfetch_reader.get("version_ref") for r in readers):
+                        item["readers"]=[*readers,dict(deepfetch_reader)]
+                for judgment in item.get("judgments") or []:
+                    j_reader=judgment.get("reader")
+                    if not (isinstance(j_reader,dict) and j_reader.get("source_ref")):
+                        if judgment.get("reference_ref") and judgment.get("payload_hash"):
+                            judgment["reader"]={"source_ref":judgment["reference_ref"],"version_ref":judgment["payload_hash"]}
+                        elif judgment.get("readers"):
+                            judgment["reader"]=dict(judgment["readers"][0])
+                        else:
+                            judgment["reader"]=None
+            return page
         if entry=="baselines":
+            def _flatten_baseline_reader(record: dict[str,object]) -> dict[str,object]:
+                raw_reader=record.get("reader")
+                if isinstance(raw_reader,dict) and isinstance(raw_reader.get("args"),dict):
+                    return {**record,"reader":{"operation":raw_reader.get("operation"),**raw_reader["args"]}}
+                return record
             if baseline_ref:
                 result=graph.query_baseline(baseline_ref,quest_ref=quest_ref)
                 if result is None:return {"items":[],"next_offset":None}
-                return graph.query_baseline_variants(baseline_ref,variant_ref=variant_ref,quest_ref=quest_ref,offset=offset,limit=limit,query_revision=query_revision)
+                if relation is not None:
+                    page=graph.query_baseline_relations(baseline_ref,relation=relation,variant_ref=variant_ref,
+                        quest_ref=quest_ref,offset=offset,limit=limit,query_revision=query_revision)
+                    normalized=[]
+                    for item in page["items"]:
+                        row=_flatten_baseline_reader(item)
+                        ref=(row.get("variant_run_ref") or row.get("evaluation_ref") or row.get("variant_ref")
+                             or row.get("evaluation_attempt_ref") or row.get("metric_result_ref") or row.get("role_ref"))
+                        normalized.append({**row,"ref":ref,"name":row.get("name") or row.get("display_name") or row.get("role") or ref})
+                    page["items"]=normalized
+                    return page
+                if variant_ref is None:
+                    page=graph.query_baseline_relations(baseline_ref,relation="variants",
+                        quest_ref=quest_ref,offset=offset,limit=limit,query_revision=query_revision)
+                    page["items"]=[{**_flatten_baseline_reader(item),"ref":item["variant_ref"]} for item in page["items"]]
+                    return page
+                variant_page=graph.query_baseline_relations(baseline_ref,relation="variants",variant_ref=variant_ref,
+                    quest_ref=quest_ref,offset=0,limit=1)
+                if not variant_page["items"]:
+                    raise OwnerConflict("variant_reference_invalid")
+                runs_page=graph.query_baseline_relations(baseline_ref,relation="runs",variant_ref=variant_ref,
+                    quest_ref=quest_ref,offset=0,limit=limit)
+                evals_page=graph.query_baseline_relations(baseline_ref,relation="evaluations",variant_ref=variant_ref,
+                    quest_ref=quest_ref,offset=0,limit=limit)
+                variant_item={
+                    **_flatten_baseline_reader(variant_page["items"][0]),
+                    "ref":variant_ref,
+                    "runs":[_flatten_baseline_reader(r) for r in runs_page["items"]],
+                    "runs_next_offset":runs_page["next_offset"],
+                    "evaluations":[_flatten_baseline_reader(e) for e in evals_page["items"]],
+                    "evaluations_next_offset":evals_page["next_offset"],
+                }
+                return {"items":[variant_item],"next_offset":None,"query_revision":variant_page["query_revision"],
+                        "result_state":"matches","scan_complete":True}
             page=graph.query_baselines(**args)
             page["items"]=[{**x,"name":x.get("method_key") or x["baseline_ref"],"ref":x["baseline_ref"]} for x in page["items"]]
             return page
@@ -2708,10 +2830,15 @@ def create_app(
                 item["summary"]=item.get("meaning","")
                 item["name"]=item.get("name",item.get("version_label",""))
                 item["ref"]=item.get("dataset_version_ref",item.get("dataset_ref"))
-                bindings=item.get("asset_bindings",[])
-                if bindings:
-                    item["reader"]={"source_ref":item["dataset_version_ref"],"version_ref":bindings[0]["version_ref"]}
-                    item["readers"]=[{"source_ref":item["dataset_version_ref"],"version_ref":b["version_ref"]} for b in bindings]
+                selection_readers=item.get("selection_readers") or []
+                if selection_readers:
+                    item["readers"]=[dict(entry["reader"]) for entry in selection_readers]
+                    item["reader"]=dict(item["readers"][0])
+                else:
+                    bindings=item.get("asset_bindings",[])
+                    if bindings:
+                        item["readers"]=[{"source_ref":item["dataset_version_ref"],"version_ref":b["version_ref"]} for b in bindings]
+                        item["reader"]=dict(item["readers"][0])
             return page
         if entry=="environments":
             if environment_ref:args={**args,"environment_ref":environment_ref,"query":""}
@@ -2723,10 +2850,13 @@ def create_app(
                     continue
                 item["summary"]=item["meaning"]
                 item["ref"]=item["environment_ref"]
-                item["readers"]=[{"source_ref":item["environment_ref"],"version_ref":binding["version_ref"]}
-                                 for binding in item["asset_bindings"]]
+                selection_readers=item.get("selection_readers") or []
+                item["readers"]=([dict(entry["reader"]) for entry in selection_readers]
+                                 if selection_readers
+                                 else [{"source_ref":item["environment_ref"],"version_ref":binding["version_ref"]}
+                                       for binding in item["asset_bindings"]])
                 if item["readers"]:
-                    item["reader"]=item["readers"][0]
+                    item["reader"]=dict(item["readers"][0])
             return page
         if entry=="human":
             hc=runtime.owners.human_collaboration

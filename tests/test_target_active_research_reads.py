@@ -104,7 +104,7 @@ class _TargetResearchReader:
             "research_graph.questions.page",
             "research_memory.assets.page",
             "research_graph.question_relations.read",
-            "research_memory.literature.page",
+            "research_graph.literature.page",
         ):
             contract = rpc(
                 "tools/call",
@@ -180,7 +180,7 @@ def test_target_provider_can_read_rg_and_rm_through_its_resident_channel(tmp_pat
             "research_graph.questions.page",
             "research_memory.assets.page",
             "research_graph.question_relations.read",
-            "research_memory.literature.page",
+            "research_graph.literature.page",
             "research_graph.question_history.read",
         ]
     finally:

@@ -82,13 +82,16 @@ def test_literature_empty_scan_page_is_not_absence_and_reader_stays_exact(tmp_pa
     try:
         graph, memory = runtime.owners.research_graph, runtime.owners.research_memory
         args = dict(quest_ref=request.accepted_question.quest_ref, query='no-such-title', limit=1)
-        page = discover_literature(graph, memory, **args)
-        assert page['items'] == [] and page['result_state'] == 'page_pending'
-        assert not page['scan_complete']
-        final = discover_literature(graph, memory, **args,
-            offset=page['next_offset'], query_revision=page['query_revision'])
-        assert final['items'] == []
-        selected = discover_literature(graph, memory, quest_ref=args['quest_ref'], limit=1)['items'][0]
+        no_match = discover_literature(graph, memory, **args)
+        assert no_match['items'] == [] and no_match['result_state'] == 'no_match'
+        assert no_match['scan_complete'] and no_match['next_offset'] is None
+        first_page = discover_literature(graph, memory, quest_ref=args['quest_ref'], limit=1)
+        assert len(first_page['items']) == 1 and first_page['next_offset'] == 1
+        assert not first_page['scan_complete']
+        second_page = discover_literature(graph, memory, quest_ref=args['quest_ref'], limit=1,
+            offset=first_page['next_offset'], query_revision=first_page['query_revision'])
+        assert len(second_page['items']) == 1
+        selected = first_page['items'][0]
         result = read_content(graph, memory, quest_ref=args['quest_ref'], **selected['reader'], limit=128)
         assert result['returned_bytes'] <= 128 and result['source_ref'] == selected['reader']['source_ref']
         # A newly changed judgment is part of this directory's result cut even
@@ -98,6 +101,7 @@ def test_literature_empty_scan_page_is_not_absence_and_reader_stays_exact(tmp_pa
                 "request_ref IN (SELECT request_ref FROM ae_stage_run_requests WHERE quest_ref=:quest)"),
                 {'hash':'0' * 64,'quest':args['quest_ref']})
         with pytest.raises(OwnerConflict, match='research_query_changed'):
-            discover_literature(graph,memory,**args,offset=page['next_offset'],query_revision=page['query_revision'])
+            discover_literature(graph, memory, quest_ref=args['quest_ref'], limit=1,
+                offset=first_page['next_offset'], query_revision=first_page['query_revision'])
     finally:
         runtime.close()

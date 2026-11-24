@@ -50,7 +50,7 @@ def literature_operations(graph, agent_runtime, human_collaboration=None):
 
     operations=[]
     for action,(properties,required) in schemas.items():
-        name="research_memory.literature."+action
+        name="research_graph.literature."+action
         operations.append(SemanticOperation(semantic_operation_id=name,owning_module="research_graph",
             description=("Register an ordinary paper's external source and exact accepted RM originals. obtained requires originals; missing/waiting_user retain honest limitations. Does not claim reading or create a DeepFetch run. "
                 if action == "register" else "Associate a registered paper with Question/research purpose and actual reading summary/accepted note assets. Keep external authorship separate from this reading work. Target reading assets must belong to the accepted Target. ") +
@@ -64,7 +64,7 @@ def literature_operations(graph, agent_runtime, human_collaboration=None):
             input_schema={"type":"object","properties":{"effect_id":{"type":"string","minLength":1,"maxLength":128}},
                 "required":["effect_id"],"additionalProperties":False},output_schema={"type":"object"},
             handler=lambda c,a,action=action:invoke(c,a,action,True)))
-    operations.append(SemanticOperation(semantic_operation_id="research_memory.literature.read",owning_module="research_graph",
+    operations.append(SemanticOperation(semantic_operation_id="research_graph.literature.read",owning_module="research_graph",
         description="Read an exact ordinary Literature record or reference. Companion may set source_quest_ref for another currently HC-authorized Quest; other roots retain the current Quest. Original files and reading notes use content.read with their exact AssetVersion refs and the same source_quest_ref.",
         input_schema={"type":"object","properties":{"literature_ref":string,
             "source_quest_ref":{"type":"string","minLength":1,"maxLength":256}},

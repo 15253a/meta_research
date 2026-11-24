@@ -61,7 +61,7 @@ def _gateway(runtime, question, generation=1):
     def call(op, **args):
         status,response=gateway.dispatch(channel.token,
             {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-                "name":"research_memory.literature."+op,"arguments":args}})
+                "name":"research_graph.literature."+op,"arguments":args}})
         return response["result"] if status == 200 else {"isError":True,"http_status":status,"response":response}
     return scope,call
 
@@ -157,20 +157,20 @@ def test_accepted_target_reading_is_indexed_by_bundle_with_original_provenance(t
         graph=runtime.owners.research_graph
         graph.accept_asset_role(binding=paper,role="evidence",quest_ref=q.quest_ref,idempotency_key="original-source")
         channel=_bundle_channel(runtime)
-        reg=_accepted(_call(runtime,channel,"research_memory.literature.register",effect_id="paper",
+        reg=_accepted(_call(runtime,channel,"research_graph.literature.register",effect_id="paper",
             record_ref="doi:10.1000/external",title="External paper",source="External author, publisher",
             fulltext_status="obtained",asset_bindings=[paper.as_dict()]))["result"]
-        use=_accepted(_call(runtime,channel,"research_memory.literature.reference",effect_id="reading",
+        use=_accepted(_call(runtime,channel,"research_graph.literature.reference",effect_id="reading",
             literature_ref=reg["ref"],question_ref=q.question_ref,research_ref=handle.target_ref,
             purpose="Assess applicability",reading_summary="Missing independent evidence",
             reading_bindings=[entry.binding.as_dict()]))["result"]
-        wrong=_call(runtime,channel,"research_memory.literature.reference",effect_id="wrong-reading",
+        wrong=_call(runtime,channel,"research_graph.literature.reference",effect_id="wrong-reading",
             literature_ref=reg["ref"],question_ref=q.question_ref,research_ref=handle.target_ref,
             purpose="Wrong producer",reading_bindings=[paper.as_dict()])
         assert wrong["isError"] and "literature_reading_source_invalid" in str(wrong)
-        page=_accepted(_call(runtime,channel,"research_memory.literature.page",record_ref="doi:10.1000/external"))
+        page=_accepted(_call(runtime,channel,"research_graph.literature.page",record_ref="doi:10.1000/external"))
         for query in (handle.target_ref, "Assess applicability", "Missing independent evidence"):
-            found = _accepted(_call(runtime, channel, "research_memory.literature.page", query=query))
+            found = _accepted(_call(runtime, channel, "research_graph.literature.page", query=query))
             assert any(item.get("literature_ref") == reg["ref"] for item in found["items"])
         item=next(i for i in page["items"] if i.get("literature_ref")==reg["ref"])
         assert len(item["judgments"]) == 1
@@ -206,13 +206,13 @@ def test_reasoning_without_bundle_can_register_and_read_literature(tmp_path):
         channel=runtime.harnesses.issue_resident_mcp_channel(run_ref=run.run_ref,attempt_ref=run.attempt_ref,
             root_session_ref=run.root_session_ref,fence_ref=run.fence_ref,capability_binding_hash=run.runtime_binding_hash,
             root_kind="reasoning",phase="primary",subject_policy="operation_tree",operation_ids=REASONING_ROOT_SEMANTIC_OPERATION_IDS)
-        reg=_accepted(_call(runtime,channel,"research_memory.literature.register",effect_id="reasoning-paper",
+        reg=_accepted(_call(runtime,channel,"research_graph.literature.register",effect_id="reasoning-paper",
             record_ref="doi:10.1000/lead",title="Unavailable full text",source="Publisher abstract",
             fulltext_status="missing",metadata={"limitation":"abstract only; not read in full"}))["result"]
-        usage=_accepted(_call(runtime,channel,"research_memory.literature.reference",effect_id="reasoning-use",
+        usage=_accepted(_call(runtime,channel,"research_graph.literature.reference",effect_id="reasoning-use",
             literature_ref=reg["ref"],question_ref=quest["question_ref"],purpose="Follow up evidence gap"))["result"]
-        assert _accepted(_call(runtime,channel,"research_memory.literature.read",literature_ref=usage["ref"]))["result"]==usage
-        page=_accepted(_call(runtime,channel,"research_memory.literature.page",record_ref=reg["record_ref"]))
+        assert _accepted(_call(runtime,channel,"research_graph.literature.read",literature_ref=usage["ref"]))["result"]==usage
+        page=_accepted(_call(runtime,channel,"research_graph.literature.page",record_ref=reg["record_ref"]))
         assert page["items"][0]["fulltext_status"]=="missing"
         assert page["items"][0]["readers"]==[]
         assert page["items"][0]["judgments"][0]["purpose"]=="Follow up evidence gap"

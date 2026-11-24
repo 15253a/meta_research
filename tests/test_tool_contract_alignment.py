@@ -181,7 +181,7 @@ def test_public_content_keeps_three_distinct_pagination_endings_and_exact_errors
         assert "Other content may exist" in diagnosis
         assert json.loads(bad_version["content"][0]["text"]) == bad_version["structuredContent"]
         assert _call(gateway, channel, operation, source)["isError"] is False
-        for unavailable in ("research_memory.literature.page", "unregistered.read"):
+        for unavailable in ("research_graph.literature.page", "unregistered.read"):
             error = _call(gateway, channel, unavailable, {})
             assert error["isError"] is True
             assert error["structuredContent"] == {"code": "capability_unavailable"}

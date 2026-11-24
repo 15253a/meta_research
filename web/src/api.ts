@@ -5874,14 +5874,16 @@ export function followProjection(
 
 export type OutputLanguage = "zh" | "en";
 export type ResearchLibraryEntry = "questions" | "baselines" | "datasets" | "literature" | "human" | "environments";
-export type ResearchContentReader = { source_ref?: string; version_ref?: string | null; entry_path?: string; ref?: string; operation?: string; question_ref?: string };
+export type ResearchContentReader = { source_ref?: string; version_ref?: string | null; entry_path?: string; selection_path?: string | null; ref?: string; operation?: string; question_ref?: string; basis_ref?: string; expected_basis_hash?: string };
 export type ResearchLibraryItem = Record<string, unknown> & {
   ref?: string; title?: string; name?: string; summary?: string; status?: string;
   request_ref?: string; response_count?: number;
   reader?: ResearchContentReader | null;
   history_reader?: ResearchContentReader | null;
+  creation_basis_reader?: ResearchContentReader | null;
+  relation_count?: number;
 };
-export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; query_revision?: string; result_state?: string; total_count?: number; request_next_cursor?: string | null; guidance_next_offset?: number | null; guidance_query_revision?: string };
+export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; query_revision?: string; result_state?: string; total_count?: number; request_next_cursor?: string | null; guidance_next_offset?: number | null; guidance_query_revision?: string; creation_basis_reader?: ResearchContentReader | null };
 export type ResearchContentPage = {
   text?: string; content?: unknown; next_offset: number | null; status?: string;
   [key: string]: unknown;
@@ -5917,6 +5919,9 @@ export function fetchResearchContent(questRef: string, reader: ResearchContentRe
   const parameters = new URLSearchParams({ quest_ref: questRef, source_ref: reader.source_ref, offset: String(offset), limit: "16384" });
   if (reader.version_ref) parameters.set("version_ref", reader.version_ref);
   if (reader.entry_path) parameters.set("entry_path", reader.entry_path);
+  if ("selection_path" in reader && reader.selection_path !== undefined) {
+    parameters.set("selection_path", reader.selection_path ?? "");
+  }
   return readResearchJson<ResearchContentPage>(`/api/v1/research-content?${parameters}`, signal);
 }
 export const submitResearchInput = (quest_ref: string, question_ref: string | null, text: string) =>

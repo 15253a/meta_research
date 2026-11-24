@@ -28,7 +28,7 @@ SHARED_RESEARCH_READ_OPERATION_IDS = {
     "research_graph.question_history.read",
     "research_graph.question_relations.read",
     "research_memory.assets.page",
-    "research_memory.literature.page",
+    "research_graph.literature.page",
     "research_memory.content.read",
 }
 
@@ -101,7 +101,7 @@ def test_catalog_rejects_duplicate_or_overlapping_grants():
         root_operation_catalog("target", common_operation_ids=("agent_runtime.target_run.observe",))
 
 
-@pytest.mark.parametrize("root_kind", ("companion", "bundle", "target"))
+@pytest.mark.parametrize("root_kind", ("companion", "target", "deepfetch"))
 def test_role_only_effect_and_reconcile_are_visible_but_owner_gated(root_kind):
     effect = SemanticOperation(
         semantic_operation_id="research_graph.question_relations.record",

@@ -63,10 +63,11 @@ def test_dataset_read_requires_one_reference_and_preserves_owner_diagnosis(admit
     details = failure(_call(runtime, channel, 'research_graph.datasets.read', dataset_ref=ref), 'dataset_store_unavailable')
     assert 'exact dataset_ref' in details['correction']
     monkeypatch.setattr(graph, 'query_dataset', original)
-    # Registering the global identity does not create a version in this Quest.
+    # Registering an identity in this Quest makes it discoverable to this Quest immediately.
     restored = _call(runtime, channel, 'research_graph.datasets.read', dataset_ref=ref)
     assert not restored['isError']
-    assert restored['structuredContent']['status'] == 'not_found'
+    assert restored['structuredContent']['status'] == 'accepted'
+    assert restored['structuredContent']['result']['dataset_ref'] == ref
     retained = _call(runtime, channel, 'research_graph.datasets.register.reconcile', effect_id='original-dataset')
     assert retained['structuredContent']['result']['dataset_ref'] == ref
 
@@ -80,7 +81,7 @@ def test_baseline_deep_reference_names_its_required_relation(admitted):
     assert not restored['isError']
 
 
-@pytest.mark.parametrize('operation', ['research_graph.questions.page', 'research_memory.literature.page',
+@pytest.mark.parametrize('operation', ['research_graph.questions.page', 'research_graph.literature.page',
     'research_graph.datasets.page', 'research_graph.environments.page', 'research_graph.baselines.page'])
 def test_discovery_revision_diagnostics_lead_to_valid_continuation(admitted, operation):
     runtime, channel = admitted
@@ -99,10 +100,10 @@ def test_literature_fulltext_diagnostic_preserves_actual_missing_status(admitted
     runtime, channel = admitted
     submitted = dict(effect_id='literature-diagnostic', record_ref='doi:10.1000/diagnostic',
         title='Abstract only', source='Supplied abstract', fulltext_status='obtained')
-    details = failure(_call(runtime, channel, 'research_memory.literature.register', **submitted), 'literature_fulltext_binding_required')
+    details = failure(_call(runtime, channel, 'research_graph.literature.register', **submitted), 'literature_fulltext_binding_required')
     assert 'fulltext_status' in details['message'] and 'asset_bindings' in details['message']
-    absent = _call(runtime, channel, 'research_memory.literature.register.reconcile', effect_id=submitted['effect_id'])
+    absent = _call(runtime, channel, 'research_graph.literature.register.reconcile', effect_id=submitted['effect_id'])
     assert absent['structuredContent']['result'] is None
-    accepted = _call(runtime, channel, 'research_memory.literature.register', **{**submitted, 'fulltext_status': 'missing'})
+    accepted = _call(runtime, channel, 'research_graph.literature.register', **{**submitted, 'fulltext_status': 'missing'})
     assert not accepted['isError']
     assert accepted['structuredContent']['result']['fulltext_status'] == 'missing'

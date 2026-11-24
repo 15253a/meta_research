@@ -78,7 +78,7 @@ def test_literature_directory_original_and_reading_bindings_are_navigable(tmp_pa
             question_ref=q.question_ref, purpose="Inspect original and supplement", reading_summary="Limits retained",
             reading_bindings=[reading.as_dict()], idempotency_key="reading")
         channel = _channel(runtime, _external_context(_scope(runtime, quest_ref=q.quest_ref)))
-        page = _accepted(_call(runtime, channel, "research_memory.literature.page", query="multiple-files"))
+        page = _accepted(_call(runtime, channel, "research_graph.literature.page", query="multiple-files"))
         item, = page["items"]
         for descriptor, expected in ((item["reader"], registered), (item["judgments"][0]["reader"], usage)):
             op, args = descriptor["operation"], {key: value for key, value in descriptor.items() if key != "operation"}

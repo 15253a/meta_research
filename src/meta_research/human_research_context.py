@@ -240,6 +240,7 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
                      "请求目录只附最新回复；沿 responses_reader 的 entry_kind=responses 及 request_ref 查询全部历史回复，"
                      "以 response_offset 和 query_revision 独立续页。每条回复提供准确 reader，目录不准备请求的完整执行生命周期。"
                      "正式指导和回复的详情在 upload_readers 提供上传附件的精确内容入口，沿 reader 的 source_ref/version_ref/entry_path 读取原已接纳上传字节，无需原接收工作区权限。"
+                     "也可改用更专一的单视图分页工具：human_request.responses.page、human_collaboration.inputs.page、human_collaboration.guidance.page、human_collaboration.guidance.treatments.page（均使用统一 offset/limit/query_revision）。"
                      "delivery.reply_file／uploaded_files 也保留原工作区的相对路径与 SHA-256，原接收根可从获授目录读取；外部原目录沿当前获授的工作材料引用读取。无 Quest 的原根须提供精确 request_ref／response_ref。人类交付是工作材料，按 Agent 判断再正式入库或登记。执行授权按对应 Owner 事实核验。"),
         input_schema={"type": "object", "properties": {"source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
             "entry_kind": {"type": "string", "enum": ["guidance", "responses", "treatments"]},
@@ -270,3 +271,151 @@ def human_research_context_operation(*, agent_runtime, human_collaboration):
             "next_cursor": {"type": "string"}}, "additionalProperties": False},
         handler=lambda context, arguments: read_human_research_context(
             agent_runtime, human_collaboration, context, arguments))
+
+
+def _carry_human_item_quest(items, quest_ref):
+    for item in items:
+        for key in ("reader", "content_reader", "treatments_reader", "responses_reader"):
+            if key in item and isinstance(item[key], dict):
+                item[key] = {**item[key], "source_quest_ref": quest_ref}
+
+
+def human_research_context_operations(*, agent_runtime, human_collaboration):
+    source_quest_schema = {"type": "string", "minLength": 1, "maxLength": 256}
+    revision_schema = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    page_props = {
+        "source_quest_ref": source_quest_schema,
+        "offset": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "query_revision": revision_schema,
+    }
+
+    def run_page(context, arguments, fetcher):
+        try:
+            selected_quest = arguments.get("source_quest_ref")
+            quest_ref = _reading_quest(
+                agent_runtime,
+                context,
+                source_quest_ref=selected_quest,
+                human_collaboration=human_collaboration,
+            )
+            result = fetcher(quest_ref, arguments)
+            if selected_quest is not None and isinstance(result.get("items"), list):
+                _carry_human_item_quest(result["items"], quest_ref)
+            return result
+        except OwnerConflict as error:
+            raise SemanticMcpError(error.code, error.details) from error
+
+    def responses_page(quest_ref, arguments):
+        page = human_collaboration.query_research_response_page(
+            quest_ref=quest_ref,
+            request_ref=arguments["request_ref"],
+            offset=arguments.get("offset", 0),
+            limit=arguments.get("limit", 12),
+            query_revision=arguments.get("query_revision"),
+        )
+        return {
+            **page,
+            "items": [
+                _response_summary(response, arguments["request_ref"])
+                for response in page["items"]
+            ],
+        }
+
+    def inputs_page(quest_ref, arguments):
+        return human_collaboration.query_research_inputs(
+            quest_ref=quest_ref,
+            query=arguments.get("query", ""),
+            offset=arguments.get("offset", 0),
+            limit=arguments.get("limit", 12),
+            query_revision=arguments.get("query_revision"),
+        )
+
+    def guidance_page(quest_ref, arguments):
+        return human_collaboration.query_research_guidance(
+            quest_ref=quest_ref,
+            query=arguments.get("query", ""),
+            offset=arguments.get("offset", 0),
+            limit=arguments.get("limit", 12),
+            query_revision=arguments.get("query_revision"),
+        )
+
+    def treatments_page(quest_ref, arguments):
+        return human_collaboration.query_research_guidance_treatments(
+            arguments["constraint_ref"],
+            quest_ref=quest_ref,
+            version_ref=arguments["version_ref"],
+            offset=arguments.get("offset", 0),
+            limit=arguments.get("limit", 12),
+            query_revision=arguments.get("query_revision"),
+        )
+
+    return (
+        human_research_context_operation(
+            agent_runtime=agent_runtime,
+            human_collaboration=human_collaboration,
+        ),
+        SemanticOperation(
+            semantic_operation_id="human_request.responses.page",
+            owning_module="human_collaboration",
+            description="Companion may select another HC-authorized source_quest_ref. Page all responses for one exact request_ref using standard offset, limit, and query_revision.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    **page_props,
+                    "request_ref": {"type": "string", "minLength": 1, "maxLength": 96},
+                },
+                "required": ["request_ref"],
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: run_page(context, arguments, responses_page),
+        ),
+        SemanticOperation(
+            semantic_operation_id="human_collaboration.inputs.page",
+            owning_module="human_collaboration",
+            description="Companion may select another HC-authorized source_quest_ref. Page proactive human research inputs in this Quest by query using standard offset, limit, and query_revision.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    **page_props,
+                    "query": {"type": "string", "maxLength": 1024},
+                },
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: run_page(context, arguments, inputs_page),
+        ),
+        SemanticOperation(
+            semantic_operation_id="human_collaboration.guidance.page",
+            owning_module="human_collaboration",
+            description="Companion may select another HC-authorized source_quest_ref. Page confirmed formal human guidance in this Quest by query using standard offset, limit, and query_revision.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    **page_props,
+                    "query": {"type": "string", "maxLength": 1024},
+                },
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: run_page(context, arguments, guidance_page),
+        ),
+        SemanticOperation(
+            semantic_operation_id="human_collaboration.guidance.treatments.page",
+            owning_module="human_collaboration",
+            description="Companion may select another HC-authorized source_quest_ref. Page all treatment assessments for one formal guidance constraint_ref and version_ref using standard offset, limit, and query_revision.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    **page_props,
+                    "constraint_ref": {"type": "string", "minLength": 1, "maxLength": 96},
+                    "version_ref": {"type": "string", "minLength": 1, "maxLength": 256},
+                },
+                "required": ["constraint_ref", "version_ref"],
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: run_page(context, arguments, treatments_page),
+        ),
+    )

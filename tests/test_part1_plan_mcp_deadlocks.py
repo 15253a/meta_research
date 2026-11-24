@@ -766,7 +766,7 @@ def test_non_owner_effect_and_reconcile_admission_returns_rejected_without_recon
         gateway = runtime.harnesses._gateway
         for root_kind, ops in (
             (
-                "bundle",
+                "target",
                 (
                     "research_graph.question_relations.record",
                     "research_graph.question_relations.record.reconcile",
@@ -775,8 +775,8 @@ def test_non_owner_effect_and_reconcile_admission_returns_rejected_without_recon
             (
                 "companion",
                 (
-                    "research_memory.literature.register",
-                    "research_memory.literature.register.reconcile",
+                    "research_graph.literature.register",
+                    "research_graph.literature.register.reconcile",
                 ),
             ),
         ):
