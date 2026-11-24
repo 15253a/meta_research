@@ -112,7 +112,7 @@ def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
         return RecoveryOwner.AGENT
     if any(token in code for token in ("audit", "persistence", "invariant", "corrupt", "readback")):
         return RecoveryOwner.OPERATOR
-    if any(token in code for token in ("schema", "input", "target_", "context", "authorization", "permission", "scope")):
+    if any(token in code for token in ("schema", "input", "target_", "context", "authorization", "permission", "scope", "research_query_")):
         return RecoveryOwner.AGENT
     if details.get("recovery_owner") in _ROUTING:
         return _ROUTING[str(details["recovery_owner"])]

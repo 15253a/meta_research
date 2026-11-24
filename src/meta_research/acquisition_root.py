@@ -42,7 +42,24 @@ _TARGETLESS_PREFLIGHT_REASONS = frozenset(
         "empty_targets",
         "targets_not_supplied",
         "paper_targets_missing",
+        "targetless",
     }
+)
+_TARGETLESS_REASON_PHRASES = (
+    "no_target",
+    "no_paper_target",
+    "missing_target",
+    "missing_paper_target",
+    "empty_target",
+    "empty_paper_target",
+    "without_target",
+    "without_paper_target",
+    "targets_missing",
+    "paper_targets_missing",
+    "targetless",
+)
+_UNHEALTHY_PREFLIGHT_STATES = frozenset(
+    {"unavailable", "waiting", "broken", "invalid", "failed", "error", "missing"}
 )
 
 
@@ -52,8 +69,21 @@ def _is_targetless_preflight_reason(reason_code: object) -> bool:
     normalized = reason_code.strip().lower()
     if normalized in _TARGETLESS_PREFLIGHT_REASONS:
         return True
-    return "target" in normalized and any(
-        token in normalized for token in ("no_", "missing", "empty", "without")
+    return any(phrase in normalized for phrase in _TARGETLESS_REASON_PHRASES)
+
+
+def _configuration_health_ready(evidence: object) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    health = evidence.get("configuration_health")
+    if not isinstance(health, str) or not health.strip():
+        return False
+    normalized = health.strip().lower()
+    if normalized in _UNHEALTHY_PREFLIGHT_STATES:
+        return False
+    return not any(
+        token in normalized
+        for token in ("broken", "invalid", "fail", "error", "unavail", "missing")
     )
 
 
@@ -174,7 +204,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             request.mode in {"oa_only", "provided_only"}
             and result.status == "unavailable"
             and _is_targetless_preflight_reason(result.reason_code)
-            and isinstance(result.evidence, dict)
+            and _configuration_health_ready(result.evidence)
         ):
             result = AcquisitionPreflightResult(
                 status="ready",
@@ -191,7 +221,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             and _is_targetless_preflight_reason(result.reason_code)
             and isinstance(result.browser_context_ref, str)
             and bool(result.browser_context_ref.strip())
-            and isinstance(result.evidence, dict)
+            and _configuration_health_ready(result.evidence)
         ):
             result = AcquisitionPreflightResult(
                 status="ready",

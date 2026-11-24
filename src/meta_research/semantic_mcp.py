@@ -1489,7 +1489,7 @@ def _contract_tool_error(
         if key not in projected or projected[key] is None:
             projected[key] = value
     if error_audit_store is not None:
-        if not effect:
+        if not effect and contract.recovery_owner is RecoveryOwner.AGENT:
             projected["audit_ref"] = None
             projected["audit_status"] = "skipped_read_only"
         else:

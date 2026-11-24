@@ -1380,11 +1380,15 @@ def test_pr320_p2_5_readonly_audit_skip_and_p2_6_unauthorized_agent_routing(
         def _readonly_handler(_ctx, _args):
             raise SemanticMcpError("research_query_changed", {"correction": "Re-query from offset 0."})
 
+        def _readonly_operator_handler(_ctx, _args):
+            raise SemanticMcpError("persistence_corrupt_record", {"message": "Indexed store corruption detected."})
+
         def _unauth_effect(_ctx, _args):
             raise SemanticMcpError("quest_goal_root_unauthorized", {"message": "Not a research root."})
 
         ops = (
             SemanticOperation("ro.test", "rg", "ro", _readonly_handler, {"type": "object"}, {"type": "object"}, "read"),
+            SemanticOperation("ro.operator_fail", "rg", "ro op", _readonly_operator_handler, {"type": "object"}, {"type": "object"}, "read"),
             SemanticOperation(
                 "eff.unauth",
                 "rg",
@@ -1400,7 +1404,7 @@ def test_pr320_p2_5_readonly_audit_skip_and_p2_6_unauthorized_agent_routing(
         gw = SemanticMcpGateway(ops, error_audit_store=store)
         ch, _ = gw.issue_channel(
             run_ref="r1", attempt_ref="a1", root_session_ref="s1", fence_ref="f1",
-            capability_binding_hash="a" * 64, operation_ids=("ro.test", "eff.unauth", "eff.unauth.reconcile"),
+            capability_binding_hash="a" * 64, operation_ids=("ro.test", "ro.operator_fail", "eff.unauth", "eff.unauth.reconcile"),
             root_kind="idea", phase="primary",
         )
 
@@ -1409,6 +1413,13 @@ def test_pr320_p2_5_readonly_audit_skip_and_p2_6_unauthorized_agent_routing(
         assert ro_details["audit_ref"] is None
         assert ro_details["audit_status"] == "skipped_read_only"
         assert fw_count == 0
+
+        _, op_resp = gw.dispatch(ch.token, {"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "ro.operator_fail", "arguments": {}}})
+        op_details = op_resp["result"]["structuredContent"]["details"]
+        assert isinstance(op_details.get("audit_ref"), str) and op_details["audit_ref"]
+        assert op_details.get("audit_status") != "skipped_read_only"
+        assert op_details["recovery_owner"] == "operator"
+        assert fw_count >= 1
 
         for code in (
             "quest_goal_root_unauthorized",
@@ -1819,6 +1830,18 @@ def test_all_five_roots_concise_cycle_position_and_target_continuation_slimming(
     }
     view = stage_context_view("idea", huge_pack, context_pack_ref="cp:1", context_pack_hash="b" * 64)
     assert view["section_delivery"].get("current_handoff_notes") == "omitted"
+    omitted_notes = view.get("current_handoff_notes")
+    assert isinstance(omitted_notes, list) and len(omitted_notes) == 6
+    assert all(
+        isinstance(item, dict)
+        and item.get("omitted_from_preview") is True
+        and isinstance(item.get("reader"), dict)
+        and item["reader"].get("operation") == "research_memory.stage_context.read"
+        and "research_note" not in item
+        and "notes" not in item
+        and "scientific_summary" not in item
+        for item in omitted_notes
+    )
 
 
 def test_work_materials_single_file_cross_turn_and_native_read_feedback(
@@ -1942,3 +1965,31 @@ def test_acquisition_root_targetless_preflight_and_oa_then_institution_policy(
         AcquisitionPreflightRequest("s3", "init3", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv3"))
     )
     assert res_bad.status == "unavailable" and res_bad.browser_context_ref is None
+
+    runner_site_missing = _AcqSequenceRunner([{
+        "status": "unavailable",
+        "browser_context_ref": None,
+        "reason_code": "target_site_missing",
+        "evidence": {"configuration_health": "ok", "browser_control": "skipped", "authorized_resource": "no_targets"},
+    }])
+    adapter_site_missing = CodexAcquisitionRootAdapter(
+        tmp_path / "acq-site-missing", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex-site")), process_runner=runner_site_missing
+    )
+    res_site_missing = adapter_site_missing.preflight(
+        AcquisitionPreflightRequest("s4", "init4", 1, "a" * 64, "oa_only", "", str(tmp_path / "priv4"))
+    )
+    assert res_site_missing.status == "unavailable" and res_site_missing.reason_code == "target_site_missing"
+
+    runner_broken_health = _AcqSequenceRunner([{
+        "status": "unavailable",
+        "browser_context_ref": "ctx-verified-2",
+        "reason_code": "missing_paper_targets",
+        "evidence": {"configuration_health": "broken", "browser_control": "connected", "authorized_resource": "verified"},
+    }])
+    adapter_broken_health = CodexAcquisitionRootAdapter(
+        tmp_path / "acq-broken-health", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex-broken")), process_runner=runner_broken_health
+    )
+    res_broken_health = adapter_broken_health.preflight(
+        AcquisitionPreflightRequest("s5", "init5", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv5"))
+    )
+    assert res_broken_health.status == "unavailable" and res_broken_health.reason_code == "missing_paper_targets"

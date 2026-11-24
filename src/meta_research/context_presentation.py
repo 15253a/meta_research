@@ -279,18 +279,42 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
                       if k not in scientific_inputs
                       and not (isinstance(v, dict) and v.get("omitted_from_preview"))]
         if not candidates:
-            if view.get("current_handoff_notes"):
-                view["current_handoff_notes"] = [
-                    {
-                        **{k: v for k, v in item.items() if k != "preview"},
-                        "omitted_from_preview": True,
-                    }
-                    for item in view["current_handoff_notes"]
-                ]
+            handoff_notes = view.get("current_handoff_notes")
+            if isinstance(handoff_notes, list) and handoff_notes:
+                if not all(
+                    isinstance(item, dict) and item.get("omitted_from_preview")
+                    for item in handoff_notes
+                ):
+                    view["current_handoff_notes"] = [
+                        {
+                            **{
+                                k: v
+                                for k, v in item.items()
+                                if k in ("stage", "source_commit_ref", "source_outcome_ref", "reader")
+                                and v is not None
+                            },
+                            "omitted_from_preview": True,
+                        }
+                        for item in handoff_notes
+                    ]
+                    view["section_delivery"]["current_handoff_notes"] = "omitted"
+                    continue
+                first_reader = (
+                    handoff_notes[0].get("reader")
+                    if isinstance(handoff_notes[0], dict)
+                    else None
+                )
+                fallback_reader = (
+                    reader(["upstream_stage_closure"])
+                    if "upstream_stage_closure" in context_pack
+                    else (first_reader if isinstance(first_reader, dict) else reader([]))
+                )
+                view["current_handoff_notes"] = {
+                    "omitted_from_preview": True,
+                    "count": len(handoff_notes),
+                    "reader": fallback_reader,
+                }
                 view["section_delivery"]["current_handoff_notes"] = "omitted"
-                if optional_view_bytes() <= CONTEXT_VIEW_MAX_BYTES:
-                    break
-                view.pop("current_handoff_notes", None)
                 continue
             raise ValueError("context_presentation_identity_too_large")
         _, key = max(candidates)
