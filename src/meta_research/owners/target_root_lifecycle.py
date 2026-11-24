@@ -60,6 +60,7 @@ from meta_research.target_run_runtime_contract import (
 
 
 AR_TARGET_ROOT_COMPLETION_RECEIPT_KIND = "target_root_completion_accepted"
+TARGET_REJECTION_LIMIT_ACK_EVENT = "target_root_lifecycle.rejection_limit_acknowledged"
 
 
 def _current_goal_work_intent(
@@ -2418,11 +2419,26 @@ class SQLiteTargetRootLifecycleAuthority:
     def query_consecutive_candidate_rejections(
         self, *, target_ref: str, target_run_ref: str,
     ) -> tuple[int, float | None]:
-        """Count trailing candidate-rejected completions for this Target run."""
+        """Count trailing candidate-rejected completions since the latest operator ack."""
         with self._database.read() as connection:
+            ack_row = connection.execute(
+                text(
+                    "SELECT json_extract(payload_json, '$.acknowledged_up_to_generation') AS ack_gen "
+                    "FROM durable_feed WHERE event_type = :event_type "
+                    "AND json_extract(payload_json, '$.target_ref') = :target_ref "
+                    "AND json_extract(payload_json, '$.target_run_ref') = :target_run_ref "
+                    "ORDER BY revision DESC LIMIT 1"
+                ),
+                {
+                    "event_type": TARGET_REJECTION_LIMIT_ACK_EVENT,
+                    "target_ref": target_ref,
+                    "target_run_ref": target_run_ref,
+                },
+            ).first()
+            ack_gen = int(ack_row.ack_gen) if ack_row is not None and ack_row.ack_gen is not None else 0
             rows = connection.execute(
                 text(
-                    "SELECT c.accepted_at, "
+                    "SELECT c.generation, c.accepted_at, "
                     "EXISTS (SELECT 1 FROM ar_target_root_completion_rejections r "
                     "WHERE r.completion_ref = c.completion_ref) AS is_rejected "
                     "FROM ar_target_root_completions c "
@@ -2434,12 +2450,91 @@ class SQLiteTargetRootLifecycleAuthority:
         count = 0
         latest_at: float | None = None
         for row in rows:
-            if not row.is_rejected:
+            if not row.is_rejected or int(row.generation) <= ack_gen:
                 break
             count += 1
             if latest_at is None and row.accepted_at is not None:
                 latest_at = float(row.accepted_at)
         return count, latest_at
+
+    def record_target_rejection_limit_audit(
+        self,
+        *,
+        target_ref: str,
+        target_run_ref: str,
+        consecutive_rejections: int,
+        completion_ref: str | None = None,
+    ) -> dict[str, object]:
+        """Persist one idempotent operator-routed audit record without write-thrash."""
+        from meta_research.error_audit import ERROR_AUDIT_EVENT_TYPE, ErrorAuditStore
+        from meta_research.error_contract import error_contract_from_legacy
+
+        correlation_ref = f"target_run:{target_ref}:{target_run_ref}"
+        contract = error_contract_from_legacy(
+            "target_rejection_limit_reached",
+            {
+                "target_ref": target_ref,
+                "target_run_ref": target_run_ref,
+                "consecutive_rejections": consecutive_rejections,
+                "completion_ref": completion_ref,
+            },
+            phase="finalizer",
+            operation_id="target_run_runtime.resume_after_rejection",
+            effect=False,
+            operation_ref=completion_ref,
+            correlation_ref=correlation_ref,
+        )
+        with self._database.read() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT 1 FROM durable_feed WHERE event_type = :event_type "
+                    "AND json_extract(payload_json, '$.audit_ref') = :audit_ref LIMIT 1"
+                ),
+                {"event_type": ERROR_AUDIT_EVENT_TYPE, "audit_ref": contract.audit_ref},
+            ).first()
+        if existing is not None:
+            audit_ref = contract.audit_ref
+        else:
+            audit_ref = ErrorAuditStore(self._database, self._feed).record(contract).audit_ref
+        return {
+            "audit_ref": audit_ref,
+            "correlation_ref": contract.correlation_ref,
+            "operator_required": True,
+        }
+
+    def acknowledge_target_rejection_limit(
+        self,
+        *,
+        target_ref: str,
+        target_run_ref: str,
+        operator_note: str | None = None,
+    ) -> dict[str, object]:
+        """Record explicit operator acknowledgement to reset trailing rejection pause."""
+        now = time.time()
+        with self._database.fenced_write() as connection:
+            max_gen = connection.execute(
+                text(
+                    "SELECT COALESCE(MAX(c.generation), 0) "
+                    "FROM ar_target_root_completions c "
+                    "JOIN ar_target_root_completion_rejections r "
+                    "ON r.completion_ref = c.completion_ref "
+                    "WHERE c.target_ref = :target_ref AND c.target_run_ref = :target_run_ref"
+                ),
+                {"target_ref": target_ref, "target_run_ref": target_run_ref},
+            ).scalar_one()
+            payload = {
+                "target_ref": target_ref,
+                "target_run_ref": target_run_ref,
+                "acknowledged_up_to_generation": int(max_gen or 0),
+                "acknowledged_at": now,
+                "operator_note": operator_note,
+            }
+            revision = self._feed.record(
+                connection,
+                TARGET_REJECTION_LIMIT_ACK_EVENT,
+                payload,
+            )
+        return {"revision": revision, **payload}
 
     def query_completion_rejection(
         self, completion_ref: str

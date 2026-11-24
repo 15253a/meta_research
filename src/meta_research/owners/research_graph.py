@@ -20886,7 +20886,7 @@ def _measurement_closure_conflict(code: str, error: Exception) -> OwnerConflict:
     details = getattr(error, "details", None)
     details_dict = dict(details) if isinstance(details, dict) else None
     if details_dict and details_dict.get("category") == "technical_capacity":
-        conflict: OwnerConflict = TargetContentIssue(code, details_dict)
+        conflict = OwnerConflict(code, details_dict)
         actual = details_dict.get("actual_bytes")
         qualifier = "at least " if details_dict.get("actual_is_lower_bound") else ""
         conflict.feedback = (

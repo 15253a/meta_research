@@ -1269,6 +1269,8 @@ class QuestGoalOwnerMixin:
                         or source_work.get("work_ref") != item.work.run_ref
                     ):
                         raise OwnerConflict("goal_retained_asset_producer_invalid")
+                else:
+                    raise OwnerConflict("goal_retained_asset_producer_invalid")
                 if preverified_assets is not None and asset["version_ref"] in preverified_assets:
                     accepted, verify_error = preverified_assets[asset["version_ref"]]
                 else:

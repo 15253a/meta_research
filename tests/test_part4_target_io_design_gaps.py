@@ -380,6 +380,20 @@ def test_target_result_json_remaining_conflicts_route_to_revision_feedback_and_k
     r_hl = _case("hardlink-artifact", _hardlink_artifact)
     assert r_hl.pending_code == "target_root_artifact_type_unsupported"
 
+    from meta_research.bundle_protocol import BundleProtocolError
+    from meta_research.owners.research_graph import _measurement_closure_conflict
+    from meta_research.target_content_issue import TargetContentIssue
+
+    cap_err = _measurement_closure_conflict(
+        "target_root_measurement_closure_invalid",
+        BundleProtocolError(
+            "too big",
+            {"category": "technical_capacity", "path": "$", "actual_bytes": 999999, "limit": 65536},
+        ),
+    )
+    assert type(cap_err) is OwnerConflict and not isinstance(cap_err, TargetContentIssue)
+    assert cap_err.feedback and "Do not truncate results" in cap_err.feedback
+
 
 def test_target_reused_run_conflicts_route_to_revision_feedback(tmp_path: Path) -> None:
     runtime, lifecycle, _memory, _authority, handle, workspace, evidence = _root_finalizer_fixture(
@@ -705,11 +719,17 @@ def test_configurable_bounded_rejection_backoff_for_target_and_stage(
             conn.execute(text("UPDATE ar_stage_runs SET current_attempt_ref='plan_attempt_5', current_fence_ref='fence_5' WHERE run_ref=:r"), {"r": run.run_ref})
             conn.execute(text("UPDATE ar_run_controls SET attempt_ref='plan_attempt_5', fence_ref='fence_5', control_revision=control_revision+1 WHERE run_ref=:r"), {"r": run.run_ref})
 
-        with pytest.raises(OwnerConflict, match="stage_rejection_limit_reached"):
+        with pytest.raises(OwnerConflict, match="stage_rejection_limit_reached") as limit_exc:
             rt.owners.agent_runtime.begin_provider_unit(
                 unit_ref="u5", operation_ref="op5", run_ref=run.run_ref,
                 attempt_ref="plan_attempt_5", fence_ref="fence_5", unit_kind="plan_primary",
             )
+        assert limit_exc.value.details["operator_required"] is True
+        assert limit_exc.value.details["recovery_owner"] == "operator"
+        assert isinstance(limit_exc.value.details.get("audit_ref"), str) and limit_exc.value.details["audit_ref"]
+        stage_corr = f"stage_run:{run.run_ref}:attempt:plan_attempt_5"
+        assert limit_exc.value.details["correlation_ref"] == stage_corr
+
         monkeypatch.setenv("META_RESEARCH_REJECTION_MAX_CONSECUTIVE", "6")
         clock.now = 5100.0
         rt.owners.agent_runtime.begin_provider_unit(
@@ -718,6 +738,73 @@ def test_configurable_bounded_rejection_backoff_for_target_and_stage(
         )
     finally:
         rt.close()
+
+    from test_plan_owner_acceptance import _QuestionRestatingPlanSkill
+    from test_public_plan_stage import _DeterministicIdeaSkill, _runtime as _plan_runtime
+
+    with monkeypatch.context() as mp:
+        mp.setenv("META_RESEARCH_REJECTION_BACKOFF_AFTER", "1")
+        mp.setenv("META_RESEARCH_REJECTION_MAX_CONSECUTIVE", "1")
+        rt_w = _plan_runtime(
+            tmp_path / "stage-worker-rej",
+            idea_skill=_DeterministicIdeaSkill(),
+            plan_skill=_QuestionRestatingPlanSkill(),
+        )
+        try:
+            q_w = _confirm_direct_quest(rt_w)
+            _finish_idea_stage(rt_w)
+            req_w = None
+            for _ in range(12):
+                progressed = rt_w.plan_stage.process_once()
+                if req_w is None:
+                    req_w = rt_w.owners.advancement_engine.query_plan_stage_request(q_w["cycle_ref"])
+                if not progressed and rt_w.plan_stage.transient_error == "stage_rejection_limit_reached":
+                    break
+            assert req_w is not None
+            run_w = rt_w.owners.agent_runtime.query_plan_stage_run(req_w.request_ref)
+            assert run_w is not None and run_w.attempt_generation == 2
+            assert rt_w.plan_stage.transient_error == "stage_rejection_limit_reached"
+
+            audit_store = ErrorAuditStore(rt_w._database, rt_w.feed)
+            corr_w = f"stage_run:{run_w.run_ref}:attempt:{run_w.attempt_ref}"
+            audits_w = audit_store.query_correlation(corr_w)
+            assert len(audits_w) == 1
+            assert audits_w[0].payload["contract"]["details"]["operator_required"] is True
+            assert audits_w[0].payload["contract"]["details"]["recovery_owner"] == "operator"
+
+            write_calls: list[str] = []
+            from contextlib import contextmanager
+            orig_w = rt_w._database.write
+            orig_fw = rt_w._database.fenced_write
+
+            @contextmanager
+            def _spy_w():
+                write_calls.append("write")
+                with orig_w() as c:
+                    yield c
+
+            @contextmanager
+            def _spy_fw():
+                write_calls.append("fenced_write")
+                with orig_fw() as c:
+                    yield c
+
+            with monkeypatch.context() as spy_mp:
+                spy_mp.setattr(rt_w._database, "write", _spy_w)
+                spy_mp.setattr(rt_w._database, "fenced_write", _spy_fw)
+                assert rt_w.plan_stage.process_once() is False
+                assert rt_w.plan_stage.transient_error == "stage_rejection_limit_reached"
+                assert write_calls == []
+            assert len(audit_store.query_correlation(corr_w)) == 1
+
+            ack_w = rt_w.owners.agent_runtime.acknowledge_stage_rejection_limit(
+                run_ref=run_w.run_ref, operator_note="operator reviewed plan rejection",
+            )
+            assert ack_w["acknowledged_up_to_generation"] == 1
+            assert rt_w.plan_stage.process_once() is True
+            assert rt_w.plan_stage.transient_error is None
+        finally:
+            rt_w.close()
 
     rt_t, lc_t, _mem_t, _auth_t, h_t, ws_t, ev_t = _root_finalizer_fixture(tmp_path / "target-rej-backoff")
     try:
@@ -768,7 +855,24 @@ def test_configurable_bounded_rejection_backoff_for_target_and_stage(
         st4 = t_runtime.query_status(h_t.target_ref)
         assert st4 is not None and st4.phase == "revision_paused"
         assert st4.pending_code == "target_rejection_limit_reached"
+        assert st4.operator_required is True
+        assert isinstance(st4.audit_ref, str) and st4.audit_ref
+        target_corr = f"target_run:{h_t.target_ref}:{h_t.target_run_ref}"
+        assert st4.correlation_ref == target_corr
+        target_audits = ErrorAuditStore(rt_t._database, rt_t.feed)
+        assert target_audits.query(st4.audit_ref) is not None
+        assert t_runtime._resume_after_rejection(handle=h_t, harness_request_ref="hr:1", revision=rejg) is False
+        assert len(target_audits.query_correlation(target_corr)) == 1
         assert rt_t.owners.agent_runtime.query_human_requests() == ()
+
+        ack_target = lc_t.acknowledge_target_rejection_limit(
+            target_ref=h_t.target_ref,
+            target_run_ref=h_t.target_run_ref,
+            operator_note="operator approved target continuation",
+        )
+        assert ack_target["acknowledged_up_to_generation"] == 4
+        assert t_runtime._resume_after_rejection(handle=h_t, harness_request_ref="hr:1", revision=rejg) is True
+        assert len(calls) >= 2
     finally:
         rt_t.close()
 
@@ -1074,6 +1178,7 @@ def test_quest_goal_evolve_stop_retention_zero_lock_io_and_binary_managed_assets
             disk_io_in_fw.clear()
             evolved = _mcp(invocation.mcp_token, "research_graph.quest_goal.evolve", effect_id="evolve-bin-stop", decision=decision)
             assert not evolved.get("isError"), evolved
+            observed["decision"] = decision
             observed["evolved"] = evolved["structuredContent"]
             observed["evolve_lock_ms"] = list(fw_durations_ms)
             observed["disk_io_in_fw"] = list(disk_io_in_fw)
@@ -1090,6 +1195,64 @@ def test_quest_goal_evolve_stop_retention_zero_lock_io_and_binary_managed_assets
             f"\n[BENCH quest_goal.evolve fenced_write] runs={len(lock_ms)} "
             f"median_ms={statistics.median(lock_ms):.3f} disk_io_in_lock={len(observed['disk_io_in_fw'])}"
         )
+
+        unrelated = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="unrelated-direct.txt",
+                media_type="text/plain",
+                content=b"Unrelated asset.\n",
+                origin_quest_ref=launch.quest_ref,
+            ),
+            idempotency_key="unrelated-retain-check",
+        ).asset
+        runtime.owners.research_graph.accept_asset_role(
+            binding=unrelated.as_binding(),
+            role="quest_source_material",
+            quest_ref=launch.quest_ref,
+            idempotency_key="unrelated-role",
+        )
+        saved_decision = observed["decision"]
+        target_work = next(
+            d["work"]
+            for d in saved_decision["arrangements"]["decisions"]
+            if d["work"].get("target_ref") == target.target_ref
+        )
+        bad_stop = (
+            WorkDecision(
+                kind="stop",
+                work=WorkHandle(**target_work),
+                reason="Attempt unrelated asset retention.",
+                retention={
+                    "kind": "selected",
+                    "assets": [{
+                        "asset_ref": unrelated.asset_ref,
+                        "version_ref": unrelated.version_ref,
+                        "content_hash": unrelated.content_hash,
+                        "manifest_hash": unrelated.manifest_hash,
+                        "receipt": unrelated.receipt.as_public_dict(),
+                        "meaning": "Should fail producer check.",
+                    }],
+                },
+            ),
+        )
+        with runtime._database.read() as conn:
+            with pytest.raises(OwnerConflict, match="goal_retained_asset_producer_invalid"):
+                runtime.owners.research_graph._verify_goal_retention_in_transaction(
+                    conn,
+                    quest_ref=launch.quest_ref,
+                    decisions=bad_stop,
+                )
+
+        with monkeypatch.context() as mp:
+            mp.setattr(
+                runtime.owners.research_memory._receipt_verifier,
+                "_asset_export_source",
+                lambda _ref: (None, SimpleNamespace(), [SimpleNamespace(custody_mode="managed")], {"entries": []}),
+            )
+            with pytest.raises(OwnerConflict, match="asset_custody_unavailable"):
+                runtime.owners.research_memory.verify_managed_asset_content("any-empty-manifest")
     finally:
         runtime.close()
 
@@ -1485,6 +1648,8 @@ def test_first_turn_include_direction_and_turn2_delta_only_goal_propagation(
     assert "current_goal_and_conditions=" in p2_evolved and "Direction v2." in p2_evolved
     p3 = guidance_prompt(cut_2, resident=True, include_body=False, include_direction=False, previous_prompts=(p1, p2_evolved))
     assert "current_goal_and_conditions=" not in p3
+    p_revert = guidance_prompt(cut_1, resident=True, include_body=False, include_direction=False, previous_prompts=(p1, p2_evolved))
+    assert "current_goal_and_conditions=" in p_revert and "Direction v1." in p_revert
 
     class _CutAuthority:
         def freeze_operation_guidance(self, _op):
@@ -1734,6 +1899,28 @@ def test_goal_evolution_g1_to_g2_propagates_to_bundle_and_subsequent_targets(
             if any(rev and rev["goal_revision_ref"] == g2["goal_revision_ref"] for _, rev in observed_requests):
                 break
         assert any(rev and rev["goal_revision_ref"] == g2["goal_revision_ref"] for _, rev in observed_requests), observed_requests
+
+        live_goal = runtime.bundle_stage._live_quest_goal_revision(
+            SimpleNamespace(
+                accepted_question=SimpleNamespace(quest_ref=quest_ref),
+                context_pack={"quest_goal_revision": g1},
+            )
+        )
+        assert live_goal is not None and live_goal["goal_revision_ref"] == g2["goal_revision_ref"]
+        orig_query_goal = runtime.owners.research_graph.query_current_quest_goal_revision
+        try:
+            runtime.owners.research_graph.query_current_quest_goal_revision = lambda _q: (_ for _ in ()).throw(
+                OwnerConflict("quest_goal_head_missing")
+            )
+            fallback_goal = runtime.bundle_stage._live_quest_goal_revision(
+                SimpleNamespace(
+                    accepted_question=SimpleNamespace(quest_ref=quest_ref),
+                    context_pack={"quest_goal_revision": g1},
+                )
+            )
+            assert fallback_goal == g1
+        finally:
+            runtime.owners.research_graph.query_current_quest_goal_revision = orig_query_goal
 
         (tmp_path / "drift-g2").mkdir(parents=True, exist_ok=True)
         adapter, _runner = bundle_drift_fixtures._adapter(tmp_path / "drift-g2", bundle_drift_fixtures._output("batch"))
@@ -1993,3 +2180,31 @@ def test_acquisition_root_targetless_preflight_and_oa_then_institution_policy(
         AcquisitionPreflightRequest("s5", "init5", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv5"))
     )
     assert res_broken_health.status == "unavailable" and res_broken_health.reason_code == "missing_paper_targets"
+
+    runner_inst_missing = _AcqSequenceRunner([{
+        "status": "unavailable",
+        "browser_context_ref": "ctx-verified-3",
+        "reason_code": "institution_targets_missing",
+        "evidence": {"configuration_health": "ok", "browser_control": "connected", "authorized_resource": "verified"},
+    }])
+    adapter_inst_missing = CodexAcquisitionRootAdapter(
+        tmp_path / "acq-inst-missing", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex-im")), process_runner=runner_inst_missing
+    )
+    res_inst_missing = adapter_inst_missing.preflight(
+        AcquisitionPreflightRequest("s6", "init6", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv6"))
+    )
+    assert res_inst_missing.status == "unavailable" and res_inst_missing.reason_code == "institution_targets_missing"
+
+    runner_bad_browser = _AcqSequenceRunner([{
+        "status": "unavailable",
+        "browser_context_ref": "ctx-verified-4",
+        "reason_code": "missing_paper_targets",
+        "evidence": {"configuration_health": "ok", "browser_control": "not_connected", "authorized_resource": "verified"},
+    }])
+    adapter_bad_browser = CodexAcquisitionRootAdapter(
+        tmp_path / "acq-bad-browser", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex-bb")), process_runner=runner_bad_browser
+    )
+    res_bad_browser = adapter_bad_browser.preflight(
+        AcquisitionPreflightRequest("s7", "init7", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv7"))
+    )
+    assert res_bad_browser.status == "unavailable" and res_bad_browser.browser_context_ref == "ctx-verified-4"

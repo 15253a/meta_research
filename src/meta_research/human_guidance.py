@@ -183,7 +183,7 @@ def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True,
             direction = "current_goal_and_conditions=" + canonical_json({
                 "goal": cut.direction_cut["goal"], "conditions": cut.direction_cut["conditions"],
             })
-            if direction not in prior_directions:
+            if not prior_directions or direction != prior_directions[-1]:
                 rendered += "\n" + direction
     return rendered
 

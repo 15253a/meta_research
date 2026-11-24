@@ -100,6 +100,10 @@ def _is_unauthorized_capability_reason(reason: object) -> bool:
 def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
     if code in {"provider_auth_revoked", "provider_authentication_required"}:
         return RecoveryOwner.OPERATOR
+    if code in {"stage_rejection_limit_reached", "target_rejection_limit_reached"}:
+        return RecoveryOwner.OPERATOR
+    if code in {"stage_rejection_backoff_pending", "target_rejection_backoff_pending"}:
+        return RecoveryOwner.SYSTEM
     if code == "mcp_channel_authentication_required":
         return RecoveryOwner.OPERATOR
     if code == "capability_unavailable":
@@ -122,6 +126,10 @@ def _route_for(code: str, details: Mapping[str, Any]) -> RecoveryOwner:
 def _status_for(code: str, details: Mapping[str, Any], *, effect: bool) -> EffectStatus:
     if code in {"provider_auth_revoked", "provider_authentication_required"}:
         return EffectStatus.REJECTED
+    if code in {"stage_rejection_limit_reached", "target_rejection_limit_reached"}:
+        return EffectStatus.REJECTED
+    if code in {"stage_rejection_backoff_pending", "target_rejection_backoff_pending"}:
+        return EffectStatus.WAITING
     if "fence_stale" in code or code in {"attempt_fence_stale", "stale_fence"}:
         return EffectStatus.STALE
     if _is_business_unauthorized_code(code):
@@ -266,10 +274,14 @@ def error_contract_from_legacy(
     """Map an existing code/details pair without changing Owner semantics."""
 
     raw = dict(details or {})
-    if code == PROVIDER_INSUFFICIENT_BALANCE and type(raw.get("next_retry_at")) in {int, float}:
+    if (
+        code in {PROVIDER_INSUFFICIENT_BALANCE, "stage_rejection_backoff_pending", "target_rejection_backoff_pending"}
+        and type(raw.get("next_retry_at")) in {int, float}
+    ):
         raw.setdefault("effect_status", "waiting")
         raw.setdefault("next_action", "wait")
-        raw.setdefault("recovery_component", "target_runtime")
+        if code == PROVIDER_INSUFFICIENT_BALANCE:
+            raw.setdefault("recovery_component", "target_runtime")
         raw.setdefault("handoff", {"next_retry_at": raw["next_retry_at"]})
     operation_id = str(raw.get("operation_id") or operation_id)
     effect_id = effect_id or (raw.get("effect_id") if isinstance(raw.get("effect_id"), str) else None)
@@ -325,6 +337,13 @@ def error_contract_from_legacy(
     correction = raw.get("correction") if isinstance(raw.get("correction"), str) else None
     if code in {"provider_auth_revoked", "provider_authentication_required"} and correction is None:
         correction = "Refresh the Provider authentication and rerun the failed operation after the Owner confirms the new credential."
+    if code in {"stage_rejection_limit_reached", "target_rejection_limit_reached"} and correction is None:
+        correction = (
+            "Consecutive owner rejections reached the configured limit. "
+            "Inspect rejection feedback and resume via operator acknowledgement "
+            "(acknowledge_stage_rejection_limit / acknowledge_target_rejection_limit) "
+            "or raise META_RESEARCH_REJECTION_MAX_CONSECUTIVE."
+        )
     if (
         code == "capability_unavailable"
         and _is_unauthorized_capability_reason(raw.get("reason"))

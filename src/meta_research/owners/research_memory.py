@@ -1608,7 +1608,10 @@ class SQLiteResearchMemoryReceiptVerifier:
         _description, row, custodies, manifest = self._asset_export_source(memory_ref)
         if "managed" not in {item.custody_mode for item in custodies}:
             raise OwnerConflict("asset_custody_unavailable")
-        for entry in manifest["entries"]:
+        entries = manifest.get("entries")
+        if not isinstance(entries, list) or not entries:
+            raise OwnerConflict("asset_custody_unavailable")
+        for entry in entries:
             verified = False
             for candidate in _asset_entry_sources(
                 self._object_store, row, custodies, manifest, entry

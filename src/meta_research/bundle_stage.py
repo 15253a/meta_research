@@ -203,7 +203,10 @@ class BundleStageWorker:
     ) -> dict[str, object] | None:
         query = getattr(self._research_graph, "query_current_quest_goal_revision", None)
         if callable(query):
-            current = query(request.accepted_question.quest_ref)
+            try:
+                current = query(request.accepted_question.quest_ref)
+            except OwnerConflict:
+                current = None
             if isinstance(current, dict):
                 return current
         fallback = request.context_pack.get("quest_goal_revision")

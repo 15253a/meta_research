@@ -94,6 +94,9 @@ class TargetRunRuntimeStatus:
     phase: str
     pending_code: str | None = None
     next_retry_at: float | None = None
+    operator_required: bool = False
+    audit_ref: str | None = None
+    correlation_ref: str | None = None
 
 
 class TargetRunRuntime:
@@ -687,10 +690,26 @@ class TargetRunRuntime:
                 now=now,
             )
             if decision == "limit_reached":
+                record_audit = getattr(
+                    self._target_root_lifecycle,
+                    "record_target_rejection_limit_audit",
+                    None,
+                )
+                audit_info: dict[str, object] = {}
+                if callable(record_audit):
+                    audit_info = record_audit(
+                        target_ref=handle.target_ref,
+                        target_run_ref=handle.target_run_ref,
+                        consecutive_rejections=consecutive_rejections,
+                        completion_ref=getattr(revision, "completion_ref", None),
+                    )
                 self._set_status(
                     handle.target_ref,
                     "revision_paused",
                     "target_rejection_limit_reached",
+                    operator_required=bool(audit_info.get("operator_required", True)),
+                    audit_ref=audit_info.get("audit_ref"),  # type: ignore[arg-type]
+                    correlation_ref=audit_info.get("correlation_ref"),  # type: ignore[arg-type]
                 )
                 return False
             if decision == "backoff_pending":
@@ -889,12 +908,18 @@ class TargetRunRuntime:
         pending_code: str | None = None,
         *,
         next_retry_at: float | None = None,
+        operator_required: bool = False,
+        audit_ref: str | None = None,
+        correlation_ref: str | None = None,
     ) -> None:
         self._status_by_target[target_ref] = TargetRunRuntimeStatus(
             target_ref=target_ref,
             phase=phase,
             pending_code=pending_code,
             next_retry_at=next_retry_at,
+            operator_required=operator_required,
+            audit_ref=audit_ref,
+            correlation_ref=correlation_ref,
         )
 
 

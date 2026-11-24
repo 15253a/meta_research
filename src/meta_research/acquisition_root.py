@@ -45,22 +45,12 @@ _TARGETLESS_PREFLIGHT_REASONS = frozenset(
         "targetless",
     }
 )
-_TARGETLESS_REASON_PHRASES = (
-    "no_target",
-    "no_paper_target",
-    "missing_target",
-    "missing_paper_target",
-    "empty_target",
-    "empty_paper_target",
-    "without_target",
-    "without_paper_target",
-    "targets_missing",
-    "paper_targets_missing",
-    "targetless",
-)
 _UNHEALTHY_PREFLIGHT_STATES = frozenset(
     {"unavailable", "waiting", "broken", "invalid", "failed", "error", "missing"}
 )
+_BAD_HEALTH_TOKENS = ("broken", "invalid", "fail", "error", "unavail", "missing")
+_BAD_BROWSER_TOKENS = ("not_connected", "disconnected", "skipped", *_BAD_HEALTH_TOKENS)
+_BAD_RESOURCE_TOKENS = ("unverified", "login_required", "denied", "no_targets", *_BAD_HEALTH_TOKENS)
 
 
 def _is_targetless_preflight_reason(reason_code: object) -> bool:
@@ -69,22 +59,39 @@ def _is_targetless_preflight_reason(reason_code: object) -> bool:
     normalized = reason_code.strip().lower()
     if normalized in _TARGETLESS_PREFLIGHT_REASONS:
         return True
-    return any(phrase in normalized for phrase in _TARGETLESS_REASON_PHRASES)
+    if "institution" in normalized:
+        return False
+    return "paper_target" in normalized and any(
+        token in normalized for token in ("no_", "missing", "empty", "without")
+    )
+
+
+def _non_empty_lower(evidence: object, key: str) -> str | None:
+    if not isinstance(evidence, dict):
+        return None
+    val = evidence.get(key)
+    if not isinstance(val, str) or not val.strip():
+        return None
+    return val.strip().lower()
 
 
 def _configuration_health_ready(evidence: object) -> bool:
-    if not isinstance(evidence, dict):
+    normalized = _non_empty_lower(evidence, "configuration_health")
+    if normalized is None or normalized in _UNHEALTHY_PREFLIGHT_STATES:
         return False
-    health = evidence.get("configuration_health")
-    if not isinstance(health, str) or not health.strip():
+    return not any(token in normalized for token in _BAD_HEALTH_TOKENS)
+
+
+def _institution_evidence_ready(evidence: object) -> bool:
+    if not _configuration_health_ready(evidence):
         return False
-    normalized = health.strip().lower()
-    if normalized in _UNHEALTHY_PREFLIGHT_STATES:
+    browser = _non_empty_lower(evidence, "browser_control")
+    resource = _non_empty_lower(evidence, "authorized_resource")
+    if browser is None or resource is None:
         return False
-    return not any(
-        token in normalized
-        for token in ("broken", "invalid", "fail", "error", "unavail", "missing")
-    )
+    if any(token in browser for token in _BAD_BROWSER_TOKENS):
+        return False
+    return not any(token in resource for token in _BAD_RESOURCE_TOKENS)
 
 
 class CodexAcquisitionRootAdapter(AcquisitionProvider):
@@ -221,7 +228,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             and _is_targetless_preflight_reason(result.reason_code)
             and isinstance(result.browser_context_ref, str)
             and bool(result.browser_context_ref.strip())
-            and _configuration_health_ready(result.evidence)
+            and _institution_evidence_ready(result.evidence)
         ):
             result = AcquisitionPreflightResult(
                 status="ready",
